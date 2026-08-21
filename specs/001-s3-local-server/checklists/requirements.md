@@ -38,4 +38,10 @@
   requires explicit justification in the feature spec). It is a governance
   appendix and is exempt from the "no implementation details" check; all
   user-facing requirement sections remain technology-agnostic.
+- 2026-08-21 review: implementation-level decisions (stack, protocol framework,
+  state layout, config schema, logging/metrics mechanisms, management-plane
+  transports, hardening details) were moved out of the spec's Clarifications
+  into plan.md / research.md / data-model.md / contracts/. The spec now records
+  only user-facing behavior decisions; the moved content is fully covered by
+  those design artifacts.
 - Items marked incomplete require spec updates before `/speckit-clarify` or `/speckit-plan`
