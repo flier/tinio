@@ -56,7 +56,7 @@ The following MUST be enforced in CI and locally:
 - `cargo doc` MUST build without warnings; broken doc links fail CI.
 - MSRV and current stable toolchain MUST both pass the test matrix.
 - `cargo-semver-checks` runs on any PR touching the public API.
-- `cargo audit` runs on the release branch.
+- `cargo audit` runs on the release branch; the maintainer reviews its report before every release — a vulnerable dependency blocks the release unless the risk is documented and accepted.
 
 ## Development Workflow
 

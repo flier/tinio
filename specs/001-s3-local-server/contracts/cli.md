@@ -44,6 +44,7 @@ Management transport flags: `--api <URL>` (repeatable) configures a management t
 - On ready: prints endpoint, storage root, credentials status to stderr (operational log).
 - Errors (exit 1): port in use; control channel bind failure after stale-socket reclaim (second live instance on same root); `api` feature present but every management transport disabled; unreadable storage root; storage root not writable without `--read-only`; invalid config.
 - Flags override env overrides `.env` overrides config.
+- Binding a non-loopback address prints a startup warning to stderr (basic); with anonymous mode also active the warning is escalated (prominent, per the layered trust model in spec §Assumptions/Network).
 
 ### `tinio status`
 

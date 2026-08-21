@@ -22,8 +22,8 @@ max_wait = "15s"         # max time to wait for a scan slot when throttled
 cycle = "24h"            # full-tree scan cycle (re-scan for out-of-band changes)
 
 [auth]
-access_key = "..."       # generated on first start
-secret_key = "..."
+access_key = "..."       # generated on first start (≥ 16 bytes, CSPRNG random)
+secret_key = "..."       # generated on first start (≥ 32 bytes, CSPRNG random)
 # NOTE: no `anonymous` key — anonymous mode is flag/env only (deliberate); the key is rejected as unknown.
 
 [log]
@@ -39,7 +39,7 @@ copy_object = true
 list_objects_v1 = true
 list_objects_v2 = true
 delete_objects = true
-sig_v2 = false            # SigV2 off by default (weaker scheme; aws cli v2 / rclone never use it)
+sig_v2 = false            # SigV2 off by default; DEPRECATED (weaker scheme; aws cli v2 / rclone never use it) — enabling prints a startup warning; slated for removal in v2
 temp_ttl_hours = 24       # stale temp-write sweep timeout
 multipart_expire_days = 7 # abandoned-upload sweep timeout
 
@@ -92,7 +92,7 @@ CLI flags > process environment > .env > config file
 ## Validation rules
 
 - Unknown config keys / sections → startup error.
-- Unknown `access_log_format` variables → startup error (fixed variable set: `$remote_addr`, `$remote_user`, `$time_local`, `$request`, `$status`, `$body_bytes_sent`, `$http_referer`, `$http_user_agent`, `$request_time`).
+- Unknown `access_log_format` variables → startup error (fixed variable set: `$remote_addr`, `$remote_user`, `$time_local`, `$request`, `$status`, `$body_bytes_sent`, `$http_referer`, `$http_user_agent`, `$request_time`). The set is closed by design — it cannot reference the Authorization header, query strings, or credentials, a security property that keeps secrets out of access logs (spec §FR-017); extending the set requires revisiting this guarantee.
 - `[server] port`: default 9000 (Minio-compatible); `0` = OS-assigned ephemeral port (for tests; reported in logs/state); explicit 1–65535 = fixed port. The auto-created config on first start writes `port = 9000`. Host any; verbosity in the four levels; boolean-typed keys must be booleans (`[server]` read_only, `[s3]`/`[storage]`/`[telemetry]` toggles); `[scanner]` and `[api.*]` transports are presence-gated (section present = on, absent = off).
 - Credential presence rules: no creds + no anonymous → generated session creds (printed once); first start → config auto-created with persisted creds.
 - Backend selection is deferred: v1 is filesystem-only (`tinio-fs`); the `[storage]` section holds backend behavior keys (e.g. `follow_symlinks`), and a `type` selection key will be added when a second backend (`tinio-s3`, `tinio-webdav`) lands.
