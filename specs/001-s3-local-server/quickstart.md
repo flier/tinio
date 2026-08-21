@@ -127,8 +127,7 @@ tinio server /tmp/tinio-demo --anonymous &
 # start a multipart upload, then kill -9 the server mid-upload
 # (e.g., upload a huge file and kill the process)
 tinio server /tmp/tinio-demo --anonymous   # restart works; parts still complete-able
-# leave upload idle; after 7 days (or configured shorter TTL) the sweep removes it
-# temp files older than temp_ttl_hours are removed on the sweep tick
+# leave the upload idle — the background sweep removes it after the configured TTL
 ```
 
 Expected: restart succeeds; no partial object ever appears in listings; `list_multipart_uploads` still shows the interrupted upload until it completes/aborts/expires.
@@ -175,4 +174,4 @@ Expected: reads behave identically to normal mode; every mutating call returns `
 
 ## CI note
 
-Scenarios 1–3, 6 run in CI on Windows/Linux/macOS; scenarios 5 (error codes), 8 (doctor incl. `--fix`/`--dry-run`), and 10 (read-only mode; the `chmod` step is unix-only) run everywhere; scenario 7 is manual/CI-long-TTL variant; the TTL-cache behavior is covered by unit tests rather than wall-clock waits. Scenario 9: the zero-byte round-trip runs in CI; the 1 GB transfer is a manual SC-003 check (a smaller streaming smoke test runs in CI via the criterion benches). Dedicated integration tests additionally cover: addressing style (aws cli v2 against `127.0.0.1` and `localhost`, no client overrides), cold listing with and without the scanner, any-depth `.tinio` hiding incl. nested roots, and stop-wait confirmation (see plan.md Testing).
+Scenarios 1–3, 6 run in CI on Windows/Linux/macOS; scenarios 5 (error codes), 8 (doctor incl. `--fix`/`--dry-run`), and 10 (read-only mode; the `chmod` step is unix-only) run everywhere; scenario 7 is manual/CI-long-TTL variant; the TTL-cache behavior is covered by unit tests rather than wall-clock waits. Scenario 9: the zero-byte round-trip runs in CI; the 1 GB transfer is a manual SC-003 check (a smaller streaming smoke test runs in CI via the criterion benches). Dedicated integration test coverage: see plan.md Testing.

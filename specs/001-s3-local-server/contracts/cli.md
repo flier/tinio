@@ -18,7 +18,7 @@ Positional `DIR` argument (Minio-style, e.g. `tinio server /data`); else walk up
 
 ## Environment variables
 
-`TINIO_*` names take precedence; when a `TINIO_` variable is absent, the corresponding `MINIO_` variable is accepted as a fallback for credentials: `TINIO_ACCESS_KEY` ← `MINIO_ACCESS_KEY` (legacy) / `MINIO_ROOT_USER` (modern), `TINIO_SECRET_KEY` ← `MINIO_SECRET_KEY` (legacy) / `MINIO_ROOT_PASSWORD` (modern).
+`TINIO_*` names take precedence, with a `MINIO_*` credential fallback (`MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` legacy, `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` modern) — the full env list is in [config.md](config.md), the mapping in [minio-compat.md](minio-compat.md).
 
 ## Commands
 

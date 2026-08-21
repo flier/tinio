@@ -12,13 +12,13 @@
 
 ## Clarifications
 
-> **Note**: Implementation-level decisions made during design review (stack and workspace structure, protocol framework, private-state layout, configuration schema, logging/metrics mechanisms, management-plane transports, and related hardening) are recorded in the design artifacts: [plan.md](plan.md) (structure, features), [research.md](research.md) (decisions and alternatives), [data-model.md](data-model.md) (entities), and [contracts/](contracts/) (exact schemas). This section records user-facing behavior decisions only.
+> **Note**: Implementation-level decisions made during design review (stack and workspace structure, protocol framework, private-state layout, configuration schema, logging/metrics mechanisms, management-plane transports, and related hardening) are recorded in the design artifacts: [plan.md](plan.md) (structure, features), [research.md](research.md) (decisions and alternatives), [data-model.md](data-model.md) (entities), and [contracts/](contracts/) (exact schemas). This section records user-facing behavior and interface decisions; the exact schemas live in the contracts.
 
 ### Session 2026-08-21 (initial)
 
 - Q: Should the v1 operation set include multipart uploads and server-side copy, or stay strictly compact? → A: Include basic multipart (initiate / upload part / complete / abort) and CopyObject in v1.
 - Q: How should users provide server credentials to the CLI? → A: Config file, environment variables, and CLI flags are all supported; precedence is flags > environment variables > config file.
-- Q: What request logging should the server do by default? → A: Request logs (method, path, status, duration) go to stderr with a verbosity flag (error/warn/info/debug, default info); an optional log-file configuration redirects request logs to that file; errors always remain visible on stderr. *(Superseded by later design sessions: the access log defaults to a log file in the reserved directory; operational logs go to stderr.)*
+- Q: What request logging should the server do by default? → A: Each request (method, path, status, duration) is written to an access log; operational logs default to stderr; errors always remain visible on stderr. (Current logging details are specified in FR-017 and the configuration contract.)
 
 ### Session 2026-08-21 (clarify)
 
@@ -29,7 +29,7 @@
 
 ### Session 2026-08-21 (plan review)
 
-- Q: Is a fixed default port required? → A: No — an unspecified or zero port selects an OS-assigned ephemeral port (reported in logs and status); fixed ports remain available via flag/config. *(Superseded by the Minio-compatibility session: the default port is 9000; `--port 0` explicitly selects an ephemeral port.)*
+- Q: Is a fixed default port required? → A: The default port is 9000 (Minio-compatible); `--port 0` explicitly selects an OS-assigned ephemeral port (for tests), reported in logs and status.
 - Q: Are conditional request headers supported? → A: Yes — If-Match/If-None-Match/If-Modified-Since/If-Unmodified-Since on Get/Head (304) and Put/Copy (412), with the Copy source evaluated per S3 semantics.
 - Q: How are keys ending in `/` (folder markers) handled? → A: They are never objects — PUT creates the directory, GET/HEAD return NoSuchKey, DELETE removes an empty directory.
 - Q: Are key charset restrictions platform-consistent? → A: No — universal rules (traversal, absolute paths, control characters) apply everywhere; platform charset limits follow the backend (Windows-invalid characters rejected on Windows only; future backends define their own).
@@ -147,7 +147,7 @@ A user configures a pair of credentials (access key and secret key) when startin
 - **FR-004**: Users MUST be able to list buckets, and list objects within a bucket including prefix filtering and delimiter-based grouping per standard S3 semantics.
 - **FR-005**: The server MUST respond to error conditions with the standard S3 error codes (bucket not found, key not found, invalid bucket name, authentication failure, and so on) so standard clients report failures correctly.
 - **FR-006**: The server MUST reject any request whose object key could address a path outside the storage root (path traversal, absolute paths); such requests MUST fail without touching the filesystem.
-- **FR-007**: The tool MUST provide CLI subcommands to start the server (with configurable host, port, storage root, credentials, logging settings, daemon mode, and symlink policy), report server status, stop the server, and diagnose the target directory (`doctor` — config validity, on-disk key validity, reserved-directory integrity; exit 0 clean / 1 problems; optional `--json`; `--dry-run` reports fixable problems without changing anything, `--fix` applies the cleanups — stale state/sockets, orphaned metadata entries, abandoned multipart uploads, stale temp files, and home root-state dirs whose root no longer exists — and requires the server to be stopped). On first start the tool MUST auto-create the configuration file with generated credentials; there is no separate init command, and no CLI data commands are provided (bucket/object operations are performed directly on the filesystem).
+- **FR-007**: The tool MUST provide CLI subcommands to start the server (with configurable host, port, storage root, credentials, logging settings, daemon mode, and symlink policy), report server status, stop the server, and diagnose the target directory (`doctor` — config validity, on-disk key validity, reserved-directory integrity; exit 0 clean / 1 problems; optional `--json`; `--dry-run`/`--fix` per the CLI contract). On first start the tool MUST auto-create the configuration file with generated credentials; there is no separate init command, and no CLI data commands are provided (bucket/object operations are performed directly on the filesystem).
 - **FR-008**: The server MUST support authenticated requests using the standard S3 request-signing scheme (SigV4) with user-configured credentials, and MUST reject requests with missing or invalid signatures with an authentication error.
 - **FR-009**: The server MUST support an anonymous mode (no credentials required), enabled only by explicit configuration (flag or environment variable); an explicit anonymous switch takes precedence over configured credentials, with a warning logged.
 - **FR-010**: Object transfers MUST stream; serving or receiving an object MUST NOT require buffering the full object in memory regardless of object size.

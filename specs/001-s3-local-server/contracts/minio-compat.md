@@ -32,16 +32,15 @@ All other variables (host, port, log, api transports) are `TINIO_`-only — Mini
 
 ## 4. Scanner configuration (Minio-aligned keys)
 
-The `[scanner]` section is presence-gated (section present = background ETag scanner on; the auto-created config includes it; omitted = off). Its keys match `mc admin config set myminio scanner ...`:
+The `[scanner]` section is presence-gated (section present = background ETag scanner on; the auto-created config includes it; omitted = off). Its keys match `mc admin config set myminio scanner ...` — schema and defaults are in [config.md](config.md); the mapping to Minio's semantics:
 
-```toml
-[scanner]
-delay = 10.0             # seconds between scan iterations (pacing/throttle)
-max_wait = "15s"         # max time to wait for a scan slot when throttled
-cycle = "24h"            # full-tree scan cycle (re-scan for out-of-band changes)
-```
+| key | meaning |
+|-----|---------|
+| `delay` | seconds between scan iterations (pacing/throttle) |
+| `max_wait` | max time to wait for a scan slot when throttled |
+| `cycle` | full-tree re-scan cadence (re-scan for out-of-band changes) |
 
-Mapping to Minio's scanner semantics: `delay` paces the scanner (replaces any rate-based throttle), `max_wait` bounds waiting under load, `cycle` is the full-tree re-scan cadence. Env: `TINIO_SCANNER` (`0`/`1`) toggles the scanner independently.
+Env: `TINIO_SCANNER` (`0`/`1`) toggles the scanner independently.
 
 ## 5. Presence-based config semantics
 
