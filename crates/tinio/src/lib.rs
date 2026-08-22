@@ -7,10 +7,29 @@
 //! S3 compatibility layer from tinio-server, the management plane from
 //! tinio-api, and the CLI entry from tinio-cli.
 //!
-//! The curated re-exports (with rustdoc examples per constitution III) land
-//! as the underlying modules are implemented: the storage contract arrives
-//! with Phase 2, the server/CLI surfaces with US1/US2, and the facade
-//! integration tests in `tests/` with task T096. Nothing is public yet.
+//! # Examples
 //!
-//! The binary is built from `main.rs`, a two-line delegate to
-//! `tinio_cli::run`.
+//! ```rust
+//! use tinio::{Config, Storage};
+//!
+//! // The configuration schema and the storage contract are the public
+//! // extension seams.
+//! let config = Config::parse("version = 1").unwrap();
+//! assert_eq!(config.server.port, 9000);
+//!
+//! fn accepts_any_backend<S: Storage>(backend: &S) -> &S {
+//!     backend
+//! }
+//! ```
+
+mod error;
+
+pub use tinio_config::Config;
+pub use tinio_core::{
+    BodyStream, Bucket, BucketOps, ByteRange, ETag, MultipartOps, MultipartUpload, ObjectOps,
+    PartInfo, Storage, bucket, cleanup, etag, object, storage,
+};
+
+#[cfg(feature = "api")]
+pub use self::error::ApiError;
+pub use self::error::{CliError, ConfigError, ServerError, StorageError};

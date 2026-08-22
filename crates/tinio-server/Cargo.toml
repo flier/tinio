@@ -6,34 +6,33 @@ description = "S3 compatibility layer for tinio: s3s protocol mapping over the t
 publish = false
 
 [dependencies]
-s3s.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-tokio-util.workspace = true
+lazy_static.workspace = true
 mime_guess.workspace = true
-prometheus.workspace = true
-tracing.workspace = true
-tinio-core = { path = "../tinio-core" }
-tinio-config = { path = "../tinio-config" }
-# Management plane (metrics registry injection) — behind the `api` feature.
-tinio-api = { path = "../tinio-api", optional = true }
-
-# Opt-in OpenTelemetry export (FR-017): OTLP exporter + tracing layer.
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
+prometheus.workspace = true
+s3s.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
+
+tinio-api = { workspace = true, optional = true }
+tinio-config.workspace = true
+tinio-core.workspace = true
+
+[dev-dependencies]
+tinio-core = { workspace = true, features = ["testing"] }
 
 [features]
 default = ["multipart", "copy", "list-v1", "list-v2"]
-# S3 capability groups — strippable at compile time; disabled groups return
-# NotImplemented at runtime.
 multipart = []
 copy = []
 list-v1 = []
 list-v2 = []
-# Management-plane integration (optional tinio-api dependency).
 api = ["dep:tinio-api"]
-# OpenTelemetry export layer (opt-in).
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry-otlp",

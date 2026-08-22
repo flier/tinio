@@ -6,23 +6,26 @@ description = "Command-line interface for tinio: server/start, status, stop, doc
 publish = false
 
 [dependencies]
-clap.workspace = true
+clap = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
 
-tinio-config = { path = "../tinio-config" }
-tinio-core = { path = "../tinio-core" }
-tinio-fs = { path = "../tinio-fs" }
-tinio-server = { path = "../tinio-server" }
-# Management-plane client commands (status/stop) — behind the `api` feature.
-tinio-api = { path = "../tinio-api", optional = true }
+tinio-api = { workspace = true, optional = true }
+tinio-config.workspace = true
+tinio-core.workspace = true
+tinio-fs.workspace = true
+tinio-mem = { workspace = true, optional = true }
+tinio-server.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# Console-close event handling (SetConsoleCtrlHandler) for graceful shutdown
-# on Ctrl+C / close — used by the signal handling in start.rs (T069).
 windows-sys = { workspace = true, features = ["Win32_System_Console"] }
 
+[dev-dependencies]
+tinio-core = { workspace = true, features = ["testing"] }
+
 [features]
-default = ["api"]
+default = ["api", "mem"]
 api = ["dep:tinio-api"]
+mem = ["dep:tinio-mem"]
 
 [lints.rust]
 unsafe_code = "forbid"

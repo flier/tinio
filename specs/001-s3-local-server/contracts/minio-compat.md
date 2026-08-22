@@ -44,7 +44,7 @@ Env: `TINIO_SCANNER` (`0`/`1`) toggles the scanner independently.
 
 ## 5. Presence-based config semantics
 
-`[api.unix]` / `[api.http]` / `[api.https]` and `[scanner]` use **section presence = enabled** (no `enabled` booleans in the config): the section present means on, omitted means off. `--api` flags and `--no-api-unix` override per scheme as usual.
+`[api.unix]` / `[api.pipe]` / `[api.http]` / `[api.https]` and `[scanner]` use **section presence = enabled** (no `enabled` booleans in the config): the section present means on, omitted means off. The transports are three-choose-one: exactly one of the local channel (`[api.unix]` on Linux/macOS, `[api.pipe]` on Windows), `[api.http]`, or `[api.https]` may be enabled. `--api` flags and `--no-api-unix` override per scheme as usual.
 
 ## 6. Documented deviations from Minio
 

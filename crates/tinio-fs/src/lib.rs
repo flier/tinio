@@ -8,3 +8,7 @@
 //! Module layout is populated by the US1 tasks (path, write, meta, buckets,
 //! listing, multipart, scanner, sweep, cleanup, backend/); nothing is public
 //! yet.
+
+mod error;
+
+pub use self::error::Error;

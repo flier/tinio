@@ -8,7 +8,11 @@
 //! `crates/tinio` compiles from the workspace setup phase onward.
 //!
 //! The command implementations land in `commands/` (start, status, stop,
-//! doctor); nothing else is public yet.
+//! doctor).
+
+mod error;
+
+pub use self::error::Error;
 
 /// Entry point for the `tinio` CLI.
 ///
@@ -28,4 +32,12 @@
 /// argument parsing and command dispatch.
 pub fn run() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn placeholder_run_returns_success() {
+        assert_eq!(super::run(), std::process::ExitCode::SUCCESS);
+    }
 }

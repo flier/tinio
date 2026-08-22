@@ -9,7 +9,7 @@ Related: [failure-handling.md](failure-handling.md) (abnormal conditions, reclam
 ## 1. Path mapping (`crates/tinio-fs/src/path.rs`, T037)
 
 - Bucket → `<root>/<bucket>`; key → path relative to the bucket; nested keys map to nested directories.
-- Traversal (`..`), absolute paths, and control characters are rejected **before any FS access** (FR-006; `tinio-core` keys.rs validation is reused).
+- Traversal (`..`), absolute paths, and control characters are rejected **before any FS access** (FR-006; `tinio-core` `object::key` / `bucket::name` validation is reused).
 - `.tinio` is a reserved segment at ANY depth: writes rejected (`AccessDenied`), reads return `NoSuchKey`, listings skip (FR-020) — this also protects nested roots (an outer server never serves an inner root's state).
 - Platform charset: universal rules apply everywhere; Windows-invalid characters are rejected on Windows only (future backends define their own).
 - Case sensitivity follows the host filesystem (no artificial enforcement on case-insensitive hosts).

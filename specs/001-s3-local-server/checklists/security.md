@@ -53,15 +53,15 @@
 
 - [x] CHK026 Is the default loopback bind (127.0.0.1) specified as a deliberate security default and documented as a Minio deviation? [Clarity, Spec §Assumptions/Network, contracts/minio-compat.md §6]
 - [x] CHK027 Is the absence of TLS on the S3 data plane (v1) explicitly documented as an intentional exclusion rather than an omission? [Intentional Exclusion, Spec §Assumptions/Network]
-- [x] CHK028 Is the absence of body-size and rate limits explicitly documented as an intentional choice for a local single-user tool? [Intentional Exclusion, Spec §Edge Cases, §Technical Decisions]
+- [x] CHK028 Is the absence of body-size and rate limits explicitly documented as an intentional choice for a local single-user tool? [Intentional Exclusion, Spec §Edge Cases, research.md §1]
 - [x] CHK029 Are the combined implications of anonymous mode + non-loopback binding documented (explicit exposure, documented assumption)? [Coverage, Gap]
   > **Resolution (2026-08-22)**: layered trust model + graded startup warnings (basic non-loopback; prominent with anonymous) — spec §Assumptions/Network, §Edge Cases, contracts/cli.md.
 
 ## Supply Chain & Dependency Security
 
-- [x] CHK030 Is dependency minimization enforced — every dependency justified in the spec (Technical Decisions) per constitution Principle I? [Completeness, Spec §Technical Decisions]
+- [x] CHK030 Is dependency minimization enforced — every dependency justified in research.md §24 per constitution Principle I? [Completeness, research.md §24]
 - [x] CHK031 Is `cargo audit` specified as a release/CI gate? [Completeness, Constitution §Rust Tooling]
-- [x] CHK032 Is the unsafe-forbidding stance recorded, including s3s's `unsafe_code = "forbid"` as a selection rationale? [Dependency, Spec §Technical Decisions]
+- [x] CHK032 Is the unsafe-forbidding stance recorded, including s3s's `unsafe_code = "forbid"` as a selection rationale? [Dependency, research.md §1]
 - [x] CHK033 Are dependency vulnerability/upgrade response requirements defined for the project? [Gap]
   > **Resolution (2026-08-22)**: constitution Rust Tooling — maintainer reviews `cargo audit` report before every release; vulnerable dependency blocks release unless risk documented and accepted.
 
@@ -77,7 +77,7 @@
 
 - [x] CHK039 Is the credential precedence (flags > env > .env > config) consistent across spec §FR-016, contracts/cli.md, and contracts/config.md? [Consistency]
 - [x] CHK040 Are the read-only-mode config read rules (`.tinio.toml` wins, read-only, never written) consistent between §FR-023 and contracts/config.md? [Consistency]
-- [x] CHK041 Does the spec distinguish "intentional security exclusions" from missing requirements — each exclusion carrying an explicit rationale tied to the usage model? [Measurability, Spec §Assumptions, §Technical Decisions]
+- [x] CHK041 Does the spec distinguish "intentional security exclusions" from missing requirements — each exclusion carrying an explicit rationale tied to the usage model? [Measurability, Spec §Assumptions, research.md §1]
 
 ## Notes
 

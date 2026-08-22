@@ -7,5 +7,30 @@
 //! contract and must pass the conformance test harness behind the `testing`
 //! feature.
 //!
-//! The module layout (error, domain, storage, cleanup, keys, testing) is
-//! populated by the Phase 2 foundational tasks; nothing is public yet.
+//! Contract domain types: [`Bucket`] and [`bucket::Name`], [`object::Key`]
+//! and [`object::Info`], [`ETag`], [`MultipartUpload`] and [`PartInfo`].
+//! The newtypes carry validation in [`object::key`],
+//! [`bucket::name`], and [`ETag::new`]: untrusted input MUST go
+//! through the checked constructors before any backend is called.
+
+pub mod bucket;
+pub mod cleanup;
+pub mod etag;
+pub mod multipart;
+pub mod object;
+pub mod storage;
+
+/// Conformance harness + shared test helpers. Available to backend crates
+/// via the `testing` feature, and to this crate's own unit tests (`cfg(test)`
+/// — the harness is never compiled into a regular dependency build).
+#[cfg(any(feature = "testing", test))]
+pub mod testing;
+
+pub use self::bucket::Bucket;
+pub use self::etag::ETag;
+pub use self::multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber};
+pub use self::storage::{
+    BodyStream, BucketOps, ByteRange, GetObjectResult, ListObjectsParams, ListPartsParams,
+    ListUploadsParams, MultipartOps, ObjectListing, ObjectOps, PartsListing, PutObjectResult,
+    Storage, UploadsListing, collect_body, from_nanos, group_and_paginate, now_nanos,
+};

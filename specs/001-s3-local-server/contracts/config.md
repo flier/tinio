@@ -2,6 +2,8 @@
 
 **Branch**: `001-s3-local-server` | **Date**: 2026-08-21
 
+**Implementation**: `crates/tinio-config/src/schema/mod.rs` (`Config::parse`, garde validation, `SmartDefault` defaults); `.env` loading in `sources.rs` (T018). Credential generation (`credentials.rs`) lands in US2/US3.
+
 ## Config file: `<root>/.tinio/.tinio.toml`
 
 Auto-created with generated credentials on first `start` (in read-only mode: created under the home state dir instead — see below). `<state-dir>/config.toml` is accepted as an alias when `.tinio.toml` is absent (auto-create always writes `.tinio.toml`). Sections and keys are validated; **unknown keys are rejected at startup** (fail-fast). All paths relative to the state dir (`<root>/.tinio/`, or `~/.tinio/roots/<sha1(canonical root)16>/` in read-only mode) unless absolute.
@@ -46,22 +48,28 @@ multipart_expire_days = 7 # abandoned-upload sweep timeout
 [storage]
 follow_symlinks = true    # follow symlinks in the storage root (default); false = reject access through links + exclude from listings
 
-[api.unix]
+[api.unix]              # local channel, unix form — Linux/macOS (part of three-choose-one)
 # presence = local channel on (the auto-created config includes this section; omit it to disable)
-path = ""                 # unix: socket path (relative to .tinio/, or absolute); Windows: pipe name (empty = derived tinio-<sha1>); default tinio.sock on unix
+# The transports are mutually exclusive — exactly one of unix/http/https may be enabled
+# (three-choose-one). On Windows use [api.pipe] instead of [api.unix]. More than one is a
+# startup error (US2 orchestration).
+path = ""                 # socket path (relative to .tinio/, or absolute); default tinio.sock
 
-# [api.http]              # presence of this section enables TCP HTTP exposure (default off: omit the section; port default 9001)
+# [api.pipe]              # local channel, Windows form — use this section on Windows instead of [api.unix]
+# path = ""              # named-pipe name (empty = derived tinio-<sha1>)
+
+# [api.http]              # presence of this section enables TCP HTTP exposure (mutually exclusive with unix/pipe/https; port default 9001)
 # host = "127.0.0.1"
 # port = 9001
 
-# [api.https]             # presence of this section (or `--api https://`) enables TCP HTTPS; requires cert + key
+# [api.https]             # presence of this section (or `--api https://`) enables TCP HTTPS; requires cert + key (mutually exclusive with unix/pipe/http)
 # host = "127.0.0.1"
-# port = 9001             # must differ from http.port when both are enabled
+# port = 9001
 # cert = ""               # PEM certificate path
 # key = ""                # PEM private key path
 
 [telemetry]
-otlp_endpoint = ""        # empty = off; requires the `otel` cargo feature
+otlp_endpoint = "http://127.0.0.1:4317"   # required when the section is present (empty → startup error); omit [telemetry] to disable; requires the `otel` cargo feature
 ```
 
 ## Environment variables
@@ -98,11 +106,11 @@ CLI flags > process environment > .env > config file
 - Backend selection is deferred: v1 is filesystem-only (`tinio-fs`); the `[storage]` section holds backend behavior keys (e.g. `follow_symlinks`), and a `type` selection key will be added when a second backend (`tinio-s3`, `tinio-webdav`) lands.
 - `[s3]` capability groups are also strippable at compile time via default-on cargo features (`multipart`, `copy`, `list-v1`, `list-v2`); when a group is not compiled, its keys here are schema-known and silently ignored.
 - The `[api.https]` section (or `--api https://`) requires both `cert` and `key` (PEM paths); missing → startup error.
-- `http` and `https` ports must differ when both are enabled (startup error otherwise); both may be on (two listeners on the same router).
-- `[api.unix]` `path`: on unix it is a socket path, relative to `.tinio/` unless absolute; on Windows it is the named-pipe name (empty = derived `tinio-<sha1(root)>`).
+- `http` and `https` are mutually exclusive transports (three-choose-one with the local channel): at most one of `unix`/`pipe`/`http`/`https` may be enabled — the local channel is `unix` on Linux/macOS and `pipe` on Windows, so `unix` and `pipe` are mutually exclusive too; more than one is a startup error.
+- The local channel has two platform forms: `[api.unix]` `path` (Linux/macOS — socket path, relative to `.tinio/` unless absolute; default `tinio.sock`) and `[api.pipe]` `path` (Windows — named-pipe name, empty = derived `tinio-<sha1(root)>`). Use the platform-appropriate section; both participate in the three-choose-one exclusivity.
 - `[storage] follow_symlinks`: boolean, default true; false = reject access resolving through symlinks and exclude symlink entries from listings.
 - `[server] read_only`: boolean, default false; see the read-only-mode section above. In read-only mode, `[s3]` write-related toggles are moot (writes are rejected regardless).
 - `[scanner]` section: presence = background ETag scanner on (FR-024; the auto-created config includes it; omitted = off); keys are Minio-aligned (`mc admin config set myminio scanner ...`): `delay` float seconds ≥ 0 (default 10.0 — pacing between scan iterations), `max_wait` duration string (default `15s` — max wait for a scan slot when throttled), `cycle` duration string (default `24h` — full-tree re-scan cadence). Runs in read-only mode as well (meta writes land in the home state dir). Env: `TINIO_SCANNER` (`0`/`1`).
 - Any TCP exposure (http/https section present or `--api` flags) requires the token on ALL management endpoints (including `/metrics` and `/openapi.json`).
-- The `[api]` section requires the `api` cargo feature (default on). In builds without it, the keys are schema-known and silently ignored, not rejected as unknown. With the `api` feature compiled in, at least one management transport must be enabled after resolution — `--no-api-unix` with no TCP transport configured is a startup error.
-- Repeatable `--api <URL>` flags override config per scheme: a flag replaces the matching transport's subsection (`unix`/`http`/`https`); transports not mentioned by any flag keep their configured values.
+- The `[api]` section requires the `api` cargo feature (default on). In builds without it, the keys are schema-known and silently ignored, not rejected as unknown. With the `api` feature compiled in, exactly one management transport must be enabled after resolution (three-choose-one: `unix`/`http`/`https`) — `--no-api-unix` with no TCP transport configured is a startup error.
+- Repeatable `--api <URL>` flags select the transport per scheme: a flag replaces the matching transport's subsection (`unix`/`http`/`https`); the three-choose-one exclusivity applies after all flags and config are resolved.

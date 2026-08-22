@@ -6,19 +6,20 @@ description = "Filesystem backend for tinio: implements the tinio-core Storage c
 publish = false
 
 [dependencies]
-tinio-core = { path = "../tinio-core" }
-md-5.workspace = true
+thiserror.workspace = true
 time.workspace = true
-uuid.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true, features = ["v4"] }
+
+tinio-core.workspace = true
 
 [dev-dependencies]
-tinio-core = { path = "../tinio-core", features = ["testing"] }
-tempfile.workspace = true
-proptest.workspace = true
 criterion.workspace = true
-# Heap-profiling for the allocation-discipline verification (Phase 6, T091).
 dhat.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+tinio-core = { workspace = true, features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"

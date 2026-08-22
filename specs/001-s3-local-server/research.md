@@ -101,7 +101,7 @@ Consolidated findings from the design-review research (s3s ecosystem report), th
 
 ## 15. Backend abstraction (extension seam)
 
-- **Decision**: `tinio-core` defines the storage contract — a `Storage` trait (async bucket/object/multipart operations, `Send + Sync + 'static`), domain types (`Bucket`, `ObjectInfo`, part/multipart state), backend-agnostic key validation, and a conformance test harness (behind the `testing` feature, off by default — backend crates enable it in their dev-dependencies) that every backend implementation must pass. `tinio-fs` is the v1 filesystem implementation (path mapping, atomic writes, listing, meta store, multipart parts, sweep, buckets.json). `tinio-server` maps the s3s `S3` trait operations onto `Storage`; the facade re-exports the contract for third-party backends. Planned follow-on backends: `tinio-s3` (S3-backed gateway) and `tinio-webdav` — same trait, no protocol/CLI/config changes. Backend selection is not a v1 config key (filesystem-only); the selection key lands with the second backend.
+- **Decision**: `tinio-core` defines the storage contract — a `Storage` trait (async bucket/object/multipart operations, `Send + Sync + 'static`), domain newtypes split by concern (`bucket::Name` + `Bucket`, `object::Key` + `object::Info`, `ETag`, `MultipartUpload` + `PartInfo` in `bucket`/`object`/`etag`/`multipart` modules), validation via `bucket::name` / `object::key` (checked constructors on the newtypes), and a conformance test harness (behind the `testing` feature, off by default — backend crates enable it in their dev-dependencies) that every backend implementation must pass. `tinio-mem` provides the in-memory reference backend (`MemoryStorage` over redb `InMemoryBackend`, split by operation group — `storage`/`bucket`/`object`/`multipart`/`cleanup`/`error` per `docs/style.md`; CLI default when no directory is given; conformance green). `tinio-config` schema lives in `schema/mod.rs` (not flat `lib.rs`). `tinio-fs` is the v1 filesystem implementation (path mapping, atomic writes, listing, meta store, multipart parts, sweep, buckets.json). `tinio-server` maps the s3s `S3` trait operations onto `Storage` (metrics registry landed in T023; S3 mapping in US1); the facade currently re-exports `Config` + the core contract + error aliases (full server/api/cli re-exports in T096/US2). Planned follow-on backends: `tinio-s3` (S3-backed gateway) and `tinio-webdav` — same trait, no protocol/CLI/config changes. Backend selection is not a v1 config key (filesystem-only); the selection key lands with the second backend.
 - **Rationale**: User-directed extensibility; the trait is a deep module — protocol layer, management plane, CLI, and config all speak the contract, so adding a backend is a new crate + one wiring point. The conformance harness makes every backend provably equivalent from the protocol layer's perspective.
 - **Alternatives considered**: Filesystem implementation wired directly into the server (rejected: the planned backends would require a refactor of the mapping layer); contract hosted in `tinio-server` (rejected: backends would drag in the HTTP/s3s stack); traitless single-implementation (rejected: contradicts the extension plan).
 
@@ -113,7 +113,7 @@ Consolidated findings from the design-review research (s3s ecosystem report), th
 
 ## 17. Per-crate error types (thiserror)
 
-- **Decision**: Every crate defines its own error module (`error.rs`) with `thiserror`-derived types, and each crate exposes exactly one public error type: `tinio-core::Error` (backend-agnostic domain errors: NotFound/AlreadyExists/NotEmpty/InvalidKey/InvalidBucketName/Unsupported/transparent Io), `tinio-fs::Error` (io + domain mapping, `From`-converts into the core error), `tinio-config::Error` (parse/validation), `tinio-server::Error` (startup + mapping), `tinio-api::Error` (maps to HTTP status + JSON error bodies), `tinio-cli::Error` (user-facing messages + exit codes), and the facade's `error.rs` re-exports the crate errors for third-party consumers. Conversion chains run one way: fs → core → s3s error codes (in `tinio-server`'s mapping layer) → HTTP statuses (in `tinio-api`) → CLI exit codes (in `tinio-cli`).
+- **Decision**: Each crate exposes exactly one public error type named `Error`: `tinio_core::storage::Error` (backend-agnostic domain errors — lives in the storage contract module, not a separate `error.rs`; import conventions in `docs/style.md`), `tinio_fs::Error` (io + domain mapping, `From`-converts into `storage::Error` — T019), `tinio_config::Error` (parse/validation — implemented, in `error.rs`), `tinio_server::Error` (startup + mapping — T020), `tinio_api::Error` (maps to HTTP status + JSON error bodies — T021), `tinio_cli::Error` (user-facing messages + exit codes — T022), and the facade's `error.rs` re-exports the crate errors for third-party consumers. Conversion chains run one way: fs → `storage::Error` → s3s error codes (in `tinio-server`'s mapping layer) → HTTP statuses (in `tinio-api`) → CLI exit codes (in `tinio-cli`).
 - **Rationale**: User-directed; typed errors are required by constitution II, and per-crate errors keep dependency boundaries honest — `tinio-core` must never leak a backend-specific type, and the mapping layers (S3 codes, HTTP statuses, exit codes) each translate in exactly one place.
 - **Alternatives considered**: One workspace-wide error type (rejected: couples crates and would force `tinio-s3`/`tinio-webdav` to reuse filesystem error variants); `anyhow` in library crates (rejected: libraries need typed, nameable errors; `anyhow` is reserved for nothing here since the CLI also uses typed errors for exit-code mapping).
 
@@ -126,7 +126,7 @@ Consolidated findings from the design-review research (s3s ecosystem report), th
 ## 19. Plan-review round 3 decisions
 
 - **Symlink policy**: followed by default — the storage root is user-owned and links may point outside it (documented, matches "serve what is in the directory", SC-006). Disable via `[storage] follow_symlinks = false` or `--no-follow-symlinks`: access resolving through a symlink is then rejected and symlink entries are excluded from listings. The `[storage]` config section now exists for backend behavior keys; the deferred `type` selection key will land with the second backend.
-- **Windows local-channel addressing**: `--api pipe://<name>` is the pipe-analogous form of `unix://`; `[api.unix] path` holds the pipe name on Windows (empty = derived `tinio-<sha1(root)>`); platform-mismatched schemes are usage errors.
+- **Windows local-channel addressing**: `--api pipe://<name>` is the pipe-analogous form of `unix://`; the local-channel config section is `[api.unix]` on Linux/macOS and `[api.pipe]` on Windows, with `path` holding the socket path / named-pipe name respectively (empty = derived `tinio-<sha1(root)>`); platform-mismatched schemes are usage errors.
 - **Stale unix socket recovery**: probe-then-unlink before bind (a live instance makes the probe succeed → single-instance error; a dead socket is removed → clean restart). No unconditional unlink (would allow double instances).
 - **Multipart upload IDs**: UUID v4 via the `uuid` crate (added to the dependency list).
 - **`tinio doctor`**: offline diagnostic subcommand (no server needed): config validity (exists/parses/validates/credentials resolvable), on-disk bucket/object key validity (universal + platform rules), `.tinio/` integrity (stale state, stale socket, orphaned meta/buckets.json entries, abandoned multipart, stale temps), symlinks present while disabled, low disk space warn; human-readable severity report, optional `--json`, exit 0 clean / 1 problems. Lives in `tinio-cli`, uses `tinio-config` + `tinio-core` + `tinio-fs`; not feature-gated (diagnoses the always-present layers).
@@ -160,3 +160,75 @@ The plan-review session confirmed the S3 surface semantics — port defaults (Mi
 - **Decision**: CLI invocation, port defaults, environment fallbacks, and scanner keys follow Minio conventions (`tinio server <dir>` positional, `--address` alias, 9000/9001 defaults, `TINIO_*`-first with `MINIO_*` credential fallback, Minio-aligned scanner keys). The complete user-facing surface — including the documented deviations (loopback-only default bind, `--anonymous`, not-adopted Minio flags) — is specified in [contracts/minio-compat.md](contracts/minio-compat.md).
 - **Rationale**: User-directed; Minio is the reference local S3 tool, and its invocation shape (`minio server /data`, ports 9000/9001, root-user env vars) is what automation scripts already assume. The earlier ephemeral-port default was reversed (explicit `--port 0` for tests keeps the same testing value without surprising default behavior).
 - **Alternatives considered**: Keeping `--root` (rejected: user-directed removal — the positional form is the Minio idiom); ephemeral default with 9000 only in config (rejected: diverges from Minio's out-of-the-box 9000); adopting Minio's all-interfaces `:9000` bind (rejected: a local tool should stay loopback-bound by default); `MINIO_*` fallback for every variable (rejected: only credentials have meaningful Minio equivalents; address/logging variables stay `TINIO_`-only).
+
+## 24. Dependencies (constitution Principle I)
+
+Canonical justifications for workspace crates. [plan.md](plan.md) lists them; this section is the Principle I home. Crates decided earlier are indexed; the rest follow Decision / Rationale / Alternatives.
+
+### Indexed
+
+| Crate | See | Role |
+|-------|-----|------|
+| `s3s` | §1 | Protocol layer (routing, XML, error codes, SigV4/SigV2). Apache-2.0, `unsafe_code = "forbid"`. Always compiled; capability groups strippable (`multipart`, `copy`, `list-v1`, `list-v2`). No HTTP body-size or rate limiting — intentional (SC-003, trusted local clients). |
+| `hyper` / `hyper-util` / `tokio` / `tokio-util` | §2 | Data-plane HTTP and async runtime (s3s native transport). |
+| `axum` | §2, §8, §14 | Management-plane HTTP (unix socket / named pipe, optional TCP HTTP/HTTPS). |
+| `tokio-rustls` + `rustls-pemfile` | §14 | Optional HTTPS management listener (`tls` feature). S3 data plane stays plain HTTP in v1. |
+| `utoipa` (`axum_extras`) | §14 | Management-plane OpenAPI (`openapi` feature). |
+| `prometheus` | §9 | Registry and Prometheus text for `GET /metrics`. |
+| `tracing` / `tracing-subscriber` | §9 | All logging; text/JSON operational formats. |
+| `opentelemetry` / `opentelemetry-otlp` / `tracing-opentelemetry` | §9 | Optional OTLP export (`otel` feature). |
+| `serde` / `serde_json` / `toml` | §10 | Config parse and serialize. |
+| `dotenvy` | §10 | `.env` loading (not hand-rolled). |
+| `dirs` | §21 | Home-directory resolution for read-only-mode state (`~/.tinio/roots/<hash>/`). |
+| `mime_guess` | §11 | Content-Type from file extension. |
+| `md-5` | §4 | ETag (single-object MD5 and multipart composition). |
+| `thiserror` | §17 | Per-crate typed errors; conversions chain `storage::Error` → S3 codes → HTTP statuses → CLI exit codes. |
+| `uuid` | §19 | Multipart upload IDs (v4). |
+| `criterion` / `proptest` / `tempfile` (dev) | §13 | Streaming benchmarks (Principle V); I/O property tests (Principle IV); scratch roots in tests. |
+
+### Remaining crates
+
+- **clap**
+  - **Decision**: CLI parsing (`derive` at `tinio-cli`).
+  - **Rationale**: Subcommands, env overlays, and Minio-style flags without a hand-rolled argv parser.
+  - **Alternatives considered**: Hand-rolled argv (rejected: env/flag precedence and help text are the footgun clap exists to close).
+- **time**
+  - **Decision**: Timestamp formatting.
+  - **Rationale**: Same ecosystem as s3s; HTTP-date / S3 XML timestamps without pulling `chrono`.
+  - **Alternatives considered**: `chrono` (rejected: heavier); `std::time` formatting only (rejected: HTTP-date / RFC 3339 need a formatter).
+- **lazy_static**
+  - **Decision**: Process-wide Prometheus families in `tinio-server::metrics`, constructed with `register_*!` macros.
+  - **Rationale**: User-directed; globals on the default registry, no wrapper type.
+  - **Alternatives considered**: Per-instance `Metrics` + owned `Registry` (rejected: user-directed).
+- **redb**
+  - **Decision**: Embedded KV over `redb::InMemoryBackend` in `tinio-mem::MemoryStorage` (six tables: buckets, objects, meta, multipart uploads, parts, part-index).
+  - **Rationale**: Single-writer transactions give the reference backend atomic multi-table updates (bucket + object bytes + meta + multipart state) without hand-rolled lock ordering — the conformance harness exercises exactly these invariants. Supersedes the earlier `papaya` pick: a lock-free map cannot express cross-table transactions, and the in-memory backend keeps the crate disk-free. Module layout follows `docs/style.md` (operation groups in `storage`/`bucket`/`object`/`multipart`/`cleanup`/`error`).
+  - **Alternatives considered**: `papaya` (rejected: lock-free single maps, no cross-table transactions); `std::sync::Mutex<HashMap>` (rejected: serializes all access, manual multi-map atomicity); `dashmap` (rejected: lock-per-shard, same atomicity gap).
+- **windows-sys** (target-gated, `cfg(windows)`)
+  - **Decision**: Win32 `SetConsoleCtrlHandler` for console-close (`CTRL_CLOSE_EVENT` / `CTRL_LOGOUT_EVENT` / `CTRL_SHUTDOWN_EVENT`).
+  - **Rationale**: User-approved. tokio `signal::ctrl_c` covers only Ctrl+C; a foreground server must drain when the console window closes, the user logs off, or the system shuts down.
+  - **Alternatives considered**: Ctrl+C only (rejected: closing the window would leave a live listener); a Windows service (rejected: v1 has no service-manager integration).
+- **garde + smart-default + parse-display**
+  - **Decision**: Config validation, field defaults, enum Display/FromStr.
+  - **Rationale**: Fail-fast schema rules without a hand-written validator; `SmartDefault` for presence-gated sections; `parse-display` for verbosity/log-format enums.
+  - **Alternatives considered**: Hand-written `Default` + ad-hoc checks (rejected: duplicates serde/garde); `validator` (rejected: garde is the derive-on-struct path already in use).
+- **derive_more**
+  - **Decision**: `Display`/`Deref`/`AsRef`/`Into` on domain newtypes (`full` feature at `tinio-core`).
+  - **Rationale**: Newtypes stay thin; conventions in `docs/style.md`.
+  - **Alternatives considered**: Hand-written impls (rejected: noise on every newtype).
+- **async-trait + bytes + futures**
+  - **Decision**: Async storage/cleanup traits; streaming body chunks.
+  - **Rationale**: `Storage` is object-safe and `Send`; `Bytes`/`Stream` are the s3s body shape.
+  - **Alternatives considered**: RPITIT-only traits (rejected: object-safety for `dyn Storage`); `Vec<u8>` bodies (rejected: SC-003 streaming).
+- **hex**
+  - **Decision**: Hex encode/decode for ETag wire form.
+  - **Rationale**: ETag is stored as raw MD5 bytes and emitted as hex; one crate instead of a local encoder.
+  - **Alternatives considered**: Hand-rolled hex (rejected: classic off-by-one).
+- **secrecy + humantime-serde**
+  - **Decision**: Zeroizing secret keys in config; human-duration fields in TOML.
+  - **Rationale**: Secret keys must not leak via `Debug`; scanner/sweep TTLs are written as `"24h"` / `"7d"`.
+  - **Alternatives considered**: Plain `String` secrets (rejected: log/debug leaks); integer-second durations (rejected: unreadable config).
+- **dhat** (dev, `tinio-fs`)
+  - **Decision**: Heap-profile streaming put/get to assert bounded allocations (constitution V).
+  - **Rationale**: User-approved. Criterion measures time; dhat measures the allocation discipline on the hot path.
+  - **Alternatives considered**: RSS-only SC-003 checks (rejected: they do not catch per-chunk `Vec` growth).

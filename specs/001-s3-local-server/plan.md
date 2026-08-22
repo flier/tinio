@@ -1,18 +1,18 @@
 # Implementation Plan: S3-Compatible Local Storage Server (tinio)
 
-**Branch**: `001-s3-local-server` | **Date**: 2026-08-22 | **Spec**: [spec.md](spec.md)
+**Branch**: `dev` | **Date**: 2026-08-22 | **Spec**: [spec.md](spec.md)
 
 **Input**: Feature specification from `/specs/001-s3-local-server/spec.md`
 
 ## Summary
 
-A compact Rust tool serving an S3-compatible interface over local directories: buckets map to top-level subdirectories, objects to files, with an S3 protocol layer provided by `s3s` over hyper/hyper-util and a filesystem backend implementing the `tinio-core` storage contract (mapped onto ~30 `S3` trait operations). All private state lives in a reserved `<root>/.tinio/` directory (configuration, state file, control socket, logs, multipart parts, git-style ETag metadata store, bucket creation times). A lifecycle CLI (`server`/`start`/`status`/`stop`/`doctor`, systemd-style with Minio-compatible invocation — positional directory argument, default ports 9000/9001) drives a management plane — axum + utoipa (OpenAPI) + Prometheus `/metrics` over a unix socket (Linux/macOS) or Windows named pipe — separate from the S3 data plane. Observability is tracing-based with optional OpenTelemetry export. Workspace of 7 crates: facade `tinio` (thin binary + curated re-export library), `tinio-core` (storage backend contract: trait + domain types + validation), `tinio-fs` (filesystem backend, v1), `tinio-config` (configuration/credentials), `tinio-server` (S3 compatibility layer: s3s operation mapping + data plane — always compiled; capability groups strippable via features `multipart`, `copy`, `list-v1`, `list-v2`), `tinio-api` (management plane — feature `api`, with crate-internal `openapi` and `tls` features), `tinio-cli` (commands). Facade default features: `api` + `openapi` + `tls` + `multipart` + `copy` + `list-v1` + `list-v2` (all individually strippable via `--no-default-features`); `otel` is opt-in. The `tinio-core` storage trait is the extension seam — planned backends (`tinio-s3`, `tinio-webdav`) implement the same contract, and future interface layers follow the same optional-feature pattern. CI runs unit/integration/property tests, criterion benchmarks (smoke), and aws cli v2 + rclone interop tests on Windows, Linux, and macOS.
+A compact Rust tool serving an S3-compatible interface over local directories: buckets map to top-level subdirectories, objects to files, with an S3 protocol layer provided by `s3s` over hyper/hyper-util and a filesystem backend implementing the `tinio-core` storage contract (mapped onto ~30 `S3` trait operations). All private state lives in a reserved `<root>/.tinio/` directory (configuration, state file, control socket, logs, multipart parts, git-style ETag metadata store, bucket creation times). A lifecycle CLI (`server`/`start`/`status`/`stop`/`doctor`, systemd-style with Minio-compatible invocation — positional directory argument, default ports 9000/9001) drives a management plane — axum + utoipa (OpenAPI) + Prometheus `/metrics` over a unix socket (Linux/macOS) or Windows named pipe — separate from the S3 data plane. Observability is tracing-based with optional OpenTelemetry export. Workspace of 8 crates: facade `tinio` (thin binary + curated re-export library), `tinio-core` (storage backend contract: trait + domain types + validation), `tinio-mem` (in-memory reference backend — optional in CLI when no storage directory), `tinio-fs` (filesystem backend, v1), `tinio-config` (configuration/credentials), `tinio-server` (S3 compatibility layer: s3s operation mapping + data plane — always compiled; capability groups strippable via features `multipart`, `copy`, `list-v1`, `list-v2`), `tinio-api` (management plane — feature `api`, with crate-internal `openapi` and `tls` features), `tinio-cli` (commands). Facade default features: `api` + `openapi` + `tls` + `multipart` + `copy` + `list-v1` + `list-v2` (all individually strippable via `--no-default-features`); `otel` is opt-in. CLI additionally defaults `mem` (in-memory backend when no directory argument). The `tinio-core` storage trait is the extension seam — planned backends (`tinio-s3`, `tinio-webdav`) implement the same contract, and future interface layers follow the same optional-feature pattern. CI runs unit/integration/property tests, criterion benchmarks (smoke), and aws cli v2 + rclone interop tests on Windows, Linux, and macOS.
 
 ## Technical Context
 
 **Language/Version**: Rust, edition 2024; tracks the latest stable toolchain (no pinned MSRV — s3s's declared MSRV floor is satisfied by any current stable). MSRV policy = current stable; if fixed-version pinning is ever needed, it will follow constitution §VI discipline (documented, CI-tested, raised only in MINOR/MAJOR).
 
-**Primary Dependencies**: `s3s` (protocol/auth/XML/error codes); `hyper` + `hyper-util` (data plane); `axum` (management plane); `utoipa` with `axum_extras` (OpenAPI); `prometheus` (metrics); `tracing` + `tracing-subscriber` (logging); `tokio` (async, fs/io-util/net) + `tokio-util` (streams); `serde`/`serde_json`/`toml` (config); `dotenvy` (`.env`); `mime_guess` (Content-Type inference); `md-5` (ETag); `clap` (CLI); `time` (timestamps); `thiserror` (per-crate error types); `uuid` (multipart upload IDs); `dirs` (home-dir resolution for read-only-mode state); `windows-sys` (cfg(windows), console-close event handling); `tokio-rustls` + `rustls-pemfile` (optional HTTPS management listener). Optional, behind feature `otel`: `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry`. Dev: `criterion`, `proptest`, `tempfile`.
+**Primary Dependencies**: Canonical justifications in [research.md §24](research.md). Stack: `s3s` (protocol/auth/XML/error codes); `hyper` + `hyper-util` (data plane); `axum` (management plane); `utoipa` with `axum_extras` (OpenAPI); `prometheus` (metrics); `lazy_static` (process-wide metric families); `redb` (transactional in-memory KV in `tinio-mem`); `tracing` + `tracing-subscriber` (logging); `tokio` (async, fs/io-util/net) + `tokio-util` (streams); `serde`/`serde_json`/`toml` (config); `garde` + `smart-default` + `parse-display` (config validation/defaults); `derive_more` (domain newtypes); `async-trait` (storage/cleanup traits); `bytes` + `futures` (streaming bodies); `dotenvy` (`.env`); `mime_guess` (Content-Type inference); `md-5` + `hex` (ETag); `clap` (CLI); `time` (timestamps); `thiserror` (per-crate error types); `uuid` (multipart upload IDs); `dirs` (home-dir resolution for read-only-mode state); `windows-sys` (cfg(windows), console-close event handling); `tokio-rustls` + `rustls-pemfile` (optional HTTPS management listener). Optional, behind feature `otel`: `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry`. Dev: `criterion`, `proptest`, `tempfile`, `dhat`.
 
 **Storage**: Local filesystem. Buckets = top-level directories of the storage root; objects = files; nested keys map to nested directories. The state dir is `<root>/.tinio/` normally and `~/.tinio/roots/<sha1(canonical root)16>/` in read-only mode (FR-023 — root never written, all S3 mutations rejected with `AccessDenied`). It holds the files specified in [data-model.md](data-model.md) (Reserved Directory table). Writes are streaming temp-file + atomic rename.
 
@@ -24,7 +24,7 @@ A compact Rust tool serving an S3-compatible interface over local directories: b
 
 **Performance Goals**: Flat memory on streaming paths regardless of object size (SC-003); ready within 1 s of start (SC-005); `status`/`stop` round-trip within 1 s (SC-007); full-scan metric gauges bounded by a 30 s TTL cache; bounded-buffer streaming with no unbounded buffering (constitution V); the background ETag scanner never blocks startup and yields to request traffic (FR-024).
 
-**Constraints**: No panics/`unwrap`/`expect` in library code (constitution II); no `unsafe` (all crates `forbid`); every dependency already justified in spec Technical Decisions; case-sensitivity follows host filesystem (no artificial enforcement); Linux unix-socket path-length limit (108 bytes) documented as a limitation; single-instance enforcement via control-channel bind (management plane only — a build without the `api` feature has no such enforcement); graceful stop with bounded (10 s) in-flight drain; cargo feature gates: `api` (management plane), `openapi` (OpenAPI endpoint), `tls` (HTTPS listener), and the S3 capability groups `multipart`/`copy`/`list-v1`/`list-v2` — all default on; `otel` (OpenTelemetry) opt-in. The S3 compatibility layer itself is always compiled; symlinks are followed by default and can be disabled via `[storage] follow_symlinks` or `--no-follow-symlinks`. Allocation discipline (constitution V): streaming hot paths (file↔socket copy loops, ETag MD5 computation, multipart assembly) MUST use bounded buffers with no per-object allocation; verified by benchmark profiles.
+**Constraints**: No panics/`unwrap`/`expect` in library code (constitution II); no `unsafe` (all crates `forbid`); every dependency justified in [research.md §24](research.md); case-sensitivity follows host filesystem (no artificial enforcement); Linux unix-socket path-length limit (108 bytes) documented as a limitation; single-instance enforcement via control-channel bind (management plane only — a build without the `api` feature has no such enforcement); graceful stop with bounded (10 s) in-flight drain; cargo feature gates: `api` (management plane), `openapi` (OpenAPI endpoint), `tls` (HTTPS listener), and the S3 capability groups `multipart`/`copy`/`list-v1`/`list-v2` — all default on; `otel` (OpenTelemetry) opt-in. The S3 compatibility layer itself is always compiled; symlinks are followed by default and can be disabled via `[storage] follow_symlinks` or `--no-follow-symlinks`. Allocation discipline (constitution V): streaming hot paths (file↔socket copy loops, ETag MD5 computation, multipart assembly) MUST use bounded buffers with no per-object allocation; verified by benchmark profiles.
 
 **Scale/Scope**: Design ceiling: thousands to hundreds of thousands of objects per bucket, hundreds of GB to a few TB per storage root; no performance promises beyond that.
 
@@ -34,7 +34,7 @@ A compact Rust tool serving an S3-compatible interface over local directories: b
 
 | Gate | Status | Evidence |
 |------|--------|----------|
-| I. Tiny Core | PASS | All dependencies justified in spec Technical Decisions section; no speculative features; scope bounded by spec (incl. management plane and observability, which are explicit spec scope) |
+| I. Tiny Core | PASS | All dependencies justified in [research.md §24](research.md); no speculative features; scope bounded by spec (incl. management plane and observability, which are explicit spec scope) |
 | II. Safety & Correctness | PASS | Library code returns `Result`/`Option`; no `unwrap`/`expect`/`panic!` in lib paths; `unsafe_code = "forbid"` in all crates (s3s itself forbids unsafe) |
 | III. Idiomatic Rust APIs | PASS | Public API = curated facade re-exports with rustdoc examples; semver-checks target the facade; `no_std` N/A — server feature inherently requires std I/O (constitution exemption) |
 | IV. Test-First | PASS | Unit tests written before implementation; proptest for I/O edge cases (path traversal, meta store, multipart); red-green-refactor enforced in task sequence |
@@ -76,25 +76,36 @@ crates/
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── main.rs         # thin entry → tinio_cli::run()
-│   │   ├── lib.rs          # curated pub use of tinio_core/tinio_config/tinio_server/tinio_api/tinio_cli (api feature-gated)
+│   │   ├── lib.rs          # curated pub use: Config + tinio-core contract + error aliases (server/api/cli module re-exports land in T096/US2)
 │   │   └── error.rs        # facade error re-exports
 │   └── tests/              # integration tests against the facade public API
 ├── tinio-core/             # storage backend contract — no HTTP deps, no backend impl
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── lib.rs
-│   │   ├── error.rs       # StorageError (thiserror): backend-agnostic domain errors
-│   │   ├── storage.rs      # Storage trait: bucket/object/multipart ops (async, Send+Sync)
-│   │   ├── cleanup.rs      # Cleanup trait: startup repair / orphan reclamation / doctor diagnostics (backend-specific)
-│   │   ├── domain.rs       # Bucket, ObjectInfo, PartInfo, multipart state types
-│   │   ├── keys.rs         # backend-agnostic key validation (traversal, control chars)
-│   │   └── testing.rs      # conformance test harness for backend implementations (behind the `testing` feature, off by default)
+│   │   ├── lib.rs          # crate docs, mod declarations, pub use only
+│   │   ├── storage.rs      # Storage contract + storage::Error (thiserror): backend-agnostic domain errors; BodyStream/listing types
+│   │   ├── cleanup.rs      # Cleanup trait: RepairKind startup/full repair + meta-orphan reclamation as action streams
+│   │   ├── bucket.rs       # bucket::Name + Bucket; bucket::name (FR-012 validation)
+│   │   ├── object.rs       # object::Key + object::Info; object::key (FR-006/FR-020 validation)
+│   │   ├── etag.rs         # ETag newtype (raw MD5 digest + composed multipart form)
+│   │   ├── multipart.rs    # MultipartUpload, PartInfo
+│   │   └── testing.rs      # conformance harness (feature `testing`, off by default)
 │   └── tests/
+├── tinio-mem/              # in-memory Storage reference backend (CLI `mem` feature, default on)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── storage.rs      # MemoryStorage + redb InMemoryBackend table layout
+│       ├── bucket.rs       # BucketOps impl
+│       ├── object.rs       # ObjectOps impl
+│       ├── multipart.rs    # MultipartOps impl
+│       ├── cleanup.rs      # MemoryCleanup (Cleanup trait)
+│       └── error.rs        # Error (Storage + DatabaseError variants)
 ├── tinio-fs/               # filesystem backend (implements tinio-core::Storage) — v1
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── error.rs       # FsError (thiserror): io + domain mapping
+│   │   ├── error.rs       # Error (thiserror): io + domain mapping
 │   │   ├── backend/       # Storage impl over the local filesystem (mod.rs + buckets.rs + objects.rs)
 │   │   ├── path.rs         # bucket/key → path mapping, traversal rejection, case rules
 │   │   ├── write.rs        # streaming temp-file + atomic rename
@@ -109,18 +120,19 @@ crates/
 ├── tinio-config/
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── lib.rs          # Config struct, [server]/[scanner]/[auth]/[log]/[s3]/[storage]/[api]/[telemetry], validation
-│   │   ├── error.rs       # ConfigError (thiserror): parse/validation failures
-│   │   ├── sources.rs      # flags > env > .env > file resolution
-│   │   └── credentials.rs  # first-start generation (persisted) / session generation
+│   │   ├── lib.rs          # crate docs + re-exports (Config, section types, Error)
+│   │   ├── schema/         # Config + section structs, garde validation, SmartDefault defaults (schema/mod.rs, schema/tests.rs)
+│   │   ├── error.rs        # Error (thiserror): parse/validation failures
+│   │   ├── sources.rs      # .env loading (T018); CLI/env overlay via clap in US2; MINIO_* in US3
+│   │   └── credentials.rs  # first-start generation (persisted) / session generation (US2/US3, not yet)
 │   └── tests/
 ├── tinio-server/           # S3 compatibility layer — always compiled; capability features multipart/copy/list-v1/list-v2 (default on)
 │   ├── Cargo.toml          # optional dep: tinio-api (behind feature `api`)
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── error.rs       # ServerError (thiserror): startup + mapping failures
+│   │   ├── error.rs       # Error (thiserror): startup + mapping failures
 │   │   ├── backend/       # S3 trait impl (~30 ops) over tinio-core (mod.rs + buckets/objects/listing/multipart.rs)
-│   │   ├── metrics.rs      # MetricS3 wrapper + registry + TTL-cached gauges (registry injected into tinio-api)
+│   │   ├── metrics.rs      # Prometheus registry + metric families (T023); instrumentation + TTL-cached gauges in T054/T075
 │   │   ├── auth.rs         # S3Auth impl from config (SigV4 verification by s3s)
 │   │   ├── data.rs         # hyper-util + S3Service data plane wiring
 │   │   └── log.rs          # tracing layers: access-log formatter (nginx-style), fmt layers
@@ -130,7 +142,7 @@ crates/
 │   ├── Cargo.toml          # axum, prometheus; utoipa(axum_extras) behind feature `openapi`; tokio-rustls behind feature `tls`
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── error.rs       # ApiError (thiserror): maps to HTTP status + JSON error bodies
+│   │   ├── error.rs       # Error (thiserror): maps to HTTP status + JSON error bodies
 │   │   ├── router.rs       # axum router: status/stop/metrics/openapi + token auth
 │   │   ├── transport.rs    # unix socket / Windows named pipe / TCP HTTP(S) listeners
 │   │   ├── state.rs        # state file (pid/token/port), single-instance bind
@@ -140,7 +152,7 @@ crates/
     ├── Cargo.toml          # optional dep: tinio-api (behind feature `api`)
     └── src/
         ├── lib.rs          # run() + clap arg parsing + directory discovery
-        ├── error.rs        # CliError (thiserror): user-facing messages + exit codes
+        ├── error.rs        # Error (thiserror): user-facing messages + exit codes
         └── commands/
             ├── start.rs    # server/start commands (Minio-style positional DIR), config auto-create, daemon, wiring
             ├── status.rs   # api client (subcommand absent without `api`)
@@ -155,8 +167,10 @@ e2e/
 └── perf/                   # performance verification scripts (flat-memory, streaming-memory smoke)
 
 docs/
-├── user-manual.md          # user manual (markdown)
-└── tutorial.md             # usage tutorial (markdown)
+├── cargo.md                # workspace Cargo conventions (pins, features, dependency groups)
+├── style.md                # Rust code style (errors, validation, modules, ETag)
+├── user-manual.md          # user manual (markdown, T101)
+└── tutorial.md             # usage tutorial (markdown, T102)
 
 packaging/
 └── tinio.service           # example systemd unit (Type=simple, foreground)
@@ -166,7 +180,9 @@ benches/baselines.json      # committed criterion baseline data (Phase 6 regress
 .github/workflows/ci.yml    # matrix: Windows/Linux/macOS on latest stable; quality gates + feature-matrix compile checks; interop stage; bench-comparison job
 ```
 
-**Structure Decision**: Seven-crate workspace. The facade crate `tinio` is the only public API surface (semver-checks target, rustdoc-example contract) while keeping the binary entry point a few lines. `tinio-core` defines the storage contract (`Storage` trait + domain types + backend-agnostic key validation + a conformance test harness) with zero HTTP dependencies; `tinio-fs` is the v1 filesystem implementation, and planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait — the protocol layer, CLI, and config do not change when a backend is added. `tinio-server` maps the s3s `S3` trait onto the storage contract (the s3s protocol layer itself stays replaceable per the MVP decision). `tinio-api` holds the entire management plane (axum router, transports, token auth, state file, single-instance bind, status/stop client) as an optional crate behind the default-on `api` cargo feature — builds with `--no-default-features` produce a bare S3 server without FR-018's management surface; when the feature is off, the `status`/`stop` subcommands and `--api` options are absent from the CLI (compiled out) and `[api]` config keys are silently ignored (they are schema-known keys, not unknown-key failures). Wiring: `tinio-cli` (start) builds the data plane (the S3 compatibility layer is always compiled — there is no `s3` feature), then the api plane around a shared shutdown channel; the Prometheus registry is owned by `tinio-server` (the data plane instruments it) and injected into `tinio-api` for `/metrics`, so any feature combination works (the api plane exposes the metrics and computes the storage-layer gauges via the storage contract). Feature-off behavior follows the contract for each disabled feature (config keys silently ignored, CLI options absent, `NotImplemented` for stripped groups — see `contracts/config.md`, `contracts/cli.md`, `contracts/management-api.md`, `contracts/s3-surface.md`). `tinio-config` isolates configuration/credential resolution so CLI, server, and tests share one source of truth. Conformance tests: every backend implementation runs the `tinio-core` harness, so `tinio-s3`/`tinio-webdav` inherit the same behavioral contract. Interop tests live outside the crate tree because they require installed S3 clients and only run in CI; unit/integration tests live per crate and run everywhere. Backend selection is not configurable in v1 (filesystem-only); a selection key will be added when the second backend lands. Cleanup follows the same seam: the `Cleanup` trait in `tinio-core` (startup repair, orphan reclamation, doctor diagnostics/fix) is implemented per backend — the fs implementation owns tmp/multipart/buckets.json/meta reconciliation — and the start orchestration and `doctor` call it through the trait, never through a backend implementation. Each crate defines its own typed error module (`error.rs`) built on `thiserror`, with `From`-conversion chains across crate boundaries (storage errors → S3 error codes → HTTP statuses → CLI exit codes), so no crate ever leaks another crate's error type.
+**Status (2026-08-23)**: Phase 1 (setup, T001–T009) and Phase 2 (foundational, T010–T023) are **complete**. Implemented: `tinio-core` (storage/cleanup contracts, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness), `tinio-config` (`schema/` + validation + `sources`), `tinio-mem` (`MemoryStorage` over redb `InMemoryBackend`, conformance green), per-crate `Error` types (T019–T022), and `tinio-server::metrics` (Prometheus registry, T023). Still skeleton / placeholder: `tinio-fs` (error only — US1), `tinio-api` (error only — US2), `tinio-cli` (placeholder `run()` — US2), `tinio-server` (error + metrics only — S3 mapping in US1). Facade binary compiles and exits 0 (`crates/tinio/tests/smoke.rs`); no S3 or management surface yet. **Next**: Phase 3 (US1) — tinio-fs + tinio-server S3 mapping.
+
+**Structure Decision**: Eight-crate workspace. The facade crate `tinio` is the only public API surface (semver-checks target, rustdoc-example contract) while keeping the binary entry point a few lines; as of Phase 2 it re-exports `Config`, the `tinio-core` contract (`Storage`, domain modules, `ETag`), and typed error aliases — server/api/cli module re-exports land in T096/US2. `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, validation via `bucket::name` / `object::key`, conformance harness) with zero HTTP dependencies; domain errors live in `storage::Error` (no separate `error.rs`, per `docs/style.md`). `tinio-mem` provides the in-memory reference backend (enabled by default on `tinio-cli` via feature `mem` — used when no storage directory is given; passes the conformance harness); `tinio-fs` is the v1 filesystem implementation, and planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait — the protocol layer, CLI, and config do not change when a backend is added. `tinio-server` maps the s3s `S3` trait onto the storage contract (the s3s protocol layer itself stays replaceable per the MVP decision). `tinio-api` holds the entire management plane (axum router, transports, token auth, state file, single-instance bind, status/stop client) as an optional crate behind the default-on `api` cargo feature — builds with `--no-default-features` produce a bare S3 server without FR-018's management surface; when the feature is off, the `status`/`stop` subcommands and `--api` options are absent from the CLI (compiled out) and `[api]` config keys are silently ignored (they are schema-known keys, not unknown-key failures). Wiring: `tinio-cli` (start) builds the data plane (the S3 compatibility layer is always compiled — there is no `s3` feature), then the api plane around a shared shutdown channel; the Prometheus registry is owned by `tinio-server` (the data plane instruments it) and injected into `tinio-api` for `/metrics`, so any feature combination works (the api plane exposes the metrics and computes the storage-layer gauges via the storage contract). Feature-off behavior follows the contract for each disabled feature (config keys silently ignored, CLI options absent, `NotImplemented` for stripped groups — see `contracts/config.md`, `contracts/cli.md`, `contracts/management-api.md`, `contracts/s3-surface.md`). `tinio-config` isolates configuration/credential resolution so CLI, server, and tests share one source of truth. Conformance tests: every backend implementation runs the `tinio-core` harness, so `tinio-s3`/`tinio-webdav` inherit the same behavioral contract. Interop tests live outside the crate tree because they require installed S3 clients and only run in CI; unit/integration tests live per crate and run everywhere. Backend selection is not configurable in v1 (filesystem-only); a selection key will be added when the second backend lands. Cleanup follows the same seam: the `Cleanup` trait in `tinio-core` (startup repair, orphan reclamation, doctor diagnostics/fix) is implemented per backend — the fs implementation owns tmp/multipart/buckets.json/meta reconciliation — and the start orchestration and `doctor` call it through the trait, never through a backend implementation. Each crate defines its own typed error module (`error.rs`) built on `thiserror`, with `From`-conversion chains across crate boundaries (storage errors → S3 error codes → HTTP statuses → CLI exit codes), so no crate ever leaks another crate's error type.
 
 ## Complexity Tracking
 
@@ -174,7 +190,7 @@ benches/baselines.json      # committed criterion baseline data (Phase 6 regress
 
 ## Phase 0: Research
 
-Output: [research.md](research.md) — protocol/framework decisions, storage semantics, observability design, and Windows/Unix transport verification. No unresolved `NEEDS CLARIFICATION` items remain (design review + clarify session resolved all; three framework facts verified during research).
+Output: [research.md](research.md) — protocol/framework decisions, storage semantics, observability design, Windows/Unix transport verification, and the Principle I dependency catalog (§24). No unresolved `NEEDS CLARIFICATION` items remain (design review + clarify session resolved all; three framework facts verified during research).
 
 ## Phase 1: Design & Contracts
 

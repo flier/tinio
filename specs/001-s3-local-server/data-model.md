@@ -4,7 +4,7 @@
 
 Entities derived from the feature spec (Key Entities + FR-001..024). The filesystem is the single source of truth; every entity below maps to concrete on-disk state. `<state-dir>` below means `<root>/.tinio/` in normal mode and `~/.tinio/roots/<sha1(canonical root)16>/` in read-only mode (FR-023).
 
-**Backend seam**: `tinio-core` defines the storage contract (`Storage` trait + domain types + validation + conformance harness); `tinio-fs` implements it over the local filesystem (v1); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, buckets.json, tmp/) are `tinio-fs` internals behind that contract.
+**Backend seam**: `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness); `tinio-fs` implements it over the local filesystem (v1); `tinio-mem` provides the in-memory reference backend (CLI default when no directory is given); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, buckets.json, tmp/) are `tinio-fs` internals behind that contract.
 
 ## Entities
 
@@ -37,7 +37,7 @@ Case sensitivity follows the host filesystem (amended assumption): on case-insen
 | key | `String` | Path relative to the bucket; may contain `/` (nested dirs); MUST NOT contain traversal (`..`, absolute) or control characters (FR-006, universal across backends); a `.tinio` path segment is reserved at ANY depth (FR-020): writes rejected with `AccessDenied`, reads return `NoSuchKey`, listings skip such entries; platform charset restrictions follow the backend (Windows-invalid characters rejected on Windows only); keys ending in `/` are folder markers, not objects; empty key invalid; zero-length content valid |
 | size | `u64` | From filesystem metadata |
 | last_modified | timestamp | Filesystem mtime (actual file state, FR edge case) |
-| etag | `String` | `"<md5hex>"` for single uploads; `"<md5hex>-N"` for multipart (FR-022) |
+| etag | `ETag` | Contract type in `tinio_core::etag` — raw 16-byte MD5 (`Single`) or composed multipart form (`Composed` + part count); wire format `"<md5hex>"` / `"<md5hex>-N"` via `Display`/`as_str` (FR-022); persisted in meta JSON as hex strings |
 | content | file | Streamed, never buffered whole (FR-010) |
 | content_type | inferred | From extension via `mime_guess`, fallback `application/octet-stream`; not persisted (FR-022) |
 | user metadata | dropped | `x-amz-meta-*` accepted, not stored, not returned |
@@ -76,7 +76,7 @@ Normal mode: `<root>/.tinio/`. Read-only mode (FR-023): `~/.tinio/roots/<sha1(ca
 | `.tinio.toml` | Config file (auto-created first start; top-level `version = 1` for future format migration) |
 | `.env` | Optional env file (loaded if present; in read-only mode only the state dir's `.env` is loaded) |
 | `state` | `{version, pid, token, port, started_at, control_name}` JSON, mode 0600 |
-| `tinio.sock` | Unix socket (Linux/macOS; stale file probed + unlinked before bind); Windows: pipe name in state (configurable via `[api.unix] path` / `--api pipe://`) |
+| `tinio.sock` | Unix socket (Linux/macOS; stale file probed + unlinked before bind; configured via `[api.unix] path`); Windows: named pipe, name in state (configured via `[api.pipe] path` / `--api pipe://`) |
 | `access.log` | Data-plane access log |
 | `server.log` / `server.json` | Operational log (daemon mode; json = format-selected name) |
 | `buckets.json` | Bucket name → creation time (`{"version": 1, "buckets": {...}}`; written atomically: temp + rename under an in-process lock) |
@@ -94,7 +94,7 @@ Never served or listed; names that could collide (leading-dot buckets) rejected 
 | token | `String` | Random, per run; required on management `status`/`stop` |
 | port | `u16` | Default 9000 (Minio-compatible); `0` = OS-assigned ephemeral (tests; actual port in logs/state); explicit value = fixed port |
 | control channel | unix socket / named pipe | Bind failure = single-instance error. Stale unix socket: probe first — connect refused → unlink and rebind; connect succeeds → genuine second-instance error. Windows pipe created with `FILE_FLAG_FIRST_PIPE_INSTANCE`. With the `api` feature compiled in, at least one transport must be enabled (startup error otherwise) |
-| management listeners | local channel (`[api.unix]`, on by default) + optional TCP HTTP/HTTPS (`[api.http]` / `[api.https]`, or `--api <URL>` flag); crate `tinio-api`, feature `api` (default on) | TCP exposure requires token on all endpoints |
+| management listeners | local channel (Linux/macOS: `[api.unix]`; Windows: `[api.pipe]`; on by default) + optional TCP HTTP/HTTPS (`[api.http]` / `[api.https]`, or `--api <URL>` flag) — transports are three-choose-one (exactly one enabled); crate `tinio-api`, feature `api` (default on) | TCP exposure requires token on all endpoints |
 | scanner task | background | Low-priority ETag scanner (FR-024; Minio-aligned name): streams MD5 for missing/stale meta entries across the tree after startup; default on (`[scanner]` section present in the auto-created config), paced by `[scanner] delay` with `max_wait`/`cycle` (Minio-aligned keys); yields to request traffic; aborts on shutdown; runs in read-only mode too (meta → home state dir) |
 | file permissions | — | unix: state dir 0700, `state`/config 0600; Windows: ACL restricted to the current user (0600 equivalent) |
 

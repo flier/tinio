@@ -6,39 +6,58 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 
-# Every dependency version is declared here (project convention — see
-# CLAUDE.md "Cargo Workspace Conventions"); crates reference them with
-# `X.workspace = true`. Versions are major.minor only, sorted alphabetically.
-# Local tinio-* path dependencies are the only exception (never versioned).
 [workspace.dependencies]
+async-trait = "0.1"
 axum = "0.8"
-clap = { version = "4.6", features = ["derive"] }
+bytes = "1"
+clap = "4"
 criterion = "0.8"
+derive_more = "2"
 dhat = "0.3"
 dirs = "6.0"
 dotenvy = "0.15"
+futures = "0.3"
+garde = "0.23"
+hex = "0.4"
+humantime-serde = "1.1"
 hyper = "1.1"
 hyper-util = "0.1"
+lazy_static = "1"
 md-5 = "0.11"
 mime_guess = "2.0"
 opentelemetry = "0.32"
 opentelemetry-otlp = "0.32"
+parse-display = "0.11"
 prometheus = "0.14"
 proptest = "1.11"
+redb = "4.2"
 rustls-pemfile = "2.2"
-s3s = "0.14" # stable line; 0.15 is still in alpha (research.md §1)
-serde = { version = "1.0", features = ["derive"] }
+s3s = "0.14"
+secrecy = "0.10"
+serde = "1"
+serde_ignored = "0.1"
 serde_json = "1.0"
+smart-default = "0.7"
 tempfile = "3.27"
 thiserror = "2.0"
 time = "0.3"
-tokio = { version = "1.53", features = ["full"] }
+tokio = "1"
 tokio-rustls = "0.26"
 tokio-util = "0.7"
 toml = "1.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = "0.3"
+url = "2"
 utoipa = "5.5"
-uuid = { version = "1.24", features = ["v4"] }
+uuid = "1"
 windows-sys = "0.61"
+
+tinio = { path = "crates/tinio" }
+tinio-api = { path = "crates/tinio-api", default-features = false }
+tinio-cli = { path = "crates/tinio-cli", default-features = false }
+tinio-config = { path = "crates/tinio-config" }
+tinio-core = { path = "crates/tinio-core" }
+tinio-fs = { path = "crates/tinio-fs" }
+tinio-mem = { path = "crates/tinio-mem" }
+tinio-server = { path = "crates/tinio-server", default-features = false }

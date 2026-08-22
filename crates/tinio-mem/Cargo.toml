@@ -1,0 +1,23 @@
+[package]
+name = "tinio-mem"
+version.workspace = true
+edition.workspace = true
+description = "In-memory storage backend for tinio (reference impl + no-directory CLI mode)"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true, features = ["v4"] }
+
+tinio-core.workspace = true
+
+[dev-dependencies]
+tinio-core = { workspace = true, features = ["testing"] }
+
+[lints.rust]
+unsafe_code = "forbid"

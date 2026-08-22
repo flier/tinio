@@ -49,7 +49,7 @@
 
 ## Non-Functional Gates (Constitution V)
 
-- [x] CHK025 Is the constitution-V benchmark requirement mapped to concrete requirements — which hot paths (streaming write/read, listing, multipart assembly) MUST have criterion benchmarks, and is the "MUST NOT regress without discussion" rule operationalized in spec/plan (e.g., what counts as a regression, who approves)? [Completeness, Spec §Technical Decisions/plan.md Testing]
+- [x] CHK025 Is the constitution-V benchmark requirement mapped to concrete requirements — which hot paths (streaming write/read, listing, multipart assembly) MUST have criterion benchmarks, and is the "MUST NOT regress without discussion" rule operationalized in spec/plan (e.g., what counts as a regression, who approves)? [Completeness, plan.md Testing, research.md §13]
 - [x] CHK026 Is "no hidden allocations" (constitution V) made verifiable — are the hot paths where allocation-freedom is required enumerated, or is the criterion left as a general principle without testable scope? [Clarity, Gap, Constitution V]
 - [x] CHK027 Is the "no performance promises beyond the design ceiling" assumption (spec Assumptions) applied consistently — do all success criteria and NFRs (SC-003/005/007, FR-024) state their scope, or do any imply unbounded-scale guarantees? [Consistency, Spec §Assumptions]
 

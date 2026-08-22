@@ -6,13 +6,13 @@
 
 **Revised**: 2026-08-22
 
-**Status**: Draft (design + plan review complete; ready for tasks)
+**Status**: Draft (design + plan review complete; Phase 2 foundational implementation complete — US1 next)
 
 **Input**: User description: "Build a compact tool providing a Minio-like S3-compatible layer over local directories with basic CLI management."
 
 ## Clarifications
 
-> **Note**: Implementation-level decisions made during design review (stack and workspace structure, protocol framework, private-state layout, configuration schema, logging/metrics mechanisms, management-plane transports, and related hardening) are recorded in the design artifacts: [plan.md](plan.md) (structure, features), [research.md](research.md) (decisions and alternatives), [data-model.md](data-model.md) (entities), and [contracts/](contracts/) (exact schemas). This section records user-facing behavior and interface decisions; the exact schemas live in the contracts.
+> **Note**: Implementation-level decisions made during design review (stack and workspace structure, protocol framework, private-state layout, configuration schema, logging/metrics mechanisms, management-plane transports, dependency justifications, and related hardening) are recorded in the design artifacts: [plan.md](plan.md) (structure, features, dependency list), [research.md](research.md) (decisions, alternatives, constitution Principle I justifications), [data-model.md](data-model.md) (entities), and [contracts/](contracts/) (exact schemas). This section records user-facing behavior and interface decisions; the exact schemas live in the contracts.
 
 ### Session 2026-08-21 (initial)
 
@@ -201,30 +201,6 @@ A user configures a pair of credentials (access key and secret key) when startin
 - **SC-006**: A file created or modified directly in the storage root is served to clients immediately with no refresh, restart, or sync step; the on-disk directory always mirrors what the S3 interface serves.
 - **SC-007**: Management plane: `status`/`stop` round-trips complete within 1 second; starting a second instance on the same storage root fails with a clear error.
 - **SC-008**: `GET /metrics` returns the three-layer metric set (HTTP, S3 operations, storage) in Prometheus text format; full-scan gauges respect the TTL cache.
-
-## Technical Decisions & Dependencies *(constitution-mandated; dependency justification per Principle I)*
-
-- **s3s** (Apache-2.0, active maintenance, `unsafe_code = "forbid"`): the S3 protocol layer — routing, XML, standard error codes, SigV4/SigV2 verification. The compatibility layer is always compiled; its capability groups are strippable at compile time via default-on cargo features (`multipart`, `copy`, `list-v1`, `list-v2`). Reimplementing the S3 protocol from scratch is out of scope for a compact tool and would be the dominant source of correctness risk; the `S3` trait keeps the storage layer swappable. MVP decision; the architecture permits replacing the protocol layer later. The framework ships no HTTP body-size or rate limiting; that is an intentional choice for a local single-user tool — object size is unlimited (see SC-003), and clients are expected to be trusted.
-- **hyper / hyper-util / tokio / tokio-util**: async runtime and streaming HTTP for the data plane (hyper is s3s's native transport; the framework's own server uses the same pattern).
-- **axum**: HTTP framework for the management plane (unix socket / named pipe, optionally TCP HTTP/HTTPS).
-- **tokio-rustls + rustls-pemfile**: TLS for the optional HTTPS management listener (the S3 data plane remains plain HTTP in v1) — behind the default-on `tls` feature.
-- **utoipa (axum_extras)**: OpenAPI documentation for the management plane — behind the default-on `openapi` feature.
-- **prometheus**: metrics registry and text exposition for `GET /metrics`.
-- **tracing / tracing-subscriber**: all logging; format layers provide the text/JSON operational log formats.
-- **opentelemetry / opentelemetry-otlp / tracing-opentelemetry** (behind the `otel` feature): optional OTLP export of tracing data.
-- **serde / serde_json / toml**: configuration parsing and serialization.
-- **dotenvy**: `.env` file loading (standard parsing instead of hand-rolled).
-- **dirs**: cross-platform home-directory resolution for the read-only-mode state directory (`~/.tinio/roots/<hash>/`); hand-rolled `HOME`/`USERPROFILE` lookup is a classic portability footgun.
-- **mime_guess**: Content-Type inference from file extensions.
-- **md-5**: ETag computation (single-object MD5 and multipart composition).
-- **clap**: CLI parsing.
-- **thiserror**: every crate defines its own typed error module (`error.rs`); error conversions chain across crate boundaries (storage errors → S3 error codes → HTTP statuses → CLI exit codes).
-- **uuid**: multipart upload identifiers (v4).
-- **time**: timestamp formatting (same ecosystem as s3s).
-- **criterion** (dev): benchmarks for the streaming paths, per constitution Principle V.
-- **proptest** (dev, constitution Principle IV): property tests for I/O edge cases (path handling, meta-store validation, multipart assembly).
-- **tempfile** (dev): scratch storage roots in tests.
-- **windows-sys** (target-gated, `cfg(windows)`): Win32 `SetConsoleCtrlHandler` for console-close event handling (CTRL_CLOSE_EVENT / CTRL_LOGOUT_EVENT / CTRL_SHUTDOWN_EVENT) so a foreground server shuts down gracefully when the console window closes, logs off, or the system shuts down; tokio's `signal::ctrl_c` covers only Ctrl+C. User-approved; justification recorded per Principle I.
 
 ## Assumptions
 

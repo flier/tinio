@@ -72,8 +72,8 @@
 
 ## 9. Dependencies & Assumptions
 
-- [x] CHK039 Is the assumption that s3s framework behavior IS the protocol contract (framework authoritative for routing, XML, error codes) explicitly documented? [Assumption, Spec Technical Decisions] *(Technical Decisions: s3s handles routing/XML/error codes/SigV4/SigV2; s3-surface.md line 5 restates it; research.md: "framework's rules are authoritative")*
-- [x] CHK040 Is the trusted-client / no-body-limit assumption recorded as intentional (no built-in body/rate protection) and consistent with the unlimited-object-size compatibility claim? [Assumption, Spec Assumptions, Edge Cases] *(Technical Decisions + Assumptions + Edge Cases all record the intentional choice)*
+- [x] CHK039 Is the assumption that s3s framework behavior IS the protocol contract (framework authoritative for routing, XML, error codes) explicitly documented? [Assumption, research.md §1] *(research.md §1: s3s handles routing/XML/error codes/SigV4/SigV2; s3-surface.md line 5 restates it; "framework's rules are authoritative")*
+- [x] CHK040 Is the trusted-client / no-body-limit assumption recorded as intentional (no built-in body/rate protection) and consistent with the unlimited-object-size compatibility claim? [Assumption, Spec Assumptions, Edge Cases] *(research.md §1 + Assumptions + Edge Cases all record the intentional choice)*
 - [x] CHK041 Is the out-of-band-modification dependency recorded (SC-006 mirror semantics ↔ ETag meta-store validation; one-time full-content pass cost; background-scanner mitigation)? [Dependency, Spec §FR-022, §FR-024] *(FR-022 documents the cost and granularity limit; FR-024 the scanner mitigation; SC-006 the mirror semantics)*
 - [x] CHK042 Is the storage-backend conformance requirement specified (every backend must pass the shared `tinio-core` harness, so future backends inherit the S3 compatibility contract)? [Dependency, plan.md] *(plan.md Structure Decision: conformance tests — "tinio-s3/tinio-webdav inherit the same behavioral contract")*
 

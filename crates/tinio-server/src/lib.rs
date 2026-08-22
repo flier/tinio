@@ -10,3 +10,8 @@
 //!
 //! Module layout is populated by the Phase 2 foundational tasks and US1;
 //! nothing is public yet.
+
+mod error;
+pub mod metrics;
+
+pub use self::error::Error;

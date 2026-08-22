@@ -8,3 +8,7 @@
 //!
 //! Module layout is populated by the US2 tasks (router, transport, state,
 //! openapi, client, error); nothing is public yet.
+
+mod error;
+
+pub use self::error::{Error, ErrorBody};

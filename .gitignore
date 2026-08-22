@@ -15,3 +15,5 @@
 Thumbs.db
 *.swp
 *.tmp
+
+.claude-flow/

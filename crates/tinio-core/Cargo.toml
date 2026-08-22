@@ -3,16 +3,23 @@ name = "tinio-core"
 version.workspace = true
 edition.workspace = true
 description = "Storage backend contract for tinio: domain errors, the async Storage trait, and backend-agnostic key validation"
+publish = false
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+derive_more = { workspace = true, features = ["full"] }
+futures.workspace = true
+garde.workspace = true
+hex.workspace = true
+md-5.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [features]
 default = []
-# Conformance test harness (tinio-core/src/testing.rs) — enabled by backend
-# crates in their dev-dependencies only.
 testing = []
 
 [lints.rust]
