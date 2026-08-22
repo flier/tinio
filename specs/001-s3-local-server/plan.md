@@ -90,7 +90,7 @@ crates/
 │   ├── src/
 │   │   ├── lib.rs
 │   │   ├── error.rs       # FsError (thiserror): io + domain mapping
-│   │   ├── backend.rs      # Storage impl over the local filesystem
+│   │   ├── backend/       # Storage impl over the local filesystem (mod.rs + buckets.rs + objects.rs)
 │   │   ├── path.rs         # bucket/key → path mapping, traversal rejection, case rules
 │   │   ├── write.rs        # streaming temp-file + atomic rename
 │   │   ├── listing.rs      # prefix/delimiter listing, pagination
@@ -113,12 +113,13 @@ crates/
 │   ├── src/
 │   │   ├── lib.rs
 │   │   ├── error.rs       # ServerError (thiserror): startup + mapping failures
-│   │   ├── backend.rs      # S3 trait impl (~30 ops) over tinio-core
+│   │   ├── backend/       # S3 trait impl (~30 ops) over tinio-core (mod.rs + buckets/objects/listing/multipart.rs)
 │   │   ├── metrics.rs      # MetricS3 wrapper + registry + TTL-cached gauges (registry injected into tinio-api)
 │   │   ├── auth.rs         # S3Auth impl from config (SigV4 verification by s3s)
 │   │   ├── data.rs         # hyper-util + S3Service data plane wiring
 │   │   └── log.rs          # tracing layers: access-log formatter (nginx-style), fmt layers
-│   └── benches/
+│   ├── benches/
+│   └── examples/           # serve.rs: minimal server binary used by the interop harness during US1
 ├── tinio-api/              # management plane — optional crate, feature `api` (default on)
 │   ├── Cargo.toml          # axum, prometheus; utoipa(axum_extras) behind feature `openapi`; tokio-rustls behind feature `tls`
 │   ├── src/
@@ -141,12 +142,22 @@ crates/
             └── doctor.rs   # offline diagnostics: config validity, on-disk keys, .tinio/ integrity
 
 e2e/
-└── interop/                # aws cli v2 + rclone scenarios (CI, 3 OS matrix)
+├── interop/                # third-party S3 client scenarios (aws cli v2 + rclone CI-gated; boto3/mc targeted — FR-025)
+│   ├── journey.sh          # core journey + shared harness; multipart/copy/cold-listing scenarios
+│   ├── boto3.sh, mc.sh     # best-effort client scenarios
+│   └── README.md           # client coverage matrix (FR-025)
+└── perf/                   # performance verification scripts (flat-memory, streaming-memory smoke)
+
+docs/
+├── user-manual.md          # user manual (markdown)
+└── tutorial.md             # usage tutorial (markdown)
 
 packaging/
 └── tinio.service           # example systemd unit (Type=simple, foreground)
 
-.github/workflows/ci.yml    # matrix: Windows/Linux/macOS on latest stable; interop stage
+benches/baselines.json      # committed criterion baseline data (Phase 6 regression gate)
+
+.github/workflows/ci.yml    # matrix: Windows/Linux/macOS on latest stable; quality gates + feature-matrix compile checks; interop stage; bench-comparison job
 ```
 
 **Structure Decision**: Seven-crate workspace. The facade crate `tinio` is the only public API surface (semver-checks target, rustdoc-example contract) while keeping the binary entry point a few lines. `tinio-core` defines the storage contract (`Storage` trait + domain types + backend-agnostic key validation + a conformance test harness) with zero HTTP dependencies; `tinio-fs` is the v1 filesystem implementation, and planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait — the protocol layer, CLI, and config do not change when a backend is added. `tinio-server` maps the s3s `S3` trait onto the storage contract (the s3s protocol layer itself stays replaceable per the MVP decision). `tinio-api` holds the entire management plane (axum router, transports, token auth, state file, single-instance bind, status/stop client) as an optional crate behind the default-on `api` cargo feature — builds with `--no-default-features` produce a bare S3 server without FR-018's management surface; when the feature is off, the `status`/`stop` subcommands and `--api` options are absent from the CLI (compiled out) and `[api]` config keys are silently ignored (they are schema-known keys, not unknown-key failures). Wiring: `tinio-cli` (start) builds the data plane (the S3 compatibility layer is always compiled — there is no `s3` feature), then the api plane around a shared shutdown channel; the Prometheus registry is owned by `tinio-server` (the data plane instruments it) and injected into `tinio-api` for `/metrics`, so any feature combination works (the api plane exposes the metrics and computes the storage-layer gauges via the storage contract). Feature-off behavior follows the contract for each disabled feature (config keys silently ignored, CLI options absent, `NotImplemented` for stripped groups — see `contracts/config.md`, `contracts/cli.md`, `contracts/management-api.md`, `contracts/s3-surface.md`). `tinio-config` isolates configuration/credential resolution so CLI, server, and tests share one source of truth. Conformance tests: every backend implementation runs the `tinio-core` harness, so `tinio-s3`/`tinio-webdav` inherit the same behavioral contract. Interop tests live outside the crate tree because they require installed S3 clients and only run in CI; unit/integration tests live per crate and run everywhere. Backend selection is not configurable in v1 (filesystem-only); a selection key will be added when the second backend lands. Each crate defines its own typed error module (`error.rs`) built on `thiserror`, with `From`-conversion chains across crate boundaries (storage errors → S3 error codes → HTTP statuses → CLI exit codes), so no crate ever leaks another crate's error type.
