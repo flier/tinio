@@ -1,0 +1,28 @@
+[package]
+name = "tinio-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line interface for tinio: server/start, status, stop, doctor"
+publish = false
+
+[dependencies]
+clap.workspace = true
+
+tinio-config = { path = "../tinio-config" }
+tinio-core = { path = "../tinio-core" }
+tinio-fs = { path = "../tinio-fs" }
+tinio-server = { path = "../tinio-server" }
+# Management-plane client commands (status/stop) — behind the `api` feature.
+tinio-api = { path = "../tinio-api", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Console-close event handling (SetConsoleCtrlHandler) for graceful shutdown
+# on Ctrl+C / close — used by the signal handling in start.rs (T069).
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }
+
+[features]
+default = ["api"]
+api = ["dep:tinio-api"]
+
+[lints.rust]
+unsafe_code = "forbid"

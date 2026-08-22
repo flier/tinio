@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+
+# tinio private state (state dir of a served root must never be committed)
+.tinio/
+
+# Environment files (credentials live in .env / config files)
+.env
+.env.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

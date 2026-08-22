@@ -1,0 +1,16 @@
+[package]
+name = "tinio-config"
+version.workspace = true
+edition.workspace = true
+description = "Configuration and credential resolution for tinio (TOML config, .env, env vars, CLI flags)"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+dotenvy.workspace = true
+dirs.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

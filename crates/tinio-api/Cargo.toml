@@ -1,0 +1,24 @@
+[package]
+name = "tinio-api"
+version.workspace = true
+edition.workspace = true
+description = "Management plane for tinio: axum router, control-channel transports, state file, status/stop client"
+publish = false
+
+[dependencies]
+axum.workspace = true
+prometheus.workspace = true
+tinio-core = { path = "../tinio-core" }
+# HTTPS management listener (feature `tls`).
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+# OpenAPI schema for the management endpoints (feature `openapi`).
+utoipa = { workspace = true, optional = true, features = ["axum_extras"] }
+
+[features]
+default = []
+openapi = ["dep:utoipa"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+
+[lints.rust]
+unsafe_code = "forbid"

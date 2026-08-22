@@ -1,0 +1,19 @@
+[package]
+name = "tinio-core"
+version.workspace = true
+edition.workspace = true
+description = "Storage backend contract for tinio: domain errors, the async Storage trait, and backend-agnostic key validation"
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+serde.workspace = true
+
+[features]
+default = []
+# Conformance test harness (tinio-core/src/testing.rs) — enabled by backend
+# crates in their dev-dependencies only.
+testing = []
+
+[lints.rust]
+unsafe_code = "forbid"

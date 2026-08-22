@@ -1,0 +1,24 @@
+[package]
+name = "tinio-fs"
+version.workspace = true
+edition.workspace = true
+description = "Filesystem backend for tinio: implements the tinio-core Storage contract over the local filesystem"
+publish = false
+
+[dependencies]
+tinio-core = { path = "../tinio-core" }
+md-5.workspace = true
+time.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tinio-core = { path = "../tinio-core", features = ["testing"] }
+tempfile.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+# Heap-profiling for the allocation-discipline verification (Phase 6, T091).
+dhat.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

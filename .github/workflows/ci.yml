@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality (fmt/clippy/test/doc/features)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Quality gates (constitution "Rust Tooling & Quality Gates").
+      - name: fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test (default features)
+        run: cargo test --workspace
+
+      - name: test (--no-default-features)
+        run: cargo test --workspace --no-default-features
+
+      - name: doc (no warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      # Feature-matrix compile checks: every feature combination of the
+      # facade (and, through its passthroughs, of tinio-server/tinio-cli/
+      # tinio-api) must compile — catches feature-gate breakage early.
+      # cargo check level, no dev-deps.
+      - uses: taiki-e/install-action@v2
+        with:
+          tools: cargo-hack
+
+      - name: feature-matrix check (tinio)
+        run: cargo hack check --package tinio --feature-powerset --no-dev-deps
+
+  semver:
+    name: Semver checks (tinio facade)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tools: cargo-semver-checks
+
+      # constitution VI: API changes MUST be checked with cargo-semver-checks.
+      # check-release compares against the last published version on crates.io;
+      # before the first release there is no baseline, so the check is skipped.
+      - name: semver-checks (vs last published release)
+        run: |
+          ver=$(cargo metadata --no-deps --format-version 1 | \
+            python -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='tinio'))")
+          if cargo info "tinio@${ver}" >/dev/null 2>&1; then
+            cargo semver-checks check-release --package tinio
+          else
+            echo "tinio@${ver} is not on crates.io yet — semver-checks baseline starts with the first release"
+          fi
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    # constitution VI: cargo audit runs on the release branch; the maintainer
+    # reviews its report before every release.
+    if: github.ref_name == 'main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tools: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+  interop:
+    name: Interop (aws cli v2 + rclone)
+    # Gated on the harness existing: e2e/interop/journey.sh lands with task
+    # T032 (US1); until then this job is skipped so setup-phase CI stays green.
+    if: hashFiles('e2e/interop/journey.sh') != ''
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tools: aws-cli, rclone
+
+      - name: build facade binary
+        run: cargo build --package tinio
+
+      # FR-025: aws cli v2 + rclone are the CI-gated clients. The harness
+      # contract (server spawn, addressing, scenario set) is defined by
+      # e2e/interop/journey.sh (T032).
+      - name: interop journey
+        shell: bash
+        run: bash e2e/interop/journey.sh

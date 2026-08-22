@@ -1,0 +1,30 @@
+[package]
+name = "tinio"
+version.workspace = true
+edition.workspace = true
+description = "Tinio: an S3-compatible local storage server (facade crate with the tinio binary and public re-export library)"
+
+[dependencies]
+tinio-core = { path = "../tinio-core" }
+tinio-config = { path = "../tinio-config" }
+tinio-server = { path = "../tinio-server" }
+tinio-cli = { path = "../tinio-cli" }
+# Management plane — behind the `api` feature.
+tinio-api = { path = "../tinio-api", optional = true }
+
+[features]
+# All capability features default on; every one is strippable via
+# `--no-default-features` (feature-off behavior contracts per plan.md).
+default = ["api", "openapi", "tls", "multipart", "copy", "list-v1", "list-v2"]
+api = ["dep:tinio-api", "tinio-server/api", "tinio-cli/api"]
+openapi = ["tinio-api/openapi"]
+tls = ["tinio-api/tls"]
+multipart = ["tinio-server/multipart"]
+copy = ["tinio-server/copy"]
+list-v1 = ["tinio-server/list-v1"]
+list-v2 = ["tinio-server/list-v2"]
+# Opt-in passthrough: OpenTelemetry export layer of tinio-server.
+otel = ["tinio-server/otel"]
+
+[lints.rust]
+unsafe_code = "forbid"
