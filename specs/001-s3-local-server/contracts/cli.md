@@ -41,6 +41,7 @@ Management transport flags: `--api <URL>` (repeatable) configures a management t
 
 - Foreground by default; `--daemon` detaches (stderr → `server.log`/`server.json`). On Windows, `--daemon` spawns a detached child process (no service manager integration in v1); the systemd unit example below covers Linux.
 - Signals: a foreground server handles SIGINT/SIGTERM (unix) and Ctrl+C / console-close events (Windows) as a graceful shutdown — identical to `POST /stop` (cease accepting, drain ≤ 10 s, remove `state` and the socket, exit 0); a second signal exits immediately without draining; `SIGHUP` is ignored and logged (no config reload in v1). `--daemon` children handle the same signals (the systemd unit relies on SIGTERM).
+- Crash recovery: after the single-instance check succeeds and before readiness, the server runs a fast, deterministic repair of the private state (itemized in failure-handling.md §3): stale `state`/socket, a full clear of `tmp/`, multipart subtrees whose bucket directory no longer exists (cross-restart uploads stay intact, quickstart §7), and stale `buckets.json` entries. Orphaned ETag meta entries are reclaimed in the background by the scanner. User data (bucket directories and objects) is never touched; every repair action is logged to the operational log.
 - First start: auto-creates `.tinio.toml` with generated credentials (in the state dir — `<root>/.tinio/` normally, the home state dir in read-only mode).
 - On ready: prints endpoint, storage root, credentials status to stderr (operational log).
 - Errors (exit 1): port in use; control channel bind failure after stale-socket reclaim (second live instance on same root); `api` feature present but every management transport disabled; unreadable storage root; storage root not writable without `--read-only`; invalid config.
@@ -85,7 +86,7 @@ Offline diagnostics of the target directory (no server required). Checks:
 
 Output: human-readable report with per-check severity (ok / warn / error); `--json` emits machine-readable output. Exit codes: `0` = no problems, `1` = warnings/errors found (with `--dry-run`) or remain (with `--fix`), `2` = usage error.
 
-`--dry-run` lists exactly what a fix would change without touching anything. `--fix` applies the cleanups: removes stale state files and sockets, orphaned meta-store and `buckets.json` entries, abandoned multipart uploads, stale temp files, and stale home root-state dirs (whose root no longer exists). `--fix` requires the server for the target root to be stopped — a live control-channel probe is an error (exit 1). Neither flag ever touches user data (bucket directories and objects are never modified).
+`--dry-run` lists exactly what a fix would change without touching anything. `--fix` applies the same cleanups as the startup crash-recovery repair (failure-handling.md §3), plus meta-orphan reclamation and stale home root-state dirs (whose root no longer exists). `--fix` requires the server for the target root to be stopped — a live control-channel probe is an error (exit 1). Neither flag ever touches user data (bucket directories and objects are never modified).
 
 With `--read-only` (or `[server] read_only = true`), the root-writability check is skipped (read-only roots are valid) and state-dir checks target the home state dir.
 
