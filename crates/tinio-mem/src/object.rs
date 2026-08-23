@@ -5,6 +5,9 @@
 //! access; bodies are copied out before the transaction ends (streams are
 //! `'static` and cannot borrow the transaction guard).
 
+use std::iter::from_fn;
+use std::ops::Bound;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::iter;
@@ -163,36 +166,51 @@ impl ObjectOps for MemoryStorage {
         let meta = txn.open_table(OBJECT_META)?;
         let scan_prefix = object_key(params.bucket.as_ref().as_str(), &params.prefix);
         let bucket_prefix = format!("{}\0", params.bucket.as_ref().as_str());
-        let objects: Vec<object::Info> = meta
-            .range(scan_prefix.as_str()..)?
-            .take_while(|entry| {
-                entry
-                    .as_ref()
-                    .map(|(k, _)| k.value().starts_with(&scan_prefix))
-                    .unwrap_or(false)
-            })
-            .filter_map(|entry| match entry {
-                Ok((k, v)) => {
-                    let key = k.value()[bucket_prefix.len()..].to_string();
-                    let (etag, size, mtime) = v.value();
-                    let key = object::key(key).expect("stored object key is validated");
-                    if key.is_folder_marker() || key.is_reserved() {
+        // Exclusive `start_after` when it sits inside the prefix; otherwise
+        // the prefix itself is the lower bound. Grouping still applies the
+        // marker: a continuation token may be a common prefix (`dir/`),
+        // which is not the same as skipping raw keys `<= start_after`.
+        let after_key = params
+            .start_after
+            .as_deref()
+            .map(|after| object_key(params.bucket.as_ref().as_str(), after));
+        let start = match after_key.as_deref() {
+            Some(after) if after > scan_prefix.as_str() => Bound::Excluded(after),
+            _ => Bound::Included(scan_prefix.as_str()),
+        };
+        let mut range = meta.range::<&str>((start, Bound::Unbounded))?;
+        let mut scan_error = None;
+        // `bucket\0key` order is already lexicographic. Folder markers and
+        // reserved keys are skipped; `group_and_paginate` stops after one
+        // probe entry past `max_keys`, so the range is not drained.
+        let objects = from_fn(|| {
+            loop {
+                let (k, v) = match range.next() {
+                    None => return None,
+                    Some(Err(e)) => {
+                        scan_error = Some(database_storage(e));
                         return None;
                     }
-                    let etag = etag.parse().expect("stored etag is validated");
-                    Some(Ok(object::Info {
-                        key,
-                        size,
-                        last_modified: from_nanos(mtime),
-                        etag,
-                    }))
+                    Some(Ok(entry)) => entry,
+                };
+                if !k.value().starts_with(&scan_prefix) {
+                    return None;
                 }
-                Err(e) => Some(Err(database_storage(e))),
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        // The scan is in `bucket\0key` order, so results are already
-        // lexicographic — no sort needed before grouping/pagination.
-
+                let key = k.value()[bucket_prefix.len()..].to_string();
+                let (etag, size, mtime) = v.value();
+                let key = object::key(key).expect("stored object key is validated");
+                if key.is_folder_marker() || key.is_reserved() {
+                    continue;
+                }
+                let etag = etag.parse().expect("stored etag is validated");
+                return Some(object::Info {
+                    key,
+                    size,
+                    last_modified: from_nanos(mtime),
+                    etag,
+                });
+            }
+        });
         let (keys, common_prefixes, truncated, next_start_after) = group_and_paginate(
             objects,
             &params.prefix,
@@ -201,6 +219,9 @@ impl ObjectOps for MemoryStorage {
             params.max_keys,
             |o| o.key.as_ref(),
         );
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
         Ok(ObjectListing {
             objects: keys,
             common_prefixes,
@@ -215,7 +236,8 @@ mod tests {
     use bytes::Bytes;
     use futures::stream::iter;
     use tinio_core::{
-        BodyStream, BucketOps, ByteRange, ETag, ObjectOps, bucket, object,
+        BodyStream, BucketOps, ByteRange, ETag, ListObjectsParams, ObjectListing, ObjectOps,
+        bucket, object,
         storage::Error::*,
         testing::{body, read_body},
     };
@@ -235,6 +257,39 @@ mod tests {
             .map(|p| Ok(Bytes::from((*p).to_vec())))
             .collect();
         Box::pin(iter(owned))
+    }
+
+    fn params(
+        bucket: &bucket::Name,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> ListObjectsParams {
+        ListObjectsParams {
+            bucket: bucket.clone(),
+            prefix: prefix.into(),
+            delimiter: delimiter.map(str::to_string),
+            start_after: start_after.map(str::to_string),
+            max_keys,
+        }
+    }
+
+    async fn put_keys(storage: &MemoryStorage, bucket: &bucket::Name, keys: &[&str]) {
+        for key in keys {
+            storage
+                .put_object(
+                    bucket,
+                    &object::key(*key).unwrap(),
+                    body(key.as_bytes().to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn object_keys(page: &ObjectListing) -> Vec<&str> {
+        page.objects.iter().map(|o| &*o.key).collect()
     }
 
     #[tokio::test]
@@ -434,5 +489,209 @@ mod tests {
             .unwrap();
         let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_ref()).collect();
         assert_eq!(keys, ["dir/a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn list_objects_empty_bucket_is_not_truncated() {
+        let (storage, bucket) = with_bucket().await;
+        let page = storage
+            .list_objects(params(&bucket, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert!(page.objects.is_empty());
+        assert!(page.common_prefixes.is_empty());
+        assert!(!page.truncated);
+        assert_eq!(page.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn list_objects_paginates_without_delimiter() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(&storage, &bucket, &["a.txt", "b.txt", "c.txt", "d.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "", None, None, 2))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["a.txt", "b.txt"]);
+        assert!(page.truncated);
+        assert_eq!(page.next_start_after.as_deref(), Some("b.txt"));
+
+        let page = storage
+            .list_objects(params(&bucket, "", None, Some("b.txt"), 2))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["c.txt", "d.txt"]);
+        assert!(!page.truncated);
+        assert_eq!(page.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn list_objects_exact_page_is_not_truncated() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(&storage, &bucket, &["a.txt", "b.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "", None, None, 2))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["a.txt", "b.txt"]);
+        assert!(!page.truncated);
+        assert_eq!(page.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn list_objects_start_after_inside_prefix_excludes_the_marker() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(&storage, &bucket, &["dir/a.txt", "dir/b.txt", "dir/c.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "dir/", None, Some("dir/a.txt"), 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["dir/b.txt", "dir/c.txt"]);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_objects_start_after_before_prefix_still_lists_the_prefix() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(
+            &storage,
+            &bucket,
+            &["a.txt", "dir/a.txt", "dir/b.txt", "z.txt"],
+        )
+        .await;
+        let page = storage
+            .list_objects(params(&bucket, "dir/", None, Some("a.txt"), 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["dir/a.txt", "dir/b.txt"]);
+        assert!(page.common_prefixes.is_empty());
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_objects_prefix_does_not_include_siblings() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(&storage, &bucket, &["a.txt", "dir/a.txt", "z.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "dir/", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["dir/a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn list_objects_delimiter_groups_and_resumes_after_common_prefix() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(
+            &storage,
+            &bucket,
+            &["a.txt", "b.txt", "dir/c.txt", "dir/e.txt", "z.txt"],
+        )
+        .await;
+        let page = storage
+            .list_objects(params(&bucket, "", Some("/"), None, 2))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["a.txt", "b.txt"]);
+        assert!(page.common_prefixes.is_empty());
+        assert!(page.truncated);
+        assert_eq!(page.next_start_after.as_deref(), Some("b.txt"));
+
+        let page = storage
+            .list_objects(params(&bucket, "", Some("/"), Some("b.txt"), 1))
+            .await
+            .unwrap();
+        assert!(page.objects.is_empty());
+        assert_eq!(page.common_prefixes, ["dir/"]);
+        assert!(page.truncated);
+        assert_eq!(page.next_start_after.as_deref(), Some("dir/"));
+
+        let page = storage
+            .list_objects(params(&bucket, "", Some("/"), Some("dir/"), 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["z.txt"]);
+        assert!(
+            page.common_prefixes.is_empty(),
+            "resuming after dir/ must not re-emit it: {:?}",
+            page.common_prefixes
+        );
+        assert!(!page.truncated);
+        assert_eq!(page.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn list_objects_object_marker_inside_rollup_skips_the_prefix() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(
+            &storage,
+            &bucket,
+            &["dir/a.txt", "dir/c.txt", "dir/e.txt", "z.txt"],
+        )
+        .await;
+        let page = storage
+            .list_objects(params(&bucket, "", Some("/"), Some("dir/c.txt"), 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["z.txt"]);
+        assert!(page.common_prefixes.is_empty());
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_objects_nested_delimiter_under_prefix() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(
+            &storage,
+            &bucket,
+            &["dir/a.txt", "dir/sub/b.txt", "dir/sub/c.txt"],
+        )
+        .await;
+        let page = storage
+            .list_objects(params(&bucket, "dir/", Some("/"), None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["dir/a.txt"]);
+        assert_eq!(page.common_prefixes, ["dir/sub/"]);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_objects_max_zero_is_truncated_when_keys_exist() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(&storage, &bucket, &["a.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "", None, None, 0))
+            .await
+            .unwrap();
+        assert!(page.objects.is_empty());
+        assert!(page.truncated);
+        assert_eq!(page.next_start_after.as_deref(), Some("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn list_objects_skips_folder_markers_with_delimiter() {
+        let (storage, bucket) = with_bucket().await;
+        put_keys(&storage, &bucket, &["dir/", "dir/a.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "", Some("/"), None, 1000))
+            .await
+            .unwrap();
+        assert!(page.objects.is_empty());
+        assert_eq!(page.common_prefixes, ["dir/"]);
+    }
+
+    #[tokio::test]
+    async fn list_objects_does_not_cross_buckets() {
+        let (storage, bucket) = with_bucket().await;
+        let other = bucket::name("other").unwrap();
+        storage.create_bucket(&other).await.unwrap();
+        put_keys(&storage, &bucket, &["a.txt"]).await;
+        put_keys(&storage, &other, &["b.txt"]).await;
+        let page = storage
+            .list_objects(params(&bucket, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(object_keys(&page), ["a.txt"]);
     }
 }

@@ -8,7 +8,7 @@ use crate::{
     object,
 };
 
-use super::{body::BodyStream, Storage};
+use super::{Storage, body::BodyStream};
 
 /// Parameters of a [`MultipartOps::list_parts`] call.
 ///
