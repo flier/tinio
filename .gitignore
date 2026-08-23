@@ -17,3 +17,6 @@ Thumbs.db
 *.tmp
 
 .claude-flow/
+
+# tobihagemann/turbo temp files
+.turbo/

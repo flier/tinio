@@ -141,13 +141,51 @@ pub struct ObjectListing {
 /// ```
 #[async_trait]
 pub trait ObjectOps: Send + Sync + 'static {
+    /// A request body staged for a later [`ObjectOps::commit_object`] —
+    /// backend-specific (a temp file, an in-memory buffer, ...).
+    type StagedBody: Send + Sync + 'static;
+
     /// Stream an object body into storage (atomic on the backend side —
-    /// last completed write wins, never a torn object, FR-011).
+    /// last completed write wins, never a torn object, FR-011). The
+    /// default implementation is [`ObjectOps::stage_body`] followed by
+    /// [`ObjectOps::commit_object`].
     async fn put_object(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         body: BodyStream,
+    ) -> Result<PutObjectResult, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let staged = self.stage_body(bucket, key, body).await?;
+        self.commit_object(bucket, key, staged).await
+    }
+
+    /// The streaming phase of a write: buffer `body` outside the
+    /// backend's write locks, so a slow client never stalls other
+    /// writers. The stage is cheap to discard — the body is published
+    /// only by the later [`ObjectOps::commit_object`]. Validation that can
+    /// fail before any body is read (bucket, key) still rejects here.
+    async fn stage_body(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        body: BodyStream,
+    ) -> Result<Self::StagedBody, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// The mutation phase of a write: atomically publish a staged body
+    /// onto `key` (atomic on the backend side — last completed write
+    /// wins, never a torn object, FR-011). Re-checks everything the
+    /// stage checked, under the backend's mutation lock, so the commit
+    /// is safe against concurrent bucket deletion.
+    async fn commit_object(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        staged: Self::StagedBody,
     ) -> Result<PutObjectResult, <Self as Storage>::Error>
     where
         Self: Storage;

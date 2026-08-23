@@ -39,13 +39,16 @@ pub use error::{
     invalid_part, invalid_part_key, invalid_part_number, invalid_range, io, no_parts,
     no_such_bucket, no_such_key, no_such_upload, not_empty,
 };
-pub use listing::group_and_paginate;
+pub use listing::{
+    group_and_paginate, group_and_paginate_ordered, paginate_ordered, split_uploads_order,
+    uploads_order,
+};
 pub use multipart::{
     ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
 };
 pub use object::{GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, PutObjectResult};
 pub use range::ByteRange;
-pub use time::{from_nanos, now_nanos};
+pub use time::{from_nanos, now_nanos, to_nanos};
 
 /// The storage backend contract: the aggregation of [`BucketOps`],
 /// [`ObjectOps`], and [`MultipartOps`].

@@ -26,24 +26,49 @@ use crate::{
 
 #[async_trait]
 impl ObjectOps for MemoryStorage {
-    async fn put_object(
+    /// A staged body: the buffered payload (the commit inserts it).
+    type StagedBody = Vec<u8>;
+
+    async fn stage_body(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         body: BodyStream,
-    ) -> Result<PutObjectResult, Error> {
+    ) -> Result<Vec<u8>, Error> {
         if key.is_reserved() {
             return Err(access_denied(key));
         }
-        // Fast-fail on a missing bucket before buffering the body (the write
-        // transaction re-checks, closing the race).
+        // Fast-fail on a missing bucket before buffering the body (the
+        // commit transaction re-checks, closing the race).
         if !self.has_bucket(bucket)? {
             return Err(no_such_bucket(bucket));
         }
+        // Folder markers are never objects (s3-surface.md): no body is
+        // buffered — the commit answers the marker's empty-content ETag
+        // (the fs backend creates a directory instead).
+        if key.is_folder_marker() {
+            return Ok(Vec::new());
+        }
         // Stream the body before opening the transaction (the body future
         // cannot borrow the transaction guard).
-        let data = collect_body(body).await?;
-        let etag = ETag::from_content(&data);
+        Ok(collect_body(body).await?)
+    }
+
+    async fn commit_object(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        data: Vec<u8>,
+    ) -> Result<PutObjectResult, Error> {
+        // Folder markers are never objects (s3-surface.md): the staged
+        // body is dropped and the record stores the empty-content ETag —
+        // still counted as bucket content (delete-bucket's non-empty
+        // check), matching the fs backend's directory.
+        let etag = if key.is_folder_marker() {
+            ETag::from_content(b"")
+        } else {
+            ETag::from_content(&data)
+        };
         let txn = self.db.begin_write()?;
         {
             let buckets = txn.open_table(BUCKETS)?;
@@ -198,11 +223,18 @@ impl ObjectOps for MemoryStorage {
                 }
                 let key = k.value()[bucket_prefix.len()..].to_string();
                 let (etag, size, mtime) = v.value();
-                let key = object::key(key).expect("stored object key is validated");
+                // A tampered row (a key/etag that cannot be domain-valid)
+                // is skipped, never a panic — same tolerance as the fs
+                // walk's unrepresentable entries.
+                let Ok(key) = object::key(key) else {
+                    continue;
+                };
                 if key.is_folder_marker() || key.is_reserved() {
                     continue;
                 }
-                let etag = etag.parse().expect("stored etag is validated");
+                let Ok(etag) = etag.parse() else {
+                    continue;
+                };
                 return Some(object::Info {
                     key,
                     size,
@@ -657,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_objects_max_zero_is_truncated_when_keys_exist() {
+    async fn list_objects_max_zero_returns_an_empty_untruncated_page() {
         let (storage, bucket) = with_bucket().await;
         put_keys(&storage, &bucket, &["a.txt"]).await;
         let page = storage
@@ -665,8 +697,10 @@ mod tests {
             .await
             .unwrap();
         assert!(page.objects.is_empty());
-        assert!(page.truncated);
-        assert_eq!(page.next_start_after.as_deref(), Some("a.txt"));
+        // No resume marker: an exclusive-after marker would skip the
+        // first object of the next page forever.
+        assert!(!page.truncated);
+        assert_eq!(page.next_start_after, None);
     }
 
     #[tokio::test]

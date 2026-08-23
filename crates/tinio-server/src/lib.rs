@@ -7,11 +7,14 @@
 //! capability groups `multipart`, `copy`, `list-v1`, `list-v2` are strippable
 //! cargo features (default on); `otel` enables the opt-in OpenTelemetry
 //! export layer.
-//!
-//! Module layout is populated by the Phase 2 foundational tasks and US1;
-//! nothing is public yet.
 
+pub mod backend;
+
+mod data;
 mod error;
+pub mod log;
 pub mod metrics;
 
+pub use self::backend::{Capabilities, S3Backend};
+pub use self::data::DataPlane;
 pub use self::error::Error;

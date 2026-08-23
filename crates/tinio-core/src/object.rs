@@ -9,7 +9,9 @@ use crate::{
     storage::{self, Error::*},
 };
 
-const RESERVED_SEGMENT: &str = ".tinio";
+/// The reserved state-directory segment: never a bucket, never part of a
+/// key (FR-020). The fs backend's state dir is named after this constant.
+pub const RESERVED_SEGMENT: &str = ".tinio";
 
 /// A validated object key (FR-006/FR-020).
 ///

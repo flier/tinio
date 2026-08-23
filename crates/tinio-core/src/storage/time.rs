@@ -5,8 +5,12 @@ use std::time::{Duration, SystemTime};
 /// Unix time in nanoseconds (stored backend timestamps; `0` on a pre-epoch
 /// clock).
 pub fn now_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+    to_nanos(SystemTime::now())
+}
+
+/// Unix nanoseconds of a [`SystemTime`] (`0` on a pre-epoch clock).
+pub fn to_nanos(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }

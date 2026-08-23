@@ -58,6 +58,23 @@ jobs:
       - name: feature-matrix check (tinio)
         run: cargo hack check --package tinio --feature-powerset --no-dev-deps
 
+  bench-smoke:
+    name: Benchmark smoke (criterion --test)
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # T030/T031: one-iteration criterion runs keep the fs-backend and
+      # S3-mapping benches compilable and runnable. Baselines and
+      # regression gating are Phase 6 (T088).
+      - name: bench smoke
+        run: cargo bench -p tinio-fs -p tinio-server -- --test
+
   semver:
     name: Semver checks (tinio facade)
     runs-on: ubuntu-latest
@@ -136,3 +153,9 @@ jobs:
       - name: interop journey
         shell: bash
         run: bash e2e/interop/journey.sh
+
+      # T033: multipart (> 8 MiB), server-side copy, cold listing with and
+      # without the scanner.
+      - name: interop advanced
+        shell: bash
+        run: bash e2e/interop/advanced.sh

@@ -76,6 +76,7 @@ pub struct PartsListing {
 ///     prefix: "big".into(),
 ///     delimiter: None,
 ///     key_marker: None,
+///     upload_id_marker: None,
 ///     max_uploads: 1000,
 /// };
 /// assert_eq!(params.prefix, "big");
@@ -90,6 +91,9 @@ pub struct ListUploadsParams {
     pub delimiter: Option<String>,
     /// Resume after this key (exclusive).
     pub key_marker: Option<String>,
+    /// Resume after this upload id — refines `key_marker` to a position
+    /// inside a same-key group (S3 `upload-id-marker`).
+    pub upload_id_marker: Option<String>,
     /// Maximum number of uploads per page (default 1000).
     pub max_uploads: usize,
 }
@@ -106,6 +110,7 @@ pub struct ListUploadsParams {
 ///     common_prefixes: vec![],
 ///     truncated: false,
 ///     next_key_marker: None,
+///     next_upload_id_marker: None,
 /// };
 /// assert!(page.uploads.is_empty());
 /// ```
@@ -119,6 +124,9 @@ pub struct UploadsListing {
     pub truncated: bool,
     /// Resume marker for the next page.
     pub next_key_marker: Option<String>,
+    /// The upload-id half of the resume marker (paired with
+    /// `next_key_marker` to resume inside a same-key group).
+    pub next_upload_id_marker: Option<String>,
 }
 
 /// Multipart operations of the storage contract.

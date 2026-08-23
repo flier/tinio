@@ -21,13 +21,15 @@
 //! assert!(!prometheus::default_registry().gather().is_empty());
 //! ```
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
+use async_trait::async_trait;
 use lazy_static::lazy_static;
 use prometheus::{
     HistogramVec, IntCounter, IntCounterVec, IntGauge, register_histogram_vec,
     register_int_counter, register_int_counter_vec, register_int_gauge,
 };
+use s3s::{S3, S3Request, S3Response, S3Result, dto};
 
 lazy_static! {
     /// HTTP requests served by the management plane, by method and status.
@@ -113,6 +115,15 @@ lazy_static! {
         "Multipart uploads currently in progress"
     )
     .expect("register tinio_storage_multipart_in_progress");
+}
+
+/// Decrement the in-progress-multipart gauge, saturating at zero: after a
+/// restart the persisted uploads are not counted, so completing or
+/// aborting one must not drive the gauge negative.
+pub(crate) fn multipart_in_progress_dec() {
+    if STORAGE_MULTIPART_IN_PROGRESS.get() > 0 {
+        STORAGE_MULTIPART_IN_PROGRESS.dec();
+    }
 }
 
 /// Record a completed operation against a counter/histogram family pair.
@@ -225,5 +236,276 @@ mod tests {
             text.contains(r#"tinio_s3_operations_total{op="IncGetObject",status="200"} 1"#),
             "{text}"
         );
+    }
+}
+
+/// A delegation wrapper recording `tinio_s3_operations_total{op,status}`
+/// plus duration for every implemented operation, and the in-progress
+/// multipart gauge (task T054). The status label is `200` on success,
+/// `400` for client errors, and `500`/`501` for internal/not-implemented.
+///
+/// # Examples
+///
+/// ```rust
+/// use s3s::{S3, S3Request, dto};
+/// use tinio_server::backend::S3Backend;
+/// use tinio_server::metrics::MetricS3;
+/// use tinio_mem::MemoryStorage;
+///
+/// fn request<T>(input: T) -> S3Request<T> {
+///     S3Request {
+///         input,
+///         method: http::Method::GET,
+///         uri: http::Uri::default(),
+///         headers: http::HeaderMap::new(),
+///         extensions: http::Extensions::new(),
+///         credentials: None,
+///         region: None,
+///         service: None,
+///         trailing_headers: None,
+///     }
+/// }
+///
+/// let inner = S3Backend::new(MemoryStorage::new().unwrap(), Default::default());
+/// let backend = MetricS3::new(inner);
+/// let out = tokio::runtime::Runtime::new().unwrap().block_on(async {
+///     backend
+///         .list_buckets(request(dto::ListBucketsInput::default()))
+///         .await
+///         .unwrap()
+/// });
+/// assert_eq!(out.output.buckets.as_ref().unwrap().len(), 0);
+/// ```
+#[derive(Debug, Clone)]
+pub struct MetricS3<T> {
+    inner: T,
+}
+
+impl<T> MetricS3<T> {
+    /// Wrap any `S3` implementation.
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// The inner mapping.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Record one operation: `op` label, status class, duration.
+    async fn record<R>(
+        &self,
+        op: &'static str,
+        fut: impl Future<Output = S3Result<R>> + Send,
+    ) -> S3Result<R> {
+        let start = std::time::Instant::now();
+        let result = fut.await;
+        let status = match &result {
+            Ok(_) => 200u16,
+            Err(err) => match err.code().as_str() {
+                "InternalError" => 500,
+                "NotImplemented" => 501,
+                _ => 400,
+            },
+        };
+        record_s3_operation(op, status, start.elapsed());
+        result
+    }
+}
+
+#[async_trait]
+impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
+    // --- buckets ---
+    async fn create_bucket(
+        &self,
+        req: S3Request<dto::CreateBucketInput>,
+    ) -> S3Result<S3Response<dto::CreateBucketOutput>> {
+        self.record("CreateBucket", self.inner.create_bucket(req))
+            .await
+    }
+    async fn delete_bucket(
+        &self,
+        req: S3Request<dto::DeleteBucketInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketOutput>> {
+        self.record("DeleteBucket", self.inner.delete_bucket(req))
+            .await
+    }
+    async fn head_bucket(
+        &self,
+        req: S3Request<dto::HeadBucketInput>,
+    ) -> S3Result<S3Response<dto::HeadBucketOutput>> {
+        self.record("HeadBucket", self.inner.head_bucket(req))
+            .await
+    }
+    async fn list_buckets(
+        &self,
+        req: S3Request<dto::ListBucketsInput>,
+    ) -> S3Result<S3Response<dto::ListBucketsOutput>> {
+        self.record("ListBuckets", self.inner.list_buckets(req))
+            .await
+    }
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<dto::GetBucketLocationInput>,
+    ) -> S3Result<S3Response<dto::GetBucketLocationOutput>> {
+        self.record("GetBucketLocation", self.inner.get_bucket_location(req))
+            .await
+    }
+
+    // --- objects ---
+    async fn put_object(
+        &self,
+        req: S3Request<dto::PutObjectInput>,
+    ) -> S3Result<S3Response<dto::PutObjectOutput>> {
+        self.record("PutObject", self.inner.put_object(req))
+            .await
+    }
+    async fn get_object(
+        &self,
+        req: S3Request<dto::GetObjectInput>,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        self.record("GetObject", self.inner.get_object(req))
+            .await
+    }
+    async fn head_object(
+        &self,
+        req: S3Request<dto::HeadObjectInput>,
+    ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
+        self.record("HeadObject", self.inner.head_object(req))
+            .await
+    }
+    async fn delete_object(
+        &self,
+        req: S3Request<dto::DeleteObjectInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectOutput>> {
+        self.record("DeleteObject", self.inner.delete_object(req))
+            .await
+    }
+    async fn delete_objects(
+        &self,
+        req: S3Request<dto::DeleteObjectsInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectsOutput>> {
+        self.record("DeleteObjects", self.inner.delete_objects(req))
+            .await
+    }
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<dto::GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::GetObjectTaggingOutput>> {
+        self.record("GetObjectTagging", self.inner.get_object_tagging(req))
+            .await
+    }
+
+    #[cfg(feature = "copy")]
+    async fn copy_object(
+        &self,
+        req: S3Request<dto::CopyObjectInput>,
+    ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
+        self.record("CopyObject", self.inner.copy_object(req))
+            .await
+    }
+
+    // --- listing ---
+    #[cfg(feature = "list-v1")]
+    async fn list_objects(
+        &self,
+        req: S3Request<dto::ListObjectsInput>,
+    ) -> S3Result<S3Response<dto::ListObjectsOutput>> {
+        self.record("ListObjects", self.inner.list_objects(req))
+            .await
+    }
+    #[cfg(feature = "list-v2")]
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<dto::ListObjectsV2Input>,
+    ) -> S3Result<S3Response<dto::ListObjectsV2Output>> {
+        self.record("ListObjectsV2", self.inner.list_objects_v2(req))
+            .await
+    }
+
+    // --- multipart (in-progress gauge maintained here) ---
+    #[cfg(feature = "multipart")]
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<dto::CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
+        let out = self
+            .record(
+                "CreateMultipartUpload",
+                self.inner.create_multipart_upload(req),
+            )
+            .await;
+        if out.is_ok() {
+            STORAGE_MULTIPART_IN_PROGRESS.inc();
+        }
+        out
+    }
+    #[cfg(feature = "multipart")]
+    async fn upload_part(
+        &self,
+        req: S3Request<dto::UploadPartInput>,
+    ) -> S3Result<S3Response<dto::UploadPartOutput>> {
+        self.record("UploadPart", self.inner.upload_part(req))
+            .await
+    }
+    #[cfg(feature = "multipart")]
+    #[cfg(feature = "copy")]
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<dto::UploadPartCopyInput>,
+    ) -> S3Result<S3Response<dto::UploadPartCopyOutput>> {
+        self.record("UploadPartCopy", self.inner.upload_part_copy(req))
+            .await
+    }
+    #[cfg(feature = "multipart")]
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<dto::CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<dto::CompleteMultipartUploadOutput>> {
+        let out = self
+            .record(
+                "CompleteMultipartUpload",
+                self.inner.complete_multipart_upload(req),
+            )
+            .await;
+        if out.is_ok() {
+            multipart_in_progress_dec();
+        }
+        out
+    }
+    #[cfg(feature = "multipart")]
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<dto::AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<dto::AbortMultipartUploadOutput>> {
+        let out = self
+            .record(
+                "AbortMultipartUpload",
+                self.inner.abort_multipart_upload(req),
+            )
+            .await;
+        if out.is_ok() {
+            multipart_in_progress_dec();
+        }
+        out
+    }
+    #[cfg(feature = "multipart")]
+    async fn list_parts(
+        &self,
+        req: S3Request<dto::ListPartsInput>,
+    ) -> S3Result<S3Response<dto::ListPartsOutput>> {
+        self.record("ListParts", self.inner.list_parts(req))
+            .await
+    }
+    #[cfg(feature = "multipart")]
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<dto::ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<dto::ListMultipartUploadsOutput>> {
+        self.record(
+            "ListMultipartUploads",
+            self.inner.list_multipart_uploads(req),
+        )
+        .await
     }
 }

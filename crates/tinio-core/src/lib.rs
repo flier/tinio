@@ -32,5 +32,7 @@ pub use self::multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber};
 pub use self::storage::{
     BodyStream, BucketOps, ByteRange, GetObjectResult, ListObjectsParams, ListPartsParams,
     ListUploadsParams, MultipartOps, ObjectListing, ObjectOps, PartsListing, PutObjectResult,
-    Storage, UploadsListing, collect_body, from_nanos, group_and_paginate, now_nanos,
+    Storage, UploadsListing, collect_body, from_nanos, group_and_paginate,
+    group_and_paginate_ordered, now_nanos, paginate_ordered, split_uploads_order, to_nanos,
+    uploads_order,
 };

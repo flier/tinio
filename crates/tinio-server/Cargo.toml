@@ -6,25 +6,64 @@ description = "S3 compatibility layer for tinio: s3s protocol mapping over the t
 publish = false
 
 [dependencies]
+async-trait.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body.workspace = true
 hyper.workspace = true
-hyper-util.workspace = true
+hyper-util = { workspace = true, features = [
+    "server-auto",
+    "tokio",
+    "http1",
+    "http2",
+] }
 lazy_static.workspace = true
 mime_guess.workspace = true
 opentelemetry = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = [
+    "grpc-tonic",
+] }
+opentelemetry_sdk = { workspace = true, optional = true }
 prometheus.workspace = true
 s3s.workspace = true
 thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time", "macros", "rt"] }
 tokio-util.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = [
+    "registry",
+    "fmt",
+    "json",
+    "env-filter",
+] }
 
 tinio-api = { workspace = true, optional = true }
 tinio-config.workspace = true
 tinio-core.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+criterion = { workspace = true, features = ["async_tokio"] }
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
 tinio-core = { workspace = true, features = ["testing"] }
+tinio-fs.workspace = true
+tinio-mem.workspace = true
+
+[[bench]]
+name = "multipart_assembly"
+harness = false
+
+[[bench]]
+name = "listing"
+harness = false
 
 [features]
 default = ["multipart", "copy", "list-v1", "list-v2"]
@@ -36,6 +75,7 @@ api = ["dep:tinio-api"]
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
     "dep:tracing-opentelemetry",
 ]
 

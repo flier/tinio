@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 312f9d158ce6d057908366cfe5f61bdadf34af211da1d09341b828b1fc699fc9 # shrinks to segs = ["_"], etag_hex = ['A', '0', 'A', 'A', 'a', 'A', '0', '0', 'A', 'A', 'A', 'A', 'A', 'A', '0', 'a', '0', 'A', 'a', 'A', '0', 'A', 'A', 'A', 'A', 'A', 'A', 'A', '0', 'A', 'G', 'a'], size = 0, secs = 0
+cc 04dc190d85688838d21bcc156761c84581b41898cf56d94020e482df46b8cc93 # shrinks to hex = ['A', 'A', '0', 'a', 'A', '0', 'A', 'A', 'A', 'A', 'A', 'A', '0', '0', '0', '0', 'A', 'A', 'A', 'A', '0', '0', '0', 'A', 'A', 'a', '0', 'a', '0', 'A', 'G', '0'], parts = 1
+cc 91f956d1543474dad4de1da8c1926499554788ec5113e2084b16c30035a30883 # shrinks to segs = [".."], etag_hex = "aaaaa00a00a0a0aaa0aa0aaa00aa000a", size = 0, secs = 0

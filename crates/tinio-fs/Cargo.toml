@@ -6,20 +6,34 @@ description = "Filesystem backend for tinio: implements the tinio-core Storage c
 publish = false
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+getset.workspace = true
+hex.workspace = true
+md-5.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 tinio-core.workspace = true
 
 [dev-dependencies]
-criterion.workspace = true
+criterion = { workspace = true, features = ["async_tokio"] }
 dhat.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
 tinio-core = { workspace = true, features = ["testing"] }
+
+[[bench]]
+name = "streaming"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"

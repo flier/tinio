@@ -10,13 +10,13 @@ use redb::{ReadableDatabase, ReadableTable};
 use tinio_core::{
     CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
     PartInfo, PartNumber, PartsListing, UploadsListing, bucket, collect_body, from_nanos,
-    group_and_paginate, now_nanos, object,
+    group_and_paginate_ordered, now_nanos, object, split_uploads_order, uploads_order,
 };
 use uuid::Uuid;
 
 use crate::{
     Error,
-    error::{access_denied, database_storage, invalid_part, no_parts, no_such_bucket},
+    error::{access_denied, database_storage, invalid_etag, invalid_part, no_parts, no_such_bucket},
     storage::{
         BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, check_upload,
         object_key, parse_part_number, part_key, remove_all_parts, upload_key,
@@ -102,16 +102,34 @@ impl MultipartOps for MemoryStorage {
             let uploads = txn.open_table(UPLOADS)?;
             check_upload(&uploads, &params.upload_id, &params.bucket, &params.key)?;
         }
+        // `max_parts = 0` requests nothing — and no marker either, since
+        // an exclusive-after marker would skip the first part of the next
+        // page forever (the fs backend and the engine agree).
+        if params.max_parts == 0 {
+            return Ok(PartsListing {
+                parts: Vec::new(),
+                truncated: false,
+                next_part_number_marker: None,
+            });
+        }
         let meta = txn.open_table(PART_META)?;
         let prefix = format!("{}\0", params.upload_id);
-        let mut parts_vec: Vec<PartInfo> = meta
-            .range(prefix.as_str()..)?
+        // The zero-padded part keys are string-ordered by number, so the
+        // scan starts just after the marker and stops one probe part past
+        // the page — a page costs O(page) reads, not O(total parts).
+        let start = match params.part_number_marker {
+            Some(marker) => part_key(&params.upload_id, marker.saturating_add(1)),
+            None => prefix.clone(),
+        };
+        let parts = meta
+            .range(start.as_str()..)?
             .take_while(|entry| {
                 entry
                     .as_ref()
                     .map(|(k, _)| k.value().starts_with(&prefix))
                     .unwrap_or(false)
             })
+            .take(params.max_parts.saturating_add(1))
             .map(|entry| {
                 let (k, v) = entry?;
                 let part_number = parse_part_number(&k.value()[prefix.len()..])?;
@@ -119,23 +137,22 @@ impl MultipartOps for MemoryStorage {
                 Ok(PartInfo {
                     part_number: part_number.into(),
                     size,
-                    etag: etag.parse().expect("stored part etag is validated"),
+                    etag: etag.parse().map_err(invalid_etag)?,
                     last_modified: from_nanos(mtime),
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        if let Some(marker) = params.part_number_marker {
-            parts_vec.retain(|p| u32::from(p.part_number) > marker);
-        }
-        let truncated = parts_vec.len() > params.max_parts;
-        parts_vec.truncate(params.max_parts);
+        // The probe past the page sets the truncation flag; the resume
+        // marker is the page's last part.
+        let truncated = parts.len() > params.max_parts;
+        let parts: Vec<PartInfo> = parts.into_iter().take(params.max_parts).collect();
         let next = if truncated {
-            parts_vec.last().map(|p| u32::from(p.part_number))
+            parts.last().map(|p| u32::from(p.part_number))
         } else {
             None
         };
         Ok(PartsListing {
-            parts: parts_vec,
+            parts,
             truncated,
             next_part_number_marker: next,
         })
@@ -177,8 +194,7 @@ impl MultipartOps for MemoryStorage {
                         .get(pk.as_str())?
                         .ok_or_else(|| invalid_part(n))?;
                     let (etag_str, size, mtime) = meta_guard.value();
-                    let stored_etag: ETag =
-                        etag_str.parse().expect("stored part etag is validated");
+                    let stored_etag: ETag = etag_str.parse().map_err(invalid_etag)?;
                     if stored_etag != part.etag {
                         return Err(invalid_part(n));
                     }
@@ -293,20 +309,38 @@ impl MultipartOps for MemoryStorage {
             .collect::<Result<Vec<_>, Error>>()?;
         // Compound keys (`bucket\0key\0upload_id`) scan in (key, id) order,
         // so key order — and thus delimiter grouping — needs no re-sort.
-
-        let (keys, common_prefixes, truncated, next) = group_and_paginate(
+        // The resume marker pairs the key with the upload id, so a page
+        // can position inside a same-key group (S3 `upload-id-marker`).
+        // A bare key marker skips the whole key group (S3: only keys
+        // strictly greater than `key-marker` are listed) — the sentinel
+        // upload id sorts after every real one.
+        let marker = match (&params.key_marker, &params.upload_id_marker) {
+            (Some(key), Some(upload_id)) => Some(uploads_order(key, upload_id)),
+            (Some(key), None) => Some(uploads_order(key, "\u{10FFFF}")),
+            _ => None,
+        };
+        let (keys, common_prefixes, truncated, next) = group_and_paginate_ordered(
             upload_list,
             &params.prefix,
             params.delimiter.as_deref(),
-            params.key_marker.as_deref(),
+            marker.as_deref(),
             params.max_uploads,
             |u| u.key.as_ref(),
+            |u| uploads_order(&u.key, &u.upload_id),
         );
+        let (next_key, next_upload_id) = match next {
+            Some(next) => {
+                let (key, upload_id) = split_uploads_order(&next);
+                (Some(key.to_string()), upload_id.map(str::to_string))
+            }
+            None => (None, None),
+        };
         Ok(UploadsListing {
             uploads: keys,
             common_prefixes,
             truncated,
-            next_key_marker: next,
+            next_key_marker: next_key,
+            next_upload_id_marker: next_upload_id,
         })
     }
 }
@@ -643,6 +677,7 @@ mod tests {
                 prefix: "b".into(),
                 delimiter: None,
                 key_marker: None,
+                upload_id_marker: None,
                 max_uploads: 1000,
             })
             .await
@@ -655,6 +690,7 @@ mod tests {
                 prefix: String::new(),
                 delimiter: None,
                 key_marker: None,
+                upload_id_marker: None,
                 max_uploads: 1,
             })
             .await
@@ -668,6 +704,7 @@ mod tests {
                 prefix: String::new(),
                 delimiter: None,
                 key_marker: page.next_key_marker.clone(),
+                upload_id_marker: page.next_upload_id_marker.clone(),
                 max_uploads: 10,
             })
             .await
@@ -675,6 +712,30 @@ mod tests {
         let keys: Vec<_> = page2.uploads.iter().map(|u| u.key.as_ref()).collect();
         assert_eq!(keys, ["b.bin", "c.bin"]);
         assert!(!page2.truncated);
+    }
+
+    #[tokio::test]
+    async fn bare_key_marker_skips_the_whole_key_group() {
+        // A key-marker without an upload-id-marker skips the entire
+        // same-key group (S3: only keys strictly greater than the marker
+        // are listed).
+        let (storage, bucket) = with_bucket().await;
+        let key = object::key("same.bin").unwrap();
+        let u1 = storage.create_multipart_upload(&bucket, &key).await.unwrap();
+        storage.create_multipart_upload(&bucket, &key).await.unwrap();
+        let page = storage
+            .list_multipart_uploads(ListUploadsParams {
+                bucket,
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: Some(u1.key.to_string()),
+                upload_id_marker: None,
+                max_uploads: 10,
+            })
+            .await
+            .unwrap();
+        assert!(page.uploads.is_empty(), "{:?}", page.uploads);
+        assert!(!page.truncated);
     }
 
     #[tokio::test]
@@ -726,6 +787,7 @@ mod tests {
                     prefix: String::new(),
                     delimiter: None,
                     key_marker: None,
+                    upload_id_marker: None,
                     max_uploads: 1000,
                 })
                 .await

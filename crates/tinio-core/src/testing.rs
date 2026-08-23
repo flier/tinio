@@ -203,6 +203,16 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     let got = read_body(get.body).await.unwrap();
     check(got == data, "get must return the object byte-identical");
 
+    // The two-phase write (stage + commit) equals a direct put.
+    let staged = storage.stage_body(b, &hello, body(data.to_vec())).await.unwrap();
+    let put = storage.commit_object(b, &hello, staged).await.unwrap();
+    check(
+        put.etag == ETag::from_content(data),
+        "staged commit ETag must be the content MD5",
+    );
+    let head = storage.head_object(b, &hello).await.unwrap();
+    check(head.size == data.len() as u64, "staged commit must overwrite");
+
     // Missing object.
     let missing = object::key("missing").unwrap();
     let err = into_core_error(storage.head_object(b, &missing).await.unwrap_err());
@@ -575,6 +585,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             prefix: String::new(),
             delimiter: None,
             key_marker: None,
+            upload_id_marker: None,
             max_uploads: 1000,
         })
         .await
