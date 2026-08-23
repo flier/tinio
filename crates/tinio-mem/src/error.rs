@@ -121,43 +121,43 @@ impl From<Error> for storage::Error {
 }
 
 // Constructors wrapping `storage::Error` and `DatabaseError`. The contract
-// mapping (payload clone-from-ref etc.) lives in `storage::Error`; these
-// wrappers only lift it into the backend error.
+// mapping (payload clone-from-ref etc.) lives in `storage`'s constructors;
+// these wrappers only lift it into the backend error.
 
 /// The referenced bucket does not exist.
 #[inline]
 pub(crate) fn no_such_bucket(name: &bucket::Name) -> Error {
-    Error::Storage(storage::Error::no_such_bucket(name))
+    Error::Storage(storage::no_such_bucket(name))
 }
 
 /// The referenced object (key) does not exist.
 #[inline]
 pub(crate) fn no_such_key(key: &object::Key) -> Error {
-    Error::Storage(storage::Error::no_such_key(key))
+    Error::Storage(storage::no_such_key(key))
 }
 
 /// The referenced multipart upload does not exist.
 #[inline]
 pub(crate) fn no_such_upload(upload_id: &str) -> Error {
-    Error::Storage(storage::Error::no_such_upload(upload_id))
+    Error::Storage(storage::no_such_upload(upload_id))
 }
 
 /// The entity already exists (e.g. bucket creation on an existing name).
 #[inline]
 pub(crate) fn already_exists(name: &bucket::Name) -> Error {
-    Error::Storage(storage::Error::already_exists(name))
+    Error::Storage(storage::already_exists(name))
 }
 
 /// The bucket still contains objects and cannot be deleted.
 #[inline]
 pub(crate) fn not_empty(name: &bucket::Name) -> Error {
-    Error::Storage(storage::Error::not_empty(name))
+    Error::Storage(storage::not_empty(name))
 }
 
 /// Stored or wire-format ETag could not be parsed.
 #[inline]
 pub(crate) fn invalid_etag(err: etag::Error) -> Error {
-    Error::Storage(storage::Error::invalid_etag(err))
+    Error::Storage(storage::invalid_etag(err))
 }
 
 /// Part number outside `1..=10000`.
@@ -167,37 +167,37 @@ pub(crate) fn invalid_etag(err: etag::Error) -> Error {
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn invalid_part_number(part_number: u32) -> Error {
-    Error::Storage(storage::Error::invalid_part_number(part_number))
+    Error::Storage(storage::invalid_part_number(part_number))
 }
 
 /// Complete listed a missing, out-of-order, or ETag-mismatched part.
 #[inline]
 pub(crate) fn invalid_part(part_number: u32) -> Error {
-    Error::Storage(storage::Error::invalid_part(part_number))
+    Error::Storage(storage::invalid_part(part_number))
 }
 
 /// Complete called with no parts uploaded.
 #[inline]
 pub(crate) fn no_parts() -> Error {
-    Error::Storage(storage::Error::no_parts())
+    Error::Storage(storage::no_parts())
 }
 
 /// A multipart part-key suffix is not a `u32`.
 #[inline]
 pub(crate) fn invalid_part_key(err: ParseIntError) -> Error {
-    Error::Storage(storage::Error::invalid_part_key(err))
+    Error::Storage(storage::invalid_part_key(err))
 }
 
 /// The operation is refused (reserved `.tinio` segment or read-only mode).
 #[inline]
 pub(crate) fn access_denied(key: &object::Key) -> Error {
-    Error::Storage(storage::Error::access_denied(key))
+    Error::Storage(storage::access_denied(key))
 }
 
 /// A backend I/O failure; the underlying error is preserved.
 #[inline]
 pub(crate) fn io(err: io::Error) -> Error {
-    Error::Storage(storage::Error::io(err))
+    Error::Storage(storage::io(err))
 }
 
 /// Database open/create failed.

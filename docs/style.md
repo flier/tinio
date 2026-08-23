@@ -29,7 +29,7 @@
 - Usage: `use tinio_core::storage;` then `storage::Error` in signatures — bare `Error` collides. `Error::*` is globbed only in `error.rs` and tests; operation modules import the `crate::error` constructors.
 - Payloads keep original types: `#[from]` `io::Error` / `etag::Error` / `ParseIntError`; entities `bucket::Name` / `object::Key`; ranges `{ range, size }`; paths `PathBuf`; rejected input `String`.
 - Structure: backends wrap `storage::Error` (`Storage(#[from])`) + own variants (redb nests in `Database(DatabaseError)` — per-kind explicit `From`, never derived `#[from]`); `?` funnels through `From`; extras project to `Io`.
-- Constructors: one `#[inline] pub(crate)` per variant (`no_such_bucket`, `database_storage`), one-line `///`, cloneable payloads take `&` and clone inside; call `already_exists(name)`, never the variant directly. The mapping is single-homed on `storage::Error`'s inherent constructors — backend wrappers only lift (`Error::Storage(storage::Error::no_such_bucket(name))`).
+- Constructors: one `#[inline] pub(crate)` per variant (`no_such_bucket`, `database_storage`), one-line `///`, cloneable payloads take `&` and clone inside; call `already_exists(name)`, never the variant directly. The mapping is single-homed on `storage::Error`'s free-function constructors — backend wrappers only lift (`Error::Storage(storage::no_such_bucket(name))`).
 
 ## Async traits
 
