@@ -1,7 +1,7 @@
 //! Bucket operations of the fs backend (task T041).
 //!
 //! Buckets are top-level directories of the storage root. Creation times
-//! come from `buckets.json`, lazily recorded on first sight of a
+//! come from the `BUCKETS` table, lazily recorded on first sight of a
 //! pre-existing directory. Names are re-validated on create (defensive
 //! backstop, FR-012); the reserved `.tinio/` directory is never a bucket.
 
@@ -10,16 +10,17 @@ use std::{collections::HashMap, io, time::SystemTime};
 use async_trait::async_trait;
 use tinio_core::{
     bucket::{self, Bucket},
-    storage::{BucketOps, already_exists, invalid_bucket_name, no_such_bucket, not_empty},
+    storage::{BucketOps, already_exists, no_such_bucket, not_empty},
 };
-
-use crate::path::bucket_path;
 
 use super::{Error, FsStorage};
 
 /// A bucket counts as empty when it has no files and no directories
 /// anywhere (folder-marker directories are content, per the conformance
-/// harness) and no in-progress multipart uploads.
+/// harness), no in-progress multipart uploads, and no `.tinio` staging
+/// residue (FR-020 — the reserved segment is never served or listed, so
+/// a crashed/failed cross-volume commit's staging dir must not make the
+/// bucket undeletable; the startup repair clears it).
 async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<bool, Error> {
     if storage.multipart_store().has_uploads(name).await? {
         return Ok(false);
@@ -32,8 +33,11 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
         }
         Err(err) => return Err(err.into()),
     };
-    if entries.next_entry().await?.is_some() {
-        return Ok(false); // any file or directory is content
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name() == crate::path::STATE_DIR_NAME {
+            continue; // staging residue (FR-020): not content
+        }
+        return Ok(false); // any other file or directory is content
     }
     Ok(true)
 }
@@ -42,16 +46,25 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
 impl BucketOps for FsStorage {
     async fn create_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
         // Defensive re-validation (FR-012) before any FS access; the
-        // checked constructor is authoritative. `bucket_path` rejects the
-        // reserved `.tinio` collision (FR-020).
-        if bucket_path(self.root(), name).is_err() {
-            return Err(invalid_bucket_name(name.to_string()).into());
+        // checked constructor is authoritative (it rejects the reserved
+        // `.tinio` name, FR-020). A pre-existing entry of ANY type — a
+        // directory, a symlinked/junction bucket directory resolving
+        // outside the root, a stray file — is a *taken name*:
+        // AlreadyExists, never a name-validation error.
+        match tokio::fs::symlink_metadata(self.root().join(&**name)).await {
+            Ok(_) => return Err(already_exists(name).into()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
-        // The directory creation and its `buckets.json` record are one
+        // The directory creation and its `BUCKETS` record are one
         // critical section against `delete_bucket` (a delete must never
         // remove a bucket a create just reported as created).
         let _guard = self.bucket_mutation_lock.lock().await;
-        let dir = bucket_path(self.root(), name)?;
+        // The name was just proven absent, so the plain lexical join is
+        // the directory to create (the containment-proven `bucket_dir`
+        // answers NoSuchBucket for a missing bucket — it cannot be used
+        // to build the create target).
+        let dir = self.root().join(&**name);
         match tokio::fs::create_dir(&dir).await {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -76,10 +89,17 @@ impl BucketOps for FsStorage {
         // directories remain, so a recursive remove is safe and handles
         // leftover folder-marker directories.
         tokio::fs::remove_dir_all(&dir).await?;
-        // Lazy cleanup of the private state (data-model.md).
-        let _ = self.bucket_store.remove(name).await;
-        let _ = self.meta_store.remove_bucket(name).await;
-        let _ = self.multipart_store.remove_bucket(name).await;
+        // Lazy cleanup of the private state (data-model.md) — one write
+        // transaction over BUCKETS + OBJECT_META + UPLOADS + PARTS (G2:
+        // a bucket's whole derived state dies atomically). The directory
+        // is already gone — the delete has succeeded — so a state
+        // failure must NOT fail the response (the client would see an
+        // error for a delete that happened); the leaked rows are
+        // reclaimed by the startup repair (stale bucket records drain
+        // the whole derived state).
+        if let Err(err) = self.remove_bucket_state(name).await {
+            tracing::warn!(error = %err, "bucket state not removed after delete");
+        }
         Ok(())
     }
 
@@ -123,16 +143,13 @@ impl BucketOps for FsStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::rt;
-    use std::fs;
-    use tinio_core::storage::{Error as StorageError, Error::*, MultipartOps, ObjectOps};
-    use tinio_core::testing::{assert_conformance, body};
-
-    fn storage() -> (tempfile::TempDir, FsStorage) {
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(root.path(), Default::default()).unwrap();
-        (root, storage)
-    }
+    use crate::testutil::{rt, storage};
+    use std::{fs, time::SystemTime};
+    use tinio_core::{
+        object,
+        storage::{Error as StorageError, Error::*, MultipartOps, ObjectOps},
+    };
+    use tinio_util::testing::{assert_conformance, body, etag};
 
     #[test]
     fn conformance_green() {
@@ -188,6 +205,96 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_bucket_follows_when_enabled_and_invisible_when_disabled() {
+        use crate::FsOptions;
+        use tinio_core::storage::ListObjectsParams;
+        use tinio_util::testing::read_body;
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+            let b = bucket::name("linked").unwrap();
+            let k = object::key("a.txt").unwrap();
+
+            // follow_symlinks = false: the bucket is invisible — direct
+            // ops answer NoSuchBucket (not a path error), the name is
+            // taken for create, and discovery omits it.
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let err: StorageError = storage.head_bucket(&b).await.unwrap_err().into();
+            assert!(matches!(err, NoSuchBucket(_)), "{err:?}");
+            let err: StorageError = storage
+                .put_object(&b, &k, body(b"x"))
+                .await
+                .unwrap_err()
+                .into();
+            assert!(matches!(err, NoSuchBucket(_)), "{err:?}");
+            let err: StorageError = storage.create_bucket(&b).await.unwrap_err().into();
+            assert!(matches!(err, AlreadyExists(_)), "{err:?}");
+            let buckets = storage.list_buckets().await.unwrap();
+            assert!(buckets.is_empty(), "{buckets:?}");
+
+            // follow_symlinks = true: the bucket IS the target — full
+            // CRUD through the link, listed and discovered like any
+            // other bucket.
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            storage.put_object(&b, &k, body(b"hello")).await.unwrap();
+            assert!(outside.path().join("a.txt").exists());
+            let head = storage.head_object(&b, &k).await.unwrap();
+            assert_eq!(head.size, 5);
+            let got = storage.get_object(&b, &k, None).await.unwrap();
+            assert_eq!(read_body(got.body).await.unwrap(), b"hello");
+            let buckets = storage.list_buckets().await.unwrap();
+            assert_eq!(buckets.len(), 1);
+            assert_eq!(buckets[0].name, b);
+            let page = storage
+                .list_objects(ListObjectsParams {
+                    bucket: b.clone(),
+                    prefix: String::new(),
+                    delimiter: None,
+                    start_after: None,
+                    max_keys: 100,
+                })
+                .await
+                .unwrap();
+            assert_eq!(page.objects.len(), 1);
+            // Delete resolves through the link (the follow policy).
+            storage.delete_object(&b, &k).await.unwrap();
+            assert!(!outside.path().join("a.txt").exists());
+        });
+    }
+
+    #[test]
+    fn bucket_with_only_staging_residue_is_empty() {
+        // A crashed cross-volume commit leaves `<bucket>/.tinio/` — the
+        // reserved segment is not content (FR-020), so the bucket stays
+        // deletable (the startup repair later reclaims the bytes).
+        rt(async {
+            let (root, storage) = storage();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            fs::create_dir_all(root.path().join("data/.tinio")).unwrap();
+            fs::write(root.path().join("data/.tinio/aaaa"), b"residue").unwrap();
+            storage.delete_bucket(&b).await.unwrap();
+            assert!(!root.path().join("data").exists());
+        });
+    }
+
     #[test]
     fn delete_bucket_with_uploads_is_not_empty() {
         rt(async {
@@ -229,7 +336,9 @@ mod tests {
     fn tinio_and_root_files_are_not_buckets() {
         rt(async {
             let (root, storage) = storage();
-            fs::create_dir(root.path().join(".tinio")).unwrap();
+            // The state dir already exists (constructed with the backend);
+            // a `.tinio` directory must never surface as a bucket.
+            fs::create_dir_all(root.path().join(".tinio")).unwrap();
             fs::write(root.path().join("file.txt"), b"x").unwrap();
             fs::create_dir(root.path().join("Big")).unwrap(); // invalid name
             let buckets = storage.list_buckets().await.unwrap();
@@ -251,6 +360,55 @@ mod tests {
             storage.delete_bucket(&b).await.unwrap();
             assert!(storage.bucket_store().load_all().await.unwrap().is_empty());
             assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn remove_bucket_state_clears_all_four_tables_atomically() {
+        rt(async {
+            let (_root, storage) = storage();
+            let b = bucket::name("my-bucket").unwrap();
+            let k = object::key("a.txt").unwrap();
+            // Bucket row.
+            storage
+                .bucket_store()
+                .record(&b, SystemTime::now())
+                .await
+                .unwrap();
+            // Object meta row.
+            storage
+                .meta_store()
+                .set(
+                    &b,
+                    &k,
+                    &etag("9dd4e461268c8034f5c8564e155c67a6"),
+                    3,
+                    SystemTime::now(),
+                    0,
+                )
+                .await
+                .unwrap();
+            // Upload + part rows.
+            let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+            storage
+                .multipart_store()
+                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+                .await
+                .unwrap();
+
+            storage.remove_bucket_state(&b).await.unwrap();
+
+            assert!(storage.bucket_store().load_all().await.unwrap().is_empty());
+            assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
+            assert!(!storage.multipart_store().has_uploads(&b).await.unwrap());
+            assert!(
+                storage
+                    .multipart_store()
+                    .walk_uploads()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 

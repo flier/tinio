@@ -122,7 +122,9 @@ fn representative_valid_and_invalid_keys() {
     for key in ["a", "dir/file.txt", "with space.txt", "ümlaut.txt", "dir/"] {
         assert!(object::key(key).is_ok(), "{key:?}");
     }
-    for key in ["", "/abs", "C:\\evil", "a\x00b", "a/../b", "a/./b", ".."] {
+    for key in [
+        "", "/abs", "C:\\evil", "a\x00b", "a/../b", "a/./b", "..", "a//b", r"a\\b", r"a/\b",
+    ] {
         assert!(object::key(key).is_err(), "{key:?}");
     }
 }

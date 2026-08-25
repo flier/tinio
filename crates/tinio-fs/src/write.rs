@@ -12,13 +12,14 @@
 //! completed rename wins; no per-object allocation.
 
 use std::{
+    io,
     path::{Path, PathBuf},
     pin::pin,
 };
 
 use futures::StreamExt;
 use md5::{Digest, Md5};
-use tinio_core::{BodyStream, ETag};
+use tinio_core::{BodyStream, ETag, object::RESERVED_SEGMENT};
 
 use crate::Error;
 use crate::path::TMP_DIR_NAME;
@@ -27,8 +28,40 @@ use crate::path::TMP_DIR_NAME;
 /// no per-object buffering; hyper chunks are typically ≤ 64 KiB anyway).
 pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
 
-/// The streaming content MD5 of the file at `path` (bounded buffers).
-pub(crate) async fn md5_of_file(path: &Path) -> Result<[u8; 16], Error> {
+/// Copy `temp` onto `target` via a unique staging file inside the target
+/// directory's `.tinio/` reserved segment, then rename it (same volume —
+/// atomic). The EXDEV fallback of [`AtomicWriter::commit`].
+///
+/// Staging inside the reserved segment keeps a crash residual **invisible
+/// to the data plane** (FR-020: `.tinio` segments are never served or
+/// listed at any depth); the staging file is removed best-effort on
+/// failure, and the staging directory is removed when empty.
+async fn copy_across_volumes(temp: &Path, target: &Path) -> Result<(), Error> {
+    let staging_dir = target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(RESERVED_SEGMENT);
+    tokio::fs::create_dir_all(&staging_dir).await?;
+    let staging = staging_dir.join(uuid::Uuid::new_v4().to_string());
+    let copied = async {
+        tokio::fs::copy(temp, &staging).await?;
+        tokio::fs::rename(&staging, target).await?;
+        Ok::<_, Error>(())
+    }
+    .await;
+    if copied.is_err() {
+        let _ = tokio::fs::remove_file(&staging).await;
+    }
+    // Remove the staging directory when empty (a concurrent EXDEV write
+    // may still be staging in it — the removal then fails harmlessly).
+    let _ = tokio::fs::remove_dir(&staging_dir).await;
+    copied
+}
+
+/// The streaming content MD5 of the file at `path` plus the metadata of
+/// the opened file (bounded buffers; the metadata is the caller's file
+/// identity — one open serves both, no second stat of the path).
+pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], std::fs::Metadata), Error> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Md5::new();
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -39,7 +72,8 @@ pub(crate) async fn md5_of_file(path: &Path) -> Result<[u8; 16], Error> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().into())
+    let metadata = file.metadata().await?;
+    Ok((hasher.finalize().into(), metadata))
 }
 
 /// Atomic object-body writer over the state-dir `tmp/` staging area.
@@ -47,7 +81,7 @@ pub(crate) async fn md5_of_file(path: &Path) -> Result<[u8; 16], Error> {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::testing::body;
+/// use tinio_util::testing::body;
 /// use tinio_fs::AtomicWriter;
 ///
 /// let state = tempfile::tempdir().unwrap();
@@ -92,18 +126,34 @@ impl AtomicWriter {
     /// Rename a staged temp onto `target` (creating parent directories);
     /// the temp is removed best-effort on failure. Callers that serialize
     /// bucket mutations hold their lock across this call.
+    ///
+    /// A cross-volume state dir (FR-023 relocation) makes `rename` fail
+    /// with `CrossesDevices` — the fallback copies the temp through a
+    /// unique staging file **on the target volume**, then renames (atomic
+    /// there; readers still see the old object or the new one, never a
+    /// torn mix). The staging file lives in the target directory's
+    /// `.tinio/` reserved segment — a crash between copy and rename
+    /// leaves invisible residue (never served or listed, FR-020), not a
+    /// stray object.
     pub(crate) async fn commit(temp: &Path, target: &Path) -> Result<(), Error> {
         let result = async {
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::rename(temp, target).await?;
-            Ok::<_, Error>(())
+            match tokio::fs::rename(temp, target).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+                    copy_across_volumes(temp, target).await
+                }
+                Err(err) => Err(err.into()),
+            }
         }
         .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(temp).await;
-        }
+        // Remove the source temp on every outcome: on failure it is
+        // partial residue; on the EXDEV fallback success the copy did not
+        // consume it (on the rename success path it is already gone — a
+        // harmless NotFound).
+        let _ = tokio::fs::remove_file(temp).await;
         result
     }
 
@@ -144,24 +194,6 @@ impl AtomicWriter {
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
         Ok(ETag::Single(hasher.finalize().into()))
     }
-
-    /// Atomically write a small byte payload onto `target` (temp file
-    /// under `tmp/` + rename — same volume by construction).
-    ///
-    /// Used by the meta store, `buckets.json`, and multipart sidecars;
-    /// callers hold their own in-process lock so concurrent writers never
-    /// produce torn JSON. Staging under `tmp/` means a crash between
-    /// temp-write and rename leaves a file the startup repair / sweep
-    /// reclaims.
-    pub async fn write_bytes(&self, target: &Path, bytes: &[u8]) -> Result<(), Error> {
-        tokio::fs::create_dir_all(&self.tmp_dir).await?;
-        let temp = self.tmp_dir.join(format!("state-{}", uuid::Uuid::new_v4()));
-        if let Err(err) = tokio::fs::write(&temp, bytes).await {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(err.into());
-        }
-        Self::commit(&temp, target).await
-    }
 }
 
 #[cfg(test)]
@@ -169,7 +201,7 @@ mod tests {
     use super::*;
     use crate::testutil::rt;
     use std::io;
-    use tinio_core::testing::{body, etag};
+    use tinio_util::testing::{body, etag};
 
     #[test]
     fn write_stores_content_and_etag() {
@@ -243,56 +275,42 @@ mod tests {
     }
 
     #[test]
-    fn write_bytes_writes_and_replaces() {
+    fn copy_across_volumes_lands_content_atomically() {
+        // The EXDEV fallback (a cross-volume state dir cannot `rename`):
+        // copy through a staging file next to the target, then rename —
+        // the mechanism test; the trigger is the `CrossesDevices` match.
         rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("meta.json");
-            writer.write_bytes(&target, b"{\"v\":1}").await.unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let temp = dir.path().join("staged.bin");
+            tokio::fs::write(&temp, b"cross-volume payload")
+                .await
+                .unwrap();
+            let target = dir.path().join("sub").join("obj.bin");
+            tokio::fs::create_dir_all(target.parent().unwrap())
+                .await
+                .unwrap();
+            copy_across_volumes(&temp, &target).await.unwrap();
             assert_eq!(
-                tokio::fs::read_to_string(&target).await.unwrap(),
-                "{\"v\":1}"
+                tokio::fs::read(&target).await.unwrap(),
+                b"cross-volume payload"
             );
-            writer.write_bytes(&target, b"{\"v\":2}").await.unwrap();
-            assert_eq!(
-                tokio::fs::read_to_string(&target).await.unwrap(),
-                "{\"v\":2}"
-            );
-            // No stray temp files under tmp/.
-            let tmp = state.path().join("tmp");
-            let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
-            assert!(entries.next_entry().await.unwrap().is_none());
-        });
-    }
-
-    #[test]
-    fn write_bytes_concurrent_writers_never_torn() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("meta.json");
-            let mut handles = Vec::new();
-            for i in 0..8u32 {
-                let target = target.clone();
-                let writer = writer.clone();
-                handles.push(tokio::spawn(async move {
-                    let payload = format!(r#"{{"writer":{i},"pad":"{}"}}"#, "x".repeat(1000));
-                    writer
-                        .write_bytes(&target, payload.as_bytes())
-                        .await
-                        .unwrap();
-                }));
-            }
-            for h in handles {
-                h.await.unwrap();
-            }
-            // The final file is exactly one writer's complete payload.
-            let final_content = tokio::fs::read_to_string(&target).await.unwrap();
-            let parsed: serde_json::Value = serde_json::from_str(&final_content).unwrap();
-            let writer = parsed["writer"].as_u64().unwrap();
-            let pad = "x".repeat(1000);
-            assert_eq!(parsed["pad"].as_str().unwrap(), pad);
-            assert!(writer < 8);
+            // No staging file left behind on success.
+            let entries: Vec<_> = std::fs::read_dir(dir.path().join("sub"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(entries, ["obj.bin"], "{entries:?}");
+            // A failed copy cleans up the staging file and directory
+            // (no `.tinio` residue).
+            let target2 = dir.path().join("sub2").join("obj.bin");
+            tokio::fs::create_dir_all(target2.parent().unwrap())
+                .await
+                .unwrap();
+            let err = copy_across_volumes(&dir.path().join("missing"), &target2)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Io(_)), "{err:?}");
+            assert!(!target2.parent().unwrap().join(".tinio").exists());
         });
     }
 }

@@ -13,7 +13,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # --- aws cli v2 journey ----------------------------------------------------
-ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log")"
+ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log")" || exit 1
 echo "server on $ENDPOINT (pid $SERVER_PID)"
 AWS="aws --endpoint-url http://$ENDPOINT --region us-east-1"
 
@@ -48,7 +48,7 @@ run rclone purge "tinio:rclone-bucket"
 # --- ephemeral-port run ----------------------------------------------------
 echo ">> ephemeral-port run"
 FIRST_PID="$SERVER_PID"
-EP2="$(start_server "$SCRATCH/root2" "$SCRATCH/server2.log")"
+EP2="$(start_server "$SCRATCH/root2" "$SCRATCH/server2.log")" || exit 1
 # The bucket ops below keep using the first server's endpoint; the second
 # run proves `--port 0` startup.
 run $AWS s3 mb "s3://ephemeral-bucket"

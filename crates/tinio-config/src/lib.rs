@@ -14,6 +14,9 @@
 //! attributes), [`sources`] (`.env` loading), [`Error`]. Validation is derive-driven
 //! ([`garde::Validate`] on every section); [`schema::Config::parse`] runs it
 //! after deserialization and maps the report onto [`Error`].
+//!
+//! Section types live under their module path (`log::Config`, `api::Http`);
+//! the root document is [`Config`].
 
 mod error;
 pub mod schema;
@@ -21,11 +24,4 @@ pub mod sources;
 
 pub use self::error::Error;
 
-#[cfg(windows)]
-pub use schema::ApiPipe;
-#[cfg(unix)]
-pub use schema::ApiUnix;
-pub use schema::{
-    AccessLogFormat, ApiConfig, ApiHttp, ApiHttps, AuthConfig, Config, LogConfig, LogFormat,
-    S3Config, ScannerConfig, ServerConfig, StorageConfig, TelemetryConfig, Verbosity, Version,
-};
+pub use schema::{Config, Version, api, auth, log, s3, scanner, server, storage, telemetry};

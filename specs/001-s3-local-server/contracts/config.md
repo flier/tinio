@@ -45,8 +45,9 @@ sig_v2 = false            # SigV2 off by default; DEPRECATED (weaker scheme; aws
 temp_ttl_hours = 24       # stale temp-write sweep timeout
 multipart_expire_days = 7 # abandoned-upload sweep timeout
 
-[storage]
-follow_symlinks = true    # follow symlinks in the storage root (default); false = reject access through links + exclude from listings
+[storage.fs]              # filesystem backend keys
+follow_symlinks = false   # reject access through symlinks + exclude from listings (default; true = follow — a link inside a bucket can then escape the storage root)
+compact_threshold_percent = 20  # state-database fragmentation % triggering compact at startup (5..=90)
 
 [api.unix]              # local channel, unix form — Linux/macOS (part of three-choose-one)
 # presence = local channel on (the auto-created config includes this section; omit it to disable)
@@ -81,7 +82,7 @@ otlp_endpoint = "http://127.0.0.1:4317"   # required when the section is present
 ## Read-only mode (`[server] read_only = true` / `--read-only` / `TINIO_READ_ONLY=1`)
 
 - All S3 mutating operations are rejected with `AccessDenied`; the storage root is never written (may be a genuinely read-only filesystem).
-- State dir relocates from `<root>/.tinio/` to `~/.tinio/roots/<sha1(canonical root)16>/` (mode 0700; home resolved via the `dirs` crate). Everything else in this contract — state, socket, logs, meta store, `buckets.json` — lives there with the same layout.
+- State dir relocates from `<root>/.tinio/` to `~/.tinio/roots/<sha1(canonical root)16>/` (mode 0700; home resolved via the `dirs` crate). Everything else in this contract — state, socket, logs, meta store (`meta.redb`) — lives there with the same layout.
 - Config read rule: a pre-existing `<root>/.tinio/.tinio.toml` or `<root>/.tinio/config.toml` is still read — never written (`.tinio.toml` wins when both exist; other contents of the root's `.tinio/` are ignored in read-only mode). When absent, the config is auto-created with generated credentials **in the home state dir** instead.
 - `.env` is loaded only from the state dir in read-only mode.
 
@@ -101,14 +102,15 @@ CLI flags > process environment > .env > config file
 
 - Unknown config keys / sections → startup error.
 - Unknown `access_log_format` variables → startup error (fixed variable set: `$remote_addr`, `$remote_user`, `$time_local`, `$request`, `$status`, `$body_bytes_sent`, `$http_referer`, `$http_user_agent`, `$request_time`). The set is closed by design — it cannot reference the Authorization header, query strings, or credentials, a security property that keeps secrets out of access logs (spec §FR-017); extending the set requires revisiting this guarantee.
-- `[server] port`: default 9000 (Minio-compatible); `0` = OS-assigned ephemeral port (for tests; reported in logs/state); explicit 1–65535 = fixed port. The auto-created config on first start writes `port = 9000`. Host any; verbosity in the four levels; boolean-typed keys must be booleans (`[server]` read_only, `[s3]`/`[storage]`/`[telemetry]` toggles); `[scanner]` and `[api.*]` transports are presence-gated (section present = on, absent = off).
+- `[server] port`: default 9000 (Minio-compatible); `0` = OS-assigned ephemeral port (for tests; reported in logs/state); explicit 1–65535 = fixed port. The auto-created config on first start writes `port = 9000`. Host any; verbosity in the four levels; boolean-typed keys must be booleans (`[server]` read_only, `[s3]`/`[storage.fs]`/`[telemetry]` toggles); `[scanner]` and `[api.*]` transports are presence-gated (section present = on, absent = off).
 - Credential presence rules: no creds + no anonymous → generated session creds (printed once); first start → config auto-created with persisted creds.
-- Backend selection is deferred: v1 is filesystem-only (`tinio-fs`); the `[storage]` section holds backend behavior keys (e.g. `follow_symlinks`), and a `type` selection key will be added when a second backend (`tinio-s3`, `tinio-webdav`) lands.
+- Backend selection is deferred: v1 is filesystem-only (`tinio-fs`); the `[storage]` section holds backend behavior keys (nested per backend — `[storage.fs]` for the filesystem), and a `type` selection key will be added when a second backend (`tinio-s3`, `tinio-webdav`) lands.
 - `[s3]` capability groups are also strippable at compile time via default-on cargo features (`multipart`, `copy`, `list-v1`, `list-v2`); when a group is not compiled, its keys here are schema-known and silently ignored.
 - The `[api.https]` section (or `--api https://`) requires both `cert` and `key` (PEM paths); missing → startup error.
 - `http` and `https` are mutually exclusive transports (three-choose-one with the local channel): at most one of `unix`/`pipe`/`http`/`https` may be enabled — the local channel is `unix` on Linux/macOS and `pipe` on Windows, so `unix` and `pipe` are mutually exclusive too; more than one is a startup error.
 - The local channel has two platform forms: `[api.unix]` `path` (Linux/macOS — socket path, relative to `.tinio/` unless absolute; default `tinio.sock`) and `[api.pipe]` `path` (Windows — named-pipe name, empty = derived `tinio-<sha1(root)>`). Use the platform-appropriate section; both participate in the three-choose-one exclusivity.
-- `[storage] follow_symlinks`: boolean, default true; false = reject access resolving through symlinks and exclude symlink entries from listings.
+- `[storage.fs] follow_symlinks`: boolean, default **false** (secure default: access never resolves through a symlink and link entries are excluded from listings, so a link inside a bucket cannot escape the storage root); `true` = follow symlinks (opt-in).
+- `[storage.fs] compact_threshold_percent`: 5–90, default 20; the state-database fragmentation percentage that triggers compaction at startup (offline, before the store handles are shared; `doctor --fix` triggers the same).
 - `[server] read_only`: boolean, default false; see the read-only-mode section above. In read-only mode, `[s3]` write-related toggles are moot (writes are rejected regardless).
 - `[scanner]` section: presence = background ETag scanner on (FR-024; the auto-created config includes it; omitted = off); keys are Minio-aligned (`mc admin config set myminio scanner ...`): `delay` float seconds ≥ 0 (default 10.0 — pacing between scan iterations), `max_wait` duration string (default `15s` — max wait for a scan slot when throttled), `cycle` duration string (default `24h` — full-tree re-scan cadence). Runs in read-only mode as well (meta writes land in the home state dir). Env: `TINIO_SCANNER` (`0`/`1`).
 - Any TCP exposure (http/https section present or `--api` flags) requires the token on ALL management endpoints (including `/metrics` and `/openapi.json`).

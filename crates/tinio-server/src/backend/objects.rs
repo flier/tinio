@@ -8,11 +8,74 @@
 //! `x-amz-checksum-*` are accepted and dropped. CopyObject is gated by the
 //! `copy` cargo feature and the runtime `copy_object` toggle (FR-021).
 
-use s3s::{S3Error, S3Request, S3Response, S3Result, dto};
+use std::str::FromStr;
+
+use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
 
 use tinio_core::storage::{ByteRange, Error as StorageError, GetObjectResult, Storage};
 
-use crate::backend::{ConditionFailure, S3Backend, condition_error, map_backend_error};
+use crate::backend::{
+    ConditionFailure, ConditionalHeaders, S3Backend, condition_error, map_backend_error,
+};
+
+/// Parse an ETag-condition header (`x-amz-if-match`, `x-amz-if-none-match`)
+/// into the DTO type when present. CopyObject's destination conditionals
+/// are not part of the s3s DTO, so they are read from the headers here.
+fn parse_etag_condition_header(
+    headers: &http::HeaderMap,
+    name: &'static str,
+) -> Result<Option<dto::ETagCondition>, S3Error> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))?;
+    dto::ETagCondition::from_str(text)
+        .map(Some)
+        .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))
+}
+
+/// The destination-conditional protocol (`x-amz-if-match` /
+/// `x-amz-if-none-match`): evaluate against the CURRENT object at
+/// (bucket, key), 412 on failure. Shared by the conditional put and the
+/// conditional copy — a missing object is the "no current version" case
+/// (If-None-Match: *); any real failure must not look like an absent
+/// object, or the precondition would pass and overwrite.
+impl<S: Storage> S3Backend<S> {
+    async fn check_destination_conditions(
+        &self,
+        bucket: &tinio_core::bucket::Name,
+        key: &tinio_core::object::Key,
+        if_match: Option<&dto::ETagCondition>,
+        if_none_match: Option<&dto::ETagCondition>,
+    ) -> S3Result<()> {
+        if if_match.is_none() && if_none_match.is_none() {
+            return Ok(());
+        }
+        let current = match self.storage.head_object(bucket, key).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                let err: StorageError = err.into();
+                match err {
+                    StorageError::NoSuchKey(_) => None,
+                    err => return Err(map_backend_error(err)),
+                }
+            }
+        };
+        if let Some(info) = current {
+            ConditionalHeaders::new(if_match, if_none_match, None, None).check(
+                &info.etag,
+                info.last_modified,
+                true,
+            )?;
+        } else if if_match.is_some() {
+            // No current version can match an If-Match (412).
+            return Err(condition_error(ConditionFailure::Match, true));
+        }
+        Ok(())
+    }
+}
 
 /// The batch-delete error entry for a failed key (the S3 error into the
 /// wire `dto::Error` shape).
@@ -44,38 +107,15 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         let _guard = self.lock_object(&bucket, &key).await;
-        if req.input.if_match.is_some() || req.input.if_none_match.is_some() {
-            // Conditional put: If-Match / If-None-Match against the
-            // current object (412 on failure).
-            let current = match self.storage.head_object(&bucket, &key).await {
-                Ok(info) => Some(info),
-                Err(err) => {
-                    // A missing object is the "no current version" case
-                    // (If-None-Match: *); any real failure must not look
-                    // like an absent object — that would pass the
-                    // precondition and overwrite.
-                    let err: StorageError = err.into();
-                    match err {
-                        StorageError::NoSuchKey(_) => None,
-                        err => return Err(map_backend_error(err)),
-                    }
-                }
-            };
-            if let Some(info) = current {
-                Self::check_conditions(
-                    &info.etag,
-                    info.last_modified,
-                    req.input.if_match.as_ref(),
-                    req.input.if_none_match.as_ref(),
-                    None,
-                    None,
-                    true,
-                )?;
-            } else if req.input.if_match.is_some() {
-                // No current version can match an If-Match (412).
-                return Err(condition_error(ConditionFailure::Match, true));
-            }
-        }
+        // Conditional put: If-Match / If-None-Match against the current
+        // object (412 on failure) — the shared destination protocol.
+        self.check_destination_conditions(
+            &bucket,
+            &key,
+            req.input.if_match.as_ref(),
+            req.input.if_none_match.as_ref(),
+        )
+        .await?;
         let put = self
             .storage
             .commit_object(&bucket, &key, staged)
@@ -113,15 +153,13 @@ impl<S: Storage> S3Backend<S> {
             .get_object(&bucket, &key, range)
             .await
             .map_err(map_backend_error)?;
-        Self::check_conditions(
-            &info.etag,
-            info.last_modified,
+        ConditionalHeaders::new(
             req.input.if_match.as_ref(),
             req.input.if_none_match.as_ref(),
             req.input.if_modified_since,
             req.input.if_unmodified_since,
-            false,
-        )?;
+        )
+        .check(&info.etag, info.last_modified, false)?;
 
         let (content_length, content_range) = match served_range {
             Some((start, end)) => (
@@ -157,15 +195,13 @@ impl<S: Storage> S3Backend<S> {
             .head_object(&bucket, &key)
             .await
             .map_err(map_backend_error)?;
-        Self::check_conditions(
-            &head.etag,
-            head.last_modified,
+        ConditionalHeaders::new(
             req.input.if_match.as_ref(),
             req.input.if_none_match.as_ref(),
             req.input.if_modified_since,
             req.input.if_unmodified_since,
-            false,
-        )?;
+        )
+        .check(&head.etag, head.last_modified, false)?;
         Ok(S3Response::new(dto::HeadObjectOutput {
             accept_ranges: Some("bytes".into()),
             content_length: Some(head.size as i64),
@@ -280,19 +316,30 @@ impl<S: Storage> S3Backend<S> {
             .get_object(&src_bucket, &src_key, None)
             .await
             .map_err(map_backend_error)?;
-        Self::check_conditions(
-            &get.info.etag,
-            get.info.last_modified,
+        ConditionalHeaders::new(
             req.input.copy_source_if_match.as_ref(),
             req.input.copy_source_if_none_match.as_ref(),
             req.input.copy_source_if_modified_since,
             req.input.copy_source_if_unmodified_since,
-            true,
-        )?;
+        )
+        .check(&get.info.etag, get.info.last_modified, true)?;
         // The destination write serializes with the write lock, as in
         // `op_put_object` — a copy landing between a conditional put's
         // check and commit would invalidate the precondition.
         let _guard = self.lock_object(&dst_bucket, &dst_key).await;
+        // Destination conditionals (`x-amz-if-match` / `x-amz-if-none-match`)
+        // evaluate against the CURRENT destination (412 on failure): a
+        // conditional copy must not silently overwrite — the shared
+        // destination protocol.
+        let dest_if_match = parse_etag_condition_header(&req.headers, "x-amz-if-match")?;
+        let dest_if_none_match = parse_etag_condition_header(&req.headers, "x-amz-if-none-match")?;
+        self.check_destination_conditions(
+            &dst_bucket,
+            &dst_key,
+            dest_if_match.as_ref(),
+            dest_if_none_match.as_ref(),
+        )
+        .await?;
         let put = self
             .storage
             .put_object(&dst_bucket, &dst_key, get.body)
@@ -317,8 +364,8 @@ mod tests {
     use s3s::S3;
     use tinio_core::bucket;
     use tinio_core::storage::ObjectOps;
-    use tinio_core::testing::{body, read_body};
     use tinio_mem::MemoryStorage;
+    use tinio_util::testing::{body, read_body};
 
     async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
         let (backend, b) = setup().await;
@@ -500,6 +547,24 @@ mod tests {
             }))
             .await;
         assert!(ok.is_ok(), "If-Match must override If-Unmodified-Since");
+
+        // If-Unmodified-Since takes precedence over If-None-Match (RFC
+        // 9110 §13.2.2): a matching If-None-Match with a failing date
+        // answers 412, never 304 — a caching client must not reuse a
+        // stale body.
+        let err = backend
+            .get_object(s3_request(dto::GetObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_none_match: Some(format!("\"{etag}\"").parse().unwrap()),
+                if_unmodified_since: Some(dto::Timestamp::from(
+                    time::OffsetDateTime::from_unix_timestamp(915_148_800).unwrap(),
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
     }
 
     #[tokio::test]
@@ -688,5 +753,101 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "PreconditionFailed");
+    }
+
+    #[cfg(feature = "copy")]
+    #[tokio::test]
+    async fn copy_object_destination_conditionals_are_enforced() {
+        // x-amz-if-match / x-amz-if-none-match evaluate against the
+        // CURRENT destination (s3s omits them from the DTO — the headers
+        // are read and enforced here; a conditional copy must not
+        // silently overwrite).
+        let (backend, b) = setup_name().await;
+        let storage = backend.storage();
+        storage
+            .put_object(&b, &"src.txt".into(), body(b"source data"))
+            .await
+            .unwrap();
+        storage
+            .put_object(&b, &"dst.txt".into(), body(b"existing"))
+            .await
+            .unwrap();
+        let dst_etag = storage
+            .head_object(&b, &"dst.txt".into())
+            .await
+            .unwrap()
+            .etag
+            .as_str();
+
+        // x-amz-if-none-match matching the destination → 412, no write.
+        let mut req = s3_request(
+            dto::CopyObjectInput::builder()
+                .bucket(b.to_string())
+                .key("dst.txt".to_string())
+                .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .build()
+                .unwrap(),
+        );
+        req.headers.insert(
+            "x-amz-if-none-match",
+            http::HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
+        );
+        let err = backend.copy_object(req).await.unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+        let got = read_body(
+            storage
+                .get_object(&b, &"dst.txt".into(), None)
+                .await
+                .unwrap()
+                .body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got, b"existing",
+            "the failed conditional copy must not overwrite"
+        );
+
+        // x-amz-if-match with a mismatching ETag → 412.
+        let mut req = s3_request(
+            dto::CopyObjectInput::builder()
+                .bucket(b.to_string())
+                .key("dst.txt".to_string())
+                .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .build()
+                .unwrap(),
+        );
+        req.headers.insert(
+            "x-amz-if-match",
+            http::HeaderValue::from_str("\"deadbeefdeadbeefdeadbeefdeadbeef\"").unwrap(),
+        );
+        let err = backend.copy_object(req).await.unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+
+        // x-amz-if-match matching the destination → the copy proceeds.
+        let mut req = s3_request(
+            dto::CopyObjectInput::builder()
+                .bucket(b.to_string())
+                .key("dst.txt".to_string())
+                .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .build()
+                .unwrap(),
+        );
+        req.headers.insert(
+            "x-amz-if-match",
+            http::HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
+        );
+        let out = backend.copy_object(req).await.unwrap();
+        assert!(out.output.copy_object_result.is_some());
+        let got = read_body(
+            storage
+                .get_object(&b, &"dst.txt".into(), None)
+                .await
+                .unwrap()
+                .body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, b"source data");
     }
 }

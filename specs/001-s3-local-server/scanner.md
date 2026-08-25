@@ -19,7 +19,7 @@ The scanner walks the object tree and reconciles it against the meta store (entr
 | Object gone, meta exists | **Orphan reclamation**: delete the meta entry (invalid-file recovery; FR-024) |
 | Entry matches | No-op (cheap skip: stat + entry read) |
 
-All meta writes use the atomic temp+rename pattern under the in-process lock (no torn JSON). Reclamation and recomputation share the same walk; there is no separate pass.
+All meta writes are redb transactions on `OBJECT_META` (single-writer, crash-safe by default — no torn state). Reclamation and recomputation share the same walk; there is no separate pass.
 
 ## 3. Scheduling and pacing
 
@@ -59,7 +59,7 @@ Loop shape:
 |--------|----------|
 | `listing.rs` (T043) | Synchronous recompute fallback for missing/stale entries during a listing — the scanner only makes this rare; never a correctness dependency |
 | `sweep.rs` (T046) | Sweep owns time-based cleanup of `tmp/` (24 h) and idle multipart (7 d). Scanner owns meta reconciliation only |
-| `Cleanup` trait (T012) / `FsCleanup` (fs-backend.md §8) | Startup repair owns fast deterministic items (tmp clear, bucket-orphaned multipart, stale buckets.json). Meta-orphan reclamation belongs to the scanner (cost: full meta-tree walk). Both go through the `Cleanup` trait (fs details: fs-backend.md §8) |
+| `Cleanup` trait (T012) / `FsCleanup` (fs-backend.md §8) | Startup repair owns fast deterministic items (tmp clear, bucket-orphaned multipart, no-record upload dirs, stale bucket records). Meta-orphan reclamation belongs to the scanner (cost: full meta-tree walk). Both go through the `Cleanup` trait (fs details: fs-backend.md §8) |
 | `doctor` (T073/T074) | Offline checks share the same reclamation semantics via cleanup.rs; the scanner is the runtime counterpart |
 
 ## 7. Testing

@@ -11,7 +11,7 @@ Feature: S3-Compatible Local Storage Server (tinio). This directory holds the co
 | [spec.md](spec.md) | Feature requirements: FR-001..FR-025, success criteria (SC-001..SC-008), edge cases | Starting anywhere — the normative source |
 | [plan.md](plan.md) | Implementation plan: workspace, crate structure, constitution check, testing strategy | Making architecture decisions |
 | [research.md](research.md) | Phase-0 decisions, alternatives, and dependency justifications (constitution Principle I) | Asking *why* a crate or design was chosen |
-| [data-model.md](data-model.md) | Entities and on-disk state layout (`meta/` fan-out, `buckets.json`, `multipart/`, `tmp/`) | Implementing tinio-fs state |
+| [data-model.md](data-model.md) | Entities and on-disk state layout (`meta.redb`, `multipart/`, `tmp/`) | Implementing tinio-fs state |
 | [contracts/](contracts/) | Exact schemas: [config.md](contracts/config.md), [cli.md](contracts/cli.md), [management-api.md](contracts/management-api.md), [s3-surface.md](contracts/s3-surface.md), [minio-compat.md](contracts/minio-compat.md) | Implementing a user-facing surface |
 | [failure-handling.md](failure-handling.md) | Abnormal-condition taxonomy, crash recovery, reclamation division of labor | Implementing cleanup/repair (T070, T073/T074) |
 | [scanner.md](scanner.md) | Background ETag scanner design: pacing, meta reclamation, lifecycle | Implementing the scanner (T045) |

@@ -4,7 +4,7 @@
 
 Entities derived from the feature spec (Key Entities + FR-001..024). The filesystem is the single source of truth; every entity below maps to concrete on-disk state. `<state-dir>` below means `<root>/.tinio/` in normal mode and `~/.tinio/roots/<sha1(canonical root)16>/` in read-only mode (FR-023).
 
-**Backend seam**: `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness); `tinio-fs` implements it over the local filesystem (v1); `tinio-mem` provides the in-memory reference backend (CLI default when no directory is given); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, buckets.json, tmp/) are `tinio-fs` internals behind that contract.
+**Backend seam**: `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness); `tinio-fs` implements it over the local filesystem (v1); `tinio-mem` provides the in-memory reference backend (CLI default when no directory is given); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, `meta.redb`, tmp/) are `tinio-fs` internals behind that contract.
 
 ## Entities
 
@@ -23,10 +23,10 @@ Validation: canonicalization before use; unix-socket path limit (108 bytes) docu
 | Field | Type | Notes |
 |-------|------|-------|
 | name | `String` | Validated per S3 rules: 3–63 chars, lowercase letters/digits/dots/hyphens, no leading/trailing dot or hyphen (FR-012; framework `check-bucket-name` feature enforces, backend re-validates on create) |
-| creation_time | timestamp | Persisted in `<state-dir>/buckets.json`; lazily recorded on first sight (pre-existing dirs) |
+| creation_time | timestamp | Persisted in the `BUCKETS` table of `<state-dir>/meta.redb`; lazily recorded on first sight (pre-existing dirs) |
 | path | `PathBuf` | `<root>/<name>` |
 
-Relationships: contains 0..n `Object`s. State: exists ⇔ directory exists. Delete: only when empty (standard S3 `BucketNotEmpty`); removes the directory and the meta-store subtree + buckets.json entry (lazy cleanup of orphans).
+Relationships: contains 0..n `Object`s. State: exists ⇔ directory exists. Delete: only when empty (standard S3 `BucketNotEmpty`); removes the directory and the bucket's metadata ranges (`OBJECT_META`/`UPLOADS`/`PARTS`/`BUCKETS`, one redb transaction — lazy cleanup of orphans).
 
 Case sensitivity follows the host filesystem (amended assumption): on case-insensitive hosts, names differing only in case collide at the FS level and no artificial enforcement is applied.
 
@@ -42,9 +42,9 @@ Case sensitivity follows the host filesystem (amended assumption): on case-insen
 | content_type | inferred | From extension via `mime_guess`, fallback `application/octet-stream`; not persisted (FR-022) |
 | user metadata | dropped | `x-amz-meta-*` accepted, not stored, not returned |
 
-ETag persistence: meta entry `<state-dir>/meta/objects/<bucket>/<2hex>/<sha1hex>.json` = `{key, etag, size, mtime}`; served only when size+mtime match, else recomputed streaming and rewritten (out-of-band modification detection). Orphaned meta entries removed on object delete, lazily on bucket delete. Known granularity limit: an out-of-band edit preserving both size and mtime tick may serve a stale ETag (accepted trade-off, FR-022). Meta files are written atomically (temp file + rename) under an in-process lock, so concurrent writers never produce torn JSON. Listings include ETags: missing/stale entries are recomputed synchronously during the listing — a one-time full-content pass over externally-added files (documented cost of SC-006).
+ETag persistence: `OBJECT_META` table of `<state-dir>/meta.redb` — key `(bucket, key)`, value `(etag, size, mtime, file identity)`; served only when size+mtime match, else recomputed streaming and rewritten (out-of-band modification detection). Orphaned meta entries removed on object delete, lazily on bucket delete. Known granularity limit: an out-of-band edit preserving both size and mtime tick may serve a stale ETag (accepted trade-off, FR-022). The stored file identity (unix dev+inode; 0 where unavailable, e.g. Windows) lets a same-file touch keep a multipart `MD5-of-MD5s-N` ETag while a same-size replacement (new inode) re-hashes — the 60 s mtime jitter window is the fallback where no identity exists. Meta writes are redb transactions (single-writer, crash-safe by default — commit is atomic; no torn state). The composite key keeps one bucket's entries contiguous, so bucket walks and deletions are cheap prefix range scans. Listings include ETags: missing/stale entries are recomputed synchronously during the listing — a one-time full-content pass over externally-added files (documented cost of SC-006).
 
-State: absent → exists → (overwritten atomically) → deleted. Concurrent writes: last completed atomic rename wins; never a torn mix (FR-011). Symlinks: followed by default (links may point outside the root — user-owned directory, documented); when `follow_symlinks` is disabled, access resolving through a symlink is rejected and symlink entries are excluded from listings.
+State: absent → exists → (overwritten atomically) → deleted. Concurrent writes: last completed atomic rename wins; never a torn mix (FR-011). Symlinks: rejected by default (`[storage.fs] follow_symlinks = false`) — access resolving through a symlink is refused and symlink entries are excluded from listings; opt-in `true` follows links (which may point outside the root — user-owned directory, documented).
 
 ### Multipart Upload
 
@@ -79,9 +79,8 @@ Normal mode: `<root>/.tinio/`. Read-only mode (FR-023): `~/.tinio/roots/<sha1(ca
 | `tinio.sock` | Unix socket (Linux/macOS; stale file probed + unlinked before bind; configured via `[api.unix] path`); Windows: named pipe, name in state (configured via `[api.pipe] path` / `--api pipe://`) |
 | `access.log` | Data-plane access log |
 | `server.log` / `server.json` | Operational log (daemon mode; json = format-selected name) |
-| `buckets.json` | Bucket name → creation time (`{"version": 1, "buckets": {...}}`; written atomically: temp + rename under an in-process lock) |
-| `meta/objects/<bucket>/<2hex>/<hash>.json` | ETag metadata store |
-| `multipart/<bucket>/<uploadId>/part-<n>` | Multipart parts (unused in read-only mode) |
+| `meta.redb` | The state database (redb 4.2, copy-on-write, crash-safe by default): five tables — `OBJECT_META` (`(bucket, key)` → `(etag, size, mtime, file identity)`), `BUCKETS` (name → creation time), `UPLOADS` (`(bucket, upload_id)` → `(key, initiated_at)`), `PARTS` (`(bucket, upload_id, part_number)` → etag), `STATE` (`version` + `compact_needed` marker) |
+| `multipart/<bucket>/<uploadId>/part-<n>` | Multipart part content files only (records + part ETags live in `UPLOADS`/`PARTS`; unused in read-only mode) |
 | `tmp/` | In-flight write temp files (swept after 24 h; unused in read-only mode) |
 
 Never served or listed; names that could collide (leading-dot buckets) rejected (FR-020).

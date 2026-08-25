@@ -96,8 +96,8 @@ mod tests {
     use crate::backend::testutil::s3_request;
     use s3s::S3;
     use tinio_core::storage::{self, BucketOps, ObjectOps};
-    use tinio_core::testing::assert_conformance;
     use tinio_mem::MemoryStorage;
+    use tinio_util::testing::assert_conformance;
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -218,7 +218,7 @@ mod tests {
             .put_object(
                 &"data".into(),
                 &"a.txt".into(),
-                tinio_core::testing::body(b"x"),
+                tinio_util::testing::body(b"x"),
             )
             .await
             .unwrap();

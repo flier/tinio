@@ -129,8 +129,8 @@ fn validate_bucket_name(name: &str) -> garde::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::assert_send_sync;
     use std::time::{Duration, SystemTime};
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn bucket_name_validates_and_exposes() {

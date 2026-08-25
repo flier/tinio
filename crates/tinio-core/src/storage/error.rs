@@ -182,7 +182,7 @@ mod tests {
 
     use std::error::Error as StdError;
 
-    use crate::testing::assert_send_sync;
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn displays_variants() {

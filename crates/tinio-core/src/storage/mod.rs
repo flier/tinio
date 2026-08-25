@@ -58,7 +58,7 @@ pub use time::{from_nanos, now_nanos, to_nanos};
 /// `<Self as Storage>::Error`, so they are only usable on a complete
 /// backend (`S: Storage`).
 ///
-/// The conformance harness (`tinio_core::testing`, behind the `testing`
+/// The conformance harness (`tinio_util::testing`, behind the `testing`
 /// feature) verifies the behavioral contract; every backend must pass it.
 ///
 /// # Examples
@@ -96,3 +96,22 @@ pub trait Storage: Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps 
     /// layer and the conformance harness can translate any backend failure.
     type Error: StdError + Send + Sync + 'static + Into<crate::storage::Error>;
 }
+
+/// The default symlink policy of the filesystem backend: `false` = reject
+/// access resolving through a link and exclude link entries from listings
+/// (secure default — a link inside a bucket cannot escape the storage
+/// root). Shared by the `[storage.fs]` config schema and `tinio-fs`
+/// `FsOptions`, so the two defaults cannot drift.
+pub const DEFAULT_FOLLOW_SYMLINKS: bool = false;
+
+/// The default compact trigger of the filesystem backend: the state
+/// database is compacted at startup when its fragmentation reaches this
+/// percentage. Shared by the `[storage.fs]` config schema and `tinio-fs`
+/// `FsOptions` (contracts/config.md is the prose home).
+pub const DEFAULT_COMPACT_THRESHOLD_PERCENT: u8 = 20;
+
+/// The validation bounds of the compact trigger (`[storage.fs]
+/// compact_threshold_percent`, 5..=90 — meta-redb-spec Q2). Shared by the
+/// config schema and `FsOptions` so the two validations cannot drift.
+pub const COMPACT_THRESHOLD_MIN_PERCENT: u8 = 5;
+pub const COMPACT_THRESHOLD_MAX_PERCENT: u8 = 90;

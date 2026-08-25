@@ -23,7 +23,7 @@ use tinio_core::{Storage, bucket, object};
 
 use crate::{
     Error,
-    error::{database_storage, no_such_upload},
+    error::{database_storage, no_such_bucket, no_such_upload},
 };
 
 /// `name` → creation time (unix nanoseconds).
@@ -146,6 +146,20 @@ pub(crate) fn collect_part_keys(
     Ok(out)
 }
 
+/// Check that `bucket` exists (`NoSuchBucket` otherwise). Multipart
+/// operations answer bucket existence first — the fs backend's
+/// `ensure_bucket` precedes everything else, and NoParts/NoSuchUpload
+/// must not mask a missing bucket.
+pub(crate) fn check_bucket<T>(buckets: &T, name: &bucket::Name) -> Result<(), Error>
+where
+    T: ReadableTable<&'static str, u64>,
+{
+    if buckets.get(name.as_ref().as_str())?.is_none() {
+        return Err(no_such_bucket(name));
+    }
+    Ok(())
+}
+
 /// Check that `upload_id` names an upload for exactly this bucket/key
 /// (a mismatched identity is `NoSuchUpload`).
 ///
@@ -186,10 +200,8 @@ impl Storage for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use tinio_core::{
-        BucketOps, ListObjectsParams, MultipartOps, ObjectOps, bucket, object,
-        testing::{assert_conformance, assert_send_sync, body},
-    };
+    use tinio_core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, bucket, object};
+    use tinio_util::testing::{assert_conformance, assert_send_sync, body};
 
     use super::*;
     use std::sync::Arc;

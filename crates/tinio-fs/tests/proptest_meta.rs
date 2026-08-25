@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use proptest::prelude::*;
 use tinio_core::{ETag, bucket, object};
-use tinio_fs::MetaStore;
+use tinio_fs::meta;
 
 proptest! {
     /// Arbitrary (valid) keys and ETag values round-trip exactly.
@@ -26,9 +26,9 @@ proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
-            let store = MetaStore::new(state.path());
+            let store = meta::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
-            store.set(&b, &key, &etag, size, mtime).await.unwrap();
+            store.set(&b, &key, &etag, size, mtime, 0).await.unwrap();
             let record = store.get(&b, &key).await.unwrap().unwrap();
             prop_assert_eq!(&record.key, &key);
             prop_assert_eq!(&record.etag, &etag);
@@ -49,10 +49,10 @@ proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
-            let store = MetaStore::new(state.path());
+            let store = meta::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            store.set(&b, &key, &etag, 1, SystemTime::UNIX_EPOCH).await.unwrap();
+            store.set(&b, &key, &etag, 1, SystemTime::UNIX_EPOCH, 0).await.unwrap();
             let record = store.get(&b, &key).await.unwrap().unwrap();
             prop_assert_eq!(record.etag, etag);
             Ok(())
@@ -68,7 +68,7 @@ proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
-            let store = MetaStore::new(state.path());
+            let store = meta::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("shared.txt").unwrap();
             let mut handles = Vec::new();
@@ -79,7 +79,7 @@ proptest! {
                 let payload = payload.clone();
                 handles.push(tokio::spawn(async move {
                     let etag = ETag::from_content(payload.as_bytes());
-                    store.set(&b, &key, &etag, payload.len() as u64, SystemTime::UNIX_EPOCH).await.unwrap();
+                    store.set(&b, &key, &etag, payload.len() as u64, SystemTime::UNIX_EPOCH, 0).await.unwrap();
                 }));
             }
             for h in handles {
@@ -92,6 +92,49 @@ proptest! {
                 p.len() as u64 == record.size && record.etag == ETag::from_content(p.as_bytes())
             });
             prop_assert!(ok, "final record {:?} matches no writer", record);
+            Ok(())
+        })?;
+    }
+}
+
+proptest! {
+    /// Concurrent writers on distinct keys never lose an entry: every
+    /// committed write is visible afterwards (the redb single writer
+    /// serializes them).
+    #[test]
+    fn concurrent_distinct_key_writes_all_persist(
+        keys in prop::collection::vec("[a-z0-9]{1,16}", 1..16),
+    ) {
+        // Deduplicate: "distinct keys" is the property under test.
+        let keys: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            keys.into_iter()
+                .filter(|k| seen.insert(k.clone()))
+                .collect()
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = tempfile::tempdir().unwrap();
+            let store = meta::store(state.path()).unwrap();
+            let b = bucket::name("data").unwrap();
+            let mut handles = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                let store = store.clone();
+                let b = b.clone();
+                let key = object::key(format!("{key}.txt")).unwrap();
+                handles.push(tokio::spawn(async move {
+                    let etag = ETag::new(&format!("{i:032x}")).unwrap();
+                    store
+                        .set(&b, &key, &etag, i as u64, SystemTime::UNIX_EPOCH, 0)
+                        .await
+                        .unwrap();
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            let records = store.walk(&b).await.unwrap();
+            prop_assert_eq!(records.len(), keys.len(), "every write persists");
             Ok(())
         })?;
     }

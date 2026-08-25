@@ -8,13 +8,16 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+derive_more = { workspace = true, features = ["full"] }
 futures.workspace = true
+garde = { workspace = true, features = ["derive"] }
 getset.workspace = true
 hex.workspace = true
 md-5.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-sha1.workspace = true
+moka = { workspace = true, features = ["sync", "atomic64"] }
+redb.workspace = true
+smart-default.workspace = true
+strict-path = { workspace = true, features = ["junctions"] }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["full"] }
@@ -22,6 +25,10 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 tinio-core.workspace = true
+tinio-util.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["async_tokio"] }
@@ -29,10 +36,14 @@ dhat.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
-tinio-core = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
 
 [[bench]]
 name = "streaming"
+harness = false
+
+[[bench]]
+name = "meta"
 harness = false
 
 [lints.rust]

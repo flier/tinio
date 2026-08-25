@@ -16,9 +16,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use tokio::sync::watch;
 
-use tinio_config::{AccessLogFormat, LogFormat, Verbosity};
-use tinio_fs::{FsOptions, FsStorage, Scanner, ScannerOptions, SweepOptions, Sweeper};
-use tinio_server::{Capabilities, DataPlane, log};
+use tinio_config::log;
+use tinio_fs::{FsOptions, FsStorage, Scanner, ScannerOptions, sweep};
+use tinio_server::{Capabilities, DataPlane, log as server_log};
 
 fn usage() -> ! {
     eprintln!("usage: serve <root> [--port N] [--address HOST:PORT]");
@@ -70,10 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Operational logs to stderr (info), access log to `<root>/.tinio/access.log`
     // (T052). The `[log]` config wiring lands with the US2 CLI.
     std::fs::create_dir_all(storage.state_dir())?;
-    let subscriber = log::build_subscriber(
-        Verbosity::Info,
-        LogFormat::Text,
-        &AccessLogFormat::Combined,
+    let subscriber = server_log::build_subscriber(
+        log::Verbosity::Info,
+        log::Format::Text,
+        &log::AccessFormat::Combined,
         &storage.state_dir().join("access.log"),
         None,
     )?;
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Async sweep (temp 24 h, multipart 7 d).
     let (sweep_tx, sweep_rx) = watch::channel(false);
-    let sweeper = Sweeper::new(storage.clone(), SweepOptions::default());
+    let sweeper = sweep::Sweeper::new(storage.clone(), sweep::Options::default());
     tokio::spawn(async move {
         sweeper.run(sweep_rx).await;
     });

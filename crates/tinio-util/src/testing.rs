@@ -7,14 +7,14 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! tinio-core = { workspace = true, features = ["testing"] }
+//! tinio-util = { workspace = true, features = ["testing"] }
 //! ```
 //!
 //! ```rust,ignore
 //! #[tokio::test]
 //! async fn conformance() {
 //!     let backend = MyBackend::new(...);
-//!     tinio_core::testing::assert_conformance(&backend).await;
+//!     tinio_util::testing::assert_conformance(&backend).await;
 //! }
 //! ```
 //!
@@ -37,7 +37,7 @@ use std::{
 use bytes::Bytes;
 use futures::StreamExt;
 
-use crate::{
+use tinio_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListObjectsParams, ListPartsParams,
     ListUploadsParams, Storage, bucket, object, storage, storage::Error::*,
 };
@@ -161,7 +161,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     let empty = object::key("empty").unwrap();
     let put = storage.put_object(b, &empty, body("")).await.unwrap();
     check(
-        put.etag == ETag::from_content(b""),
+        put.etag == ETag::EMPTY,
         "zero-byte object ETag must be the MD5 of empty content",
     );
     let head = storage.head_object(b, &empty).await.unwrap();
@@ -204,14 +204,20 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     check(got == data, "get must return the object byte-identical");
 
     // The two-phase write (stage + commit) equals a direct put.
-    let staged = storage.stage_body(b, &hello, body(data.to_vec())).await.unwrap();
+    let staged = storage
+        .stage_body(b, &hello, body(data.to_vec()))
+        .await
+        .unwrap();
     let put = storage.commit_object(b, &hello, staged).await.unwrap();
     check(
         put.etag == ETag::from_content(data),
         "staged commit ETag must be the content MD5",
     );
     let head = storage.head_object(b, &hello).await.unwrap();
-    check(head.size == data.len() as u64, "staged commit must overwrite");
+    check(
+        head.size == data.len() as u64,
+        "staged commit must overwrite",
+    );
 
     // Missing object.
     let missing = object::key("missing").unwrap();

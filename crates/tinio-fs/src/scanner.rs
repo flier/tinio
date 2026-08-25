@@ -26,7 +26,7 @@ use tinio_core::{
 };
 use tokio::sync::watch;
 
-use crate::{BackendError, FsCleanup, backend::FsStorage, error::Error, pacing};
+use crate::{FsCleanup, backend::FsStorage, error::Error, pacing};
 
 /// Entries per batch: after each batch the scanner yields and sleeps
 /// `delay`, so in-flight S3 requests preempt scanning (tuned by the T093
@@ -53,7 +53,7 @@ pub struct ScannerOptions {
 ///
 /// ```rust
 /// use std::time::Duration;
-/// use tinio_core::testing::body;
+/// use tinio_util::testing::body;
 /// use tinio_core::storage::{BucketOps, ObjectOps};
 /// use tinio_fs::{FsOptions, FsStorage, Scanner, ScannerOptions};
 ///
@@ -204,7 +204,7 @@ impl Scanner {
                 Ok((_, false)) => {}
                 // The file vanished (concurrent delete): nothing to
                 // reconcile — the orphan pass reclaims the entry.
-                Err(BackendError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
             batch += 1;
@@ -248,7 +248,7 @@ mod tests {
     use std::fs;
     use tinio_core::object;
     use tinio_core::storage::{BucketOps, ObjectOps};
-    use tinio_core::testing::body;
+    use tinio_util::testing::body;
 
     fn options() -> ScannerOptions {
         ScannerOptions {
@@ -392,6 +392,82 @@ mod tests {
                     .await
                     .unwrap()
                     .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn yields_between_entry_batches() {
+        // More than one batch of entries: the scan must yield and sleep
+        // between batches so in-flight S3 requests preempt scanning.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            fs::create_dir(root.path().join("data")).unwrap();
+            for i in 0..40 {
+                fs::write(
+                    root.path().join(format!("data/f{i:02}.txt")),
+                    format!("payload {i}"),
+                )
+                .unwrap();
+            }
+            let scanner = Scanner::new(storage.clone(), options());
+            let summary = scanner.scan_once().await.unwrap();
+            assert_eq!(summary.reconciled, 40);
+            assert_eq!(summary.recomputed, 40);
+            assert_eq!(
+                storage
+                    .meta_store()
+                    .walk(&bucket::name("data").unwrap())
+                    .await
+                    .unwrap()
+                    .len(),
+                40
+            );
+        });
+    }
+
+    #[test]
+    fn run_restarts_immediately_when_pass_exceeds_cycle() {
+        // A pass longer than the cycle budget restarts without sleeping;
+        // a shorter one sleeps. Either way the loop must keep making
+        // passes and stop promptly on shutdown.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            fs::create_dir(root.path().join("data")).unwrap();
+            for i in 0..40 {
+                fs::write(
+                    root.path().join(format!("data/f{i:02}.txt")),
+                    format!("payload {i}"),
+                )
+                .unwrap();
+            }
+            let scanner = Scanner::new(
+                storage.clone(),
+                ScannerOptions {
+                    enabled: true,
+                    delay: Duration::from_millis(1),
+                    max_wait: Duration::from_millis(10),
+                    cycle: Duration::from_millis(1),
+                },
+            );
+            let (tx, rx) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                scanner.run(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(true).unwrap();
+            task.await.unwrap();
+            // At least one full pass completed before shutdown.
+            assert_eq!(
+                storage
+                    .meta_store()
+                    .walk(&bucket::name("data").unwrap())
+                    .await
+                    .unwrap()
+                    .len(),
+                40
             );
         });
     }

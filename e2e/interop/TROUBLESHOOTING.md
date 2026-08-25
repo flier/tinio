@@ -67,24 +67,18 @@ Stop-Process -Id <pid> -Force     # or: taskkill /PID <pid> /F
 - Build into a separate target dir: `cargo build -p tinio-server --example serve --target-dir /tmp/tinio-e2e-build`, then pass `--server-binary /tmp/tinio-e2e-build/debug/examples/serve.exe`.
 - Run tests without building examples (the lingering exe only blocks example linking): `cargo test --workspace --all-features --lib --tests`.
 
-## 5. Environment: missing clients, boto3 venv, `python3` shim
+## 5. Environment: missing clients, boto3 venv
 
 - aws cli is not on `PATH` by default on Windows — prepend `C:\Program Files\Amazon\AWSCLIV2` (and the `mc` WinGet links dir) to `PATH` before running the scripts.
-- `boto3.sh` needs Python + boto3. Install into a throwaway venv (keep the system Python untouched):
+- `boto3.sh` runs inside an isolated venv (never the system python). Provision once — same convention as the Rust port (`crates/tinio-server/tests/boto3.rs`), `<target>/tinio-e2e-venv` with `TINIO_BOTO3_PYTHON` as the override:
 
   ```bash
-  python -m venv /tmp/tinio-e2e-venv
-  /tmp/tinio-e2e-venv/Scripts/pip install boto3
+  python3 -m venv target/tinio-e2e-venv
+  target/tinio-e2e-venv/Scripts/pip install boto3   # bin/pip on unix
+  ./e2e/interop/boto3.sh
   ```
 
-- The scripts invoke plain `python3`, but a Windows venv only ships `python.exe`. **Do not copy `python.exe` out of the venv** — it then fails with `failed to locate pyvenv.cfg`. Use a bash wrapper on `PATH`:
-
-  ```bash
-  printf '#!/usr/bin/env bash\nexec /tmp/tinio-e2e-venv/Scripts/python.exe "$@"\n' \
-    > /tmp/e2e-bin/python3 && chmod +x /tmp/e2e-bin/python3
-  PATH="/tmp/e2e-bin:$PATH" ./e2e/interop/boto3.sh ...
-  ```
-
+  The venv lives under `target/`, so `cargo clean` removes it — recreate when needed. When the venv python is missing, `boto3.sh` prints these provisioning instructions and exits 1.
 - Bucket names must be ≥ 3 characters (`s3api create-bucket --bucket t` answers `InvalidBucketName` — that is the client's own validation, not a server bug).
 
 ## 6. Diagnostics toolbox

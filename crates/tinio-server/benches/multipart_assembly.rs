@@ -12,9 +12,9 @@ use tinio_core::{
     multipart::CompletedPart,
     object,
     storage::{BucketOps, MultipartOps, ObjectOps},
-    testing::body,
 };
 use tinio_fs::{FsOptions, FsStorage};
+use tinio_util::testing::body;
 
 /// Part count of the assembly benchmark (each part 256 KiB → 64 MiB
 /// composed object).

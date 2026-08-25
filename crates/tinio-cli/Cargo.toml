@@ -20,7 +20,7 @@ tinio-server.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_Console"] }
 
 [dev-dependencies]
-tinio-core = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
 
 [features]
 default = ["api", "mem"]

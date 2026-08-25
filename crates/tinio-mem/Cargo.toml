@@ -17,7 +17,7 @@ uuid = { workspace = true, features = ["v4"] }
 tinio-core.workspace = true
 
 [dev-dependencies]
-tinio-core = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"

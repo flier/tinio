@@ -18,7 +18,7 @@ utoipa = { workspace = true, optional = true, features = ["axum_extras"] }
 tinio-core.workspace = true
 
 [dev-dependencies]
-tinio-core = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
 
 [features]
 default = []

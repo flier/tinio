@@ -10,9 +10,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use tinio_core::{
     bucket, object,
     storage::{BucketOps, ListObjectsParams, ObjectOps},
-    testing::body,
 };
 use tinio_fs::{FsOptions, FsStorage};
+use tinio_util::testing::body;
 
 /// Tree shape: 4 prefixes × 1000 objects each + 500 flat objects.
 const PREFIXES: usize = 4;

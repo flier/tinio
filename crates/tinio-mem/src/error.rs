@@ -142,6 +142,12 @@ pub(crate) fn no_such_upload(upload_id: &str) -> Error {
     Error::Storage(storage::no_such_upload(upload_id))
 }
 
+/// A key cannot be stored (folder markers as multipart targets).
+#[inline]
+pub(crate) fn invalid_key(key: String) -> Error {
+    Error::Storage(storage::invalid_key(key))
+}
+
 /// The entity already exists (e.g. bucket creation on an existing name).
 #[inline]
 pub(crate) fn already_exists(name: &bucket::Name) -> Error {
@@ -233,7 +239,7 @@ pub(crate) fn database_commit(err: redb::CommitError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tinio_core::testing::assert_send_sync;
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn displays_wrapped_contract_errors() {

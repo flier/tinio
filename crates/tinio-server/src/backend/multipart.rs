@@ -19,7 +19,7 @@ use tinio_core::{
     storage::{ListPartsParams, ListUploadsParams, Storage},
 };
 
-use crate::backend::{S3Backend, map_backend_error};
+use crate::backend::{ConditionalHeaders, S3Backend, map_backend_error};
 
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
@@ -128,15 +128,13 @@ impl<S: Storage> S3Backend<S> {
             .get_object(&src_bucket, &src_key, range)
             .await
             .map_err(map_backend_error)?;
-        Self::check_conditions(
-            &get.info.etag,
-            get.info.last_modified,
+        ConditionalHeaders::new(
             req.input.copy_source_if_match.as_ref(),
             req.input.copy_source_if_none_match.as_ref(),
             req.input.copy_source_if_modified_since,
             req.input.copy_source_if_unmodified_since,
-            true,
-        )?;
+        )
+        .check(&get.info.etag, get.info.last_modified, true)?;
         let part = self
             .storage
             .upload_part(&bucket, &key, &upload_id, part_number, get.body)
@@ -332,11 +330,11 @@ mod tests {
     use crate::backend::testutil::{s3_request, setup};
     use s3s::S3;
     use tinio_core::storage::{BucketOps, ObjectOps};
-    #[cfg(feature = "copy")]
-    use tinio_core::testing::body;
-    use tinio_core::testing::read_body;
     use tinio_core::{bucket, object};
     use tinio_mem::MemoryStorage;
+    #[cfg(feature = "copy")]
+    use tinio_util::testing::body;
+    use tinio_util::testing::read_body;
 
     #[cfg(feature = "multipart")]
     #[tokio::test]

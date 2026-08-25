@@ -24,11 +24,11 @@ use std::{
 use futures::StreamExt;
 use tinio_core::{
     bucket,
-    object::{self, Info, Key},
+    object::{self, Info},
     storage::{self, ListObjectsParams, ObjectListing, group_and_paginate},
 };
 
-use crate::{Error, meta::MetaStore, path::STATE_DIR_NAME};
+use crate::{Error, meta, path::STATE_DIR_NAME};
 
 /// Bounded parallelism for the per-object ETag resolution of one listing
 /// page (the recompute-on-stale pass can hash large files).
@@ -40,12 +40,12 @@ const ETAG_CONCURRENCY: usize = 16;
 ///
 /// ```rust
 /// use tinio_core::{bucket, storage::ListObjectsParams};
-/// use tinio_fs::{FsListing, MetaStore};
+/// use tinio_fs::{FsListing, meta};
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let state = tempfile::tempdir().unwrap();
-/// let meta = MetaStore::new(state.path());
-/// let listing = FsListing::new(root.path(), meta, true);
+/// let store = meta::store(state.path()).unwrap();
+/// let listing = FsListing::new(root.path(), store, true);
 /// tokio::runtime::Runtime::new().unwrap().block_on(async {
 ///     let b = bucket::name("data").unwrap();
 ///     std::fs::create_dir(root.path().join("data")).unwrap();
@@ -71,7 +71,7 @@ pub struct FsListing {
     /// Storage root (bucket dirs at the top level).
     root: PathBuf,
     /// The meta store (ETags; recompute-on-stale during the walk).
-    meta: MetaStore,
+    meta: meta::Store,
     /// Exclude symlink entries (and do not descend symlink dirs) when
     /// `follow_symlinks` is disabled.
     follow_symlinks: bool,
@@ -79,7 +79,7 @@ pub struct FsListing {
 
 impl FsListing {
     /// Create a listing over `root`.
-    pub fn new(root: &Path, meta: MetaStore, follow_symlinks: bool) -> Self {
+    pub fn new(root: &Path, meta: meta::Store, follow_symlinks: bool) -> Self {
         Self {
             root: root.to_path_buf(),
             meta,
@@ -111,8 +111,8 @@ impl FsListing {
         // small meta read, a full content hash when stale (the
         // recompute-on-stale pass is bounded to the page).
         let mut objects: Vec<Info> = Vec::with_capacity(page.len());
-        let mut tasks = futures::stream::iter(page.into_iter().map(
-            |(key, path, size, mtime)| async move {
+        let mut tasks =
+            futures::stream::iter(page.into_iter().map(|(key, path, size, mtime)| async move {
                 let etag = match self
                     .meta
                     .etag_for_file(&params.bucket, &key, &path, size, mtime)
@@ -133,9 +133,8 @@ impl FsListing {
                     last_modified: mtime,
                     etag,
                 }))
-            },
-        ))
-        .buffer_unordered(ETAG_CONCURRENCY);
+            }))
+            .buffer_unordered(ETAG_CONCURRENCY);
         while let Some(item) = tasks.next().await {
             if let Some(info) = item? {
                 objects.push(info);
@@ -166,7 +165,7 @@ impl FsListing {
         &self,
         bucket: &bucket::Name,
         key_prefix: &str,
-    ) -> Result<Vec<(Key, PathBuf, u64, SystemTime)>, Error> {
+    ) -> Result<Vec<(object::Key, PathBuf, u64, SystemTime)>, Error> {
         let bucket_dir = self.root.join(&**bucket);
         let mut out = Vec::new();
         let bucket_meta = match tokio::fs::symlink_metadata(&bucket_dir).await {
@@ -301,7 +300,7 @@ mod tests {
     use std::fs;
     use tinio_core::storage::Error::NoSuchBucket;
     use tinio_core::storage::ListObjectsParams;
-    use tinio_core::testing::etag;
+    use tinio_util::testing::etag;
 
     fn fixture() -> (
         tempfile::TempDir,
@@ -318,7 +317,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, format!("{key}!")).unwrap();
         }
-        let listing = FsListing::new(root.path(), MetaStore::new(state.path()), true);
+        let listing = FsListing::new(root.path(), meta::store(state.path()).unwrap(), true);
         (root, state, listing, b)
     }
 
@@ -510,13 +509,14 @@ mod tests {
                     root.path().join("data/link.txt"),
                 )
                 .unwrap();
-                let listing = FsListing::new(root.path(), MetaStore::new(state.path()), false);
+                let listing =
+                    FsListing::new(root.path(), meta::store(state.path()).unwrap(), false);
                 let page = listing
                     .list(&params(&b, "", None, None, 1000))
                     .await
                     .unwrap();
                 assert!(!page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
-                let listing = FsListing::new(root.path(), MetaStore::new(state.path()), true);
+                let listing = FsListing::new(root.path(), meta::store(state.path()).unwrap(), true);
                 let page = listing
                     .list(&params(&b, "", None, None, 1000))
                     .await
@@ -553,7 +553,7 @@ mod tests {
             let outside = tempfile::tempdir().unwrap();
             fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
             link_directory(outside.path(), &root.path().join("data"));
-            let listing = FsListing::new(root.path(), MetaStore::new(state.path()), false);
+            let listing = FsListing::new(root.path(), meta::store(state.path()).unwrap(), false);
             let b = bucket::name("data").unwrap();
             let page = listing
                 .list(&params(&b, "", None, None, 1000))
@@ -605,6 +605,97 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!page.objects.iter().any(|o| o.key.as_ref() == "empty-dir"));
+        });
+    }
+
+    #[test]
+    fn prefix_prunes_whole_subtrees() {
+        // A directory neither inside the prefix nor an ancestor of it can
+        // never hold a matching key — the walk must skip the subtree, not
+        // descend into it (a `max_keys=1` listing of a huge bucket costs
+        // only the prefix's directories).
+        rt(async {
+            let (_root, _state, listing, b) = fixture();
+            let page = listing
+                .list(&params(&b, "b.txt", None, None, 1000))
+                .await
+                .unwrap();
+            let keys: Vec<&str> = page
+                .objects
+                .iter()
+                .map(|o| o.key.as_ref().as_str())
+                .collect();
+            assert_eq!(keys, ["b.txt"], "dir/ subtree must be pruned");
+            // An ancestor prefix still descends (dir/ is an ancestor of
+            // dir/sub/): the sub-tree is not pruned away.
+            let page = listing
+                .list(&params(&b, "dir/sub/d", None, None, 1000))
+                .await
+                .unwrap();
+            let keys: Vec<&str> = page
+                .objects
+                .iter()
+                .map(|o| o.key.as_ref().as_str())
+                .collect();
+            assert_eq!(keys, ["dir/sub/d.txt"]);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_bucket_symlink_is_no_such_bucket() {
+        // With following enabled the bucket dir is canonicalized; a link
+        // whose target is gone resolves to nothing — a bucket, not an
+        // empty listing.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(root.path().join("gone"), root.path().join("data")).unwrap();
+            let listing = FsListing::new(root.path(), meta::store(state.path()).unwrap(), true);
+            let b = bucket::name("data").unwrap();
+            let err = listing
+                .list(&params(&b, "", None, None, 1000))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_symlink_targets_descend_once() {
+        // Two directory links to the SAME target must not be walked
+        // twice: the visited-target set skips the second (a link pointing
+        // at an ancestor would otherwise loop forever).
+        rt(async {
+            let (root, _state, listing, b) = fixture();
+            std::os::unix::fs::symlink(
+                root.path().join("data/dir"),
+                root.path().join("data/link1"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                root.path().join("data/dir"),
+                root.path().join("data/link2"),
+            )
+            .unwrap();
+            let page = listing
+                .list(&params(&b, "", None, None, 1000))
+                .await
+                .unwrap();
+            let keys: Vec<&str> = page
+                .objects
+                .iter()
+                .map(|o| o.key.as_ref().as_str())
+                .collect();
+            assert!(
+                !keys.iter().any(|k| k.starts_with("link2/")),
+                "second link to the same target must be skipped: {keys:?}"
+            );
+            assert!(
+                keys.iter().any(|k| k.starts_with("link1/")),
+                "first link is a real object path: {keys:?}"
+            );
         });
     }
 }

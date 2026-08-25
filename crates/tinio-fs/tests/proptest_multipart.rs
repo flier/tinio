@@ -13,9 +13,9 @@ use tinio_core::{
     ETag, bucket,
     multipart::{CompletedPart, PartInfo, PartNumber},
     object,
-    testing::body,
 };
-use tinio_fs::MultipartStore;
+use tinio_fs::multipart;
+use tinio_util::testing::body;
 
 /// Independent reference composition: MD5 of the raw part digests
 /// concatenated, then `-N` (the AWS composition, computed here from
@@ -38,7 +38,7 @@ proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
-            let store = MultipartStore::new(state.path());
+            let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
             let upload = store.create(&b, &key).await.unwrap();
@@ -73,11 +73,13 @@ proptest! {
             tokio::fs::rename(&temp, &target).await.unwrap();
             let assembled = tokio::fs::read(&target).await.unwrap();
             prop_assert_eq!(&assembled, &expected);
-            // The upload consumed: abort is now NoSuchUpload.
+            // The caller renames, then consumes; the upload is gone and
+            // abort is now NoSuchUpload.
+            store.consume(&b, &upload.upload_id).await.unwrap();
             let err = store.abort(&b, &key, &upload.upload_id).await.unwrap_err();
             prop_assert!(matches!(
                 err,
-                tinio_fs::BackendError::Storage(tinio_core::storage::Error::NoSuchUpload(_))
+                tinio_fs::Error::Storage(tinio_core::storage::Error::NoSuchUpload(_))
             ));
             Ok(())
         })?;
@@ -90,7 +92,7 @@ proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
-            let store = MultipartStore::new(state.path());
+            let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
             let upload = store.create(&b, &key).await.unwrap();
@@ -100,7 +102,7 @@ proptest! {
             let p2 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(second_data.clone())).await.unwrap();
             prop_assert_eq!(p1.part_number, p2.part_number);
             // The stored part is the second write.
-            let (listed, truncated) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();
+            let (listed, truncated, _) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();
             prop_assert!(!truncated);
             prop_assert_eq!(listed.len(), 1);
             prop_assert_eq!(&listed[0].etag, &ETag::from_content(&second_data));
@@ -130,7 +132,7 @@ proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
-            let store = MultipartStore::new(state.path());
+            let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
             let upload = store.create(&b, &key).await.unwrap();
@@ -139,7 +141,7 @@ proptest! {
             let part = store.put_part(&b, &key, &upload.upload_id, pn, body(b"x")).await.unwrap();
             prop_assert_eq!(u32::from(part.part_number), n);
             // A part at the extreme edge is listable.
-            let (listed, _) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();
+            let (listed, _, _) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();
             prop_assert!(listed.iter().any(|p| u32::from(p.part_number) == n));
             let _ = SystemTime::now();
             Ok(())

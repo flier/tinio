@@ -72,11 +72,7 @@ pub fn group_and_paginate<T>(
         };
         // The marker is exclusive-after: rolled-up entries compare with
         // their prefix string, objects with their key.
-        let compare = if entry.1 {
-            entry.0.as_str()
-        } else {
-            key
-        };
+        let compare = if entry.1 { entry.0.as_str() } else { key };
         if marker.is_some_and(|after| compare <= after) {
             continue;
         }

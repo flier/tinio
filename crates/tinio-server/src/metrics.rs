@@ -167,8 +167,14 @@ mod tests {
     use super::*;
     use prometheus::Encoder;
 
+    /// Serializes the tests that mutate the shared, label-less
+    /// `STORAGE_MULTIPART_IN_PROGRESS` gauge — parallel interleaving would
+    /// clobber the exact-value asserts.
+    static MULTIPART_GAUGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn registers_all_families() {
+        let _guard = MULTIPART_GAUGE.lock().unwrap();
         // gather() only emits families with samples — record one of each
         // label-bearing family first.
         record_http_request("FAM", 200, Duration::from_millis(1));
@@ -236,6 +242,279 @@ mod tests {
             text.contains(r#"tinio_s3_operations_total{op="IncGetObject",status="200"} 1"#),
             "{text}"
         );
+    }
+
+    #[test]
+    fn multipart_in_progress_dec_saturates_at_zero() {
+        let _guard = MULTIPART_GAUGE.lock().unwrap();
+        // After a restart the persisted uploads are not counted — a dec
+        // on an empty gauge must not drive it negative.
+        STORAGE_MULTIPART_IN_PROGRESS.set(0);
+        multipart_in_progress_dec();
+        assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 0);
+        STORAGE_MULTIPART_IN_PROGRESS.set(3);
+        multipart_in_progress_dec();
+        assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 2);
+    }
+
+    /// A minimal `S3` whose bucket/multipart operations answer per mode —
+    /// every other operation inherits the trait default (NotImplemented).
+    #[derive(Clone, Copy)]
+    struct FakeS3 {
+        mode: FakeMode,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeMode {
+        Ok,
+        NoSuchBucket,
+        InternalError,
+        NotImplemented,
+    }
+
+    #[async_trait]
+    impl S3 for FakeS3 {
+        async fn create_bucket(
+            &self,
+            _req: S3Request<dto::CreateBucketInput>,
+        ) -> S3Result<S3Response<dto::CreateBucketOutput>> {
+            match self.mode {
+                FakeMode::Ok => Ok(S3Response::new(dto::CreateBucketOutput::default())),
+                FakeMode::NoSuchBucket => Err(s3s::s3_error!(NoSuchBucket, "no such bucket")),
+                FakeMode::InternalError => Err(s3s::s3_error!(InternalError, "boom")),
+                FakeMode::NotImplemented => Err(s3s::s3_error!(NotImplemented, "nope")),
+            }
+        }
+
+        async fn create_multipart_upload(
+            &self,
+            _req: S3Request<dto::CreateMultipartUploadInput>,
+        ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
+            Ok(S3Response::new(dto::CreateMultipartUploadOutput::default()))
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            _req: S3Request<dto::CompleteMultipartUploadInput>,
+        ) -> S3Result<S3Response<dto::CompleteMultipartUploadOutput>> {
+            Ok(S3Response::new(
+                dto::CompleteMultipartUploadOutput::default(),
+            ))
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _req: S3Request<dto::AbortMultipartUploadInput>,
+        ) -> S3Result<S3Response<dto::AbortMultipartUploadOutput>> {
+            Ok(S3Response::new(dto::AbortMultipartUploadOutput::default()))
+        }
+    }
+
+    fn request<T>(input: T) -> S3Request<T> {
+        S3Request {
+            input,
+            method: http::Method::PUT,
+            uri: http::Uri::default(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn s3_counter(op: &str, status: u16) -> u64 {
+        S3_OPERATIONS
+            .with_label_values(&[op, &status.to_string()])
+            .get()
+    }
+
+    #[test]
+    fn metric_s3_records_status_classes() {
+        // Ok → 200; a generic client error → 400; InternalError → 500;
+        // the trait default (NotImplemented) → 501.
+        for (mode, _status) in [
+            (FakeMode::Ok, 200),
+            (FakeMode::NoSuchBucket, 400),
+            (FakeMode::InternalError, 500),
+            (FakeMode::NotImplemented, 501),
+        ] {
+            let backend = MetricS3::new(FakeS3 { mode });
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _ = rt.block_on(backend.create_bucket(request(dto::CreateBucketInput::default())));
+        }
+        assert_eq!(s3_counter("CreateBucket", 200), 1);
+        assert_eq!(s3_counter("CreateBucket", 400), 1);
+        assert_eq!(s3_counter("CreateBucket", 500), 1);
+        assert_eq!(s3_counter("CreateBucket", 501), 1);
+    }
+
+    #[test]
+    fn metric_s3_maintains_multipart_gauge() {
+        let _guard = MULTIPART_GAUGE.lock().unwrap();
+        STORAGE_MULTIPART_IN_PROGRESS.set(0);
+        let backend = MetricS3::new(FakeS3 { mode: FakeMode::Ok });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(
+            backend.create_multipart_upload(request(dto::CreateMultipartUploadInput::default())),
+        )
+        .unwrap();
+        assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 1);
+        rt.block_on(
+            backend
+                .complete_multipart_upload(request(dto::CompleteMultipartUploadInput::default())),
+        )
+        .unwrap();
+        assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 0);
+        // An abort on an empty gauge must not go negative (saturating).
+        rt.block_on(
+            backend.abort_multipart_upload(request(dto::AbortMultipartUploadInput::default())),
+        )
+        .unwrap();
+        assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 0);
+    }
+
+    #[test]
+    fn metric_s3_records_every_delegated_operation() {
+        // Every thin wrapper must route through `record` — the fake
+        // answers the trait default (NotImplemented → 501) for every op
+        // it does not override, so each delegation line is exercised.
+        let backend = MetricS3::new(FakeS3 {
+            mode: FakeMode::NotImplemented,
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        macro_rules! call {
+            ($op:ident, $input:ty) => {
+                let _ = rt.block_on(backend.$op(request(<$input>::default())));
+            };
+        }
+        call!(delete_bucket, dto::DeleteBucketInput);
+        call!(head_bucket, dto::HeadBucketInput);
+        call!(list_buckets, dto::ListBucketsInput);
+        call!(get_bucket_location, dto::GetBucketLocationInput);
+        call!(put_object, dto::PutObjectInput);
+        call!(get_object, dto::GetObjectInput);
+        call!(head_object, dto::HeadObjectInput);
+        call!(delete_object, dto::DeleteObjectInput);
+        call!(get_object_tagging, dto::GetObjectTaggingInput);
+        call!(upload_part, dto::UploadPartInput);
+        #[cfg(feature = "list-v1")]
+        call!(list_objects, dto::ListObjectsInput);
+        #[cfg(feature = "list-v2")]
+        call!(list_objects_v2, dto::ListObjectsV2Input);
+        call!(list_parts, dto::ListPartsInput);
+        call!(list_multipart_uploads, dto::ListMultipartUploadsInput);
+        // These three inputs have required fields (no Default) — built
+        // explicitly with every field.
+        #[cfg(feature = "copy")]
+        {
+            let copy_source = dto::CopySource::parse("src/key").unwrap();
+            let _ = rt.block_on(backend.copy_object(request(dto::CopyObjectInput {
+                bucket: "b".into(),
+                key: "k".into(),
+                copy_source,
+                acl: None,
+                bucket_key_enabled: None,
+                cache_control: None,
+                checksum_algorithm: None,
+                content_disposition: None,
+                content_encoding: None,
+                content_language: None,
+                content_type: None,
+                copy_source_if_match: None,
+                copy_source_if_modified_since: None,
+                copy_source_if_none_match: None,
+                copy_source_if_unmodified_since: None,
+                copy_source_sse_customer_algorithm: None,
+                copy_source_sse_customer_key: None,
+                copy_source_sse_customer_key_md5: None,
+                expected_bucket_owner: None,
+                expected_source_bucket_owner: None,
+                expires: None,
+                grant_full_control: None,
+                grant_read: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                metadata: None,
+                metadata_directive: None,
+                object_lock_legal_hold_status: None,
+                object_lock_mode: None,
+                object_lock_retain_until_date: None,
+                request_payer: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                ssekms_encryption_context: None,
+                ssekms_key_id: None,
+                server_side_encryption: None,
+                storage_class: None,
+                tagging: None,
+                tagging_directive: None,
+                website_redirect_location: None,
+            })));
+            let _ = rt.block_on(backend.upload_part_copy(request(dto::UploadPartCopyInput {
+                bucket: "b".into(),
+                key: "k".into(),
+                copy_source: dto::CopySource::parse("src/key").unwrap(),
+                part_number: 1,
+                upload_id: "u".into(),
+                copy_source_if_match: None,
+                copy_source_if_modified_since: None,
+                copy_source_if_none_match: None,
+                copy_source_if_unmodified_since: None,
+                copy_source_range: None,
+                copy_source_sse_customer_algorithm: None,
+                copy_source_sse_customer_key: None,
+                copy_source_sse_customer_key_md5: None,
+                expected_bucket_owner: None,
+                expected_source_bucket_owner: None,
+                request_payer: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+            })));
+        }
+        let _ = rt.block_on(backend.delete_objects(request(dto::DeleteObjectsInput {
+            bucket: "b".into(),
+            delete: dto::Delete::default(),
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
+        })));
+        let recorded: Vec<&str> = [
+            "DeleteBucket",
+            "HeadBucket",
+            "ListBuckets",
+            "GetBucketLocation",
+            "PutObject",
+            "GetObject",
+            "HeadObject",
+            "DeleteObject",
+            "DeleteObjects",
+            "GetObjectTagging",
+            "UploadPart",
+            "ListParts",
+            "ListMultipartUploads",
+        ]
+        .into_iter()
+        .filter(|op| s3_counter(op, 501) == 1)
+        .collect();
+        // All 13 unconditional ops recorded exactly one 501 (the
+        // feature-gated ones are asserted under cfg below to keep the
+        // baseline feature-independent).
+        assert_eq!(recorded.len(), 13, "{recorded:?}");
+        #[cfg(feature = "copy")]
+        {
+            assert_eq!(s3_counter("CopyObject", 501), 1);
+            assert_eq!(s3_counter("UploadPartCopy", 501), 1);
+        }
+        #[cfg(feature = "list-v1")]
+        assert_eq!(s3_counter("ListObjects", 501), 1);
+        #[cfg(feature = "list-v2")]
+        assert_eq!(s3_counter("ListObjectsV2", 501), 1);
     }
 }
 
@@ -334,8 +613,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         &self,
         req: S3Request<dto::HeadBucketInput>,
     ) -> S3Result<S3Response<dto::HeadBucketOutput>> {
-        self.record("HeadBucket", self.inner.head_bucket(req))
-            .await
+        self.record("HeadBucket", self.inner.head_bucket(req)).await
     }
     async fn list_buckets(
         &self,
@@ -357,22 +635,19 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         &self,
         req: S3Request<dto::PutObjectInput>,
     ) -> S3Result<S3Response<dto::PutObjectOutput>> {
-        self.record("PutObject", self.inner.put_object(req))
-            .await
+        self.record("PutObject", self.inner.put_object(req)).await
     }
     async fn get_object(
         &self,
         req: S3Request<dto::GetObjectInput>,
     ) -> S3Result<S3Response<dto::GetObjectOutput>> {
-        self.record("GetObject", self.inner.get_object(req))
-            .await
+        self.record("GetObject", self.inner.get_object(req)).await
     }
     async fn head_object(
         &self,
         req: S3Request<dto::HeadObjectInput>,
     ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
-        self.record("HeadObject", self.inner.head_object(req))
-            .await
+        self.record("HeadObject", self.inner.head_object(req)).await
     }
     async fn delete_object(
         &self,
@@ -401,8 +676,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         &self,
         req: S3Request<dto::CopyObjectInput>,
     ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
-        self.record("CopyObject", self.inner.copy_object(req))
-            .await
+        self.record("CopyObject", self.inner.copy_object(req)).await
     }
 
     // --- listing ---
@@ -445,8 +719,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         &self,
         req: S3Request<dto::UploadPartInput>,
     ) -> S3Result<S3Response<dto::UploadPartOutput>> {
-        self.record("UploadPart", self.inner.upload_part(req))
-            .await
+        self.record("UploadPart", self.inner.upload_part(req)).await
     }
     #[cfg(feature = "multipart")]
     #[cfg(feature = "copy")]
@@ -494,8 +767,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         &self,
         req: S3Request<dto::ListPartsInput>,
     ) -> S3Result<S3Response<dto::ListPartsOutput>> {
-        self.record("ListParts", self.inner.list_parts(req))
-            .await
+        self.record("ListParts", self.inner.list_parts(req)).await
     }
     #[cfg(feature = "multipart")]
     async fn list_multipart_uploads(

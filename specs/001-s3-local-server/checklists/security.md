@@ -25,7 +25,7 @@
 - [x] CHK009 Are the any-depth `.tinio` reserved-segment behaviors consistent across write (AccessDenied), read (NoSuchKey), and listing (skipped)? [Consistency, Spec §FR-020]
 - [x] CHK010 Is the nested-storage-root isolation requirement explicit — an outer root must never serve an inner root's `.tinio/` (which holds credentials)? [Coverage, Spec §Edge Cases]
 - [x] CHK011 Is the boundary between universal key rules (traversal, absolute paths, control characters) and platform charset rules (Windows-invalid characters) clearly drawn? [Clarity, Spec §Clarifications]
-- [x] CHK012 Is the symlink policy requirement complete — followed by default, disableable, rejected + excluded from listings when disabled, out-of-root links documented as acceptable? [Completeness, Spec §Clarifications, §Edge Cases]
+- [x] CHK012 Is the symlink policy requirement complete — **rejected by default** (secure default: a link inside a bucket cannot escape the storage root), opt-in follow, rejected + excluded from listings when disabled, out-of-root links documented as acceptable when followed? [Completeness, Spec §Clarifications, §Edge Cases]
 - [x] CHK013 Are traversal attempts and invalid keys covered by automated verification requirements (SC-004's edge-case suite)? [Measurability, Spec §SC-004]
 
 ## Credential & Secret Management

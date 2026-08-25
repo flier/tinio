@@ -135,7 +135,7 @@ pub struct PartInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::assert_send_sync;
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn part_info_round_trip() {

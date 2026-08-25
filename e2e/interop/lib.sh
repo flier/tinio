@@ -24,8 +24,28 @@ done
 SCRATCH="$(mktemp -d)"
 mkdir -p "$SCRATCH/root"
 # Stop the running server (idempotent).
+# On Git Bash/MSYS `$!` is not the MSYS pid of a native Windows process and
+# `kill` is a no-op, so the server leaks (TROUBLESHOOTING §4). Resolve real
+# pids by command line; on Linux `ps -W` does not exist and we fall back to
+# the `$!` pid.
 stop_server() {
-    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
+    local pids
+    pids="$(ps -W 2>/dev/null | awk '/debug[\\/]examples[\\/]serve/ {print $1}')" || true
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
+        # MSYS kill (TerminateProcess) is asynchronous: wait until the
+        # processes are gone so the redb lock is released before a
+        # sibling server starts on the same root (advanced.sh restarts
+        # on one root; without the wait it fails DatabaseAlreadyOpen).
+        for _ in $(seq 1 50); do
+            if ! ps -W 2>/dev/null | grep -q '/debug/examples/serve'; then
+                break
+            fi
+            sleep 0.1
+        done
+    else
+        [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
+    fi
     SERVER_PID=""
 }
 cleanup() {
@@ -78,7 +98,12 @@ start_server() {
     if [[ -z "$endpoint" ]]; then
         echo "server did not start:" >&2
         cat "$log" >&2
-        exit 1
+        # `return`, not `exit`: this function runs inside a command
+        # substitution — an `exit` here would only exit the subshell (its
+        # propagation to the parent depends on bash's set -e quirks). The
+        # caller's `|| exit 1` after the substitution is the explicit,
+        # version-independent failure path.
+        return 1
     fi
     echo "$endpoint"
 }

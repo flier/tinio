@@ -9,7 +9,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # --- multipart: > 8 MiB file → composed ETag "md5-N" -----------------------
-ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log" 1)"
+ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log" 1)" || exit 1
 echo "server on $ENDPOINT"
 AWS="aws --endpoint-url http://$ENDPOINT --region us-east-1"
 run $AWS s3 mb "s3://adv-bucket"
@@ -41,7 +41,7 @@ grep -q "file-50.txt" "$SCRATCH/out.log" || { echo "cold listing missing files" 
 stop_server
 
 # --- cold listing (scanner OFF) --------------------------------------------
-ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server2.log" 0)"
+ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server2.log" 0)" || exit 1
 echo "server (no scanner) on $ENDPOINT"
 AWS="aws --endpoint-url http://$ENDPOINT --region us-east-1"
 run $AWS s3 ls "s3://cold-bucket/"

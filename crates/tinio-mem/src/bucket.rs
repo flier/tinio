@@ -46,13 +46,19 @@ impl BucketOps for MemoryStorage {
             }
             // In-progress multipart uploads are bucket-level state — S3
             // answers BucketNotEmpty for them too. The compound UPLOADS key
-            // (`bucket\0...`) makes this a bounded range probe.
+            // (`bucket\0...`) makes this a bounded range probe; the first
+            // key must belong to THIS bucket (`\0` sorts below every
+            // bucket-name character, so the probe's first entry can be a
+            // later bucket's upload — the OBJECTS probe above guards, the
+            // UPLOADS probe must too).
             let uploads = txn.open_table(UPLOADS)?;
             let upload_prefix = format!("{}\0", name.as_ref().as_str());
             let mut uploads_range = uploads.range(upload_prefix.as_str()..)?;
             if let Some(entry) = uploads_range.next() {
-                entry?;
-                return Err(not_empty(name));
+                let (k, _) = entry?;
+                if k.value().starts_with(&upload_prefix) {
+                    return Err(not_empty(name));
+                }
             }
             let mut buckets = txn.open_table(BUCKETS)?;
             if buckets.remove(name.as_ref().as_str())?.is_none() {
@@ -95,7 +101,8 @@ impl BucketOps for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use tinio_core::{MultipartOps, ObjectOps, bucket, object, storage::Error::*, testing::body};
+    use tinio_core::{MultipartOps, ObjectOps, bucket, object, storage::Error::*};
+    use tinio_util::testing::body;
 
     use super::*;
 

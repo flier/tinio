@@ -124,7 +124,12 @@ impl DataPlane {
 }
 
 /// The boxed future every service call returns.
-type ServiceFuture = Pin<Box<dyn Future<Output = Result<Response<CountingBody<S3Body>>, Box<dyn StdError + Send + Sync>>> + Send>>;
+type ServiceFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Response<CountingBody<S3Body>>, Box<dyn StdError + Send + Sync>>>
+            + Send,
+    >,
+>;
 
 /// Attach the peer address to the service (the middleware needs it for the
 /// access log).
@@ -390,13 +395,51 @@ fn strip_query(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body::Body as _;
+
+    /// A minimal [`http_body::Body`] serving in-memory chunks.
+    struct VecBody {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl VecBody {
+        fn new(chunks: &[&'static [u8]]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| Bytes::from_static(c)).collect(),
+            }
+        }
+    }
+
+    impl http_body::Body for VecBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.chunks.pop_front() {
+                Some(data) => Poll::Ready(Some(Ok(http_body::Frame::data(data)))),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    fn cx() -> Context<'static> {
+        Context::from_waker(futures::task::noop_waker_ref())
+    }
+
+    fn drain(body: &mut CountingBody<VecBody>) -> u64 {
+        let mut pin = Pin::new(body);
+        while let Poll::Ready(Some(Ok(_))) = pin.as_mut().poll_frame(&mut cx()) {}
+        pin.counter.load(Ordering::Relaxed)
+    }
 
     #[test]
     fn request_line_drops_query_string() {
-        let uri: http::Uri =
-            "/bucket/key?X-Amz-Signature=secret&X-Amz-Credential=AKID"
-                .parse()
-                .unwrap();
+        let uri: http::Uri = "/bucket/key?X-Amz-Signature=secret&X-Amz-Credential=AKID"
+            .parse()
+            .unwrap();
         assert_eq!(request_line("GET", &uri), "GET /bucket/key HTTP/1.1");
     }
 
@@ -407,5 +450,70 @@ mod tests {
             "https://example/x"
         );
         assert_eq!(strip_query("-"), "-");
+    }
+
+    #[test]
+    fn nginx_time_is_formatted_like_nginx() {
+        // `23/Aug/2026:12:00:00 +0000` — fixed 26-char shape.
+        let t = nginx_time();
+        assert_eq!(t.len(), 26, "{t}");
+        assert_eq!(&t[2..3], "/");
+        assert_eq!(&t[6..7], "/");
+        assert_eq!(&t[11..12], ":");
+        assert!(t.ends_with(" +0000"), "{t}");
+    }
+
+    #[test]
+    fn counting_body_records_download_bytes_exactly_once() {
+        // Scenarios are serialized inside one test — the gauge is global,
+        // and parallel tests would clobber each other's deltas.
+
+        // (1) A fully-drained download records its total once.
+        let before = metrics::STORAGE_DOWNLOAD_BYTES.get();
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut body = CountingBody::new(
+            VecBody::new(&[b"he", b"llo", b" world"]),
+            Arc::clone(&counter),
+            CountingKind::Download,
+        );
+        assert_eq!(drain(&mut body), 11);
+        assert_eq!(metrics::STORAGE_DOWNLOAD_BYTES.get(), before + 11);
+        // The Drop must not record the same stream twice.
+        drop(body);
+        assert_eq!(metrics::STORAGE_DOWNLOAD_BYTES.get(), before + 11);
+
+        // (2) A stream dropped mid-flight records what already flowed.
+        let before = metrics::STORAGE_DOWNLOAD_BYTES.get();
+        let counter = Arc::new(AtomicU64::new(0));
+        let body = CountingBody::new(
+            VecBody::new(&[b"abc", b"def"]),
+            counter.clone(),
+            CountingKind::Download,
+        );
+        let mut pin = Box::pin(body);
+        let _ = pin.as_mut().poll_frame(&mut cx());
+        drop(pin); // client disconnect — the drop path records the 3 bytes
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics::STORAGE_DOWNLOAD_BYTES.get(), before + 3);
+
+        // (3) An upload body never touches the download metric.
+        let before = metrics::STORAGE_DOWNLOAD_BYTES.get();
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut body = CountingBody::new(
+            VecBody::new(&[b"payload"]),
+            counter.clone(),
+            CountingKind::Upload,
+        );
+        assert_eq!(drain(&mut body), 7);
+        assert_eq!(metrics::STORAGE_DOWNLOAD_BYTES.get(), before);
+    }
+
+    #[test]
+    fn inflight_gauge_decrements_on_drop() {
+        metrics::HTTP_IN_FLIGHT.set(5);
+        {
+            let _gauge = InFlightGauge;
+        }
+        assert_eq!(metrics::HTTP_IN_FLIGHT.get(), 4);
     }
 }

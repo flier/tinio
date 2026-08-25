@@ -13,6 +13,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use smart_default::SmartDefault;
 use tokio::sync::watch;
 
 use crate::{backend::FsStorage, error::Error, fsutil::tmp_entries, pacing};
@@ -23,29 +24,19 @@ use crate::{backend::FsStorage, error::Error, fsutil::tmp_entries, pacing};
 ///
 /// ```rust
 /// use std::time::Duration;
-/// use tinio_fs::SweepOptions;
+/// use tinio_fs::sweep::Options;
 ///
-/// let options = SweepOptions {
-///     temp_ttl: Duration::from_secs(24 * 3600),
-///     multipart_ttl: Duration::from_secs(7 * 24 * 3600),
-/// };
+/// let options = Options::default();
 /// assert_eq!(options.temp_ttl, Duration::from_secs(86400));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SweepOptions {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SmartDefault)]
+pub struct Options {
     /// Stale temp-file timeout (`[s3] temp_ttl_hours`).
+    #[default(_code = "Duration::from_secs(24 * 3600)")]
     pub temp_ttl: Duration,
     /// Abandoned-upload timeout (`[s3] multipart_expire_days`).
+    #[default(_code = "Duration::from_secs(7 * 24 * 3600)")]
     pub multipart_ttl: Duration,
-}
-
-impl Default for SweepOptions {
-    fn default() -> Self {
-        Self {
-            temp_ttl: Duration::from_secs(24 * 3600),
-            multipart_ttl: Duration::from_secs(7 * 24 * 3600),
-        }
-    }
 }
 
 /// Sweep cadence: one pass per hour. Not a config knob — the contract's
@@ -58,11 +49,11 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 ///
 /// ```rust
 /// use std::time::Duration;
-/// use tinio_fs::{FsOptions, FsStorage, SweepOptions, Sweeper};
+/// use tinio_fs::{FsOptions, FsStorage, sweep};
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
-/// let sweeper = Sweeper::new(storage.clone(), SweepOptions::default());
+/// let sweeper = sweep::Sweeper::new(storage.clone(), sweep::Options::default());
 /// let (tx, rx) = tokio::sync::watch::channel(false);
 /// tokio::runtime::Runtime::new().unwrap().block_on(async {
 ///     let task = tokio::spawn(async move { sweeper.run(rx).await });
@@ -73,12 +64,12 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 #[derive(Debug, Clone)]
 pub struct Sweeper {
     storage: FsStorage,
-    options: SweepOptions,
+    options: Options,
 }
 
 impl Sweeper {
     /// Construct the sweeper.
-    pub fn new(storage: FsStorage, options: SweepOptions) -> Self {
+    pub fn new(storage: FsStorage, options: Options) -> Self {
         Self { storage, options }
     }
 
@@ -108,11 +99,30 @@ impl Sweeper {
     /// One sweep pass against a synthetic clock (`now`): removes temp
     /// files older than the TTL and multipart uploads idle longer than the
     /// TTL. Returns the counts.
-    pub async fn sweep_once(&self, now: SystemTime) -> Result<SweepSummary, Error> {
-        Ok(SweepSummary {
+    ///
+    /// Every pass ends with one low-frequency fragmentation evaluation
+    /// (the stats call takes the write lock): over the `[storage.fs]
+    /// compact_threshold_percent` threshold the `compact_needed` marker is
+    /// set, and the next startup compacts (meta-redb-spec §5.9). Best
+    /// effort — an evaluation failure is logged, never a sweep failure.
+    pub async fn sweep_once(&self, now: SystemTime) -> Result<Summary, Error> {
+        let summary = Summary {
             temp_files: self.sweep_tmp(now).await?,
             uploads: self.sweep_multipart(now).await?,
-        })
+        };
+        self.evaluate_compact_needed().await;
+        Ok(summary)
+    }
+
+    /// Evaluate fragmentation and set the compact-needed marker when the
+    /// threshold is reached (best effort; one write transaction).
+    async fn evaluate_compact_needed(&self) {
+        if let Err(err) = self
+            .storage
+            .evaluate_compact(self.storage.compact_threshold_percent())
+        {
+            tracing::warn!(error = %err, "compact evaluation failed");
+        }
     }
 
     async fn sweep_tmp(&self, now: SystemTime) -> Result<usize, Error> {
@@ -186,13 +196,13 @@ impl Sweeper {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_fs::SweepSummary;
+/// use tinio_fs::sweep::Summary;
 ///
-/// let summary = SweepSummary { temp_files: 1, uploads: 0 };
+/// let summary = Summary { temp_files: 1, uploads: 0 };
 /// assert_eq!(summary.temp_files, 1);
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SweepSummary {
+pub struct Summary {
     /// Stale temp files removed.
     pub temp_files: usize,
     /// Abandoned multipart uploads removed.
@@ -206,10 +216,10 @@ mod tests {
     use std::fs::{self, FileTimes, OpenOptions};
     use tinio_core::bucket;
     use tinio_core::storage::{BucketOps, MultipartOps};
-    use tinio_core::testing::body;
+    use tinio_util::testing::body;
 
-    fn old_ttl_options() -> SweepOptions {
-        SweepOptions {
+    fn old_ttl_options() -> Options {
+        Options {
             temp_ttl: Duration::from_secs(60),
             multipart_ttl: Duration::from_secs(60),
         }
@@ -224,6 +234,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     follow_symlinks: true,
+                    compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
                 },
             )
@@ -295,6 +306,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     follow_symlinks: true,
+                    compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
                 },
             )
@@ -336,6 +348,60 @@ mod tests {
             });
             tx.send(true).unwrap();
             task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn directories_under_tmp_are_never_swept() {
+        // Only files stage under `tmp/` — a stray directory (a mount
+        // point, a leftover) must not be removed as a temp file.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fs::create_dir_all(state.path().join("tmp/nested")).unwrap();
+            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+            let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+            assert_eq!(summary.temp_files, 0);
+            assert!(state.path().join("tmp/nested").is_dir());
+        });
+    }
+
+    #[test]
+    fn future_dated_temp_survives() {
+        // A temp whose mtime lies in the future has a negative age —
+        // `duration_since` fails and the file must survive (unwrap_or
+        // false), not be swept as infinitely stale.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fs::create_dir(state.path().join("tmp")).unwrap();
+            let stale = state.path().join("tmp/future");
+            fs::write(&stale, b"x").unwrap();
+            let f = OpenOptions::new().write(true).open(&stale).unwrap();
+            f.set_times(
+                FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(3600)),
+            )
+            .unwrap();
+            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+            let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+            assert_eq!(summary.temp_files, 0);
+            assert!(stale.exists());
         });
     }
 }

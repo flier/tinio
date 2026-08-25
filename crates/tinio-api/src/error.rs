@@ -78,7 +78,7 @@ impl Error {
 mod tests {
     use super::*;
     use tinio_core::storage::Error::*;
-    use tinio_core::testing::assert_send_sync;
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn maps_to_status_codes() {

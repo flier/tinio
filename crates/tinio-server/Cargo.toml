@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+derive_more = { workspace = true, features = ["display"] }
 futures.workspace = true
 http.workspace = true
 http-body.workspace = true
@@ -43,17 +44,20 @@ tracing-subscriber = { workspace = true, features = [
 tinio-api = { workspace = true, optional = true }
 tinio-config.workspace = true
 tinio-core.workspace = true
+tinio-util.workspace = true
 
 [dev-dependencies]
+assert_cmd.workspace = true
 bytes.workspace = true
 criterion = { workspace = true, features = ["async_tokio"] }
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+predicates.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
-tinio-core = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
 tinio-fs.workspace = true
 tinio-mem.workspace = true
 

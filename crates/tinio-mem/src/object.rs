@@ -60,12 +60,26 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         data: Vec<u8>,
     ) -> Result<PutObjectResult, Error> {
+        // Defensive: the staged-body path already rejects reserved keys —
+        // a direct stage/commit must not create an invisible, undeletable
+        // object (the fs backend re-checks in its commit path too).
+        if key.is_reserved() {
+            return Err(access_denied(key));
+        }
         // Folder markers are never objects (s3-surface.md): the staged
         // body is dropped and the record stores the empty-content ETag —
         // still counted as bucket content (delete-bucket's non-empty
-        // check), matching the fs backend's directory.
+        // check), matching the fs backend's directory. A marker's bytes
+        // are never stored: a direct stage/commit with a non-empty body
+        // must not strand invisible bytes counted as content (the fs
+        // backend's commit creates a directory and drops the temp).
+        let data = if key.is_folder_marker() {
+            Vec::new()
+        } else {
+            data
+        };
         let etag = if key.is_folder_marker() {
-            ETag::from_content(b"")
+            ETag::EMPTY
         } else {
             ETag::from_content(&data)
         };
@@ -269,10 +283,9 @@ mod tests {
     use futures::stream::iter;
     use tinio_core::{
         BodyStream, BucketOps, ByteRange, ETag, ListObjectsParams, ObjectListing, ObjectOps,
-        bucket, object,
-        storage::Error::*,
-        testing::{body, read_body},
+        bucket, object, storage::Error::*,
     };
+    use tinio_util::testing::{body, read_body};
 
     use super::*;
 

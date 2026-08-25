@@ -17,12 +17,16 @@ use common::{Server, request};
 
 #[tokio::test]
 async fn tinio_writes_denied_reads_missing() {
-    let server = Server::fs(Capabilities::default()).await;
+    // The bucket is created before the server starts (redb's file lock
+    // allows a single open per root — SC-005 — so the test handle must be
+    // dropped before the server opens the same state database).
+    let root = tempfile::tempdir().unwrap();
+    {
+        let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+        storage.create_bucket(&"data".into()).await.unwrap();
+    }
+    let server = Server::fs_at(root.path(), Capabilities::default()).await;
     let addr = server.addr();
-    // Create the bucket through the contract (the raw harness has no
-    // bucket-create shortcut).
-    let storage = FsStorage::new(server.root(), FsOptions::default()).unwrap();
-    storage.create_bucket(&"data".into()).await.unwrap();
 
     for key in [".tinio", ".tinio/state", "a/.tinio/x", "a/b/.tinio/c"] {
         // Write → AccessDenied.
@@ -46,18 +50,23 @@ async fn tinio_writes_denied_reads_missing() {
 async fn nested_root_state_never_served() {
     // An outer server's root contains an inner server's root as a bucket.
     // The outer server must never serve the inner root's state — the
-    // `.tinio` segment is reserved at any depth.
-    let outer_server = Server::fs(Capabilities::default()).await;
+    // `.tinio` segment is reserved at any depth. (The outer bucket is
+    // created before the server starts — redb's file lock allows a single
+    // open per root, SC-005.)
+    let outer_root = tempfile::tempdir().unwrap();
+    {
+        let storage = FsStorage::new(outer_root.path(), FsOptions::default()).unwrap();
+        storage.create_bucket(&"inner-root".into()).await.unwrap();
+    }
+    let outer_server = Server::fs_at(outer_root.path(), Capabilities::default()).await;
     let addr = outer_server.addr();
-    let outer = FsStorage::new(outer_server.root(), FsOptions::default()).unwrap();
-    outer.create_bucket(&"inner-root".into()).await.unwrap();
 
     // The inner root's reserved state (created by its own server).
     let inner_root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(inner_root.path().join(".tinio")).unwrap();
     std::fs::write(inner_root.path().join(".tinio/state"), b"secret").unwrap();
     // Symlink-free copy: place the inner root inside the outer bucket.
-    let inner_bucket = outer_server.root().join("inner-root");
+    let inner_bucket = outer_root.path().join("inner-root");
     copy_dir(inner_root.path(), &inner_bucket);
 
     // Reading the inner state through the outer server → NoSuchKey.

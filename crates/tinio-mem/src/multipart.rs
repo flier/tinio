@@ -16,10 +16,13 @@ use uuid::Uuid;
 
 use crate::{
     Error,
-    error::{access_denied, database_storage, invalid_etag, invalid_part, no_parts, no_such_bucket},
+    error::{
+        access_denied, database_storage, invalid_etag, invalid_key, invalid_part, no_parts,
+        no_such_bucket,
+    },
     storage::{
-        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, check_upload,
-        object_key, parse_part_number, part_key, remove_all_parts, upload_key,
+        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, check_bucket,
+        check_upload, object_key, parse_part_number, part_key, remove_all_parts, upload_key,
     },
 };
 
@@ -30,8 +33,20 @@ impl MultipartOps for MemoryStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<MultipartUpload, Error> {
+        // Bucket existence first, like the fs backend and every S3 op: a
+        // reserved/marker key on a missing bucket answers NoSuchBucket,
+        // not AccessDenied/InvalidKey (cross-backend error-code parity).
+        if !self.has_bucket(bucket)? {
+            return Err(no_such_bucket(bucket));
+        }
         if key.is_reserved() {
             return Err(access_denied(key));
+        }
+        // Folder markers are never objects — refuse the upload up front
+        // (the fs backend rejects them at create too; completing one
+        // would materialize an invisible, undeletable object).
+        if key.is_folder_marker() {
+            return Err(invalid_key(key.to_string()));
         }
         let upload = MultipartUpload {
             upload_id: Uuid::new_v4().to_string(),
@@ -99,6 +114,11 @@ impl MultipartOps for MemoryStorage {
     async fn list_parts(&self, params: ListPartsParams) -> Result<PartsListing, Error> {
         let txn = self.db.begin_read()?;
         {
+            // Bucket existence first (the fs backend answers NoSuchBucket
+            // before anything else).
+            check_bucket(&txn.open_table(BUCKETS)?, &params.bucket)?;
+        }
+        {
             let uploads = txn.open_table(UPLOADS)?;
             check_upload(&uploads, &params.upload_id, &params.bucket, &params.key)?;
         }
@@ -165,10 +185,15 @@ impl MultipartOps for MemoryStorage {
         upload_id: &str,
         parts: &[CompletedPart],
     ) -> Result<object::Info, Error> {
+        let txn = self.db.begin_write()?;
+        {
+            // Bucket existence first (the fs backend answers NoSuchBucket
+            // before anything else — NoParts only for a real upload).
+            check_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        }
         if parts.is_empty() {
             return Err(no_parts());
         }
-        let txn = self.db.begin_write()?;
         let (data, etag, now) = {
             {
                 let uploads = txn.open_table(UPLOADS)?;
@@ -247,6 +272,11 @@ impl MultipartOps for MemoryStorage {
         upload_id: &str,
     ) -> Result<(), Error> {
         let txn = self.db.begin_write()?;
+        {
+            // Bucket existence first (the fs backend answers NoSuchBucket
+            // before anything else).
+            check_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        }
         {
             {
                 let uploads = txn.open_table(UPLOADS)?;
@@ -349,12 +379,9 @@ impl MultipartOps for MemoryStorage {
 mod tests {
     use tinio_core::{
         BucketOps, CompletedPart, ListPartsParams, ListUploadsParams, MultipartOps, ObjectOps,
-        PartInfo, bucket,
-        multipart::part_number,
-        object,
-        storage::Error::*,
-        testing::{body, read_body},
+        PartInfo, bucket, multipart::part_number, object, storage::Error::*,
     };
+    use tinio_util::testing::{body, read_body};
 
     use super::*;
 
@@ -721,8 +748,14 @@ mod tests {
         // are listed).
         let (storage, bucket) = with_bucket().await;
         let key = object::key("same.bin").unwrap();
-        let u1 = storage.create_multipart_upload(&bucket, &key).await.unwrap();
-        storage.create_multipart_upload(&bucket, &key).await.unwrap();
+        let u1 = storage
+            .create_multipart_upload(&bucket, &key)
+            .await
+            .unwrap();
+        storage
+            .create_multipart_upload(&bucket, &key)
+            .await
+            .unwrap();
         let page = storage
             .list_multipart_uploads(ListUploadsParams {
                 bucket,

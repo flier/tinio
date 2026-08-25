@@ -27,6 +27,7 @@ use crate::{multipart::PartInfo, storage};
 /// assert_eq!(single.as_str(), "d41d8cd98f00b204e9800998ecf8427e");
 ///
 /// let from_content = ETag::from_content(b"");
+/// assert_eq!(from_content, ETag::EMPTY);
 /// assert_eq!(from_content, single);
 ///
 /// let multipart = ETag::new("d41d8cd98f00b204e9800998ecf8427e-3").unwrap();
@@ -103,6 +104,12 @@ impl AsRef<[u8]> for ETag {
 }
 
 impl ETag {
+    /// ETag of empty content (`MD5("")` = `d41d8cd98f00b204e9800998ecf8427e`).
+    pub const EMPTY: Self = Self::Single([
+        0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42,
+        0x7e,
+    ]);
+
     fn md5(data: &[u8]) -> [u8; 16] {
         let mut hasher = Md5::new();
         hasher.update(data);
@@ -171,7 +178,7 @@ impl From<&str> for ETag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::assert_send_sync;
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn etag_validates_formats() {
@@ -187,7 +194,8 @@ mod tests {
         assert_eq!(from_literal.len(), 16);
         let bytes: Bytes = from_literal.clone().into();
         assert_eq!(bytes.len(), 16);
-        assert_eq!(ETag::from_content(b""), ETag::new(hex).unwrap());
+        assert_eq!(ETag::from_content(b""), ETag::EMPTY);
+        assert_eq!(ETag::EMPTY, ETag::new(hex).unwrap());
         assert!(ETag::new("").is_err());
         assert!(ETag::new("short").is_err());
         assert!(ETag::new(&format!("{hex}-")).is_err());

@@ -5,7 +5,7 @@
 //! contract, and key validation — all without any HTTP or filesystem
 //! implementation. Concrete backends (tinio-fs is the v1 one) implement the
 //! contract and must pass the conformance test harness behind the `testing`
-//! feature.
+//! feature of `tinio-util`.
 //!
 //! Contract domain types: [`Bucket`] and [`bucket::Name`], [`object::Key`]
 //! and [`object::Info`], [`ETag`], [`MultipartUpload`] and [`PartInfo`].
@@ -19,12 +19,6 @@ pub mod etag;
 pub mod multipart;
 pub mod object;
 pub mod storage;
-
-/// Conformance harness + shared test helpers. Available to backend crates
-/// via the `testing` feature, and to this crate's own unit tests (`cfg(test)`
-/// — the harness is never compiled into a regular dependency build).
-#[cfg(any(feature = "testing", test))]
-pub mod testing;
 
 pub use self::bucket::Bucket;
 pub use self::etag::ETag;

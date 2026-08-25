@@ -152,9 +152,9 @@ mod tests {
     use crate::backend::testutil::{s3_request, setup as base_setup};
     use s3s::S3;
     use tinio_core::storage::ObjectOps;
-    use tinio_core::testing::body;
     use tinio_core::{bucket, object};
     use tinio_mem::MemoryStorage;
+    use tinio_util::testing::body;
 
     async fn setup() -> (S3Backend<MemoryStorage>, String) {
         let (backend, b) = base_setup().await;

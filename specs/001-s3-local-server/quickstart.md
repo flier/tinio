@@ -141,7 +141,7 @@ tinio doctor /tmp/tinio-demo --dry-run   # list what a fix would change
 tinio doctor /tmp/tinio-demo --fix       # apply cleanups (server must be stopped)
 ```
 
-Expected after a normal session: clean report, exit 0. After `kill -9` (stale state/socket) or with orphaned metadata, doctor reports warnings/errors and exits 1; `--dry-run` lists the repairs without touching anything, `--fix` removes the stale state/socket, orphaned meta, abandoned multipart, stale temps, and stale `~/.tinio/roots/<hash>/` dirs whose root no longer exists. Symlink check: `ln -s /etc /tmp/tinio-demo/photos/etc-link` — served by default; with `--no-follow-symlinks` the GET is rejected and the entry disappears from listings. Nested-root check: a `.tinio/` directory at any depth is never served — `aws s3 cp` of a key containing a `.tinio` segment is rejected and listings skip it.
+Expected after a normal session: clean report, exit 0. After `kill -9` (stale state/socket) or with orphaned metadata, doctor reports warnings/errors and exits 1; `--dry-run` lists the repairs without touching anything, `--fix` removes the stale state/socket, orphaned meta, abandoned multipart, stale temps, and stale `~/.tinio/roots/<hash>/` dirs whose root no longer exists. Symlink check: `ln -s /etc /tmp/tinio-demo/photos/etc-link` — rejected by default (`[storage.fs] follow_symlinks = false`): the GET fails and the entry is absent from listings; with `follow_symlinks = true` it is served. Nested-root check: a `.tinio/` directory at any depth is never served — `aws s3 cp` of a key containing a `.tinio` segment is rejected and listings skip it.
 
 ## 9. Zero-byte and large objects (SC-003, FR edge cases)
 

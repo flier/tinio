@@ -10,7 +10,7 @@
 
 use std::{error::Error, fmt::Debug, fs::File, io::Write, path::Path, sync::Mutex};
 
-use tinio_config::{AccessLogFormat, LogFormat, Verbosity};
+use tinio_config::log;
 use tracing::{
     Event, Subscriber,
     field::{Field, Visit},
@@ -140,7 +140,7 @@ impl AccessFields {
     /// `$request` prefix never eats `$request_time`); unknown variables
     /// stay as their literal `$name` (the config gate already restricted
     /// the set).
-    pub fn format_line(&self, format: &AccessLogFormat) -> String {
+    pub fn format_line(&self, format: &log::AccessFormat) -> String {
         let fmt = format.as_str();
         let mut out = String::with_capacity(fmt.len() + 32);
         let mut rest = fmt;
@@ -201,11 +201,11 @@ impl Visit for FieldCollector {
 ///
 /// ```rust
 /// use std::io::sink;
-/// use tinio_config::AccessLogFormat;
+/// use tinio_config::log;
 /// use tinio_server::log::{AccessLogLayer, ACCESS_TARGET, AccessFields};
 /// use tracing_subscriber::layer::SubscriberExt;
 ///
-/// let layer = AccessLogLayer::new(AccessLogFormat::Common, sink());
+/// let layer = AccessLogLayer::new(log::AccessFormat::Common, sink());
 /// let _subscriber = tracing_subscriber::registry().with(layer);
 /// let fields = AccessFields::new(
 ///     "127.0.0.1".into(),
@@ -218,17 +218,17 @@ impl Visit for FieldCollector {
 ///     "-".into(),
 ///     "0.001".into(),
 /// );
-/// assert!(fields.format_line(&AccessLogFormat::Combined).contains(" - - "));
+/// assert!(fields.format_line(&log::AccessFormat::Combined).contains(" - - "));
 /// ```
 #[derive(Debug)]
 pub struct AccessLogLayer<W: Write + Send + 'static> {
-    format: AccessLogFormat,
+    format: log::AccessFormat,
     writer: Mutex<W>,
 }
 
 impl<W: Write + Send + 'static> AccessLogLayer<W> {
     /// Create the layer writing to `writer`.
-    pub fn new(format: AccessLogFormat, writer: W) -> Self {
+    pub fn new(format: log::AccessFormat, writer: W) -> Self {
         Self {
             format,
             writer: Mutex::new(writer),
@@ -268,9 +268,9 @@ where
 /// `Io` when the access-log file cannot be opened for appending; OTLP
 /// exporter construction failures when the `otel` feature is enabled.
 pub fn build_subscriber(
-    verbosity: Verbosity,
-    format: LogFormat,
-    access_format: &AccessLogFormat,
+    verbosity: log::Verbosity,
+    format: log::Format,
+    access_format: &log::AccessFormat,
     access_path: &Path,
     otel_endpoint: Option<&str>,
 ) -> Result<Box<dyn Subscriber + Send + Sync>, Box<dyn Error + Send + Sync>> {
@@ -281,15 +281,15 @@ pub fn build_subscriber(
     let access_layer = AccessLogLayer::new(access_format.clone(), access_file);
 
     let level = match verbosity {
-        Verbosity::Error => tracing::Level::ERROR,
-        Verbosity::Warn => tracing::Level::WARN,
-        Verbosity::Info => tracing::Level::INFO,
-        Verbosity::Debug => tracing::Level::DEBUG,
+        log::Verbosity::Error => tracing::Level::ERROR,
+        log::Verbosity::Warn => tracing::Level::WARN,
+        log::Verbosity::Info => tracing::Level::INFO,
+        log::Verbosity::Debug => tracing::Level::DEBUG,
     };
     let stderr = fmt::writer::BoxMakeWriter::new(std::io::stderr).with_max_level(level);
     let op_layer = match format {
-        LogFormat::Text => fmt::layer().with_writer(stderr).with_target(false).boxed(),
-        LogFormat::Json => fmt::layer()
+        log::Format::Text => fmt::layer().with_writer(stderr).with_target(false).boxed(),
+        log::Format::Json => fmt::layer()
             .json()
             .with_writer(stderr)
             .with_target(false)
@@ -340,14 +340,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
-    fn fields(
-        remote_addr: &str,
-        request: &str,
-        status: u16,
-        body_bytes_sent: u64,
-    ) -> AccessFields {
+    fn fields(remote_addr: &str, request: &str, status: u16, body_bytes_sent: u64) -> AccessFields {
         AccessFields::new(
             remote_addr.into(),
             "-".into(),
@@ -364,7 +362,7 @@ mod tests {
     #[test]
     fn combined_format_line() {
         let fields = fields("127.0.0.1", "GET /data/a.txt HTTP/1.1", 200, 5);
-        let line = fields.format_line(&AccessLogFormat::Combined);
+        let line = fields.format_line(&log::AccessFormat::Combined);
         assert_eq!(
             line,
             "127.0.0.1 - - [t] \"GET /data/a.txt HTTP/1.1\" 200 5 \"-\" \"-\""
@@ -374,14 +372,14 @@ mod tests {
     #[test]
     fn common_format_line() {
         let fields = fields("127.0.0.1", "GET / HTTP/1.1", 404, 0);
-        let line = fields.format_line(&AccessLogFormat::Common);
+        let line = fields.format_line(&log::AccessFormat::Common);
         assert_eq!(line, "127.0.0.1 - - [t] \"GET / HTTP/1.1\" 404 0");
     }
 
     #[test]
     fn custom_format_line() {
         let fields = fields("10.0.0.1", "GET / HTTP/1.1", 200, 1);
-        let line = fields.format_line(&AccessLogFormat::Custom("$request $status".into()));
+        let line = fields.format_line(&log::AccessFormat::Custom("$request $status".into()));
         assert_eq!(line, "GET / HTTP/1.1 200");
     }
 
@@ -400,7 +398,7 @@ mod tests {
             "-".into(),
             "0.5".into(),
         );
-        let line = fields.format_line(&AccessLogFormat::Custom(
+        let line = fields.format_line(&log::AccessFormat::Custom(
             "$request_time $request $unknown".into(),
         ));
         assert_eq!(line, "0.5 GET / HTTP/1.1 $unknown");
@@ -456,7 +454,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let buf = SharedBuf::default();
-        let layer = AccessLogLayer::new(AccessLogFormat::Custom(format), buf.clone());
+        let layer = AccessLogLayer::new(log::AccessFormat::Custom(format), buf.clone());
         let subscriber = tracing_subscriber::registry().with(layer);
         with_default(subscriber, || {
             tracing::info!(
@@ -473,8 +471,124 @@ mod tests {
                 "s3 request completed"
             );
         });
-        let expected: Vec<&str> = AccessField::ALL.iter().map(|f| sentinel(f.name())).collect();
+        let expected: Vec<&str> = AccessField::ALL
+            .iter()
+            .map(|f| sentinel(f.name()))
+            .collect();
         let line = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert_eq!(line.trim(), expected.join(" "));
+    }
+
+    /// An owned `Write` sink for the layer-under-test.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn non_access_events_are_ignored() {
+        use tracing::subscriber::with_default;
+        let buf = SharedBuf::default();
+        let layer = AccessLogLayer::new(log::AccessFormat::Combined, buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        with_default(subscriber, || {
+            tracing::info!(target: "tinio::other", "not an access event");
+        });
+        assert!(buf.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn debug_and_signed_fields_are_collected() {
+        use tracing::subscriber::with_default;
+        let buf = SharedBuf::default();
+        let layer = AccessLogLayer::new(
+            log::AccessFormat::Custom("$status $request".into()),
+            buf.clone(),
+        );
+        let subscriber = tracing_subscriber::registry().with(layer);
+        with_default(subscriber, || {
+            tracing::info!(
+                target: ACCESS_TARGET,
+                status = -3i64,
+                request = ?"debug-rendered",
+                "s3 request completed"
+            );
+        });
+        let line = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(line.trim(), "-3 \"debug-rendered\"");
+    }
+
+    #[test]
+    fn poisoned_lock_recovers_into_inner_writer() {
+        // A panicked writer (e.g. a full disk during a flush) poisons the
+        // mutex; the layer must recover the inner writer, not lose events.
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let buf = SharedBuf::default();
+        let layer = AccessLogLayer::new(log::AccessFormat::Combined, buf.clone());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = layer.writer.lock().unwrap();
+            panic!("poison the access-log mutex");
+        }));
+        let fields = AccessFields::new(
+            "127.0.0.1".into(),
+            "-".into(),
+            "t".into(),
+            "GET / HTTP/1.1".into(),
+            200,
+            0,
+            "-".into(),
+            "-".into(),
+            "0.001".into(),
+        );
+        // Render through the layer's own writer path (poisoned → recover).
+        {
+            let mut writer = layer
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let line = fields.format_line(&layer.format);
+            let _ = writeln!(writer, "{line}");
+            let _ = writer.flush();
+        }
+        let line = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(line.contains("GET / HTTP/1.1"), "{line}");
+    }
+
+    #[test]
+    fn build_subscriber_writes_access_events_to_file() {
+        use tracing::subscriber::with_default;
+        for (format, suffix) in [(log::Format::Text, "text"), (log::Format::Json, "json")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("access.log");
+            let sub = build_subscriber(
+                log::Verbosity::Info,
+                format,
+                &log::AccessFormat::Custom("$status $request".into()),
+                &path,
+                None,
+            )
+            .unwrap();
+            with_default(sub, || {
+                tracing::info!(
+                    target: ACCESS_TARGET,
+                    status = 201u16,
+                    request = "GET /data/x HTTP/1.1",
+                    "s3 request completed"
+                );
+            });
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.contains("201 GET /data/x HTTP/1.1"),
+                "{suffix} format: {content}"
+            );
+        }
     }
 }

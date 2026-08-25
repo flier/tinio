@@ -3,8 +3,8 @@
 ## Rules
 
 - No comments in `Cargo.toml` — rationale in `docs/`.
-- One pin in root `[workspace.dependencies]`; crates use `X.workspace = true`.
-- Members (`tinio-*`): `path = "crates/…"` — no version.
+- Pin once in root `[workspace.dependencies]`; crates use `X.workspace = true`.
+- Members (`tinio-*`): `path = "crates/…"`, no version.
 - `version`/`edition` from `[workspace.package]`.
 - `publish = false` except facade `tinio`.
 - `[lints.rust] unsafe_code = "forbid"` on every crate.
@@ -12,7 +12,7 @@
 
 ## Versions
 
-- Pins are `major.minor` only (`tokio = "1"`).
+- `major.minor` only (`tokio = "1"`).
 
 ## Features
 
@@ -21,7 +21,7 @@
 
 ## Groups
 
-- `[workspace.dependencies]`, `[dependencies]`, `[dev-dependencies]`, `[target.'cfg(...)'.dependencies]`: external, blank line, `tinio-*`. Alpha within each group. Skip blank line when one group.
+- Order: `[workspace.dependencies]`, `[dependencies]`, `[dev-dependencies]`, `[target.'cfg(...)'.dependencies]` — external, blank line, `tinio-*`. Alpha within each group. No blank line when one group.
 
 ## Example
 
@@ -61,11 +61,11 @@ default = ["mem"]
 mem = ["dep:tinio-mem"]
 
 [dev-dependencies]
-tinio-core = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"
 ```
 
-- `tinio-cli` defaults `mem` so `tinio server` without a directory uses in-memory backend.
-- Enable `testing` in `[dev-dependencies]` for conformance harness.
+- `tinio-cli` defaults `mem` so `tinio server` without a directory uses the in-memory backend.
+- Enable `testing` in `[dev-dependencies]` for the conformance harness.

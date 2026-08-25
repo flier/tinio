@@ -8,8 +8,9 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use tinio_core::storage::{BucketOps, ObjectOps};
-use tinio_core::{BodyStream, bucket, object, testing::body};
+use tinio_core::{BodyStream, bucket, object};
 use tinio_fs::{AtomicWriter, FsOptions, FsStorage};
+use tinio_util::testing::body;
 
 /// Total bytes per streaming round-trip (64 MiB — large enough to measure
 /// throughput, small enough for CI smoke runs).

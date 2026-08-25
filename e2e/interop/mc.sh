@@ -10,7 +10,7 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log")"
+ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log")" || exit 1
 
 mc alias set tinio "http://$ENDPOINT" minioadmin minioadmin > /dev/null
 

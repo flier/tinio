@@ -16,8 +16,10 @@ pub const RESERVED_SEGMENT: &str = ".tinio";
 /// A validated object key (FR-006/FR-020).
 ///
 /// Constructed via [`key`], which rejects traversal (`..`),
-/// absolute paths, control characters, dot segments, and the empty key —
-/// before any filesystem access. Folder markers (`dir/`) are legal keys.
+/// absolute paths, control characters, dot segments, empty interior
+/// segments (`a//b`, `a\\b` — a filesystem mirror cannot represent
+/// distinct keys that map to one path), and the empty key — before any
+/// filesystem access. Folder markers (`dir/`) are legal keys.
 /// The reserved `.tinio` segment is *syntactically* valid but flagged by
 /// [`Key::is_reserved`]; backends refuse writes to reserved keys with
 /// `AccessDenied` (FR-020).
@@ -151,6 +153,19 @@ fn validate_object_key(key: &str) -> garde::Result {
     if key.split(['/', '\\']).any(|seg| seg == ".") {
         return Err(garde::Error::new(format!("{key:?}: dot segment")));
     }
+    // Empty interior segments (`a//b`, `a\\b`, `a/\b`) alias a
+    // single-separator key on a filesystem mirror — the mirror cannot
+    // represent distinct keys that map to one OS path, so they are
+    // refused at the contract boundary (every backend agrees;
+    // fs-backend.md). `\` is a separator on Windows, matching the
+    // reserved/dot-segment splits above. The trailing empty segment of
+    // a folder marker (`dir/`) is the one legal empty segment.
+    let segs: Vec<&str> = key.split(['/', '\\']).collect();
+    if segs.len() > 1 && segs[..segs.len() - 1].iter().any(|seg| seg.is_empty()) {
+        return Err(garde::Error::new(format!(
+            "{key:?}: empty interior segment"
+        )));
+    }
     if key.chars().any(|c| c.is_control()) {
         return Err(garde::Error::new(format!("{key:?}: control character")));
     }
@@ -160,7 +175,7 @@ fn validate_object_key(key: &str) -> garde::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::assert_send_sync;
+    use tinio_util::testing::assert_send_sync;
 
     #[test]
     fn object_key_validates_and_exposes() {
@@ -208,7 +223,6 @@ mod tests {
             "ümlaut.txt",
             "dir/",
             "trailing/slash/",
-            "a//b",
             "0-._~!$&'()*+,;=@:",
         ] {
             validate_object_key(key).unwrap_or_else(|e| panic!("{key:?} should be valid: {e}"));
@@ -268,6 +282,26 @@ mod tests {
     #[test]
     fn empty_key_rejected() {
         assert!(validate_object_key("").is_err());
+    }
+
+    #[test]
+    fn empty_interior_segments_rejected() {
+        // `a//b` would alias `a/b` on a filesystem mirror; only the
+        // trailing empty segment of a folder marker (`dir/`) is legal.
+        // `\` is a separator too (same as reserved/dot-segment checks):
+        // `a\\b` aliases `a\b` / `a/b` on Windows.
+        for key in [
+            "a//b", "a//", "a///b", "a//b/", "//a", "a/b//c", r"a\\b", r"a\\", r"a\\\b", r"a\\b/",
+            r"a/\b", r"a\/b",
+        ] {
+            assert!(
+                validate_object_key(key).is_err(),
+                "{key:?} must be rejected"
+            );
+        }
+        for key in ["a/b/", "dir/", "a/b", r"a\b"] {
+            validate_object_key(key).unwrap_or_else(|e| panic!("{key:?} should be valid: {e}"));
+        }
     }
 
     #[test]
