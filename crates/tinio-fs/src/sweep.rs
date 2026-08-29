@@ -48,11 +48,24 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// # Examples
 ///
 /// ```rust
-/// use std::time::Duration;
+/// use std::{sync::Arc, time::Duration};
+/// use tinio_core::pipeline::InlineRunner;
+/// use tinio_core::storage::{
+///     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+/// };
 /// use tinio_fs::{FsOptions, FsStorage, sweep};
 ///
 /// let root = tempfile::tempdir().unwrap();
-/// let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+/// let options = FsOptions {
+///     follow_symlinks: false,
+///     state_dir: None,
+///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
+///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
+///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     io_pipeline: Arc::new(InlineRunner::default()),
+///     db_pipeline: Arc::new(InlineRunner::default()),
+/// };
+/// let storage = FsStorage::new(root.path(), options).unwrap();
 /// let sweeper = sweep::Sweeper::new(storage.clone(), sweep::Options::default());
 /// let (tx, rx) = tokio::sync::watch::channel(false);
 /// tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -120,6 +133,7 @@ impl Sweeper {
         if let Err(err) = self
             .storage
             .evaluate_compact(self.storage.compact_threshold_percent())
+            .await
         {
             tracing::warn!(error = %err, "compact evaluation failed");
         }
@@ -212,7 +226,10 @@ pub struct Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FsOptions, testutil::rt};
+    use crate::{
+        FsOptions,
+        testutil::{fs_options, rt},
+    };
     use std::fs::{self, FileTimes, OpenOptions};
     use tinio_core::bucket;
     use tinio_core::storage::{BucketOps, MultipartOps};
@@ -236,6 +253,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -267,7 +285,7 @@ mod tests {
         rt(async {
             let (root, storage) = {
                 let root = tempfile::tempdir().unwrap();
-                let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+                let storage = FsStorage::new(root.path(), fs_options()).unwrap();
                 (root, storage)
             };
             let b = bucket::name("data").unwrap();
@@ -308,6 +326,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -340,7 +359,7 @@ mod tests {
     fn run_loop_stops_on_shutdown() {
         rt(async {
             let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
             let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
             let (tx, rx) = watch::channel(false);
             let task = tokio::spawn(async move {
@@ -362,7 +381,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     state_dir: Some(state.path().to_path_buf()),
-                    ..Default::default()
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -386,7 +405,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     state_dir: Some(state.path().to_path_buf()),
-                    ..Default::default()
+                    ..fs_options()
                 },
             )
             .unwrap();

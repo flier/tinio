@@ -10,8 +10,12 @@
 //! Assembly streams all parts into a temp file, then renames atomically
 //! onto the object path; the composed ETag `MD5-of-MD5s-N` matches the AWS
 //! reference composition. Parts survive restarts, so cross-restart
-//! completion/abort is legal (quickstart §7). No 5 MB minimum is enforced
-//! (FR-014).
+//! completion/abort is legal (quickstart §7). The S3 5 MiB minimum for
+//! non-final parts is enforced at the S3 mapping layer (EntityTooSmall);
+//! the store itself accepts any part size so the contract stays uniform.
+//! The number of concurrently in-progress uploads is capped by
+//! `max_concurrent_uploads` (default `DEFAULT_MAX_CONCURRENT_UPLOADS`,
+//! `[s3] max_concurrent_uploads`).
 //!
 //! Redb transactions replace the old `upload.json` + `.etag` sidecar writes
 //! under an in-process lock: `complete`'s consume is one atomic
@@ -33,7 +37,7 @@ use tinio_core::{
     BodyStream, ETag, bucket, from_nanos,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object::{self},
-    storage::{self},
+    storage::{self, DEFAULT_MAX_CONCURRENT_UPLOADS, group_and_paginate_unordered, uploads_order},
 };
 use tinio_util::lockmap;
 
@@ -150,6 +154,11 @@ fn upload_from_row(
 pub struct Store {
     /// The shared state-database handle (upload records + part ETags).
     handle: Arc<database::Handle>,
+    /// The cap on concurrently in-progress uploads (`[s3]
+    /// max_concurrent_uploads`; default
+    /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). `create` counts the live
+    /// `UPLOADS` rows and refuses new uploads at the cap.
+    max_concurrent_uploads: u32,
     /// `<state-dir>/multipart/` — part content files only.
     root: PathBuf,
     /// Atomic writer (staging under `<state-dir>/tmp/`).
@@ -167,13 +176,24 @@ type PartLock = lockmap::Guard<(String, String)>;
 impl Store {
     /// Create a store over a shared state-database handle (the `FsStorage`
     /// construction path — one handle across all stores).
-    pub(crate) fn from_handle(handle: Arc<database::Handle>, state_dir: &Path) -> Self {
+    pub(crate) fn from_handle(
+        handle: Arc<database::Handle>,
+        state_dir: &Path,
+        max_concurrent_uploads: u32,
+    ) -> Self {
         Self {
             handle,
+            max_concurrent_uploads,
             root: state_dir.join(MULTIPART_DIR_NAME),
             writer: AtomicWriter::new(state_dir),
             part_locks: PartLocks::new(),
         }
+    }
+
+    /// Adjust the concurrent-upload cap after construction (the `FsStorage`
+    /// wiring path reads `[s3] max_concurrent_uploads`).
+    pub(crate) fn set_max_concurrent_uploads(&mut self, max: u32) {
+        self.max_concurrent_uploads = max;
     }
 
     /// The per-upload part-write lock: held across `put_part`'s rename and
@@ -196,6 +216,16 @@ impl Store {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<MultipartUpload, Error> {
+        // Cap the number of in-progress uploads (CWE-770): without a cap an
+        // authenticated client can accumulate an unbounded number of
+        // uploads, each holding up to 10,000 part files + PARTS rows. The
+        // count check is best-effort atomic (a read snapshot before the
+        // insert write); concurrent creators can overshoot by the number
+        // of simultaneous creates, which the cap tolerates.
+        let live = self.live_upload_ids().await?.len() as u32;
+        if live >= self.max_concurrent_uploads {
+            return Err(storage::too_many_uploads(self.max_concurrent_uploads).into());
+        }
         // Fresh UUID v4 (122 random bits): collisions cannot happen in
         // practice, so a failed insert is a real I/O error.
         let upload = MultipartUpload {
@@ -204,15 +234,17 @@ impl Store {
             key: key.clone(),
             initiated_at: SystemTime::now(),
         };
+        // Clone into the write closure (runs on the blocking pool, G3
+        // revision); `upload` stays owned for the return.
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id = upload.upload_id.clone();
+        let initiated_at = upload.initiated_at;
         self.handle
-            .write(|txn| {
-                database::UploadsTable::open(txn)?.put(
-                    bucket,
-                    &upload.upload_id,
-                    key,
-                    upload.initiated_at,
-                )
+            .write(move |txn| {
+                database::UploadsTable::open(txn)?.put(&bucket, &upload_id, &key, initiated_at)
             })
+            .await
             .map_err(Error::from)?;
         Ok(upload)
     }
@@ -227,13 +259,12 @@ impl Store {
         part_number: PartNumber,
         body: BodyStream,
     ) -> Result<PartInfo, Error> {
-        let n = u32::from(part_number);
         // Refuse a nonexistent upload BEFORE any disk write: the body is
         // not streamed and no directory or part file is created (an
         // UploadPart for an aborted/completed upload must not leave
         // residue). The check repeats in the record transaction below —
         // the upload can be consumed while the body streams.
-        let dir = self.require_upload(bucket, key, upload_id).await?;
+        let _dir = self.require_upload(bucket, key, upload_id).await?;
         // Stream the part body first — a slow client must not stall any
         // other multipart operation. The temp+rename happens after the
         // existence check, so a part file only ever becomes visible whole.
@@ -247,6 +278,55 @@ impl Store {
                 return Err(err);
             }
         };
+        self.publish_part(bucket, key, upload_id, part_number, temp, etag)
+            .await
+    }
+
+    /// UploadPartCopy's part write: stage `len` bytes at `offset` of an
+    /// already-open `source` through the writer's copy stage (the
+    /// kernel-side `copy_file_range` fast path — no userspace
+    /// buffering), then the shared publish. A part's ETag is always the
+    /// content MD5 of the part bytes (the staged copy's own hash).
+    /// Unix-only: the backend's `copy_part` uses the contract's stream
+    /// default elsewhere.
+    #[cfg(unix)]
+    pub(crate) async fn put_part_copy(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+        part_number: PartNumber,
+        source: std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<PartInfo, Error> {
+        // Refuse a nonexistent upload BEFORE any disk write (same rule
+        // as `put_part` — the check repeats in the record transaction).
+        let _dir = self.require_upload(bucket, key, upload_id).await?;
+        let (temp, etag) = self.writer.stage_copy(source, offset, len).await?;
+        self.publish_part(bucket, key, upload_id, part_number, temp, etag)
+            .await
+    }
+
+    /// The rename + record critical section shared by [`Store::put_part`]
+    /// and [`Store::put_part_copy`]: rename the staged temp onto the part
+    /// path, then ONE write transaction re-checks the upload exists and
+    /// upserts the PARTS row — the file and the record can never
+    /// disagree (a concurrent same-part overwrite must never interleave
+    /// as rename(A), rename(B), txn(B), txn(A), which would wedge the
+    /// upload). A failed record removes the renamed part and the (empty)
+    /// directory.
+    async fn publish_part(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+        part_number: PartNumber,
+        temp: PathBuf,
+        etag: ETag,
+    ) -> Result<PartInfo, Error> {
+        let n = u32::from(part_number);
+        let dir = self.upload_dir(bucket, upload_id)?;
         // The rename and the PARTS upsert are one critical section (the
         // per-upload lock): a concurrent same-part overwrite must never
         // interleave as rename(A), rename(B), txn(B), txn(A) — the file
@@ -266,15 +346,23 @@ impl Store {
         // the body streamed answers NoSuchUpload and the renamed part is
         // discarded (the empty directory is reclaimed by the orphan
         // stage).
-        let recorded = match self.handle.write(|txn| {
-            let uploads = database::UploadsTable::open(txn)?;
-            if !uploads.key_matches(bucket, key, upload_id)? {
-                return Ok(false);
-            }
-            drop(uploads);
-            database::PartsTable::open(txn)?.put(bucket, upload_id, n, &etag)?;
-            Ok(true)
-        }) {
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id_owned = upload_id.to_string();
+        let etag_owned = etag.clone();
+        let recorded = match self
+            .handle
+            .write(move |txn| {
+                let uploads = database::UploadsTable::open(txn)?;
+                if !uploads.key_matches(&bucket, &key, &upload_id_owned)? {
+                    return Ok(false);
+                }
+                drop(uploads);
+                database::PartsTable::open(txn)?.put(&bucket, &upload_id_owned, n, &etag_owned)?;
+                Ok(true)
+            })
+            .await
+        {
             Ok(recorded) => recorded,
             Err(err) => {
                 // The upload is gone (or a real DB failure) — remove the
@@ -546,6 +634,10 @@ impl Store {
                 }
             }
             tokio::io::AsyncWriteExt::flush(&mut out).await?;
+            // D1 — content durability: the assembled object's bytes must
+            // be on disk before `AtomicWriter::commit` renames it (the
+            // rename's directory entry is synced by commit).
+            out.sync_all().await?;
             Ok::<_, Error>(())
         }
         .await;
@@ -615,8 +707,11 @@ impl Store {
         bucket: &bucket::Name,
         upload_id: &str,
     ) -> Result<(), Error> {
+        let bucket = bucket.clone();
+        let upload_id = upload_id.to_string();
         self.handle
-            .write(|txn| drain_upload(txn, bucket, upload_id))
+            .write(move |txn| drain_upload(txn, &bucket, &upload_id))
+            .await
             .map_err(Error::from)
     }
 
@@ -635,18 +730,22 @@ impl Store {
         // redb refuses a second `open_table` of `UPLOADS` in one
         // transaction — [`drain_upload`] opens it itself).
         let dir = self.upload_dir(bucket, upload_id)?;
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id_owned = upload_id.to_string();
         let found = self
             .handle
-            .write(|txn| {
+            .write(move |txn| {
                 let mut uploads = database::UploadsTable::open(txn)?;
-                if !uploads.key_matches(bucket, key, upload_id)? {
+                if !uploads.key_matches(&bucket, &key, &upload_id_owned)? {
                     return Ok(false);
                 }
-                uploads.remove(bucket, upload_id)?;
+                uploads.remove(&bucket, &upload_id_owned)?;
                 drop(uploads);
-                database::PartsTable::open(txn)?.drain_upload(bucket, upload_id)?;
+                database::PartsTable::open(txn)?.drain_upload(&bucket, &upload_id_owned)?;
                 Ok(true)
             })
+            .await
             .map_err(Error::from)?;
         if !found {
             return Err(storage::no_such_upload(upload_id).into());
@@ -658,6 +757,9 @@ impl Store {
     /// Every in-progress upload of a bucket, in `(key, upload_id)` order
     /// — the composite order the pagination engine requires, so a page
     /// can resume inside a same-key group (from the `UPLOADS` records).
+    /// The full-bucket materialization remains for tests/standalone use;
+    /// the backend's `list_multipart_uploads` pages through
+    /// [`Self::list_uploads_page`] instead (item 7e).
     pub async fn list_uploads(&self, bucket: &bucket::Name) -> Result<Vec<MultipartUpload>, Error> {
         let mut uploads = self
             .handle
@@ -675,6 +777,89 @@ impl Store {
             .map_err(Error::from)?;
         sort_uploads(&mut uploads);
         Ok(uploads)
+    }
+
+    /// One page of the bucket's in-progress uploads per the S3
+    /// ListMultipartUploads semantics — the **bounded-memory pagination**
+    /// (item 7e, data-path review 2026-08-27): the old full-bucket `Vec`
+    /// + in-memory sort + engine pagination is gone.
+    ///
+    /// The bucket's `UPLOADS` rows are keyed by upload id — arbitrary
+    /// relative to the composite `key\0upload_id` page order — so every
+    /// row of the bucket is examined, but only the page is held in
+    /// memory. That is exactly the engine's **unordered** variant
+    /// ([`group_and_paginate_unordered`] — the shared bounded max-heap
+    /// keeps the `max + 1` smallest distinct entries after the marker;
+    /// F35: one home for the marker/rollup/truncation/resume rules,
+    /// page size, token, and order identical to the ordered engine over
+    /// a key-sorted stream). This method supplies only the row
+    /// materialization: domain validation and the prefix filter (the
+    /// engine receives only matching keys — non-matching keys must not
+    /// become object entries).
+    ///
+    /// The redb read transaction is SHORT (F18): it only materializes
+    /// the bucket's raw rows — the pagination runs after the
+    /// transaction is released, so concurrent put_part/complete commits
+    /// never pin old pages for the scan's duration (the exact
+    /// held-open-window pattern the scanner was changed to eliminate).
+    /// The materialization runs on the blocking pool (`read_blocking` —
+    /// the P3 pattern): never on a request thread.
+    ///
+    /// `marker` is the composite `key\0upload_id` order (the backend
+    /// builds it from the S3 `key-marker`/`upload-id-marker` pair; a
+    /// bare key marker uses the sentinel upload id). `max_uploads = 0`
+    /// returns an empty, untruncated page with no marker (an
+    /// exclusive-after marker would skip the first entry of the next
+    /// page forever). Returns `(uploads, common_prefixes, truncated,
+    /// next)` — `next` is the composite resume marker when truncated.
+    pub async fn list_uploads_page(
+        &self,
+        bucket: &bucket::Name,
+        prefix: &str,
+        delimiter: Option<&str>,
+        marker: Option<&str>,
+        max_uploads: usize,
+    ) -> Result<(Vec<MultipartUpload>, Vec<String>, bool, Option<String>), Error> {
+        if max_uploads == 0 {
+            return Ok((Vec::new(), Vec::new(), false, None));
+        }
+        let bucket = bucket.clone();
+        let bucket_txn = bucket.clone();
+        // F18: one SHORT read transaction — materialize the bucket's raw
+        // rows (upload id, key, initiated-at) and release the txn before
+        // any pagination work.
+        let rows: Vec<(String, String, u64)> = self
+            .handle
+            .read_blocking(move |txn| {
+                let table = database::UploadsTable::open_readonly(txn)?;
+                let mut rows = Vec::new();
+                table.for_bucket(&bucket_txn, |upload_id, (key, initiated_at)| {
+                    rows.push((upload_id.to_string(), key.to_string(), initiated_at));
+                    Ok(())
+                })?;
+                Ok(rows)
+            })
+            .await
+            .map_err(Error::from)?;
+        // Domain validation (same as `list_uploads` — invalid rows are
+        // not entries) and the prefix filter, then the shared unordered
+        // engine does the pagination.
+        let uploads: Vec<MultipartUpload> = rows
+            .into_iter()
+            .filter_map(|(upload_id, key, initiated_at)| {
+                upload_from_row(&bucket, &upload_id, &key, initiated_at)
+            })
+            .filter(|u| u.key.starts_with(prefix))
+            .collect();
+        Ok(group_and_paginate_unordered(
+            uploads,
+            prefix,
+            delimiter,
+            marker,
+            max_uploads,
+            |u| u.key.as_ref(),
+            |u| uploads_order(&u.key, &u.upload_id),
+        ))
     }
 
     /// The latest part mtime of an upload (`UNIX_EPOCH` when no parts exist
@@ -708,10 +893,12 @@ impl Store {
     /// goes through [`crate::FsStorage::remove_bucket_state`].
     #[cfg(test)]
     pub async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
-        self.handle
-            .write(|txn| drain_bucket_uploads(txn, bucket))
-            .map_err(Error::from)?;
         let dir = self.root.join(&**bucket);
+        let bucket = bucket.clone();
+        self.handle
+            .write(move |txn| drain_bucket_uploads(txn, &bucket))
+            .await
+            .map_err(Error::from)?;
         ok_if_missing(tokio::fs::remove_dir_all(&dir).await)?;
         Ok(())
     }
@@ -770,11 +957,16 @@ impl Store {
         upload_id: &str,
         key: &str,
     ) -> Result<(), Error> {
+        let bucket = bucket.clone();
+        let upload_id = upload_id.to_string();
+        let key = key.to_string();
         self.handle
-            .write(|txn| {
-                database::UploadsTable::open(txn)?.insert((&**bucket, upload_id), (key, 0))?;
+            .write(move |txn| {
+                database::UploadsTable::open(txn)?
+                    .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0))?;
                 Ok(())
             })
+            .await
             .map_err(Error::from)
     }
 
@@ -852,6 +1044,7 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
     Ok(Store::from_handle(
         database::Handle::open(state_dir)?,
         state_dir,
+        DEFAULT_MAX_CONCURRENT_UPLOADS,
     ))
 }
 
@@ -859,13 +1052,163 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
 mod tests {
     use super::*;
     use crate::testutil::rt;
-    use tinio_core::storage::Error as StorageError;
+    use tinio_core::storage::{Error as StorageError, group_and_paginate_ordered};
     use tinio_util::testing::{body, etag};
 
     fn fixture() -> (tempfile::TempDir, Store) {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path()).unwrap();
         (state, store)
+    }
+
+    #[test]
+    fn create_refuses_uploads_at_the_concurrency_cap() {
+        rt(async {
+            let (_, mut store) = fixture();
+            store.set_max_concurrent_uploads(1);
+            let b = bucket::name("data").unwrap();
+            let k = object::key("big.bin").unwrap();
+            store.create(&b, &k).await.unwrap();
+
+            let err = store.create(&b, &k).await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Storage(StorageError::TooManyMultipartUploads { limit: 1 })
+                ),
+                "second create must hit the cap, got {err:?}"
+            );
+
+            // A completed upload frees a slot (the count reads live rows).
+            let uploads = store.list_uploads(&b).await.unwrap();
+            assert_eq!(uploads.len(), 1);
+        });
+    }
+
+    #[test]
+    fn uploads_page_matches_the_engine_over_the_full_bucket() {
+        // Item 7e equivalence pin: the bounded-memory in-scan page must
+        // equal the old full-load + `group_and_paginate_ordered` path
+        // exactly — page size, resume marker, and order — across a
+        // (prefix, delimiter, marker, max) matrix over same-key groups
+        // and rollup groups (the upload ids are random UUIDs, so the
+        // row order is arbitrary relative to the composite page order —
+        // the exact case the heap must handle).
+        rt(async {
+            let (_, store) = fixture();
+            let b = bucket::name("data").unwrap();
+            let keys = ["a.txt", "dir/x.bin", "dir/sub/y.bin", "dir/z.bin", "z.txt"];
+            let mut uploads = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                for _ in 0..(i % 3 + 1) {
+                    uploads.push(store.create(&b, &object::key(*key).unwrap()).await.unwrap());
+                }
+            }
+            // The old path: the full sorted load + the shared engine.
+            async fn engine_page(
+                store: &Store,
+                b: &bucket::Name,
+                prefix: &str,
+                delim: Option<&str>,
+                marker: Option<&str>,
+                max: usize,
+            ) -> (Vec<MultipartUpload>, Vec<String>, bool, Option<String>) {
+                // The old backend filtered by prefix before the engine
+                // (the engine uses the prefix only for rollups).
+                let all = store
+                    .list_uploads(b)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|u| u.key.starts_with(prefix))
+                    .collect::<Vec<_>>();
+                group_and_paginate_ordered(
+                    all,
+                    prefix,
+                    delim,
+                    marker,
+                    max,
+                    |u| u.key.as_ref(),
+                    |u| uploads_order(&u.key, &u.upload_id),
+                )
+            }
+            // Markers: inside a same-key group, and a bare key marker
+            // (the sentinel upload id).
+            let inside = uploads_order(keys[0], &uploads[0].upload_id);
+            let bare = uploads_order(keys[3], "\u{10FFFF}");
+            let mut combos = 0usize;
+            for (prefix, delim) in [
+                ("", None),
+                ("", Some("/")),
+                ("dir/", Some("/")),
+                ("z", None),
+            ] {
+                for marker in [
+                    None,
+                    Some("a.txt"),
+                    Some(inside.as_str()),
+                    Some(bare.as_str()),
+                ] {
+                    for max in [0usize, 1, 2, 3, 1000] {
+                        combos += 1;
+                        let (u1, p1, t1, n1) =
+                            engine_page(&store, &b, prefix, delim, marker, max).await;
+                        let (u2, p2, t2, n2) = store
+                            .list_uploads_page(&b, prefix, delim, marker, max)
+                            .await
+                            .unwrap();
+                        fn ids(uploads: &[MultipartUpload]) -> Vec<(&str, &str)> {
+                            uploads
+                                .iter()
+                                .map(|u| (u.key.as_ref().as_str(), u.upload_id.as_str()))
+                                .collect()
+                        }
+                        assert_eq!(
+                            (ids(&u1), p1, t1, n1),
+                            (ids(&u2), p2, t2, n2),
+                            "prefix={prefix:?} delim={delim:?} marker={marker:?} max={max}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(combos, 80, "the matrix ran");
+        });
+    }
+
+    #[test]
+    fn marker_inside_a_rollup_absorbs_the_group() {
+        // A marker positioned INSIDE a rolled-up prefix skips the whole
+        // group: a rollup row's order IS the prefix string, so
+        // `"dir/" <= marker` — the page legitimately comes back without
+        // the prefix (the engine's documented resume semantics, shared
+        // by the ordered and unordered variants — the fs page delegates
+        // to the latter).
+        rt(async {
+            let (_, store) = fixture();
+            let b = bucket::name("data").unwrap();
+            store
+                .create(&b, &object::key("dir/a.txt").unwrap())
+                .await
+                .unwrap();
+            store
+                .create(&b, &object::key("dir/c.txt").unwrap())
+                .await
+                .unwrap();
+            store
+                .create(&b, &object::key("z.txt").unwrap())
+                .await
+                .unwrap();
+            let marker = uploads_order("dir/a.txt", "\u{10FFFF}");
+            let (uploads, prefixes, truncated, next) = store
+                .list_uploads_page(&b, "", Some("/"), Some(&marker), 1000)
+                .await
+                .unwrap();
+            let keys: Vec<&str> = uploads.iter().map(|u| u.key.as_ref().as_str()).collect();
+            assert_eq!(keys, ["z.txt"], "{keys:?}");
+            assert_eq!(prefixes, Vec::<String>::new(), "{prefixes:?}");
+            assert!(!truncated);
+            assert_eq!(next, None);
+        });
     }
 
     #[test]
@@ -1316,13 +1659,16 @@ mod tests {
                 .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
                 .await
                 .unwrap();
+            let bucket = b.clone();
+            let upload_id = upload.upload_id.clone();
             store
                 .handle
-                .write(|txn| {
+                .write(move |txn| {
                     let mut parts = database::PartsTable::open(txn).unwrap();
-                    parts.insert((&*b, upload.upload_id.as_str(), 1u32), "not-an-etag")?;
+                    parts.insert((&*bucket, upload_id.as_str(), 1u32), "not-an-etag")?;
                     Ok(())
                 })
+                .await
                 .unwrap();
             let (parts, _, _) = store
                 .list_parts(&b, &k, &upload.upload_id, None, 100)
@@ -1741,15 +2087,18 @@ mod tests {
             let upload = store.create(&b, &k).await.unwrap();
             // A raw row at the boundary (no part file needed — pass 2
             // skips missing files; the marker logic sees the raw rows).
+            let bucket = b.clone();
+            let upload_id = upload.upload_id.clone();
             store
                 .handle
-                .write(|txn| {
+                .write(move |txn| {
                     database::PartsTable::open(txn).unwrap().insert(
-                        (&*b, upload.upload_id.as_str(), u32::MAX),
+                        (&*bucket, upload_id.as_str(), u32::MAX),
                         "9dd4e461268c8034f5c8564e155c67a6",
                     )?;
                     Ok(())
                 })
+                .await
                 .unwrap();
             // Control: the boundary row is reachable from just below it.
             let (_, truncated, raw_last) = store

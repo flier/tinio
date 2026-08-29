@@ -88,8 +88,111 @@ pub async fn assert_conformance<S: Storage>(storage: &S) {
     let b = bucket::name(unique_bucket("conform")).unwrap();
     conformance_buckets(storage, &b).await;
     conformance_objects(storage, &b).await;
+    conformance_copy(storage, &b).await;
     conformance_listing(storage, &b).await;
     conformance_multipart(storage, &b).await;
+}
+
+async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
+    storage.create_bucket(b).await.unwrap();
+
+    // CopyObject: the destination holds the source's bytes, and its ETag
+    // is the content MD5 (a full copy of a single-form source may reuse
+    // the source ETag — either way the wire value is the content MD5).
+    let data = b"copy me, byte for byte";
+    let src = object::key("src.bin").unwrap();
+    let dst = object::key("dst.bin").unwrap();
+    storage
+        .put_object(b, &src, body(data.to_vec()))
+        .await
+        .unwrap();
+    let put = storage.copy_object(b, &src, b, &dst).await.unwrap();
+    check(
+        put.etag == ETag::from_content(data),
+        "copy ETag must be the content MD5",
+    );
+    let get = storage.get_object(b, &dst, None).await.unwrap();
+    check(get.info.size == data.len() as u64, "copy size must match");
+    check(
+        read_body(get.body).await.unwrap() == data,
+        "copy content must be byte-identical",
+    );
+
+    // Copy of a missing source is NoSuchKey.
+    let missing = object::key("ghost.bin").unwrap();
+    let err = into_core_error(storage.copy_object(b, &missing, b, &dst).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "copy of a missing source must be NoSuchKey",
+    );
+
+    // Copy into a folder-marker destination creates the marker (the
+    // destination is a directory, never an object).
+    let marker = object::key("copied-dir/").unwrap();
+    storage.copy_object(b, &src, b, &marker).await.unwrap();
+    let err = into_core_error(storage.get_object(b, &marker, None).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "a copied folder marker is not an object",
+    );
+    storage.delete_object(b, &marker).await.unwrap();
+
+    // UploadPartCopy: the part holds the source's bytes (optionally a
+    // byte range); the part ETag is the content MD5 of the part bytes.
+    let upload = storage.create_multipart_upload(b, &src).await.unwrap();
+    let part = storage
+        .copy_part(
+            b,
+            &src,
+            b,
+            &src,
+            &upload.upload_id,
+            tinio_core::multipart::part_number(1).unwrap(),
+            Some(ByteRange::Inclusive(2, 9)),
+        )
+        .await
+        .unwrap();
+    check(
+        part.etag == ETag::from_content(&data[2..=9]),
+        "part-copy ETag must be the range's content MD5",
+    );
+    check(part.size == 8, "part-copy size must match the range");
+    let part = storage
+        .copy_part(
+            b,
+            &src,
+            b,
+            &src,
+            &upload.upload_id,
+            tinio_core::multipart::part_number(2).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    check(
+        part.etag == ETag::from_content(data),
+        "full part-copy ETag must be the content MD5",
+    );
+    let parts = storage
+        .list_parts(ListPartsParams {
+            bucket: b.clone(),
+            key: src.clone(),
+            upload_id: upload.upload_id.clone(),
+            max_parts: 1000,
+            part_number_marker: None,
+        })
+        .await
+        .unwrap();
+    check(parts.parts.len() == 2, "part copies must be listed");
+    storage
+        .abort_multipart_upload(b, &src, &upload.upload_id)
+        .await
+        .unwrap();
+
+    // Cleanup.
+    storage.delete_object(b, &src).await.unwrap();
+    storage.delete_object(b, &dst).await.unwrap();
+    storage.delete_bucket(b).await.unwrap();
 }
 
 async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
@@ -630,5 +733,35 @@ mod tests {
     fn etag_helper_builds_validated_etag() {
         let hex = "d41d8cd98f00b204e9800998ecf8427e";
         assert_eq!(etag(hex).as_str(), hex);
+    }
+}
+
+/// Poll `cond` until true or a 10 s deadline passes (the test runners'
+/// workers are asynchronous, so assertions must wait). The shared home of
+/// the helper formerly duplicated across tinio-fs testutil and the
+/// tinio-server pipeline tests (F30).
+pub async fn wait_for(mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met within 10 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
+/// An owned `Write` sink for the fmt layers under test (the log.rs and
+/// pipeline.rs test pattern — F32: one definition, three copies removed).
+#[derive(Clone, Default)]
+pub struct SharedBuf(pub std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

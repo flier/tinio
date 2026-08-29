@@ -66,6 +66,35 @@ pub enum Error {
     /// Complete called with no parts uploaded.
     #[error("no parts uploaded")]
     NoParts,
+    /// A non-final multipart part is below the S3 5 MiB minimum
+    /// (EntityTooSmall — enforced at the S3 mapping layer).
+    #[error(
+        "multipart part {part_number} is {actual} bytes, below the {min_bytes}-byte minimum for non-final parts"
+    )]
+    PartTooSmall {
+        /// The offending part number.
+        part_number: u32,
+        /// The enforced minimum for non-final parts.
+        min_bytes: u64,
+        /// The actual stored size of the part.
+        actual: u64,
+    },
+    /// The number of in-progress multipart uploads exceeds the configured
+    /// limit (mapped to `SlowDown` at the S3 layer).
+    #[error("too many in-progress multipart uploads (limit: {limit})")]
+    TooManyMultipartUploads {
+        /// The configured concurrent-upload limit.
+        limit: u32,
+    },
+    /// The object (or multipart part) exceeds the backend's configured
+    /// size limit (mapped to `EntityTooLarge` at the S3 layer).
+    #[error("entity too large: {size} bytes exceeds the {limit}-byte limit")]
+    EntityTooLarge {
+        /// The actual size of the entity.
+        size: u64,
+        /// The configured limit.
+        limit: u64,
+    },
     /// A multipart part-key suffix is not a `u32`.
     #[error("invalid part key: {0}")]
     InvalidPartKey(#[from] ParseIntError),
@@ -150,6 +179,28 @@ pub fn invalid_part(part_number: u32) -> Error {
 #[inline]
 pub fn no_parts() -> Error {
     Error::NoParts
+}
+
+/// A non-final multipart part below the S3 5 MiB minimum.
+#[inline]
+pub fn part_too_small(part_number: u32, min_bytes: u64, actual: u64) -> Error {
+    Error::PartTooSmall {
+        part_number,
+        min_bytes,
+        actual,
+    }
+}
+
+/// The concurrent in-progress multipart upload limit was reached.
+#[inline]
+pub fn too_many_uploads(limit: u32) -> Error {
+    Error::TooManyMultipartUploads { limit }
+}
+
+/// The entity exceeds the backend's configured size limit.
+#[inline]
+pub fn entity_too_large(size: u64, limit: u64) -> Error {
+    Error::EntityTooLarge { size, limit }
 }
 
 /// A multipart part-key suffix is not a `u32`.

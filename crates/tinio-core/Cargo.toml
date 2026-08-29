@@ -14,11 +14,12 @@ garde.workspace = true
 hex.workspace = true
 md-5.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints.rust]
 unsafe_code = "forbid"

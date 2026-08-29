@@ -8,7 +8,7 @@ use crate::{
     object,
 };
 
-use super::{Storage, body::BodyStream};
+use super::{Storage, body::BodyStream, range::ByteRange};
 
 /// Parameters of a [`MultipartOps::list_parts`] call.
 ///
@@ -166,6 +166,31 @@ pub trait MultipartOps: Send + Sync + 'static {
     ) -> Result<PartInfo, <Self as Storage>::Error>
     where
         Self: Storage;
+
+    /// Server-side copy of `src` (optionally a byte range) into the part
+    /// `part_number` of the upload `upload_id` (S3 UploadPartCopy). The
+    /// default implementation streams the source through the body
+    /// contract (get range → upload part); a backend may override with a
+    /// filesystem-level copy. A part's ETag is always the content MD5 of
+    /// the part bytes (the range, when present).
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_part(
+        &self,
+        src_bucket: &bucket::Name,
+        src_key: &object::Key,
+        dst_bucket: &bucket::Name,
+        dst_key: &object::Key,
+        upload_id: &str,
+        part_number: crate::multipart::PartNumber,
+        range: Option<ByteRange>,
+    ) -> Result<PartInfo, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let get = self.get_object(src_bucket, src_key, range).await?;
+        self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body)
+            .await
+    }
 
     /// List the parts of an upload.
     async fn list_parts(

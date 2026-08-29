@@ -12,10 +12,10 @@ use std::str::FromStr;
 
 use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
 
-use tinio_core::storage::{ByteRange, Error as StorageError, GetObjectResult, Storage};
+use tinio_core::storage::{Error as StorageError, GetObjectResult, Storage};
 
 use crate::backend::{
-    ConditionFailure, ConditionalHeaders, S3Backend, condition_error, map_backend_error,
+    ConditionFailure, ConditionalHeaders, S3Backend, byte_range, condition_error, map_backend_error,
 };
 
 /// Parse an ETag-condition header (`x-amz-if-match`, `x-amz-if-none-match`)
@@ -134,14 +134,7 @@ impl<S: Storage> S3Backend<S> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
 
-        let range = req.input.range.map(|r| match r {
-            dto::Range::Int {
-                first,
-                last: Some(last),
-            } => ByteRange::Inclusive(first, last),
-            dto::Range::Int { first, last: None } => ByteRange::From(first),
-            dto::Range::Suffix { length } => ByteRange::Suffix(length),
-        });
+        let range = req.input.range.map(byte_range);
         // One resolution: the conditionals evaluate against the object's
         // own info (the body is dropped when a precondition fails).
         let GetObjectResult {
@@ -307,13 +300,14 @@ impl<S: Storage> S3Backend<S> {
         let dst_bucket = self.bucket(req.input.bucket)?;
         let dst_key = self.key(req.input.key)?;
 
-        // Server-side copy: stream the source into the destination through
-        // the contract (no client passthrough, FR-015). The get's info
+        // Server-side copy: the contract's copy primitive moves the
+        // source bytes into the destination (no client passthrough,
+        // FR-015 — a backend may copy them kernel-side). The head's info
         // carries the source ETag + mtime for the conditionals (412 on
-        // failure, per S3 copy semantics — the body is dropped).
-        let get = self
+        // failure, per S3 copy semantics — no body is streamed to drop).
+        let info = self
             .storage
-            .get_object(&src_bucket, &src_key, None)
+            .head_object(&src_bucket, &src_key)
             .await
             .map_err(map_backend_error)?;
         ConditionalHeaders::new(
@@ -322,7 +316,7 @@ impl<S: Storage> S3Backend<S> {
             req.input.copy_source_if_modified_since,
             req.input.copy_source_if_unmodified_since,
         )
-        .check(&get.info.etag, get.info.last_modified, true)?;
+        .check(&info.etag, info.last_modified, true)?;
         // The destination write serializes with the write lock, as in
         // `op_put_object` — a copy landing between a conditional put's
         // check and commit would invalidate the precondition.
@@ -342,7 +336,7 @@ impl<S: Storage> S3Backend<S> {
         .await?;
         let put = self
             .storage
-            .put_object(&dst_bucket, &dst_key, get.body)
+            .copy_object(&src_bucket, &src_key, &dst_bucket, &dst_key)
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(dto::CopyObjectOutput {
@@ -849,5 +843,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got, b"source data");
+    }
+
+    #[cfg(feature = "copy")]
+    #[tokio::test]
+    async fn copy_source_rejects_an_access_point_arn() {
+        // Only the plain `<bucket>/<key>` source is supported (path-style
+        // addressing, SC-002); an access-point ARN answers
+        // `InvalidArgument`, never a partial parse or a wrong bucket.
+        let (backend, b) = setup().await;
+        let req = s3_request(
+            dto::CopyObjectInput::builder()
+                .bucket(b)
+                .key("dst.txt".to_string())
+                .copy_source(dto::CopySource::AccessPoint {
+                    partition: "aws".into(),
+                    region: "us-east-1".into(),
+                    account_id: "123456789012".into(),
+                    access_point_name: "ap".into(),
+                    key: "src.txt".into(),
+                    version_id: None,
+                })
+                .build()
+                .unwrap(),
+        );
+        let err = backend.copy_object(req).await.unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument, "{err:?}");
+        assert!(
+            err.message().unwrap().contains("unsupported copy source"),
+            "{err:?}"
+        );
     }
 }

@@ -49,6 +49,15 @@ pub struct Config {
     #[serde(default = "multipart_expire_days")]
     #[default = 7]
     pub multipart_expire_days: u64,
+    /// Cap on concurrently in-progress multipart uploads (default 1000):
+    /// without a cap an authenticated client can accumulate an unbounded
+    /// number of uploads (each up to 10,000 parts), exhausting disk,
+    /// inodes, and metadata rows. Shared with the filesystem backend via
+    /// [`tinio_core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS`].
+    #[serde(default = "max_concurrent_uploads")]
+    #[default = 1000]
+    #[garde(range(min = 1))]
+    pub max_concurrent_uploads: u32,
 }
 
 fn multipart() -> bool {
@@ -77,4 +86,33 @@ fn temp_ttl_hours() -> u64 {
 
 fn multipart_expire_days() -> u64 {
     Config::default().multipart_expire_days
+}
+
+fn max_concurrent_uploads() -> u32 {
+    Config::default().max_concurrent_uploads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_concurrent_uploads_defaults_to_1000() {
+        assert_eq!(Config::default().max_concurrent_uploads, 1000);
+        let config = crate::Config::parse("version = 1\n[s3]").unwrap();
+        assert_eq!(config.s3.as_ref().unwrap().max_concurrent_uploads, 1000);
+    }
+
+    #[test]
+    fn max_concurrent_uploads_parses_when_set() {
+        let config = crate::Config::parse("version = 1\n[s3]\nmax_concurrent_uploads = 5").unwrap();
+        assert_eq!(config.s3.as_ref().unwrap().max_concurrent_uploads, 5);
+    }
+
+    #[test]
+    fn max_concurrent_uploads_rejects_zero() {
+        let err =
+            crate::Config::parse("version = 1\n[s3]\nmax_concurrent_uploads = 0").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidValue { .. }), "{err}");
+    }
 }

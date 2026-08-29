@@ -15,6 +15,15 @@ use super::{
 
 const META_DB_FILE: &str = "meta.redb";
 
+/// The state-directory mode on unix (CHK014): private to the owning user.
+#[cfg(unix)]
+const STATE_DIR_MODE: u32 = 0o700;
+
+/// The state-database file mode on unix (CHK014): private to the owning
+/// user.
+#[cfg(unix)]
+const META_DB_MODE: u32 = 0o600;
+
 fn meta_db_path(state_dir: &Path) -> PathBuf {
     state_dir.join(META_DB_FILE)
 }
@@ -39,6 +48,12 @@ pub struct Open {
 /// [`Error::UnsupportedVersion`]. The `compact_needed` and `stats` fields
 /// are read in the same write transaction for the startup compact path.
 ///
+/// On unix the private state is hardened after creation, per the project's
+/// CHK014 requirement: the state directory is `0700` and `meta.redb` is
+/// `0600`, regardless of the process umask. On Windows the files inherit
+/// the creating user's default ACLs (std has no ACL API; the state dir is
+/// created under the storage root's `.tinio` segment).
+///
 /// # Errors
 ///
 /// `Error::Open` when the file exists but is not a valid redb database
@@ -46,8 +61,12 @@ pub struct Open {
 /// for a rebuild); `UnsupportedVersion` on a version mismatch.
 pub fn open(state_dir: &Path) -> Result<Open, Error> {
     fs::create_dir_all(state_dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(state_dir, fs::Permissions::from_mode(STATE_DIR_MODE))?;
     let path = meta_db_path(state_dir);
     let db = Database::create(&path)?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(META_DB_MODE))?;
     let (compact_needed, stats) = {
         let mut txn = db.begin_write()?;
         let compact_needed = {
@@ -68,6 +87,64 @@ pub fn open(state_dir: &Path) -> Result<Open, Error> {
         compact_needed,
         stats,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn state_dir_and_meta_db_are_hardened() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let opened = open(&state).unwrap();
+        drop(opened);
+
+        let dir_mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, STATE_DIR_MODE,
+            "state dir must be {STATE_DIR_MODE:o}, got {dir_mode:o}"
+        );
+
+        let db_mode = fs::metadata(meta_db_path(&state))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            db_mode, META_DB_MODE,
+            "meta.redb must be {META_DB_MODE:o}, got {db_mode:o}"
+        );
+    }
+
+    #[test]
+    fn open_hardens_pre_existing_state() {
+        // Re-opening an existing state dir also enforces the modes
+        // (idempotent; CHK014 must hold after every startup).
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        drop(open(&state).unwrap());
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(meta_db_path(&state), fs::Permissions::from_mode(0o644)).unwrap();
+
+        drop(open(&state).unwrap());
+
+        let dir_mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, STATE_DIR_MODE,
+            "state dir must be re-hardened to {STATE_DIR_MODE:o}, got {dir_mode:o}"
+        );
+        let db_mode = fs::metadata(meta_db_path(&state))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            db_mode, META_DB_MODE,
+            "meta.redb must be re-hardened to {META_DB_MODE:o}, got {db_mode:o}"
+        );
+    }
 }
 
 /// The outcome of a state-database integrity check (doctor reporting,

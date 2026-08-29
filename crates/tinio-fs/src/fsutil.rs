@@ -59,7 +59,13 @@ pub(crate) async fn object_metadata(
     }
 }
 
-fn open_nofollow_std(path: &Path) -> io::Result<std::fs::File> {
+/// Open `path` for reading with the leaf open through the symlink policy
+/// (blocking): `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` so a TOCTOU
+/// swap to a symlink cannot escape the storage root, then reject the
+/// handle when it still resolves to a link. The blocking half of
+/// [`open_file`]; also the [`crate::etag::ComputeTask`] open
+/// (R3 — one open serves the hash and the file identity).
+pub(crate) fn open_nofollow_std(path: &Path) -> io::Result<std::fs::File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -71,7 +77,28 @@ fn open_nofollow_std(path: &Path) -> io::Result<std::fs::File> {
         // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point itself.
         opts.custom_flags(0x0020_0000);
     }
-    let file = opts.open(path)?;
+    let file = match opts.open(path) {
+        // O_NOFOLLOW rejects the link at open time on unix (ELOOP) —
+        // normalized to the documented `PermissionDenied` so both
+        // platforms answer the rejection the same way (R3). The original
+        // ELOOP is preserved as the error's source (F24), so an
+        // intermediate-chain loop (an out-of-band symlink chain beyond
+        // the kernel resolution limit) is distinguishable from a leaf
+        // O_NOFOLLOW rejection through the error chain. The raw OS error
+        // is consulted directly — `ErrorKind::FilesystemLoop` is not
+        // stable on every toolchain.
+        #[cfg(unix)]
+        Err(err) if err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, err));
+        }
+        result => result?,
+    };
+    // The post-open check is Windows-only (data-path review 2026-08-29,
+    // finding 5): on unix O_NOFOLLOW already guarantees the opened file
+    // is not a symlink — a post-open metadata() would be one dead syscall
+    // per hashed file. On Windows FILE_FLAG_OPEN_REPARSE_POINT *succeeds*
+    // on a link, so this check is the only thing that rejects it here.
+    #[cfg(windows)]
     if is_symlink_or_reparse(&file.metadata()?) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "symlink"));
     }
@@ -166,13 +193,48 @@ pub(crate) fn file_identity(path: &Path, metadata: &Metadata) -> u64 {
     }
 }
 
+/// The stable identity of an **already-open** file (R3 — the identity
+/// comes from the handle that was opened under the symlink policy, never
+/// a second path-based open). Same rules as [`file_identity`] — unix
+/// dev+inode from `metadata`, Windows volume serial + file index from
+/// the handle. The read path uses this on its own handle
+/// (`backend/objects.rs` — `tokio::fs::File::into_std()` bridges the
+/// two without unsafe); the remaining path-based [`file_identity`]
+/// callers are the walks and post-commit stats, which have no handle in
+/// hand.
+pub(crate) fn file_identity_handle(file: &std::fs::File, metadata: &Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        metadata.dev() ^ metadata.ino().rotate_left(32)
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        windows_handle_identity(file).unwrap_or(0)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, metadata);
+        0
+    }
+}
+
 /// The Windows file identity: volume serial + file index from
 /// `GetFileInformationByHandle` (stable Win32, via the safe `winapi-util`
 /// wrapper). `0` on filesystems without a file ID (FAT/exFAT).
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> io::Result<u64> {
     let file = std::fs::File::open(path)?;
-    let info = winapi_util::file::information(&file)?;
+    windows_handle_identity(&file)
+}
+
+/// The Windows identity of an already-open handle (one open serves the
+/// symlink policy, the hash, and the identity — R3).
+#[cfg(windows)]
+fn windows_handle_identity(file: &std::fs::File) -> io::Result<u64> {
+    let info = winapi_util::file::information(file)?;
     let volume = info.volume_serial_number();
     let index = info.file_index();
     Ok(if volume == 0 && index == 0 {
@@ -180,6 +242,88 @@ fn windows_file_identity(path: &Path) -> io::Result<u64> {
     } else {
         volume ^ index.rotate_left(32)
     })
+}
+
+/// Whether `path` is absent — the exact "object file / bucket dir no
+/// longer exists" test of the reclaim paths (scanner orphan reclamation,
+/// stale-bucket pruning). `NotFound` answers `true`; **any other error
+/// (EACCES, EIO, …) propagates** — an IO error must never be treated as
+/// "gone", or a live object whose path is temporarily unreadable would
+/// have its meta row (or its bucket's whole derived state) removed (F11).
+pub(crate) async fn is_absent(path: &Path) -> io::Result<bool> {
+    match tokio::fs::try_exists(path).await {
+        Ok(exists) => Ok(!exists),
+        Err(err) => Err(err),
+    }
+}
+
+/// Copy `len` bytes at `offset` of `src` into `dst` with the kernel's
+/// `copy_file_range` (unix; zero userspace buffering — the copy
+/// primitives' fast path, E3). Copies exactly `len` bytes: a short
+/// kernel copy is retried from where it stopped, and a zero-progress
+/// round is an unexpected EOF (the source shrank mid-copy — the callers'
+/// torn guard then treats the staged bytes as self-consistent).
+#[cfg(unix)]
+pub(crate) fn copy_file_range(
+    src: &std::fs::File,
+    offset: u64,
+    len: u64,
+    dst: &std::fs::File,
+) -> io::Result<()> {
+    let mut off = offset;
+    let mut remaining = len;
+    while remaining > 0 {
+        let copied =
+            rustix::fs::copy_file_range(src, Some(&mut off), dst, None, remaining as usize)
+                .map_err(io::Error::from)?;
+        if copied == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "copy_file_range made no progress",
+            ));
+        }
+        remaining -= copied as u64;
+    }
+    Ok(())
+}
+
+/// The shared streaming MD5 core (F43): read `reader` through `buf` in
+/// bounded slices into an incremental MD5. The blocking home of the rule
+/// (std readers — the etag task's per-file hash over the worker-thread
+/// pooled buffer); the async tokio-reader form is [`md5_stream_async`].
+/// The multipart assembly deliberately does NOT use it — its copy+hash
+/// loop is fused by design (the part bytes must stream into the output
+/// file).
+pub(crate) fn md5_stream<R: io::Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<[u8; 16]> {
+    use md5::Digest;
+    let mut hasher = md5::Md5::new();
+    loop {
+        let n = reader.read(buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// The async share of [`md5_stream`] — a tokio reader (the atomic-write
+/// staging path, which has no blocking-pool buffer).
+pub(crate) async fn md5_stream_async<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> io::Result<[u8; 16]> {
+    use md5::Digest;
+    use tokio::io::AsyncReadExt;
+    let mut hasher = md5::Md5::new();
+    loop {
+        let n = reader.read(buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// A removal is idempotent: a missing target is success, any other

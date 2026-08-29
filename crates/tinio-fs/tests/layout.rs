@@ -9,11 +9,21 @@
 
 use std::path::Path;
 
-use tinio_core::bucket;
-use tinio_core::multipart::part_number;
-use tinio_core::storage::{BucketOps, ListPartsParams, MultipartOps, ObjectOps};
+use tinio_core::{
+    bucket,
+    multipart::part_number,
+    storage::{BucketOps, ListPartsParams, MultipartOps, ObjectOps},
+};
 use tinio_fs::{FsOptions, FsStorage};
 use tinio_util::testing::{body, read_body};
+
+/// The shared offline defaults plus the test's state-dir override (F33).
+fn fs_options(state_dir: &Path) -> FsOptions {
+    FsOptions {
+        state_dir: Some(state_dir.to_path_buf()),
+        ..tinio_fs::testing::fs_options()
+    }
+}
 
 /// The entries of `dir` as a sorted set.
 fn entries(dir: &Path) -> Vec<String> {
@@ -30,14 +40,7 @@ fn entries(dir: &Path) -> Vec<String> {
 async fn state_dir_holds_only_redb_tmp_and_multipart() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    let storage = FsStorage::new(
-        root.path(),
-        FsOptions {
-            state_dir: Some(state.path().to_path_buf()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let storage = FsStorage::new(root.path(), fs_options(state.path())).unwrap();
 
     let b = bucket_name("data");
     storage.create_bucket(&b).await.unwrap();
@@ -99,14 +102,7 @@ async fn deleting_meta_redb_self_heals() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let state_dir = state.path().to_path_buf();
-    let storage = FsStorage::new(
-        root.path(),
-        FsOptions {
-            state_dir: Some(state_dir.clone()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let storage = FsStorage::new(root.path(), fs_options(&state_dir)).unwrap();
     let b = bucket_name("data");
     storage.create_bucket(&b).await.unwrap();
     storage
@@ -119,14 +115,7 @@ async fn deleting_meta_redb_self_heals() {
 
     // Wipe the database (simulating corruption beyond repair), then reopen.
     std::fs::remove_file(state_dir.join("meta.redb")).unwrap();
-    let storage = FsStorage::new(
-        root.path(),
-        FsOptions {
-            state_dir: Some(state_dir),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let storage = FsStorage::new(root.path(), fs_options(&state_dir)).unwrap();
     // The object is still served — the ETag is recomputed on demand.
     let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
     assert_eq!(head.size, 5);

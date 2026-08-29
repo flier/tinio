@@ -25,10 +25,14 @@ fn caps() -> Capabilities {
 async fn no_such_bucket() {
     let server = Server::mem(caps()).await;
 
-    // GET on a missing bucket → NoSuchBucket.
-    let resp = request(server.addr(), "GET", "/missing", &[], &[]).await;
-    assert_eq!(resp.status, StatusCode::NOT_FOUND);
-    assert_eq!(resp.error_code(), "NoSuchBucket");
+    // GET on a missing bucket → NoSuchBucket (path-style GET routes to
+    // ListObjects, so it exists only with the list-v1 feature).
+    #[cfg(feature = "list-v1")]
+    {
+        let resp = request(server.addr(), "GET", "/missing", &[], &[]).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.error_code(), "NoSuchBucket");
+    }
 
     // PUT into a missing bucket → NoSuchBucket.
     let resp = request(server.addr(), "PUT", "/missing/a.txt", &[], b"x").await;

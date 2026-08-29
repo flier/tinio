@@ -26,6 +26,52 @@ pub(crate) mod objects;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{FutureExt, StreamExt};
+    use tinio_core::bucket;
+    use tinio_core::storage::BucketOps;
+    use tinio_mem::MemoryStorage;
+
+    fn backend() -> S3Backend<MemoryStorage> {
+        S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
+    }
+
+    #[test]
+    fn capabilities_accessor_returns_the_toggles() {
+        let mut caps = Capabilities::default();
+        caps.multipart = false;
+        let backend = S3Backend::new(MemoryStorage::new().unwrap(), caps);
+        assert_eq!(backend.capabilities(), caps);
+    }
+
+    #[test]
+    fn stream_in_wraps_or_empties_a_body() {
+        // No body: the handlers get an empty stream, never a panic.
+        let mut empty = S3Backend::<MemoryStorage>::stream_in(None);
+        assert!(empty.next().now_or_never().unwrap().is_none());
+        // A present body is wrapped into the contract's body stream,
+        // each chunk surfacing as `io::Result<Bytes>`.
+        let stream =
+            futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))]);
+        let body = dto::StreamingBlob::wrap(stream);
+        let mut streamed = S3Backend::<MemoryStorage>::stream_in(Some(body));
+        assert_eq!(
+            streamed.next().now_or_never().unwrap().unwrap().unwrap(),
+            bytes::Bytes::from_static(b"x")
+        );
+    }
+
+    #[test]
+    fn bucket_validates_the_request_input() {
+        let backend = backend();
+        assert!(backend.bucket("valid-bucket".to_string()).is_ok());
+        let err = backend.bucket("UPPER".to_string()).unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidBucketName, "{err:?}");
+    }
+}
+
 pub use capabilities::Capabilities;
 pub(crate) use conditions::{ConditionFailure, ConditionalHeaders, condition_error};
 pub(crate) use errors::map_backend_error;
@@ -36,7 +82,7 @@ use futures::TryStreamExt;
 use s3s::{S3Error, S3Result, dto, s3_error};
 use tinio_core::{
     BodyStream, ETag, bucket, object,
-    storage::{Error as StorageError, Storage},
+    storage::{ByteRange, Error as StorageError, Storage},
 };
 use tinio_util::lockmap;
 
@@ -187,4 +233,28 @@ impl<S: Storage> S3Backend<S> {
             .essence_str()
             .to_string()
     }
+}
+
+/// The wire `Range` header into the contract's [`ByteRange`] — the GET
+/// mapping (all three S3 shapes). The strict copy-source form
+/// ([`copy_source_range`]) accepts only the closed `bytes=first-last`
+/// shape on top of this mapping.
+pub(crate) fn byte_range(r: dto::Range) -> ByteRange {
+    match r {
+        dto::Range::Int {
+            first,
+            last: Some(last),
+        } => ByteRange::Inclusive(first, last),
+        dto::Range::Int { first, last: None } => ByteRange::From(first),
+        dto::Range::Suffix { length } => ByteRange::Suffix(length),
+    }
+}
+
+/// Normalize the S3 wire `delimiter`: an empty `delimiter=` value means
+/// "no delimiter" (clients like mc always send it) — a `Some("")` would
+/// roll every key up into an empty common prefix and empty the page.
+/// One home for the boundary rule, shared by the object and upload
+/// listings.
+pub(crate) fn normalize_delimiter(delimiter: Option<String>) -> Option<String> {
+    delimiter.filter(|d| !d.is_empty())
 }

@@ -28,8 +28,16 @@ opentelemetry_sdk = { workspace = true, optional = true }
 prometheus.workspace = true
 s3s.workspace = true
 thiserror.workspace = true
+thread-priority.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "time", "macros", "rt"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
@@ -53,13 +61,14 @@ criterion = { workspace = true, features = ["async_tokio"] }
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+md-5.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
-tinio-util = { workspace = true, features = ["testing"] }
 tinio-fs.workspace = true
 tinio-mem.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
 
 [[bench]]
 name = "multipart_assembly"
@@ -67,6 +76,10 @@ harness = false
 
 [[bench]]
 name = "listing"
+harness = false
+
+[[bench]]
+name = "pipeline"
 harness = false
 
 [features]

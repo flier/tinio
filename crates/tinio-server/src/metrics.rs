@@ -1,11 +1,18 @@
 //! Prometheus registry and metric families (task T023).
 //!
-//! The three metric layers of the data model (data-model.md Metrics):
-//! HTTP (`tinio_http_*`), S3 operations (`tinio_s3_*`), and storage
-//! (`tinio_storage_*`). Families are process-wide globals, registered
-//! once on the default registry via `register_*!`. The storage-layer
-//! full-scan gauges are computed (with a 30 s TTL cache) by the
-//! management plane later (T075).
+//! The metric layers of the data model (data-model.md Metrics): HTTP
+//! (`tinio_http_*`), S3 operations (`tinio_s3_*`), storage
+//! (`tinio_storage_*`), the pipeline gauges (`tinio_pipeline_*`), and the
+//! write-lock duration histograms (`tinio_write_lock_*`, pipeline-spec.md
+//! §4). Families are process-wide globals, registered once on the default
+//! registry via `register_*!`. The storage-layer full-scan gauges are
+//! computed (with a 30 s TTL cache) by the management plane later (T075);
+//! the pipeline gauges are refreshed from the runtimes' [`Stats`]
+//! snapshots on scrape, and the write-lock histograms are converted from
+//! a plain-data [`WriteLockStats`] (the backend snapshot conversion lives
+//! at the wiring point — `tinio-server` never imports a backend crate) —
+//! cheap atomic snapshots, no TTL cache (that pattern belongs to the
+//! storage full-scan gauges only).
 //!
 //! # Examples
 //!
@@ -21,15 +28,52 @@
 //! assert!(!prometheus::default_registry().gather().is_empty());
 //! ```
 
-use std::{future::Future, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use lazy_static::lazy_static;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto;
 use prometheus::{
-    HistogramVec, IntCounter, IntCounterVec, IntGauge, register_histogram_vec,
-    register_int_counter, register_int_counter_vec, register_int_gauge,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, register_histogram_vec,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, dto};
+
+use tinio_core::{
+    pipeline::Stats,
+    storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
+};
+
+/// The write-lock distribution snapshot as **plain data** — the metric
+/// layer is decoupled from any backend's snapshot type: the wiring point
+/// (serve.rs) converts the tinio-fs `WriteLockSnapshot` into this
+/// value, so `tinio-server` never imports a backend crate. The bucket
+/// bounds are the shared tinio-core constants (positional with the
+/// fs backend's bucketing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteLockStats {
+    /// Wait-duration counts per bucket (index per
+    /// [`WRITE_LOCK_BUCKET_BOUNDS_US`]).
+    pub wait_buckets: [u64; WRITE_LOCK_BUCKETS],
+    /// Total-duration counts per bucket.
+    pub total_buckets: [u64; WRITE_LOCK_BUCKETS],
+    /// Write transactions recorded.
+    pub count: u64,
+    /// Sum of wait durations, microseconds.
+    pub wait_sum_us: u64,
+    /// Maximum wait duration, microseconds.
+    pub wait_max_us: u64,
+    /// Sum of total durations, microseconds.
+    pub total_sum_us: u64,
+    /// Maximum total duration, microseconds.
+    pub total_max_us: u64,
+}
 
 lazy_static! {
     /// HTTP requests served by the management plane, by method and status.
@@ -115,6 +159,39 @@ lazy_static! {
         "Multipart uploads currently in progress"
     )
     .expect("register tinio_storage_multipart_in_progress");
+    /// Tasks currently queued in a pipeline, by pipeline (io/db).
+    pub static ref PIPELINE_QUEUE_DEPTH: IntGaugeVec = register_int_gauge_vec!(
+        "tinio_pipeline_queue_depth",
+        "Tasks currently queued in a pipeline, by pipeline",
+        &["pipeline"]
+    )
+    .expect("register tinio_pipeline_queue_depth");
+    /// Tasks currently executing in a pipeline, by pipeline (io/db).
+    pub static ref PIPELINE_IN_FLIGHT: IntGaugeVec = register_int_gauge_vec!(
+        "tinio_pipeline_in_flight",
+        "Tasks currently executing in a pipeline, by pipeline",
+        &["pipeline"]
+    )
+    .expect("register tinio_pipeline_in_flight");
+    /// Workers currently busy in a pipeline, by pipeline (io/db).
+    pub static ref PIPELINE_BUSY_WORKERS: IntGaugeVec = register_int_gauge_vec!(
+        "tinio_pipeline_busy_workers",
+        "Workers currently busy in a pipeline, by pipeline",
+        &["pipeline"]
+    )
+    .expect("register tinio_pipeline_busy_workers");
+    /// The write-lock duration histograms (pipeline-spec.md §4): the
+    /// `wait` and `total` distributions of every write transaction,
+    /// converted from the tinio-fs snapshot at scrape time (registered
+    /// with the default registry — the registry holds its own copy of
+    /// the descriptors).
+    pub static ref WRITE_LOCK_HISTOGRAMS: WriteLockHistograms = {
+        let histograms = WriteLockHistograms::new()
+            .expect("build the write-lock histogram descriptors");
+        prometheus::register(Box::new(histograms.clone()))
+            .expect("register the write-lock histogram families");
+        histograms
+    };
 }
 
 /// Decrement the in-progress-multipart gauge, saturating at zero: after a
@@ -162,6 +239,146 @@ pub fn record_s3_operation(op: &str, status: u16, duration: Duration) {
     );
 }
 
+/// Refresh every scrape-computed family from one call (F49 — the single
+/// refresh entry point behind the `/metrics` endpoint, pipeline-spec.md
+/// §4): the pipeline gauges from two [`Stats`] snapshots and the
+/// write-lock histograms from a plain-data [`WriteLockStats`] (the
+/// conversion happens at gather, never on the write path; the backend
+/// snapshot → [`WriteLockStats`] conversion lives at the wiring point).
+/// Touching the statics registers the families with the default registry
+/// (F10 — the server's `/metrics` endpoint calls this on every scrape,
+/// so a running server's registry always contains them).
+pub fn refresh(io: Stats, db: Stats, write_lock: WriteLockStats) {
+    for (label, stats) in [("io", io), ("db", db)] {
+        PIPELINE_QUEUE_DEPTH
+            .with_label_values(&[label])
+            .set(i64::try_from(stats.queue_depth).unwrap_or(i64::MAX));
+        PIPELINE_IN_FLIGHT
+            .with_label_values(&[label])
+            .set(i64::try_from(stats.in_flight).unwrap_or(i64::MAX));
+        PIPELINE_BUSY_WORKERS
+            .with_label_values(&[label])
+            .set(i64::try_from(stats.busy_workers).unwrap_or(i64::MAX));
+    }
+    WRITE_LOCK_HISTOGRAMS.refresh(write_lock);
+}
+
+/// The scrape-time conversion of the write-lock histograms
+/// (pipeline-spec.md §4): two cumulative histogram families — the `wait`
+/// and `total` distributions of every write transaction — filled from
+/// the latest [`WriteLockStats`] on gather. Prometheus histograms
+/// cannot be set from external counts, so the families are a small
+/// custom [`Collector`] over the [`proto`] message types: the shared
+/// tinio-core bucket bounds become cumulative `le=` buckets (µs →
+/// seconds), with `_sum`/`_count` from the snapshot's count/sum (the
+/// text encoder appends the `le="+Inf"` bucket from `_count`).
+#[derive(Clone)]
+pub struct WriteLockHistograms {
+    wait_desc: Desc,
+    total_desc: Desc,
+    /// The latest snapshot, shared with the registered clone (the
+    /// lazy_static registers a clone — the snapshot must be one Arc, not
+    /// per-copy state). A cheap atomic read on the write path — no 30 s
+    /// TTL cache; that pattern belongs to the storage full-scan gauges
+    /// only.
+    snapshot: Arc<Mutex<WriteLockStats>>,
+}
+
+impl WriteLockHistograms {
+    /// Build the two family descriptors. The bucket bounds are the
+    /// shared tinio-core constants — the conversion is positional by
+    /// index (the metrics layer reads the buckets by index, not name).
+    fn new() -> prometheus::Result<Self> {
+        let wait_desc = Desc::new(
+            "tinio_write_lock_wait_duration_seconds".to_string(),
+            "Write-lock wait duration of write transactions (the entry-to-begin_write interval, approximating the single-writer lock wait), cumulative histogram"
+                .to_string(),
+            Vec::new(),
+            HashMap::new(),
+        )?;
+        let total_desc = Desc::new(
+            "tinio_write_lock_total_duration_seconds".to_string(),
+            "Total duration of write transactions (entry to commit/abort return, incl. fsync), cumulative histogram"
+                .to_string(),
+            Vec::new(),
+            HashMap::new(),
+        )?;
+        Ok(Self {
+            wait_desc,
+            total_desc,
+            snapshot: Arc::new(Mutex::new(WriteLockStats::default())),
+        })
+    }
+
+    /// Store the latest snapshot for the scrape-time conversion.
+    fn refresh(&self, snapshot: WriteLockStats) {
+        *self.snapshot.lock().unwrap() = snapshot;
+    }
+}
+
+impl Collector for WriteLockHistograms {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.wait_desc, &self.total_desc]
+    }
+
+    fn collect(&self) -> Vec<proto::MetricFamily> {
+        let snapshot = *self.snapshot.lock().unwrap();
+        vec![
+            write_lock_family(
+                &self.wait_desc,
+                &snapshot.wait_buckets,
+                snapshot.count,
+                snapshot.wait_sum_us,
+            ),
+            write_lock_family(
+                &self.total_desc,
+                &snapshot.total_buckets,
+                snapshot.count,
+                snapshot.total_sum_us,
+            ),
+        ]
+    }
+}
+
+/// One write-lock distribution as a prometheus cumulative histogram:
+/// per-bound cumulative buckets (µs → seconds). The open `>100k µs`
+/// bucket's counts stay implicit in `_count` (the standard +Inf
+/// semantics — `histogram_quantile` extrapolates past the last bound).
+/// A duration exactly at a bucket bound counts in the NEXT `le=` bucket
+/// (the strict `bounds[i-1] <= d < bounds[i]` bucketing of tinio-fs's
+/// `write_lock_bucket`, documented with `WRITE_LOCK_BUCKET_BOUNDS_US`) —
+/// correct as-is, not a fencepost to fix.
+fn write_lock_family(
+    desc: &Desc,
+    buckets: &[u64; WRITE_LOCK_BUCKETS],
+    count: u64,
+    sum_us: u64,
+) -> proto::MetricFamily {
+    let mut histogram = proto::Histogram::default();
+    histogram.set_sample_count(count);
+    histogram.set_sample_sum(sum_us as f64 / 1_000_000.0);
+    let mut cumulative = 0u64;
+    let mut proto_buckets = Vec::with_capacity(WRITE_LOCK_BUCKET_BOUNDS_US.len());
+    for (bucket, bound_us) in buckets.iter().zip(WRITE_LOCK_BUCKET_BOUNDS_US) {
+        cumulative += bucket;
+        let mut proto_bucket = proto::Bucket::default();
+        proto_bucket.set_cumulative_count(cumulative);
+        proto_bucket.set_upper_bound(bound_us as f64 / 1_000_000.0);
+        proto_buckets.push(proto_bucket);
+    }
+    histogram.set_bucket(proto_buckets);
+
+    let mut metric = proto::Metric::default();
+    metric.set_histogram(histogram);
+
+    let mut family = proto::MetricFamily::default();
+    family.set_name(desc.fq_name.clone());
+    family.set_help(desc.help.clone());
+    family.set_field_type(proto::MetricType::HISTOGRAM);
+    family.set_metric(vec![metric]);
+    family
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +388,10 @@ mod tests {
     /// `STORAGE_MULTIPART_IN_PROGRESS` gauge — parallel interleaving would
     /// clobber the exact-value asserts.
     static MULTIPART_GAUGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes the tests that refresh the shared write-lock snapshot —
+    /// a parallel refresh between the refresh and the encode would clobber
+    /// the exact bucket counts.
+    static WRITE_LOCK_SNAPSHOT_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn registers_all_families() {
@@ -188,13 +409,26 @@ mod tests {
         STORAGE_OBJECTS_UPLOADED.with_label_values(&["put"]).inc();
         STORAGE_OBJECTS_DELETED.inc_by(0);
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
+        // The pipeline gauges (io/db labels) sample the inline runners —
+        // stats are all zeros, the family set is what matters here.
+        refresh(
+            Stats::default(),
+            Stats::default(),
+            WriteLockStats::default(),
+        );
+        // The write-lock histograms are always emitted (zero counts
+        // before any write transaction); the refresh is also the
+        // registration path (the server's `/metrics` endpoint calls it on
+        // every scrape, F10).
+        let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
         let names: Vec<String> = prometheus::default_registry()
             .gather()
             .iter()
             .map(|f| f.name().to_string())
             .collect();
-        // The tinio_* family set must be exactly the 13 spec'd names
-        // (data-model.md Metrics) — a 14th family would fail this equality.
+        // The tinio_* family set must be exactly the 18 spec'd names
+        // (data-model.md Metrics + the pipeline gauges + the write-lock
+        // histograms) — a 19th family would fail this equality.
         let expected: std::collections::HashSet<&str> = [
             "tinio_http_requests_total",
             "tinio_http_request_duration_seconds",
@@ -209,6 +443,11 @@ mod tests {
             "tinio_storage_objects_uploaded_total",
             "tinio_storage_objects_deleted_total",
             "tinio_storage_multipart_in_progress",
+            "tinio_pipeline_queue_depth",
+            "tinio_pipeline_in_flight",
+            "tinio_pipeline_busy_workers",
+            "tinio_write_lock_wait_duration_seconds",
+            "tinio_write_lock_total_duration_seconds",
         ]
         .into_iter()
         .collect();
@@ -218,6 +457,86 @@ mod tests {
             .map(|n| n.as_str())
             .collect();
         assert_eq!(actual, expected, "tinio_* family set");
+    }
+
+    #[test]
+    fn write_lock_histograms_reflect_the_snapshot() {
+        // The conversion is positional: snapshot bucket i maps to the
+        // i-th cumulative `le=` bound (µs → seconds), `_sum`/`_count`
+        // carry the snapshot's count/sum, and the text encoder appends
+        // the `le="+Inf"` bucket from `_count` (the open >100k µs
+        // bucket's counts are implicit there).
+        let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
+        let snapshot = WriteLockStats {
+            wait_buckets: [10, 5, 3, 2, 1, 0, 0],
+            total_buckets: [0, 1, 2, 3, 4, 5, 6],
+            count: 21,
+            wait_sum_us: 21_000,
+            wait_max_us: 9_999,
+            total_sum_us: 210_000,
+            total_max_us: 99_999,
+        };
+        refresh(Stats::default(), Stats::default(), snapshot);
+
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&prometheus::default_registry().gather(), &mut buf)
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        // Wait distribution: cumulative 10/15/18/20/21/21, sum 0.021 s.
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.00001"} 10"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.0001"} 15"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.001"} 18"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.005"} 20"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.02"} 21"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.1"} 21"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="+Inf"} 21"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_sum 0.021"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_wait_duration_seconds_count 21"#),
+            "{text}"
+        );
+        // Total distribution: cumulative 0/1/3/6/10/15, +Inf 21, sum 0.21 s.
+        assert!(
+            text.contains(r#"tinio_write_lock_total_duration_seconds_bucket{le="0.005"} 6"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_total_duration_seconds_bucket{le="+Inf"} 21"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_total_duration_seconds_sum 0.21"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"tinio_write_lock_total_duration_seconds_count 21"#),
+            "{text}"
+        );
     }
 
     #[test]
@@ -351,6 +670,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn metric_s3_maintains_multipart_gauge() {
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
@@ -398,12 +718,15 @@ mod tests {
         call!(head_object, dto::HeadObjectInput);
         call!(delete_object, dto::DeleteObjectInput);
         call!(get_object_tagging, dto::GetObjectTaggingInput);
+        #[cfg(feature = "multipart")]
         call!(upload_part, dto::UploadPartInput);
         #[cfg(feature = "list-v1")]
         call!(list_objects, dto::ListObjectsInput);
         #[cfg(feature = "list-v2")]
         call!(list_objects_v2, dto::ListObjectsV2Input);
+        #[cfg(feature = "multipart")]
         call!(list_parts, dto::ListPartsInput);
+        #[cfg(feature = "multipart")]
         call!(list_multipart_uploads, dto::ListMultipartUploadsInput);
         // These three inputs have required fields (no Default) — built
         // explicitly with every field.
@@ -484,7 +807,7 @@ mod tests {
             mfa: None,
             request_payer: None,
         })));
-        let recorded: Vec<&str> = [
+        let mut expected: Vec<&str> = vec![
             "DeleteBucket",
             "HeadBucket",
             "ListBuckets",
@@ -495,17 +818,18 @@ mod tests {
             "DeleteObject",
             "DeleteObjects",
             "GetObjectTagging",
-            "UploadPart",
-            "ListParts",
-            "ListMultipartUploads",
-        ]
-        .into_iter()
-        .filter(|op| s3_counter(op, 501) == 1)
-        .collect();
-        // All 13 unconditional ops recorded exactly one 501 (the
-        // feature-gated ones are asserted under cfg below to keep the
-        // baseline feature-independent).
-        assert_eq!(recorded.len(), 13, "{recorded:?}");
+        ];
+        #[cfg(feature = "multipart")]
+        expected.extend(["UploadPart", "ListParts", "ListMultipartUploads"]);
+        let recorded: Vec<&str> = expected
+            .iter()
+            .copied()
+            .filter(|op| s3_counter(op, 501) == 1)
+            .collect();
+        // Every unconditional + feature-enabled op recorded exactly one
+        // 501 (the copy/list-v1/list-v2 ops are asserted under cfg below
+        // to keep the baseline feature-independent).
+        assert_eq!(recorded, expected, "{recorded:?}");
         #[cfg(feature = "copy")]
         {
             assert_eq!(s3_counter("CopyObject", 501), 1);

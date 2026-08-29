@@ -78,13 +78,16 @@ impl ObjectOps for MemoryStorage {
         } else {
             data
         };
+        // Enforce the per-object size limit before opening the write
+        // transaction (fast fail; folder markers are empty and pass).
+        self.check_object_size(data.len() as u64)?;
         let etag = if key.is_folder_marker() {
             ETag::EMPTY
         } else {
             ETag::from_content(&data)
         };
         let txn = self.db.begin_write()?;
-        {
+        let delta = {
             let buckets = txn.open_table(BUCKETS)?;
             if buckets.get(bucket.as_ref().as_str())?.is_none() {
                 return Err(no_such_bucket(bucket));
@@ -93,13 +96,23 @@ impl ObjectOps for MemoryStorage {
             let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
             let mut objects = txn.open_table(OBJECTS)?;
             let mut meta = txn.open_table(OBJECT_META)?;
+            let old_len = objects
+                .get(ok.as_str())?
+                .map(|v| v.value().len() as u64)
+                .unwrap_or(0);
+            let delta = data.len() as i64 - old_len as i64;
+            self.adjust_total(delta)?;
             objects.insert(ok.as_str(), data.as_slice())?;
             meta.insert(
                 ok.as_str(),
                 (etag_str.as_str(), data.len() as u64, now_nanos()),
             )?;
+            delta
+        };
+        if let Err(err) = txn.commit() {
+            self.rollback_total(delta);
+            return Err(err.into());
         }
-        txn.commit()?;
         Ok(PutObjectResult { etag })
     }
 
@@ -179,7 +192,7 @@ impl ObjectOps for MemoryStorage {
 
     async fn delete_object(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
         let txn = self.db.begin_write()?;
-        {
+        let old_len = {
             let buckets = txn.open_table(BUCKETS)?;
             if buckets.get(bucket.as_ref().as_str())?.is_none() {
                 return Err(no_such_bucket(bucket));
@@ -187,10 +200,19 @@ impl ObjectOps for MemoryStorage {
             let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
             let mut objects = txn.open_table(OBJECTS)?;
             let mut meta = txn.open_table(OBJECT_META)?;
+            let old_len = objects
+                .get(ok.as_str())?
+                .map(|v| v.value().len() as u64)
+                .unwrap_or(0);
             objects.remove(ok.as_str())?;
             meta.remove(ok.as_str())?;
+            old_len
+        };
+        if let Err(err) = txn.commit() {
+            return Err(err.into());
         }
-        txn.commit()?;
+        // A delete only shrinks the total; it cannot exceed a limit.
+        let _ = self.adjust_total(-(old_len as i64));
         Ok(())
     }
 
@@ -288,12 +310,98 @@ mod tests {
     use tinio_util::testing::{body, read_body};
 
     use super::*;
+    use crate::MemoryOptions;
 
     async fn with_bucket() -> (MemoryStorage, bucket::Name) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         (storage, name)
+    }
+
+    #[tokio::test]
+    async fn object_size_limit_rejects_oversized_objects() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: Some(4),
+            max_total_bytes: None,
+        })
+        .unwrap();
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        let key = object::key("big.bin").unwrap();
+
+        let err = storage
+            .put_object(&name, &key, body(b"12345"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(EntityTooLarge { size: 5, limit: 4 })),
+            "{err}"
+        );
+        // At-or-below the limit succeeds.
+        storage
+            .put_object(&name, &key, body(b"1234"))
+            .await
+            .unwrap();
+        // An overwrite that pushes past the limit is refused too.
+        let err = storage
+            .put_object(&name, &key, body(b"12345"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(EntityTooLarge { .. })),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn total_size_limit_rejects_and_releases_on_delete() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(10),
+        })
+        .unwrap();
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        let k1 = object::key("a.bin").unwrap();
+        let k2 = object::key("b.bin").unwrap();
+
+        storage
+            .put_object(&name, &k1, body(b"12345"))
+            .await
+            .unwrap();
+        // 5 + 6 = 11 > 10 → refused.
+        let err = storage
+            .put_object(&name, &k2, body(b"123456"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(EntityTooLarge { .. })),
+            "{err}"
+        );
+        // 5 + 5 = 10 fits.
+        storage
+            .put_object(&name, &k2, body(b"12345"))
+            .await
+            .unwrap();
+        assert_eq!(storage.total_bytes(), 10);
+
+        // Deleting frees the capacity.
+        storage.delete_object(&name, &k1).await.unwrap();
+        let k3 = object::key("c.bin").unwrap();
+        let err = storage
+            .put_object(&name, &k3, body(b"123456"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(EntityTooLarge { .. })),
+            "{err}"
+        );
+        storage
+            .put_object(&name, &k3, body(b"12345"))
+            .await
+            .unwrap();
+        assert_eq!(storage.total_bytes(), 10);
     }
 
     fn chunked(parts: &[&[u8]]) -> BodyStream {

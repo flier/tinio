@@ -16,6 +16,7 @@ hex.workspace = true
 md-5.workspace = true
 moka = { workspace = true, features = ["sync", "atomic64"] }
 redb.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 smart-default.workspace = true
 strict-path = { workspace = true, features = ["junctions"] }
 thiserror.workspace = true
@@ -44,6 +45,10 @@ harness = false
 
 [[bench]]
 name = "meta"
+harness = false
+
+[[bench]]
+name = "set_batch"
 harness = false
 
 [lints.rust]

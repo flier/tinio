@@ -155,7 +155,7 @@ table_impl!(ObjectMetaTable, OBJECT_META, MetaKey, MetaValue);
 
 /// One stored `OBJECT_META` entry, validated into domain types (the row
 /// shape is `(etag hex, size, mtime unix nanos, file identity)`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMeta {
     /// ETag (single MD5 or composed `-N` form).
     pub etag: ETag,
@@ -166,6 +166,22 @@ pub struct StoredMeta {
     /// File identity at record time (`0` marks an unavailable platform
     /// identity).
     pub file_identity: u64,
+}
+
+/// Validate one raw `OBJECT_META` row into [`StoredMeta`] — `None` on a
+/// domain-invalid etag (self-healing: the caller treats it as missing
+/// and recomputes). Shared by the point read [`ObjectMetaTable::get`]
+/// and the gating traversal [`ObjectMetaTable::for_bucket_gated`] — the
+/// single home of the rule.
+fn validate_stored(
+    (etag, size, mtime, file_identity): (&str, u64, u64, u64),
+) -> Option<StoredMeta> {
+    Some(StoredMeta {
+        etag: ETag::new(etag).ok()?,
+        size,
+        mtime,
+        file_identity,
+    })
 }
 
 impl<'txn, T> ObjectMetaTable<'txn, T>
@@ -182,16 +198,7 @@ where
         let Some(guard) = self.0.get((&**bucket, &**key))? else {
             return Ok(None);
         };
-        let (etag, size, mtime, file_identity) = guard.value();
-        let Ok(etag) = ETag::new(etag) else {
-            return Ok(None);
-        };
-        Ok(Some(StoredMeta {
-            etag,
-            size,
-            mtime,
-            file_identity,
-        }))
+        Ok(validate_stored(guard.value()))
     }
 
     /// Visit every row of `bucket` (contiguous from `(bucket, "")`).
@@ -210,6 +217,33 @@ where
                 let key = object::key(raw_key).map_err(|err| corrupt_meta(raw_key, err))?;
                 let etag = ETag::new(etag).map_err(|err| corrupt_meta(raw_key, err))?;
                 visit(key, etag, size, mtime)
+            },
+        )
+    }
+
+    /// Visit every row of `bucket` with per-row [`Self::get`] semantics —
+    /// the gating-load traversal (pipeline-spec.md P2, R1): a
+    /// domain-invalid key skips the row, a domain-invalid etag reports
+    /// `stored: None` (treated as missing — the caller recomputes and
+    /// rewrites, self-healing). Unlike [`Self::for_bucket`], a corrupt
+    /// row never fails the walk.
+    pub fn for_bucket_gated<F>(&self, bucket: &bucket::Name, mut visit: F) -> Result<(), Error>
+    where
+        F: FnMut(object::Key, Option<StoredMeta>) -> Result<(), Error>,
+    {
+        let bucket = &**bucket;
+        for_each_pair(
+            &self.0,
+            (bucket, ""),
+            |b, _| b == bucket,
+            |_, raw_key, (etag, size, mtime, file_identity)| {
+                let Ok(key) = object::key(raw_key) else {
+                    return Ok(()); // invalid key domain → skip the row
+                };
+                // Same row validation as the point read and the gate
+                // (invalid etag → None — self-healing).
+                let stored = validate_stored((etag, size, mtime, file_identity));
+                visit(key, stored)
             },
         )
     }

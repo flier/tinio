@@ -4,7 +4,7 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 
-use super::{api, auth, log, s3, scanner, server, storage, telemetry};
+use super::{api, auth, log, pipeline, s3, scanner, server, storage, telemetry};
 use crate::Error;
 
 /// Config format version (currently only `1`).
@@ -86,6 +86,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
     pub storage: Option<storage::Config>,
+    /// The task pipelines (`[pipeline.io]` / `[pipeline.db]`; absent =
+    /// defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(dive)]
+    pub pipeline: Option<pipeline::Config>,
     /// Management-plane transports (presence-gated subsections).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
@@ -135,6 +140,11 @@ impl Config {
     }
 
     /// Serialize to TOML (used by the first-start auto-create).
+    ///
+    /// Plain `toml` (the read side's serializer, Q8): the presence-gated
+    /// serde attributes still apply, so absent sections — including
+    /// `[pipeline.*]` — are never emitted. The `toml_edit` write path was
+    /// an unmotivated second serializer for the same format (F47).
     pub fn to_toml(&self) -> Result<String, Error> {
         toml::to_string(self)
             .map_err(|e| crate::error::parse(Path::new("(serialization)"), e.to_string()))
@@ -156,7 +166,7 @@ mod tests {
 
     use secrecy::ExposeSecret;
 
-    use super::{Config, Version, auth, log};
+    use super::{Config, Version, auth, log, s3};
     use crate::Error;
 
     #[test]
@@ -207,6 +217,18 @@ mod tests {
         [storage.fs]
         follow_symlinks = false
         compact_threshold_percent = 50
+        meta_batch_size = 64
+        meta_batch_bytes = 131072
+
+        [pipeline.io]
+        workers = 4
+        priority = "low"
+        capacity = 2048
+
+        [pipeline.db]
+        workers = 2
+        priority = "high"
+        capacity = 4096
 
         [api.http]
         host = "127.0.0.1"
@@ -238,6 +260,15 @@ mod tests {
                 .compact_threshold_percent,
             50
         );
+        assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_size, 64);
+        assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_bytes, 131072);
+        let pipeline = config.pipeline.as_ref().unwrap();
+        assert_eq!(pipeline.io.workers, 4);
+        assert_eq!(pipeline.io.priority, super::pipeline::Priority::Low);
+        assert_eq!(pipeline.io.capacity, 2048);
+        assert_eq!(pipeline.db.workers, 2);
+        assert_eq!(pipeline.db.priority, super::pipeline::Priority::High);
+        assert_eq!(pipeline.db.capacity, 4096);
         assert_eq!(
             config.api.as_ref().unwrap().http.as_ref().unwrap().port,
             9002
@@ -294,9 +325,17 @@ mod tests {
         assert_eq!(s3.temp_ttl_hours, 24);
         assert_eq!(s3.multipart_expire_days, 7);
 
+        // An empty `[s3]` section falls back to every serde default
+        // helper (the toggle defaults must match `Config::default`).
+        let config = Config::parse("version = 1\n[s3]").unwrap();
+        let empty = config.s3.as_ref().unwrap();
+        assert_eq!(empty, &super::s3::Config::default());
+
         let config = Config::parse("version = 1\n[storage.fs]\nfollow_symlinks = false").unwrap();
         let fs = &config.storage.as_ref().unwrap().fs;
         assert_eq!(fs.compact_threshold_percent, 20);
+        assert_eq!(fs.meta_batch_size, 128);
+        assert_eq!(fs.meta_batch_bytes, 262144);
 
         let config = Config::parse("version = 1\n[scanner]").unwrap();
         let scanner = config.scanner.as_ref().unwrap();
@@ -425,6 +464,8 @@ mod tests {
         let toml = config.to_toml().unwrap();
         assert!(!toml.contains("scanner"), "{toml}");
         assert!(!toml.contains("api"), "{toml}");
+        // Q8: the auto-generated config never emits `[pipeline.*]` sections.
+        assert!(!toml.contains("pipeline"), "{toml}");
     }
 
     #[test]

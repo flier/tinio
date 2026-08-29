@@ -48,6 +48,18 @@ multipart_expire_days = 7 # abandoned-upload sweep timeout
 [storage.fs]              # filesystem backend keys
 follow_symlinks = false   # reject access through symlinks + exclude from listings (default; true = follow — a link inside a bucket can then escape the storage root)
 compact_threshold_percent = 20  # state-database fragmentation % triggering compact at startup (5..=90)
+meta_batch_size = 128     # meta entries per write-pipeline batch (1..=4096; the cold list/scanner flush threshold — default from the set_batch benchmark knee)
+meta_batch_bytes = 262144 # estimated bytes per write-pipeline batch (1024..=16 MiB; ≈ 56 B + key length per entry — the second flush trigger)
+
+# [pipeline.io]          # IO task pipeline (ETag computation: bounded file reads + hashing)
+# workers = 2            # worker-thread count (1..=64; each worker runs one blocking task); replaces the old fixed 16-way cold-list hash concurrency (buffer_unordered) — benchmark-backed, pipeline-spec.md §3.3
+# priority = "normal"    # normal | low | high (normal = OS default thread priority; low/high = lowest/highest legal)
+# capacity = 1024        # bounded queue capacity (1..=65536; the backpressure bound)
+
+# [pipeline.db]          # DB write pipeline (batched meta writes)
+# workers = 1            # worker-thread count (1..=4; redb is single-writer, so 1 is the write-throughput optimum)
+# priority = "normal"
+# capacity = 1024
 
 [api.unix]              # local channel, unix form — Linux/macOS (part of three-choose-one)
 # presence = local channel on (the auto-created config includes this section; omit it to disable)
@@ -111,8 +123,10 @@ CLI flags > process environment > .env > config file
 - The local channel has two platform forms: `[api.unix]` `path` (Linux/macOS — socket path, relative to `.tinio/` unless absolute; default `tinio.sock`) and `[api.pipe]` `path` (Windows — named-pipe name, empty = derived `tinio-<sha1(root)>`). Use the platform-appropriate section; both participate in the three-choose-one exclusivity.
 - `[storage.fs] follow_symlinks`: boolean, default **false** (secure default: access never resolves through a symlink and link entries are excluded from listings, so a link inside a bucket cannot escape the storage root); `true` = follow symlinks (opt-in).
 - `[storage.fs] compact_threshold_percent`: 5–90, default 20; the state-database fragmentation percentage that triggers compaction at startup (offline, before the store handles are shared; `doctor --fix` triggers the same).
+- `[storage.fs] meta_batch_size` / `meta_batch_bytes`: the streaming meta-batch flush thresholds of the cold list/scanner producers (pipeline-spec.md §3.2, Q5). Computed entries accumulate into one batch, which is flushed through the DB write pipeline (`MetaWriteBatchTask` — one batch = one write transaction) once the entry count reaches `meta_batch_size` (1–4096, default 128 — the task-2.5 `set_batch` benchmark knee, Q6) **or** the estimated bytes reach `meta_batch_bytes` (1024–16 MiB, default 262144 = 256 KiB; the per-entry estimate is ≈ 56 B + key byte length). The defaults live in the tinio-core storage module and are shared by the config schema and `FsOptions`, so the two cannot drift.
+- `[pipeline.io]` / `[pipeline.db]`: the task pipelines (IO: ETag computation — CPU/IO-bound; DB: batched meta writes). The section is presence-gated (Q8): an absent `[pipeline]` section resolves to the defaults, and the auto-created config never emits it. Keys per section: `workers` (io: 1–64, default 2 — the task-5 full-pipeline benchmark knee: 1→2 ≈ +2×, 2→4 regresses on the short-key axis, 4→8 flat, basis in task-5-report.md; db: 1–4, default 1 — redb is a single-writer store, so more than one worker adds no write throughput, verified at +0.5%/+1.7% vs 2), `priority` (`normal`/`low`/`high`, default `normal`; `normal` = no thread priority is set — the OS default; `low`/`high` = the lowest/highest legal thread-priority values — Windows `THREAD_PRIORITY_IDLE` / `THREAD_PRIORITY_TIME_CRITICAL`), `capacity` (1–65536, default 1024; the bounded-queue capacity, i.e. the backpressure bound). Each pipeline runs on its own tokio runtime with `workers` worker threads named `tinio-pipeline-io` / `tinio-pipeline-db`, and the configured priority is applied to exactly those threads.
 - `[server] read_only`: boolean, default false; see the read-only-mode section above. In read-only mode, `[s3]` write-related toggles are moot (writes are rejected regardless).
 - `[scanner]` section: presence = background ETag scanner on (FR-024; the auto-created config includes it; omitted = off); keys are Minio-aligned (`mc admin config set myminio scanner ...`): `delay` float seconds ≥ 0 (default 10.0 — pacing between scan iterations), `max_wait` duration string (default `15s` — max wait for a scan slot when throttled), `cycle` duration string (default `24h` — full-tree re-scan cadence). Runs in read-only mode as well (meta writes land in the home state dir). Env: `TINIO_SCANNER` (`0`/`1`).
-- Any TCP exposure (http/https section present or `--api` flags) requires the token on ALL management endpoints (including `/metrics` and `/openapi.json`).
+- Any TCP exposure (http/https section present or `--api` flags) requires the token on ALL management endpoints (including `/metrics` and `/openapi.json`). Until the management plane lands (T075), the `serve` example additionally exposes a reserved `GET /metrics` on the data-plane listener without auth for local scraping (F10, pipeline-spec.md §4); the token rule above applies from T075.
 - The `[api]` section requires the `api` cargo feature (default on). In builds without it, the keys are schema-known and silently ignored, not rejected as unknown. With the `api` feature compiled in, exactly one management transport must be enabled after resolution (three-choose-one: `unix`/`http`/`https`) — `--no-api-unix` with no TCP transport configured is a startup error.
 - Repeatable `--api <URL>` flags select the transport per scheme: a flag replaces the matching transport's subsection (`unix`/`http`/`https`); the three-choose-one exclusivity applies after all flags and config are resolved.

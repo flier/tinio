@@ -13,8 +13,11 @@
 //! [`Handle`] is the shared access handle (meta-redb-spec G2): closure
 //! based — a transaction's lifetime is sealed inside the closure, so a
 //! transaction guard cannot escape — and multi-table operations run as one
-//! write closure. Calls block directly (G3); the pipeline stage wraps
-//! `write` for write-lock timing.
+//! write closure. Write transactions run on the tokio blocking pool
+//! (G3, revised by the data-path review 2026-08-27 — every `Immediate`
+//! commit is an fsync, so `Handle::write` is async and `spawn_blocking`s
+//! the closure + commit); reads stay inline. `Handle` times every write
+//! transaction (write-lock histograms, pipeline-spec.md §4).
 //!
 //! Per-kind redb errors live in [`Error`]; every function in this module
 //! returns it. The crate lifts it via [`From`] into [`crate::Error::Database`]
@@ -34,7 +37,7 @@ pub use compact::{Compaction, Stats, compact_if_needed};
 pub use error::Error;
 pub use open::{Integrity, Open, check_integrity, open};
 
-pub use handle::Handle;
+pub use handle::{Handle, WriteLockSnapshot};
 #[cfg(test)]
 pub(crate) use tables::StateTable;
 pub(crate) use tables::{BucketsTable, PartsTable, UploadsTable};

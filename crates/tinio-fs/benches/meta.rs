@@ -96,8 +96,10 @@ fn meta_hits(c: &mut Criterion) {
             let bucket = bucket.clone();
             let key = key.clone();
             async move {
+                // The bench runs the size+mtime pair (identity 0 — the
+                // walk's identity lookup is not on this path).
                 let etag = store
-                    .etag_matching(&bucket, &key, size, mtime)
+                    .etag_matching(&bucket, &key, size, mtime, 0)
                     .await
                     .unwrap();
                 black_box(etag);

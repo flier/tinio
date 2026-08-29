@@ -16,6 +16,8 @@
 //! [`crate::bucket`], [`crate::object`], and [`crate::multipart`] and share
 //! the items below.
 
+use std::sync::Mutex;
+
 use redb::backends::InMemoryBackend;
 use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
 
@@ -23,7 +25,7 @@ use tinio_core::{Storage, bucket, object};
 
 use crate::{
     Error,
-    error::{database_storage, no_such_bucket, no_such_upload},
+    error::{database_storage, entity_too_large, no_such_bucket, no_such_upload},
 };
 
 /// `name` → creation time (unix nanoseconds).
@@ -51,11 +53,20 @@ pub(crate) const PART_META: TableDefinition<&str, (&str, u64, u64)> =
 /// but are never objects. Nothing is persisted — the in-memory backend is
 /// discarded with the instance.
 ///
+/// Resource limits are optional and configurable via [`MemoryOptions`]
+/// ([`MemoryStorage::with_options`]): `max_object_bytes` caps one object or
+/// part, `max_total_bytes` caps the sum of all object and part bytes. The
+/// default (`MemoryStorage::new`) is **unlimited**, matching the project's
+/// documented no-limit posture (CHK028); a server wiring the in-memory
+/// backend should set explicit limits from its configuration. The total
+/// accounting is a best-effort soft limit — concurrent writers may briefly
+/// overshoot by the number of simultaneous writes.
+///
 /// # Examples
 ///
 /// ```rust
 /// use tinio_core::{bucket, BucketOps};
-/// use tinio_mem::MemoryStorage;
+/// use tinio_mem::{MemoryOptions, MemoryStorage};
 ///
 /// let storage = MemoryStorage::new().unwrap();
 /// let bucket = bucket::name("data").unwrap();
@@ -63,17 +74,48 @@ pub(crate) const PART_META: TableDefinition<&str, (&str, u64, u64)> =
 ///     .unwrap()
 ///     .block_on(storage.create_bucket(&bucket))
 ///     .unwrap();
+///
+/// let limited = MemoryStorage::with_options(MemoryOptions {
+///     max_object_bytes: Some(1024),
+///     max_total_bytes: Some(10 * 1024),
+/// })
+/// .unwrap();
 /// ```
 pub struct MemoryStorage {
     pub(crate) db: Database,
+    options: MemoryOptions,
+    /// Current total stored bytes across `OBJECTS` and `PARTS` (updated
+    /// only when a limit is configured).
+    total_bytes: Mutex<u64>,
+}
+
+/// Optional resource limits for [`MemoryStorage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryOptions {
+    /// Maximum size of a single object or multipart part in bytes.
+    /// `None` (default) = unlimited.
+    pub max_object_bytes: Option<u64>,
+    /// Maximum total stored bytes across all objects and parts.
+    /// `None` (default) = unlimited.
+    pub max_total_bytes: Option<u64>,
 }
 
 impl MemoryStorage {
-    /// Create an empty in-memory backend.
+    /// Create an empty in-memory backend with **no** resource limits
+    /// (the project's documented default; see [`MemoryOptions`]).
     ///
     /// Fails only if the redb database cannot be created (programmer error —
     /// the in-memory backend cannot fail in practice).
     pub fn new() -> Result<Self, Error> {
+        Self::with_options(MemoryOptions::default())
+    }
+
+    /// Create an empty in-memory backend with the given resource limits
+    /// (see [`MemoryOptions`]).
+    ///
+    /// Fails only if the redb database cannot be created (programmer error —
+    /// the in-memory backend cannot fail in practice).
+    pub fn with_options(options: MemoryOptions) -> Result<Self, Error> {
         let db = Database::builder().create_with_backend(InMemoryBackend::new())?;
         {
             // Create all tables up front: read transactions refuse to open
@@ -87,7 +129,56 @@ impl MemoryStorage {
             txn.open_table(PART_META)?;
             txn.commit()?;
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            options,
+            total_bytes: Mutex::new(0),
+        })
+    }
+
+    /// Enforce `max_object_bytes` on a single object/part of `size` bytes.
+    pub(crate) fn check_object_size(&self, size: u64) -> Result<(), Error> {
+        if let Some(limit) = self.options.max_object_bytes {
+            if size > limit {
+                return Err(entity_too_large(size, limit));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a signed byte delta to the tracked total and enforce
+    /// `max_total_bytes`. Call inside the write transaction before the
+    /// commit; a failing limit leaves the total unchanged. No-op when no
+    /// total limit is configured.
+    pub(crate) fn adjust_total(&self, delta: i64) -> Result<(), Error> {
+        let Some(limit) = self.options.max_total_bytes else {
+            return Ok(());
+        };
+        let mut total = self.total_bytes.lock().unwrap();
+        let new_total = *total as i128 + delta as i128;
+        if new_total < 0 {
+            // Defensive: internal accounting must never go negative.
+            *total = 0;
+            return Ok(());
+        }
+        if new_total as u64 > limit {
+            return Err(entity_too_large(new_total as u64, limit));
+        }
+        *total = new_total as u64;
+        Ok(())
+    }
+
+    /// Roll back a [`Self::adjust_total`] delta after a failed commit.
+    pub(crate) fn rollback_total(&self, delta: i64) {
+        let mut total = self.total_bytes.lock().unwrap();
+        *total = ((*total as i128 - delta as i128).max(0)) as u64;
+    }
+
+    /// The currently tracked total bytes (objects + parts). Meaningful only
+    /// when a total limit is configured; 0 otherwise. Test hook.
+    #[cfg(test)]
+    pub(crate) fn total_bytes(&self) -> u64 {
+        *self.total_bytes.lock().unwrap()
     }
 
     /// Fast-fail bucket existence check (own read transaction). Backend

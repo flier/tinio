@@ -10,10 +10,10 @@ mod common;
 use http::StatusCode;
 
 use tinio_core::storage::BucketOps;
-use tinio_fs::{FsOptions, FsStorage};
+use tinio_fs::FsStorage;
 use tinio_server::Capabilities;
 
-use common::{Server, request};
+use common::{Server, fs_options, request};
 
 #[tokio::test]
 async fn tinio_writes_denied_reads_missing() {
@@ -22,7 +22,7 @@ async fn tinio_writes_denied_reads_missing() {
     // dropped before the server opens the same state database).
     let root = tempfile::tempdir().unwrap();
     {
-        let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         storage.create_bucket(&"data".into()).await.unwrap();
     }
     let server = Server::fs_at(root.path(), Capabilities::default()).await;
@@ -55,7 +55,7 @@ async fn nested_root_state_never_served() {
     // open per root, SC-005.)
     let outer_root = tempfile::tempdir().unwrap();
     {
-        let storage = FsStorage::new(outer_root.path(), FsOptions::default()).unwrap();
+        let storage = FsStorage::new(outer_root.path(), fs_options()).unwrap();
         storage.create_bucket(&"inner-root".into()).await.unwrap();
     }
     let outer_server = Server::fs_at(outer_root.path(), Capabilities::default()).await;

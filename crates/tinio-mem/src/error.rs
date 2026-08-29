@@ -188,6 +188,13 @@ pub(crate) fn no_parts() -> Error {
     Error::Storage(storage::no_parts())
 }
 
+/// The object (or multipart part) exceeds the backend's configured size
+/// limit (`MemoryOptions.max_object_bytes` / `max_total_bytes`).
+#[inline]
+pub(crate) fn entity_too_large(size: u64, limit: u64) -> Error {
+    Error::Storage(storage::entity_too_large(size, limit))
+}
+
 /// A multipart part-key suffix is not a `u32`.
 #[inline]
 pub(crate) fn invalid_part_key(err: ParseIntError) -> Error {

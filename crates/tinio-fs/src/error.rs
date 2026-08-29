@@ -16,7 +16,7 @@
 
 use std::{io, path::PathBuf};
 
-use tinio_core::storage;
+use tinio_core::{pipeline, storage};
 
 /// A filesystem backend failure.
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +24,11 @@ pub enum Error {
     /// A filesystem I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// A task-pipeline failure (pipeline-spec.md P7): the task was not
+    /// accepted (shutdown, Q3) or dropped before its result was sent
+    /// (panic, R6). The original [`pipeline::Error`] is kept.
+    #[error("pipeline error: {0}")]
+    Pipeline(#[from] pipeline::Error),
     /// A path-mapping violation (traversal, platform charset, reserved
     /// segments) — rejected before any filesystem access.
     #[error("invalid path: {}", .0.display())]
@@ -80,10 +85,22 @@ impl From<Error> for storage::Error {
             Error::InvalidPath(p) => storage::invalid_key(p.to_string_lossy().into_owned()),
             Error::Storage(e) => e,
             Error::Database(e) => storage::io(io::Error::other(e)),
+            Error::Pipeline(e) => storage::io(io::Error::other(e)),
             Error::InvalidValue(_) | Error::RootNotDirectory(_) => {
                 storage::io(io::Error::other(err))
             }
         }
+    }
+}
+
+/// View this error as a [`std::error::Error`] trait object — the
+/// `pipeline::Outcome` blanket (`Result<T, E>` with `E:
+/// AsRef<dyn StdError + Send + Sync>`, pipeline.rs) requires it, so the
+/// task-pipeline runtimes can log the original failure (R8, never
+/// stringified).
+impl AsRef<dyn std::error::Error + Send + Sync> for Error {
+    fn as_ref(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
     }
 }
 
@@ -114,7 +131,7 @@ mod tests {
         }
         .validate()
         .unwrap_err();
-        let cases: [(Error, &str); 6] = [
+        let cases: [(Error, &str); 7] = [
             (Error::Io(io::Error::other("boom")), "I/O error: boom"),
             (Error::InvalidPath("a/../b".into()), "invalid path: a/../b"),
             (invalid_value(report), "invalid options:"),
@@ -130,6 +147,10 @@ mod tests {
                     expected: 1,
                 }),
                 "unsupported /data/root version 9 (expected 1)",
+            ),
+            (
+                Error::Pipeline(pipeline::Error::ShutDown),
+                "pipeline error: pipeline is shut down",
             ),
         ];
         for (err, prefix) in cases {
@@ -157,6 +178,12 @@ mod tests {
         let db_err: Error =
             crate::database::Error::Open(redb::DatabaseError::DatabaseAlreadyOpen).into();
         let core: storage::Error = db_err.into();
+        assert!(matches!(core, Io(_)));
+
+        // Pipeline failures (shutdown/dropped) also project onto Io —
+        // they are never contract-domain conditions.
+        let pipeline_err: Error = pipeline::Error::Dropped.into();
+        let core: storage::Error = pipeline_err.into();
         assert!(matches!(core, Io(_)));
     }
 

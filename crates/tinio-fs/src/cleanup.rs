@@ -75,12 +75,26 @@ async fn record_repair(
 /// # Examples
 ///
 /// ```rust
+/// use std::sync::Arc;
 /// use tinio_core::cleanup::{Cleanup, CleanupOptions, RepairKind};
+/// use tinio_core::pipeline::InlineRunner;
+/// use tinio_core::storage::{
+///     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+/// };
 /// use futures::StreamExt;
 /// use tinio_fs::{FsCleanup, FsOptions, FsStorage};
 ///
 /// let root = tempfile::tempdir().unwrap();
-/// let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+/// let options = FsOptions {
+///     follow_symlinks: false,
+///     state_dir: None,
+///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
+///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
+///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     io_pipeline: Arc::new(InlineRunner::default()),
+///     db_pipeline: Arc::new(InlineRunner::default()),
+/// };
+/// let storage = FsStorage::new(root.path(), options).unwrap();
 /// let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
 /// tokio::runtime::Runtime::new().unwrap().block_on(async {
 ///     let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
@@ -172,7 +186,7 @@ impl FsCleanup {
             }
         };
         for bucket in buckets {
-            let Ok(bucket_dir) = self.storage.bucket_dir(&bucket) else {
+            let Ok(bucket_dir) = self.storage.bucket_dir(&bucket).await else {
                 continue;
             };
             // Collect every `.tinio` entry of the bucket tree (iterative
@@ -259,27 +273,30 @@ impl FsCleanup {
                 break;
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !tokio::fs::try_exists(self.root.join(&name))
-                .await
-                .unwrap_or(false)
-            {
-                record_repair(
-                    actions,
-                    self.dry_run,
-                    format!("would remove multipart subtree of missing bucket {name}"),
-                    format!("removed multipart subtree of missing bucket {name}"),
-                    async {
-                        // Drain UPLOADS/PARTS (and the other derived
-                        // tables) before deleting the tree — a missing
-                        // bucket directory used to leave ghost uploads.
-                        if let Ok(bucket) = bucket::name(&name) {
-                            self.storage.remove_bucket_state(&bucket).await?;
-                        }
-                        ok_if_missing(tokio::fs::remove_dir_all(entry.path()).await)?;
-                        Ok(())
-                    },
-                )
-                .await;
+            match crate::fsutil::is_absent(&self.root.join(&name)).await {
+                // F11: a probe error is not "gone" — the live bucket's
+                // subtree is kept and the error reported.
+                Ok(false) => {}
+                Err(err) => actions.push(Err(err.into())),
+                Ok(true) => {
+                    record_repair(
+                        actions,
+                        self.dry_run,
+                        format!("would remove multipart subtree of missing bucket {name}"),
+                        format!("removed multipart subtree of missing bucket {name}"),
+                        async {
+                            // Drain UPLOADS/PARTS (and the other derived
+                            // tables) before deleting the tree — a missing
+                            // bucket directory used to leave ghost uploads.
+                            if let Ok(bucket) = bucket::name(&name) {
+                                self.storage.remove_bucket_state(&bucket).await?;
+                            }
+                            ok_if_missing(tokio::fs::remove_dir_all(entry.path()).await)?;
+                            Ok(())
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -411,27 +428,75 @@ impl FsCleanup {
             }
         };
         for (name, _) in entries {
-            if !tokio::fs::try_exists(self.root.join(&name))
-                .await
-                .unwrap_or(false)
-            {
-                let name = match bucket::name(name) {
-                    Ok(name) => name,
-                    Err(err) => {
-                        actions.push(Err(Error::Storage(err)));
-                        continue;
-                    }
-                };
-                record_repair(
-                    actions,
-                    self.dry_run,
-                    format!("would prune stale bucket record for {name}"),
-                    format!("pruned stale bucket record for {name}"),
-                    async { self.storage.remove_bucket_state(&name).await },
-                )
-                .await;
+            let name = match bucket::name(name) {
+                Ok(name) => name,
+                Err(err) => {
+                    actions.push(Err(Error::Storage(err)));
+                    continue;
+                }
+            };
+            match crate::fsutil::is_absent(&self.root.join(&*name)).await {
+                // F11: a probe error is not "gone" — the live record is
+                // kept and the error reported.
+                Ok(false) => {}
+                Err(err) => actions.push(Err(err.into())),
+                Ok(true) => {
+                    record_repair(
+                        actions,
+                        self.dry_run,
+                        format!("would prune stale bucket record for {name}"),
+                        format!("pruned stale bucket record for {name}"),
+                        async { self.storage.remove_bucket_state(&name).await },
+                    )
+                    .await;
+                }
             }
         }
+    }
+
+    /// The stale-bucket-records stage alone — the scanner's per-pass path
+    /// (item 2, data-path review 2026-08-27: the meta-orphan half of
+    /// [`Cleanup::reclaim_meta_orphans`] is derived from each bucket's
+    /// reconcile pass in scanner.rs, so only the stale-`BUCKETS` half
+    /// remains per pass). A bucket directory removed out-of-band also
+    /// orphans its derived state — and the scanner's reconcile loop only
+    /// visits live directories. Cheap: one `BUCKETS` read plus an
+    /// existence probe per row. Returns the number of records pruned; a
+    /// failed prune is warned and skipped (the trait path keeps its
+    /// action reporting — this is the count-only form the scanner needs).
+    ///
+    /// The probe + wipe run under the bucket-mutation lock (F02): a
+    /// bucket deleted out-of-band and RECREATED between the probe and
+    /// the wipe would have its fresh derived state (BUCKETS, UPLOADS,
+    /// PARTS, OBJECT_META rows) destroyed in one write transaction. Under
+    /// the lock the recreation cannot interleave — the probe sees the
+    /// fresh directory, or the wipe drains before any of its rows commit
+    /// (create/put hold the same lock).
+    pub(crate) async fn reclaim_stale_buckets(&self) -> Result<usize, Error> {
+        let entries = self.storage.bucket_store().load_all().await?;
+        let mut pruned = 0usize;
+        for (name, _) in entries {
+            let Ok(name) = bucket::name(name) else {
+                continue;
+            };
+            let _guard = self.storage.lock_bucket_mutations().await;
+            match crate::fsutil::is_absent(&self.root.join(&*name)).await {
+                Ok(true) => {}         // the bucket dir is gone — prune
+                Ok(false) => continue, // live bucket — keep the record
+                Err(err) => {
+                    // F11: a probe error is not "gone" — keep the record
+                    // (the next pass re-probes).
+                    tracing::warn!(bucket = %name, error = %err, "stale-bucket probe failed; the record is kept");
+                    continue;
+                }
+            }
+            if let Err(err) = self.storage.remove_bucket_state(&name).await {
+                tracing::warn!(error = %err, "stale bucket record not pruned");
+                continue;
+            }
+            pruned += 1;
+        }
+        Ok(pruned)
     }
 
     /// Stage 6: meta-orphan reclamation — meta entries whose object file no
@@ -462,14 +527,21 @@ impl FsCleanup {
                 // resolves through the symlink policy, so a symlinked
                 // bucket (follow_symlinks=true) is reclaimed against its
                 // canonical target.
-                let Ok(bucket_dir) = self.storage.bucket_dir(&bucket) else {
+                let Ok(bucket_dir) = self.storage.bucket_dir(&bucket).await else {
                     continue;
                 };
-                let Ok(path) = self.storage.key_path(&bucket_dir, &record.key, true) else {
+                let Ok(path) = self.storage.key_path(&bucket_dir, &record.key, true).await else {
                     continue;
                 };
-                if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                    continue;
+                match crate::fsutil::is_absent(&path).await {
+                    // F11: a probe error is not "gone" — the entry is
+                    // kept and the error reported.
+                    Ok(false) => continue,
+                    Err(err) => {
+                        actions.push(Err(err.into()));
+                        continue;
+                    }
+                    Ok(true) => {}
                 }
                 record_repair(
                     actions,
@@ -524,13 +596,19 @@ impl Cleanup for FsCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FsOptions, testutil::rt};
+    use crate::{
+        FsOptions,
+        testutil::{fs_options, rt},
+    };
     use futures::StreamExt;
     use std::fs;
     use std::time::SystemTime;
     use tinio_core::storage::{BucketOps, ObjectOps};
     use tinio_core::{bucket, object};
     use tinio_util::testing::body;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     async fn collect(actions: ActionStream<Error>) -> Vec<RepairAction> {
         let mut out = Vec::new();
@@ -552,6 +630,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -611,7 +690,7 @@ mod tests {
         // (the accidental parent dirs) is untouched.
         rt(async {
             let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
             let b = bucket::name("data").unwrap();
             storage.create_bucket(&b).await.unwrap();
             fs::create_dir_all(root.path().join("data/.tinio")).unwrap();
@@ -642,7 +721,7 @@ mod tests {
         // ghosts that cannot complete, and has_uploads blocks delete.
         rt(async {
             let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
             let gone = bucket::name("gone-bucket").unwrap();
             storage.create_bucket(&gone).await.unwrap();
             let k = object::key("k").unwrap();
@@ -672,6 +751,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -736,6 +816,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -803,6 +884,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -874,6 +956,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -914,6 +997,7 @@ mod tests {
                     follow_symlinks: true,
                     compact_threshold_percent: 20,
                     state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -933,10 +1017,132 @@ mod tests {
     }
 
     #[test]
+    fn partless_orphan_dir_uses_dir_mtime_for_idle() {
+        // An orphan upload dir with NO part files has no part mtime to
+        // anchor the idle age — `orphan_idle_since` falls back to the
+        // directory mtime. A zero grace forces the fallback into the
+        // judgment (the dir is fresh, so only the grace can be the
+        // discriminator).
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    compact_threshold_percent: 20,
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+            let b = bucket::name("live").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+
+            // A part-less orphan (no UPLOADS record, no part files).
+            let orphan_dir = state.path().join("multipart/live/u-partless");
+            fs::create_dir_all(&orphan_dir).unwrap();
+
+            // Zero grace: the fresh dir mtime must not block removal
+            // (age 0 is not < 0), and the fallback must have run.
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+                .with_multipart_grace(Duration::ZERO);
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| a.description.contains("orphaned upload")),
+                "{actions:?}"
+            );
+            assert!(!orphan_dir.exists());
+
+            // The same dir under a generous grace survives (dir mtime is
+            // fresh — younger than the grace).
+            fs::create_dir_all(&orphan_dir).unwrap();
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+                .with_multipart_grace(Duration::from_secs(3600));
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| a.description.contains("orphaned upload")),
+                "{actions:?}"
+            );
+            assert!(orphan_dir.exists());
+        });
+    }
+
+    #[test]
+    fn bucket_staging_file_residue_is_cleared() {
+        // The reserved `.tinio` name at any depth: a FILE out-of-band
+        // (not the cross-volume staging dir) is cleared too — the
+        // NotADirectory fallback of the residue removal.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            fs::create_dir_all(root.path().join("data/sub")).unwrap();
+            fs::write(root.path().join("data/.tinio"), b"residue").unwrap();
+            fs::write(root.path().join("data/sub/.tinio"), b"residue").unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| a.description.contains("staging residue"))
+                    .count(),
+                2,
+                "{actions:?}"
+            );
+            assert!(!root.path().join("data/.tinio").exists());
+            assert!(!root.path().join("data/sub/.tinio").exists());
+            assert!(root.path().join("data/sub").is_dir());
+        });
+    }
+
+    #[test]
+    fn reclaim_stale_buckets_prunes_and_counts() {
+        // The scanner's count-only path (item 2): stale records are
+        // pruned under the bucket-mutation lock; live records and probe
+        // errors are kept. The count is returned, not the action stream.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            let stale = bucket::name("stale-bucket").unwrap();
+            let live = bucket::name("live-bucket").unwrap();
+            storage.create_bucket(&live).await.unwrap();
+            // A stale record: the bucket directory is gone out-of-band.
+            storage
+                .bucket_store()
+                .record(&stale, SystemTime::now())
+                .await
+                .unwrap();
+            tokio::fs::create_dir(root.path().join("stale-bucket"))
+                .await
+                .unwrap();
+            tokio::fs::remove_dir_all(root.path().join("stale-bucket"))
+                .await
+                .unwrap();
+            assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let pruned = cleanup.reclaim_stale_buckets().await.unwrap();
+            assert_eq!(pruned, 1, "the stale record is pruned exactly once");
+            let all = storage.bucket_store().load_all().await.unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].0, "live-bucket");
+            // A second pass finds nothing to prune.
+            assert_eq!(cleanup.reclaim_stale_buckets().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
     fn full_repair_reclaims_meta_orphans() {
         rt(async {
             let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
             let b = bucket::name("data").unwrap();
             storage.create_bucket(&b).await.unwrap();
             let k = object::key("a.txt").unwrap();
@@ -978,7 +1184,7 @@ mod tests {
         // startup repair.
         rt(async {
             let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
             let b = bucket::name("data").unwrap();
             storage.create_bucket(&b).await.unwrap();
             let k = object::key("a.txt").unwrap();
@@ -1003,7 +1209,7 @@ mod tests {
     fn reclaim_meta_orphans_removes_only_missing() {
         rt(async {
             let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), Default::default()).unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
             let b = bucket::name("data").unwrap();
             storage.create_bucket(&b).await.unwrap();
             let gone = object::key("gone.txt").unwrap();
@@ -1016,6 +1222,235 @@ mod tests {
             let actions = collect(cleanup.reclaim_meta_orphans().await.unwrap()).await;
             assert_eq!(actions.len(), 1, "{actions:?}");
             assert!(storage.meta_store().walk(&b).await.unwrap().len() == 1);
+        });
+    }
+
+    #[test]
+    fn tmp_directory_entry_reports_a_remove_error() {
+        // A `tmp/` entry that is a DIRECTORY cannot be removed as a file
+        // — the op fails and the failure is REPORTED (an action stream
+        // entry), not swallowed: the operator sees that a leftover could
+        // not be cleared.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    compact_threshold_percent: 20,
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+            fs::create_dir_all(state.path().join("tmp/subdir")).unwrap();
+            fs::write(state.path().join("tmp/upload-leftover"), b"x").unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+            let mut errs = 0;
+            while let Some(action) = actions.next().await {
+                if action.is_err() {
+                    errs += 1;
+                }
+            }
+            assert_eq!(errs, 1, "the directory entry fails as a file removal");
+            assert!(!state.path().join("tmp/upload-leftover").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_reports_unreadable_tmp_and_multipart_trees() {
+        // Permission failures are REPORTED, never silently skipped: an
+        // unreadable `tmp/` and an unreadable `multipart/` root both
+        // surface as error actions (the cleanup must not pretend the
+        // state is clean when it could not even enumerate it).
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    compact_threshold_percent: 20,
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+            fs::create_dir(state.path().join("tmp")).unwrap();
+            fs::write(state.path().join("tmp/leftover"), b"x").unwrap();
+            fs::create_dir_all(state.path().join("multipart/gone/u1")).unwrap();
+            fs::write(state.path().join("multipart/gone/u1/part-1"), b"x").unwrap();
+
+            fs::set_permissions(state.path().join("tmp"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+            fs::set_permissions(
+                state.path().join("multipart"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+            let mut errs = 0;
+            while let Some(action) = actions.next().await {
+                if action.is_err() {
+                    errs += 1;
+                }
+            }
+            // tmp read (stage 1) + multipart read (stages 3 and 4).
+            assert!(errs >= 2, "unreadable trees must be reported: {errs}");
+
+            // The repair must not have touched anything.
+            fs::set_permissions(state.path().join("tmp"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fs::set_permissions(
+                state.path().join("multipart"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            assert!(state.path().join("tmp/leftover").exists());
+            assert!(state.path().join("multipart/gone/u1/part-1").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_walk_survives_an_unreadable_subdir() {
+        // A bucket subtree that cannot be read must not abort the whole
+        // staging walk — the readable siblings still get cleared.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            fs::create_dir_all(root.path().join("data/blocked")).unwrap();
+            fs::create_dir_all(root.path().join("data/ok/.tinio")).unwrap();
+            fs::write(root.path().join("data/ok/.tinio/aaaa"), b"x").unwrap();
+            fs::set_permissions(
+                root.path().join("data/blocked"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| a.description.contains("staging residue")),
+                "{actions:?}"
+            );
+            assert!(!root.path().join("data/ok/.tinio").exists());
+            fs::set_permissions(
+                root.path().join("data/blocked"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bucket_staging_descents_symlinked_dirs_when_following() {
+        // A symlinked directory INSIDE a bucket is part of the bucket
+        // only when following is enabled (the follow policy, one source
+        // of truth): with following the residue behind the link is
+        // cleared; without it the link is not descended and the residue
+        // survives.
+        let run = |follow_symlinks: bool| {
+            rt(async move {
+                let root = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                fs::create_dir_all(outside.path().join(".tinio")).unwrap();
+                fs::write(outside.path().join(".tinio/aaaa"), b"residue").unwrap();
+                let storage = FsStorage::new(
+                    root.path(),
+                    FsOptions {
+                        follow_symlinks,
+                        ..fs_options()
+                    },
+                )
+                .unwrap();
+                let b = bucket::name("data").unwrap();
+                storage.create_bucket(&b).await.unwrap();
+                fs::create_dir(root.path().join("data/real")).unwrap();
+                std::os::unix::fs::symlink(outside.path(), root.path().join("data/link")).unwrap();
+
+                let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+                let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+                (
+                    follow_symlinks,
+                    actions
+                        .iter()
+                        .any(|a| a.description.contains("staging residue")),
+                    outside.path().join(".tinio").exists(),
+                )
+            })
+        };
+        let (following, reported, residue_exists) = run(true);
+        assert!(following && reported && !residue_exists);
+        let (not_following, reported, residue_exists) = run(false);
+        assert!(not_following && !reported && residue_exists);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_repair_reports_unreadable_roots_and_probes() {
+        // F11: a probe error is never \"gone\" — an unreadable storage
+        // root surfaces as reported errors across the stages (tmp, bucket
+        // walk, multipart orphan probe, stale-bucket probe), and the
+        // scanner's count path warns-and-keeps instead of pruning.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    compact_threshold_percent: 20,
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            let k = object::key("a.txt").unwrap();
+            storage.put_object(&b, &k, body(b"x")).await.unwrap();
+            // A multipart subtree + a stale bucket record to probe.
+            storage
+                .bucket_store()
+                .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
+                .await
+                .unwrap();
+            fs::create_dir_all(state.path().join("multipart/gone-bucket/u1")).unwrap();
+
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let mut actions = cleanup.repair(RepairKind::Full).await.unwrap();
+            let mut errs = 0;
+            while let Some(action) = actions.next().await {
+                if action.is_err() {
+                    errs += 1;
+                }
+            }
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(errs >= 3, "unreadable root must be reported: {errs}");
+            assert!(
+                storage.meta_store().walk(&b).await.unwrap().len() == 1,
+                "the record is kept (a probe error is not gone)"
+            );
+
+            // The scanner count path: probe errors warn and keep the row.
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
+            let pruned = cleanup.reclaim_stale_buckets().await.unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(pruned, 0, "no record is pruned on a probe error");
+            assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
         });
     }
 }

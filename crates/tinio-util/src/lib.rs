@@ -3,7 +3,7 @@
 //!
 //! - [`lockmap`] — the evicting per-key lock map (multipart part-write
 //!   locks, per-object conditional-PUT locks).
-//! - [`testing`] — the conformance test harness (behind the `testing`
+//! - `testing` — the conformance test harness (behind the `testing`
 //!   feature: requires `tinio-core` types).
 
 pub mod lockmap;

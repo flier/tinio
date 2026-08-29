@@ -16,6 +16,7 @@ pub mod bucket;
 mod cleanup;
 pub mod database;
 mod error;
+pub mod etag;
 mod fsutil;
 mod listing;
 pub mod meta;
@@ -24,9 +25,11 @@ mod pacing;
 pub mod path;
 mod scanner;
 pub mod sweep;
+pub mod testing;
 #[cfg(test)]
 mod testutil;
 mod write;
+mod write_task;
 
 pub use self::backend::{FsOptions, FsStorage, StagedBody};
 pub use self::cleanup::FsCleanup;

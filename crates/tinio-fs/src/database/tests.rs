@@ -1,8 +1,8 @@
 use redb::{Database, ReadableDatabase};
-use std::ops::DerefMut;
+use std::{ops::DerefMut, sync::Arc, time::Duration};
 
 use crate::testutil::rt;
-use tinio_core::bucket;
+use tinio_core::{bucket, object};
 use tinio_util::testing::assert_send_sync;
 
 use super::{
@@ -167,9 +167,9 @@ fn compact_marker_round_trip() {
         let (state, db, _) = open_db();
         let handle = Handle::new(db);
         assert!(!handle.compact_needed().unwrap());
-        handle.mark_compact_needed(true).unwrap();
+        handle.mark_compact_needed(true).await.unwrap();
         assert!(handle.compact_needed().unwrap());
-        handle.mark_compact_needed(false).unwrap();
+        handle.mark_compact_needed(false).await.unwrap();
         assert!(!handle.compact_needed().unwrap());
         drop(state);
     });
@@ -280,11 +280,13 @@ fn handle_read_write_round_trip() {
         let handle = Handle::new(db);
         let name = bucket::name("alpha").unwrap();
         let created = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(42);
+        let write_name = name.clone();
         handle
-            .write(|txn| {
-                BucketsTable::open(txn)?.put(&name, created)?;
+            .write(move |txn| {
+                BucketsTable::open(txn)?.put(&write_name, created)?;
                 Ok(())
             })
+            .await
             .unwrap();
         let got = handle
             .read(|txn| BucketsTable::open_readonly(txn)?.get(&name))
@@ -300,16 +302,284 @@ fn write_closure_aborts_on_error() {
         let (state, db, _) = open_db();
         let handle = Handle::new(db);
         let name = bucket::name("beta").unwrap();
-        let err = handle.write(|txn| {
-            BucketsTable::open(txn)?.put(&name, std::time::UNIX_EPOCH)?;
-            Err::<(), _>(Error::Io(std::io::Error::other("boom")))
-        });
+        let write_name = name.clone();
+        let err = handle
+            .write(move |txn| {
+                BucketsTable::open(txn)?.put(&write_name, std::time::UNIX_EPOCH)?;
+                Err::<(), _>(Error::Io(std::io::Error::other("boom")))
+            })
+            .await;
         assert!(err.is_err());
         // The aborted transaction persisted nothing.
         let got = handle
             .read(|txn| Ok(BucketsTable::open_readonly(txn)?.get(&name)?.is_some()))
             .unwrap();
         assert!(!got);
+        drop(state);
+    });
+}
+
+// --- write-lock histograms (pipeline-spec.md §4) ---
+
+/// The recorded snapshot of a fresh handle: zero write transactions must
+/// produce a fully zero histogram — no spurious empty buckets.
+#[test]
+fn write_lock_stats_start_all_zero() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        let snapshot = handle.write_lock_stats();
+        assert_eq!(snapshot.count, 0);
+        assert_eq!(snapshot.wait_sum_us, 0);
+        assert_eq!(snapshot.total_sum_us, 0);
+        assert_eq!(snapshot.wait_max_us, 0);
+        assert_eq!(snapshot.total_max_us, 0);
+        assert!(snapshot.wait_buckets.iter().all(|n| *n == 0));
+        assert!(snapshot.total_buckets.iter().all(|n| *n == 0));
+        drop(state);
+    });
+}
+
+/// One write transaction records exactly one wait + one total sample
+/// (wait ≤ total — the lock wait is a prefix of the transaction).
+#[test]
+fn write_transactions_are_timed() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        let name = bucket::name("alpha").unwrap();
+        handle
+            .write(move |txn| {
+                BucketsTable::open(txn)?.put(&name, std::time::UNIX_EPOCH)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let snapshot = handle.write_lock_stats();
+        assert_eq!(snapshot.count, 1);
+        assert_eq!(snapshot.wait_buckets.iter().sum::<u64>(), 1);
+        assert_eq!(snapshot.total_buckets.iter().sum::<u64>(), 1);
+        assert!(
+            snapshot.wait_sum_us <= snapshot.total_sum_us,
+            "the lock wait must be a prefix of the total: {} > {}",
+            snapshot.wait_sum_us,
+            snapshot.total_sum_us
+        );
+        assert_eq!(snapshot.total_max_us, snapshot.total_sum_us);
+        // The max sample's bucket carries the single count.
+        let bucket = super::handle::write_lock_bucket(snapshot.total_max_us);
+        assert_eq!(snapshot.total_buckets[bucket], 1);
+        drop(state);
+    });
+}
+
+/// A slow write closure lands in the overflow bucket (>100k µs)
+/// deterministically — the histogram records real durations, not just
+/// counts.
+#[test]
+fn slow_write_lands_in_the_last_bucket() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        let name = bucket::name("gamma").unwrap();
+        handle
+            .write(move |txn| {
+                BucketsTable::open(txn)?.put(&name, std::time::UNIX_EPOCH)?;
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let snapshot = handle.write_lock_stats();
+        assert_eq!(snapshot.count, 1);
+        assert_eq!(snapshot.total_buckets.len(), 7);
+        assert_eq!(
+            snapshot.total_buckets[6], 1,
+            "a 150 ms transaction must land in the >100k µs bucket"
+        );
+        assert!(
+            snapshot.total_max_us >= 100_000,
+            "150 ms must exceed the 100 ms overflow bound: {}",
+            snapshot.total_max_us
+        );
+        drop(state);
+    });
+}
+
+/// An aborted write closure is still one timed transaction (the total
+/// covers the abort) and persists nothing.
+#[test]
+fn aborted_write_is_recorded() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        let name = bucket::name("delta").unwrap();
+        let write_name = name.clone();
+        let err = handle
+            .write(move |txn| {
+                BucketsTable::open(txn)?.put(&write_name, std::time::UNIX_EPOCH)?;
+                Err::<(), _>(Error::Io(std::io::Error::other("boom")))
+            })
+            .await;
+        assert!(err.is_err());
+        let snapshot = handle.write_lock_stats();
+        assert_eq!(snapshot.count, 1);
+        assert_eq!(snapshot.total_buckets.iter().sum::<u64>(), 1);
+        drop(state);
+    });
+}
+
+/// Read transactions are never timed — the histograms cover write
+/// transactions only.
+#[test]
+fn reads_do_not_record() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        handle
+            .read(|txn| ObjectMetaTable::open_readonly(txn)?.get(&b, &k))
+            .unwrap();
+        assert_eq!(handle.write_lock_stats().count, 0);
+        drop(state);
+    });
+}
+
+/// P5: `evaluate_compact` is the only direct `begin_write` path besides
+/// the `write` wrapper — its stats transaction goes through the SAME
+/// timing helper, so "all write transactions are covered" holds.
+#[test]
+fn evaluate_compact_is_timed() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        assert_eq!(handle.write_lock_stats().count, 0);
+        handle.evaluate_compact(20).await.unwrap();
+        let snapshot = handle.write_lock_stats();
+        assert_eq!(
+            snapshot.count, 1,
+            "the stats transaction must be timed (P5)"
+        );
+        assert_eq!(snapshot.total_buckets.iter().sum::<u64>(), 1);
+        // A second evaluation with the marker unchanged is still a write
+        // transaction (an aborted one) — still recorded.
+        handle.evaluate_compact(20).await.unwrap();
+        assert_eq!(handle.write_lock_stats().count, 2);
+        drop(state);
+    });
+}
+
+/// Multiple transactions accumulate per-bucket counts and the sum/max.
+#[test]
+fn snapshots_accumulate_across_transactions() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        for i in 0..5u64 {
+            let name = bucket::name(format!("bucket{i}")).unwrap();
+            handle
+                .write(move |txn| {
+                    BucketsTable::open(txn)?.put(&name, std::time::UNIX_EPOCH)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let snapshot = handle.write_lock_stats();
+        assert_eq!(snapshot.count, 5);
+        assert_eq!(snapshot.total_buckets.iter().sum::<u64>(), 5);
+        assert_eq!(snapshot.wait_buckets.iter().sum::<u64>(), 5);
+        assert!(snapshot.total_max_us >= snapshot.total_sum_us / 5);
+        drop(state);
+    });
+}
+
+/// P1 (G3 revision): a write transaction executes on the tokio blocking
+/// pool, NOT on the runtime worker. Deterministic proof: on a
+/// single-thread runtime, a write parked inside its closure (the write
+/// transaction is open — the redb write lock is held) must not stop the
+/// worker — a read transaction completes while the write is still
+/// parked, and the write task is still in flight when the read returns.
+/// (Pre-revision the inline write would hang the runtime forever — the
+/// worker is occupied, so the timeout is never polled.)
+#[test]
+fn async_writes_run_on_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        let name = bucket::name("data").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let writer = {
+            let handle = Arc::clone(&handle);
+            let name = name.clone();
+            tokio::spawn(async move {
+                handle
+                    .write(move |txn| {
+                        BucketsTable::open(txn)?.put(&name, std::time::UNIX_EPOCH)?;
+                        let _ = started_tx.send(());
+                        // Park with the write transaction OPEN — the
+                        // redb write lock is held from here on.
+                        let _ = gate_rx.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        // The write is running on the blocking pool and parked (not
+        // committed). A failure to reach the park within 5 s means the
+        // worker was occupied — the pre-revision hang.
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the write never reached the blocking pool")
+            .unwrap();
+        // The single runtime worker is free: a read transaction
+        // completes here while the write is still parked. The parked
+        // write is uncommitted, so the row is invisible (redb MVCC)...
+        let got = handle
+            .read(|txn| BucketsTable::open_readonly(txn)?.get(&name))
+            .unwrap();
+        assert_eq!(got, None, "the parked write must not be committed yet");
+        // ...and the parked write is still in flight (it holds the
+        // write lock — the single-writer serialization is unchanged).
+        assert!(
+            !writer.is_finished(),
+            "the parked write must still be in flight"
+        );
+        drop(gate_tx);
+        writer.await.unwrap();
+        // The write committed when the closure returned: the row is
+        // now visible.
+        let got = handle
+            .read(|txn| BucketsTable::open_readonly(txn)?.get(&name))
+            .unwrap();
+        assert_eq!(got, Some(std::time::UNIX_EPOCH));
+        drop(state);
+    });
+}
+
+/// A panic inside the write closure re-panics the caller: the blocking
+/// task's panic surfaces as a `JoinError`, which the wrapper re-raises
+/// on the awaiting side (the old inline call propagated panics the same
+/// way — behavior unchanged by the blocking-pool move). The open
+/// transaction is dropped, i.e. aborted, so the database stays
+/// consistent; only the awaiting task panics.
+#[test]
+#[should_panic(expected = "the write-transaction task panicked")]
+fn a_panicking_write_closure_panics_the_caller() {
+    rt(async {
+        let (state, db, _) = open_db();
+        let handle = Handle::new(db);
+        handle
+            .write(move |_txn| -> Result<(), Error> { panic!("boom") })
+            .await
+            .unwrap();
         drop(state);
     });
 }

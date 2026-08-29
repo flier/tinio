@@ -340,10 +340,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use tinio_util::testing::SharedBuf;
 
     fn fields(remote_addr: &str, request: &str, status: u16, body_bytes_sent: u64) -> AccessFields {
         AccessFields::new(
@@ -414,23 +413,8 @@ mod tests {
 
     #[test]
     fn access_event_renders_every_variable() {
-        use std::io::{self, Write};
-        use std::sync::{Arc, Mutex};
+        use tinio_util::testing::SharedBuf;
         use tracing::subscriber::with_default;
-
-        /// An owned `Write` sink the access-log layer can hold.
-        #[derive(Clone, Default)]
-        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
 
         let sentinel = |var: &str| match var {
             "remote_addr" => "ra",
@@ -477,20 +461,6 @@ mod tests {
             .collect();
         let line = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert_eq!(line.trim(), expected.join(" "));
-    }
-
-    /// An owned `Write` sink for the layer-under-test.
-    #[derive(Clone, Default)]
-    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]

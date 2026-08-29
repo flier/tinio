@@ -2,10 +2,10 @@
 //!
 //! Single source of truth for the server's configuration (tasks T016/T017):
 //! the TOML config file schema (`version = 1` with `[server]`, `[scanner]`,
-//! `[auth]`, `[log]`, `[s3]`, `[storage]`, `[api]`, `[telemetry]` sections
-//! per contracts/config.md), fail-fast validation (unknown keys collected by
-//! `serde_ignored`, value rules by `garde`, presence-gated sections, port
-//! rules, the
+//! `[auth]`, `[log]`, `[s3]`, `[storage]`, `[pipeline]`, `[api]`,
+//! `[telemetry]` sections per contracts/config.md), fail-fast validation
+//! (unknown keys collected by `serde_ignored`, value rules by `garde`,
+//! presence-gated sections, port rules, the
 //! closed access-log variable set), and source loading (`.env` via
 //! `dotenvy`; the env overlays are declared as clap `env` attributes in the
 //! CLI — FR-016, in [`sources`]).
@@ -24,4 +24,6 @@ pub mod sources;
 
 pub use self::error::Error;
 
-pub use schema::{Config, Version, api, auth, log, s3, scanner, server, storage, telemetry};
+pub use schema::{
+    Config, Version, api, auth, log, pipeline, s3, scanner, server, storage, telemetry,
+};

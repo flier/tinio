@@ -22,47 +22,75 @@ use std::{
     sync::Arc,
 };
 
+use derive_more::Debug;
 use garde::Validate;
 use getset::{CopyGetters, Getters};
-use smart_default::SmartDefault;
 use tokio::sync;
 
 use tinio_core::{
-    ETag, object,
+    ETag, object, pipeline,
     storage::{
         COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
-        DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_FOLLOW_SYMLINKS, Storage, no_such_bucket,
+        DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
+        META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
     },
 };
 
 use crate::{
     bucket,
     database::{self, BucketsTable, Handle, ObjectMetaTable, compact_if_needed},
+    etag,
     listing::FsListing,
     meta,
     multipart::{drain_bucket_uploads, drain_upload},
-    path::{BoundaryCache, map_bucket_path, map_key_path, state_dir},
+    path::{
+        BoundaryCache, map_bucket_path, map_key_path, map_key_path_lexical, prove_key_contained,
+        state_dir,
+    },
     write::AtomicWriter,
 };
 
 /// Construction options of [`FsStorage`].
 ///
+/// The two pipelines are **mandatory** (P4, pipeline-spec.md §7): the cold
+/// list/scanner paths enqueue ETag-computation and batch meta-write tasks
+/// into them — there is no inline fallback. Offline contexts (doctor,
+/// benches, examples, unit tests) pass [`pipeline::InlineRunner`]
+/// (tinio-core Q1); the server passes its two pipeline runtimes.
+///
+/// Each pipeline is typed to its task [`pipeline::Task::Output`] (P4/P7):
+/// the IO pipeline accepts `crate::etag::ComputeTask`
+/// ([`etag::Result`]), the DB pipeline accepts
+/// `crate::write_task::MetaWriteBatchTask` (`Result<(), Error>` — the
+/// original error, never boxed into `RunOutput`).
+///
 /// # Examples
 ///
 /// ```rust
+/// use std::sync::Arc;
+/// use tinio_core::pipeline::InlineRunner;
+/// use tinio_core::storage::{
+///     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+/// };
 /// use tinio_fs::FsOptions;
 ///
-/// let options = FsOptions::default();
-/// assert!(!options.follow_symlinks); // default: reject symlinks
-/// assert_eq!(options.compact_threshold_percent, 20);
+/// let options = FsOptions {
+///     follow_symlinks: false, // default: reject symlinks
+///     state_dir: None,
+///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
+///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
+///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     io_pipeline: Arc::new(InlineRunner::default()),
+///     db_pipeline: Arc::new(InlineRunner::default()),
+/// };
+/// assert!(!options.follow_symlinks);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, SmartDefault, Validate)]
+#[derive(Clone, Debug, Validate)]
 pub struct FsOptions {
     /// Follow symlinks in the storage root (default `false`: symlinks are
     /// rejected — access never resolves through a link, and link entries
     /// are excluded from listings — so a link inside a bucket cannot
     /// escape the storage root). Set `true` to follow them.
-    #[default(_code = "DEFAULT_FOLLOW_SYMLINKS")]
     #[garde(skip)]
     pub follow_symlinks: bool,
     /// State-dir override: where the private state lives. `None` (default)
@@ -73,7 +101,6 @@ pub struct FsOptions {
     /// Compact trigger: the fragmentation percentage at which the state
     /// database is compacted at startup (`[storage.fs]
     /// compact_threshold_percent`, 5..=90).
-    #[default(_code = "DEFAULT_COMPACT_THRESHOLD_PERCENT")]
     #[garde(
         range(
             min = COMPACT_THRESHOLD_MIN_PERCENT,
@@ -81,6 +108,32 @@ pub struct FsOptions {
         )
     )]
     pub compact_threshold_percent: u8,
+    /// The meta-batch entry-count threshold (`[storage.fs]
+    /// meta_batch_size`, 1..=4096): the cold list/scanner producers flush
+    /// one write-pipeline batch once it holds this many entries
+    /// (pipeline-spec.md Q5; default from the task-2.5 benchmark, Q6).
+    #[garde(range(min = META_BATCH_SIZE_MIN, max = META_BATCH_SIZE_MAX))]
+    pub meta_batch_size: u16,
+    /// The meta-batch byte threshold (`[storage.fs] meta_batch_bytes`,
+    /// 1024..=16 MiB): the producers flush once the estimated batch size
+    /// (≈ 56 B + key length per entry) reaches this (pipeline-spec.md Q5).
+    #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
+    pub meta_batch_bytes: u32,
+    /// The ETag-computation pipeline (pipeline-spec.md §3.1): the cold
+    /// list/scanner paths enqueue `crate::etag::ComputeTask`
+    /// instances here. Mandatory (P4) — the pipeline (or `InlineRunner`
+    /// in offline contexts) is a construction-time decision. Typed to the
+    /// task's output [`etag::Result`] (P4/P7).
+    #[garde(skip)]
+    #[debug("<runner>")]
+    pub io_pipeline: Arc<dyn pipeline::Runner<etag::Result>>,
+    /// The batch meta-write pipeline (pipeline-spec.md §3.1): the
+    /// producers enqueue `crate::write_task::MetaWriteBatchTask` batches
+    /// here. Mandatory (P4). Typed to the task's output
+    /// `Result<(), crate::Error>` (P4/P7).
+    #[garde(skip)]
+    #[debug("<runner>")]
+    pub db_pipeline: Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
 }
 
 /// The filesystem storage backend: buckets are top-level subdirectories of
@@ -91,12 +144,32 @@ pub struct FsOptions {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{bucket, storage::{BucketOps, ObjectOps}};
+/// use std::sync::Arc;
+/// use tinio_core::{
+///     bucket,
+///     pipeline::InlineRunner,
+///     storage::{
+///         BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
+///         DEFAULT_META_BATCH_SIZE, ObjectOps,
+///     },
+/// };
 /// use tinio_fs::{FsOptions, FsStorage};
 /// use tinio_util::testing::body;
 ///
 /// let root = tempfile::tempdir().unwrap();
-/// let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+/// let storage = FsStorage::new(
+///     root.path(),
+///     FsOptions {
+///         follow_symlinks: false,
+///         state_dir: None,
+///         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
+///         meta_batch_size: DEFAULT_META_BATCH_SIZE,
+///         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///         io_pipeline: Arc::new(InlineRunner::default()),
+///         db_pipeline: Arc::new(InlineRunner::default()),
+///     },
+/// )
+/// .unwrap();
 /// let b = bucket::name("data").unwrap();
 /// tokio::runtime::Runtime::new().unwrap().block_on(async {
 ///     storage.create_bucket(&b).await.unwrap();
@@ -205,9 +278,12 @@ impl FsStorage {
     }
 
     /// Hold the bucket-mutation lock so a concurrent write's phase-2
-    /// commit blocks until the guard is dropped. Tests use this to
-    /// retarget a followed bucket symlink between resolve and rename.
-    #[cfg(test)]
+    /// commit blocks until the guard is dropped. The scanner's orphan
+    /// reclamation and the cleanup stale-bucket pruning hold it across
+    /// their probe + remove (F02/F05 — a fresh row or a recreated
+    /// bucket's state can never be destroyed by a stale probe); tests
+    /// use it to retarget a followed bucket symlink between resolve and
+    /// rename.
     pub(crate) async fn lock_bucket_mutations(&self) -> sync::MutexGuard<'_, ()> {
         self.bucket_mutation_lock.lock().await
     }
@@ -233,8 +309,12 @@ impl FsStorage {
     ) -> Result<Self, Error> {
         let FsOptions {
             follow_symlinks,
+            state_dir: _,
             compact_threshold_percent,
-            ..
+            meta_batch_size,
+            meta_batch_bytes,
+            io_pipeline,
+            db_pipeline,
         } = options;
         let handle = Handle::new(db);
 
@@ -245,10 +325,18 @@ impl FsStorage {
                 &canonical,
                 meta::Store::from_handle(handle.clone()),
                 follow_symlinks,
+                io_pipeline,
+                db_pipeline,
+                meta_batch_size,
+                meta_batch_bytes,
             ),
             bucket_store: bucket::Store::from_handle(handle.clone()),
             meta_store: meta::Store::from_handle(handle.clone()),
-            multipart_store: crate::multipart::Store::from_handle(handle.clone(), &state_dir),
+            multipart_store: crate::multipart::Store::from_handle(
+                handle.clone(),
+                &state_dir,
+                DEFAULT_MAX_CONCURRENT_UPLOADS,
+            ),
             handle,
             writer: AtomicWriter::new(&state_dir),
             bucket_mutation_lock: Arc::new(sync::Mutex::new(())),
@@ -256,6 +344,15 @@ impl FsStorage {
             root: canonical,
             state_dir,
         })
+    }
+
+    /// Set the cap on concurrently in-progress multipart uploads
+    /// (`[s3] max_concurrent_uploads`; the store default is
+    /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). Must be called before serving
+    /// requests; a `create_multipart_upload` above the cap answers
+    /// `TooManyMultipartUploads` (mapped to S3 `SlowDown`).
+    pub fn set_max_concurrent_uploads(&mut self, max: u32) {
+        self.multipart_store.set_max_concurrent_uploads(max);
     }
 
     /// The bucket directory `<root>/<bucket>`.
@@ -266,12 +363,15 @@ impl FsStorage {
     /// every proof and walk addresses the same resolved path. With
     /// following disabled the containment proof refuses the link (the
     /// bucket is invisible; callers map that to `NoSuchBucket`).
-    pub(crate) fn bucket_dir(&self, name: &bucket::Name) -> Result<PathBuf, Error> {
+    /// **Async (item 7a)**: the symlink probe and canonicalize run
+    /// through `tokio::fs` — no sync syscalls on the request threads
+    /// (the old per-object-op `std::fs` pair is gone).
+    pub(crate) async fn bucket_dir(&self, name: &bucket::Name) -> Result<PathBuf, Error> {
         if self.follow_symlinks {
             let lexical = self.root().join(&**name);
-            match std::fs::symlink_metadata(&lexical) {
+            match tokio::fs::symlink_metadata(&lexical).await {
                 Ok(metadata) if crate::fsutil::is_symlink_or_reparse(&metadata) => {
-                    return std::fs::canonicalize(&lexical).map_err(|err| {
+                    return tokio::fs::canonicalize(&lexical).await.map_err(|err| {
                         if err.kind() == io::ErrorKind::NotFound {
                             // A dangling bucket link has no target — no
                             // bucket.
@@ -294,55 +394,61 @@ impl FsStorage {
                 Err(err) => return Err(err.into()),
             }
         }
-        map_bucket_path(Some(&self.boundary_cache), self.root(), name)
+        map_bucket_path(&self.boundary_cache, self.root(), name).await
     }
 
     /// The object file path `<bucket>/<key>` — the cached form of
     /// [`path::key_path`](crate::path::key_path). `enforce_boundary` is
     /// `!follow_symlinks` for object operations; cleanup/scan paths always
-    /// enforce (they must never address outside the bucket).
-    pub(crate) fn key_path(
+    /// enforce (they must never address outside the bucket). Async
+    /// (item 7a) — the boundary resolution runs off the request threads.
+    pub(crate) async fn key_path(
         &self,
         bucket_dir: &Path,
         key: &object::Key,
         enforce_boundary: bool,
     ) -> Result<PathBuf, Error> {
-        map_key_path(
-            Some(&self.boundary_cache),
-            bucket_dir,
-            key,
-            enforce_boundary,
-        )
+        map_key_path(&self.boundary_cache, bucket_dir, key, enforce_boundary).await
     }
 
-    /// Resolve `key` under `bucket_dir` through the symlink policy first,
-    /// then the containment proof.
+    /// Resolve `key` under `bucket_dir`: the pure lexical validation
+    /// first (no filesystem access), then the symlink policy, then the
+    /// containment proof.
     ///
-    /// The I/O-time policy fires **before** the proof: the proof would
-    /// canonicalize through a link inside the bucket and report an escape
-    /// (`InvalidPath` → 400), where the documented contract (s3-surface.md)
-    /// answers `AccessDenied` (403) for a link when following is disabled.
-    /// With following enabled the plain lexical join is returned (the
-    /// policy is off and the proof is skipped — the current object-op
-    /// contract).
+    /// The lexical validation (defensive re-check, the reserved `.tinio`
+    /// refusal — FR-020, both follow modes — and the Windows charset
+    /// refusal) runs before any syscall, so a refused key never pays for
+    /// the symlink walk (P5). The I/O-time policy fires **before** the
+    /// proof: the proof would canonicalize through a link inside the
+    /// bucket and report an escape (`InvalidPath` → 400), where the
+    /// documented contract (s3-surface.md) answers `AccessDenied` (403)
+    /// for a link when following is disabled. With following enabled the
+    /// lexical-validated join is returned (the policy is off and the
+    /// proof is skipped — the current object-op contract).
     pub(crate) async fn resolve_key(
         &self,
         bucket_dir: &Path,
         key: &object::Key,
     ) -> Result<PathBuf, Error> {
-        // The lexical join is what the symlink walk inspects (the key is
-        // already contract-validated; the supplements and the containment
-        // proof re-run in the full mapping below).
-        let lexical = bucket_dir.join(&**key);
+        // 1. Pure lexical validation — no syscalls: the defensive
+        //    re-check, the reserved-segment refusal, the Windows
+        //    charset/aliasing refusal, and the plain join (the path the
+        //    symlink walk inspects). A key refused here never pays for
+        //    the walk or the proof.
+        let path = map_key_path_lexical(bucket_dir, key)?;
         if self.follow_symlinks {
-            return Ok(lexical);
+            return Ok(path);
         }
-        self.check_symlinks(key, &lexical).await?;
-        // One full mapping: supplements + the containment proof (the
-        // `enforce_boundary = true` path). The proof runs AFTER the
-        // symlink policy so a link inside the bucket answers AccessDenied
-        // (403), not InvalidPath (400) — s3-surface.md.
-        map_key_path(Some(&self.boundary_cache), bucket_dir, key, true)
+        // 2. The I/O-time symlink policy: lstat every existing component
+        //    (missing components are skipped — the parents may not exist
+        //    yet).
+        self.check_symlinks(key, &path).await?;
+        // 3. The containment proof (canonicalize) — after the policy so
+        //    a link inside the bucket answers AccessDenied (403), not
+        //    InvalidPath (400) — s3-surface.md. Async (item 7a): the
+        //    boundary resolution runs off the request threads.
+        prove_key_contained(&self.boundary_cache, bucket_dir, key).await?;
+        Ok(path)
     }
 
     /// Every bucket of the root: top-level directories with valid names
@@ -393,19 +499,21 @@ impl FsStorage {
     /// `OBJECT_META` rows that no cleanup stage can see (the repair walk
     /// only visits live buckets).
     pub(crate) async fn remove_bucket_state(&self, bucket: &bucket::Name) -> Result<(), Error> {
+        let bucket = bucket.clone();
         self.handle
-            .write(|txn| {
+            .write(move |txn| {
                 {
                     let mut buckets = BucketsTable::open(txn)?;
-                    buckets.remove(bucket)?;
+                    buckets.remove(&bucket)?;
                 }
                 {
                     let mut meta = ObjectMetaTable::open(txn)?;
-                    meta.drain_bucket(bucket)?;
+                    meta.drain_bucket(&bucket)?;
                 }
-                drain_bucket_uploads(txn, bucket)?;
+                drain_bucket_uploads(txn, &bucket)?;
                 Ok(())
             })
+            .await
             .map_err(Into::into)
     }
 
@@ -430,21 +538,34 @@ impl FsStorage {
         let size = metadata.len();
         let mtime = metadata.modified()?;
         let identity = crate::fsutil::file_identity(path, metadata);
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id = upload_id.to_string();
+        let etag = etag.clone();
         self.handle
-            .write(|txn| {
-                drain_upload(txn, bucket, upload_id)?;
-                ObjectMetaTable::open(txn)?.put(bucket, key, etag, size, mtime, identity)
+            .write(move |txn| {
+                drain_upload(txn, &bucket, &upload_id)?;
+                ObjectMetaTable::open(txn)?.put(&bucket, &key, &etag, size, mtime, identity)
             })
+            .await
             .map_err(Into::into)
     }
 
     /// Evaluate fragmentation and update the `compact_needed` marker (one
     /// write transaction; the sweep calls this once per round — the
     /// stats call takes the write lock, so it is low-frequency only).
-    pub(crate) fn evaluate_compact(&self, threshold_percent: u8) -> Result<bool, Error> {
+    pub(crate) async fn evaluate_compact(&self, threshold_percent: u8) -> Result<bool, Error> {
         self.handle
             .evaluate_compact(threshold_percent)
+            .await
             .map_err(Into::into)
+    }
+
+    /// The write-transaction timing snapshot behind the server's
+    /// `tinio_write_lock_*` metrics (pipeline-spec.md §4; the `/metrics`
+    /// scrape path reads it — a cheap atomic snapshot, never a lock).
+    pub fn write_lock_stats(&self) -> database::WriteLockSnapshot {
+        self.handle.write_lock_stats()
     }
 }
 

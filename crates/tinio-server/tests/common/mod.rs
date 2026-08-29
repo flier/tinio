@@ -23,9 +23,11 @@ use tokio::{
 };
 
 use tinio_core::storage::Storage;
-use tinio_fs::{FsOptions, FsStorage};
+use tinio_fs::FsStorage;
 use tinio_mem::MemoryStorage;
 use tinio_server::{Capabilities, DataPlane};
+
+pub use tinio_fs::testing::fs_options;
 
 /// A running in-process server bound to an ephemeral loopback port.
 pub struct Server {
@@ -38,13 +40,13 @@ impl Server {
     /// Serve a fresh filesystem-backed root (a temp dir).
     pub async fn fs(caps: Capabilities) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         Self::spawn(storage, caps, Some(root)).await
     }
 
     /// Serve a filesystem backend over `root` (caller keeps the dir).
     pub async fn fs_at(root: &Path, caps: Capabilities) -> Self {
-        let storage = FsStorage::new(root, FsOptions::default()).unwrap();
+        let storage = FsStorage::new(root, fs_options()).unwrap();
         Self::spawn(storage, caps, None).await
     }
 

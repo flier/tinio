@@ -1,5 +1,10 @@
 //! Shared S3 listing pagination and delimiter grouping.
 
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashSet},
+};
+
 /// Group, filter, and paginate a key-sorted item stream — the shared S3
 /// listing engine for both object and multipart-upload listings.
 ///
@@ -106,6 +111,24 @@ pub fn split_uploads_order(order: &str) -> (&str, Option<&str>) {
     match order.split_once('\0') {
         Some((key, upload_id)) => (key, Some(upload_id)),
         None => (order, None),
+    }
+}
+
+/// The composite page-resume marker of an S3 ListMultipartUploads
+/// listing from its wire halves (`key-marker` plus the optional
+/// `upload-id-marker`). A bare key marker skips the whole key group
+/// (S3: only keys strictly greater than `key-marker` are listed) — the
+/// sentinel upload id sorts after every real one (upload ids never
+/// contain `\0`, and `\u{10FFFF}` is beyond any legal upload-id
+/// character). One home for the conversion, shared by both backends.
+pub fn key_marker_order(
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> Option<String> {
+    match (key_marker, upload_id_marker) {
+        (Some(key), Some(upload_id)) => Some(uploads_order(key, upload_id)),
+        (Some(key), None) => Some(uploads_order(key, "\u{10FFFF}")),
+        _ => None,
     }
 }
 
@@ -224,9 +247,164 @@ pub fn group_and_paginate_ordered<T>(
     (keys, common_prefixes, false, None)
 }
 
+/// Like [`group_and_paginate_ordered`], but over an **unordered** item
+/// stream (the fs backend's bounded-memory uploads page, item 7e): every
+/// item is examined, but only the page is held in memory — a max-heap
+/// keeps the `max + 1` smallest **distinct** entries after the marker
+/// (entries = the rolled-up prefix string for delimiter groups —
+/// deduplicated against the heap — or the composite order). The heap's
+/// `max + 1`-th entry is the truncation probe; the resume marker is the
+/// last entry of the page — page size, marker, and resume semantics
+/// identical to the ordered engine over a key-sorted stream (pinned by
+/// the equality matrix test).
+///
+/// The rollup dedup is against prefixes currently in the heap (an
+/// evicted prefix is re-offered by a later row of the same group — one
+/// entry either way). A marker positioned *inside* a rolled-up prefix
+/// skips the whole group identically in both engines: a rollup row's
+/// order IS the prefix string, so `"dir/" <= marker` — the page
+/// legitimately comes back empty and untruncated (the ordered engine's
+/// documented resume semantics).
+pub fn group_and_paginate_unordered<T>(
+    items: impl IntoIterator<Item = T>,
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max: usize,
+    key_of: impl Fn(&T) -> &str,
+    order_of: impl Fn(&T) -> String,
+) -> (Vec<T>, Vec<String>, bool, Option<String>) {
+    let mut keys = Vec::new();
+    let mut common_prefixes = Vec::new();
+    let mut heap: BinaryHeap<HeapEntry<T>> = BinaryHeap::new();
+    let mut heap_prefixes: HashSet<String> = HashSet::new();
+    if max == 0 {
+        // Nothing was requested and nothing emitted: no resume marker
+        // either — an exclusive-after marker would skip the first item
+        // of the next page.
+        return (keys, common_prefixes, false, None);
+    }
+    let cap = max + 1;
+    for item in items {
+        // The key drives delimiter grouping only — a delimiter-less
+        // caller never materializes it (objects compare by order).
+        let entry = match delimiter.and_then(|delim| common_prefix(key_of(&item), prefix, delim)) {
+            Some(cp) => (cp.to_string(), true),
+            None => (String::new(), false),
+        };
+        // The order: the rolled-up prefix, or the composite order.
+        let order = if entry.1 { entry.0 } else { order_of(&item) };
+        // Exclusive-after marker — BEFORE the rollup dedup (see the
+        // divergence note above: a marker-skipped prefix is not in the
+        // heap, so a later row of the same group re-offers it).
+        if marker.is_some_and(|after| order.as_str() <= after) {
+            continue;
+        }
+        // The rollup is already counted while it is in the heap (an
+        // evicted prefix is offered again — one entry either way).
+        if entry.1 && heap_prefixes.contains(&order) {
+            continue;
+        }
+        heap_insert(
+            &mut heap,
+            &mut heap_prefixes,
+            HeapEntry {
+                order,
+                item: (!entry.1).then_some(item),
+            },
+            cap,
+        );
+    }
+    // Split the heap: ascending page plus the probe entry.
+    let mut sorted = heap.into_sorted_vec();
+    let truncated = sorted.len() > max;
+    if truncated {
+        sorted.pop(); // the probe — beyond the page
+    }
+    let next = if truncated {
+        sorted.last().map(|entry| entry.order.clone())
+    } else {
+        None
+    };
+    for entry in sorted {
+        match entry.item {
+            Some(item) => keys.push(item),
+            None => common_prefixes.push(entry.order),
+        }
+    }
+    (keys, common_prefixes, truncated, next)
+}
+
+/// One entry of the unordered pagination's bounded max-heap: the entry's
+/// order string — the composite `key\0upload_id` order for objects, the
+/// rolled-up prefix for delimiter groups — plus the item when the entry
+/// is an object (`None` = a common prefix). Ordered by `order`
+/// (max-heap: the largest is displaced first, keeping the `max + 1`
+/// smallest).
+struct HeapEntry<T> {
+    order: String,
+    item: Option<T>,
+}
+
+impl<T> PartialEq for HeapEntry<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+impl<T> Eq for HeapEntry<T> {}
+impl<T> PartialOrd for HeapEntry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for HeapEntry<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order.cmp(&other.order)
+    }
+}
+
+/// Insert `entry` into the capped max-heap of the `cap` smallest
+/// entries: while the heap has room it is pushed; when full, the entry
+/// displaces the current largest only if it is smaller (the standard
+/// bounded-k selection — the final heap holds the `cap` smallest of
+/// everything offered). `heap_prefixes` mirrors the prefixes currently
+/// in the heap — the rollup dedup set: an evicted prefix is removed, so
+/// a later row of the same group is offered again, which is correct (it
+/// is ONE entry either way — the heap's `cap`-th slot is the truncation
+/// probe, and a duplicate can only displace a distinct entry, so
+/// `len == cap` still means "at least `cap` distinct entries").
+fn heap_insert<T>(
+    heap: &mut BinaryHeap<HeapEntry<T>>,
+    heap_prefixes: &mut HashSet<String>,
+    entry: HeapEntry<T>,
+    cap: usize,
+) {
+    if heap.len() < cap {
+        if entry.item.is_none() {
+            heap_prefixes.insert(entry.order.clone());
+        }
+        heap.push(entry);
+        return;
+    }
+    if let Some(largest) = heap.peek()
+        && entry < *largest
+    {
+        let displaced = heap.pop().expect("non-empty heap");
+        if displaced.item.is_none() {
+            heap_prefixes.remove(&displaced.order);
+        }
+        if entry.item.is_none() {
+            heap_prefixes.insert(entry.order.clone());
+        }
+        heap.push(entry);
+    }
+}
+
 /// The rolled-up common prefix (`prefix + head + delim`) when `key` groups
-/// under `delimiter`, `None` otherwise.
-fn common_prefix<'a>(key: &'a str, prefix: &str, delimiter: &str) -> Option<&'a str> {
+/// under `delimiter`, `None` otherwise. Public so backends implementing
+/// their own in-scan pagination share the single home of the rollup rule
+/// (the fs backend's bounded-memory uploads page, item 7e).
+pub fn common_prefix<'a>(key: &'a str, prefix: &str, delimiter: &str) -> Option<&'a str> {
     let rest = key.strip_prefix(prefix)?;
     let (head, _) = rest.split_once(delimiter)?;
     Some(&key[..prefix.len() + head.len() + delimiter.len()])
@@ -558,5 +736,82 @@ mod tests {
         assert_eq!(prefixes, ["dir/"]);
         assert!(!truncated);
         assert_eq!(next, None);
+    }
+
+    fn unordered(
+        items: &[&str],
+        prefix: &str,
+        delim: Option<&str>,
+        marker: Option<&str>,
+        max: usize,
+    ) -> (Vec<String>, Vec<String>, bool, Option<String>) {
+        group_and_paginate_unordered(
+            items.iter().map(|s| (*s).to_string()),
+            prefix,
+            delim,
+            marker,
+            max,
+            String::as_str,
+            |s| s.to_string(),
+        )
+    }
+
+    #[test]
+    fn unordered_matches_ordered_on_every_combination() {
+        // The unordered variant (the bounded-memory uploads page) agrees
+        // with the ordered engine on every marker/rollup combination,
+        // including a marker positioned INSIDE a rolled-up prefix: a
+        // rollup row's order IS the prefix string, so `"dir/" <= marker`
+        // skips the whole group identically in both engines (a marker
+        // inside a rollup legitimately yields an empty, untruncated
+        // page — the ordered engine's documented resume semantics).
+        let items = ["a.txt", "dir/b.txt", "dir/c.txt", "dir/sub/d.txt", "z.txt"];
+        let mut combos = 0usize;
+        for (prefix, delim) in [
+            ("", None),
+            ("", Some("/")),
+            ("dir/", Some("/")),
+            ("z", None),
+        ] {
+            for marker in [
+                None,
+                Some("a.txt"),
+                Some("dir/b.txt"),
+                Some("dir/"),
+                Some("z.txt"),
+            ] {
+                for max in [0usize, 1, 2, 3, 1000] {
+                    combos += 1;
+                    let ordered = paginate(&items, prefix, delim, marker, max);
+                    let unordered = unordered(&items, prefix, delim, marker, max);
+                    assert_eq!(
+                        ordered, unordered,
+                        "prefix={prefix:?} delim={delim:?} marker={marker:?} max={max}"
+                    );
+                }
+            }
+        }
+        assert_eq!(combos, 100, "the matrix ran");
+    }
+
+    #[test]
+    fn unordered_rollup_collapses_to_one_entry_for_the_page() {
+        // A rolled-up prefix is ONE entry for the page: with `max = 1`
+        // the rollup fills the page and the next distinct entry is the
+        // truncation probe — identical to the ordered engine.
+        let items = ["a.txt", "dir/x", "dir/y", "z.txt"];
+        let (keys, prefixes, truncated, next) = unordered(&items, "", Some("/"), None, 1);
+        assert_eq!(keys, ["a.txt"]);
+        assert_eq!(prefixes, Vec::<String>::new(), "{prefixes:?}");
+        assert!(truncated);
+        assert_eq!(next.as_deref(), Some("a.txt"));
+
+        // The ordered engine agrees (the rollup dedup keeps `dir/` one
+        // entry; `z.txt` is the probe).
+        let (keys, prefixes, truncated, next) = paginate(&items, "", Some("/"), None, 1);
+        assert_eq!(keys, ["a.txt"]);
+        assert!(prefixes.is_empty());
+        assert!(truncated);
+        assert_eq!(next.as_deref(), Some("a.txt"));
     }
 }

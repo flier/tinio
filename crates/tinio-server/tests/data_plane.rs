@@ -25,6 +25,7 @@ async fn fs_server() -> Server {
 }
 
 #[tokio::test]
+#[cfg(feature = "list-v2")]
 async fn full_round_trip_with_listing_and_delete() {
     let server = fs_server().await;
     let addr = server.addr();
@@ -327,8 +328,11 @@ async fn out_of_band_changes_served_immediately() {
     );
 
     // And it shows up in listings without any restart/rescan.
-    let resp = request(addr, "GET", "/data?list-type=2", &[], &[]).await;
-    assert!(resp.text().contains("<Key>dropped.txt</Key>"));
+    #[cfg(feature = "list-v2")]
+    {
+        let resp = request(addr, "GET", "/data?list-type=2", &[], &[]).await;
+        assert!(resp.text().contains("<Key>dropped.txt</Key>"));
+    }
 }
 
 /// Percent-encode a query-string value (unreserved + `/` pass through).

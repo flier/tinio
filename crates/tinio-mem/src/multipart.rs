@@ -10,7 +10,8 @@ use redb::{ReadableDatabase, ReadableTable};
 use tinio_core::{
     CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
     PartInfo, PartNumber, PartsListing, UploadsListing, bucket, collect_body, from_nanos,
-    group_and_paginate_ordered, now_nanos, object, split_uploads_order, uploads_order,
+    group_and_paginate_ordered, key_marker_order, now_nanos, object, split_uploads_order,
+    uploads_order,
 };
 use uuid::Uuid;
 
@@ -22,7 +23,8 @@ use crate::{
     },
     storage::{
         BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, check_bucket,
-        check_upload, object_key, parse_part_number, part_key, remove_all_parts, upload_key,
+        check_upload, collect_part_keys, object_key, parse_part_number, part_key, remove_all_parts,
+        upload_key,
     },
 };
 
@@ -89,20 +91,33 @@ impl MultipartOps for MemoryStorage {
             return Err(no_such_bucket(bucket));
         }
         let data = collect_body(body).await?;
+        // Enforce the per-part size limit before opening the write
+        // transaction (fast fail).
+        self.check_object_size(data.len() as u64)?;
         let etag = ETag::from_content(&data);
         let now = now_nanos();
         let txn = self.db.begin_write()?;
-        {
+        let delta = {
             let uploads = txn.open_table(UPLOADS)?;
             check_upload(&uploads, upload_id, bucket, key)?;
             let pk = part_key(upload_id, u32::from(part_number));
             let etag_str = etag.as_str();
             let mut parts = txn.open_table(PARTS)?;
             let mut meta = txn.open_table(PART_META)?;
+            let old_len = parts
+                .get(pk.as_str())?
+                .map(|v| v.value().len() as u64)
+                .unwrap_or(0);
+            let delta = data.len() as i64 - old_len as i64;
+            self.adjust_total(delta)?;
             parts.insert(pk.as_str(), data.as_slice())?;
             meta.insert(pk.as_str(), (etag_str.as_str(), data.len() as u64, now))?;
+            delta
+        };
+        if let Err(err) = txn.commit() {
+            self.rollback_total(delta);
+            return Err(err.into());
         }
-        txn.commit()?;
         Ok(PartInfo {
             part_number,
             size: data.len() as u64,
@@ -256,6 +271,10 @@ impl MultipartOps for MemoryStorage {
             }
             (data, etag, now)
         };
+        // The assembled object replaces the parts byte-for-byte (the
+        // tracked total is unchanged), but the per-object limit still
+        // applies to the assembled size.
+        self.check_object_size(data.len() as u64)?;
         txn.commit()?;
         Ok(object::Info {
             key: key.clone(),
@@ -277,7 +296,7 @@ impl MultipartOps for MemoryStorage {
             // before anything else).
             check_bucket(&txn.open_table(BUCKETS)?, bucket)?;
         }
-        {
+        let removed = {
             {
                 let uploads = txn.open_table(UPLOADS)?;
                 check_upload(&uploads, upload_id, bucket, key)?;
@@ -292,10 +311,22 @@ impl MultipartOps for MemoryStorage {
                 let mut stored_parts = txn.open_table(PARTS)?;
                 let mut stored_meta = txn.open_table(PART_META)?;
                 let prefix = format!("{upload_id}\0");
+                let keys = collect_part_keys(&stored_parts, &prefix)?;
+                let mut removed = 0u64;
+                for k in &keys {
+                    if let Some(v) = stored_parts.get(k.as_str())? {
+                        removed += v.value().len() as u64;
+                    }
+                }
                 remove_all_parts(&mut stored_parts, &mut stored_meta, &prefix)?;
+                removed
             }
+        };
+        if let Err(err) = txn.commit() {
+            return Err(err.into());
         }
-        txn.commit()?;
+        // An abort only shrinks the total; it cannot exceed a limit.
+        let _ = self.adjust_total(-(removed as i64));
         Ok(())
     }
 
@@ -340,15 +371,13 @@ impl MultipartOps for MemoryStorage {
         // Compound keys (`bucket\0key\0upload_id`) scan in (key, id) order,
         // so key order — and thus delimiter grouping — needs no re-sort.
         // The resume marker pairs the key with the upload id, so a page
-        // can position inside a same-key group (S3 `upload-id-marker`).
-        // A bare key marker skips the whole key group (S3: only keys
-        // strictly greater than `key-marker` are listed) — the sentinel
-        // upload id sorts after every real one.
-        let marker = match (&params.key_marker, &params.upload_id_marker) {
-            (Some(key), Some(upload_id)) => Some(uploads_order(key, upload_id)),
-            (Some(key), None) => Some(uploads_order(key, "\u{10FFFF}")),
-            _ => None,
-        };
+        // can position inside a same-key group (S3 `upload-id-marker`); a
+        // bare key marker skips the whole key group — the conversion has
+        // one home in tinio-core (shared with the fs backend).
+        let marker = key_marker_order(
+            params.key_marker.as_deref(),
+            params.upload_id_marker.as_deref(),
+        );
         let (keys, common_prefixes, truncated, next) = group_and_paginate_ordered(
             upload_list,
             &params.prefix,
@@ -384,6 +413,7 @@ mod tests {
     use tinio_util::testing::{body, read_body};
 
     use super::*;
+    use crate::MemoryOptions;
 
     fn completed(part: &PartInfo) -> CompletedPart {
         CompletedPart {
@@ -397,6 +427,112 @@ mod tests {
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         (storage, name)
+    }
+
+    #[tokio::test]
+    async fn part_size_limit_rejects_oversized_parts() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: Some(4),
+            max_total_bytes: None,
+        })
+        .unwrap();
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        let key = object::key("big.bin").unwrap();
+        let upload = storage.create_multipart_upload(&name, &key).await.unwrap();
+
+        let err = storage
+            .upload_part(
+                &name,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"12345"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(EntityTooLarge { size: 5, limit: 4 })),
+            "{err}"
+        );
+        storage
+            .upload_part(
+                &name,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"1234"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_releases_part_bytes() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(8),
+        })
+        .unwrap();
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        let key = object::key("big.bin").unwrap();
+        let upload = storage.create_multipart_upload(&name, &key).await.unwrap();
+
+        storage
+            .upload_part(
+                &name,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"12345"),
+            )
+            .await
+            .unwrap();
+        let err = storage
+            .upload_part(
+                &name,
+                &key,
+                &upload.upload_id,
+                part_number(2).unwrap(),
+                body(b"1234"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(EntityTooLarge { .. })),
+            "{err}"
+        );
+        storage
+            .upload_part(
+                &name,
+                &key,
+                &upload.upload_id,
+                part_number(2).unwrap(),
+                body(b"123"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.total_bytes(), 8);
+
+        storage
+            .abort_multipart_upload(&name, &key, &upload.upload_id)
+            .await
+            .unwrap();
+        assert_eq!(storage.total_bytes(), 0);
+
+        // The freed capacity is reusable by a new upload.
+        let u2 = storage.create_multipart_upload(&name, &key).await.unwrap();
+        storage
+            .upload_part(
+                &name,
+                &key,
+                &u2.upload_id,
+                part_number(1).unwrap(),
+                body(b"12345678"),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

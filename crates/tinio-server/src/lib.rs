@@ -14,6 +14,7 @@ mod data;
 mod error;
 pub mod log;
 pub mod metrics;
+pub mod pipeline;
 
 pub use self::backend::{Capabilities, S3Backend};
 pub use self::data::DataPlane;

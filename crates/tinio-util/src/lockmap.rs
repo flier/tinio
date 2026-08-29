@@ -123,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn lock_serializes_same_key() {
         let map = Map::new();
-        let held = map.lock("k".to_string()).await;
+        let _held = map.lock("k".to_string()).await;
         let waiter = tokio::spawn({
             let map = map.clone();
             async move { map.lock("k".to_string()).await }
@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn slot_survives_waiter_and_evicts_at_last_drop() {
         let map = Map::new();
-        let held = map.lock("k".to_string()).await;
+        let _held = map.lock("k".to_string()).await;
         let waiter = tokio::spawn({
             let map = map.clone();
             async move {
@@ -167,7 +167,7 @@ mod tests {
             }
         });
         tokio::task::yield_now().await;
-        drop(held);
+        drop(_held);
         // The waiter (whose slot clone pins the entry) acquires the key
         // next; whichever interleaving wins, the last guard's drop must
         // leave the table empty — the slot is never evicted out from
@@ -182,9 +182,9 @@ mod tests {
     #[tokio::test]
     async fn slot_evicts_after_single_lock() {
         let map = Map::new();
-        let held = map.lock("k".to_string()).await;
+        let _held = map.lock("k".to_string()).await;
         assert_eq!(map.len(), 1);
-        drop(held);
+        drop(_held);
         assert!(map.is_empty());
     }
 
@@ -197,12 +197,9 @@ mod tests {
         }));
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let held = map.lock("k".to_string()).await;
-            drop(held);
+            let _held = map.lock("k".to_string()).await;
+            drop(_held);
         });
-        assert!(
-            map.is_empty(),
-            "poison recovery must not leak the slot"
-        );
+        assert!(map.is_empty(), "poison recovery must not leak the slot");
     }
 }

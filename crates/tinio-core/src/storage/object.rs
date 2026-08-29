@@ -200,6 +200,31 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage;
 
+    /// Server-side copy of `src` into `dst` (S3 CopyObject): the source
+    /// content is stored under `dst` atomically (FR-011), and the
+    /// source's metadata is NOT carried over — a copy is a fresh object
+    /// (its mtime is the copy time; its ETag is the content's). The
+    /// default implementation streams the source through the body
+    /// contract (get → put); a backend may override with a
+    /// filesystem-level copy (same filesystem, zero userspace
+    /// buffering) and may reuse the source's ETag for a full copy of a
+    /// single-form source (the content MD5 is unchanged by a copy).
+    /// `NoSuchKey` when the source does not exist; `NoSuchBucket` when
+    /// either bucket does not.
+    async fn copy_object(
+        &self,
+        src_bucket: &bucket::Name,
+        src_key: &object::Key,
+        dst_bucket: &bucket::Name,
+        dst_key: &object::Key,
+    ) -> Result<PutObjectResult, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let get = self.get_object(src_bucket, src_key, None).await?;
+        self.put_object(dst_bucket, dst_key, get.body).await
+    }
+
     /// Object metadata; `NoSuchKey` when missing.
     async fn head_object(
         &self,

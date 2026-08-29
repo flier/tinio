@@ -9,7 +9,8 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use tinio_core::storage::{BucketOps, ObjectOps};
 use tinio_core::{BodyStream, bucket, object};
-use tinio_fs::{AtomicWriter, FsOptions, FsStorage};
+use tinio_fs::testing::fs_options;
+use tinio_fs::{AtomicWriter, FsStorage};
 use tinio_util::testing::body;
 
 /// Total bytes per streaming round-trip (64 MiB — large enough to measure
@@ -56,7 +57,7 @@ fn streaming_read(c: &mut Criterion) {
     group.throughput(criterion::Throughput::Bytes(TOTAL));
     group.bench_function("get_object_drain_64MiB", |b| {
         let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let b = bucket::name("data").unwrap();
@@ -92,7 +93,7 @@ fn small_write(c: &mut Criterion) {
     group.throughput(criterion::Throughput::Elements(1));
     group.bench_function("put_1KiB", |b| {
         let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             storage

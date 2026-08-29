@@ -13,7 +13,9 @@ use tinio_core::{
     object,
     storage::{BucketOps, MultipartOps, ObjectOps},
 };
-use tinio_fs::{FsOptions, FsStorage};
+use tinio_fs::FsStorage;
+use tinio_fs::testing::fs_options;
+
 use tinio_util::testing::body;
 
 /// Part count of the assembly benchmark (each part 256 KiB → 64 MiB
@@ -26,7 +28,7 @@ fn multipart_assembly(c: &mut Criterion) {
     group.throughput(criterion::Throughput::Bytes((PARTS * PART_SIZE) as u64));
     group.bench_function("complete_64MiB_256_parts", |b| {
         let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let bname = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();

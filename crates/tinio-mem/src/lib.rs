@@ -20,4 +20,4 @@ mod storage;
 
 pub use self::cleanup::MemoryCleanup;
 pub use self::error::{DatabaseError, Error};
-pub use self::storage::MemoryStorage;
+pub use self::storage::{MemoryOptions, MemoryStorage};

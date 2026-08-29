@@ -68,15 +68,19 @@ impl Store {
         if let Some(created) = self.created_at(name).await? {
             return Ok(created);
         }
+        let name = name.clone();
         self.handle
-            .write(|txn| database::BucketsTable::open(txn)?.get_or_insert(name, now))
+            .write(move |txn| database::BucketsTable::open(txn)?.get_or_insert(&name, now))
+            .await
             .map_err(Into::into)
     }
 
     /// Record (or overwrite) the creation time of a bucket.
     pub async fn record(&self, name: &bucket::Name, created_at: SystemTime) -> Result<(), Error> {
+        let name = name.clone();
         self.handle
-            .write(|txn| database::BucketsTable::open(txn)?.put(name, created_at))
+            .write(move |txn| database::BucketsTable::open(txn)?.put(&name, created_at))
+            .await
             .map_err(Into::into)
     }
 
@@ -85,8 +89,10 @@ impl Store {
     /// [`crate::FsStorage::remove_bucket_state`].
     #[cfg(test)]
     pub async fn remove(&self, name: &bucket::Name) -> Result<(), Error> {
+        let name = name.clone();
         self.handle
-            .write(|txn| database::BucketsTable::open(txn)?.remove(name))
+            .write(move |txn| database::BucketsTable::open(txn)?.remove(&name))
+            .await
             .map_err(Into::into)
     }
 

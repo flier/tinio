@@ -12,8 +12,10 @@ use tinio_core::{
     bucket::{self, Bucket},
     storage::{BucketOps, already_exists, no_such_bucket, not_empty},
 };
+use tokio::fs;
 
 use super::{Error, FsStorage};
+use crate::path::{STATE_DIR_NAME, bucket_path_lexical};
 
 /// A bucket counts as empty when it has no files and no directories
 /// anywhere (folder-marker directories are content, per the conformance
@@ -25,8 +27,8 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
     if storage.multipart_store().has_uploads(name).await? {
         return Ok(false);
     }
-    let bucket_dir = storage.bucket_dir(name)?;
-    let mut entries = match tokio::fs::read_dir(&bucket_dir).await {
+    let bucket_dir = storage.bucket_dir(name).await?;
+    let mut entries = match fs::read_dir(&bucket_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Err(Error::Storage(no_such_bucket(name)));
@@ -34,7 +36,7 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
         Err(err) => return Err(err.into()),
     };
     while let Some(entry) = entries.next_entry().await? {
-        if entry.file_name() == crate::path::STATE_DIR_NAME {
+        if entry.file_name() == STATE_DIR_NAME {
             continue; // staging residue (FR-020): not content
         }
         return Ok(false); // any other file or directory is content
@@ -45,13 +47,21 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
 #[async_trait]
 impl BucketOps for FsStorage {
     async fn create_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
+        // The lexical mapping: the validation supplements (the reserved
+        // `.tinio` refusal — FR-020 — and the Windows charset/aliasing
+        // refusal — F21, the same clean `InvalidBucketName` the object
+        // ops answer) plus the plain join; the containment-proven
+        // `bucket_dir` answers NoSuchBucket for a missing bucket, so it
+        // cannot build the create target (a name just proven absent is
+        // safe to create under — path.rs, one home for the supplements).
+        let dir = bucket_path_lexical(self.root(), name)?;
         // Defensive re-validation (FR-012) before any FS access; the
         // checked constructor is authoritative (it rejects the reserved
         // `.tinio` name, FR-020). A pre-existing entry of ANY type — a
         // directory, a symlinked/junction bucket directory resolving
         // outside the root, a stray file — is a *taken name*:
         // AlreadyExists, never a name-validation error.
-        match tokio::fs::symlink_metadata(self.root().join(&**name)).await {
+        match fs::symlink_metadata(&dir).await {
             Ok(_) => return Err(already_exists(name).into()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
@@ -60,12 +70,7 @@ impl BucketOps for FsStorage {
         // critical section against `delete_bucket` (a delete must never
         // remove a bucket a create just reported as created).
         let _guard = self.bucket_mutation_lock.lock().await;
-        // The name was just proven absent, so the plain lexical join is
-        // the directory to create (the containment-proven `bucket_dir`
-        // answers NoSuchBucket for a missing bucket — it cannot be used
-        // to build the create target).
-        let dir = self.root().join(&**name);
-        match tokio::fs::create_dir(&dir).await {
+        match fs::create_dir(&dir).await {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(already_exists(name).into());
@@ -88,7 +93,7 @@ impl BucketOps for FsStorage {
         // Empty by the object walk (no files anywhere) — only empty
         // directories remain, so a recursive remove is safe and handles
         // leftover folder-marker directories.
-        tokio::fs::remove_dir_all(&dir).await?;
+        fs::remove_dir_all(&dir).await?;
         // Lazy cleanup of the private state (data-model.md) — one write
         // transaction over BUCKETS + OBJECT_META + UPLOADS + PARTS (G2:
         // a bucket's whole derived state dies atomically). The directory
@@ -208,7 +213,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_bucket_follows_when_enabled_and_invisible_when_disabled() {
-        use crate::FsOptions;
+        use crate::{FsOptions, testutil::fs_options};
         use tinio_core::storage::ListObjectsParams;
         use tinio_util::testing::read_body;
         rt(async {
@@ -225,7 +230,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     follow_symlinks: false,
-                    ..Default::default()
+                    ..fs_options()
                 },
             )
             .unwrap();
@@ -249,7 +254,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     follow_symlinks: true,
-                    ..Default::default()
+                    ..fs_options()
                 },
             )
             .unwrap();

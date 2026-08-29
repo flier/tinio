@@ -12,14 +12,62 @@ use tinio_core::{
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object::{self, Info},
     storage::{
-        ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
-        access_denied, group_and_paginate_ordered, invalid_key, split_uploads_order, uploads_order,
+        ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
+        access_denied, invalid_key, key_marker_order, split_uploads_order,
     },
 };
+// The Windows stream fallback of `copy_part` calls the ObjectOps trait
+// method (the unix fast path never does).
+#[cfg(not(unix))]
+use tinio_core::storage::ObjectOps;
 
 use crate::write::AtomicWriter;
 
 use super::{Error, FsStorage};
+
+/// The unix fast path of the part-copy primitive: `copy_file_range` the
+/// source's (range of) bytes into a staged part file, then the store's
+/// shared publish. The part ETag is the staged bytes' own content MD5 —
+/// a range never carries the source's ETag.
+#[cfg(unix)]
+impl FsStorage {
+    pub(crate) async fn copy_part_fast(
+        &self,
+        src_bucket: &bucket::Name,
+        src_key: &object::Key,
+        dst_bucket: &bucket::Name,
+        dst_key: &object::Key,
+        upload_id: &str,
+        part_number: PartNumber,
+        range: Option<ByteRange>,
+    ) -> Result<PartInfo, Error> {
+        self.ensure_bucket(dst_bucket).await?;
+        if dst_key.is_reserved() {
+            return Err(access_denied(dst_key).into());
+        }
+        let (_path, file, size, _mtime, _identity) =
+            self.resolve_object_file(src_bucket, src_key).await?;
+        let (start, len) = match range {
+            Some(range) => {
+                let (start, end) = range.resolve(size)?;
+                (start, end - start + 1)
+            }
+            None => (0, size),
+        };
+        let std_file = file.into_std().await;
+        self.multipart_store
+            .put_part_copy(
+                dst_bucket,
+                dst_key,
+                upload_id,
+                part_number,
+                std_file,
+                start,
+                len,
+            )
+            .await
+    }
+}
 
 #[async_trait::async_trait]
 impl MultipartOps for FsStorage {
@@ -56,6 +104,39 @@ impl MultipartOps for FsStorage {
         self.multipart_store
             .put_part(bucket, key, upload_id, part_number, body)
             .await
+    }
+
+    async fn copy_part(
+        &self,
+        src_bucket: &bucket::Name,
+        src_key: &object::Key,
+        dst_bucket: &bucket::Name,
+        dst_key: &object::Key,
+        upload_id: &str,
+        part_number: PartNumber,
+        range: Option<ByteRange>,
+    ) -> Result<PartInfo, Error> {
+        #[cfg(unix)]
+        {
+            self.copy_part_fast(
+                src_bucket,
+                src_key,
+                dst_bucket,
+                dst_key,
+                upload_id,
+                part_number,
+                range,
+            )
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            // No kernel copy primitive on Windows — the contract's
+            // stream default (get range → upload part).
+            let get = self.get_object(src_bucket, src_key, range).await?;
+            self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body)
+                .await
+        }
     }
 
     async fn list_parts(&self, params: ListPartsParams) -> Result<PartsListing, Error> {
@@ -126,7 +207,9 @@ impl MultipartOps for FsStorage {
         let phase2 = async {
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
-            AtomicWriter::commit(&temp, &target).await?;
+            // F03: the bucket root bounds the first-into-a-new-prefix
+            // ancestor sync.
+            AtomicWriter::commit(&temp, &target, Some(&bucket_dir)).await?;
             Ok::<_, Error>(target)
         }
         .await;
@@ -185,36 +268,28 @@ impl MultipartOps for FsStorage {
         params: ListUploadsParams,
     ) -> Result<UploadsListing, Error> {
         self.ensure_bucket(&params.bucket).await?;
-        // Prefix filter first (the engine uses the prefix only for
-        // delimiter rollups — without the filter, non-matching uploads
-        // would leak onto the page).
-        let uploads = self
-            .multipart_store
-            .list_uploads(&params.bucket)
-            .await?
-            .into_iter()
-            .filter(|u| u.key.starts_with(&params.prefix))
-            .collect::<Vec<_>>();
-        // The order is the composite `key\0upload_id` (see
-        // `tinio_core::storage::uploads_order`), so the resume marker can
-        // position inside a same-key group (S3 `upload-id-marker`). A
-        // bare key marker skips the whole key group (S3: only keys
-        // strictly greater than `key-marker` are listed) — the sentinel
-        // upload id sorts after every real one.
-        let marker = match (&params.key_marker, &params.upload_id_marker) {
-            (Some(key), Some(upload_id)) => Some(uploads_order(key, upload_id)),
-            (Some(key), None) => Some(uploads_order(key, "\u{10FFFF}")),
-            _ => None,
-        };
-        let (uploads, common_prefixes, truncated, next) = group_and_paginate_ordered(
-            uploads,
-            &params.prefix,
-            params.delimiter.as_deref(),
-            marker.as_deref(),
-            params.max_uploads,
-            |u| u.key.as_ref(),
-            |u| uploads_order(&u.key, &u.upload_id),
+        // The resume marker is the composite `key\0upload_id` (see
+        // `tinio_core::storage::uploads_order`), so the page can resume
+        // inside a same-key group (S3 `upload-id-marker`); a bare key
+        // marker skips the whole key group — the conversion has one home
+        // in tinio-core (shared with the mem backend).
+        let marker = key_marker_order(
+            params.key_marker.as_deref(),
+            params.upload_id_marker.as_deref(),
         );
+        // The store pages inside its scan — bounded memory, off the
+        // async thread (item 7e): page size, resume marker, and order
+        // are identical to the old full-load pagination.
+        let (uploads, common_prefixes, truncated, next) = self
+            .multipart_store
+            .list_uploads_page(
+                &params.bucket,
+                &params.prefix,
+                params.delimiter.as_deref(),
+                marker.as_deref(),
+                params.max_uploads,
+            )
+            .await?;
         let (next_key_marker, next_upload_id_marker) = match next {
             Some(next) => {
                 let (key, upload_id) = split_uploads_order(&next);
@@ -235,7 +310,7 @@ impl MultipartOps for FsStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{rt, storage};
+    use crate::testutil::{fs_options, rt, storage};
     use tinio_core::object;
     use tinio_core::storage::{BucketOps, ObjectOps};
     use tinio_util::testing::{body, read_body};
@@ -406,6 +481,60 @@ mod tests {
     }
 
     #[test]
+    fn delimiter_rollup_paginates_and_resumes() {
+        // Item 7e: delimiter grouping through the in-scan page — a page
+        // cut inside a rollup emits the prefix and the resume marker
+        // positions past it (the engine's rollup semantics, unchanged).
+        rt(async {
+            let (_root, storage) = storage();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
+                storage
+                    .create_multipart_upload(&b, &object::key(key).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let page = storage
+                .list_multipart_uploads(ListUploadsParams {
+                    bucket: b.clone(),
+                    prefix: String::new(),
+                    delimiter: Some("/".into()),
+                    key_marker: None,
+                    upload_id_marker: None,
+                    max_uploads: 1,
+                })
+                .await
+                .unwrap();
+            assert!(page.uploads.is_empty(), "{:?}", page.uploads);
+            assert_eq!(page.common_prefixes, ["dir/"]);
+            assert!(page.truncated);
+            assert_eq!(page.next_key_marker.as_deref(), Some("dir/"));
+            assert_eq!(page.next_upload_id_marker, None);
+
+            let page = storage
+                .list_multipart_uploads(ListUploadsParams {
+                    bucket: b.clone(),
+                    prefix: String::new(),
+                    delimiter: Some("/".into()),
+                    key_marker: page.next_key_marker,
+                    upload_id_marker: page.next_upload_id_marker,
+                    max_uploads: 10,
+                })
+                .await
+                .unwrap();
+            let keys: Vec<&str> = page
+                .uploads
+                .iter()
+                .map(|u| u.key.as_ref().as_str())
+                .collect();
+            assert_eq!(keys, ["z.bin"]);
+            assert!(page.common_prefixes.is_empty());
+            assert!(!page.truncated);
+        });
+    }
+
+    #[test]
     fn bare_key_marker_skips_the_whole_key_group() {
         // A key-marker without an upload-id-marker skips the entire
         // same-key group (S3: only keys strictly greater than the marker
@@ -492,7 +621,7 @@ mod tests {
                 root.path(),
                 FsOptions {
                     follow_symlinks: true,
-                    ..Default::default()
+                    ..fs_options()
                 },
             )
             .unwrap();

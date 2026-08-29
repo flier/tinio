@@ -23,6 +23,22 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
         }
         StorageError::InvalidPart(n) => s3_error!(InvalidPart, "invalid part: {n}"),
         StorageError::NoParts => s3_error!(InvalidRequest, "no parts uploaded"),
+        StorageError::PartTooSmall {
+            part_number,
+            min_bytes,
+            actual,
+        } => s3_error!(
+            EntityTooSmall,
+            "part {part_number} is {actual} bytes, below the {min_bytes}-byte minimum for non-final parts"
+        ),
+        StorageError::TooManyMultipartUploads { limit } => s3_error!(
+            SlowDown,
+            "too many in-progress multipart uploads (limit: {limit}); retry later"
+        ),
+        StorageError::EntityTooLarge { size, limit } => s3_error!(
+            EntityTooLarge,
+            "entity is {size} bytes, exceeding the {limit}-byte limit"
+        ),
         StorageError::InvalidPartKey(_) => s3_error!(InvalidArgument, "invalid part key"),
         StorageError::InvalidRange { .. } => s3_error!(InvalidRange),
         StorageError::AccessDenied(_) => s3_error!(AccessDenied),

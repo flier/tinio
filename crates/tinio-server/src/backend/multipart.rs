@@ -12,14 +12,14 @@
 
 use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
 
-#[cfg(feature = "copy")]
-use tinio_core::storage::ByteRange;
 use tinio_core::{
-    multipart::{CompletedPart, PartNumber},
-    storage::{ListPartsParams, ListUploadsParams, Storage},
+    multipart::{CompletedPart, MIN_PART_BYTES, PartNumber},
+    storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
 };
 
-use crate::backend::{ConditionalHeaders, S3Backend, map_backend_error};
+use crate::backend::{
+    ConditionalHeaders, S3Backend, byte_range, map_backend_error, normalize_delimiter,
+};
 
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
@@ -31,15 +31,14 @@ fn part_number(n: i32) -> S3Result<PartNumber> {
 /// The `x-amz-copy-source-range` header into a [`ByteRange`], parsed by
 /// the framework's own range grammar. S3 copy ranges use the strict
 /// `bytes=first-last` form only; the suffix/open forms GET accepts answer
-/// `InvalidArgument`.
+/// `InvalidArgument` — the shared [`byte_range`] mapping plus the strict
+/// shape gate.
 #[cfg(feature = "copy")]
 fn copy_source_range(raw: &str) -> Result<ByteRange, S3Error> {
     let invalid = || s3_error!(InvalidArgument, "invalid copy source range: {raw}");
-    match dto::Range::parse(raw).map_err(|_| invalid())? {
-        dto::Range::Int {
-            first,
-            last: Some(last),
-        } => Ok(ByteRange::Inclusive(first, last)),
+    let range = byte_range(dto::Range::parse(raw).map_err(|_| invalid())?);
+    match range {
+        ByteRange::Inclusive(_, _) => Ok(range),
         _ => Err(invalid()),
     }
 }
@@ -122,10 +121,11 @@ impl<S: Storage> S3Backend<S> {
             .transpose()?;
 
         // Source conditionals (412 on failure, per S3 copy semantics):
-        // the get's info carries the source ETag + mtime.
-        let get = self
+        // the head's info carries the source ETag + mtime (no body — the
+        // copy primitive moves the bytes).
+        let info = self
             .storage
-            .get_object(&src_bucket, &src_key, range)
+            .head_object(&src_bucket, &src_key)
             .await
             .map_err(map_backend_error)?;
         ConditionalHeaders::new(
@@ -134,10 +134,18 @@ impl<S: Storage> S3Backend<S> {
             req.input.copy_source_if_modified_since,
             req.input.copy_source_if_unmodified_since,
         )
-        .check(&get.info.etag, get.info.last_modified, true)?;
+        .check(&info.etag, info.last_modified, true)?;
         let part = self
             .storage
-            .upload_part(&bucket, &key, &upload_id, part_number, get.body)
+            .copy_part(
+                &src_bucket,
+                &src_key,
+                &bucket,
+                &key,
+                &upload_id,
+                part_number,
+                range,
+            )
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(dto::UploadPartCopyOutput {
@@ -181,6 +189,51 @@ impl<S: Storage> S3Backend<S> {
                 Ok(CompletedPart { part_number, etag })
             })
             .collect::<Result<Vec<CompletedPart>, S3Error>>()?;
+        // S3 requires every non-final part to be at least 5 MiB
+        // (EntityTooSmall); the final part has no minimum. The sizes come
+        // from the stored parts (paged listing), so the check reflects the
+        // bytes the completion would assemble — a part that does not exist
+        // answers InvalidPart, matching the backend's own verification.
+        if parts.len() > 1 {
+            let mut sizes = std::collections::HashMap::new();
+            let mut marker = None;
+            loop {
+                let page = self
+                    .storage
+                    .list_parts(ListPartsParams {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
+                        max_parts: 1000,
+                        part_number_marker: marker,
+                    })
+                    .await
+                    .map_err(map_backend_error)?;
+                for part in page.parts {
+                    sizes.insert(u32::from(part.part_number), part.size);
+                }
+                match page.next_part_number_marker {
+                    Some(next) if page.truncated => marker = Some(next),
+                    _ => break,
+                }
+            }
+            for (index, part) in parts.iter().enumerate() {
+                if index + 1 == parts.len() {
+                    continue; // the final part may be smaller than 5 MiB
+                }
+                let n = u32::from(part.part_number);
+                let size = sizes
+                    .get(&n)
+                    .copied()
+                    .ok_or_else(|| s3_error!(InvalidPart, "part {n} was not uploaded"))?;
+                if size < MIN_PART_BYTES {
+                    return Err(s3_error!(
+                        EntityTooSmall,
+                        "part {n} is {size} bytes, below the {MIN_PART_BYTES}-byte minimum for non-final parts"
+                    ));
+                }
+            }
+        }
         // Serialize with the write lock: the completion writes the
         // object — it must not land between a conditional put's check
         // and commit.
@@ -278,8 +331,9 @@ impl<S: Storage> S3Backend<S> {
         self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let max_uploads = req.input.max_uploads.unwrap_or(1000).max(0);
-        // An empty `delimiter=` means "no delimiter" (see `list_page`).
-        let delimiter = req.input.delimiter.clone().filter(|d| !d.is_empty());
+        // An empty `delimiter=` means "no delimiter" (the shared
+        // boundary rule, `normalize_delimiter`).
+        let delimiter = normalize_delimiter(req.input.delimiter.clone());
         let page = self
             .storage
             .list_multipart_uploads(ListUploadsParams {
@@ -328,7 +382,7 @@ impl<S: Storage> S3Backend<S> {
 mod tests {
     use super::*;
     use crate::backend::testutil::{s3_request, setup};
-    use s3s::S3;
+    use s3s::{S3, S3ErrorCode};
     use tinio_core::storage::{BucketOps, ObjectOps};
     use tinio_core::{bucket, object};
     use tinio_mem::MemoryStorage;
@@ -350,9 +404,12 @@ mod tests {
             .unwrap();
         let upload_id = create.output.upload_id.unwrap();
 
-        // Upload three parts.
+        // Upload three parts: the two non-final parts must satisfy the
+        // S3 5 MiB minimum; the final part may be small.
         let mut etags = Vec::new();
-        let parts_data: [&[u8]; 3] = [b"part-one-", b"part-two-", b"part-three"];
+        let min = tinio_core::multipart::MIN_PART_BYTES as usize;
+        let parts_data: Vec<Vec<u8>> =
+            vec![vec![b'a'; min + 1], vec![b'b'; min + 1], b"tail".to_vec()];
         for (n, data) in parts_data.iter().enumerate() {
             let part = backend
                 .upload_part(s3_request(dto::UploadPartInput {
@@ -408,10 +465,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_eq!(
-            complete.output.e_tag.unwrap().as_strong().unwrap(),
-            "aed23cbfc502f1e851e828efe2ca50d0-3"
-        );
+        let etag_owned = complete.output.e_tag.unwrap();
+        let etag = etag_owned.as_strong().unwrap().to_string();
+        assert!(etag.ends_with("-3"), "composed multipart ETag, got {etag}");
         let got = read_body(
             backend
                 .storage()
@@ -426,7 +482,68 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(got, b"part-one-part-two-part-three");
+        let expected: Vec<u8> = parts_data.iter().flatten().copied().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn complete_rejects_non_final_parts_below_5_mib() {
+        let (backend, b) = setup().await;
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload_id = create.output.upload_id.unwrap();
+
+        let mut etags = Vec::new();
+        for n in 1..=3 {
+            let part = backend
+                .upload_part(s3_request(dto::UploadPartInput {
+                    bucket: b.clone(),
+                    key: "big.bin".into(),
+                    upload_id: upload_id.clone(),
+                    part_number: n,
+                    body: Some(dto::StreamingBlob::wrap(futures::stream::iter(vec![Ok::<
+                        _,
+                        std::io::Error,
+                    >(
+                        bytes::Bytes::copy_from_slice(b"tiny"),
+                    )]))),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            etags.push(part.output.e_tag.unwrap());
+        }
+
+        let err = backend
+            .complete_multipart_upload(s3_request(dto::CompleteMultipartUploadInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                upload_id: upload_id.clone(),
+                multipart_upload: Some(dto::CompletedMultipartUpload {
+                    parts: Some(
+                        etags
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, e)| dto::CompletedPart {
+                                part_number: Some((i + 1) as i32),
+                                e_tag: Some(e),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::EntityTooSmall);
     }
 
     #[cfg(feature = "multipart")]

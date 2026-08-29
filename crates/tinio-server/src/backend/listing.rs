@@ -12,7 +12,7 @@ use s3s::{S3Request, S3Response, S3Result, dto};
 
 use tinio_core::storage::{ListObjectsParams, Storage};
 
-use crate::backend::{S3Backend, map_backend_error};
+use crate::backend::{S3Backend, map_backend_error, normalize_delimiter};
 
 /// One mapped listing page shared by the V1/V2 XML surfaces.
 struct ListPage {
@@ -43,8 +43,9 @@ impl<S: Storage> S3Backend<S> {
         let max_keys = max_keys.unwrap_or(1000).max(0) as usize;
         // An empty `delimiter=` value means "no delimiter" (S3 semantics;
         // clients like mc always send it) — a `Some("")` would roll every
-        // object up into an empty common prefix and empty the page.
-        let delimiter = delimiter.filter(|d| !d.is_empty());
+        // object up into an empty common prefix and empty the page. The
+        // boundary rule has one home (`normalize_delimiter`).
+        let delimiter = normalize_delimiter(delimiter);
         let page = self
             .storage
             .list_objects(ListObjectsParams {

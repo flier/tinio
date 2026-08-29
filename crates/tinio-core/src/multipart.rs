@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use derive_more::{AsRef, Deref, Display};
+use derive_more::{AsRef, Deref, Display, Into};
 
 use crate::bucket;
 use crate::etag::ETag;
@@ -12,6 +12,10 @@ use crate::storage::{self, Error::*};
 /// Inclusive part-number range (S3 / the data model).
 const MIN_PART: u32 = 1;
 const MAX_PART: u32 = 10_000;
+
+/// The S3 minimum size of every non-final multipart part (5 MiB,
+/// `EntityTooSmall` on completion). The final part has no minimum.
+pub const MIN_PART_BYTES: u64 = 5 * 1024 * 1024;
 
 /// A validated multipart part number (`1..=10000`).
 ///
@@ -30,7 +34,7 @@ const MAX_PART: u32 = 10_000;
 /// let trusted: multipart::PartNumber = 7.into();
 /// assert_eq!(u32::from(trusted), 7);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Deref, AsRef)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Deref, AsRef, Into)]
 #[display("{}", _0)]
 pub struct PartNumber(u32);
 
@@ -47,12 +51,6 @@ impl From<u32> for PartNumber {
     /// [`part_number`] for untrusted input).
     fn from(n: u32) -> Self {
         part_number(n).expect("valid part number")
-    }
-}
-
-impl From<PartNumber> for u32 {
-    fn from(n: PartNumber) -> Self {
-        n.0
     }
 }
 

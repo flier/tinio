@@ -11,7 +11,9 @@ use tinio_core::{
     bucket, object,
     storage::{BucketOps, ListObjectsParams, ObjectOps},
 };
-use tinio_fs::{FsOptions, FsStorage};
+use tinio_fs::FsStorage;
+use tinio_fs::testing::fs_options;
+
 use tinio_util::testing::body;
 
 /// Tree shape: 4 prefixes × 1000 objects each + 500 flat objects.
@@ -21,7 +23,7 @@ const FLAT: usize = 500;
 
 fn listing(c: &mut Criterion) {
     let root = tempfile::tempdir().unwrap();
-    let storage = FsStorage::new(root.path(), FsOptions::default()).unwrap();
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bname = bucket::name("data").unwrap();
     rt.block_on(async {

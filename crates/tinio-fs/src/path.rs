@@ -22,8 +22,12 @@
 
 use std::{
     io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
+
+// `Component` is used only by the cfg-gated [`is_contained`].
+#[cfg(any(test, debug_assertions))]
+use std::path::Component;
 
 #[cfg(unix)]
 use moka::sync::Cache;
@@ -150,9 +154,24 @@ struct DirId {
 
 #[cfg(unix)]
 impl DirId {
+    /// Test-only: the production cache-freshness check goes through
+    /// [`Self::of_async`] (item 7a — the freshness stat must not run
+    /// sync on the request threads).
+    #[cfg(test)]
     fn of(dir: &Path) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(dir)?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// The async form used by the boundary cache (item 7a — the
+    /// freshness stat must not run sync on the request threads).
+    async fn of_async(dir: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = tokio::fs::metadata(dir).await?;
         Ok(Self {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -174,13 +193,31 @@ fn map_boundary_error(err: StrictPathError) -> crate::Error {
 /// itself is gone — the object cannot exist, and the old lexical join +
 /// stat answered `NoSuchKey` (a racing `delete_bucket` or out-of-band
 /// removal between the caller's `ensure_bucket` and the proof must not
-/// turn into a 500). Other failures pass through unchanged.
-fn missing_bucket_boundary(
+/// turn into a 500). Other failures pass through unchanged. The
+/// racing-delete policy has ONE home (F44) in its two forms: the sync
+/// probe serves the offline [`key_path`]; the async probe (item 7a —
+/// never a sync stat on the request threads, F22) serves
+/// [`prove_key_contained`]. A probe error is treated as "the bucket is
+/// still there" — the original error passes through (F11).
+fn missing_bucket_boundary_sync(
     err: crate::Error,
     bucket_dir: &Path,
     key: &object::Key,
 ) -> crate::Error {
     if !bucket_dir.exists() {
+        return crate::Error::Storage(storage::no_such_key(key));
+    }
+    err
+}
+
+/// The async form of [`missing_bucket_boundary_sync`] (F22 — the probe
+/// runs through `tokio::fs`, never a blocking stat on a request thread).
+async fn missing_bucket_boundary_async(
+    err: crate::Error,
+    bucket_dir: &Path,
+    key: &object::Key,
+) -> crate::Error {
+    if crate::fsutil::is_absent(bucket_dir).await.unwrap_or(false) {
         return crate::Error::Storage(storage::no_such_key(key));
     }
     err
@@ -209,32 +246,43 @@ impl BoundaryCache {
     }
 
     /// The validated boundary of `dir`, rebuilt when the directory was
-    /// replaced (identity change) or evicted.
-    fn boundary(&self, dir: &Path) -> Result<PathBoundary, crate::Error> {
+    /// replaced (identity change) or evicted. **Async (item 7a)**: the
+    /// freshness stat runs through `tokio::fs` and the rebuild's
+    /// canonicalize runs on the blocking pool — the boundary resolution
+    /// never executes sync filesystem calls on the request threads
+    /// (the old per-object-op sync stat/canonicalize is gone).
+    async fn boundary(&self, dir: &Path) -> Result<PathBoundary, crate::Error> {
         #[cfg(unix)]
         {
             if let Some((boundary, id)) = self.0.get(dir) {
-                if DirId::of(dir).ok() == Some(id) {
+                if DirId::of_async(dir).await.ok() == Some(id) {
                     return Ok(boundary);
                 }
             }
         }
-        let boundary = PathBoundary::try_new(dir).map_err(map_boundary_error)?;
+        let dir = dir.to_path_buf();
+        // The task closure owns its path copy — the unix bookkeeping
+        // below uses the original (a `move` closure would move it).
+        let dir_task = dir.clone();
+        let boundary = tokio::task::spawn_blocking(move || PathBoundary::try_new(&dir_task))
+            .await
+            .map_err(io::Error::other)
+            .map_err(crate::Error::Io)?
+            .map_err(map_boundary_error)?;
         #[cfg(unix)]
         {
-            let id = DirId::of(dir).map_err(crate::Error::Io)?;
-            self.0.insert(dir.to_path_buf(), (boundary.clone(), id));
+            let id = DirId::of_async(&dir).await.map_err(crate::Error::Io)?;
+            self.0.insert(dir, (boundary.clone(), id));
         }
         Ok(boundary)
     }
 }
 
-/// The validated boundary of `dir`, either from `cache` or built fresh.
-fn boundary_for(cache: Option<&BoundaryCache>, dir: &Path) -> Result<PathBoundary, crate::Error> {
-    match cache {
-        Some(cache) => cache.boundary(dir),
-        None => PathBoundary::try_new(dir).map_err(map_boundary_error),
-    }
+/// The sync, uncached boundary — the public mapping functions only
+/// (test/offline surface; the `FsStorage` path goes through the async
+/// cached form, item 7a).
+fn boundary_uncached(dir: &Path) -> Result<PathBoundary, crate::Error> {
+    PathBoundary::try_new(dir).map_err(map_boundary_error)
 }
 
 /// The containment proof for `candidate` inside `boundary`: `strict_join`
@@ -282,21 +330,62 @@ pub fn state_dir(root: &Path) -> Result<PathBuf, crate::Error> {
 /// — names are pre-validated by [`bucket::name`]) or when the bucket
 /// directory resolves outside `root`.
 pub fn bucket_path(root: &Path, name: &bucket::Name) -> Result<PathBuf, crate::Error> {
-    map_bucket_path(None, root, name)
+    let path = bucket_path_lexical(root, name)?;
+    prove_contained(&boundary_uncached(root)?, name)?;
+    Ok(path)
 }
 
-/// Map `name` to `<root>/<name>`: the `.tinio` supplement, then the
-/// strict-path containment proof, returning the **lexical** join.
-pub(crate) fn map_bucket_path(
-    cache: Option<&BoundaryCache>,
+/// The lexical bucket mapping: the validation supplements (the reserved
+/// `.tinio` refusal and the Windows charset/aliasing refusal — F21) and
+/// the plain join. NO containment proof — the sync [`bucket_path`] and
+/// async [`map_bucket_path`] add their own; the create path
+/// ([`crate::FsStorage::create_bucket`](crate::FsStorage)) cannot prove
+/// a directory that does not exist yet, and the listing walk applies its
+/// own symlink policy.
+pub(crate) fn bucket_path_lexical(
     root: &Path,
     name: &bucket::Name,
 ) -> Result<PathBuf, crate::Error> {
     if name.as_ref() == STATE_DIR_NAME {
         return Err(invalid_path(name.as_ref()));
     }
-    prove_contained(&boundary_for(cache, root)?, name)?;
+    #[cfg(windows)]
+    {
+        refuse_windows_bucket_name(name)?;
+    }
     Ok(root.join(&**name))
+}
+
+/// Map `name` to `<root>/<name>`: the `.tinio` supplement, then the
+/// strict-path containment proof, returning the **lexical** join.
+/// Async (item 7a) — the boundary resolution runs off the request
+/// threads; the public sync [`bucket_path`] is the uncached offline
+/// form.
+pub(crate) async fn map_bucket_path(
+    cache: &BoundaryCache,
+    root: &Path,
+    name: &bucket::Name,
+) -> Result<PathBuf, crate::Error> {
+    let path = bucket_path_lexical(root, name)?;
+    prove_contained(&cache.boundary(root).await?, name)?;
+    Ok(path)
+}
+
+/// The Windows reserved-name / charset refusal for BUCKET names (F21) —
+/// the bucket-side mirror of the key-side check in
+/// [`map_key_path_lexical`]. Without it a `con`/`nul`/`aux`/`com1`…
+/// bucket passes name validation and fails materialization with an
+/// opaque error (canonicalizing `root\con` resolves the console device
+/// outside the boundary); the clean refusal answers `InvalidBucketName`.
+#[cfg(windows)]
+fn refuse_windows_bucket_name(name: &bucket::Name) -> Result<(), crate::Error> {
+    let seg = name.as_ref();
+    if seg.chars().any(|c| WINDOWS_INVALID.contains(&c)) || windows_aliasing(seg) {
+        return Err(crate::Error::Storage(storage::Error::InvalidBucketName(
+            name.to_string(),
+        )));
+    }
+    Ok(())
 }
 
 /// The object file path of a key: `<root>/<bucket>/<key>`.
@@ -328,16 +417,28 @@ pub fn key_path(
     key: &object::Key,
     enforce_boundary: bool,
 ) -> Result<PathBuf, crate::Error> {
-    map_key_path(None, bucket_dir, key, enforce_boundary)
+    let path = map_key_path_lexical(bucket_dir, key)?;
+    if enforce_boundary {
+        let boundary = match boundary_uncached(bucket_dir) {
+            Ok(boundary) => boundary,
+            Err(err) => return Err(missing_bucket_boundary_sync(err, bucket_dir, key)),
+        };
+        if let Err(err) = prove_contained(&boundary, key) {
+            return Err(missing_bucket_boundary_sync(err, bucket_dir, key));
+        }
+    }
+    Ok(path)
 }
 
-/// Map `key` to `bucket_dir.join(key)` — the single implementation behind
-/// the public [`key_path`] and the `FsStorage` cached path.
-pub(crate) fn map_key_path(
-    cache: Option<&BoundaryCache>,
+/// The lexical half of [`map_key_path`]: the validation supplements and
+/// the plain join, with **no filesystem access** — the defensive
+/// constructor re-check, the reserved `.tinio` refusal (FR-020), the
+/// Windows charset/aliasing refusal, and `bucket_dir.join(key)`. The
+/// containment proof is a separate step ([`prove_key_contained`]) so the
+/// object-op resolution can refuse a key before any syscall (P5).
+pub(crate) fn map_key_path_lexical(
     bucket_dir: &Path,
     key: &object::Key,
-    enforce_boundary: bool,
 ) -> Result<PathBuf, crate::Error> {
     // Defensive re-validation: the contract is only ever called with
     // validated keys, but re-running the checked constructor keeps the
@@ -359,15 +460,9 @@ pub(crate) fn map_key_path(
         }
     }
     let path = bucket_dir.join(&**key);
-    if enforce_boundary {
-        let boundary = match boundary_for(cache, bucket_dir) {
-            Ok(boundary) => boundary,
-            Err(err) => return Err(missing_bucket_boundary(err, bucket_dir, key)),
-        };
-        if let Err(err) = prove_contained(&boundary, key) {
-            return Err(missing_bucket_boundary(err, bucket_dir, key));
-        }
-    }
+    // Same gate as [`is_contained`] (the reference must not survive a
+    // release build that compiled the function out).
+    #[cfg(any(test, debug_assertions))]
     debug_assert!(
         is_contained(bucket_dir, &path),
         "key path escapes the bucket directory: {path:?}"
@@ -375,11 +470,57 @@ pub(crate) fn map_key_path(
     Ok(path)
 }
 
+/// The containment-proof half of [`map_key_path`] over an already
+/// mapped key: the `strict-path` boundary of `bucket_dir` plus the
+/// `strict_join` check (canonicalize — filesystem access). Runs after
+/// the symlink policy in the object-op resolution so a link inside the
+/// bucket answers `AccessDenied` first (s3-surface.md).
+///
+/// # Errors
+///
+/// - `InvalidPath` — a key path that resolves outside the bucket
+///   directory.
+/// - `NoSuchKey` — the bucket directory vanished before the proof (a
+///   racing `delete_bucket` / out-of-band removal); the object cannot
+///   exist.
+pub(crate) async fn prove_key_contained(
+    cache: &BoundaryCache,
+    bucket_dir: &Path,
+    key: &object::Key,
+) -> Result<(), crate::Error> {
+    let boundary = match cache.boundary(bucket_dir).await {
+        Ok(boundary) => boundary,
+        Err(err) => return Err(missing_bucket_boundary_async(err, bucket_dir, key).await),
+    };
+    if let Err(err) = prove_contained(&boundary, key) {
+        return Err(missing_bucket_boundary_async(err, bucket_dir, key).await);
+    }
+    Ok(())
+}
+
+/// Map `key` to `bucket_dir.join(key)` — the lexical mapping plus the
+/// containment proof when `enforce_boundary` is set; the async
+/// implementation behind the `FsStorage` cached path (item 7a; the
+/// public sync [`key_path`] is the uncached offline form).
+pub(crate) async fn map_key_path(
+    cache: &BoundaryCache,
+    bucket_dir: &Path,
+    key: &object::Key,
+    enforce_boundary: bool,
+) -> Result<PathBuf, crate::Error> {
+    let path = map_key_path_lexical(bucket_dir, key)?;
+    if enforce_boundary {
+        prove_key_contained(cache, bucket_dir, key).await?;
+    }
+    Ok(path)
+}
+
 /// Whether `path` stays within `base` (no `..` components, not absolute).
 ///
 /// The escape-proof check backing [`key_path`]'s debug assertion; kept for
 /// tests. The production containment proof is the strict-path boundary
-/// check.
+/// check. Dead outside tests and debug builds (the only callers are the
+/// `debug_assert` in [`map_key_path_lexical`] and the test module).
 #[cfg(any(test, debug_assertions))]
 fn is_contained(base: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(base) else {
@@ -391,6 +532,7 @@ fn is_contained(base: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::rt;
     use tinio_core::storage::Error as StorageError;
     use tinio_core::{bucket, object};
 
@@ -567,17 +709,19 @@ mod tests {
         // unchanged; replacing the directory (new identity) rebuilds.
         // Unix only for the identity assertion (dev+ino): Windows has no
         // stable identity and never hits the cache (see [`DirId`]).
-        let dir = tempfile::tempdir().unwrap();
-        let cache = BoundaryCache::new();
-        assert!(cache.boundary(dir.path()).is_ok());
-        #[cfg(unix)]
-        {
-            let before = DirId::of(dir.path()).unwrap();
-            std::fs::remove_dir(dir.path()).unwrap();
-            std::fs::create_dir(dir.path()).unwrap();
-            assert_ne!(before, DirId::of(dir.path()).unwrap());
-            assert!(cache.boundary(dir.path()).is_ok());
-        }
+        rt(async {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = BoundaryCache::new();
+            assert!(cache.boundary(dir.path()).await.is_ok());
+            #[cfg(unix)]
+            {
+                let before = DirId::of(dir.path()).unwrap();
+                std::fs::remove_dir(dir.path()).unwrap();
+                std::fs::create_dir(dir.path()).unwrap();
+                assert_ne!(before, DirId::of(dir.path()).unwrap());
+                assert!(cache.boundary(dir.path()).await.is_ok());
+            }
+        });
     }
 
     #[test]
@@ -606,5 +750,114 @@ mod tests {
         ] {
             assert!(!windows_aliasing(ok), "{ok:?} must be allowed");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_aliasing_covers_reserved_device_names() {
+        // Reserved device names (with or without an extension, any case)
+        // alias the console/device files — `CON` would open the console
+        // instead of a file.
+        for evil in [
+            "con", "CON", "Con.txt", "nul", "nul.log", "aux", "prn", "com1", "com9", "lpt1", "lpt9",
+        ] {
+            assert!(windows_aliasing(evil), "{evil:?} must be refused");
+        }
+        for ok in ["console", "com10", "com0", "lpt10", "coner", "null"] {
+            assert!(!windows_aliasing(ok), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn map_boundary_error_projects_both_error_shapes() {
+        // `PathEscapesBoundary` is a client error (`InvalidPath`); any
+        // other boundary failure (a missing/invalid boundary directory)
+        // is an IO error — the two map to different wire statuses.
+        let escape = StrictPathError::PathEscapesBoundary {
+            attempted_path: PathBuf::from("/etc/passwd"),
+            restriction_boundary: PathBuf::from("/srv/data/b"),
+        };
+        assert!(matches!(
+            map_boundary_error(escape),
+            crate::Error::InvalidPath(_)
+        ));
+        let broken = StrictPathError::InvalidRestriction {
+            restriction: PathBuf::from("/gone"),
+            source: io::Error::new(io::ErrorKind::NotFound, "gone"),
+        };
+        assert!(matches!(map_boundary_error(broken), crate::Error::Io(_)));
+    }
+
+    #[test]
+    fn missing_bucket_boundary_maps_to_no_such_key() {
+        // A boundary failure while the bucket directory is gone is
+        // `NoSuchKey` (the object cannot exist); with the directory
+        // present the original error passes through unchanged (F11 — a
+        // probe error is not "gone").
+        let root = tempfile::tempdir().unwrap();
+        let key = object::key("a.txt").unwrap();
+        let boundary_err =
+            crate::Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "probe"));
+
+        let missing = root.path().join("gone-bucket");
+        let err = missing_bucket_boundary_sync(boundary_err, &missing, &key);
+        assert!(matches!(
+            err,
+            crate::Error::Storage(StorageError::NoSuchKey(_))
+        ));
+
+        let present = bucket_dir(root.path(), "b");
+        let err = missing_bucket_boundary_sync(
+            crate::Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "probe")),
+            &present,
+            &key,
+        );
+        assert_eq!(err.to_string(), "I/O error: probe");
+
+        rt(async {
+            let err = missing_bucket_boundary_async(
+                crate::Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "probe")),
+                &missing,
+                &key,
+            )
+            .await;
+            assert!(matches!(
+                err,
+                crate::Error::Storage(StorageError::NoSuchKey(_))
+            ));
+            let err = missing_bucket_boundary_async(
+                crate::Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "probe")),
+                &present,
+                &key,
+            )
+            .await;
+            assert_eq!(err.to_string(), "I/O error: probe");
+        });
+    }
+
+    #[test]
+    fn key_path_on_a_missing_bucket_answers_no_such_key() {
+        // The containment proof on a vanished bucket directory must not
+        // surface as a boundary IO error — the racing-delete policy
+        // (F44) answers `NoSuchKey` for the sync and async forms alike.
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("gone-bucket");
+        let key = object::key("a.txt").unwrap();
+        let err = key_path(&missing, &key, true).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Storage(StorageError::NoSuchKey(_))
+        ));
+
+        rt(async {
+            let cache = BoundaryCache::new();
+            let err = map_key_path(&cache, &missing, &key, true)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                crate::Error::Storage(StorageError::NoSuchKey(_))
+            ));
+        });
     }
 }
