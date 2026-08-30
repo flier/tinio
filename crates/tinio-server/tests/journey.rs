@@ -8,12 +8,15 @@
 
 mod e2e;
 
+use std::fs;
+
+use e2e::{Rclone, Server};
 use predicates::prelude::*;
 
 #[test]
 #[ignore = "requires aws cli v2 and rclone on PATH"]
 fn journey() {
-    let server = e2e::Server::start();
+    let server = Server::start();
     let ep = server.endpoint();
     let scratch = tempfile::tempdir().unwrap();
 
@@ -22,7 +25,7 @@ fn journey() {
         .assert()
         .success();
     let hello = scratch.path().join("hello.txt");
-    std::fs::write(&hello, "hello from aws").unwrap();
+    fs::write(&hello, "hello from aws").unwrap();
     e2e::aws_s3(
         ep,
         "cp",
@@ -66,20 +69,20 @@ fn journey() {
         .success();
 
     // --- rclone journey --------------------------------------------------
-    let rclone = e2e::Rclone::new(scratch.path().join("rclone.conf"));
+    let rclone = Rclone::new(scratch.path().join("rclone.conf"));
     rclone.remote(ep).assert().success();
     rclone
         .cmd(&["mkdir", "tinio:rclone-bucket"])
         .assert()
         .success();
     let r = scratch.path().join("r.txt");
-    std::fs::write(&r, "hello from rclone").unwrap();
+    fs::write(&r, "hello from rclone").unwrap();
     rclone
         .cmd(&["copy", r.to_str().unwrap(), "tinio:rclone-bucket/"])
         .assert()
         .success();
     let rdown = scratch.path().join("rclone-dl");
-    std::fs::create_dir_all(&rdown).unwrap();
+    fs::create_dir_all(&rdown).unwrap();
     rclone
         .cmd(&["copy", "tinio:rclone-bucket/r.txt", rdown.to_str().unwrap()])
         .assert()
@@ -102,7 +105,7 @@ fn journey() {
     // --- ephemeral `--port 0` run ---------------------------------------
     // A second server starts while the first keeps serving (the bucket ops
     // below target the first server, as in the bash scenario).
-    let second = e2e::Server::start();
+    let second = Server::start();
     assert!(!second.endpoint().is_empty());
     e2e::aws_s3(ep, "mb", &["s3://ephemeral-bucket"])
         .assert()

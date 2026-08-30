@@ -5,12 +5,18 @@
 //! fan-out JSON layout. Baselines are recorded in Phase 6 (T088) and
 //! regression-gated.
 
-use std::hint::black_box;
-use std::time::{Duration, SystemTime};
+use std::{
+    hint::black_box,
+    time::{Duration, SystemTime},
+};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{bucket, object};
-use tinio_fs::{database, meta};
+use tinio_fs::{
+    database::{self, ObjectMetaTable},
+    meta,
+};
+use tokio::runtime::Runtime;
 
 /// Entries in the populated `OBJECT_META` table (inserted in one bulk
 /// write transaction — the bench measures lookups, not setup).
@@ -29,7 +35,7 @@ fn populated_store() -> (tempfile::TempDir, meta::Store) {
         {
             let mut txn = db.begin_write().unwrap();
             {
-                let mut table = database::ObjectMetaTable::open(&mut txn).unwrap();
+                let mut table = ObjectMetaTable::open(&mut txn).unwrap();
                 for i in 0..ENTRIES {
                     let key = format!("dir/obj-{i:06}");
                     table
@@ -64,10 +70,10 @@ fn meta_hits(c: &mut Criterion) {
     let key = hit_key();
 
     let mut group = c.benchmark_group("meta_hits");
-    group.throughput(criterion::Throughput::Elements(1));
+    group.throughput(Throughput::Elements(1));
 
     group.bench_function("get_hit_100k", |b| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         let store = store.clone();
         let bucket = bucket.clone();
         let key = key.clone();
@@ -85,7 +91,7 @@ fn meta_hits(c: &mut Criterion) {
     // The full gate (FR-022): size + mtime must match the entry (i = 50000
     // recorded both as 50000).
     group.bench_function("etag_matching_hit_100k", |b| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         let store = store.clone();
         let bucket = bucket.clone();
         let key = key.clone();
@@ -116,9 +122,9 @@ fn meta_walk(c: &mut Criterion) {
     let bucket = bucket::name("data").unwrap();
 
     let mut group = c.benchmark_group("meta_walk");
-    group.throughput(criterion::Throughput::Elements(u64::from(ENTRIES)));
+    group.throughput(Throughput::Elements(u64::from(ENTRIES)));
     group.bench_function("walk_100k", |b| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         let store = store.clone();
         let bucket = bucket.clone();
         b.to_async(rt).iter(|| {

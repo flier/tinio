@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::{sync::watch, time::sleep};
 
 /// Sleep at most `duration` in `chunk`-bounded steps, re-checking the
 /// shutdown channel between chunks (shutdown stays prompt even with a
@@ -18,7 +18,7 @@ pub(crate) async fn sleep_checked(
             return;
         }
         let step = remaining.min(chunk);
-        tokio::time::sleep(step).await;
+        sleep(step).await;
         remaining = remaining.saturating_sub(step);
     }
 }

@@ -8,17 +8,28 @@
 //! verbosity — errors are always visible on stderr (FR-017). The optional
 //! `otel` feature adds an OTLP export layer (T053).
 
-use std::{error::Error, fmt::Debug, fs::File, io::Write, path::Path, sync::Mutex};
+use std::{
+    error::Error,
+    fmt::Debug,
+    fs::File,
+    io::{self, Write},
+    path::Path,
+    sync::Mutex,
+};
 
-use tinio_config::log;
+use tinio_config::log::{self, Format, Verbosity};
 use tracing::{
-    Event, Subscriber,
+    Event, Level, Subscriber,
     field::{Field, Visit},
 };
 use tracing_subscriber::{
     Layer,
-    fmt::{self, writer::MakeWriterExt},
+    fmt::{
+        self,
+        writer::{BoxMakeWriter, MakeWriterExt},
+    },
     layer::{Context, SubscriberExt},
+    registry::LookupSpan,
 };
 
 /// The access-log event target (the data-plane middleware emits events
@@ -201,11 +212,12 @@ impl Visit for FieldCollector {
 ///
 /// ```rust
 /// use std::io::sink;
+///
 /// use tinio_config::log;
-/// use tinio_server::log::{AccessLogLayer, ACCESS_TARGET, AccessFields};
+/// use tinio_server::log::{ACCESS_TARGET, AccessFields, AccessLogLayer};
 /// use tracing_subscriber::layer::SubscriberExt;
 ///
-/// let layer = AccessLogLayer::new(log::AccessFormat::Common, sink());
+/// let layer = AccessLogLayer::new(AccessFormat::Common, sink());
 /// let _subscriber = tracing_subscriber::registry().with(layer);
 /// let fields = AccessFields::new(
 ///     "127.0.0.1".into(),
@@ -218,7 +230,11 @@ impl Visit for FieldCollector {
 ///     "-".into(),
 ///     "0.001".into(),
 /// );
-/// assert!(fields.format_line(&log::AccessFormat::Combined).contains(" - - "));
+/// assert!(
+///     fields
+///         .format_line(&AccessFormat::Combined)
+///         .contains(" - - ")
+/// );
 /// ```
 #[derive(Debug)]
 pub struct AccessLogLayer<W: Write + Send + 'static> {
@@ -238,7 +254,7 @@ impl<W: Write + Send + 'static> AccessLogLayer<W> {
 
 impl<S, W> Layer<S> for AccessLogLayer<W>
 where
-    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    S: Subscriber + for<'a> LookupSpan<'a>,
     W: Write + Send + 'static,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
@@ -281,15 +297,15 @@ pub fn build_subscriber(
     let access_layer = AccessLogLayer::new(access_format.clone(), access_file);
 
     let level = match verbosity {
-        log::Verbosity::Error => tracing::Level::ERROR,
-        log::Verbosity::Warn => tracing::Level::WARN,
-        log::Verbosity::Info => tracing::Level::INFO,
-        log::Verbosity::Debug => tracing::Level::DEBUG,
+        Verbosity::Error => Level::ERROR,
+        Verbosity::Warn => Level::WARN,
+        Verbosity::Info => Level::INFO,
+        Verbosity::Debug => Level::DEBUG,
     };
-    let stderr = fmt::writer::BoxMakeWriter::new(std::io::stderr).with_max_level(level);
+    let stderr = BoxMakeWriter::new(io::stderr).with_max_level(level);
     let op_layer = match format {
-        log::Format::Text => fmt::layer().with_writer(stderr).with_target(false).boxed(),
-        log::Format::Json => fmt::layer()
+        Format::Text => fmt::layer().with_writer(stderr).with_target(false).boxed(),
+        Format::Json => fmt::layer()
             .json()
             .with_writer(stderr)
             .with_target(false)
@@ -314,20 +330,22 @@ pub fn otel_layer<S>(
     endpoint: &str,
 ) -> Result<Box<dyn Layer<S> + Send + Sync>, Box<dyn Error + Send + Sync>>
 where
-    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync + 'static,
+    S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
 {
+    use std::env;
+
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_otlp::{SpanExporter, WithExportConfig};
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing_opentelemetry::OpenTelemetryLayer;
 
     let endpoint = if endpoint.is_empty() {
-        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:4317".to_string())
     } else {
         endpoint.to_string()
     };
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let exporter = SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()?;
@@ -341,8 +359,16 @@ where
 #[cfg(test)]
 mod tests {
 
-    use super::*;
+    use std::{
+        fs,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
+
+    use tinio_config::log::AccessFormat;
     use tinio_util::testing::SharedBuf;
+    use tracing::subscriber::with_default;
+
+    use super::*;
 
     fn fields(remote_addr: &str, request: &str, status: u16, body_bytes_sent: u64) -> AccessFields {
         AccessFields::new(
@@ -361,7 +387,7 @@ mod tests {
     #[test]
     fn combined_format_line() {
         let fields = fields("127.0.0.1", "GET /data/a.txt HTTP/1.1", 200, 5);
-        let line = fields.format_line(&log::AccessFormat::Combined);
+        let line = fields.format_line(&AccessFormat::Combined);
         assert_eq!(
             line,
             "127.0.0.1 - - [t] \"GET /data/a.txt HTTP/1.1\" 200 5 \"-\" \"-\""
@@ -371,14 +397,14 @@ mod tests {
     #[test]
     fn common_format_line() {
         let fields = fields("127.0.0.1", "GET / HTTP/1.1", 404, 0);
-        let line = fields.format_line(&log::AccessFormat::Common);
+        let line = fields.format_line(&AccessFormat::Common);
         assert_eq!(line, "127.0.0.1 - - [t] \"GET / HTTP/1.1\" 404 0");
     }
 
     #[test]
     fn custom_format_line() {
         let fields = fields("10.0.0.1", "GET / HTTP/1.1", 200, 1);
-        let line = fields.format_line(&log::AccessFormat::Custom("$request $status".into()));
+        let line = fields.format_line(&AccessFormat::Custom("$request $status".into()));
         assert_eq!(line, "GET / HTTP/1.1 200");
     }
 
@@ -397,7 +423,7 @@ mod tests {
             "-".into(),
             "0.5".into(),
         );
-        let line = fields.format_line(&log::AccessFormat::Custom(
+        let line = fields.format_line(&AccessFormat::Custom(
             "$request_time $request $unknown".into(),
         ));
         assert_eq!(line, "0.5 GET / HTTP/1.1 $unknown");
@@ -413,9 +439,6 @@ mod tests {
 
     #[test]
     fn access_event_renders_every_variable() {
-        use tinio_util::testing::SharedBuf;
-        use tracing::subscriber::with_default;
-
         let sentinel = |var: &str| match var {
             "remote_addr" => "ra",
             "remote_user" => "ru",
@@ -438,7 +461,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let buf = SharedBuf::default();
-        let layer = AccessLogLayer::new(log::AccessFormat::Custom(format), buf.clone());
+        let layer = AccessLogLayer::new(AccessFormat::Custom(format), buf.clone());
         let subscriber = tracing_subscriber::registry().with(layer);
         with_default(subscriber, || {
             tracing::info!(
@@ -465,9 +488,8 @@ mod tests {
 
     #[test]
     fn non_access_events_are_ignored() {
-        use tracing::subscriber::with_default;
         let buf = SharedBuf::default();
-        let layer = AccessLogLayer::new(log::AccessFormat::Combined, buf.clone());
+        let layer = AccessLogLayer::new(AccessFormat::Combined, buf.clone());
         let subscriber = tracing_subscriber::registry().with(layer);
         with_default(subscriber, || {
             tracing::info!(target: "tinio::other", "not an access event");
@@ -477,12 +499,9 @@ mod tests {
 
     #[test]
     fn debug_and_signed_fields_are_collected() {
-        use tracing::subscriber::with_default;
         let buf = SharedBuf::default();
-        let layer = AccessLogLayer::new(
-            log::AccessFormat::Custom("$status $request".into()),
-            buf.clone(),
-        );
+        let layer =
+            AccessLogLayer::new(AccessFormat::Custom("$status $request".into()), buf.clone());
         let subscriber = tracing_subscriber::registry().with(layer);
         with_default(subscriber, || {
             tracing::info!(
@@ -500,9 +519,8 @@ mod tests {
     fn poisoned_lock_recovers_into_inner_writer() {
         // A panicked writer (e.g. a full disk during a flush) poisons the
         // mutex; the layer must recover the inner writer, not lose events.
-        use std::panic::{AssertUnwindSafe, catch_unwind};
         let buf = SharedBuf::default();
-        let layer = AccessLogLayer::new(log::AccessFormat::Combined, buf.clone());
+        let layer = AccessLogLayer::new(AccessFormat::Combined, buf.clone());
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let _guard = layer.writer.lock().unwrap();
             panic!("poison the access-log mutex");
@@ -534,14 +552,13 @@ mod tests {
 
     #[test]
     fn build_subscriber_writes_access_events_to_file() {
-        use tracing::subscriber::with_default;
-        for (format, suffix) in [(log::Format::Text, "text"), (log::Format::Json, "json")] {
+        for (format, suffix) in [(Format::Text, "text"), (Format::Json, "json")] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("access.log");
             let sub = build_subscriber(
-                log::Verbosity::Info,
+                Verbosity::Info,
                 format,
-                &log::AccessFormat::Custom("$status $request".into()),
+                &AccessFormat::Custom("$status $request".into()),
                 &path,
                 None,
             )
@@ -554,7 +571,7 @@ mod tests {
                     "s3 request completed"
                 );
             });
-            let content = std::fs::read_to_string(&path).unwrap();
+            let content = fs::read_to_string(&path).unwrap();
             assert!(
                 content.contains("201 GET /data/x HTTP/1.1"),
                 "{suffix} format: {content}"

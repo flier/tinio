@@ -1,9 +1,8 @@
 //! Shared unit-test helpers of the backend modules.
 
-use http::{Method, Uri};
+use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::S3Request;
-use tinio_core::bucket;
-use tinio_core::storage::BucketOps;
+use tinio_core::{bucket, storage::BucketOps};
 use tinio_mem::MemoryStorage;
 
 use super::S3Backend;
@@ -14,8 +13,8 @@ pub(crate) fn s3_request<T>(input: T) -> S3Request<T> {
         input,
         method: Method::GET,
         uri: Uri::default(),
-        headers: http::HeaderMap::new(),
-        extensions: http::Extensions::new(),
+        headers: HeaderMap::new(),
+        extensions: Extensions::new(),
         credentials: None,
         region: None,
         service: None,

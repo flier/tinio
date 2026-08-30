@@ -35,10 +35,12 @@ pub mod tombstone;
 mod write;
 mod write_task;
 
-pub use self::backend::{FsOptions, FsStorage, StagedBody};
-pub use self::cleanup::FsCleanup;
-pub use self::error::Error;
-pub use self::listing::FsListing;
-pub use self::path::state_dir;
-pub use self::scanner::{ScanSummary, Scanner, ScannerOptions};
-pub use self::write::AtomicWriter;
+pub use self::{
+    backend::{FsOptions, FsStorage, StagedBody},
+    cleanup::FsCleanup,
+    error::Error,
+    listing::FsListing,
+    path::state_dir,
+    scanner::{ScanSummary, Scanner, ScannerOptions},
+    write::AtomicWriter,
+};

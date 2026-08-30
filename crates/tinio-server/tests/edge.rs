@@ -11,6 +11,7 @@ mod e2e;
 
 use std::fs;
 
+use e2e::{Mc, Server};
 use predicates::prelude::*;
 
 /// ETag from `head-object` (text output, no quotes).
@@ -41,7 +42,7 @@ fn etag(ep: &str, key: &str) -> String {
 #[test]
 #[ignore = "requires aws cli v2 on PATH"]
 fn edges() {
-    let server = e2e::Server::start();
+    let server = Server::start();
     let ep = server.endpoint();
     let scratch = tempfile::tempdir().unwrap();
 
@@ -333,10 +334,10 @@ fn edges() {
 #[test]
 #[ignore = "requires the mc binary on PATH"]
 fn mc_edges() {
-    let server = e2e::Server::start();
+    let server = Server::start();
     let ep = server.endpoint();
     let scratch = tempfile::tempdir().unwrap();
-    let mc = e2e::Mc::new(scratch.path().join("mc"));
+    let mc = Mc::new(scratch.path().join("mc"));
 
     mc.alias(ep).assert().success();
     mc.cmd(&["mb", "tinio/edge-bucket"]).assert().success();

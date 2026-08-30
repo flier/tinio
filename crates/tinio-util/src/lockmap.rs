@@ -7,6 +7,7 @@
 
 use std::{hash::Hash, sync::Arc};
 
+use papaya::HashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// One per-key mutex. The table holds one `Arc`; a holder's [`Guard`] —
@@ -15,7 +16,7 @@ type Slot = Arc<Mutex<()>>;
 
 /// The slot table: key → per-key mutex. `Arc` so [`Map`] clones share
 /// the table (`papaya::HashMap` itself clones by snapshot).
-type Table<K> = Arc<papaya::HashMap<K, Slot>>;
+type Table<K> = Arc<HashMap<K, Slot>>;
 
 /// The per-key lock table. Slots are evicted when the last [`Guard`] for
 /// a key drops: the table holds one `Arc` to the slot and the guard the
@@ -40,7 +41,7 @@ pub struct Map<K: Hash + Eq> {
 impl<K: Hash + Eq> Default for Map<K> {
     fn default() -> Self {
         Self {
-            map: Arc::new(papaya::HashMap::new()),
+            map: Arc::new(HashMap::new()),
         }
     }
 }
@@ -134,6 +135,8 @@ impl<K: Clone + Eq + Hash> Drop for Guard<K> {
 mod tests {
     use std::time::Duration;
 
+    use tokio::{task::yield_now, time::timeout};
+
     use super::*;
 
     #[test]
@@ -152,9 +155,7 @@ mod tests {
         // The second lock on the same key must not resolve while the
         // first is held.
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), waiter)
-                .await
-                .is_err(),
+            timeout(Duration::from_millis(50), waiter).await.is_err(),
             "the same-key lock must wait for the held guard"
         );
     }
@@ -169,9 +170,7 @@ mod tests {
         });
         // A different key must resolve immediately.
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), b)
-                .await
-                .is_ok(),
+            timeout(Duration::from_millis(50), b).await.is_ok(),
             "distinct keys must not contend"
         );
         drop(a);
@@ -187,13 +186,13 @@ mod tests {
                 let _guard = map.lock("k".to_string()).await;
             }
         });
-        tokio::task::yield_now().await;
+        yield_now().await;
         drop(_held);
         // The waiter (whose slot clone pins the entry) acquires the key
         // next; whichever interleaving wins, the last guard's drop must
         // leave the table empty — the slot is never evicted out from
         // under a waiter, and never leaks after the final release.
-        tokio::time::timeout(Duration::from_secs(1), waiter)
+        timeout(Duration::from_secs(1), waiter)
             .await
             .unwrap()
             .unwrap();

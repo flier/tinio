@@ -7,8 +7,12 @@
 //! `.tinio` segments at any depth, bucket-name rules), and that every
 //! accepted key maps to a path that stays inside its base directory.
 
-use std::path::{Component, Path};
+use std::{
+    path::{Component, Path},
+    str::from_utf8,
+};
 
+use prop::collection;
 use proptest::prelude::*;
 use tinio_core::{bucket, object};
 
@@ -21,8 +25,8 @@ proptest! {
     }
 
     #[test]
-    fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
-        if let Ok(s) = std::str::from_utf8(&bytes) {
+    fn arbitrary_bytes_never_panic(bytes in collection::vec(any::<u8>(), 0..64)) {
+        if let Ok(s) = from_utf8(&bytes) {
             let _ = object::key(s);
             let _ = bucket::name(s);
         }
@@ -97,7 +101,7 @@ proptest! {
 proptest! {
     #[test]
     fn accepted_keys_never_escape_base(
-        segs in prop::collection::vec("[a-zA-Z0-9._ -]{1,12}", 1..6),
+        segs in collection::vec("[a-zA-Z0-9._ -]{1,12}", 1..6),
         trailing_slash in any::<bool>(),
     ) {
         let mut key = segs.join("/");

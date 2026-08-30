@@ -39,19 +39,23 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use io::Error as IoError;
+    use prometheus::Error as PrometheusError;
+    use tinio_config::Error as ConfigError;
     use tinio_core::storage::Error::*;
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn displays_variants() {
         let cases = [
             (
-                Error::Io(io::Error::other("port in use")),
+                Error::Io(IoError::other("port in use")),
                 "I/O error: port in use",
             ),
             (
-                Error::Config(tinio_config::Error::Missing("api".into())),
+                Error::Config(ConfigError::Missing("api".into())),
                 "configuration error: missing required configuration: api",
             ),
             (
@@ -63,7 +67,7 @@ mod tests {
                 "mapping error: no multipart",
             ),
             (
-                Error::Metrics(prometheus::Error::Msg("duplicate registration".into())),
+                Error::Metrics(PrometheusError::Msg("duplicate registration".into())),
                 "metrics error: Error: duplicate registration",
             ),
         ];

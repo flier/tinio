@@ -28,7 +28,6 @@
 use std::error::Error;
 
 use async_trait::async_trait;
-
 use futures::stream::BoxStream;
 
 use crate::storage;
@@ -39,8 +38,7 @@ use crate::storage;
 ///
 /// ```rust
 /// use futures::stream;
-/// use tinio_core::cleanup::ActionStream;
-/// use tinio_core::storage;
+/// use tinio_core::{cleanup::ActionStream, storage};
 ///
 /// let actions: ActionStream<storage::Error> = Box::pin(stream::empty());
 /// ```
@@ -164,13 +162,14 @@ pub struct CleanupOptions {
 /// # Examples
 ///
 /// ```rust
+/// use futures::{StreamExt, stream};
 /// use tinio_core::{
 ///     cleanup::{
 ///         ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
 ///     },
 ///     storage,
 /// };
-/// use futures::StreamExt;
+/// use tokio::runtime::Runtime;
 ///
 /// struct Noop;
 ///
@@ -182,18 +181,17 @@ pub struct CleanupOptions {
 ///         &self,
 ///         _kind: RepairKind,
 ///     ) -> Result<ActionStream<storage::Error>, storage::Error> {
-///         let actions: Vec<Result<RepairAction, storage::Error>> =
-///             vec![Ok(RepairAction {
-///                 level: RepairActionLevel::Lint,
-///                 description: "tmp/ is clean".into(),
-///             })];
-///         Ok(Box::pin(futures::stream::iter(actions)))
+///         let actions: Vec<Result<RepairAction, storage::Error>> = vec![Ok(RepairAction {
+///             level: RepairActionLevel::Lint,
+///             description: "tmp/ is clean".into(),
+///         })];
+///         Ok(Box::pin(stream::iter(actions)))
 ///     }
 ///
 ///     async fn reclaim_meta_orphans(
 ///         &self,
 ///     ) -> Result<ActionStream<storage::Error>, storage::Error> {
-///         Ok(Box::pin(futures::stream::empty()))
+///         Ok(Box::pin(stream::empty()))
 ///     }
 /// }
 ///
@@ -202,11 +200,11 @@ pub struct CleanupOptions {
 ///     dry_run: true,
 ///     ..CleanupOptions::default()
 /// };
-/// let mut stream = tokio::runtime::Runtime::new()
+/// let mut stream = Runtime::new()
 ///     .unwrap()
 ///     .block_on(cleanup.repair(RepairKind::Startup))
 ///     .unwrap();
-/// let action = tokio::runtime::Runtime::new()
+/// let action = Runtime::new()
 ///     .unwrap()
 ///     .block_on(stream.next())
 ///     .unwrap()
@@ -230,6 +228,9 @@ pub trait Cleanup: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use futures::{StreamExt, stream};
+    use tokio::runtime::Runtime;
+
     use super::*;
 
     #[test]
@@ -268,16 +269,18 @@ mod tests {
         #[async_trait::async_trait]
         impl Cleanup for DummyCleanup {
             type Error = storage::Error;
+
             async fn repair(
                 &self,
                 _kind: RepairKind,
             ) -> Result<ActionStream<storage::Error>, storage::Error> {
-                Ok(Box::pin(futures::stream::empty()))
+                Ok(Box::pin(stream::empty()))
             }
+
             async fn reclaim_meta_orphans(
                 &self,
             ) -> Result<ActionStream<storage::Error>, storage::Error> {
-                Ok(Box::pin(futures::stream::empty()))
+                Ok(Box::pin(stream::empty()))
             }
         }
         fn takes_trait_object(_c: &dyn Cleanup<Error = storage::Error>) {}
@@ -286,13 +289,13 @@ mod tests {
         takes_trait_object(&DummyCleanup);
 
         // Exercise the trait-object methods through the dyn reference.
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let c: &dyn Cleanup<Error = storage::Error> = &DummyCleanup;
             let mut actions = c.repair(RepairKind::Full).await.unwrap();
-            assert!(futures::StreamExt::next(&mut actions).await.is_none());
+            assert!(StreamExt::next(&mut actions).await.is_none());
             let mut reclaim = c.reclaim_meta_orphans().await.unwrap();
-            assert!(futures::StreamExt::next(&mut reclaim).await.is_none());
+            assert!(StreamExt::next(&mut reclaim).await.is_none());
         });
     }
 }

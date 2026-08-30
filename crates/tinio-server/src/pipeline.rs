@@ -33,18 +33,30 @@
 //!   to a strong warn at [`CONSECUTIVE_FAILURE_ESCALATION`] ("likely
 //!   systemic", R7); it never stops consuming and resets on success.
 
-use std::any::Any;
-use std::ops::Deref;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    any::Any,
+    mem,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+};
 
 use async_trait::async_trait;
+use derive_more::Deref;
 use futures::FutureExt;
-use thread_priority::{ThreadPriority, ThreadPriorityValue};
-use tinio_config::pipeline as pipeline_config;
-use tinio_core::pipeline::{self, Completion, Outcome, Reply, RunOutput, Runner, Stats, Task};
-use tokio::sync::{Mutex as TokioMutex, mpsc, watch};
+use thread_priority::{Error as ThreadPriorityError, ThreadPriority, ThreadPriorityValue};
+use tinio_config::pipeline::{self as pipeline_config, Priority};
+use tinio_core::pipeline::{
+    self, Completion, Error::ShutDown, Outcome, Reply, RunOutput, Runner, Stats, Task,
+};
+use tokio::{
+    runtime::{Builder, Runtime},
+    sync::{Mutex as TokioMutex, mpsc, watch},
+    task::JoinHandle,
+};
 
 use crate::Error;
 
@@ -87,7 +99,7 @@ pub struct Pipeline<O = RunOutput> {
     /// the last handle can move it to a detached thread on drop — tokio
     /// forbids dropping a runtime from an async context (a blocking drop),
     /// and the server shuts the pipelines down from its own runtime.
-    runtime: Option<tokio::runtime::Runtime>,
+    runtime: Option<Runtime>,
 }
 
 struct PipelineInner<O> {
@@ -109,7 +121,7 @@ struct PipelineInner<O> {
     /// once by [`Pipeline::drain`], so the handles outlive the spawn and
     /// the in-flight drain is awaitable instead of being dropped at the
     /// spawn site.
-    workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// The worker counters behind [`Runner::stats`] (pipeline-spec.md §4) —
@@ -132,19 +144,11 @@ struct Counters {
 }
 
 /// An [`AtomicU64`] on its own 64-byte cache line — the [`Counters`]
-/// layout unit. Transparent access via [`Deref`], so callers keep using
-/// the atomic methods directly.
-#[derive(Default)]
+/// layout unit. Transparent access via [`std::ops::Deref`], so callers
+/// keep using the atomic methods directly.
+#[derive(Default, Deref)]
 #[repr(align(64))]
 struct AlignedCounter(AtomicU64);
-
-impl Deref for AlignedCounter {
-    type Target = AtomicU64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
 
 /// The three server pipelines with their construction-time and shutdown
 /// wiring (pipeline-spec.md §3.3, R5).
@@ -175,7 +179,7 @@ where
         let rx = Arc::new(TokioMutex::new(rx));
         let counters = Arc::new(Counters::default());
 
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        let mut builder = Builder::new_multi_thread();
         builder
             .worker_threads(usize::from(spec.workers))
             .thread_name(format!("tinio-pipeline-{}", spec.kind));
@@ -249,7 +253,7 @@ impl<O> Pipeline<O> {
     pub async fn drain(&self) {
         let handles = {
             let mut workers = self.inner.workers.lock().unwrap();
-            std::mem::take(&mut *workers)
+            mem::take(&mut *workers)
         };
         for handle in handles {
             // The worker loops are infallible; a JoinError would mean a
@@ -270,7 +274,7 @@ impl<O> Drop for Pipeline<O> {
         // context (the server shuts the pipelines down from its own
         // runtime).
         if let Some(runtime) = self.runtime.take() {
-            std::thread::spawn(move || drop(runtime));
+            thread::spawn(move || drop(runtime));
         }
     }
 }
@@ -285,17 +289,11 @@ where
         task: Box<dyn Task<Output = O>>,
     ) -> Result<Completion<O>, pipeline::Error> {
         if self.inner.shut_down.load(Ordering::Relaxed) {
-            return Err(pipeline::Error::ShutDown);
+            return Err(ShutDown);
         }
         let (reply, done) = Completion::pair();
         // Clone the sender under the lock, then send without holding it.
-        let sender = self
-            .inner
-            .queue
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(pipeline::Error::ShutDown)?;
+        let sender = self.inner.queue.lock().unwrap().clone().ok_or(ShutDown)?;
         // No depth counting here — `stats()` reads the depth from the
         // channel itself (`max_capacity() - capacity()`, item 4,
         // data-path review 2026-08-29): a task still blocked in `send`
@@ -306,7 +304,7 @@ where
         // permanently) cannot exist.
         if sender.send((task, reply)).await.is_err() {
             // The channel closed under us (shutdown race) — not accepted.
-            return Err(pipeline::Error::ShutDown);
+            return Err(ShutDown);
         }
         // F08: a shutdown that fired while the send was in flight would
         // otherwise hand back Ok(done) for a task the workers' biased
@@ -316,7 +314,7 @@ where
         // the task is either run (harmless — the completion dies with
         // this Err) or dropped unrun (Q3 semantics).
         if self.inner.shut_down.load(Ordering::Relaxed) {
-            return Err(pipeline::Error::ShutDown);
+            return Err(ShutDown);
         }
         Ok(done)
     }
@@ -358,27 +356,27 @@ where
     /// wiring `FsOptions`). IO is ETag compute (`tinio_fs::etag::Result`);
     /// removal is unit-success tombstone work (`Result<(), tinio_fs::Error>`).
     pub fn build(config: &pipeline_config::Config) -> Result<Self, Error> {
-        let io = Pipeline::new(PipelineSpec {
-            kind: "io",
-            workers: config.io.workers,
-            capacity: config.io.capacity as usize,
-            priority: thread_priority(config.io.priority),
-            track_consecutive_failures: false,
-        })?;
-        let remove = Pipeline::new(PipelineSpec {
-            kind: "remove",
-            workers: config.remove.workers,
-            capacity: config.remove.capacity as usize,
-            priority: thread_priority(config.remove.priority),
-            track_consecutive_failures: false,
-        })?;
-        let db = Pipeline::new(PipelineSpec {
-            kind: "db",
-            workers: config.db.workers,
-            capacity: config.db.capacity as usize,
-            priority: thread_priority(config.db.priority),
-            track_consecutive_failures: true,
-        })?;
+        let io = Pipeline::new(spec(
+            "io",
+            config.io.workers,
+            config.io.capacity,
+            config.io.priority,
+            false,
+        ))?;
+        let remove = Pipeline::new(spec(
+            "remove",
+            config.remove.workers,
+            config.remove.capacity,
+            config.remove.priority,
+            false,
+        ))?;
+        let db = Pipeline::new(spec(
+            "db",
+            config.db.workers,
+            config.db.capacity,
+            config.db.priority,
+            true,
+        ))?;
         Ok(Self {
             io: Arc::new(io),
             remove: Arc::new(remove),
@@ -530,7 +528,7 @@ async fn run_one<O>(
     // `kind()` itself is caught separately (F09): a panicking `kind()` —
     // a task-implementation bug — must not kill the worker; the task
     // cannot even be identified, so the reply is cancelled (Dropped).
-    let task_kind = match std::panic::catch_unwind(AssertUnwindSafe(|| task.kind())) {
+    let task_kind = match catch_unwind(AssertUnwindSafe(|| task.kind())) {
         Ok(task_kind) => task_kind,
         Err(payload) => {
             *consecutive_failures += 1;
@@ -625,15 +623,30 @@ fn escalation_due(track_consecutive_failures: bool, consecutive_failures: u32) -
 /// lowest/highest legal [`ThreadPriorityValue`]s (`0` / `99`), verified
 /// against thread-priority 3.1.1's Windows band mapping (`THREAD_PRIORITY_
 /// IDLE` / `THREAD_PRIORITY_TIME_CRITICAL`, Q7 probe).
-fn thread_priority(priority: pipeline_config::Priority) -> Option<ThreadPriority> {
+/// One [`PipelineSpec`] from the config section's per-lane fields — the
+/// one field-wiring shape of [`Pipelines::build`] (the config value
+/// types are validated by the `[pipeline.*]` schema before this call).
+fn spec(
+    kind: &'static str,
+    workers: u8,
+    capacity: u32,
+    priority: Priority,
+    track_consecutive_failures: bool,
+) -> PipelineSpec {
+    PipelineSpec {
+        kind,
+        workers,
+        capacity: capacity as usize,
+        priority: thread_priority(priority),
+        track_consecutive_failures,
+    }
+}
+
+fn thread_priority(priority: Priority) -> Option<ThreadPriority> {
     match priority {
-        pipeline_config::Priority::Normal => None,
-        pipeline_config::Priority::Low => {
-            Some(ThreadPriority::Crossplatform(ThreadPriorityValue::MIN))
-        }
-        pipeline_config::Priority::High => {
-            Some(ThreadPriority::Crossplatform(ThreadPriorityValue::MAX))
-        }
+        Priority::Normal => None,
+        Priority::Low => Some(ThreadPriority::Crossplatform(ThreadPriorityValue::MIN)),
+        Priority::High => Some(ThreadPriority::Crossplatform(ThreadPriorityValue::MAX)),
     }
 }
 
@@ -646,7 +659,7 @@ fn apply_thread_priority(priority: Option<ThreadPriority>) {
 }
 
 /// Warn-and-degrade a `set_for_current` failure (never fatal).
-fn apply_thread_priority_result(result: Result<(), thread_priority::Error>) {
+fn apply_thread_priority_result(result: Result<(), ThreadPriorityError>) {
     if let Err(err) = result {
         tracing::warn!(
             error = %err,
@@ -657,16 +670,32 @@ fn apply_thread_priority_result(result: Result<(), thread_priority::Error>) {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as StdError;
+    use std::{
+        error::Error as StdError,
+        mem,
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, SystemTime},
+    };
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Duration;
-
-    use tokio::sync::{MutexGuard as TokioMutexGuard, oneshot};
-    use tracing_subscriber::prelude::*;
-
-    use tinio_core::pipeline::Task;
+    use pipeline::Error::{Dropped, ShutDown};
+    use tinio_core::{
+        ETag, object,
+        pipeline::Task,
+        storage::{
+            DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+        },
+    };
+    use tinio_fs::etag::{self, Outcome as EtagOutcome};
+    use tinio_util::testing::{SharedBuf, wait_for};
+    use tokio::{
+        sync::{MutexGuard as TokioMutexGuard, oneshot},
+        time::{sleep, timeout},
+    };
+    use tracing::subscriber::set_global_default;
+    use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
     use super::*;
 
@@ -773,19 +802,19 @@ mod tests {
 
     #[async_trait]
     impl Task for EtagTask {
-        type Output = tinio_fs::etag::Result;
+        type Output = etag::Result;
 
         fn kind(&self) -> &'static str {
             "etag"
         }
 
-        async fn run(&mut self) -> tinio_fs::etag::Result {
+        async fn run(&mut self) -> etag::Result {
             self.ran.store(true, Ordering::Relaxed);
-            Ok(tinio_fs::etag::Outcome {
-                key: tinio_core::object::key("probe").unwrap(),
-                etag: tinio_core::ETag::EMPTY,
+            Ok(EtagOutcome {
+                key: object::key("probe").unwrap(),
+                etag: ETag::EMPTY,
                 size: 0,
-                mtime: std::time::SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
                 identity: 0,
                 kept: true,
             })
@@ -840,7 +869,6 @@ mod tests {
     /// An owned `Write` sink the fmt layer can hold — the shared
     /// `tinio_util::testing` definition (F32 — log.rs's two copies are
     /// gone too).
-    use tinio_util::testing::{SharedBuf, wait_for};
 
     /// Serializes the log-capturing tests (they share one global buffer).
     /// A tokio mutex: the guard is deliberately held across the whole test.
@@ -856,9 +884,9 @@ mod tests {
             let buf = SharedBuf::default();
             let writer = buf.clone();
             let subscriber = tracing_subscriber::registry()
-                .with(tracing_subscriber::filter::LevelFilter::WARN)
-                .with(tracing_subscriber::fmt::layer().with_writer(move || writer.clone()));
-            tracing::subscriber::set_global_default(subscriber)
+                .with(LevelFilter::WARN)
+                .with(fmt::layer().with_writer(move || writer.clone()));
+            set_global_default(subscriber)
                 .expect("only the log-capturing tests set the global default");
             buf
         });
@@ -966,7 +994,7 @@ mod tests {
         // enqueue after shutdown errors (Q3); shutdown is idempotent.
         let (_, _, task) = FlagTask::new();
         let err = pipelines.io().enqueue(Box::new(task)).await.unwrap_err();
-        assert_eq!(err, pipeline::Error::ShutDown, "{err}");
+        assert_eq!(err, ShutDown, "{err}");
         pipelines.io().shutdown();
     }
 
@@ -1021,7 +1049,7 @@ mod tests {
         let mut drained = tokio::spawn(async move {
             pipelines.io().drain().await;
         });
-        let still_pending = tokio::time::timeout(Duration::from_millis(100), &mut drained).await;
+        let still_pending = timeout(Duration::from_millis(100), &mut drained).await;
         assert!(
             still_pending.is_err(),
             "drain must await the in-flight task, not return early"
@@ -1063,7 +1091,7 @@ mod tests {
             let result = enqueue.await.unwrap();
             assert_eq!(
                 result.unwrap_err(),
-                pipeline::Error::ShutDown,
+                ShutDown,
                 "an enqueue racing shutdown must not be accepted"
             );
             assert!(
@@ -1093,19 +1121,16 @@ mod tests {
         release.send(()).unwrap();
 
         // The in-flight gate completes normally — its reply was sent.
-        let gate_outcome = tokio::time::timeout(Duration::from_secs(5), gate_done)
+        let gate_outcome = timeout(Duration::from_secs(5), gate_done)
             .await
             .expect("the in-flight completion resolves")
             .expect("the in-flight task's reply was sent");
         assert!(gate_outcome.is_ok());
         // The queued task was dropped — its completion reports Dropped.
-        let outcome = tokio::time::timeout(Duration::from_secs(5), queued_done)
+        let outcome = timeout(Duration::from_secs(5), queued_done)
             .await
             .expect("the dropped task's completion resolves");
-        assert!(
-            matches!(outcome, Err(pipeline::Error::Dropped)),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, Err(Dropped)), "{outcome:?}");
         assert!(!queued_ran.load(Ordering::Relaxed));
     }
 
@@ -1125,8 +1150,7 @@ mod tests {
         let pipeline = pipelines.io();
         let mut blocked_enqueue =
             tokio::spawn(async move { pipeline.enqueue(Box::new(blocked)).await });
-        let timed_out =
-            tokio::time::timeout(Duration::from_millis(100), &mut blocked_enqueue).await;
+        let timed_out = timeout(Duration::from_millis(100), &mut blocked_enqueue).await;
         assert!(
             timed_out.is_err(),
             "enqueue must block while the queue is full"
@@ -1137,7 +1161,7 @@ mod tests {
         // the timeout — the timeout then sees exactly two layers (Elapsed
         // and the enqueue result).
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(5), async {
             blocked_enqueue.await.expect("the enqueue task joins")
         })
         .await
@@ -1307,7 +1331,7 @@ mod tests {
         }
         wait_for(|| io_runs.load(Ordering::Relaxed) == 12).await;
         wait_for(|| remove_runs.load(Ordering::Relaxed) == 12).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(!text.contains("likely systemic"), "{text}");
     }
@@ -1353,7 +1377,7 @@ mod tests {
         let pipeline = pipelines.io();
         let blocked_enqueue =
             tokio::spawn(async move { pipeline.enqueue(Box::new(blocked)).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(
             pipelines.io().stats().queue_depth,
             1,
@@ -1371,8 +1395,8 @@ mod tests {
         // redundant, F28) sits on its own 64-byte line, so the
         // worker-written group cannot false-share (a layout pin: the
         // per-counter alignment is the fix).
-        assert_eq!(std::mem::size_of::<Counters>(), 64);
-        assert_eq!(std::mem::align_of::<Counters>(), 64);
+        assert_eq!(mem::size_of::<Counters>(), 64);
+        assert_eq!(mem::align_of::<Counters>(), 64);
     }
 
     #[test]
@@ -1380,17 +1404,17 @@ mod tests {
         // Q7: `normal` = do not set; `low`/`high` = the lowest/highest legal
         // `ThreadPriorityValue`s (0 / 99), verified against the crate's
         // Windows band mapping (see the windows probe below).
-        assert_eq!(thread_priority(pipeline_config::Priority::Normal), None);
+        assert_eq!(thread_priority(Priority::Normal), None);
         let low: u8 = ThreadPriorityValue::MIN.into();
         assert_eq!(low, 0);
         assert_eq!(
-            thread_priority(pipeline_config::Priority::Low),
+            thread_priority(Priority::Low),
             Some(ThreadPriority::Crossplatform(ThreadPriorityValue::MIN))
         );
         let high: u8 = ThreadPriorityValue::MAX.into();
         assert_eq!(high, 99);
         assert_eq!(
-            thread_priority(pipeline_config::Priority::High),
+            thread_priority(Priority::High),
             Some(ThreadPriority::Crossplatform(ThreadPriorityValue::MAX))
         );
         // Out-of-range values are rejected by the crate — the Q7 revision
@@ -1403,7 +1427,7 @@ mod tests {
         let (_guard, buf) = capture_warns().await;
         // A failing set_for_current (e.g. missing privileges on unix) must
         // warn and degrade — never fail startup or panic.
-        apply_thread_priority_result(Err(thread_priority::Error::OS(1)));
+        apply_thread_priority_result(Err(ThreadPriorityError::OS(1)));
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             text.contains("failed to set pipeline thread priority"),
@@ -1448,6 +1472,8 @@ mod tests {
     /// outputs (P4/P7) — and a task flows through the injected IO pipeline.
     #[tokio::test]
     async fn pipelines_inject_into_fs_options() {
+        use tinio_fs::{FsOptions, FsStorage};
+
         // The `Pipelines` output types are inferred from the `FsOptions`
         // fields: IO = [`tinio_fs::etag::Result`], remove and DB =
         // `Result<(), tinio_fs::Error>` (D-A).
@@ -1466,14 +1492,14 @@ mod tests {
         })
         .expect("pipeline runtime builds");
         let root = tempfile::tempdir().unwrap();
-        let _storage = tinio_fs::FsStorage::new(
+        let _storage = FsStorage::new(
             root.path(),
-            tinio_fs::FsOptions {
+            FsOptions {
                 follow_symlinks: false,
                 state_dir: None,
-                compact_threshold_percent: tinio_core::storage::DEFAULT_COMPACT_THRESHOLD_PERCENT,
-                meta_batch_size: tinio_core::storage::DEFAULT_META_BATCH_SIZE,
-                meta_batch_bytes: tinio_core::storage::DEFAULT_META_BATCH_BYTES,
+                compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
+                meta_batch_size: DEFAULT_META_BATCH_SIZE,
+                meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
                 io_pipeline: pipelines.io(),
                 remove_pipeline: pipelines.remove(),
                 db_pipeline: pipelines.db(),

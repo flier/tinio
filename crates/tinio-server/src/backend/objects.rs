@@ -8,11 +8,17 @@
 //! `x-amz-checksum-*` are accepted and dropped. CopyObject is gated by the
 //! `copy` cargo feature and the runtime `copy_object` toggle (FR-021).
 
-use std::str::FromStr;
+use std::{str::FromStr, time::SystemTime};
 
-use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
-
-use tinio_core::storage::{Error as StorageError, GetObjectResult, Storage};
+use s3s::{
+    S3Error, S3Request, S3Response, S3Result,
+    dto::{self, DeleteObjectOutput, ETagCondition},
+    s3_error,
+};
+use tinio_core::{
+    bucket, object,
+    storage::{Error as StorageError, GetObjectResult, Storage},
+};
 
 use crate::backend::{
     ConditionFailure, ConditionalHeaders, S3Backend, byte_range, condition_error, map_backend_error,
@@ -31,7 +37,7 @@ fn parse_etag_condition_header(
     let text = value
         .to_str()
         .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))?;
-    dto::ETagCondition::from_str(text)
+    ETagCondition::from_str(text)
         .map(Some)
         .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))
 }
@@ -45,8 +51,8 @@ fn parse_etag_condition_header(
 impl<S: Storage> S3Backend<S> {
     async fn check_destination_conditions(
         &self,
-        bucket: &tinio_core::bucket::Name,
-        key: &tinio_core::object::Key,
+        bucket: &bucket::Name,
+        key: &object::Key,
         if_match: Option<&dto::ETagCondition>,
         if_none_match: Option<&dto::ETagCondition>,
     ) -> S3Result<()> {
@@ -220,7 +226,7 @@ impl<S: Storage> S3Backend<S> {
             .delete_object(&bucket, &key)
             .await
             .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::DeleteObjectOutput::default()))
+        Ok(S3Response::new(DeleteObjectOutput::default()))
     }
 
     pub(crate) async fn op_delete_objects(
@@ -342,7 +348,7 @@ impl<S: Storage> S3Backend<S> {
         Ok(S3Response::new(dto::CopyObjectOutput {
             copy_object_result: Some(dto::CopyObjectResult {
                 e_tag: Some(Self::etag_wire(&put.etag)),
-                last_modified: Some(Self::last_modified(std::time::SystemTime::now())),
+                last_modified: Some(Self::last_modified(SystemTime::now())),
                 ..Default::default()
             }),
             ..Default::default()
@@ -352,14 +358,22 @@ impl<S: Storage> S3Backend<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::backend::testutil::{s3_request, setup};
-    use futures::StreamExt;
-    use s3s::S3;
-    use tinio_core::bucket;
-    use tinio_core::storage::ObjectOps;
+    use std::io;
+
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+    use http::HeaderValue;
+    use s3s::{
+        S3, S3ErrorCode,
+        dto::{CopyObjectInput, CopySource, Range, StreamingBlob, Timestamp},
+    };
+    use time::OffsetDateTime;
+    use tinio_core::{bucket, storage::ObjectOps};
     use tinio_mem::MemoryStorage;
     use tinio_util::testing::{body, read_body};
+
+    use super::*;
+    use crate::backend::testutil::{s3_request, setup};
 
     async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
         let (backend, b) = setup().await;
@@ -373,8 +387,8 @@ mod tests {
             .put_object(s3_request(dto::PutObjectInput {
                 bucket: b.to_string(),
                 key: "hello.txt".into(),
-                body: Some(dto::StreamingBlob::wrap(futures::stream::once(async {
-                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello"))
+                body: Some(StreamingBlob::wrap(stream::once(async {
+                    Ok::<_, io::Error>(Bytes::from_static(b"hello"))
                 }))),
                 ..Default::default()
             }))
@@ -449,7 +463,7 @@ mod tests {
             .get_object(s3_request(dto::GetObjectInput {
                 bucket: b.to_string(),
                 key: "digits".into(),
-                range: Some(dto::Range::Int {
+                range: Some(Range::Int {
                     first: 2,
                     last: Some(5),
                 }),
@@ -471,7 +485,7 @@ mod tests {
             .get_object(s3_request(dto::GetObjectInput {
                 bucket: b.to_string(),
                 key: "digits".into(),
-                range: Some(dto::Range::Int {
+                range: Some(Range::Int {
                     first: 99,
                     last: None,
                 }),
@@ -534,8 +548,8 @@ mod tests {
                 bucket: b.to_string(),
                 key: "hello.txt".into(),
                 if_match: Some(format!("\"{etag}\"").parse().unwrap()),
-                if_unmodified_since: Some(dto::Timestamp::from(
-                    time::OffsetDateTime::from_unix_timestamp(915_148_800).unwrap(),
+                if_unmodified_since: Some(Timestamp::from(
+                    OffsetDateTime::from_unix_timestamp(915_148_800).unwrap(),
                 )),
                 ..Default::default()
             }))
@@ -551,8 +565,8 @@ mod tests {
                 bucket: b.to_string(),
                 key: "hello.txt".into(),
                 if_none_match: Some(format!("\"{etag}\"").parse().unwrap()),
-                if_unmodified_since: Some(dto::Timestamp::from(
-                    time::OffsetDateTime::from_unix_timestamp(915_148_800).unwrap(),
+                if_unmodified_since: Some(Timestamp::from(
+                    OffsetDateTime::from_unix_timestamp(915_148_800).unwrap(),
                 )),
                 ..Default::default()
             }))
@@ -569,8 +583,8 @@ mod tests {
             backend.put_object(s3_request(dto::PutObjectInput {
                 bucket: b.to_string(),
                 key: "hello.txt".into(),
-                body: Some(dto::StreamingBlob::wrap(futures::stream::once(async {
-                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello"))
+                body: Some(StreamingBlob::wrap(stream::once(async {
+                    Ok::<_, io::Error>(Bytes::from_static(b"hello"))
                 }))),
                 if_match,
                 if_none_match,
@@ -679,10 +693,10 @@ mod tests {
             .unwrap();
         let out = backend
             .copy_object(s3_request(
-                dto::CopyObjectInput::builder()
+                CopyObjectInput::builder()
                     .bucket(b.to_string())
                     .key("dst.txt".to_string())
-                    .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                    .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
                     .build()
                     .unwrap(),
             ))
@@ -719,10 +733,10 @@ mod tests {
         // x-amz-copy-source-if-none-match matching the source → 412.
         let err = backend
             .copy_object(s3_request(
-                dto::CopyObjectInput::builder()
+                CopyObjectInput::builder()
                     .bucket(b.to_string())
                     .key("dst.txt".to_string())
-                    .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                    .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
                     .copy_source_if_none_match(Some(format!("\"{etag}\"").parse().unwrap()))
                     .build()
                     .unwrap(),
@@ -734,10 +748,10 @@ mod tests {
         // x-amz-copy-source-if-match mismatching → 412.
         let err = backend
             .copy_object(s3_request(
-                dto::CopyObjectInput::builder()
+                CopyObjectInput::builder()
                     .bucket(b.to_string())
                     .key("dst.txt".to_string())
-                    .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                    .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
                     .copy_source_if_match(Some(
                         "\"deadbeefdeadbeefdeadbeefdeadbeef\"".parse().unwrap(),
                     ))
@@ -775,16 +789,16 @@ mod tests {
 
         // x-amz-if-none-match matching the destination → 412, no write.
         let mut req = s3_request(
-            dto::CopyObjectInput::builder()
+            CopyObjectInput::builder()
                 .bucket(b.to_string())
                 .key("dst.txt".to_string())
-                .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
                 .build()
                 .unwrap(),
         );
         req.headers.insert(
             "x-amz-if-none-match",
-            http::HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
+            HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
         );
         let err = backend.copy_object(req).await.unwrap_err();
         assert_eq!(err.code().as_str(), "PreconditionFailed");
@@ -804,32 +818,32 @@ mod tests {
 
         // x-amz-if-match with a mismatching ETag → 412.
         let mut req = s3_request(
-            dto::CopyObjectInput::builder()
+            CopyObjectInput::builder()
                 .bucket(b.to_string())
                 .key("dst.txt".to_string())
-                .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
                 .build()
                 .unwrap(),
         );
         req.headers.insert(
             "x-amz-if-match",
-            http::HeaderValue::from_str("\"deadbeefdeadbeefdeadbeefdeadbeef\"").unwrap(),
+            HeaderValue::from_str("\"deadbeefdeadbeefdeadbeefdeadbeef\"").unwrap(),
         );
         let err = backend.copy_object(req).await.unwrap_err();
         assert_eq!(err.code().as_str(), "PreconditionFailed");
 
         // x-amz-if-match matching the destination → the copy proceeds.
         let mut req = s3_request(
-            dto::CopyObjectInput::builder()
+            CopyObjectInput::builder()
                 .bucket(b.to_string())
                 .key("dst.txt".to_string())
-                .copy_source(dto::CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
                 .build()
                 .unwrap(),
         );
         req.headers.insert(
             "x-amz-if-match",
-            http::HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
+            HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
         );
         let out = backend.copy_object(req).await.unwrap();
         assert!(out.output.copy_object_result.is_some());
@@ -853,10 +867,10 @@ mod tests {
         // `InvalidArgument`, never a partial parse or a wrong bucket.
         let (backend, b) = setup().await;
         let req = s3_request(
-            dto::CopyObjectInput::builder()
+            CopyObjectInput::builder()
                 .bucket(b)
                 .key("dst.txt".to_string())
-                .copy_source(dto::CopySource::AccessPoint {
+                .copy_source(CopySource::AccessPoint {
                     partition: "aws".into(),
                     region: "us-east-1".into(),
                     account_id: "123456789012".into(),
@@ -868,7 +882,7 @@ mod tests {
                 .unwrap(),
         );
         let err = backend.copy_object(req).await.unwrap_err();
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument, "{err:?}");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "{err:?}");
         assert!(
             err.message().unwrap().contains("unsupported copy source"),
             "{err:?}"

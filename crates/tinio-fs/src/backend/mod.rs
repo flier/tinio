@@ -12,19 +12,21 @@ mod buckets;
 mod multipart;
 mod objects;
 
-pub use crate::error::Error;
-pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
-pub use objects::StagedBody;
-
 use std::{
-    fs, io,
+    fs::{Metadata, canonicalize},
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
+use bucket::Store as BucketStore;
 use derive_more::Debug;
 use garde::Validate;
 use getset::{CopyGetters, Getters};
+use lockmap::Map;
+use meta::Store;
+pub use objects::StagedBody;
 use tinio_core::{
     ETag, object, pipeline,
     storage::{
@@ -34,14 +36,17 @@ use tinio_core::{
     },
 };
 use tinio_util::lockmap;
+use tokio::fs;
 
+pub use crate::error::Error;
+pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
 use crate::{
     bucket,
     database::{self, BucketsTable, Handle, ObjectMetaTable, compact_if_needed},
-    etag,
+    etag, fsutil,
     listing::FsListing,
     meta,
-    multipart::{drain_bucket_uploads, drain_upload},
+    multipart::{Store as MultipartStore, drain_bucket_uploads, drain_upload},
     path::{
         BoundaryCache, map_bucket_path, map_key_path, map_key_path_lexical, prove_key_contained,
         state_dir,
@@ -58,11 +63,11 @@ use crate::{
 /// tests) pass [`pipeline::InlineRunner`] (tinio-core Q1); the server
 /// passes its pipeline runtimes.
 ///
-/// Each pipeline is typed to its task [`pipeline::Task::Output`] (P4/P7):
+/// Each pipeline is typed to its task [`Task::Output`] (P4/P7):
 /// the IO pipeline accepts blocking ETag compute ([`etag::Result`]), the
 /// removal pipeline accepts unit-success tombstone jobs
 /// (`Result<(), Error>` — D-A, physically isolated from ETag compute),
-/// and the DB pipeline accepts `crate::write_task::MetaWriteBatchTask`
+/// and the DB pipeline accepts `write_task::MetaWriteBatchTask`
 /// (`Result<(), Error>` — the original error, never boxed into
 /// `RunOutput`).
 ///
@@ -70,9 +75,12 @@ use crate::{
 ///
 /// ```rust
 /// use std::sync::Arc;
-/// use tinio_core::pipeline::InlineRunner;
-/// use tinio_core::storage::{
-///     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+///
+/// use tinio_core::{
+///     pipeline::InlineRunner,
+///     storage::{
+///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+///     },
 /// };
 /// use tinio_fs::FsOptions;
 ///
@@ -123,7 +131,7 @@ pub struct FsOptions {
     #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
     pub meta_batch_bytes: u32,
     /// The IO pipeline (pipeline-spec.md §3.1): the cold list/scanner
-    /// paths enqueue `crate::etag::ComputeTask` instances here. Mandatory
+    /// paths enqueue `etag::ComputeTask` instances here. Mandatory
     /// (P4) — the pipeline (or `InlineRunner` in offline contexts) is a
     /// construction-time decision. Typed to [`etag::Result`] (P4/P7).
     #[garde(skip)]
@@ -135,14 +143,14 @@ pub struct FsOptions {
     /// workers' capacity. Mandatory (P4). Typed to `Result<(), Error>`.
     #[garde(skip)]
     #[debug("<runner>")]
-    pub remove_pipeline: Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
+    pub remove_pipeline: Arc<dyn pipeline::Runner<Result<(), Error>>>,
     /// The batch meta-write pipeline (pipeline-spec.md §3.1): the
-    /// producers enqueue `crate::write_task::MetaWriteBatchTask` batches
+    /// producers enqueue `write_task::MetaWriteBatchTask` batches
     /// here. Mandatory (P4). Typed to the task's output
-    /// `Result<(), crate::Error>` (P4/P7).
+    /// `Result<(), Error>` (P4/P7).
     #[garde(skip)]
     #[debug("<runner>")]
-    pub db_pipeline: Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
+    pub db_pipeline: Arc<dyn pipeline::Runner<Result<(), Error>>>,
 }
 
 /// The filesystem storage backend: buckets are top-level subdirectories of
@@ -154,6 +162,7 @@ pub struct FsOptions {
 ///
 /// ```rust
 /// use std::sync::Arc;
+///
 /// use tinio_core::{
 ///     bucket,
 ///     pipeline::InlineRunner,
@@ -164,6 +173,7 @@ pub struct FsOptions {
 /// };
 /// use tinio_fs::{FsOptions, FsStorage};
 /// use tinio_util::testing::body;
+/// use tokio::runtime::Runtime;
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let storage = FsStorage::new(
@@ -181,7 +191,7 @@ pub struct FsOptions {
 /// )
 /// .unwrap();
 /// let b = bucket::name("data").unwrap();
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// Runtime::new().unwrap().block_on(async {
 ///     storage.create_bucket(&b).await.unwrap();
 ///     storage
 ///         .put_object(&b, &"hello.txt".into(), body(b"hi"))
@@ -213,7 +223,7 @@ pub struct FsStorage {
     meta_store: meta::Store,
     /// Multipart parts storage.
     #[getset(get = "pub(crate)")]
-    multipart_store: crate::multipart::Store,
+    multipart_store: MultipartStore,
     /// The shared state-database handle (the stores each hold a clone;
     /// kept here for cross-store single-transaction operations such as
     /// [`Self::remove_bucket_state`]).
@@ -230,7 +240,7 @@ pub struct FsStorage {
     /// ETag compute on the IO pipeline.
     #[getset(skip)]
     #[debug("<runner>")]
-    remove_pipeline: Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
+    remove_pipeline: Arc<dyn pipeline::Runner<Result<(), Error>>>,
     /// Per-bucket directory-mutation locks (rename/create/remove). A
     /// `delete_bucket` of A cannot remove a just-written object of A
     /// (emptiness check and unpublish are one critical section against
@@ -248,7 +258,7 @@ pub struct FsStorage {
 /// warns (D-E) — a second: delete/create/PUT-commit of the same name
 /// should never hold the mutex that long in normal operation, so the
 /// warn marks a stuck peer, not routine contention.
-const MUTATION_LOCK_WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+const MUTATION_LOCK_WARN_THRESHOLD: Duration = Duration::from_secs(1);
 
 impl FsStorage {
     /// Open (or create) the backend over `root` — the convenience path:
@@ -314,7 +324,7 @@ impl FsStorage {
         &self,
         name: &bucket::Name,
     ) -> lockmap::Guard<bucket::Name> {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let guard = self.bucket_mutation_locks.lock(name.clone()).await;
         let waited = started.elapsed();
         if waited > MUTATION_LOCK_WARN_THRESHOLD {
@@ -327,9 +337,16 @@ impl FsStorage {
         guard
     }
 
+    /// The removal lane (D-A) — the tombstone `remove_dir_all` runner.
+    /// The cleanup stages and the scanner enqueue through it instead of
+    /// clearing trees inline on their own paths.
+    pub(crate) fn remove_pipeline(&self) -> Arc<dyn pipeline::Runner<Result<(), Error>>> {
+        Arc::clone(&self.remove_pipeline)
+    }
+
     fn resolve(root: PathBuf, options: FsOptions) -> Result<(PathBuf, PathBuf, FsOptions), Error> {
         options.validate().map_err(invalid_value)?;
-        let canonical = fs::canonicalize(&root)?;
+        let canonical = canonicalize(&root)?;
         if !canonical.is_dir() {
             return Err(root_not_directory(canonical));
         }
@@ -363,7 +380,7 @@ impl FsStorage {
             compact_threshold_percent,
             listing: FsListing::new(
                 &canonical,
-                meta::Store::from_handle(handle.clone()),
+                Store::from_handle(handle.clone()),
                 follow_symlinks,
                 io_pipeline,
                 db_pipeline,
@@ -371,16 +388,16 @@ impl FsStorage {
                 meta_batch_bytes,
             ),
             remove_pipeline,
-            bucket_store: bucket::Store::from_handle(handle.clone()),
-            meta_store: meta::Store::from_handle(handle.clone()),
-            multipart_store: crate::multipart::Store::from_handle(
+            bucket_store: BucketStore::from_handle(handle.clone()),
+            meta_store: Store::from_handle(handle.clone()),
+            multipart_store: MultipartStore::from_handle(
                 handle.clone(),
                 &state_dir,
                 DEFAULT_MAX_CONCURRENT_UPLOADS,
             ),
             handle,
             writer: AtomicWriter::new(&state_dir),
-            bucket_mutation_locks: lockmap::Map::new(),
+            bucket_mutation_locks: Map::new(),
             boundary_cache: BoundaryCache::new(),
             root: canonical,
             state_dir,
@@ -410,13 +427,13 @@ impl FsStorage {
     pub(crate) async fn bucket_dir(&self, name: &bucket::Name) -> Result<PathBuf, Error> {
         if self.follow_symlinks {
             let lexical = self.root().join(&**name);
-            match tokio::fs::symlink_metadata(&lexical).await {
-                Ok(metadata) if crate::fsutil::is_symlink_or_reparse(&metadata) => {
-                    return tokio::fs::canonicalize(&lexical).await.map_err(|err| {
-                        if err.kind() == io::ErrorKind::NotFound {
+            match fs::symlink_metadata(&lexical).await {
+                Ok(metadata) if fsutil::is_symlink_or_reparse(&metadata) => {
+                    return fs::canonicalize(&lexical).await.map_err(|err| {
+                        if err.kind() == ErrorKind::NotFound {
                             // A dangling bucket link has no target — no
                             // bucket.
-                            crate::Error::Storage(no_such_bucket(name))
+                            Error::Storage(no_such_bucket(name))
                         } else {
                             err.into()
                         }
@@ -429,7 +446,7 @@ impl FsStorage {
                 // Windows — remove + recreate): the bucket does not
                 // exist at this instant — NoSuchBucket, never a 500 from
                 // the lexical-probe fallback.
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                Err(err) if err.kind() == ErrorKind::NotFound => {
                     return Err(no_such_bucket(name).into());
                 }
                 Err(err) => return Err(err.into()),
@@ -502,17 +519,17 @@ impl FsStorage {
     /// bucket *is* the target); with following disabled it is invisible.
     pub(crate) async fn bucket_names(&self) -> Result<Vec<bucket::Name>, Error> {
         let mut out = Vec::new();
-        let mut entries = tokio::fs::read_dir(self.root()).await?;
+        let mut entries = fs::read_dir(self.root()).await?;
         while let Some(entry) = entries.next_entry().await? {
             // lstat: a link entry is judged by its resolved target only
             // when following is enabled (a broken link is skipped).
-            let lmeta = match tokio::fs::symlink_metadata(entry.path()).await {
+            let lmeta = match fs::symlink_metadata(entry.path()).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
             };
             let mut is_dir = lmeta.is_dir();
-            if self.follow_symlinks && crate::fsutil::is_symlink_or_reparse(&lmeta) {
-                is_dir = tokio::fs::metadata(entry.path())
+            if self.follow_symlinks && fsutil::is_symlink_or_reparse(&lmeta) {
+                is_dir = fs::metadata(entry.path())
                     .await
                     .map(|m| m.is_dir())
                     .unwrap_or(false);
@@ -574,11 +591,11 @@ impl FsStorage {
         upload_id: &str,
         etag: &ETag,
         path: &Path,
-        metadata: &fs::Metadata,
+        metadata: &Metadata,
     ) -> Result<(), Error> {
         let size = metadata.len();
         let mtime = metadata.modified()?;
-        let identity = crate::fsutil::file_identity(path, metadata);
+        let identity = fsutil::file_identity(path, metadata);
         let bucket = bucket.clone();
         let key = key.clone();
         let upload_id = upload_id.to_string();

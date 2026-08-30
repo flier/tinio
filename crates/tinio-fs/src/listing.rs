@@ -3,7 +3,7 @@
 //! A directory-tree walk (buckets → files, keys in lexicographic order)
 //! with prefix filtering, delimiter-based grouping (common-prefix roll-up),
 //! and pagination per S3 semantics (FR-004) — via the shared engine
-//! `tinio_core::storage::group_and_paginate`.
+//! `group_and_paginate`.
 //!
 //! ETags are included: missing/stale entries of the emitted page are
 //! recomputed through the **IO pipeline** (`etag::ComputeTask`, pipeline-spec.md
@@ -27,23 +27,31 @@
 
 use std::{
     collections::HashSet,
-    io,
+    fs::Metadata,
+    io::ErrorKind,
+    mem::take,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::SystemTime,
 };
 
-use futures::stream::{self, FuturesUnordered};
-use futures::{FutureExt, Stream, StreamExt};
+use derive_more::Debug;
+use futures::{
+    FutureExt, Stream, StreamExt,
+    stream::{self, FuturesUnordered},
+};
 use tinio_core::{
     ETag, bucket,
     object::{self, Info},
     pipeline::{self, Completion},
     storage::{self, ListObjectsParams, ObjectListing, group_and_paginate},
 };
+use tokio::fs;
 
-use crate::{Error, etag, meta, path::STATE_DIR_NAME, write_task::MetaWriteBatchTask};
+use crate::{
+    Error, etag, fsutil, meta, path, path::STATE_DIR_NAME, write_task::MetaWriteBatchTask,
+};
 
 /// The per-entry meta-batch size estimate (pipeline-spec.md Q5): a stored
 /// row is ≈ 56 B plus the key bytes. The producers use it for the
@@ -73,7 +81,7 @@ pub struct WalkedFile {
     /// The object mtime at stat time.
     pub mtime: SystemTime,
     /// The stat the size/mtime came from — the identity source.
-    metadata: std::fs::Metadata,
+    metadata: Metadata,
 }
 
 impl WalkedFile {
@@ -83,7 +91,7 @@ impl WalkedFile {
     /// that actually gate pay the open: the LIST page gate, or the
     /// scanner once per file).
     pub fn identity(&self) -> u64 {
-        crate::fsutil::file_identity(&self.path, &self.metadata)
+        fsutil::file_identity(&self.path, &self.metadata)
     }
 }
 
@@ -99,7 +107,7 @@ impl WalkedFile {
 pub(crate) struct MetaBatchAccumulator<'a> {
     bucket: &'a bucket::Name,
     meta: meta::Store,
-    db: &'a Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
+    db: &'a Arc<dyn pipeline::Runner<Result<(), Error>>>,
     batch_size: u16,
     batch_bytes: u32,
     entries: Vec<meta::BatchEntry>,
@@ -111,7 +119,7 @@ impl<'a> MetaBatchAccumulator<'a> {
     pub(crate) fn new(
         bucket: &'a bucket::Name,
         meta: meta::Store,
-        db: &'a Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
+        db: &'a Arc<dyn pipeline::Runner<Result<(), Error>>>,
         batch_size: u16,
         batch_bytes: u32,
     ) -> Self {
@@ -132,7 +140,7 @@ impl<'a> MetaBatchAccumulator<'a> {
     pub(crate) async fn push(
         &mut self,
         entry: meta::BatchEntry,
-    ) -> Result<Option<Completion<Result<(), crate::Error>>>, pipeline::Error> {
+    ) -> Result<Option<Completion<Result<(), Error>>>, pipeline::Error> {
         self.bytes += META_ENTRY_ESTIMATE_BYTES + entry.key.as_ref().len() as u64;
         self.entries.push(entry);
         if self.entries.len() >= usize::from(self.batch_size)
@@ -153,7 +161,7 @@ impl<'a> MetaBatchAccumulator<'a> {
     pub(crate) async fn push_outcome(
         &mut self,
         outcome: etag::Outcome,
-    ) -> Result<Option<Completion<Result<(), crate::Error>>>, pipeline::Error> {
+    ) -> Result<Option<Completion<Result<(), Error>>>, pipeline::Error> {
         self.push(meta::BatchEntry {
             key: outcome.key,
             etag: outcome.etag,
@@ -170,12 +178,12 @@ impl<'a> MetaBatchAccumulator<'a> {
     /// result).
     pub(crate) async fn flush(
         &mut self,
-    ) -> Result<Option<Completion<Result<(), crate::Error>>>, pipeline::Error> {
+    ) -> Result<Option<Completion<Result<(), Error>>>, pipeline::Error> {
         if self.entries.is_empty() {
             return Ok(None);
         }
         self.bytes = 0;
-        let entries = std::mem::take(&mut self.entries);
+        let entries = take(&mut self.entries);
         let task = MetaWriteBatchTask {
             meta: self.meta.clone(),
             bucket: self.bucket.clone(),
@@ -191,12 +199,14 @@ impl<'a> MetaBatchAccumulator<'a> {
 ///
 /// ```rust
 /// use std::sync::Arc;
+///
 /// use tinio_core::{
 ///     bucket,
 ///     pipeline::InlineRunner,
 ///     storage::{DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, ListObjectsParams},
 /// };
 /// use tinio_fs::{FsListing, meta};
+/// use tokio::runtime::Runtime;
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let state = tempfile::tempdir().unwrap();
@@ -210,12 +220,12 @@ impl<'a> MetaBatchAccumulator<'a> {
 ///     DEFAULT_META_BATCH_SIZE,
 ///     DEFAULT_META_BATCH_BYTES,
 /// );
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// Runtime::new().unwrap().block_on(async {
 ///     let b = bucket::name("data").unwrap();
-///     std::fs::create_dir(root.path().join("data")).unwrap();
-///     std::fs::write(root.path().join("data/a.txt"), b"a").unwrap();
-///     std::fs::create_dir(root.path().join("data/dir")).unwrap();
-///     std::fs::write(root.path().join("data/dir/b.txt"), b"b").unwrap();
+///     create_dir(root.path().join("data")).unwrap();
+///     write(root.path().join("data/a.txt"), b"a").unwrap();
+///     create_dir(root.path().join("data/dir")).unwrap();
+///     write(root.path().join("data/dir/b.txt"), b"b").unwrap();
 ///     let page = listing
 ///         .list(&ListObjectsParams {
 ///             bucket: b,
@@ -230,7 +240,7 @@ impl<'a> MetaBatchAccumulator<'a> {
 ///     assert_eq!(page.common_prefixes, ["dir/"]);
 /// });
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FsListing {
     /// Storage root (bucket dirs at the top level).
     root: PathBuf,
@@ -240,8 +250,10 @@ pub struct FsListing {
     /// `follow_symlinks` is disabled.
     follow_symlinks: bool,
     /// The IO pipeline (`etag::ComputeTask`, typed to [`etag::Result`] — P4).
+    #[debug("<runner>")]
     io_pipeline: Arc<dyn pipeline::Runner<etag::Result>>,
     /// The DB write pipeline (`MetaWriteBatchTask` — P4).
+    #[debug("<runner>")]
     db_pipeline: Arc<dyn pipeline::Runner<Result<(), Error>>>,
     /// The meta-batch entry-count flush threshold (`[storage.fs]
     /// meta_batch_size`).
@@ -249,22 +261,6 @@ pub struct FsListing {
     /// The meta-batch byte flush threshold (`[storage.fs]
     /// meta_batch_bytes`).
     meta_batch_bytes: u32,
-}
-
-impl std::fmt::Debug for FsListing {
-    /// The pipelines are opaque handles (`Arc<dyn Runner>` is not
-    /// `Debug`) — rendered as `<runner>`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FsListing")
-            .field("root", &self.root)
-            .field("meta", &self.meta)
-            .field("follow_symlinks", &self.follow_symlinks)
-            .field("io_pipeline", &"<runner>")
-            .field("db_pipeline", &"<runner>")
-            .field("meta_batch_size", &self.meta_batch_size)
-            .field("meta_batch_bytes", &self.meta_batch_bytes)
-            .finish()
-    }
 }
 
 impl FsListing {
@@ -491,7 +487,7 @@ impl FsListing {
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err),
         };
         // The result key is one of the page's keys (the task carried
@@ -558,10 +554,10 @@ impl FsListing {
         // object ops give for a `con`/`nul` bucket instead of a raw IO 500
         // from the console device. The symlink policy stays inline below
         // (the follow-enabled resolution must not run here).
-        let bucket_dir = crate::path::bucket_path_lexical(&self.root, bucket)?;
-        let bucket_meta = match tokio::fs::symlink_metadata(&bucket_dir).await {
+        let bucket_dir = path::bucket_path_lexical(&self.root, bucket)?;
+        let bucket_meta = match fs::symlink_metadata(&bucket_dir).await {
             Ok(metadata) => metadata,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err) if err.kind() == ErrorKind::NotFound => {
                 return Err(storage::no_such_bucket(bucket).into());
             }
             Err(err) => return Err(err.into()),
@@ -576,23 +572,23 @@ impl FsListing {
         // follow-enabled path gives through its canonicalize (F13): a
         // symlink that resolves to nothing must not answer an empty,
         // untruncated 200.
-        if crate::fsutil::is_symlink_or_reparse(&bucket_meta)
+        if fsutil::is_symlink_or_reparse(&bucket_meta)
             && !self.follow_symlinks
-            && let Err(err) = tokio::fs::canonicalize(&bucket_dir).await
+            && let Err(err) = fs::canonicalize(&bucket_dir).await
         {
-            if err.kind() == io::ErrorKind::NotFound {
+            if err.kind() == ErrorKind::NotFound {
                 return Err(storage::no_such_bucket(bucket).into());
             }
             return Err(err.into());
         }
-        if !(crate::fsutil::is_symlink_or_reparse(&bucket_meta) && !self.follow_symlinks) {
+        if !(fsutil::is_symlink_or_reparse(&bucket_meta) && !self.follow_symlinks) {
             // Resolved directory targets already descended into — a
             // symlink pointing at an ancestor would otherwise loop
             // forever.
             if self.follow_symlinks {
-                visited.insert(match tokio::fs::canonicalize(&bucket_dir).await {
+                visited.insert(match fs::canonicalize(&bucket_dir).await {
                     Ok(canonical) => canonical,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
                         return Err(storage::no_such_bucket(bucket).into());
                     }
                     Err(err) => return Err(err.into()),
@@ -636,7 +632,7 @@ struct WalkState {
     /// Worklist of `(directory, relative-prefix)` pairs.
     stack: Vec<(PathBuf, PathBuf)>,
     /// The in-progress directory's entry cursor.
-    current: Option<(PathBuf, PathBuf, tokio::fs::ReadDir)>,
+    current: Option<(PathBuf, PathBuf, fs::ReadDir)>,
     /// A fatal error was already emitted — the stream terminates.
     done: bool,
 }
@@ -664,12 +660,12 @@ impl WalkState {
                     if name == STATE_DIR_NAME {
                         continue; // reserved at any depth (FR-020)
                     }
-                    let lmeta = match tokio::fs::symlink_metadata(entry.path()).await {
+                    let lmeta = match fs::symlink_metadata(entry.path()).await {
                         Ok(metadata) => metadata,
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
                         Err(err) => return self.fatal(err.into()),
                     };
-                    let is_symlink = crate::fsutil::is_symlink_or_reparse(&lmeta);
+                    let is_symlink = fsutil::is_symlink_or_reparse(&lmeta);
                     if is_symlink && !self.follow_symlinks {
                         continue;
                     }
@@ -684,7 +680,7 @@ impl WalkState {
                     let key = key.replace('\\', "/");
                     if file_type.is_dir()
                         || (is_symlink
-                            && tokio::fs::metadata(entry.path())
+                            && fs::metadata(entry.path())
                                 .await
                                 .map(|m| m.is_dir())
                                 .unwrap_or(false))
@@ -693,7 +689,7 @@ impl WalkState {
                         // (a cycle): never descend into a resolved target
                         // twice.
                         if is_symlink {
-                            let target = match tokio::fs::canonicalize(entry.path()).await {
+                            let target = match fs::canonicalize(entry.path()).await {
                                 Ok(target) => target,
                                 Err(err) => return self.fatal(err.into()),
                             };
@@ -737,9 +733,9 @@ impl WalkState {
                     // dangling link (target gone) is skipped — one broken
                     // link must not fail the whole bucket walk.
                     let metadata = if is_symlink {
-                        match tokio::fs::metadata(entry.path()).await {
+                        match fs::metadata(entry.path()).await {
                             Ok(metadata) => metadata,
-                            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                            Err(err) if err.kind() == ErrorKind::NotFound => continue,
                             Err(err) => return self.fatal(err.into()),
                         }
                     } else {
@@ -761,7 +757,7 @@ impl WalkState {
                         // The identity is lazy (see `WalkedFile`): the
                         // stat is stored, the Windows open is deferred to
                         // the consumers that actually gate.
-                        metadata: std::fs::Metadata::clone(&metadata),
+                        metadata: Metadata::clone(&metadata),
                     }));
                 }
                 // The directory is exhausted — fall through to the
@@ -773,9 +769,9 @@ impl WalkState {
                 self.done = true;
                 return None;
             };
-            let entries = match tokio::fs::read_dir(&dir).await {
+            let entries = match fs::read_dir(&dir).await {
                 Ok(entries) => entries,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                Err(err) if err.kind() == ErrorKind::NotFound => {
                     if prefix.as_os_str().is_empty() {
                         // The bucket directory itself is gone.
                         return self.fatal(storage::no_such_bucket(&self.bucket).into());
@@ -798,15 +794,29 @@ impl WalkState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testutil::{GatedRunner, LossyRunner, PacedRunner, rt, wait_for};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::{
-        fs,
+        fs::{File, OpenOptions, create_dir, create_dir_all, metadata, read, read_dir, write},
+        process::Command,
         time::{Duration, Instant},
     };
-    use tinio_core::pipeline::InlineRunner;
-    use tinio_core::storage::{
-        DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, Error::NoSuchBucket, ListObjectsParams,
+
+    use tinio_core::{
+        pipeline::{Error::Dropped, InlineRunner},
+        storage::{
+            DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, Error::NoSuchBucket,
+            ListObjectsParams,
+        },
+    };
+    use tinio_util::testing;
+    use tokio::fs;
+
+    use super::*;
+    use crate::{
+        database,
+        database::ObjectMetaTable,
+        testutil::{GatedRunner, LossyRunner, PacedRunner, files, wait_for},
     };
 
     /// The standard test listing: the fs defaults plus the mandatory
@@ -854,11 +864,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let b = bucket::name("data").unwrap();
-        fs::create_dir(root.path().join("data")).unwrap();
+        create_dir(root.path().join("data")).unwrap();
         for key in ["a.txt", "b.txt", "dir/c.txt", "dir/sub/d.txt", "dir/e.txt"] {
             let path = root.path().join("data").join(key);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, format!("{key}!")).unwrap();
+            create_dir_all(path.parent().unwrap()).unwrap();
+            write(path, format!("{key}!")).unwrap();
         }
         let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
         (root, state, listing, b)
@@ -880,195 +890,187 @@ mod tests {
         }
     }
 
-    #[test]
-    fn full_listing_is_lexicographic() {
-        rt(async {
-            let (_root, _state, listing, b) = fixture();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
+    #[tokio::test]
+    async fn full_listing_is_lexicographic() {
+        let (_root, _state, listing, b) = fixture();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["a.txt", "b.txt", "dir/c.txt", "dir/e.txt", "dir/sub/d.txt"]
+        );
+        // ETags were computed (sync recompute pass) and persisted.
+        for info in &page.objects {
             assert_eq!(
-                keys,
-                ["a.txt", "b.txt", "dir/c.txt", "dir/e.txt", "dir/sub/d.txt"]
+                info.etag,
+                ETag::from_content(format!("{}!", info.key).as_bytes())
             );
-            // ETags were computed (sync recompute pass) and persisted.
-            for info in &page.objects {
-                assert_eq!(
-                    info.etag,
-                    ETag::from_content(format!("{}!", info.key).as_bytes())
-                );
-            }
-        });
+        }
     }
 
-    #[test]
-    fn prefix_and_delimiter_grouping() {
-        rt(async {
-            let (_root, _state, listing, b) = fixture();
-            let page = listing
-                .list(&params(&b, "dir/", None, None, 1000))
-                .await
-                .unwrap();
-            assert!(page.objects.iter().all(|o| o.key.starts_with("dir/")));
-            assert_eq!(page.objects.len(), 3);
+    #[tokio::test]
+    async fn prefix_and_delimiter_grouping() {
+        let (_root, _state, listing, b) = fixture();
+        let page = listing
+            .list(&params(&b, "dir/", None, None, 1000))
+            .await
+            .unwrap();
+        assert!(page.objects.iter().all(|o| o.key.starts_with("dir/")));
+        assert_eq!(page.objects.len(), 3);
 
-            let page = listing
-                .list(&params(&b, "", Some("/"), None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert_eq!(keys, ["a.txt", "b.txt"]);
-            assert_eq!(page.common_prefixes, ["dir/"]);
-        });
+        let page = listing
+            .list(&params(&b, "", Some("/"), None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert_eq!(keys, ["a.txt", "b.txt"]);
+        assert_eq!(page.common_prefixes, ["dir/"]);
     }
 
-    #[test]
-    fn pagination_rolls_over() {
-        rt(async {
-            let (_root, _state, listing, b) = fixture();
-            let page = listing.list(&params(&b, "", None, None, 2)).await.unwrap();
-            assert_eq!(page.objects.len(), 2);
-            assert!(page.truncated);
-            let resume = page.next_start_after.clone().unwrap();
-            let page2 = listing
-                .list(&params(&b, "", None, Some(&resume), 1000))
-                .await
-                .unwrap();
-            assert_eq!(page.objects.len() + page2.objects.len(), 5);
-            assert!(!page2.truncated);
-        });
+    #[tokio::test]
+    async fn pagination_rolls_over() {
+        let (_root, _state, listing, b) = fixture();
+        let page = listing.list(&params(&b, "", None, None, 2)).await.unwrap();
+        assert_eq!(page.objects.len(), 2);
+        assert!(page.truncated);
+        let resume = page.next_start_after.clone().unwrap();
+        let page2 = listing
+            .list(&params(&b, "", None, Some(&resume), 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len() + page2.objects.len(), 5);
+        assert!(!page2.truncated);
     }
 
-    #[test]
-    fn missing_bucket_is_no_such_bucket() {
-        rt(async {
-            let (_, _, listing, _) = fixture();
-            let missing = bucket::name("ghost").unwrap();
-            let err = listing
-                .list(&params(&missing, "", None, None, 1000))
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
-        });
+    #[tokio::test]
+    async fn missing_bucket_is_no_such_bucket() {
+        let (_, _, listing, _) = fixture();
+        let missing = bucket::name("ghost").unwrap();
+        let err = listing
+            .list(&params(&missing, "", None, None, 1000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
     }
 
-    #[test]
-    fn tinio_entries_skipped_at_any_depth() {
-        rt(async {
-            let (_root, _, listing, b) = fixture();
-            let root = _root;
-            fs::create_dir_all(root.path().join("data/dir/.tinio")).unwrap();
-            fs::write(root.path().join("data/dir/.tinio/state"), b"x").unwrap();
-            // A file literally named `.tinio` at the bucket root is
-            // reserved too (FR-020, exact segment).
-            fs::write(root.path().join("data/.tinio"), b"x").unwrap();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert!(!keys.iter().any(|k| k.contains(".tinio")));
-            assert_eq!(keys.len(), 5);
-        });
+    #[tokio::test]
+    async fn tinio_entries_skipped_at_any_depth() {
+        let (_root, _, listing, b) = fixture();
+        let root = _root;
+        fs::create_dir_all(root.path().join("data/dir/.tinio"))
+            .await
+            .unwrap();
+        fs::write(root.path().join("data/dir/.tinio/state"), b"x")
+            .await
+            .unwrap();
+        // A file literally named `.tinio` at the bucket root is
+        // reserved too (FR-020, exact segment).
+        fs::write(root.path().join("data/.tinio"), b"x")
+            .await
+            .unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert!(!keys.iter().any(|k| k.contains(".tinio")));
+        assert_eq!(keys.len(), 5);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn dangling_symlink_is_skipped_not_fatal() {
-        rt(async {
-            let (root, _state, listing, b) = fixture();
-            // A link whose target does not exist must not fail the whole
-            // bucket listing (or the scanner pass).
-            std::os::unix::fs::symlink(
-                root.path().join("nope.txt"),
-                root.path().join("data/broken"),
+    #[tokio::test]
+    async fn dangling_symlink_is_skipped_not_fatal() {
+        let (root, _state, listing, b) = fixture();
+        // A link whose target does not exist must not fail the whole
+        // bucket listing (or the scanner pass).
+        symlink(
+            root.path().join("nope.txt"),
+            root.path().join("data/broken"),
+        )
+        .unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert_eq!(keys.len(), 5, "{keys:?}");
+        assert!(!keys.contains(&"broken"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_cycles_terminate() {
+        let (root, _state, listing, b) = fixture();
+        // `loop` points at the bucket itself: without cycle detection
+        // the walk would descend forever.
+        symlink(".", root.path().join("data/loop")).unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert!(keys.contains(&"a.txt"), "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn symlink_entries_excluded_when_disabled() {
+        let (root, _state, _, _b) = fixture();
+        fs::write(root.path().join("outside.txt"), b"out")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let state = _state;
+            let b = _b;
+            symlink(
+                root.path().join("outside.txt"),
+                root.path().join("data/link.txt"),
             )
             .unwrap();
+            let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
             let page = listing
                 .list(&params(&b, "", None, None, 1000))
                 .await
                 .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert_eq!(keys.len(), 5, "{keys:?}");
-            assert!(!keys.contains(&"broken"));
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_cycles_terminate() {
-        rt(async {
-            let (root, _state, listing, b) = fixture();
-            // `loop` points at the bucket itself: without cycle detection
-            // the walk would descend forever.
-            std::os::unix::fs::symlink(".", root.path().join("data/loop")).unwrap();
+            assert!(!page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
+            let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
             let page = listing
                 .list(&params(&b, "", None, None, 1000))
                 .await
                 .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert!(keys.contains(&"a.txt"), "{keys:?}");
-        });
+            assert!(page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
+        }
     }
 
-    #[test]
-    fn symlink_entries_excluded_when_disabled() {
-        rt(async {
-            let (root, _state, _, _b) = fixture();
-            fs::write(root.path().join("outside.txt"), b"out").unwrap();
-            #[cfg(unix)]
-            {
-                let state = _state;
-                let b = _b;
-                std::os::unix::fs::symlink(
-                    root.path().join("outside.txt"),
-                    root.path().join("data/link.txt"),
-                )
-                .unwrap();
-                let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
-                let page = listing
-                    .list(&params(&b, "", None, None, 1000))
-                    .await
-                    .unwrap();
-                assert!(!page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
-                let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-                let page = listing
-                    .list(&params(&b, "", None, None, 1000))
-                    .await
-                    .unwrap();
-                assert!(page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
-            }
-        });
-    }
-
-    fn link_directory(src: &std::path::Path, dst: &std::path::Path) {
+    fn link_directory(src: &Path, dst: &Path) {
         #[cfg(unix)]
-        std::os::unix::fs::symlink(src, dst).unwrap();
+        symlink(src, dst).unwrap();
         #[cfg(windows)]
         {
-            let status = std::process::Command::new("cmd")
+            let status = Command::new("cmd")
                 .args([
                     "/C",
                     "mklink",
@@ -1082,100 +1084,94 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bucket_dir_symlink_not_walked_when_disabled() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let outside = tempfile::tempdir().unwrap();
-            fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
-            link_directory(outside.path(), &root.path().join("data"));
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
-            let b = bucket::name("data").unwrap();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert!(
-                keys.is_empty(),
-                "must not list through a bucket-dir symlink: {keys:?}"
-            );
-        });
+    #[tokio::test]
+    async fn bucket_dir_symlink_not_walked_when_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"secret")
+            .await
+            .unwrap();
+        link_directory(outside.path(), &root.path().join("data"));
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
+        let b = bucket::name("data").unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "must not list through a bucket-dir symlink: {keys:?}"
+        );
     }
 
-    #[test]
-    fn out_of_band_edit_recomputes_etag() {
-        rt(async {
-            let (root, _, listing, b) = fixture();
-            // First listing persists the entries.
-            listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            // Out-of-band modification (new size).
-            fs::write(root.path().join("data/a.txt"), b"changed content").unwrap();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            let a = page
-                .objects
-                .iter()
-                .find(|o| o.key.as_ref() == "a.txt")
-                .unwrap();
-            assert_eq!(a.etag, ETag::from_content(b"changed content"));
-        });
+    #[tokio::test]
+    async fn out_of_band_edit_recomputes_etag() {
+        let (root, _, listing, b) = fixture();
+        // First listing persists the entries.
+        listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        // Out-of-band modification (new size).
+        fs::write(root.path().join("data/a.txt"), b"changed content")
+            .await
+            .unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let a = page
+            .objects
+            .iter()
+            .find(|o| o.key.as_ref() == "a.txt")
+            .unwrap();
+        assert_eq!(a.etag, ETag::from_content(b"changed content"));
     }
 
-    #[test]
-    fn directories_never_objects() {
-        rt(async {
-            let (root, _, listing, b) = fixture();
-            fs::create_dir_all(root.path().join("data/empty-dir")).unwrap();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert!(!page.objects.iter().any(|o| o.key.as_ref() == "empty-dir"));
-        });
+    #[tokio::test]
+    async fn directories_never_objects() {
+        let (root, _, listing, b) = fixture();
+        fs::create_dir_all(root.path().join("data/empty-dir"))
+            .await
+            .unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert!(!page.objects.iter().any(|o| o.key.as_ref() == "empty-dir"));
     }
 
-    #[test]
-    fn prefix_prunes_whole_subtrees() {
-        // A directory neither inside the prefix nor an ancestor of it can
-        // never hold a matching key — the walk must skip the subtree, not
-        // descend into it (a `max_keys=1` listing of a huge bucket costs
-        // only the prefix's directories).
-        rt(async {
-            let (_root, _state, listing, b) = fixture();
-            let page = listing
-                .list(&params(&b, "b.txt", None, None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert_eq!(keys, ["b.txt"], "dir/ subtree must be pruned");
-            // An ancestor prefix still descends (dir/ is an ancestor of
-            // dir/sub/): the sub-tree is not pruned away.
-            let page = listing
-                .list(&params(&b, "dir/sub/d", None, None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert_eq!(keys, ["dir/sub/d.txt"]);
-        });
+    #[tokio::test]
+    async fn prefix_prunes_whole_subtrees() {
+        let (_root, _state, listing, b) = fixture();
+        let page = listing
+            .list(&params(&b, "b.txt", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert_eq!(keys, ["b.txt"], "dir/ subtree must be pruned");
+        // An ancestor prefix still descends (dir/ is an ancestor of
+        // dir/sub/): the sub-tree is not pruned away.
+        let page = listing
+            .list(&params(&b, "dir/sub/d", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert_eq!(keys, ["dir/sub/d.txt"]);
     }
 
     // --- the streaming walk (P2) ---
@@ -1187,7 +1183,7 @@ mod tests {
         let mut out = Vec::new();
         let mut stack = vec![(root.to_path_buf(), PathBuf::new())];
         while let Some((dir, prefix)) = stack.pop() {
-            for entry in fs::read_dir(&dir).unwrap() {
+            for entry in read_dir(&dir).unwrap() {
                 let entry = entry.unwrap();
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
@@ -1202,7 +1198,7 @@ mod tests {
                     stack.push((entry.path(), rel));
                     continue;
                 }
-                if file_type.is_symlink() && fs::metadata(entry.path()).is_err() {
+                if file_type.is_symlink() && metadata(entry.path()).is_err() {
                     continue; // dangling — skipped by the walk
                 }
                 let key = rel.to_string_lossy().into_owned();
@@ -1214,8 +1210,8 @@ mod tests {
         out
     }
 
-    #[test]
-    fn walk_stream_emits_files_in_read_dir_order() {
+    #[tokio::test]
+    async fn walk_stream_emits_files_in_read_dir_order() {
         // The stream is the scanner's walk: files come out one at a
         // time, in the directory's OWN enumeration order — never a key
         // sort (the scanner needs no order; the sorted form is
@@ -1224,143 +1220,122 @@ mod tests {
         // on the same filesystem (NTFS enumerates B-tree order, ext4
         // hash order; neither is a key sort, so a future sort-regression
         // changes the stream's order).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let b = bucket::name("data").unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            // Created in non-lexicographic order on purpose.
-            for key in ["b.txt", "a.txt", "c.txt"] {
-                fs::write(root.path().join("data").join(key), key).unwrap();
-            }
-            let expected: Vec<String> = fs::read_dir(root.path().join("data"))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-            let mut walked = listing.walk_files_streaming(&b, "").await.unwrap();
-            let mut keys = Vec::new();
-            while let Some(file) = walked.next().await {
-                keys.push(file.unwrap().key.to_string());
-            }
-            assert_eq!(
-                keys, expected,
-                "the stream must follow read_dir order, unsorted"
-            );
-        });
-    }
 
-    #[test]
-    fn walk_stream_collects_every_object_of_the_tree() {
-        // The stream's file SET matches an independent filesystem walk:
-        // nested directories, empty directories (never objects),
-        // `.tinio` at depth (skipped), and a dangling link (skipped,
-        // unix) — the streaming walk is the one source of truth for
-        // what an object is.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let b = bucket::name("data").unwrap();
-            for key in [
-                "a.txt",
-                "dir/b.txt",
-                "dir/sub/c.txt",
-                "dir/e.txt",
-                "deep/x/y.txt",
-            ] {
-                let path = root.path().join("data").join(key);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, format!("{key}!")).unwrap();
-            }
-            fs::create_dir_all(root.path().join("data/dir/.tinio")).unwrap();
-            fs::write(root.path().join("data/dir/.tinio/state"), b"x").unwrap();
-            fs::create_dir_all(root.path().join("data/empty")).unwrap();
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(root.path().join("gone"), root.path().join("data/broken"))
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        // Created in non-lexicographic order on purpose.
+        for key in ["b.txt", "a.txt", "c.txt"] {
+            fs::write(root.path().join("data").join(key), key)
+                .await
                 .unwrap();
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-            let mut walked = listing.walk_files_streaming(&b, "").await.unwrap();
-            let mut got = Vec::new();
-            while let Some(file) = walked.next().await {
-                got.push(file.unwrap().key.to_string());
-            }
-            let mut want = files_under(&root.path().join("data"));
-            got.sort();
-            want.sort();
-            assert_eq!(got, want);
-        });
+        }
+        let expected: Vec<String> = read_dir(root.path().join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let mut walked = listing.walk_files_streaming(&b, "").await.unwrap();
+        let mut keys = Vec::new();
+        while let Some(file) = walked.next().await {
+            keys.push(file.unwrap().key.to_string());
+        }
+        assert_eq!(
+            keys, expected,
+            "the stream must follow read_dir order, unsorted"
+        );
     }
 
-    #[test]
-    fn walk_stream_missing_bucket_is_no_such_bucket() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-            let missing = bucket::name("ghost").unwrap();
-            let Err(err) = listing.walk_files_streaming(&missing, "").await else {
-                panic!("a missing bucket must error at stream construction");
-            };
-            assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
-        });
+    #[tokio::test]
+    async fn walk_stream_collects_every_object_of_the_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        for key in [
+            "a.txt",
+            "dir/b.txt",
+            "dir/sub/c.txt",
+            "dir/e.txt",
+            "deep/x/y.txt",
+        ] {
+            let path = root.path().join("data").join(key);
+            fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            fs::write(path, format!("{key}!")).await.unwrap();
+        }
+        fs::create_dir_all(root.path().join("data/dir/.tinio"))
+            .await
+            .unwrap();
+        fs::write(root.path().join("data/dir/.tinio/state"), b"x")
+            .await
+            .unwrap();
+        fs::create_dir_all(root.path().join("data/empty"))
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        symlink(root.path().join("gone"), root.path().join("data/broken")).unwrap();
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let mut walked = listing.walk_files_streaming(&b, "").await.unwrap();
+        let mut got = Vec::new();
+        while let Some(file) = walked.next().await {
+            got.push(file.unwrap().key.to_string());
+        }
+        let mut want = files_under(&root.path().join("data"));
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn walk_stream_missing_bucket_is_no_such_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let missing = bucket::name("ghost").unwrap();
+        let Err(err) = listing.walk_files_streaming(&missing, "").await else {
+            panic!("a missing bucket must error at stream construction");
+        };
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
     }
 
     #[cfg(unix)]
-    #[test]
-    fn dangling_bucket_symlink_is_no_such_bucket() {
-        // With following enabled the bucket dir is canonicalized; a link
-        // whose target is gone resolves to nothing — a bucket, not an
-        // empty listing.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(root.path().join("gone"), root.path().join("data")).unwrap();
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-            let b = bucket::name("data").unwrap();
-            let err = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
-        });
+    #[tokio::test]
+    async fn dangling_bucket_symlink_is_no_such_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        symlink(root.path().join("gone"), root.path().join("data")).unwrap();
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let b = bucket::name("data").unwrap();
+        let err = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
     }
 
     #[cfg(unix)]
-    #[test]
-    fn duplicate_symlink_targets_descend_once() {
-        // Two directory links to the SAME target must not be walked
-        // twice: the visited-target set skips the second (a link pointing
-        // at an ancestor would otherwise loop forever).
-        rt(async {
-            let (root, _state, listing, b) = fixture();
-            std::os::unix::fs::symlink(
-                root.path().join("data/dir"),
-                root.path().join("data/link1"),
-            )
+    #[tokio::test]
+    async fn duplicate_symlink_targets_descend_once() {
+        let (root, _state, listing, b) = fixture();
+        symlink(root.path().join("data/dir"), root.path().join("data/link1")).unwrap();
+        symlink(root.path().join("data/dir"), root.path().join("data/link2")).unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
             .unwrap();
-            std::os::unix::fs::symlink(
-                root.path().join("data/dir"),
-                root.path().join("data/link2"),
-            )
-            .unwrap();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            let keys: Vec<&str> = page
-                .objects
-                .iter()
-                .map(|o| o.key.as_ref().as_str())
-                .collect();
-            assert!(
-                !keys.iter().any(|k| k.starts_with("link2/")),
-                "second link to the same target must be skipped: {keys:?}"
-            );
-            assert!(
-                keys.iter().any(|k| k.starts_with("link1/")),
-                "first link is a real object path: {keys:?}"
-            );
-        });
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k.starts_with("link2/")),
+            "second link to the same target must be skipped: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.starts_with("link1/")),
+            "first link is a real object path: {keys:?}"
+        );
     }
 
     // --- the pipeline producers (pipeline-spec.md task 4) ---
@@ -1372,517 +1347,432 @@ mod tests {
         let state = root.join("state");
         // The shared producer fixture (F39) — this test adds its own
         // state store.
-        crate::testutil::files(root, n);
+        files(root, n);
         (meta::store(&state).unwrap(), bucket::name("data").unwrap())
     }
 
     /// The etag of one fixture file.
     fn file_etag(root: &Path, key: &str) -> tinio_core::ETag {
-        tinio_core::ETag::from_content(&std::fs::read(root.join("data").join(key)).unwrap())
+        ETag::from_content(&read(root.join("data").join(key)).unwrap())
     }
 
-    #[test]
-    fn cold_list_writes_one_batch_per_flush_threshold() {
-        // Q5: the producer streams results into write-pipeline batches —
-        // one `MetaWriteBatchTask` per flush, i.e. ≈ N/batch write
-        // transactions. With `meta_batch_size = 2` five entries flush as
-        // 2 + 2 + 1 = 3 batches; with 1, every entry flushes (5). Each
-        // iteration uses a fresh store (a populated store would be a hot
-        // list — nothing to enqueue).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (_, b) = files_fixture(root.path(), 5);
-            for (size, expected) in [(2u16, 3usize), (1, 5)] {
-                let store = meta::store(&root.path().join(format!("state{size}"))).unwrap();
-                let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
-                let listing = listing_with(
-                    root.path(),
-                    store.clone(),
-                    true,
-                    Arc::new(InlineRunner::default()),
-                    db.clone(),
-                    size,
-                    DEFAULT_META_BATCH_BYTES,
-                );
-                let page = listing
-                    .list(&params(&b, "", None, None, 1000))
-                    .await
-                    .unwrap();
-                assert_eq!(page.objects.len(), 5);
-                assert_eq!(
-                    db.enqueued(),
-                    expected,
-                    "batch size {size}: one batch per flush threshold"
-                );
-                // Every entry landed (the batch tasks ran inline on the
-                // paced worker).
-                assert_eq!(store.walk(&b).await.unwrap().len(), 5);
-            }
-        });
-    }
-
-    #[test]
-    fn hot_list_enqueues_nothing() {
-        // P6: after a cold list persists the page, a second (hot) list
-        // serves every entry from the store — zero IO tasks, zero write
-        // transactions (the in-memory matches gate runs before any
-        // enqueue).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 3);
-            let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
+    #[tokio::test]
+    async fn cold_list_writes_one_batch_per_flush_threshold() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, b) = files_fixture(root.path(), 5);
+        for (size, expected) in [(2u16, 3usize), (1, 5)] {
+            let store = meta::store(&root.path().join(format!("state{size}"))).unwrap();
             let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
             let listing = listing_with(
                 root.path(),
                 store.clone(),
                 true,
-                io.clone(),
+                Arc::new(InlineRunner::default()),
                 db.clone(),
-                1,
+                size,
                 DEFAULT_META_BATCH_BYTES,
             );
-            listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert_eq!(io.enqueued(), 3);
-            assert_eq!(db.enqueued(), 3);
-
             let page = listing
                 .list(&params(&b, "", None, None, 1000))
                 .await
                 .unwrap();
-            assert_eq!(page.objects.len(), 3);
-            assert_eq!(io.enqueued(), 3, "hot path: no compute tasks (P6)");
-            assert_eq!(db.enqueued(), 3, "hot path: no write transactions");
-            for info in &page.objects {
-                assert_eq!(info.etag, file_etag(root.path(), info.key.as_ref()));
-            }
-        });
-    }
-
-    #[test]
-    fn pagination_happens_before_enqueue() {
-        // P3: only the emitted page's keys are gated and enqueued — a
-        // `max_keys=1` request costs one compute task (one meta read)
-        // instead of one per bucket object.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 3);
-            let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
-            let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                io.clone(),
-                db.clone(),
-                1,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let page = listing.list(&params(&b, "", None, None, 1)).await.unwrap();
-            assert_eq!(page.objects.len(), 1);
-            assert_eq!(io.enqueued(), 1, "only the emitted page is enqueued (P3)");
-            assert_eq!(db.enqueued(), 1);
-            assert!(page.truncated);
-
-            // The second page rolls over with its own single enqueue.
-            let resume = page.next_start_after.unwrap();
-            listing
-                .list(&params(&b, "", None, Some(&resume), 1))
-                .await
-                .unwrap();
-            assert_eq!(io.enqueued(), 2);
-        });
-    }
-
-    #[test]
-    fn io_concurrency_equals_the_workers() {
-        // Q4: the blocking-task model — the hash concurrency is exactly
-        // the IO pipeline's worker count (a real concurrent runner, not
-        // the concurrency-1 `InlineRunner`).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 4);
-            let io = PacedRunner::<etag::Result>::new(2, 8, Duration::from_millis(40));
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                io.clone(),
-                Arc::new(InlineRunner::default()),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
+            assert_eq!(page.objects.len(), 5);
             assert_eq!(
-                io.max_in_run(),
-                2,
-                "four tasks over two workers must run two at a time"
+                db.enqueued(),
+                expected,
+                "batch size {size}: one batch per flush threshold"
             );
-
-            // A fresh store (the first listing populated the previous one
-            // — a hot list enqueues nothing).
-            let store1 = meta::store(&root.path().join("state1")).unwrap();
-            let io1 = PacedRunner::<etag::Result>::new(1, 8, Duration::from_millis(40));
-            let listing1 = listing_with(
-                root.path(),
-                store1,
-                true,
-                io1.clone(),
-                Arc::new(InlineRunner::default()),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            listing1
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert_eq!(io1.max_in_run(), 1, "one worker serializes");
-        });
+            // Every entry landed (the batch tasks ran inline on the
+            // paced worker).
+            assert_eq!(store.walk(&b).await.unwrap().len(), 5);
+        }
     }
 
-    #[test]
-    fn slow_db_pipeline_backpressures_the_producer() {
-        // Q2/backpressure: the producer waits only for the DB pipeline's
-        // queue capacity — a slow pipeline (1 worker, 150 ms per batch,
-        // capacity 1) forces the later enqueues to block, and the list
-        // still completes correctly.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 3);
-            let db = PacedRunner::<Result<(), Error>>::new(1, 1, Duration::from_millis(150));
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                Arc::new(InlineRunner::default()),
-                db.clone(),
-                1,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let started = Instant::now();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            let elapsed = started.elapsed();
-            assert_eq!(page.objects.len(), 3);
-            // Capacity 1, one worker: batch 2's enqueue does not block —
-            // the slot frees when the worker dequeues batch 1 (the queue
-            // slot, not the worker, is the backpressure bound). The
-            // enqueue that truly blocks is batch 3's (the slot holds
-            // batch 2 until batch 1's ≈ 150 ms run ends); that block plus
-            // the remaining serial drain meets the elapsed bound below.
-            assert!(
-                elapsed >= Duration::from_millis(250),
-                "the producer must block on the full DB queue: {elapsed:?}"
-            );
-            assert_eq!(store.walk(&b).await.unwrap().len(), 3);
-        });
+    #[tokio::test]
+    async fn hot_list_enqueues_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 3);
+        let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
+        let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            io.clone(),
+            db.clone(),
+            1,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(io.enqueued(), 3);
+        assert_eq!(db.enqueued(), 3);
+
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 3);
+        assert_eq!(io.enqueued(), 3, "hot path: no compute tasks (P6)");
+        assert_eq!(db.enqueued(), 3, "hot path: no write transactions");
+        for info in &page.objects {
+            assert_eq!(info.etag, file_etag(root.path(), info.key.as_ref()));
+        }
     }
 
-    #[test]
-    fn vanished_file_skips_the_entry() {
-        // The file vanishes between the walk and the hash (concurrent
-        // delete): the compute task reports NotFound and the entry is
-        // skipped — the page succeeds without it.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 1);
-            let io = GatedRunner::<etag::Result>::new(1, 8);
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                io.clone(),
-                Arc::new(InlineRunner::default()),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let listing2 = listing.clone();
-            let b2 = b.clone();
-            let page =
-                tokio::spawn(
-                    async move { listing2.list(&params(&b2, "", None, None, 1000)).await },
-                );
-            wait_for(|| io.enqueued() == 1).await;
-            // The walk is done (the task is parked); delete the file in
-            // the walk-to-hash window.
-            fs::remove_file(root.path().join("data/f00.txt")).unwrap();
-            io.open_gate();
-            let page = page.await.unwrap().unwrap();
-            assert!(
-                page.objects.is_empty(),
-                "the vanished file must be skipped, not fail the page"
-            );
-        });
+    #[tokio::test]
+    async fn pagination_happens_before_enqueue() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 3);
+        let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
+        let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            io.clone(),
+            db.clone(),
+            1,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let page = listing.list(&params(&b, "", None, None, 1)).await.unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(io.enqueued(), 1, "only the emitted page is enqueued (P3)");
+        assert_eq!(db.enqueued(), 1);
+        assert!(page.truncated);
+
+        // The second page rolls over with its own single enqueue.
+        let resume = page.next_start_after.unwrap();
+        listing
+            .list(&params(&b, "", None, Some(&resume), 1))
+            .await
+            .unwrap();
+        assert_eq!(io.enqueued(), 2);
+    }
+
+    #[tokio::test]
+    async fn io_concurrency_equals_the_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 4);
+        let io = PacedRunner::<etag::Result>::new(2, 8, Duration::from_millis(40));
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            io.clone(),
+            Arc::new(InlineRunner::default()),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(
+            io.max_in_run(),
+            2,
+            "four tasks over two workers must run two at a time"
+        );
+
+        // A fresh store (the first listing populated the previous one
+        // — a hot list enqueues nothing).
+        let store1 = meta::store(&root.path().join("state1")).unwrap();
+        let io1 = PacedRunner::<etag::Result>::new(1, 8, Duration::from_millis(40));
+        let listing1 = listing_with(
+            root.path(),
+            store1,
+            true,
+            io1.clone(),
+            Arc::new(InlineRunner::default()),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        listing1
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(io1.max_in_run(), 1, "one worker serializes");
+    }
+
+    #[tokio::test]
+    async fn slow_db_pipeline_backpressures_the_producer() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 3);
+        let db = PacedRunner::<Result<(), Error>>::new(1, 1, Duration::from_millis(150));
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            Arc::new(InlineRunner::default()),
+            db.clone(),
+            1,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let started = Instant::now();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(page.objects.len(), 3);
+        // Capacity 1, one worker: batch 2's enqueue does not block —
+        // the slot frees when the worker dequeues batch 1 (the queue
+        // slot, not the worker, is the backpressure bound). The
+        // enqueue that truly blocks is batch 3's (the slot holds
+        // batch 2 until batch 1's ≈ 150 ms run ends); that block plus
+        // the remaining serial drain meets the elapsed bound below.
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "the producer must block on the full DB queue: {elapsed:?}"
+        );
+        assert_eq!(store.walk(&b).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn vanished_file_skips_the_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 1);
+        let io = GatedRunner::<etag::Result>::new(1, 8);
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            io.clone(),
+            Arc::new(InlineRunner::default()),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let listing2 = listing.clone();
+        let b2 = b.clone();
+        let page =
+            tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 1000)).await });
+        wait_for(|| io.enqueued() == 1).await;
+        // The walk is done (the task is parked); delete the file in
+        // the walk-to-hash window.
+        fs::remove_file(root.path().join("data/f00.txt"))
+            .await
+            .unwrap();
+        io.open_gate();
+        let page = page.await.unwrap().unwrap();
+        assert!(
+            page.objects.is_empty(),
+            "the vanished file must be skipped, not fail the page"
+        );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn failed_compute_fails_the_list() {
-        // A compute task failure other than NotFound fails the whole
-        // listing (the existing per-entry-failure semantics). The file is
-        // swapped for a symlink in the walk-to-hash window — the task
-        // opens nofollow and rejects it (R3).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 1);
-            let io = GatedRunner::<etag::Result>::new(1, 8);
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                io.clone(),
-                Arc::new(InlineRunner::default()),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let listing2 = listing.clone();
-            let b2 = b.clone();
-            let page =
-                tokio::spawn(
-                    async move { listing2.list(&params(&b2, "", None, None, 1000)).await },
-                );
-            wait_for(|| io.enqueued() == 1).await;
-            let path = root.path().join("data/f00.txt");
-            std::fs::remove_file(&path).unwrap();
-            std::os::unix::fs::symlink(root.path().join("gone"), &path).unwrap();
-            io.open_gate();
-            let err = page.await.unwrap().unwrap_err();
-            assert!(
-                matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-                "a swapped-in symlink must fail the list: {err:?}"
-            );
-        });
+    #[tokio::test]
+    async fn failed_compute_fails_the_list() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 1);
+        let io = GatedRunner::<etag::Result>::new(1, 8);
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            io.clone(),
+            Arc::new(InlineRunner::default()),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let listing2 = listing.clone();
+        let b2 = b.clone();
+        let page =
+            tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 1000)).await });
+        wait_for(|| io.enqueued() == 1).await;
+        let path = root.path().join("data/f00.txt");
+        fs::remove_file(&path).await.unwrap();
+        symlink(root.path().join("gone"), &path).unwrap();
+        io.open_gate();
+        let err = page.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Io(ref e) if e.kind() == ErrorKind::PermissionDenied),
+            "a swapped-in symlink must fail the list: {err:?}"
+        );
     }
 
-    #[test]
-    fn lost_batches_error_the_list_and_self_heal_next_pass() {
-        // Crash-loss (Q3): a batch dropped before commit is equivalent to
-        // an uncommitted batch. The list errors on the dropped completion
-        // (Dropped = failure, R6) and the NEXT list recomputes from the
-        // files — the meta self-heals.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 2);
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                Arc::new(InlineRunner::default()),
-                Arc::new(LossyRunner),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let err = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, Error::Pipeline(pipeline::Error::Dropped)),
-                "a lost batch must fail the list: {err:?}"
-            );
-            assert!(store.walk(&b).await.unwrap().is_empty());
+    #[tokio::test]
+    async fn lost_batches_error_the_list_and_self_heal_next_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 2);
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            Arc::new(InlineRunner::default()),
+            Arc::new(LossyRunner),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let err = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Pipeline(Dropped)),
+            "a lost batch must fail the list: {err:?}"
+        );
+        assert!(store.walk(&b).await.unwrap().is_empty());
 
-            // The next pass (healthy pipeline) recomputes and persists.
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                Arc::new(InlineRunner::default()),
-                Arc::new(InlineRunner::default()),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
+        // The next pass (healthy pipeline) recomputes and persists.
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            Arc::new(InlineRunner::default()),
+            Arc::new(InlineRunner::default()),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(store.walk(&b).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn composed_etag_kept_by_the_producer_on_identity_less_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 1);
+        let file = root.path().join("data/f00.txt");
+        let metadata = fs::metadata(&file).await.unwrap();
+        let composed = testing::etag("5d41402abc4b2a76b9719d911017c592-2");
+        store
+            .set(
+                &b,
+                &object::key("f00.txt").unwrap(),
+                &composed,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        // A touch: same file, mtime pushed forward.
+        let handle = File::options().write(true).open(&file).unwrap();
+        handle
+            .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
+            .unwrap();
+        drop(handle);
+        let now = fs::metadata(&file).await.unwrap();
+        let listing = listing(root.path(), store.clone(), true);
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects[0].etag, composed);
+        assert!(matches!(page.objects[0].etag, ETag::Composed(_, 2)));
+        // The batch refreshed the entry — the next list is a hit.
+        let record = store
+            .get(&b, &object::key("f00.txt").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.matches(now.len(), now.modified().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mtime_preserving_replacement_recomputes_the_etag() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 1);
+        let file = root.path().join("data/f00.txt");
+        let listing = listing(root.path(), store.clone(), true);
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 0"));
+        // Replace with a NEW file, same size, mtime restored.
+        let metadata = fs::metadata(&file).await.unwrap();
+        let replacement = root.path().join("data/replacement.txt");
+        fs::write(&replacement, b"payload 9").await.unwrap();
+        let handle = OpenOptions::new().write(true).open(&replacement).unwrap();
+        handle.set_modified(metadata.modified().unwrap()).unwrap();
+        drop(handle);
+        fs::rename(&replacement, &file).await.unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 9"));
+    }
+
+    #[tokio::test]
+    async fn page_whose_entries_all_vanish_is_untruncated() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, b) = files_fixture(root.path(), 3);
+        let io = GatedRunner::<etag::Result>::new(1, 8);
+        let listing = listing_with(
+            root.path(),
+            store.clone(),
+            true,
+            io.clone(),
+            Arc::new(InlineRunner::default()),
+            DEFAULT_META_BATCH_SIZE,
+            DEFAULT_META_BATCH_BYTES,
+        );
+        let listing2 = listing.clone();
+        let b2 = b.clone();
+        let page =
+            tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 2)).await });
+        wait_for(|| io.enqueued() == 2).await;
+        // Delete every file in the walk-to-hash window.
+        for i in 0..3 {
+            fs::remove_file(root.path().join("data").join(format!("f{i:02}.txt")))
                 .await
                 .unwrap();
-            assert_eq!(page.objects.len(), 2);
-            assert_eq!(store.walk(&b).await.unwrap().len(), 2);
-        });
+        }
+        io.open_gate();
+        let page = page.await.unwrap().unwrap();
+        assert!(page.objects.is_empty());
+        assert!(
+            !page.truncated,
+            "no resume marker over a dead range: {page:?}"
+        );
+        assert!(page.next_start_after.is_none());
     }
 
-    #[test]
-    fn composed_etag_kept_by_the_producer_on_identity_less_storage() {
-        // P1 through the producer: a stored composed ETag with no file
-        // identity (identity-less platforms/filesystems) survives a touch
-        // within the mtime jitter window — the task keeps the form and
-        // the batch refreshes the entry. (On identity platforms the same
-        // touch re-hashes — F04: an in-place same-size rewrite keeps the
-        // identity and is indistinguishable from a touch without hashing.)
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 1);
-            let file = root.path().join("data/f00.txt");
-            let metadata = fs::metadata(&file).unwrap();
-            let composed = tinio_util::testing::etag("5d41402abc4b2a76b9719d911017c592-2");
+    #[tokio::test]
+    async fn corrupt_entry_self_heals_through_the_producer() {
+        let root = tempfile::tempdir().unwrap();
+        // Corrupt the row BEFORE the store opens (redb's file lock is
+        // exclusive per handle).
+        let state = tempfile::tempdir().unwrap();
+        {
+            let db = database::open(state.path()).unwrap().db;
+            let mut txn = db.begin_write().unwrap();
+            {
+                let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+                table
+                    .insert(("data", "f00.txt"), ("not-an-etag", 1, 1, 0))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let b = bucket::name("data").unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        fs::write(root.path().join("data/f00.txt"), b"payload 0")
+            .await
+            .unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let listing = listing(root.path(), store.clone(), true);
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 0"));
+        // The entry is valid again.
+        assert!(
             store
-                .set(
-                    &b,
-                    &object::key("f00.txt").unwrap(),
-                    &composed,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    0,
-                )
-                .await
-                .unwrap();
-            // A touch: same file, mtime pushed forward.
-            let handle = std::fs::File::options().write(true).open(&file).unwrap();
-            handle
-                .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
-                .unwrap();
-            drop(handle);
-            let now = fs::metadata(&file).unwrap();
-            let listing = listing(root.path(), store.clone(), true);
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert_eq!(page.objects[0].etag, composed);
-            assert!(matches!(
-                page.objects[0].etag,
-                tinio_core::ETag::Composed(_, 2)
-            ));
-            // The batch refreshed the entry — the next list is a hit.
-            let record = store
                 .get(&b, &object::key("f00.txt").unwrap())
                 .await
                 .unwrap()
-                .unwrap();
-            assert!(record.matches(now.len(), now.modified().unwrap()));
-        });
-    }
-
-    #[test]
-    fn mtime_preserving_replacement_recomputes_the_etag() {
-        // F01 through the producer: a same-size replacement that restores
-        // the mtime (`cp -p` / `rsync -a`) is a gate MISS — the walked
-        // identity differs from the stored one, so the stale ETag is
-        // never served.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 1);
-            let file = root.path().join("data/f00.txt");
-            let listing = listing(root.path(), store.clone(), true);
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert_eq!(
-                page.objects[0].etag,
-                tinio_core::ETag::from_content(b"payload 0")
-            );
-            // Replace with a NEW file, same size, mtime restored.
-            let metadata = fs::metadata(&file).unwrap();
-            let replacement = root.path().join("data/replacement.txt");
-            fs::write(&replacement, b"payload 9").unwrap();
-            let handle = fs::OpenOptions::new()
-                .write(true)
-                .open(&replacement)
-                .unwrap();
-            handle.set_modified(metadata.modified().unwrap()).unwrap();
-            drop(handle);
-            fs::rename(&replacement, &file).unwrap();
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert_eq!(
-                page.objects[0].etag,
-                tinio_core::ETag::from_content(b"payload 9")
-            );
-        });
-    }
-
-    #[test]
-    fn page_whose_entries_all_vanish_is_untruncated() {
-        // F15: a truncated page whose entries ALL vanish between the walk
-        // and the hash (mass concurrent deletion) answers empty and
-        // untruncated — no resume marker over a dead range, so the client
-        // never pages through dead pages forever.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let (store, b) = files_fixture(root.path(), 3);
-            let io = GatedRunner::<etag::Result>::new(1, 8);
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                io.clone(),
-                Arc::new(InlineRunner::default()),
-                DEFAULT_META_BATCH_SIZE,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let listing2 = listing.clone();
-            let b2 = b.clone();
-            let page =
-                tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 2)).await });
-            wait_for(|| io.enqueued() == 2).await;
-            // Delete every file in the walk-to-hash window.
-            for i in 0..3 {
-                fs::remove_file(root.path().join("data").join(format!("f{i:02}.txt"))).unwrap();
-            }
-            io.open_gate();
-            let page = page.await.unwrap().unwrap();
-            assert!(page.objects.is_empty());
-            assert!(
-                !page.truncated,
-                "no resume marker over a dead range: {page:?}"
-            );
-            assert!(page.next_start_after.is_none());
-        });
-    }
-
-    #[test]
-    fn corrupt_entry_self_heals_through_the_producer() {
-        // P2 through the producer: a domain-invalid stored etag reports
-        // missing in the gating load, the compute task re-hashes, and the
-        // batch rewrites the entry.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            // Corrupt the row BEFORE the store opens (redb's file lock is
-            // exclusive per handle).
-            let state = tempfile::tempdir().unwrap();
-            {
-                let db = crate::database::open(state.path()).unwrap().db;
-                let mut txn = db.begin_write().unwrap();
-                {
-                    let mut table = crate::database::ObjectMetaTable::open(&mut txn).unwrap();
-                    table
-                        .insert(("data", "f00.txt"), ("not-an-etag", 1, 1, 0))
-                        .unwrap();
-                }
-                txn.commit().unwrap();
-            }
-            let b = bucket::name("data").unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            fs::write(root.path().join("data/f00.txt"), b"payload 0").unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let listing = listing(root.path(), store.clone(), true);
-            let page = listing
-                .list(&params(&b, "", None, None, 1000))
-                .await
-                .unwrap();
-            assert_eq!(page.objects.len(), 1);
-            assert_eq!(
-                page.objects[0].etag,
-                tinio_core::ETag::from_content(b"payload 0")
-            );
-            // The entry is valid again.
-            assert!(
-                store
-                    .get(&b, &object::key("f00.txt").unwrap())
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-        });
+                .is_some()
+        );
     }
 }

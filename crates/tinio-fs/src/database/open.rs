@@ -1,5 +1,9 @@
 //! Database open and integrity check.
 
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -62,11 +66,11 @@ pub struct Open {
 pub fn open(state_dir: &Path) -> Result<Open, Error> {
     fs::create_dir_all(state_dir)?;
     #[cfg(unix)]
-    fs::set_permissions(state_dir, fs::Permissions::from_mode(STATE_DIR_MODE))?;
+    fs::set_permissions(state_dir, Permissions::from_mode(STATE_DIR_MODE))?;
     let path = meta_db_path(state_dir);
     let db = Database::create(&path)?;
     #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(META_DB_MODE))?;
+    fs::set_permissions(&path, Permissions::from_mode(META_DB_MODE))?;
     let (compact_needed, stats) = {
         let mut txn = db.begin_write()?;
         let compact_needed = {
@@ -91,8 +95,9 @@ pub fn open(state_dir: &Path) -> Result<Open, Error> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
 
     #[test]
     fn state_dir_and_meta_db_are_hardened() {
@@ -125,8 +130,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         drop(open(&state).unwrap());
-        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::set_permissions(meta_db_path(&state), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&state, Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(meta_db_path(&state), Permissions::from_mode(0o644)).unwrap();
 
         drop(open(&state).unwrap());
 

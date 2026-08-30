@@ -1,4 +1,4 @@
-use garde::Validate;
+use garde::{Error as GardeError, Validate};
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 use tinio_core::storage::{
@@ -107,7 +107,7 @@ pub struct Mem {
 /// A byte limit must be positive when present (absent = unlimited).
 fn validate_positive_option(value: &Option<u64>, _context: &()) -> garde::Result {
     if value.is_some_and(|v| v == 0) {
-        return Err(garde::Error::new(
+        return Err(GardeError::new(
             "byte limits must be positive when set (omit the key for unlimited)",
         ));
     }
@@ -129,7 +129,7 @@ fn meta_batch_bytes() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
+    use crate::{Config as RootConfig, Error};
 
     #[test]
     fn defaults_match_the_contract() {
@@ -145,12 +145,12 @@ mod tests {
         // 1..=4096; outside → startup error (pipeline-spec.md §3.3).
         for bad in [0u16, 4097] {
             let text = format!("version = 1\n[storage.fs]\nmeta_batch_size = {bad}");
-            let err = crate::Config::parse(&text).unwrap_err();
+            let err = RootConfig::parse(&text).unwrap_err();
             assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
         }
         for good in [1u16, 128, 4096] {
             let text = format!("version = 1\n[storage.fs]\nmeta_batch_size = {good}");
-            let config = crate::Config::parse(&text).unwrap();
+            let config = RootConfig::parse(&text).unwrap();
             assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_size, good);
         }
     }
@@ -160,12 +160,12 @@ mod tests {
         // 1024..=16 MiB; outside → startup error.
         for bad in [1023u32, 16 * 1024 * 1024 + 1] {
             let text = format!("version = 1\n[storage.fs]\nmeta_batch_bytes = {bad}");
-            let err = crate::Config::parse(&text).unwrap_err();
+            let err = RootConfig::parse(&text).unwrap_err();
             assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
         }
         for good in [1024u32, 262144, 16 * 1024 * 1024] {
             let text = format!("version = 1\n[storage.fs]\nmeta_batch_bytes = {good}");
-            let config = crate::Config::parse(&text).unwrap();
+            let config = RootConfig::parse(&text).unwrap();
             assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_bytes, good);
         }
     }
@@ -175,7 +175,7 @@ mod tests {
         // Presence-gated (Q8): a section that omits the keys deserializes
         // the defaults — never the field-type default (0 would fail garde).
         let config =
-            crate::Config::parse("version = 1\n[storage.fs]\nfollow_symlinks = false").unwrap();
+            RootConfig::parse("version = 1\n[storage.fs]\nfollow_symlinks = false").unwrap();
         let fs = &config.storage.as_ref().unwrap().fs;
         assert_eq!(fs.meta_batch_size, DEFAULT_META_BATCH_SIZE);
         assert_eq!(fs.meta_batch_bytes, DEFAULT_META_BATCH_BYTES);
@@ -185,10 +185,10 @@ mod tests {
     fn mem_limits_default_to_unlimited() {
         // `[storage.mem]` is absent by default, and the limits are
         // optional — the documented no-limit posture (CHK028).
-        let config = crate::Config::parse("version = 1").unwrap();
+        let config = RootConfig::parse("version = 1").unwrap();
         assert!(config.storage.is_none());
 
-        let config = crate::Config::parse("version = 1\n[storage.mem]").unwrap();
+        let config = RootConfig::parse("version = 1\n[storage.mem]").unwrap();
         let mem = config.storage.as_ref().unwrap().mem.as_ref().unwrap();
         assert_eq!(mem.max_object_bytes, None);
         assert_eq!(mem.max_total_bytes, None);
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn mem_limits_parse_when_set() {
-        let config = crate::Config::parse(
+        let config = RootConfig::parse(
             "version = 1\n[storage.mem]\nmax_object_bytes = 1048576\nmax_total_bytes = 1073741824",
         )
         .unwrap();
@@ -212,11 +212,8 @@ mod tests {
             "version = 1\n[storage.mem]\nmax_object_bytes = 0",
             "version = 1\n[storage.mem]\nmax_total_bytes = 0",
         ] {
-            let err = crate::Config::parse(bad).unwrap_err();
-            assert!(
-                matches!(err, crate::Error::InvalidValue { .. }),
-                "{bad}: {err}"
-            );
+            let err = RootConfig::parse(bad).unwrap_err();
+            assert!(matches!(err, Error::InvalidValue { .. }), "{bad}: {err}");
         }
     }
 }

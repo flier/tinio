@@ -1,7 +1,12 @@
 use std::time::SystemTime;
 
 use derive_more::Display;
-use s3s::{S3Error, S3Result, dto, s3_error};
+use s3s::{
+    S3Error, S3Result,
+    dto::{self, ETag as WireETag},
+    s3_error,
+};
+use time::OffsetDateTime;
 use tinio_core::ETag;
 
 /// The conditional header whose evaluation failed (the read and write
@@ -81,7 +86,7 @@ impl<'a> ConditionalHeaders<'a> {
             let ok = cond.is_any()
                 || cond
                     .as_etag()
-                    .map(|e| e.strong_cmp(&dto::ETag::Strong(wire.to_string())))
+                    .map(|e| e.strong_cmp(&WireETag::Strong(wire.to_string())))
                     .unwrap_or(false);
             if !ok {
                 return Err(ConditionFailure::Match);
@@ -100,7 +105,7 @@ impl<'a> ConditionalHeaders<'a> {
             let matched = cond.is_any()
                 || cond
                     .as_etag()
-                    .map(|e| e.weak_cmp(&dto::ETag::Strong(wire.to_string())))
+                    .map(|e| e.weak_cmp(&WireETag::Strong(wire.to_string())))
                     .unwrap_or(false);
             if matched {
                 return Err(ConditionFailure::NoneMatch);
@@ -134,14 +139,17 @@ impl<'a> ConditionalHeaders<'a> {
 /// A response timestamp into a [`SystemTime`] (conditional-header
 /// comparison).
 fn to_system_time(t: dto::Timestamp) -> SystemTime {
-    time::OffsetDateTime::from(t).into()
+    OffsetDateTime::from(t).into()
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use s3s::{S3ErrorCode, dto};
+    use s3s::{
+        S3ErrorCode,
+        dto::{self, Timestamp},
+    };
     use tinio_core::ETag;
 
     use super::*;
@@ -156,7 +164,7 @@ mod tests {
     }
 
     fn timestamp(seconds: u64) -> dto::Timestamp {
-        dto::Timestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+        Timestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
     }
 
     const LM: u64 = 100;

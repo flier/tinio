@@ -6,21 +6,24 @@
 
 mod e2e;
 
+use std::fs;
+
+use e2e::{Mc, Server};
 use predicates::prelude::*;
 
 #[test]
 #[ignore = "requires the mc binary on PATH"]
 fn journey() {
-    let server = e2e::Server::start();
+    let server = Server::start();
     let ep = server.endpoint();
     let scratch = tempfile::tempdir().unwrap();
 
-    let mc = e2e::Mc::new(scratch.path().join("mc"));
+    let mc = Mc::new(scratch.path().join("mc"));
     mc.alias(ep).assert().success();
     mc.cmd(&["mb", "tinio/mc-bucket"]).assert().success();
 
     let hello = scratch.path().join("hello.txt");
-    std::fs::write(&hello, "hello from mc").unwrap();
+    fs::write(&hello, "hello from mc").unwrap();
     mc.cmd(&["cp", hello.to_str().unwrap(), "tinio/mc-bucket/hello.txt"])
         .assert()
         .success();
@@ -32,7 +35,7 @@ fn journey() {
 
     // Zero-byte object.
     let zero = scratch.path().join("zero");
-    std::fs::write(&zero, "").unwrap();
+    fs::write(&zero, "").unwrap();
     mc.cmd(&["cp", zero.to_str().unwrap(), "tinio/mc-bucket/zero"])
         .assert()
         .success();

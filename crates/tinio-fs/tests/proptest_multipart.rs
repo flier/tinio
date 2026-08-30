@@ -8,14 +8,17 @@
 use std::time::SystemTime;
 
 use md5::{Digest, Md5};
+use prop::collection;
 use proptest::prelude::*;
 use tinio_core::{
     ETag, bucket,
     multipart::{CompletedPart, PartInfo, PartNumber},
     object,
+    storage::Error::NoSuchUpload,
 };
-use tinio_fs::multipart;
+use tinio_fs::{Error, multipart};
 use tinio_util::testing::body;
+use tokio::{fs, runtime::Runtime};
 
 /// Independent reference composition: MD5 of the raw part digests
 /// concatenated, then `-N` (the AWS composition, computed here from
@@ -33,9 +36,9 @@ proptest! {
     /// byte-exact, with the reference composed ETag.
     #[test]
     fn assembly_is_exact_concatenation(
-        part_sizes in prop::collection::vec(0usize..4096, 1..24),
+        part_sizes in collection::vec(0usize..4096, 1..24),
     ) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = multipart::store(state.path()).unwrap();
@@ -70,8 +73,8 @@ proptest! {
                 .await
                 .unwrap();
             prop_assert_eq!(etag.as_str(), expected_etag);
-            tokio::fs::rename(&temp, &target).await.unwrap();
-            let assembled = tokio::fs::read(&target).await.unwrap();
+            fs::rename(&temp, &target).await.unwrap();
+            let assembled = fs::read(&target).await.unwrap();
             prop_assert_eq!(&assembled, &expected);
             // The caller renames, then consumes; the upload is gone and
             // abort is now NoSuchUpload.
@@ -79,7 +82,7 @@ proptest! {
             let err = store.abort(&b, &key, &upload.upload_id).await.unwrap_err();
             prop_assert!(matches!(
                 err,
-                tinio_fs::Error::Storage(tinio_core::storage::Error::NoSuchUpload(_))
+                Error::Storage(NoSuchUpload(_))
             ));
             Ok(())
         })?;
@@ -89,7 +92,7 @@ proptest! {
     /// wins per part number).
     #[test]
     fn part_overwrite_last_writer_wins(n in 1u32..10_000, first in 0usize..1024, second in 0usize..1024) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = multipart::store(state.path()).unwrap();
@@ -116,10 +119,10 @@ proptest! {
                 .complete(&b, &key, &upload.upload_id, &completed)
                 .await
                 .unwrap();
-            tokio::fs::rename(&temp, &target).await.unwrap();
-            let metadata = tokio::fs::metadata(&target).await.unwrap();
+            fs::rename(&temp, &target).await.unwrap();
+            let metadata = fs::metadata(&target).await.unwrap();
             prop_assert_eq!(metadata.len(), second as u64);
-            let assembled = tokio::fs::read(&target).await.unwrap();
+            let assembled = fs::read(&target).await.unwrap();
             prop_assert_eq!(&assembled, &second_data);
             Ok(())
         })?;
@@ -129,7 +132,7 @@ proptest! {
     /// the checked constructor, not by the store).
     #[test]
     fn part_numbers_bounds(n in 1u32..10_000) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = multipart::store(state.path()).unwrap();

@@ -76,16 +76,18 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use io::Error as IoError;
     use tinio_core::storage::Error::*;
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn maps_to_status_codes() {
         assert_eq!(Error::Unauthorized.status(), 401);
         assert_eq!(Error::NotFound.status(), 404);
         assert_eq!(Error::Internal("boom".into()).status(), 500);
-        assert_eq!(Error::Io(io::Error::other("x")).status(), 500);
+        assert_eq!(Error::Io(IoError::other("x")).status(), 500);
         assert_eq!(Error::Storage(NoSuchKey("k".into())).status(), 500);
     }
 
@@ -136,7 +138,7 @@ mod tests {
             "internal server error"
         );
         assert_eq!(
-            Error::Io(io::Error::other("x")).body().error,
+            Error::Io(IoError::other("x")).body().error,
             "internal server error"
         );
         assert_eq!(

@@ -20,17 +20,22 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    env, io,
+    env,
+    io::ErrorKind,
     time::{Duration, Instant},
 };
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tinio_core::{bucket, cleanup::CleanupOptions, object, pipeline::Completion};
-use tokio::sync::watch;
+use tokio::{
+    sync::watch,
+    task::{spawn_blocking, yield_now},
+    time::sleep,
+};
 
 use crate::{
-    FsCleanup, backend::FsStorage, database, error::Error, etag, listing::MetaBatchAccumulator,
-    meta, pacing,
+    FsCleanup, backend::FsStorage, database, error::Error, etag, fsutil,
+    listing::MetaBatchAccumulator, meta, pacing, tombstone,
 };
 
 /// Entries per batch: after each batch of **enqueued compute tasks** the
@@ -65,13 +70,17 @@ pub struct ScannerOptions {
 ///
 /// ```rust
 /// use std::{sync::Arc, time::Duration};
-/// use tinio_core::pipeline::InlineRunner;
-/// use tinio_util::testing::body;
-/// use tinio_core::storage::{
-///     BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
-///     DEFAULT_META_BATCH_SIZE, ObjectOps,
+///
+/// use tinio_core::{
+///     pipeline::InlineRunner,
+///     storage::{
+///         BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
+///         DEFAULT_META_BATCH_SIZE, ObjectOps,
+///     },
 /// };
 /// use tinio_fs::{FsOptions, FsStorage, Scanner, ScannerOptions};
+/// use tinio_util::testing::body;
+/// use tokio::runtime::Runtime;
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let options = FsOptions {
@@ -86,8 +95,8 @@ pub struct ScannerOptions {
 /// };
 /// let storage = FsStorage::new(root.path(), options).unwrap();
 /// // A hand-dropped file with no meta entry.
-/// std::fs::create_dir(root.path().join("data")).unwrap();
-/// std::fs::write(root.path().join("data/dropped.txt"), b"out-of-band").unwrap();
+/// fs::create_dir(root.path().join("data")).unwrap();
+/// fs::write(root.path().join("data/dropped.txt"), b"out-of-band").unwrap();
 /// let options = ScannerOptions {
 ///     enabled: true,
 ///     delay: Duration::from_millis(1),
@@ -95,7 +104,7 @@ pub struct ScannerOptions {
 ///     cycle: Duration::from_millis(50),
 /// };
 /// let scanner = Scanner::new(storage.clone(), options);
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// Runtime::new().unwrap().block_on(async {
 ///     scanner.scan_once().await.unwrap();
 ///     let head = storage
 ///         .head_object(&"data".into(), &"dropped.txt".into())
@@ -206,7 +215,7 @@ impl Scanner {
                     "bucket reconcile failed; skipping the bucket (the next pass retries)"
                 ),
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
         // Stale bucket records (item 2): a bucket directory removed
         // out-of-band is invisible to the reconcile loop (it walks live
@@ -223,9 +232,19 @@ impl Scanner {
         // Unpublished delete-bucket trees (a crash after the unpublish
         // rename, or a failed fire-and-forget `remove_dir_all`) live
         // under `<root>/.tinio/deleting/` — not a live bucket name, so
-        // the reconcile loop never sees them.
-        match crate::tombstone::clear_leftovers(self.storage.root()).await {
-            Ok(reclaimed) => summary.reclaimed += reclaimed,
+        // the reconcile loop never sees them. They are enqueued on the
+        // removal lane (D-A), never removed inline — a huge tree must
+        // not block the scan cycle, and the lane is the storage's own
+        // (an inline runner offline, so the enqueue still clears).
+        let leftover_runner = self.storage.remove_pipeline();
+        match tombstone::leftovers(self.storage.root()).await {
+            Ok(leftovers) => {
+                for (path, _) in leftovers {
+                    if tombstone::enqueue_one(path, &leftover_runner).await {
+                        summary.reclaimed += 1;
+                    }
+                }
+            }
             Err(err) => tracing::warn!(error = %err, "delete-tombstone reclamation failed"),
         }
         Ok(summary)
@@ -242,7 +261,7 @@ impl Scanner {
     /// needs no order, §3.7 constant memory). The walk's size + mtime
     /// double as the staleness check — no second stat per file. Gating
     /// runs against a **materialized snapshot** (data-path review
-    /// 2026-08-29, finding 1): [`meta::Store::load_bucket`] loads the
+    /// 2026-08-29, finding 1): [`Store::load_bucket`] loads the
     /// whole bucket's meta into memory BEFORE the walk — one short-lived
     /// read transaction on the blocking pool (P3), released as soon as
     /// the load returns — and each file is gated against the in-memory
@@ -301,7 +320,7 @@ impl Scanner {
         let snapshot: HashMap<object::Key, Option<database::StoredMeta>> = {
             let meta = meta.clone();
             let name = name.clone();
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking(move || {
                 Ok::<_, Error>(
                     meta.load_bucket(&name)?
                         .into_iter()
@@ -436,6 +455,15 @@ impl Scanner {
             // like the old reclaim (the containment proof cannot address
             // such buckets).
             if let Ok(bucket_dir) = self.storage.bucket_dir(name).await {
+                // The probes + removes of the whole candidate pass run
+                // under this bucket's mutation lock (F05): a concurrent
+                // PUT's rename and meta-row commit hold the same
+                // per-bucket lock, so a fresh row can never be removed
+                // by a stale probe — the PUT either completes before the
+                // probe (the object exists — skipped) or after the
+                // remove (its row re-lands). Mutations of other buckets
+                // do not wait; the pass is bounded by the candidate list.
+                let _guard = self.storage.lock_bucket_mutations(name).await;
                 for key in candidates {
                     // The object path through the crate's own mapping
                     // (one source of truth — the same key_path the
@@ -445,16 +473,7 @@ impl Scanner {
                     let Ok(path) = self.storage.key_path(&bucket_dir, &key, true).await else {
                         continue;
                     };
-                    // The probe + remove run under this bucket's
-                    // mutation lock (F05): a concurrent PUT's rename and
-                    // meta-row commit hold the same per-bucket lock, so
-                    // a fresh row can never be removed by a stale probe
-                    // — the PUT either completes before the probe (the
-                    // object exists — skipped) or after the remove (its
-                    // row re-lands). Mutations of other buckets do not
-                    // wait.
-                    let _guard = self.storage.lock_bucket_mutations(name).await;
-                    match crate::fsutil::is_absent(&path).await {
+                    match fsutil::is_absent(&path).await {
                         Ok(true) => {}         // gone — reclaim below
                         Ok(false) => continue, // the object exists — not an orphan
                         Err(err) => {
@@ -494,8 +513,8 @@ impl Scanner {
     /// list tail latency by the queue depth (the queue drains while the
     /// scanner sleeps).
     async fn pace_write_batches(delay: Duration) {
-        tokio::task::yield_now().await;
-        tokio::time::sleep(delay).await;
+        yield_now().await;
+        sleep(delay).await;
     }
 
     /// Fold one resolved compute outcome into the reconcile state: a
@@ -522,7 +541,7 @@ impl Scanner {
     ) -> Result<bool, Error> {
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
             Err(err) => {
                 *consecutive_failures += 1;
                 tracing::warn!(
@@ -593,16 +612,30 @@ pub struct ScanSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::FsOptions;
-    use crate::testutil::{
-        FailingBatchRunner, FailingTaskRunner, GatedRunner, PacedRunner, fs_options, rt, wait_for,
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::{
+        fs::File,
+        path::Path,
+        sync::{Arc, atomic::Ordering},
     };
-    use std::{fs, sync::Arc};
-    use tinio_core::object;
-    use tinio_core::pipeline::{InlineRunner, Runner};
-    use tinio_core::storage::{BucketOps, ObjectOps};
+
+    use tinio_core::{
+        ETag, object,
+        pipeline::{InlineRunner, Runner},
+        storage::{BucketOps, ObjectOps},
+    };
     use tinio_util::testing::body;
+    use tokio::{fs, time::sleep};
+
+    use super::*;
+    use crate::{
+        FsOptions, testutil,
+        testutil::{
+            FailingBatchRunner, FailingTaskRunner, GatedRunner, PacedRunner, fs_options, wait_for,
+        },
+        tombstone,
+    };
 
     fn options() -> ScannerOptions {
         ScannerOptions {
@@ -627,341 +660,309 @@ mod tests {
         assert!(!scanner_enabled(None, false));
     }
 
-    #[test]
-    fn computes_missing_entries() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            fs::write(root.path().join("data/dropped.txt"), b"out-of-band").unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.reconciled, 1);
-            assert_eq!(summary.recomputed, 1);
-            let head = storage
-                .head_object(
-                    &bucket::name("data").unwrap(),
-                    &object::key("dropped.txt").unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(head.size, 11);
-            // A second pass is a no-op (entries match).
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.recomputed, 0);
-        });
-    }
-
-    #[test]
-    fn recomputes_stale_entries() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            storage
-                .put_object(&b, &"a.txt".into(), body(b"first"))
-                .await
-                .unwrap();
-            // Out-of-band edit: new content, new size.
-            fs::write(root.path().join("data/a.txt"), b"second").unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.recomputed, 1);
-            let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
-            assert_eq!(head.size, 6);
-            assert_eq!(head.etag, tinio_core::ETag::from_content(b"second"));
-        });
-    }
-
-    #[test]
-    fn recomputes_after_mtime_preserving_replacement() {
-        // F01: a same-size replacement that restores the mtime (`cp -p`,
-        // `rsync -a`) is invisible to the size+mtime gate but changes the
-        // file identity — the gate consults it, so the stale ETag is
-        // never served forever.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let file = root.path().join("data/a.txt");
-            storage
-                .put_object(&b, &"a.txt".into(), body(b"first!"))
-                .await
-                .unwrap();
-            assert_eq!(
-                storage.head_object(&b, &"a.txt".into()).await.unwrap().etag,
-                tinio_core::ETag::from_content(b"first!")
-            );
-            // Replace with a NEW file, same size, mtime restored.
-            let metadata = std::fs::metadata(&file).unwrap();
-            let replacement = root.path().join("data/replacement.txt");
-            std::fs::write(&replacement, b"second").unwrap();
-            let handle = std::fs::File::options()
-                .write(true)
-                .open(&replacement)
-                .unwrap();
-            handle.set_modified(metadata.modified().unwrap()).unwrap();
-            drop(handle);
-            std::fs::rename(&replacement, &file).unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.recomputed, 1, "the replacement must be recomputed");
-            let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
-            assert_eq!(head.etag, tinio_core::ETag::from_content(b"second"));
-        });
-    }
-
-    #[test]
-    fn reclaims_orphaned_meta_entries() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let gone = object::key("gone.txt").unwrap();
-            let alive = object::key("alive.txt").unwrap();
-            storage.put_object(&b, &gone, body(b"x")).await.unwrap();
-            storage.put_object(&b, &alive, body(b"y")).await.unwrap();
-            fs::remove_file(root.path().join("data/gone.txt")).unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.reclaimed, 1);
-            assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
-        });
-    }
-
-    #[test]
-    fn reclaims_delete_tombstones() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let leftover = crate::tombstone::dir(root.path()).join("dead-bucket");
-            fs::create_dir_all(&leftover).unwrap();
-            fs::write(leftover.join("leftover.bin"), b"was-a-bucket").unwrap();
-            let scanner = Scanner::new(storage, options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.reclaimed, 1);
-            assert!(!leftover.exists());
-        });
-    }
-
-    #[test]
-    fn write_batch_enqueues_pace_like_compute_batches() {
-        // Item 1: after every write-batch enqueue the scanner yields and
-        // sleeps `delay` — the R2 discipline extended to the DB pipeline
-        // (a cold reconcile must not keep the shared DB queue full and
-        // amplify list tail latency by the queue depth). With
-        // `meta_batch_size = 1`, three entries flush as three batches —
-        // three 200 ms pacing sleeps bound the pass from below (the
-        // compute-batch pacing sleeps nothing: 3 < BATCH_SIZE).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            files(root.path(), 3);
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    meta_batch_size: 1,
-                    io_pipeline: Arc::new(InlineRunner::default()),
-                    db_pipeline: Arc::new(InlineRunner::default()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn computes_missing_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        fs::write(root.path().join("data/dropped.txt"), b"out-of-band")
+            .await
             .unwrap();
-            let scanner = Scanner::new(
-                storage,
-                ScannerOptions {
-                    enabled: true,
-                    delay: Duration::from_millis(200),
-                    max_wait: Duration::from_millis(10),
-                    cycle: Duration::from_millis(50),
-                },
-            );
-            let started = Instant::now();
-            let summary = scanner.scan_once().await.unwrap();
-            let elapsed = started.elapsed();
-            assert_eq!(summary.recomputed, 3);
-            assert!(
-                elapsed >= Duration::from_millis(500),
-                "three write batches must pace (3 × 200 ms sleeps): {elapsed:?}"
-            );
-        });
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reconciled, 1);
+        assert_eq!(summary.recomputed, 1);
+        let head = storage
+            .head_object(
+                &bucket::name("data").unwrap(),
+                &object::key("dropped.txt").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.size, 11);
+        // A second pass is a no-op (entries match).
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.recomputed, 0);
+    }
+
+    #[tokio::test]
+    async fn recomputes_stale_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        storage
+            .put_object(&b, &"a.txt".into(), body(b"first"))
+            .await
+            .unwrap();
+        // Out-of-band edit: new content, new size.
+        fs::write(root.path().join("data/a.txt"), b"second")
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.recomputed, 1);
+        let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
+        assert_eq!(head.size, 6);
+        assert_eq!(head.etag, ETag::from_content(b"second"));
+    }
+
+    #[tokio::test]
+    async fn recomputes_after_mtime_preserving_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let file = root.path().join("data/a.txt");
+        storage
+            .put_object(&b, &"a.txt".into(), body(b"first!"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.head_object(&b, &"a.txt".into()).await.unwrap().etag,
+            ETag::from_content(b"first!")
+        );
+        // Replace with a NEW file, same size, mtime restored.
+        let metadata = fs::metadata(&file).await.unwrap();
+        let replacement = root.path().join("data/replacement.txt");
+        fs::write(&replacement, b"second").await.unwrap();
+        let handle = File::options().write(true).open(&replacement).unwrap();
+        handle.set_modified(metadata.modified().unwrap()).unwrap();
+        drop(handle);
+        fs::rename(&replacement, &file).await.unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.recomputed, 1, "the replacement must be recomputed");
+        let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
+        assert_eq!(head.etag, ETag::from_content(b"second"));
+    }
+
+    #[tokio::test]
+    async fn reclaims_orphaned_meta_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let gone = object::key("gone.txt").unwrap();
+        let alive = object::key("alive.txt").unwrap();
+        storage.put_object(&b, &gone, body(b"x")).await.unwrap();
+        storage.put_object(&b, &alive, body(b"y")).await.unwrap();
+        fs::remove_file(root.path().join("data/gone.txt"))
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 1);
+        assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reclaims_delete_tombstones() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let leftover = tombstone::dir(root.path()).join("dead-bucket");
+        fs::create_dir_all(&leftover).await.unwrap();
+        fs::write(leftover.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage, options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 1);
+        assert!(!leftover.exists());
+    }
+
+    #[tokio::test]
+    async fn write_batch_enqueues_pace_like_compute_batches() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), 3);
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                meta_batch_size: 1,
+                io_pipeline: Arc::new(InlineRunner::default()),
+                db_pipeline: Arc::new(InlineRunner::default()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let scanner = Scanner::new(
+            storage,
+            ScannerOptions {
+                enabled: true,
+                delay: Duration::from_millis(200),
+                max_wait: Duration::from_millis(10),
+                cycle: Duration::from_millis(50),
+            },
+        );
+        let started = Instant::now();
+        let summary = scanner.scan_once().await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(summary.recomputed, 3);
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "three write batches must pace (3 × 200 ms sleeps): {elapsed:?}"
+        );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn symlinked_objects_are_not_reclaimed() {
-        // Item 2: the orphan derivation's candidates are probed against
-        // the filesystem — an entry whose object is now a link (the
-        // walk skips link entries with following disabled) is NOT an
-        // orphan: the link exists, exactly as the old full-bucket
-        // reclaim judged it. Both probe shapes: a dangling link (the
-        // containment proof cannot resolve it — skipped) and a link to
-        // an in-bucket file (the probe sees the link itself — skipped).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            files(root.path(), 2); // f00.txt, f01.txt
-            fs::write(root.path().join("data/target.txt"), b"t").unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            scanner.scan_once().await.unwrap(); // all entries computed
-            // Swap the objects for links: f00 → dangling, f01 → the
-            // in-bucket target.
-            for (name, target) in [
-                ("f00.txt", root.path().join("gone")),
-                ("f01.txt", root.path().join("data/target.txt")),
-            ] {
-                let path = root.path().join("data").join(name);
-                std::fs::remove_file(&path).unwrap();
-                std::os::unix::fs::symlink(target, &path).unwrap();
-            }
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.reclaimed, 0, "the links exist — not orphans");
-            assert_eq!(
-                storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .len(),
-                3,
-                "all rows must survive (f00, f01, target)"
-            );
-        });
+    #[tokio::test]
+    async fn symlinked_objects_are_not_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), 2); // f00.txt, f01.txt
+        fs::write(root.path().join("data/target.txt"), b"t")
+            .await
+            .unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        scanner.scan_once().await.unwrap(); // all entries computed
+        // Swap the objects for links: f00 → dangling, f01 → the
+        // in-bucket target.
+        for (name, target) in [
+            ("f00.txt", root.path().join("gone")),
+            ("f01.txt", root.path().join("data/target.txt")),
+        ] {
+            let path = root.path().join("data").join(name);
+            fs::remove_file(&path).await.unwrap();
+            symlink(target, &path).unwrap();
+        }
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 0, "the links exist — not orphans");
+        assert_eq!(
+            storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "all rows must survive (f00, f01, target)"
+        );
     }
 
-    #[test]
-    fn run_stops_on_shutdown() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            fs::write(root.path().join("data/a.txt"), b"x").unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            let (tx, rx) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                scanner.run(rx).await;
-            });
-            // Give the loop a moment to make progress, then stop it.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            tx.send(true).unwrap();
-            task.await.unwrap();
-            // The pass completed at least once.
-            assert!(
-                !storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+    #[tokio::test]
+    async fn run_stops_on_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        fs::write(root.path().join("data/a.txt"), b"x")
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            scanner.run(rx).await;
         });
+        // Give the loop a moment to make progress, then stop it.
+        sleep(Duration::from_millis(200)).await;
+        tx.send(true).unwrap();
+        task.await.unwrap();
+        // The pass completed at least once.
+        assert!(
+            !storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn run_does_nothing_when_disabled() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            fs::write(root.path().join("data/a.txt"), b"x").unwrap();
-            let mut options = options();
-            options.enabled = false;
-            let scanner = Scanner::new(storage.clone(), options);
-            let (tx, rx) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                scanner.run(rx).await;
-            });
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // Disabled scanners return immediately, dropping the receiver.
-            let _ = tx.send(true);
-            task.await.unwrap();
-            assert!(
-                storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+    #[tokio::test]
+    async fn run_does_nothing_when_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        fs::write(root.path().join("data/a.txt"), b"x")
+            .await
+            .unwrap();
+        let mut options = options();
+        options.enabled = false;
+        let scanner = Scanner::new(storage.clone(), options);
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            scanner.run(rx).await;
         });
+        sleep(Duration::from_millis(50)).await;
+        // Disabled scanners return immediately, dropping the receiver.
+        let _ = tx.send(true);
+        task.await.unwrap();
+        assert!(
+            storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn yields_between_entry_batches() {
-        // More than one batch of entries: the scan must yield and sleep
-        // between batches so in-flight S3 requests preempt scanning.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            for i in 0..40 {
-                fs::write(
-                    root.path().join(format!("data/f{i:02}.txt")),
-                    format!("payload {i}"),
-                )
-                .unwrap();
-            }
-            let scanner = Scanner::new(storage.clone(), options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.reconciled, 40);
-            assert_eq!(summary.recomputed, 40);
-            assert_eq!(
-                storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .len(),
-                40
-            );
-        });
+    #[tokio::test]
+    async fn yields_between_entry_batches() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        for i in 0..40 {
+            fs::write(
+                root.path().join(format!("data/f{i:02}.txt")),
+                format!("payload {i}"),
+            )
+            .await
+            .unwrap();
+        }
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reconciled, 40);
+        assert_eq!(summary.recomputed, 40);
+        assert_eq!(
+            storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            40
+        );
     }
 
-    #[test]
-    fn run_restarts_immediately_when_pass_exceeds_cycle() {
-        // A pass longer than the cycle budget restarts without sleeping;
-        // a shorter one sleeps. Either way the loop must keep making
-        // passes and stop promptly on shutdown.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            fs::create_dir(root.path().join("data")).unwrap();
-            for i in 0..40 {
-                fs::write(
-                    root.path().join(format!("data/f{i:02}.txt")),
-                    format!("payload {i}"),
-                )
-                .unwrap();
-            }
-            let scanner = Scanner::new(
-                storage.clone(),
-                ScannerOptions {
-                    enabled: true,
-                    delay: Duration::from_millis(1),
-                    max_wait: Duration::from_millis(10),
-                    cycle: Duration::from_millis(1),
-                },
-            );
-            let (tx, rx) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                scanner.run(rx).await;
-            });
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            tx.send(true).unwrap();
-            task.await.unwrap();
-            // At least one full pass completed before shutdown.
-            assert_eq!(
-                storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .len(),
-                40
-            );
+    #[tokio::test]
+    async fn run_restarts_immediately_when_pass_exceeds_cycle() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        for i in 0..40 {
+            fs::write(
+                root.path().join(format!("data/f{i:02}.txt")),
+                format!("payload {i}"),
+            )
+            .await
+            .unwrap();
+        }
+        let scanner = Scanner::new(
+            storage.clone(),
+            ScannerOptions {
+                enabled: true,
+                delay: Duration::from_millis(1),
+                max_wait: Duration::from_millis(10),
+                cycle: Duration::from_millis(1),
+            },
+        );
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            scanner.run(rx).await;
         });
+        sleep(Duration::from_millis(200)).await;
+        tx.send(true).unwrap();
+        task.await.unwrap();
+        // At least one full pass completed before shutdown.
+        assert_eq!(
+            storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            40
+        );
     }
 
     // --- the pipeline producers (pipeline-spec.md task 4) ---
@@ -969,25 +970,25 @@ mod tests {
     /// A bucket with `n` files `f00.txt..`, each with distinct content —
     /// the shared producer fixture (F39; the listing tests' store-owning
     /// `files_fixture` builds on it).
-    fn files(root: &std::path::Path, n: usize) {
-        crate::testutil::files(root, n);
+    fn files(root: &Path, n: usize) {
+        testutil::files(root, n);
     }
 
     /// Swap every `data/f*.txt` file for a symlink to a missing target:
     /// the compute task's nofollow open then rejects each with
     /// `PermissionDenied` (R3).
     #[cfg(unix)]
-    fn swap_all_for_symlinks(root: &std::path::Path, n: usize) {
+    fn swap_all_for_symlinks(root: &Path, n: usize) {
         for i in 0..n {
             let path = root.join("data").join(format!("f{i:02}.txt"));
-            std::fs::remove_file(&path).unwrap();
-            std::os::unix::fs::symlink(root.join("gone"), &path).unwrap();
+            remove_file(&path).unwrap();
+            symlink(root.join("gone"), &path).unwrap();
         }
     }
 
     /// A scanner over a storage with the given pipelines.
     fn scanner_with(
-        root: &std::path::Path,
+        root: &Path,
         io: Arc<dyn Runner<etag::Result>>,
         db: Arc<dyn Runner<Result<(), Error>>>,
     ) -> Scanner {
@@ -1004,201 +1005,179 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn single_compute_failure_is_skipped_and_the_scan_continues() {
-        // Q10: one task failure skips the entry with a warn — the bucket
-        // reconcile continues and the healthy entries are recomputed.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            files(root.path(), 3);
-            let io = GatedRunner::<etag::Result>::new(1, 8);
-            let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
-            let scanner2 = scanner.clone();
-            let scan = tokio::spawn(async move { scanner2.scan_once().await });
-            wait_for(|| io.enqueued() == 3).await;
-            // The walk is done; break only the first file in the
-            // walk-to-hash window.
-            let path = root.path().join("data/f00.txt");
-            std::fs::remove_file(&path).unwrap();
-            std::os::unix::fs::symlink(root.path().join("gone"), &path).unwrap();
-            io.open_gate();
-            let summary = scan.await.unwrap().unwrap();
-            assert_eq!(summary.reconciled, 3);
-            assert_eq!(summary.recomputed, 2, "the healthy entries were recomputed");
-            // The broken entry is skipped, not persisted.
-            assert_eq!(
-                scanner
-                    .storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .len(),
-                2
-            );
-        });
+    #[tokio::test]
+    async fn single_compute_failure_is_skipped_and_the_scan_continues() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), 3);
+        let io = GatedRunner::<etag::Result>::new(1, 8);
+        let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
+        let scanner2 = scanner.clone();
+        let scan = tokio::spawn(async move { scanner2.scan_once().await });
+        wait_for(|| io.enqueued() == 3).await;
+        // The walk is done; break only the first file in the
+        // walk-to-hash window.
+        let path = root.path().join("data/f00.txt");
+        fs::remove_file(&path).await.unwrap();
+        symlink(root.path().join("gone"), &path).unwrap();
+        io.open_gate();
+        let summary = scan.await.unwrap().unwrap();
+        assert_eq!(summary.reconciled, 3);
+        assert_eq!(summary.recomputed, 2, "the healthy entries were recomputed");
+        // The broken entry is skipped, not persisted.
+        assert_eq!(
+            scanner
+                .storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn consecutive_compute_failures_abort_the_bucket() {
+    #[tokio::test]
+    async fn consecutive_compute_failures_abort_the_bucket() {
         // R4: the whole bucket failing systematically (≥ 100 consecutive
         // non-NotFound task failures) aborts the reconcile. F12: the
         // abort stays at the bucket boundary — scan_once succeeds and
         // the failing bucket contributes nothing to the summary (the run
         // layer warns at the bucket, and the next pass retries).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let n = 105;
-            files(root.path(), n);
-            let io = GatedRunner::<etag::Result>::new(4, 256);
-            let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
-            let scanner2 = scanner.clone();
-            let scan = tokio::spawn(async move { scanner2.scan_once().await });
-            wait_for(|| io.enqueued() == n).await;
-            swap_all_for_symlinks(root.path(), n);
-            io.open_gate();
-            let summary = scan.await.unwrap().unwrap();
-            assert_eq!(
-                summary.reconciled, 0,
-                "the aborted bucket must count nothing (F12)"
-            );
-            assert_eq!(summary.recomputed, 0);
-        });
+
+        let root = tempfile::tempdir().unwrap();
+        let n = 105;
+        files(root.path(), n);
+        let io = GatedRunner::<etag::Result>::new(4, 256);
+        let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
+        let scanner2 = scanner.clone();
+        let scan = tokio::spawn(async move { scanner2.scan_once().await });
+        wait_for(|| io.enqueued() == n).await;
+        swap_all_for_symlinks(root.path(), n);
+        io.open_gate();
+        let summary = scan.await.unwrap().unwrap();
+        assert_eq!(
+            summary.reconciled, 0,
+            "the aborted bucket must count nothing (F12)"
+        );
+        assert_eq!(summary.recomputed, 0);
     }
 
-    #[test]
-    fn systematic_failures_abort_the_walk_early() {
-        // R4 through the streaming drain: failures fold in AS THEY
-        // ARRIVE, so the 100th consecutive failure aborts the reconcile
-        // immediately — the walk never enqueues the rest of the bucket
-        // (the old collect-then-drain shape always enqueued everything
-        // first and aborted only after the whole bucket was hashed).
-        // F12: the abort stays at the bucket boundary — the pass itself
-        // completes.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            files(root.path(), 105);
-            let io = FailingTaskRunner::new();
-            let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
-            scanner.scan_once().await.unwrap();
-            assert_eq!(
-                io.enqueued(),
-                MAX_CONSECUTIVE_FAILURES as usize,
-                "the abort must stop the walk at the threshold"
-            );
-        });
+    #[tokio::test]
+    async fn systematic_failures_abort_the_walk_early() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), 105);
+        let io = FailingTaskRunner::new();
+        let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
+        scanner.scan_once().await.unwrap();
+        assert_eq!(
+            io.enqueued(),
+            MAX_CONSECUTIVE_FAILURES as usize,
+            "the abort must stop the walk at the threshold"
+        );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn one_failing_bucket_does_not_starve_the_pass() {
-        // F12: an unreadable bucket directory fails its reconcile — the
-        // remaining buckets still reconcile, and the pass completes.
-        rt(async {
-            use std::os::unix::fs::PermissionsExt;
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let bad = bucket::name("bad").unwrap();
-            let good = bucket::name("good").unwrap();
-            storage.create_bucket(&bad).await.unwrap();
-            storage.create_bucket(&good).await.unwrap();
-            fs::write(root.path().join("good/a.txt"), b"x").unwrap();
-            // The bad bucket's dir becomes unreadable — its walk fails
-            // with PermissionDenied on every pass.
-            fs::set_permissions(root.path().join("bad"), fs::Permissions::from_mode(0o000))
-                .unwrap();
-            let scanner = Scanner::new(storage.clone(), options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(
-                summary.reconciled, 1,
-                "the good bucket reconciles despite the bad one (F12)"
-            );
-            let head = storage.head_object(&good, &"a.txt".into()).await.unwrap();
-            assert_eq!(head.etag, tinio_core::ETag::from_content(b"x"));
-        });
-    }
+    #[tokio::test]
+    async fn one_failing_bucket_does_not_starve_the_pass() {
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
-    #[test]
-    fn vanished_files_do_not_abort_the_bucket() {
-        // R4 excludes NotFound: files deleted in the walk-to-hash window
-        // are normal skips — even 105 of them must not trip the threshold.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let n = 105;
-            files(root.path(), n);
-            let io = GatedRunner::<etag::Result>::new(4, 256);
-            let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
-            let scanner2 = scanner.clone();
-            let scan = tokio::spawn(async move { scanner2.scan_once().await });
-            wait_for(|| io.enqueued() == n).await;
-            for i in 0..n {
-                fs::remove_file(root.path().join("data").join(format!("f{i:02}.txt"))).unwrap();
-            }
-            io.open_gate();
-            let summary = scan.await.unwrap().unwrap();
-            assert_eq!(summary.reconciled, n);
-            assert_eq!(summary.recomputed, 0);
-        });
-    }
+        use meta::Store;
+        use tinio_core::ETag;
 
-    #[test]
-    fn write_batch_failures_are_observed_and_the_scan_continues() {
-        // Q3b/R8: the scanner drops the batch completions (fire-and-forget)
-        // — the failure is still observed at the runner (the concurrent
-        // runtime's `Outcome` warn) and the scan continues.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            files(root.path(), 3);
-            let (db, batches, failures) = FailingBatchRunner::new();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    meta_batch_size: 1, // one batch per entry (Q5)
-                    io_pipeline: Arc::new(InlineRunner::default()),
-                    db_pipeline: db,
-                    ..fs_options()
-                },
-            )
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let bad = bucket::name("bad").unwrap();
+        let good = bucket::name("good").unwrap();
+        storage.create_bucket(&bad).await.unwrap();
+        storage.create_bucket(&good).await.unwrap();
+        fs::write(root.path().join("good/a.txt"), b"x")
+            .await
             .unwrap();
-            let scanner = Scanner::new(storage, options());
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.recomputed, 3);
-            assert_eq!(batches.load(std::sync::atomic::Ordering::Relaxed), 3);
-            assert_eq!(
-                failures.load(std::sync::atomic::Ordering::Relaxed),
-                3,
-                "every dropped batch's failure must be observed (R8)"
-            );
-            // The real writes landed despite the reported failures.
-            assert_eq!(
-                scanner
-                    .storage
-                    .meta_store()
-                    .walk(&bucket::name("data").unwrap())
-                    .await
-                    .unwrap()
-                    .len(),
-                3
-            );
-        });
+        // The bad bucket's dir becomes unreadable — its walk fails
+        // with PermissionDenied on every pass.
+        fs::set_permissions(root.path().join("bad"), Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(
+            summary.reconciled, 1,
+            "the good bucket reconciles despite the bad one (F12)"
+        );
+        let head = storage.head_object(&good, &"a.txt".into()).await.unwrap();
+        assert_eq!(head.etag, ETag::from_content(b"x"));
     }
 
-    #[test]
-    fn hot_scan_enqueues_no_tasks() {
-        // P6: a second pass over a fully-matching bucket enqueues nothing
-        // into the IO pipeline (the in-memory matches gate runs first).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            files(root.path(), 3);
-            let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
-            let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.recomputed, 3);
-            assert_eq!(io.enqueued(), 3);
-            let summary = scanner.scan_once().await.unwrap();
-            assert_eq!(summary.recomputed, 0);
-            assert_eq!(io.enqueued(), 3, "hot pass: no compute tasks (P6)");
-        });
+    #[tokio::test]
+    async fn vanished_files_do_not_abort_the_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let n = 105;
+        files(root.path(), n);
+        let io = GatedRunner::<etag::Result>::new(4, 256);
+        let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
+        let scanner2 = scanner.clone();
+        let scan = tokio::spawn(async move { scanner2.scan_once().await });
+        wait_for(|| io.enqueued() == n).await;
+        for i in 0..n {
+            fs::remove_file(root.path().join("data").join(format!("f{i:02}.txt")))
+                .await
+                .unwrap();
+        }
+        io.open_gate();
+        let summary = scan.await.unwrap().unwrap();
+        assert_eq!(summary.reconciled, n);
+        assert_eq!(summary.recomputed, 0);
+    }
+
+    #[tokio::test]
+    async fn write_batch_failures_are_observed_and_the_scan_continues() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), 3);
+        let (db, batches, failures) = FailingBatchRunner::new();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                meta_batch_size: 1, // one batch per entry (Q5)
+                io_pipeline: Arc::new(InlineRunner::default()),
+                db_pipeline: db,
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let scanner = Scanner::new(storage, options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.recomputed, 3);
+        assert_eq!(batches.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            failures.load(Ordering::Relaxed),
+            3,
+            "every dropped batch's failure must be observed (R8)"
+        );
+        // The real writes landed despite the reported failures.
+        assert_eq!(
+            scanner
+                .storage
+                .meta_store()
+                .walk(&bucket::name("data").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_scan_enqueues_no_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), 3);
+        let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
+        let scanner = scanner_with(root.path(), io.clone(), Arc::new(InlineRunner::default()));
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.recomputed, 3);
+        assert_eq!(io.enqueued(), 3);
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.recomputed, 0);
+        assert_eq!(io.enqueued(), 3, "hot pass: no compute tasks (P6)");
     }
 }

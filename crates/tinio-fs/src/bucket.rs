@@ -10,11 +10,13 @@
 
 use std::{path::Path, sync::Arc, time::SystemTime};
 
+pub use bucket::{Name, name};
 use tinio_core::bucket;
 
-pub use bucket::{Name, name};
-
-use crate::{Error, database};
+use crate::{
+    Error,
+    database::{self, BucketsTable, Handle},
+};
 
 /// Bucket-name → creation-time store (`BUCKETS` table).
 ///
@@ -22,12 +24,14 @@ use crate::{Error, database};
 ///
 /// ```rust
 /// use std::time::SystemTime;
+///
 /// use tinio_fs::bucket;
+/// use tokio::runtime::Runtime;
 ///
 /// let state = tempfile::tempdir().unwrap();
 /// let store = bucket::store(state.path()).unwrap();
 /// let name = bucket::name("data").unwrap();
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// Runtime::new().unwrap().block_on(async {
 ///     store.record(&name, SystemTime::UNIX_EPOCH).await.unwrap();
 ///     let created = store.created_at(&name).await.unwrap().unwrap();
 ///     assert_eq!(created, SystemTime::UNIX_EPOCH);
@@ -50,7 +54,7 @@ impl Store {
     /// The recorded creation time of a bucket, if any.
     pub async fn created_at(&self, name: &bucket::Name) -> Result<Option<SystemTime>, Error> {
         self.handle
-            .read(|txn| database::BucketsTable::open_readonly(txn)?.get(name))
+            .read(|txn| BucketsTable::open_readonly(txn)?.get(name))
             .map_err(Into::into)
     }
 
@@ -70,7 +74,7 @@ impl Store {
         }
         let name = name.clone();
         self.handle
-            .write(move |txn| database::BucketsTable::open(txn)?.get_or_insert(&name, now))
+            .write(move |txn| BucketsTable::open(txn)?.get_or_insert(&name, now))
             .await
             .map_err(Into::into)
     }
@@ -79,19 +83,19 @@ impl Store {
     pub async fn record(&self, name: &bucket::Name, created_at: SystemTime) -> Result<(), Error> {
         let name = name.clone();
         self.handle
-            .write(move |txn| database::BucketsTable::open(txn)?.put(&name, created_at))
+            .write(move |txn| BucketsTable::open(txn)?.put(&name, created_at))
             .await
             .map_err(Into::into)
     }
 
     /// Remove the entry of a bucket (idempotent). Test-only since the
     /// production teardown removes the row inside
-    /// [`crate::FsStorage::remove_bucket_state`].
+    /// [`FsStorage::remove_bucket_state`].
     #[cfg(test)]
     pub async fn remove(&self, name: &bucket::Name) -> Result<(), Error> {
         let name = name.clone();
         self.handle
-            .write(move |txn| database::BucketsTable::open(txn)?.remove(&name))
+            .write(move |txn| BucketsTable::open(txn)?.remove(&name))
             .await
             .map_err(Into::into)
     }
@@ -101,7 +105,7 @@ impl Store {
     pub async fn load_all(&self) -> Result<Vec<(String, SystemTime)>, Error> {
         self.handle
             .read(|txn| {
-                let table = database::BucketsTable::open_readonly(txn)?;
+                let table = BucketsTable::open_readonly(txn)?;
                 let mut out = Vec::new();
                 table.for_each(|name, created_at| {
                     out.push((name.to_string(), created_at));
@@ -127,111 +131,99 @@ impl Store {
 /// `meta.redb`).
 #[inline]
 pub fn store(state_dir: &Path) -> Result<Store, Error> {
-    Ok(Store::from_handle(database::Handle::open(state_dir)?))
+    Ok(Store::from_handle(Handle::open(state_dir)?))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tinio_util::testing::assert_send_sync;
+
     use super::*;
     use crate::{
         bucket,
-        database::{self, StateTable},
-        testutil::rt,
+        database::{self, Error::UnsupportedVersion, StateTable},
     };
-    use std::time::Duration;
-    use tinio_util::testing::assert_send_sync;
 
     fn t(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    #[test]
-    fn record_and_read_back() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = bucket::store(state.path()).unwrap();
-            let name = bucket::name("data").unwrap();
-            assert!(store.created_at(&name).await.unwrap().is_none());
-            store.record(&name, t(100)).await.unwrap();
-            assert_eq!(store.created_at(&name).await.unwrap(), Some(t(100)));
-        });
+    #[tokio::test]
+    async fn record_and_read_back() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        assert!(store.created_at(&name).await.unwrap().is_none());
+        store.record(&name, t(100)).await.unwrap();
+        assert_eq!(store.created_at(&name).await.unwrap(), Some(t(100)));
     }
 
-    #[test]
-    fn get_or_record_lazily_records_first_sight() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = bucket::store(state.path()).unwrap();
-            let name = bucket::name("data").unwrap();
-            let first = store.get_or_record(&name, t(1)).await.unwrap();
-            assert_eq!(first, t(1));
-            // Second sight returns the recorded value, not the new one.
-            let second = store.get_or_record(&name, t(2)).await.unwrap();
-            assert_eq!(second, t(1));
-        });
+    #[tokio::test]
+    async fn get_or_record_lazily_records_first_sight() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        let first = store.get_or_record(&name, t(1)).await.unwrap();
+        assert_eq!(first, t(1));
+        // Second sight returns the recorded value, not the new one.
+        let second = store.get_or_record(&name, t(2)).await.unwrap();
+        assert_eq!(second, t(1));
     }
 
-    #[test]
-    fn remove_prunes_entry() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = bucket::store(state.path()).unwrap();
-            let name = bucket::name("data").unwrap();
-            store.record(&name, t(1)).await.unwrap();
-            store.remove(&name).await.unwrap();
-            assert!(store.created_at(&name).await.unwrap().is_none());
-            store.remove(&name).await.unwrap(); // idempotent
-        });
+    #[tokio::test]
+    async fn remove_prunes_entry() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        store.record(&name, t(1)).await.unwrap();
+        store.remove(&name).await.unwrap();
+        assert!(store.created_at(&name).await.unwrap().is_none());
+        store.remove(&name).await.unwrap(); // idempotent
     }
 
-    #[test]
-    fn load_all_returns_sorted_entries() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = bucket::store(state.path()).unwrap();
-            store
-                .record(&bucket::name("zeta").unwrap(), t(3))
-                .await
-                .unwrap();
-            store
-                .record(&bucket::name("alpha").unwrap(), t(1))
-                .await
-                .unwrap();
-            let all = store.load_all().await.unwrap();
-            let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(names, ["alpha", "zeta"]);
-        });
+    #[tokio::test]
+    async fn load_all_returns_sorted_entries() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        store
+            .record(&bucket::name("zeta").unwrap(), t(3))
+            .await
+            .unwrap();
+        store
+            .record(&bucket::name("alpha").unwrap(), t(1))
+            .await
+            .unwrap();
+        let all = store.load_all().await.unwrap();
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
     }
 
-    #[test]
-    fn state_version_is_written_and_validated() {
-        // The buckets.json version check moved to the STATE table
-        // (meta-redb-spec task 3): a fresh database records version 1, and
-        // a mismatch fails to open.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
+    #[tokio::test]
+    async fn state_version_is_written_and_validated() {
+        let state = tempfile::tempdir().unwrap();
+        {
+            let db = database::open(state.path()).unwrap().db;
+            let mut txn = db.begin_write().unwrap();
             {
-                let db = database::open(state.path()).unwrap().db;
-                let mut txn = db.begin_write().unwrap();
-                {
-                    let mut state = StateTable::open(&mut txn).unwrap();
-                    state.insert("version", 9).unwrap();
-                }
-                txn.commit().unwrap();
+                let mut state = StateTable::open(&mut txn).unwrap();
+                state.insert("version", 9).unwrap();
             }
-            let err: Error = database::open(state.path()).unwrap_err().into();
-            assert!(
-                matches!(
-                    err,
-                    Error::Database(database::Error::UnsupportedVersion {
-                        path: _,
-                        found: 9,
-                        expected: 1
-                    })
-                ),
-                "{err:?}"
-            );
-        });
+            txn.commit().unwrap();
+        }
+        let err: Error = database::open(state.path()).unwrap_err().into();
+        assert!(
+            matches!(
+                err,
+                Error::Database(UnsupportedVersion {
+                    path: _,
+                    found: 9,
+                    expected: 1
+                })
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -6,12 +6,16 @@
 
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
-use tinio_core::storage::{BucketOps, ObjectOps};
-use tinio_core::{BodyStream, bucket, object};
-use tinio_fs::testing::fs_options;
-use tinio_fs::{AtomicWriter, FsStorage};
+use bytes::Bytes;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use futures::stream;
+use tinio_core::{
+    BodyStream, bucket, object, storage,
+    storage::{BucketOps, ObjectOps},
+};
+use tinio_fs::{AtomicWriter, FsStorage, testing::fs_options};
 use tinio_util::testing::body;
+use tokio::runtime::Runtime;
 
 /// Total bytes per streaming round-trip (64 MiB — large enough to measure
 /// throughput, small enough for CI smoke runs).
@@ -22,43 +26,42 @@ const CHUNK: usize = 64 * 1024;
 /// pre-materialized payload).
 fn chunk_stream() -> BodyStream {
     let total = TOTAL as usize;
-    Box::pin(futures::stream::unfold(0usize, move |pos| async move {
+    Box::pin(stream::unfold(0usize, move |pos| async move {
         if pos >= total {
             return None;
         }
         let n = (total - pos).min(CHUNK);
         let chunk = vec![b'x'; n];
-        Some((Ok(bytes::Bytes::from(chunk)), pos + n))
+        Some((Ok(Bytes::from(chunk)), pos + n))
     }))
 }
 
 fn streaming_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("streaming_write");
-    group.throughput(criterion::Throughput::Bytes(TOTAL));
+    group.throughput(Throughput::Bytes(TOTAL));
     group.bench_function("atomic_write_64MiB", |b| {
         let state = tempfile::tempdir().unwrap();
         let writer = AtomicWriter::new(state.path());
         let target = state.path().join("obj.bin");
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| {
-                let writer = writer.clone();
-                let target = target.clone();
-                async move {
-                    let etag = writer.write(&target, chunk_stream()).await.unwrap();
-                    black_box(etag);
-                }
-            });
+        b.to_async(Runtime::new().unwrap()).iter(|| {
+            let writer = writer.clone();
+            let target = target.clone();
+            async move {
+                let etag = writer.write(&target, chunk_stream()).await.unwrap();
+                black_box(etag);
+            }
+        });
     });
     group.finish();
 }
 
 fn streaming_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("streaming_read");
-    group.throughput(criterion::Throughput::Bytes(TOTAL));
+    group.throughput(Throughput::Bytes(TOTAL));
     group.bench_function("get_object_drain_64MiB", |b| {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let b = bucket::name("data").unwrap();
             storage.create_bucket(&b).await.unwrap();
@@ -78,7 +81,7 @@ fn streaming_read(c: &mut Criterion) {
                     )
                     .await
                     .unwrap();
-                let drained = tinio_core::storage::collect_body(get.body).await.unwrap();
+                let drained = storage::collect_body(get.body).await.unwrap();
                 black_box(drained.len());
             }
         });
@@ -90,11 +93,11 @@ fn streaming_read(c: &mut Criterion) {
 /// write path).
 fn small_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("small_write");
-    group.throughput(criterion::Throughput::Elements(1));
+    group.throughput(Throughput::Elements(1));
     group.bench_function("put_1KiB", |b| {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             storage
                 .create_bucket(&bucket::name("data").unwrap())

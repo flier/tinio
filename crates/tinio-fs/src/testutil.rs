@@ -1,7 +1,13 @@
 //! Shared test helpers (`#[cfg(test)]` only).
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir;
 use std::{
+    fs,
     future::Future,
+    io::{Error as IoError, ErrorKind},
     path::Path,
     sync::{
         Arc,
@@ -11,34 +17,30 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
-
 use tinio_core::{
     bucket,
-    pipeline::{self, Completion, Reply, Runner, Stats, Task},
+    pipeline::{self, Completion, Error::ShutDown, Reply, Runner, Stats, Task},
+};
+use tinio_util::testing::wait_for as util_wait_for;
+use tokio::{
+    fs as tokio_fs,
+    sync::{Mutex, mpsc, watch},
+    task, time,
 };
 
-use crate::{FsOptions, FsStorage, etag};
-
-/// Run `f` to completion on a fresh multi-thread runtime.
-pub(crate) fn rt<F, T>(f: F) -> T
-where
-    F: Future<Output = T>,
-{
-    tokio::runtime::Runtime::new().unwrap().block_on(f)
-}
+use crate::{Error, FsOptions, FsStorage, etag, testing};
 
 /// Poll `cond` until true or a 10 s deadline passes (the test runners'
 /// workers are asynchronous, so assertions must wait). The shared
 /// `tinio_util::testing` home (F30).
 pub(crate) async fn wait_for(cond: impl FnMut() -> bool) {
-    tinio_util::testing::wait_for(cond).await
+    util_wait_for(cond).await
 }
 
 /// The standard test `FsOptions` — the shared `tinio_fs::testing` home
 /// (F33).
 pub(crate) fn fs_options() -> FsOptions {
-    crate::testing::fs_options()
+    testing::fs_options()
 }
 
 /// A fresh storage root + backend (default options) — the shared backend
@@ -53,9 +55,9 @@ pub(crate) fn storage() -> (tempfile::TempDir, FsStorage) {
 /// (`payload {i}`) — the shared producer fixture of the list and scanner
 /// tests (F39; the list tests add their own state store on top).
 pub(crate) fn files(root: &Path, n: usize) {
-    std::fs::create_dir(root.join("data")).unwrap();
+    fs::create_dir(root.join("data")).unwrap();
     for i in 0..n {
-        std::fs::write(
+        fs::write(
             root.join("data").join(format!("f{i:02}.txt")),
             format!("payload {i}"),
         )
@@ -82,7 +84,7 @@ where
     T: Send + 'static,
 {
     let guard = storage.lock_bucket_mutations(bucket).await;
-    let handle = tokio::spawn(op());
+    let handle = task::spawn(op());
     ready.await;
     replace_dir_link(link, new_target);
     drop(guard);
@@ -93,14 +95,14 @@ where
 /// stage has finished).
 pub(crate) async fn wait_for_tmp(storage: &FsStorage) {
     let tmp = storage.state_dir().join("tmp");
-    let appeared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let appeared = time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(mut entries) = tokio::fs::read_dir(&tmp).await
+            if let Ok(mut entries) = tokio_fs::read_dir(&tmp).await
                 && entries.next_entry().await.ok().flatten().is_some()
             {
                 return;
             }
-            tokio::task::yield_now().await;
+            task::yield_now().await;
         }
     })
     .await;
@@ -112,29 +114,29 @@ pub(crate) async fn wait_for_tmp(storage: &FsStorage) {
 /// blocks on the lock first thing).
 pub(crate) async fn wait_for_lock_waiter() {
     for _ in 0..64 {
-        tokio::task::yield_now().await;
+        task::yield_now().await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    time::sleep(Duration::from_millis(20)).await;
 }
 
 /// Create a directory symlink (Unix) or directory symlink (Windows).
 pub(crate) fn link_dir(original: &Path, link: &Path) {
     #[cfg(unix)]
-    std::os::unix::fs::symlink(original, link).unwrap();
+    symlink(original, link).unwrap();
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(original, link).unwrap();
+    symlink_dir(original, link).unwrap();
 }
 
 fn replace_dir_link(link: &Path, new_target: &Path) {
     #[cfg(unix)]
     {
-        std::fs::remove_file(link).unwrap();
-        std::os::unix::fs::symlink(new_target, link).unwrap();
+        fs::remove_file(link).unwrap();
+        symlink(new_target, link).unwrap();
     }
     #[cfg(windows)]
     {
-        std::fs::remove_dir(link).unwrap();
-        std::os::windows::fs::symlink_dir(new_target, link).unwrap();
+        fs::remove_dir(link).unwrap();
+        symlink_dir(new_target, link).unwrap();
     }
 }
 
@@ -152,7 +154,7 @@ type Job<O> = (Box<dyn Task<Output = O>>, Reply<O>);
 /// mutex guard drops before the caller runs the task — holding it across
 /// the worker body would serialize the workers (the guard temporary in a
 /// `while let` scrutinee lives for the whole statement, sleep included).
-async fn recv_job<O>(rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<Job<O>>>>) -> Option<Job<O>> {
+async fn recv_job<O>(rx: &Arc<Mutex<mpsc::Receiver<Job<O>>>>) -> Option<Job<O>> {
     rx.lock().await.recv().await
 }
 
@@ -178,7 +180,7 @@ where
     /// runtime.
     pub(crate) fn new(workers: usize, capacity: usize, delay: Duration) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<Job<O>>(capacity);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let rx = Arc::new(Mutex::new(rx));
         let max_in_run = Arc::new(AtomicUsize::new(0));
         let in_run = Arc::new(AtomicUsize::new(0));
         let enqueued = Arc::new(AtomicUsize::new(0));
@@ -186,12 +188,12 @@ where
             let rx = Arc::clone(&rx);
             let max_in_run = Arc::clone(&max_in_run);
             let in_run = Arc::clone(&in_run);
-            tokio::spawn(async move {
+            task::spawn(async move {
                 while let Some((mut task, reply)) = recv_job(&rx).await {
                     let now = in_run.fetch_add(1, Ordering::Relaxed) + 1;
                     max_in_run.fetch_max(now, Ordering::Relaxed);
                     if delay > Duration::ZERO {
-                        tokio::time::sleep(delay).await;
+                        time::sleep(delay).await;
                     }
                     let _ = reply.send(task.run().await);
                     in_run.fetch_sub(1, Ordering::Relaxed);
@@ -228,10 +230,7 @@ where
     ) -> Result<Completion<O>, pipeline::Error> {
         let (reply, done) = Completion::pair();
         self.enqueued.fetch_add(1, Ordering::Relaxed);
-        self.tx
-            .send((task, reply))
-            .await
-            .map_err(|_| pipeline::Error::ShutDown)?;
+        self.tx.send((task, reply)).await.map_err(|_| ShutDown)?;
         Ok(done)
     }
 
@@ -262,13 +261,13 @@ where
     /// before running.
     pub(crate) fn new(workers: usize, capacity: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<Job<O>>(capacity);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let rx = Arc::new(Mutex::new(rx));
         let (gate, gate_rx) = watch::channel(false);
         let enqueued = Arc::new(AtomicUsize::new(0));
         for _ in 0..workers {
             let rx = Arc::clone(&rx);
             let mut gate_rx = gate_rx.clone();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 while let Some((mut task, reply)) = recv_job(&rx).await {
                     // Park until the gate opens (`changed()` alone would
                     // fire only once per send — later tasks would hang).
@@ -304,10 +303,7 @@ where
     ) -> Result<Completion<O>, pipeline::Error> {
         let (reply, done) = Completion::pair();
         self.enqueued.fetch_add(1, Ordering::Relaxed);
-        self.tx
-            .send((task, reply))
-            .await
-            .map_err(|_| pipeline::Error::ShutDown)?;
+        self.tx.send((task, reply)).await.map_err(|_| ShutDown)?;
         Ok(done)
     }
 
@@ -321,7 +317,7 @@ where
 /// A [`Runner`] that **loses** every task without running it — the
 /// crash-loss simulation (a batch dropped before commit is equivalent to
 /// an uncommitted batch; the next pass recomputes). The completion
-/// resolves [`pipeline::Error::Dropped`].
+/// resolves [`Error::Dropped`].
 pub(crate) struct LossyRunner;
 
 #[async_trait]
@@ -375,8 +371,8 @@ impl Runner<etag::Result> for FailingTaskRunner {
     ) -> Result<Completion<etag::Result>, pipeline::Error> {
         let (reply, done) = Completion::pair();
         self.enqueued.fetch_add(1, Ordering::Relaxed);
-        let _ = reply.send(Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
+        let _ = reply.send(Err(Error::Io(IoError::new(
+            ErrorKind::PermissionDenied,
             "simulated task failure",
         ))));
         Ok(done)
@@ -415,18 +411,16 @@ impl FailingBatchRunner {
 }
 
 #[async_trait]
-impl Runner<Result<(), crate::Error>> for FailingBatchRunner {
+impl Runner<Result<(), Error>> for FailingBatchRunner {
     async fn enqueue(
         &self,
-        mut task: Box<dyn Task<Output = Result<(), crate::Error>>>,
-    ) -> Result<Completion<Result<(), crate::Error>>, pipeline::Error> {
+        mut task: Box<dyn Task<Output = Result<(), Error>>>,
+    ) -> Result<Completion<Result<(), Error>>, pipeline::Error> {
         let (reply, done) = Completion::pair();
         self.batches.fetch_add(1, Ordering::Relaxed);
         let _ = task.run().await; // the real write still lands
         self.failures.fetch_add(1, Ordering::Relaxed);
-        let _ = reply.send(Err(crate::Error::Io(std::io::Error::other(
-            "simulated batch failure",
-        ))));
+        let _ = reply.send(Err(Error::Io(IoError::other("simulated batch failure"))));
         Ok(done)
     }
 

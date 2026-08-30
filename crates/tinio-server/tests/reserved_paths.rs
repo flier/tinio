@@ -7,13 +7,13 @@
 
 mod common;
 
-use http::StatusCode;
+use std::fs;
 
+use common::{Server, fs_options, request};
+use http::StatusCode;
 use tinio_core::storage::BucketOps;
 use tinio_fs::FsStorage;
 use tinio_server::Capabilities;
-
-use common::{Server, fs_options, request};
 
 #[tokio::test]
 async fn tinio_writes_denied_reads_missing() {
@@ -63,8 +63,8 @@ async fn nested_root_state_never_served() {
 
     // The inner root's reserved state (created by its own server).
     let inner_root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(inner_root.path().join(".tinio")).unwrap();
-    std::fs::write(inner_root.path().join(".tinio/state"), b"secret").unwrap();
+    fs::create_dir_all(inner_root.path().join(".tinio")).unwrap();
+    fs::write(inner_root.path().join(".tinio/state"), b"secret").unwrap();
     // Symlink-free copy: place the inner root inside the outer bucket.
     let inner_bucket = outer_root.path().join("inner-root");
     copy_dir(inner_root.path(), &inner_bucket);
@@ -79,7 +79,7 @@ async fn nested_root_state_never_served() {
     assert_eq!(resp.status, StatusCode::FORBIDDEN);
     assert_eq!(resp.error_code(), "AccessDenied");
     assert_eq!(
-        std::fs::read(inner_bucket.join(".tinio/state")).unwrap(),
+        fs::read(inner_bucket.join(".tinio/state")).unwrap(),
         b"secret"
     );
 
@@ -89,21 +89,21 @@ async fn nested_root_state_never_served() {
 
     // Non-reserved objects of the inner root are served normally (it is a
     // regular bucket of the outer server).
-    std::fs::write(inner_bucket.join("public.txt"), b"public").unwrap();
+    fs::write(inner_bucket.join("public.txt"), b"public").unwrap();
     let resp = request(addr, "GET", "/inner-root/public.txt", &[], &[]).await;
     assert_eq!(resp.status, StatusCode::OK);
     assert_eq!(resp.body, b"public");
 }
 
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);
         } else {
-            std::fs::copy(entry.path(), target).unwrap();
+            fs::copy(entry.path(), target).unwrap();
         }
     }
 }

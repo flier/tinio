@@ -1,6 +1,7 @@
 //! Shared database access handle.
 
 use std::{
+    array::from_fn,
     path::Path,
     sync::{
         Arc,
@@ -11,6 +12,7 @@ use std::{
 
 use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
 use tinio_core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS};
+use tokio::task::spawn_blocking;
 
 use super::{
     compact::{needs_compact, snapshot},
@@ -172,7 +174,7 @@ impl Handle {
         T: Send + 'static,
     {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             f(&txn)
         })
@@ -245,7 +247,7 @@ impl Handle {
         // spawn_blocking hop (queue delay included, see the doc above).
         let start = Instant::now();
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.timed_write_blocking(start, f))
+        spawn_blocking(move || this.timed_write_blocking(start, f))
             .await
             .unwrap_or_else(|join| panic!("the write-transaction task panicked: {join}"))
     }
@@ -285,12 +287,8 @@ impl Handle {
     /// only).
     pub fn write_lock_stats(&self) -> WriteLockSnapshot {
         WriteLockSnapshot {
-            wait_buckets: std::array::from_fn(|i| {
-                self.hist.wait_buckets[i].load(Ordering::Relaxed)
-            }),
-            total_buckets: std::array::from_fn(|i| {
-                self.hist.total_buckets[i].load(Ordering::Relaxed)
-            }),
+            wait_buckets: from_fn(|i| self.hist.wait_buckets[i].load(Ordering::Relaxed)),
+            total_buckets: from_fn(|i| self.hist.total_buckets[i].load(Ordering::Relaxed)),
             count: self.hist.count.load(Ordering::Relaxed),
             wait_sum_us: self.hist.wait_sum_us.load(Ordering::Relaxed),
             wait_max_us: self.hist.wait_max_us.load(Ordering::Relaxed),

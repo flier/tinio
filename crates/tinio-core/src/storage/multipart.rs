@@ -2,20 +2,19 @@
 
 use async_trait::async_trait;
 
+use super::{Storage, body::BodyStream, range::ByteRange};
 use crate::{
     bucket,
-    multipart::{CompletedPart, MultipartUpload, PartInfo},
+    multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object,
 };
-
-use super::{Storage, body::BodyStream, range::ByteRange};
 
 /// Parameters of a [`MultipartOps::list_parts`] call.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{bucket, object, ListPartsParams};
+/// use tinio_core::{ListPartsParams, bucket, object};
 ///
 /// let params = ListPartsParams {
 ///     bucket: bucket::name("data").unwrap(),
@@ -69,7 +68,7 @@ pub struct PartsListing {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{bucket, ListUploadsParams};
+/// use tinio_core::{ListUploadsParams, bucket};
 ///
 /// let params = ListUploadsParams {
 ///     bucket: bucket::name("data").unwrap(),
@@ -161,7 +160,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         bucket: &bucket::Name,
         key: &object::Key,
         upload_id: &str,
-        part_number: crate::multipart::PartNumber,
+        part_number: PartNumber,
         body: BodyStream,
     ) -> Result<PartInfo, <Self as Storage>::Error>
     where
@@ -181,7 +180,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         dst_bucket: &bucket::Name,
         dst_key: &object::Key,
         upload_id: &str,
-        part_number: crate::multipart::PartNumber,
+        part_number: PartNumber,
         range: Option<ByteRange>,
     ) -> Result<PartInfo, <Self as Storage>::Error>
     where
@@ -204,8 +203,8 @@ pub trait MultipartOps: Send + Sync + 'static {
     ///
     /// `parts` is the client's `CompleteMultipartUpload` list: strictly
     /// ascending numbers, each ETag matching the stored part. Extra stored
-    /// parts that are not listed are discarded. Empty `parts` is [`super::Error::NoParts`].
-    /// A missing / mismatched / out-of-order part is [`super::Error::InvalidPart`].
+    /// parts that are not listed are discarded. Empty `parts` is [`Error::NoParts`].
+    /// A missing / mismatched / out-of-order part is [`Error::InvalidPart`].
     /// Returns the composed object metadata (ETag `MD5-of-MD5s-N`, FR-022).
     async fn complete_multipart_upload(
         &self,

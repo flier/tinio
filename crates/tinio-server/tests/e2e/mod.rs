@@ -17,7 +17,7 @@
 #![allow(dead_code)]
 
 use std::{
-    fs,
+    env, fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -37,7 +37,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The workspace target dir (`CARGO_TARGET_DIR` override honored).
 fn target_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+    if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
         return PathBuf::from(dir);
     }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -249,7 +249,7 @@ impl Mc {
 /// isolated venv (never the system python): `TINIO_BOTO3_PYTHON`
 /// overrides the conventional `<target>/tinio-e2e-venv` venv.
 pub fn boto3_python() -> PathBuf {
-    if let Some(p) = std::env::var_os("TINIO_BOTO3_PYTHON") {
+    if let Some(p) = env::var_os("TINIO_BOTO3_PYTHON") {
         return PathBuf::from(p);
     }
     let mut p = target_dir().join("tinio-e2e-venv");

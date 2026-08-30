@@ -6,15 +6,14 @@
 
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{
     bucket, object,
     storage::{BucketOps, ListObjectsParams, ObjectOps},
 };
-use tinio_fs::FsStorage;
-use tinio_fs::testing::fs_options;
-
+use tinio_fs::{FsStorage, testing::fs_options};
 use tinio_util::testing::body;
+use tokio::runtime::Runtime;
 
 /// Tree shape: 4 prefixes × 1000 objects each + 500 flat objects.
 const PREFIXES: usize = 4;
@@ -24,7 +23,7 @@ const FLAT: usize = 500;
 fn listing(c: &mut Criterion) {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = Runtime::new().unwrap();
     let bname = bucket::name("data").unwrap();
     rt.block_on(async {
         storage.create_bucket(&bname).await.unwrap();
@@ -53,9 +52,7 @@ fn listing(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("listing");
-    group.throughput(criterion::Throughput::Elements(
-        (PREFIXES * PER_PREFIX + FLAT) as u64,
-    ));
+    group.throughput(Throughput::Elements((PREFIXES * PER_PREFIX + FLAT) as u64));
     group.bench_function("flat_full", |b| {
         b.to_async(rt.handle().clone()).iter(|| {
             let storage = storage.clone();

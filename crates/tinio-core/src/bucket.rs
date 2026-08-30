@@ -3,6 +3,7 @@
 use std::time::SystemTime;
 
 use derive_more::{AsRef, Deref, Display, Into};
+use garde::Error as GardeError;
 
 use crate::storage::{self, Error::*};
 
@@ -15,11 +16,13 @@ use crate::storage::{self, Error::*};
 /// # Examples
 ///
 /// ```rust
+/// use std::time::SystemTime;
+///
 /// use tinio_core::bucket::Bucket;
 ///
 /// let bucket = Bucket {
 ///     name: "data".into(),
-///     creation_time: std::time::SystemTime::UNIX_EPOCH,
+///     creation_time: SystemTime::UNIX_EPOCH,
 /// };
 /// assert_eq!(bucket.name.as_ref(), "data");
 /// ```
@@ -44,17 +47,16 @@ pub struct Bucket {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::bucket;
-/// use tinio_core::storage::{self, Error::*};
+/// use tinio_core::{
+///     bucket,
+///     storage::{self, Error::*},
+/// };
 ///
 /// let name = bucket::name("my-bucket").unwrap();
 /// assert_eq!(name.as_ref(), "my-bucket");
 ///
 /// for bad in ["ab", "Big_Name", "-lead", "a..b"] {
-///     assert!(matches!(
-///         bucket::name(bad),
-///         Err(InvalidBucketName(_))
-///     ));
+///     assert!(matches!(bucket::name(bad), Err(InvalidBucketName(_))));
 /// }
 ///
 /// let from_literal: bucket::Name = "my-bucket".into();
@@ -91,12 +93,12 @@ impl From<String> for Name {
 fn validate_bucket_name(name: &str) -> garde::Result {
     let len = name.len();
     if len < 3 {
-        return Err(garde::Error::new(format!(
+        return Err(GardeError::new(format!(
             "{name:?}: bucket names must be at least 3 characters"
         )));
     }
     if len > 63 {
-        return Err(garde::Error::new(format!(
+        return Err(GardeError::new(format!(
             "{name:?}: bucket names must be at most 63 characters"
         )));
     }
@@ -104,22 +106,22 @@ fn validate_bucket_name(name: &str) -> garde::Result {
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
     {
-        return Err(garde::Error::new(format!(
+        return Err(GardeError::new(format!(
             "{name:?}: only lowercase letters, digits, dots and hyphens are allowed"
         )));
     }
     if name.starts_with('.') || name.starts_with('-') {
-        return Err(garde::Error::new(format!(
+        return Err(GardeError::new(format!(
             "{name:?}: must not start with a dot or hyphen"
         )));
     }
     if name.ends_with('.') || name.ends_with('-') {
-        return Err(garde::Error::new(format!(
+        return Err(GardeError::new(format!(
             "{name:?}: must not end with a dot or hyphen"
         )));
     }
     if name.contains("..") {
-        return Err(garde::Error::new(format!(
+        return Err(GardeError::new(format!(
             "{name:?}: adjacent dots are not allowed"
         )));
     }
@@ -128,9 +130,11 @@ fn validate_bucket_name(name: &str) -> garde::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::{Duration, SystemTime};
+
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn bucket_name_validates_and_exposes() {

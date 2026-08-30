@@ -3,9 +3,12 @@
 //! [`Error`] is a superset of [`storage::Error`]: contract failures wrap
 //! that type; redb failures wrap [`DatabaseError`]. `#[from]` converts
 //! [`storage::Error`] automatically. Projection onto the contract unwraps
-//! `Storage` and maps [`DatabaseError`] onto [`storage::Error::Io`].
+//! `Storage` and maps [`DatabaseError`] onto [`Error::Io`].
 
-use std::{io, num::ParseIntError};
+use std::{
+    io::{self, Error as IoError},
+    num::ParseIntError,
+};
 
 use tinio_core::{bucket, etag, object, storage, storage::Error::*};
 
@@ -17,8 +20,7 @@ use tinio_core::{bucket, etag, object, storage, storage::Error::*};
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::storage;
-/// use tinio_core::storage::Error::*;
+/// use tinio_core::{storage, storage::Error::*};
 /// use tinio_mem::Error;
 ///
 /// let err: Error = NoSuchBucket("data".into()).into();
@@ -39,9 +41,10 @@ pub enum Error {
 /// # Examples
 ///
 /// ```rust
+/// use StorageError::ValueTooLarge;
 /// use tinio_mem::{DatabaseError, Error};
 ///
-/// let err = Error::from(redb::StorageError::ValueTooLarge(1));
+/// let err = Error::from(ValueTooLarge(1));
 /// assert!(matches!(err, Error::Database(DatabaseError::Storage(_))));
 /// ```
 #[derive(Debug, thiserror::Error)]
@@ -115,7 +118,7 @@ impl From<Error> for storage::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::Storage(e) => e,
-            Error::Database(e) => Io(io::Error::other(e)),
+            Error::Database(e) => Io(IoError::other(e)),
         }
     }
 }
@@ -245,8 +248,17 @@ pub(crate) fn database_commit(err: redb::CommitError) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use redb::{
+        CommitError::TransactionPoisoned,
+        DatabaseError::DatabaseAlreadyOpen,
+        StorageError::{Corrupted, ValueTooLarge},
+        TableError::TableDoesNotExist,
+        TransactionError::Storage as TxnStorage,
+    };
+    use tinio_core::{etag::Error::InvalidFormat, storage::ByteRange};
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn displays_wrapped_contract_errors() {
@@ -255,12 +267,12 @@ mod tests {
             (NoSuchKey("a.txt".into()), "no such object: `a.txt`"),
             (
                 InvalidRange {
-                    range: storage::ByteRange::From(10),
+                    range: ByteRange::From(10),
                     size: 10,
                 },
                 "invalid byte range: requested From(10) on object of 10 bytes",
             ),
-            (Io(io::Error::other("boom")), "I/O error: boom"),
+            (Io(IoError::other("boom")), "I/O error: boom"),
         ];
         for (src, expected) in cases {
             let err: Error = src.into();
@@ -279,19 +291,19 @@ mod tests {
         let err: Error = NoParts.into();
         assert!(matches!(err, Error::Storage(NoParts)));
 
-        let err: Error = etag::Error::InvalidFormat.into();
+        let err: Error = InvalidFormat.into();
         assert!(matches!(err, Error::Storage(InvalidETag(_))));
     }
 
     #[test]
     fn extras_project_onto_contract_io() {
-        let core: storage::Error = Error::from(redb::StorageError::ValueTooLarge(1)).into();
+        let core: storage::Error = Error::from(ValueTooLarge(1)).into();
         assert!(matches!(core, Io(_)));
     }
 
     #[test]
     fn redb_errors_wrap_as_database() {
-        let err = Error::from(redb::StorageError::ValueTooLarge(99));
+        let err = Error::from(ValueTooLarge(99));
         assert!(
             matches!(err, Error::Database(DatabaseError::Storage(_))),
             "{err}"
@@ -345,10 +357,10 @@ mod tests {
 
     #[test]
     fn io_error_lifts_into_storage_wrapper() {
-        let err = Error::from(io::Error::other("boom"));
+        let err = Error::from(IoError::other("boom"));
         assert!(matches!(err, Error::Storage(Io(_))));
         assert!(matches!(
-            self::io(io::Error::other("boom")),
+            self::io(IoError::other("boom")),
             Error::Storage(Io(_))
         ));
     }
@@ -356,28 +368,14 @@ mod tests {
     #[test]
     fn every_database_variant_wraps_and_displays() {
         let cases: [(Error, &str); 5] = [
+            (Error::from(DatabaseAlreadyOpen), "database error:"),
             (
-                Error::from(redb::DatabaseError::DatabaseAlreadyOpen),
-                "database error:",
-            ),
-            (
-                Error::from(redb::TransactionError::Storage(
-                    redb::StorageError::ValueTooLarge(1),
-                )),
+                Error::from(TxnStorage(ValueTooLarge(1))),
                 "transaction error:",
             ),
-            (
-                Error::from(redb::TableError::TableDoesNotExist("x".into())),
-                "table error:",
-            ),
-            (
-                Error::from(redb::StorageError::Corrupted("boom".into())),
-                "storage error:",
-            ),
-            (
-                Error::from(redb::CommitError::TransactionPoisoned),
-                "commit error:",
-            ),
+            (Error::from(TableDoesNotExist("x".into())), "table error:"),
+            (Error::from(Corrupted("boom".into())), "storage error:"),
+            (Error::from(TransactionPoisoned), "commit error:"),
         ];
         for (err, prefix) in cases {
             assert!(matches!(err, Error::Database(_)), "{err}");
@@ -387,21 +385,19 @@ mod tests {
 
     #[test]
     fn database_constructors_cover_every_variant() {
-        let open = database_open(redb::DatabaseError::DatabaseAlreadyOpen);
+        let open = database_open(DatabaseAlreadyOpen);
         assert!(matches!(open, Error::Database(DatabaseError::Open(_))));
-        let txn = database_transaction(redb::TransactionError::Storage(
-            redb::StorageError::ValueTooLarge(1),
-        ));
+        let txn = database_transaction(TxnStorage(ValueTooLarge(1)));
         assert!(matches!(
             txn,
             Error::Database(DatabaseError::Transaction(_))
         ));
-        let table = database_table(redb::TableError::TableDoesNotExist("x".into()));
+        let table = database_table(TableDoesNotExist("x".into()));
         assert!(matches!(table, Error::Database(DatabaseError::Table(_))));
-        let commit = database_commit(redb::CommitError::TransactionPoisoned);
+        let commit = database_commit(TransactionPoisoned);
         assert!(matches!(commit, Error::Database(DatabaseError::Commit(_))));
         assert!(matches!(
-            database_storage(redb::StorageError::Corrupted("boom".into())),
+            database_storage(Corrupted("boom".into())),
             Error::Database(DatabaseError::Storage(_))
         ));
     }
@@ -409,13 +405,11 @@ mod tests {
     #[test]
     fn every_database_variant_projects_onto_contract_io() {
         for err in [
-            database_open(redb::DatabaseError::DatabaseAlreadyOpen),
-            database_transaction(redb::TransactionError::Storage(
-                redb::StorageError::ValueTooLarge(1),
-            )),
-            database_table(redb::TableError::TableDoesNotExist("x".into())),
-            database_commit(redb::CommitError::TransactionPoisoned),
-            database_storage(redb::StorageError::Corrupted("boom".into())),
+            database_open(DatabaseAlreadyOpen),
+            database_transaction(TxnStorage(ValueTooLarge(1))),
+            database_table(TableDoesNotExist("x".into())),
+            database_commit(TransactionPoisoned),
+            database_storage(Corrupted("boom".into())),
         ] {
             let core: storage::Error = err.into();
             assert!(matches!(core, Io(_)), "{core}");

@@ -15,9 +15,9 @@
 //! §3) needs read-only-mode state relocation and lands with US2 (T076).
 
 use std::{
-    io,
+    future,
+    io::{self, Error as IoError, ErrorKind},
     path::{Path, PathBuf},
-    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -27,25 +27,27 @@ use futures::stream;
 use tinio_core::cleanup::{
     ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
 };
-use tinio_core::pipeline::Runner;
+use tokio::fs;
 
 use crate::{
     backend::FsStorage,
     bucket,
     error::Error,
+    fsutil,
     fsutil::{entries_of, ok_if_missing, remove_tree},
     path::{MULTIPART_DIR_NAME, STATE_DIR_NAME, TMP_DIR_NAME},
-    sweep, tombstone,
+    sweep::Options,
+    tombstone,
 };
 
 /// The idle anchor of an orphan upload dir: the latest part mtime,
 /// falling back to the directory mtime so a part-less orphan still has an
 /// idle age (a vanished dir propagates `NotFound` — the caller skips).
 async fn orphan_idle_since(dir: &Path) -> io::Result<SystemTime> {
-    if let Some(latest) = crate::fsutil::latest_part_mtime(dir).await? {
+    if let Some(latest) = fsutil::latest_part_mtime(dir).await? {
         return Ok(latest);
     }
-    tokio::fs::metadata(dir).await?.modified()
+    fs::metadata(dir).await?.modified()
 }
 
 /// Report one repair operation: dry-run pushes the "would …" action;
@@ -56,7 +58,7 @@ async fn record_repair(
     dry_run: bool,
     would: String,
     did: String,
-    op: impl std::future::Future<Output = Result<(), Error>>,
+    op: impl future::Future<Output = Result<(), Error>>,
 ) {
     if dry_run {
         actions.push(Ok(RepairAction {
@@ -80,13 +82,17 @@ async fn record_repair(
 ///
 /// ```rust
 /// use std::sync::Arc;
-/// use tinio_core::cleanup::{Cleanup, CleanupOptions, RepairKind};
-/// use tinio_core::pipeline::InlineRunner;
-/// use tinio_core::storage::{
-///     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
-/// };
+///
 /// use futures::StreamExt;
+/// use tinio_core::{
+///     cleanup::{Cleanup, CleanupOptions, RepairKind},
+///     pipeline::InlineRunner,
+///     storage::{
+///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+///     },
+/// };
 /// use tinio_fs::{FsCleanup, FsOptions, FsStorage};
+/// use tokio::runtime::Runtime;
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let options = FsOptions {
@@ -101,7 +107,7 @@ async fn record_repair(
 /// };
 /// let storage = FsStorage::new(root.path(), options).unwrap();
 /// let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// Runtime::new().unwrap().block_on(async {
 ///     let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
 ///     while let Some(action) = actions.next().await {
 ///         let action = action.unwrap();
@@ -119,12 +125,6 @@ pub struct FsCleanup {
     storage: FsStorage,
     /// Report-only mode (doctor `--dry-run`): never touches anything.
     dry_run: bool,
-    /// The removal lane (D-B): when present, `repair` routes the
-    /// delete-tombstone stage to it as `RemoveTask`s (fire-and-forget)
-    /// instead of clearing inline. The server startup sets it; doctor
-    /// keeps the default — `None` repairs tombstones inline.
-    #[debug("<runner>")]
-    remove_runner: Option<Arc<dyn Runner<Result<(), Error>>>>,
     /// Idle grace for upload directories without a `UPLOADS` record:
     /// an orphan is deleted only when its parts have been idle at least
     /// this long (the sweep's `multipart_ttl` default; the startup
@@ -133,31 +133,17 @@ pub struct FsCleanup {
 }
 
 impl FsCleanup {
-    /// Construct the cleanup pipeline for `storage`.
+    /// Construct the cleanup pipeline for `storage`. The delete-tombstone
+    /// stage always routes through the storage's removal lane (D-B — see
+    /// [`Self::repair_delete_tombstones`]).
     pub fn new(storage: &FsStorage, options: CleanupOptions) -> Self {
         Self {
             root: storage.root().to_path_buf(),
             state_dir: storage.state_dir().to_path_buf(),
             storage: storage.clone(),
             dry_run: options.dry_run,
-            remove_runner: None,
-            multipart_grace: sweep::Options::default().multipart_ttl,
+            multipart_grace: Options::default().multipart_ttl,
         }
-    }
-
-    /// Route the delete-tombstone stage of `repair` through `runner` —
-    /// the removal lane (D-B): the server startup runs the rest of the
-    /// repair synchronously before readiness and hands every tombstone to
-    /// the lane (fire-and-forget; an enqueue failure is warned inside and
-    /// the leftover stays for the scanner — with the scanner OFF the
-    /// startup enqueue still clears it). Doctor does not set this and
-    /// repairs tombstones inline.
-    pub fn with_remove_runner(
-        mut self,
-        runner: Arc<dyn Runner<Result<(), Error>>>,
-    ) -> Self {
-        self.remove_runner = Some(runner);
-        self
     }
 
     /// Override the orphan-upload idle grace (default: the sweep's
@@ -184,10 +170,10 @@ impl FsCleanup {
                 format!("would clear leftover temp file {name}"),
                 format!("cleared leftover temp file {name}"),
                 async {
-                    match tokio::fs::remove_file(&path).await {
+                    match fs::remove_file(&path).await {
                         Ok(()) => Ok(()),
                         // Already gone (a concurrent sweep): nothing to report.
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
                         Err(err) => Err(err.into()),
                     }
                 },
@@ -208,33 +194,30 @@ impl FsCleanup {
                 return;
             }
         };
-        if let Some(runner) = &self.remove_runner {
-            // D-B: the server startup routes this stage to the removal
-            // lane — one `RemoveTask` per leftover (fire-and-forget; an
-            // enqueue failure is warned inside and the leftover stays for
-            // the scanner).
-            for (name, path) in entries {
-                record_repair(
-                    actions,
-                    self.dry_run,
-                    format!("would enqueue leftover bucket tombstone {name} on the removal lane"),
-                    format!("enqueued leftover bucket tombstone {name} on the removal lane"),
-                    async {
-                        tombstone::enqueue_one(path, runner).await;
-                        Ok(())
-                    },
-                )
-                .await;
-            }
-            return;
-        }
-        for (name, path) in entries {
+        // D-B: this stage always routes through the removal lane — one
+        // `RemoveTask` per leftover (fire-and-forget; an enqueue failure
+        // is warned inside and the leftover stays for the scanner). The
+        // lane is the storage's own (`FsStorage::remove_pipeline`):
+        // offline contexts wire an `InlineRunner` there, so the inline
+        // form is the same lane's synchronous run.
+        let runner = self.storage.remove_pipeline();
+        for (path, name) in entries {
             record_repair(
                 actions,
                 self.dry_run,
-                format!("would clear leftover bucket tombstone {name}"),
-                format!("cleared leftover bucket tombstone {name}"),
-                tombstone::clear_one(&path),
+                format!("would enqueue leftover bucket tombstone {name} on the removal lane"),
+                format!("enqueued leftover bucket tombstone {name} on the removal lane"),
+                async {
+                    if tombstone::enqueue_one(path, &runner).await {
+                        Ok(())
+                    } else {
+                        // Truthful report: the action stream must never
+                        // say "enqueued" when the enqueue failed.
+                        Err(Error::Io(IoError::other(
+                            "bucket tombstone not enqueued; the scanner covers it",
+                        )))
+                    }
+                },
             )
             .await;
         }
@@ -266,7 +249,7 @@ impl FsCleanup {
             let mut residue = Vec::new();
             let mut stack = vec![bucket_dir];
             while let Some(dir) = stack.pop() {
-                let mut entries = match tokio::fs::read_dir(&dir).await {
+                let mut entries = match fs::read_dir(&dir).await {
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
@@ -279,13 +262,13 @@ impl FsCleanup {
                         residue.push(entry.path());
                         continue; // never descend into a staging dir
                     }
-                    let lmeta = match tokio::fs::symlink_metadata(entry.path()).await {
+                    let lmeta = match fs::symlink_metadata(entry.path()).await {
                         Ok(metadata) => metadata,
                         Err(_) => continue,
                     };
-                    let is_dir = if crate::fsutil::is_symlink_or_reparse(&lmeta) {
+                    let is_dir = if fsutil::is_symlink_or_reparse(&lmeta) {
                         *self.storage.follow_symlinks()
-                            && tokio::fs::metadata(entry.path())
+                            && fs::metadata(entry.path())
                                 .await
                                 .map(|m| m.is_dir())
                                 .unwrap_or(false)
@@ -325,9 +308,9 @@ impl FsCleanup {
     /// touched, failure-handling.md §2D).
     async fn repair_multipart_orphans(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
         let multipart = self.state_dir.join(MULTIPART_DIR_NAME);
-        let mut buckets = match tokio::fs::read_dir(&multipart).await {
+        let mut buckets = match fs::read_dir(&multipart).await {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+            Err(err) if err.kind() == ErrorKind::NotFound => return,
             Err(err) => {
                 actions.push(Err(err.into()));
                 return;
@@ -338,7 +321,7 @@ impl FsCleanup {
                 break;
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            match crate::fsutil::is_absent(&self.root.join(&name)).await {
+            match fsutil::is_absent(&self.root.join(&name)).await {
                 // F11: a probe error is not "gone" — the live bucket's
                 // subtree is kept and the error reported.
                 Ok(false) => {}
@@ -356,7 +339,7 @@ impl FsCleanup {
                             if let Ok(bucket) = bucket::name(&name) {
                                 self.storage.remove_bucket_state(&bucket).await?;
                             }
-                            ok_if_missing(tokio::fs::remove_dir_all(entry.path()).await)?;
+                            ok_if_missing(fs::remove_dir_all(entry.path()).await)?;
                             Ok(())
                         },
                     )
@@ -387,9 +370,9 @@ impl FsCleanup {
         // 1. Enumerate the tree first.
         let multipart = self.state_dir.join(MULTIPART_DIR_NAME);
         let mut orphans: Vec<(String, String, PathBuf)> = Vec::new();
-        let mut buckets = match tokio::fs::read_dir(&multipart).await {
+        let mut buckets = match fs::read_dir(&multipart).await {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+            Err(err) if err.kind() == ErrorKind::NotFound => return,
             Err(err) => {
                 actions.push(Err(err.into()));
                 return;
@@ -406,7 +389,7 @@ impl FsCleanup {
                 continue;
             }
             let bucket = bucket_entry.file_name().to_string_lossy().into_owned();
-            let mut uploads = match tokio::fs::read_dir(bucket_entry.path()).await {
+            let mut uploads = match fs::read_dir(bucket_entry.path()).await {
                 Ok(uploads) => uploads,
                 Err(err) => {
                     actions.push(Err(err.into()));
@@ -447,7 +430,7 @@ impl FsCleanup {
                 Ok(idle_since) => idle_since,
                 // The dir vanished between enumeration and stat (a
                 // concurrent abort) — nothing to do.
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => {
                     actions.push(Err(err.into()));
                     continue;
@@ -475,7 +458,7 @@ impl FsCleanup {
                             .drain_upload_rows(&name, &upload_id)
                             .await?;
                     }
-                    ok_if_missing(tokio::fs::remove_dir_all(&dir).await)?;
+                    ok_if_missing(fs::remove_dir_all(&dir).await)?;
                     Ok(())
                 },
             )
@@ -500,7 +483,7 @@ impl FsCleanup {
                     continue;
                 }
             };
-            match crate::fsutil::is_absent(&self.root.join(&*name)).await {
+            match fsutil::is_absent(&self.root.join(&*name)).await {
                 // F11: a probe error is not "gone" — the live record is
                 // kept and the error reported.
                 Ok(false) => {}
@@ -545,7 +528,7 @@ impl FsCleanup {
                 continue;
             };
             let _guard = self.storage.lock_bucket_mutations(&name).await;
-            match crate::fsutil::is_absent(&self.root.join(&*name)).await {
+            match fsutil::is_absent(&self.root.join(&*name)).await {
                 Ok(true) => {}         // the bucket dir is gone — prune
                 Ok(false) => continue, // live bucket — keep the record
                 Err(err) => {
@@ -598,7 +581,7 @@ impl FsCleanup {
                 let Ok(path) = self.storage.key_path(&bucket_dir, &record.key, true).await else {
                     continue;
                 };
-                match crate::fsutil::is_absent(&path).await {
+                match fsutil::is_absent(&path).await {
                     // F11: a probe error is not "gone" — the entry is
                     // kept and the error reported.
                     Ok(false) => continue,
@@ -661,21 +644,24 @@ impl Cleanup for FsCleanup {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        FsOptions,
-        testutil::{fs_options, rt},
-    };
-    use futures::StreamExt;
-    use std::fs;
-    use std::time::SystemTime;
-    use tinio_core::pipeline::InlineRunner;
-    use tinio_core::storage::{BucketOps, ObjectOps};
-    use tinio_core::{bucket, object};
-    use tinio_util::testing::body;
-
+    #[cfg(unix)]
+    use std::fs::Permissions;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::{fs::OpenOptions, time::SystemTime};
+
+    use futures::StreamExt;
+    use tinio_core::{
+        bucket, object,
+        storage::{BucketOps, ObjectOps},
+    };
+    use tinio_util::testing::body;
+    use tokio::fs;
+
+    use super::*;
+    use crate::{FsOptions, testutil::fs_options};
 
     async fn collect(actions: ActionStream<Error>) -> Vec<RepairAction> {
         let mut out = Vec::new();
@@ -686,325 +672,314 @@ mod tests {
         out
     }
 
-    #[test]
-    fn startup_repair_clears_tmp_and_orphans() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn startup_repair_clears_tmp_and_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+
+        // Leftover temp file.
+        fs::create_dir(state.path().join("tmp")).await.unwrap();
+        fs::write(state.path().join("tmp/upload-leftover"), b"x")
+            .await
             .unwrap();
 
-            // Leftover temp file.
-            fs::create_dir(state.path().join("tmp")).unwrap();
-            fs::write(state.path().join("tmp/upload-leftover"), b"x").unwrap();
-
-            // Bucket-orphaned multipart subtree.
-            fs::create_dir_all(state.path().join("multipart/gone-bucket/u1")).unwrap();
-            fs::write(state.path().join("multipart/gone-bucket/u1/part-1"), b"x").unwrap();
-
-            // Stale bucket record.
-            storage
-                .bucket_store()
-                .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
-                .await
-                .unwrap();
-
-            // A live bucket + upload must be untouched (a real upload: the
-            // record commits before its directory exists).
-            let live = bucket::name("live-bucket").unwrap();
-            storage.create_bucket(&live).await.unwrap();
-            storage
-                .multipart_store()
-                .create(&live, &object::key("k").unwrap())
-                .await
-                .unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions.iter().any(|a| a.description.contains("temp file")),
-                "{actions:?}"
-            );
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("gone-bucket")),
-                "{actions:?}"
-            );
-
-            assert!(!state.path().join("tmp/upload-leftover").exists());
-            assert!(!state.path().join("multipart/gone-bucket").exists());
-            let all = storage.bucket_store().load_all().await.unwrap();
-            assert_eq!(all.len(), 1, "stale entry pruned, live entry kept: {all:?}");
-            assert_eq!(all[0].0, "live-bucket");
-            // The live upload's record is untouched.
-            assert!(storage.multipart_store().has_uploads(&live).await.unwrap());
-        });
-    }
-
-    #[test]
-    fn startup_repair_clears_bucket_staging_residue() {
-        // A crashed/failed cross-volume commit leaves `.tinio/` staging
-        // dirs at any depth of a bucket — cleared at startup; user data
-        // (the accidental parent dirs) is untouched.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            fs::create_dir_all(root.path().join("data/.tinio")).unwrap();
-            fs::write(root.path().join("data/.tinio/aaaa"), b"residue").unwrap();
-            fs::create_dir_all(root.path().join("data/sub/.tinio")).unwrap();
-            fs::write(root.path().join("data/sub/.tinio/bbbb"), b"residue").unwrap();
-            fs::create_dir_all(root.path().join("data/emptydir/.tinio")).unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("staging residue")),
-                "{actions:?}"
-            );
-            assert!(!root.path().join("data/.tinio").exists());
-            assert!(!root.path().join("data/sub/.tinio").exists());
-            assert!(!root.path().join("data/emptydir/.tinio").exists());
-            assert!(root.path().join("data/sub").is_dir());
-        });
-    }
-
-    #[test]
-    fn startup_repair_clears_delete_tombstones() {
-        // A crash after the unpublish rename leaves the bucket tree under
-        // `<root>/.tinio/deleting/<id>/` — private residue, reclaimed at
-        // startup like `tmp/` (the live name is already gone).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let tombstone = root
-                .path()
-                .join(".tinio")
-                .join("deleting")
-                .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-            fs::create_dir_all(&tombstone).unwrap();
-            fs::write(tombstone.join("leftover.bin"), b"was-a-bucket").unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions.iter().any(|a| a.description.contains("tombstone")),
-                "{actions:?}"
-            );
-            assert!(!tombstone.exists());
-        });
-    }
-
-    #[test]
-    fn startup_repair_with_remove_runner_enqueues_delete_tombstones() {
-        // D-B: the server's pre-readiness repair routes the tombstone
-        // stage to the removal lane — with the runner injected (an inline
-        // runner executes the `RemoveTask`s synchronously) the leftover
-        // is cleared by the lane while the other stages still run.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let tombstone = root
-                .path()
-                .join(".tinio")
-                .join("deleting")
-                .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-            fs::create_dir_all(&tombstone).unwrap();
-            fs::write(tombstone.join("leftover.bin"), b"was-a-bucket").unwrap();
-            // A stale bucket record the runner repair must still prune.
-            storage
-                .bucket_store()
-                .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
-                .await
-                .unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-                .with_remove_runner(Arc::new(InlineRunner::default()));
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions.iter().any(|a| a.description.contains("tombstone")),
-                "{actions:?}"
-            );
-            assert!(
-                !tombstone.exists(),
-                "the removal lane (inline runner) cleared the leftover"
-            );
-            // The other stages still run: the stale record is pruned.
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("stale bucket record")),
-                "{actions:?}"
-            );
-            assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 0);
-        });
-    }
-
-    #[test]
-    fn startup_repair_drains_uploads_of_a_missing_bucket() {
-        // Hand-deleting a bucket directory (mirror semantics) must also
-        // drain UPLOADS/PARTS — otherwise ListMultipartUploads shows
-        // ghosts that cannot complete, and has_uploads blocks delete.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let gone = bucket::name("gone-bucket").unwrap();
-            storage.create_bucket(&gone).await.unwrap();
-            let k = object::key("k").unwrap();
-            storage.multipart_store().create(&gone, &k).await.unwrap();
-            assert!(storage.multipart_store().has_uploads(&gone).await.unwrap());
-            tokio::fs::remove_dir_all(root.path().join("gone-bucket"))
-                .await
-                .unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let _ = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                !storage.multipart_store().has_uploads(&gone).await.unwrap(),
-                "UPLOADS of a missing bucket must be drained"
-            );
-        });
-    }
-
-    #[test]
-    fn orphan_upload_dirs_are_removed_after_grace() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+        // Bucket-orphaned multipart subtree.
+        fs::create_dir_all(state.path().join("multipart/gone-bucket/u1"))
+            .await
             .unwrap();
-            let b = bucket::name("live").unwrap();
-            storage.create_bucket(&b).await.unwrap();
+        fs::write(state.path().join("multipart/gone-bucket/u1/part-1"), b"x")
+            .await
+            .unwrap();
 
-            // A live upload: record committed, directory present.
-            let k = object::key("k").unwrap();
-            let upload = storage.multipart_store().create(&b, &k).await.unwrap();
-            let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
-            fs::create_dir_all(&live_dir).unwrap();
-            fs::write(live_dir.join("part-1"), b"x").unwrap();
+        // Stale bucket record.
+        storage
+            .bucket_store()
+            .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
+            .await
+            .unwrap();
 
-            // An orphan: directory with an old part, no UPLOADS record.
-            let orphan_dir = state.path().join("multipart/live/u-orphan");
-            fs::create_dir_all(&orphan_dir).unwrap();
-            let orphan_part = orphan_dir.join("part-1");
-            fs::write(&orphan_part, b"x").unwrap();
-            let handle = fs::OpenOptions::new()
-                .write(true)
-                .open(&orphan_part)
-                .unwrap();
-            handle
-                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
-                .unwrap();
-            drop(handle);
+        // A live bucket + upload must be untouched (a real upload: the
+        // record commits before its directory exists).
+        let live = bucket::name("live-bucket").unwrap();
+        storage.create_bucket(&live).await.unwrap();
+        storage
+            .multipart_store()
+            .create(&live, &object::key("k").unwrap())
+            .await
+            .unwrap();
 
-            // A young orphan (fresh parts) must survive the grace.
-            let young_dir = state.path().join("multipart/live/u-young");
-            fs::create_dir_all(&young_dir).unwrap();
-            fs::write(young_dir.join("part-1"), b"x").unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-                .with_multipart_grace(Duration::from_secs(60));
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            let removed: Vec<&str> = actions
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions.iter().any(|a| a.description.contains("temp file")),
+            "{actions:?}"
+        );
+        assert!(
+            actions
                 .iter()
-                .filter(|a| a.description.contains("orphaned upload"))
-                .map(|a| a.description.as_str())
-                .collect();
-            assert_eq!(removed.len(), 1, "{actions:?}");
-            assert!(!orphan_dir.exists());
-            assert!(young_dir.exists());
-            assert!(live_dir.exists());
-            assert!(storage.multipart_store().has_uploads(&b).await.unwrap());
-        });
+                .any(|a| a.description.contains("gone-bucket")),
+            "{actions:?}"
+        );
+
+        assert!(!state.path().join("tmp/upload-leftover").exists());
+        assert!(!state.path().join("multipart/gone-bucket").exists());
+        let all = storage.bucket_store().load_all().await.unwrap();
+        assert_eq!(all.len(), 1, "stale entry pruned, live entry kept: {all:?}");
+        assert_eq!(all[0].0, "live-bucket");
+        // The live upload's record is untouched.
+        assert!(storage.multipart_store().has_uploads(&live).await.unwrap());
     }
 
-    #[test]
-    fn live_upload_with_domain_invalid_stored_key_is_not_an_orphan() {
-        // §5.7 regression: the orphan judgment must query raw UPLOADS
-        // membership — a live upload whose stored key fails domain
-        // validation is still live. The validated `walk_uploads` view
-        // skips such a row, and judging by it would delete a live
-        // upload's directory and drain its rows.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn startup_repair_clears_bucket_staging_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        fs::create_dir_all(root.path().join("data/.tinio"))
+            .await
             .unwrap();
-            let b = bucket::name("live").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let k = object::key("k").unwrap();
-            let upload = storage.multipart_store().create(&b, &k).await.unwrap();
-            storage
-                .multipart_store()
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            // Corrupt the stored key out-of-band: the validated view no
-            // longer lists the upload, but the row is still there.
-            storage
-                .multipart_store()
-                .overwrite_stored_key(&b, &upload.upload_id, "../evil")
-                .await
-                .unwrap();
-            assert!(
-                storage
-                    .multipart_store()
-                    .walk_uploads()
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "the validated view skips the invalid-key row"
-            );
+        fs::write(root.path().join("data/.tinio/aaaa"), b"residue")
+            .await
+            .unwrap();
+        fs::create_dir_all(root.path().join("data/sub/.tinio"))
+            .await
+            .unwrap();
+        fs::write(root.path().join("data/sub/.tinio/bbbb"), b"residue")
+            .await
+            .unwrap();
+        fs::create_dir_all(root.path().join("data/emptydir/.tinio"))
+            .await
+            .unwrap();
 
-            // Zero grace: only the liveness check can shield the upload.
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-                .with_multipart_grace(Duration::ZERO);
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                !actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned upload")),
-                "a live upload must never be judged an orphan: {actions:?}"
-            );
-            let dir = state.path().join("multipart/live").join(&upload.upload_id);
-            assert!(dir.exists(), "the live upload's directory survives");
-            assert!(
-                storage.multipart_store().has_uploads(&b).await.unwrap(),
-                "the live upload's rows are not drained"
-            );
-        });
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("staging residue")),
+            "{actions:?}"
+        );
+        assert!(!root.path().join("data/.tinio").exists());
+        assert!(!root.path().join("data/sub/.tinio").exists());
+        assert!(!root.path().join("data/emptydir/.tinio").exists());
+        assert!(root.path().join("data/sub").is_dir());
     }
 
-    #[test]
-    fn orphan_stage_toctou_order_protects_live_uploads() {
+    #[tokio::test]
+    async fn startup_repair_clears_delete_tombstones() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let tombstone = root
+            .path()
+            .join(".tinio")
+            .join("deleting")
+            .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        fs::create_dir_all(&tombstone).await.unwrap();
+        fs::write(tombstone.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions.iter().any(|a| a.description.contains("tombstone")),
+            "{actions:?}"
+        );
+        assert!(!tombstone.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_repair_enqueues_delete_tombstones_on_the_removal_lane() {
+        // The tombstone stage always routes through the storage's removal
+        // lane (D-B) — the action text says "enqueued", never "cleared",
+        // and the lane (an inline runner under test) clears the leftover.
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let tombstone = root
+            .path()
+            .join(".tinio")
+            .join("deleting")
+            .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        fs::create_dir_all(&tombstone).await.unwrap();
+        fs::write(tombstone.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+        // A stale bucket record the repair must still prune.
+        storage
+            .bucket_store()
+            .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("enqueued") && a.description.contains("tombstone")),
+            "{actions:?}"
+        );
+        assert!(
+            !tombstone.exists(),
+            "the removal lane (inline runner) cleared the leftover"
+        );
+        // The other stages still run: the stale record is pruned.
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("stale bucket record")),
+            "{actions:?}"
+        );
+        assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_drains_uploads_of_a_missing_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let gone = bucket::name("gone-bucket").unwrap();
+        storage.create_bucket(&gone).await.unwrap();
+        let k = object::key("k").unwrap();
+        storage.multipart_store().create(&gone, &k).await.unwrap();
+        assert!(storage.multipart_store().has_uploads(&gone).await.unwrap());
+        fs::remove_dir_all(root.path().join("gone-bucket"))
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let _ = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            !storage.multipart_store().has_uploads(&gone).await.unwrap(),
+            "UPLOADS of a missing bucket must be drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_upload_dirs_are_removed_after_grace() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("live").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+
+        // A live upload: record committed, directory present.
+        let k = object::key("k").unwrap();
+        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
+        fs::create_dir_all(&live_dir).await.unwrap();
+        fs::write(live_dir.join("part-1"), b"x").await.unwrap();
+
+        // An orphan: directory with an old part, no UPLOADS record.
+        let orphan_dir = state.path().join("multipart/live/u-orphan");
+        fs::create_dir_all(&orphan_dir).await.unwrap();
+        let orphan_part = orphan_dir.join("part-1");
+        fs::write(&orphan_part, b"x").await.unwrap();
+        let handle = OpenOptions::new().write(true).open(&orphan_part).unwrap();
+        handle
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+            .unwrap();
+        drop(handle);
+
+        // A young orphan (fresh parts) must survive the grace.
+        let young_dir = state.path().join("multipart/live/u-young");
+        fs::create_dir_all(&young_dir).await.unwrap();
+        fs::write(young_dir.join("part-1"), b"x").await.unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+            .with_multipart_grace(Duration::from_secs(60));
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        let removed: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.description.contains("orphaned upload"))
+            .map(|a| a.description.as_str())
+            .collect();
+        assert_eq!(removed.len(), 1, "{actions:?}");
+        assert!(!orphan_dir.exists());
+        assert!(young_dir.exists());
+        assert!(live_dir.exists());
+        assert!(storage.multipart_store().has_uploads(&b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn live_upload_with_domain_invalid_stored_key_is_not_an_orphan() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("live").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("k").unwrap();
+        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        storage
+            .multipart_store()
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        // Corrupt the stored key out-of-band: the validated view no
+        // longer lists the upload, but the row is still there.
+        storage
+            .multipart_store()
+            .overwrite_stored_key(&b, &upload.upload_id, "../evil")
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .multipart_store()
+                .walk_uploads()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the validated view skips the invalid-key row"
+        );
+
+        // Zero grace: only the liveness check can shield the upload.
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+            .with_multipart_grace(Duration::ZERO);
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            !actions
+                .iter()
+                .any(|a| a.description.contains("orphaned upload")),
+            "a live upload must never be judged an orphan: {actions:?}"
+        );
+        let dir = state.path().join("multipart/live").join(&upload.upload_id);
+        assert!(dir.exists(), "the live upload's directory survives");
+        assert!(
+            storage.multipart_store().has_uploads(&b).await.unwrap(),
+            "the live upload's rows are not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_stage_toctou_order_protects_live_uploads() {
         // §5.7 pins the TOCTOU order: enumerate the `multipart/` tree
         // first, then read UPLOADS in one read transaction. `create`
         // commits the UPLOADS row before any directory exists (the first
@@ -1013,686 +988,677 @@ mod tests {
         // the two cannot be misjudged. Both halves are pinned with a ZERO
         // grace: the idle check protects nothing, so only the raw UPLOADS
         // membership shields a live upload.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("live").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("k").unwrap();
+        let cleanup = || {
+            FsCleanup::new(&storage, CleanupOptions::default()).with_multipart_grace(Duration::ZERO)
+        };
+
+        // Half 1: record committed, no directory yet (the state of a
+        // `create` racing the enumeration) — nothing to judge, the
+        // record survives.
+        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            !actions
+                .iter()
+                .any(|a| a.description.contains("orphaned upload")),
+            "{actions:?}"
+        );
+        assert!(storage.multipart_store().has_uploads(&b).await.unwrap());
+
+        // Half 2: the directory now exists (first put_part) — the
+        // enumeration+read order must see its committed record even
+        // without any idle grace.
+        storage
+            .multipart_store()
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
             .unwrap();
-            let b = bucket::name("live").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let k = object::key("k").unwrap();
-            let cleanup = || {
-                FsCleanup::new(&storage, CleanupOptions::default())
-                    .with_multipart_grace(Duration::ZERO)
-            };
+        let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
+        let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            !actions
+                .iter()
+                .any(|a| a.description.contains("orphaned upload")),
+            "{actions:?}"
+        );
+        assert!(live_dir.exists());
+        assert!(storage.multipart_store().has_uploads(&b).await.unwrap());
 
-            // Half 1: record committed, no directory yet (the state of a
-            // `create` racing the enumeration) — nothing to judge, the
-            // record survives.
-            let upload = storage.multipart_store().create(&b, &k).await.unwrap();
-            let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                !actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned upload")),
-                "{actions:?}"
-            );
-            assert!(storage.multipart_store().has_uploads(&b).await.unwrap());
-
-            // Half 2: the directory now exists (first put_part) — the
-            // enumeration+read order must see its committed record even
-            // without any idle grace.
-            storage
-                .multipart_store()
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
-            let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                !actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned upload")),
-                "{actions:?}"
-            );
-            assert!(live_dir.exists());
-            assert!(storage.multipart_store().has_uploads(&b).await.unwrap());
-
-            // Control: a true orphan (no UPLOADS row) IS removed under
-            // zero grace — the stage is not vacuously disabled.
-            let orphan_dir = state.path().join("multipart/live/u-orphan");
-            fs::create_dir_all(&orphan_dir).unwrap();
-            fs::write(orphan_dir.join("part-1"), b"x").unwrap();
-            let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned upload")),
-                "{actions:?}"
-            );
-            assert!(!orphan_dir.exists());
-            assert!(live_dir.exists());
-        });
+        // Control: a true orphan (no UPLOADS row) IS removed under
+        // zero grace — the stage is not vacuously disabled.
+        let orphan_dir = state.path().join("multipart/live/u-orphan");
+        fs::create_dir_all(&orphan_dir).await.unwrap();
+        fs::write(orphan_dir.join("part-1"), b"x").await.unwrap();
+        let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("orphaned upload")),
+            "{actions:?}"
+        );
+        assert!(!orphan_dir.exists());
+        assert!(live_dir.exists());
     }
 
-    #[test]
-    fn dry_run_reports_orphan_upload_dirs_without_removing() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn dry_run_reports_orphan_upload_dirs_without_removing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let orphan_dir = state.path().join("multipart/live/u-orphan");
+        fs::create_dir_all(&orphan_dir).await.unwrap();
+        let orphan_part = orphan_dir.join("part-1");
+        fs::write(&orphan_part, b"x").await.unwrap();
+        let handle = OpenOptions::new().write(true).open(&orphan_part).unwrap();
+        handle
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
             .unwrap();
-            let orphan_dir = state.path().join("multipart/live/u-orphan");
-            fs::create_dir_all(&orphan_dir).unwrap();
-            let orphan_part = orphan_dir.join("part-1");
-            fs::write(&orphan_part, b"x").unwrap();
-            let handle = fs::OpenOptions::new()
-                .write(true)
-                .open(&orphan_part)
-                .unwrap();
-            handle
-                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
-                .unwrap();
-            drop(handle);
+        drop(handle);
 
-            let cleanup = FsCleanup::new(
-                &storage,
-                CleanupOptions {
-                    dry_run: true,
-                    ..CleanupOptions::default()
-                },
-            )
+        let cleanup = FsCleanup::new(&storage, CleanupOptions { dry_run: true })
             .with_multipart_grace(Duration::from_secs(60));
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.starts_with("would remove orphaned upload")),
-                "{actions:?}"
-            );
-            assert!(orphan_dir.exists());
-        });
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.starts_with("would remove orphaned upload")),
+            "{actions:?}"
+        );
+        assert!(orphan_dir.exists());
     }
 
-    #[test]
-    fn dry_run_touches_nothing() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn dry_run_touches_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        fs::create_dir(state.path().join("tmp")).await.unwrap();
+        fs::write(state.path().join("tmp/upload-leftover"), b"x")
+            .await
             .unwrap();
-            fs::create_dir(state.path().join("tmp")).unwrap();
-            fs::write(state.path().join("tmp/upload-leftover"), b"x").unwrap();
 
-            let cleanup = FsCleanup::new(
-                &storage,
-                CleanupOptions {
-                    dry_run: true,
-                    ..CleanupOptions::default()
-                },
-            );
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.starts_with("would clear")),
-                "{actions:?}"
-            );
-            assert!(state.path().join("tmp/upload-leftover").exists());
-        });
+        let cleanup = FsCleanup::new(&storage, CleanupOptions { dry_run: true });
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.starts_with("would clear")),
+            "{actions:?}"
+        );
+        assert!(state.path().join("tmp/upload-leftover").exists());
     }
 
-    #[test]
-    fn partless_orphan_dir_uses_dir_mtime_for_idle() {
+    #[tokio::test]
+    async fn partless_orphan_dir_uses_dir_mtime_for_idle() {
         // An orphan upload dir with NO part files has no part mtime to
         // anchor the idle age — `orphan_idle_since` falls back to the
         // directory mtime. A zero grace forces the fallback into the
         // judgment (the dir is fresh, so only the grace can be the
         // discriminator).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("live").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+
+        // A part-less orphan (no UPLOADS record, no part files).
+        let orphan_dir = state.path().join("multipart/live/u-partless");
+        fs::create_dir_all(&orphan_dir).await.unwrap();
+
+        // Zero grace: the fresh dir mtime must not block removal
+        // (age 0 is not < 0), and the fallback must have run.
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+            .with_multipart_grace(Duration::ZERO);
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("orphaned upload")),
+            "{actions:?}"
+        );
+        assert!(!orphan_dir.exists());
+
+        // The same dir under a generous grace survives (dir mtime is
+        // fresh — younger than the grace).
+        fs::create_dir_all(&orphan_dir).await.unwrap();
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+            .with_multipart_grace(Duration::from_secs(3600));
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            !actions
+                .iter()
+                .any(|a| a.description.contains("orphaned upload")),
+            "{actions:?}"
+        );
+        assert!(orphan_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn bucket_staging_file_residue_is_cleared() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        fs::create_dir_all(root.path().join("data/sub"))
+            .await
             .unwrap();
-            let b = bucket::name("live").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-
-            // A part-less orphan (no UPLOADS record, no part files).
-            let orphan_dir = state.path().join("multipart/live/u-partless");
-            fs::create_dir_all(&orphan_dir).unwrap();
-
-            // Zero grace: the fresh dir mtime must not block removal
-            // (age 0 is not < 0), and the fallback must have run.
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-                .with_multipart_grace(Duration::ZERO);
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned upload")),
-                "{actions:?}"
-            );
-            assert!(!orphan_dir.exists());
-
-            // The same dir under a generous grace survives (dir mtime is
-            // fresh — younger than the grace).
-            fs::create_dir_all(&orphan_dir).unwrap();
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-                .with_multipart_grace(Duration::from_secs(3600));
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                !actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned upload")),
-                "{actions:?}"
-            );
-            assert!(orphan_dir.exists());
-        });
-    }
-
-    #[test]
-    fn bucket_staging_file_residue_is_cleared() {
-        // The reserved `.tinio` name at any depth: a FILE out-of-band
-        // (not the cross-volume staging dir) is cleared too — the
-        // NotADirectory fallback of the residue removal.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            fs::create_dir_all(root.path().join("data/sub")).unwrap();
-            fs::write(root.path().join("data/.tinio"), b"residue").unwrap();
-            fs::write(root.path().join("data/sub/.tinio"), b"residue").unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert_eq!(
-                actions
-                    .iter()
-                    .filter(|a| a.description.contains("staging residue"))
-                    .count(),
-                2,
-                "{actions:?}"
-            );
-            assert!(!root.path().join("data/.tinio").exists());
-            assert!(!root.path().join("data/sub/.tinio").exists());
-            assert!(root.path().join("data/sub").is_dir());
-        });
-    }
-
-    #[test]
-    fn reclaim_stale_buckets_prunes_and_counts() {
-        // The scanner's count-only path (item 2): stale records are
-        // pruned under the bucket-mutation lock; live records and probe
-        // errors are kept. The count is returned, not the action stream.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let stale = bucket::name("stale-bucket").unwrap();
-            let live = bucket::name("live-bucket").unwrap();
-            storage.create_bucket(&live).await.unwrap();
-            // A stale record: the bucket directory is gone out-of-band.
-            storage
-                .bucket_store()
-                .record(&stale, SystemTime::now())
-                .await
-                .unwrap();
-            tokio::fs::create_dir(root.path().join("stale-bucket"))
-                .await
-                .unwrap();
-            tokio::fs::remove_dir_all(root.path().join("stale-bucket"))
-                .await
-                .unwrap();
-            assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let pruned = cleanup.reclaim_stale_buckets().await.unwrap();
-            assert_eq!(pruned, 1, "the stale record is pruned exactly once");
-            let all = storage.bucket_store().load_all().await.unwrap();
-            assert_eq!(all.len(), 1);
-            assert_eq!(all[0].0, "live-bucket");
-            // A second pass finds nothing to prune.
-            assert_eq!(cleanup.reclaim_stale_buckets().await.unwrap(), 0);
-        });
-    }
-
-    #[test]
-    fn full_repair_reclaims_meta_orphans() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let k = object::key("a.txt").unwrap();
-            storage.put_object(&b, &k, body(b"x")).await.unwrap();
-
-            // Out-of-band deletion: the object vanishes, the meta entry stays.
-            fs::remove_file(root.path().join("data/a.txt")).unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Full).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned meta")),
-                "{actions:?}"
-            );
-            assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
-
-            // Startup repair does NOT reclaim meta orphans (scanner's job).
-            storage.put_object(&b, &k, body(b"y")).await.unwrap();
-            fs::remove_file(root.path().join("data/a.txt")).unwrap();
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                !actions
-                    .iter()
-                    .any(|a| a.description.contains("orphaned meta")),
-                "{actions:?}"
-            );
-            assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
-        });
-    }
-
-    #[test]
-    fn reclaim_meta_orphans_cleans_a_vanished_bucket() {
-        // A bucket directory removed out-of-band mid-run: the scanner's
-        // background reclamation must also prune the stale BUCKETS row
-        // and drain the orphaned OBJECT_META — not wait for the next
-        // startup repair.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let k = object::key("a.txt").unwrap();
-            storage.put_object(&b, &k, body(b"x")).await.unwrap();
-            assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
-            fs::remove_dir_all(root.path().join("data")).unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.reclaim_meta_orphans().await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("stale bucket record")),
-                "{actions:?}"
-            );
-            assert!(storage.bucket_store().load_all().await.unwrap().is_empty());
-            assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
-        });
-    }
-
-    #[test]
-    fn reclaim_meta_orphans_removes_only_missing() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let gone = object::key("gone.txt").unwrap();
-            let alive = object::key("alive.txt").unwrap();
-            storage.put_object(&b, &gone, body(b"x")).await.unwrap();
-            storage.put_object(&b, &alive, body(b"y")).await.unwrap();
-            fs::remove_file(root.path().join("data/gone.txt")).unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.reclaim_meta_orphans().await.unwrap()).await;
-            assert_eq!(actions.len(), 1, "{actions:?}");
-            assert!(storage.meta_store().walk(&b).await.unwrap().len() == 1);
-        });
-    }
-
-    #[test]
-    fn tmp_directory_entry_reports_a_remove_error() {
-        // A `tmp/` entry that is a DIRECTORY cannot be removed as a file
-        // — the op fails and the failure is REPORTED (an action stream
-        // entry), not swallowed: the operator sees that a leftover could
-        // not be cleared.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+        fs::write(root.path().join("data/.tinio"), b"residue")
+            .await
             .unwrap();
-            fs::create_dir_all(state.path().join("tmp/subdir")).unwrap();
-            fs::write(state.path().join("tmp/upload-leftover"), b"x").unwrap();
+        fs::write(root.path().join("data/sub/.tinio"), b"residue")
+            .await
+            .unwrap();
 
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
-            let mut errs = 0;
-            while let Some(action) = actions.next().await {
-                if action.is_err() {
-                    errs += 1;
-                }
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| a.description.contains("staging residue"))
+                .count(),
+            2,
+            "{actions:?}"
+        );
+        assert!(!root.path().join("data/.tinio").exists());
+        assert!(!root.path().join("data/sub/.tinio").exists());
+        assert!(root.path().join("data/sub").is_dir());
+    }
+
+    #[tokio::test]
+    async fn reclaim_stale_buckets_prunes_and_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let stale = bucket::name("stale-bucket").unwrap();
+        let live = bucket::name("live-bucket").unwrap();
+        storage.create_bucket(&live).await.unwrap();
+        // A stale record: the bucket directory is gone out-of-band.
+        storage
+            .bucket_store()
+            .record(&stale, SystemTime::now())
+            .await
+            .unwrap();
+        fs::create_dir(root.path().join("stale-bucket"))
+            .await
+            .unwrap();
+        fs::remove_dir_all(root.path().join("stale-bucket"))
+            .await
+            .unwrap();
+        assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let pruned = cleanup.reclaim_stale_buckets().await.unwrap();
+        assert_eq!(pruned, 1, "the stale record is pruned exactly once");
+        let all = storage.bucket_store().load_all().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "live-bucket");
+        // A second pass finds nothing to prune.
+        assert_eq!(cleanup.reclaim_stale_buckets().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_repair_reclaims_meta_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("a.txt").unwrap();
+        storage.put_object(&b, &k, body(b"x")).await.unwrap();
+
+        // Out-of-band deletion: the object vanishes, the meta entry stays.
+        fs::remove_file(root.path().join("data/a.txt"))
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Full).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("orphaned meta")),
+            "{actions:?}"
+        );
+        assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
+
+        // Startup repair does NOT reclaim meta orphans (scanner's job).
+        storage.put_object(&b, &k, body(b"y")).await.unwrap();
+        fs::remove_file(root.path().join("data/a.txt"))
+            .await
+            .unwrap();
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            !actions
+                .iter()
+                .any(|a| a.description.contains("orphaned meta")),
+            "{actions:?}"
+        );
+        assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reclaim_meta_orphans_cleans_a_vanished_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("a.txt").unwrap();
+        storage.put_object(&b, &k, body(b"x")).await.unwrap();
+        assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
+        fs::remove_dir_all(root.path().join("data")).await.unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.reclaim_meta_orphans().await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("stale bucket record")),
+            "{actions:?}"
+        );
+        assert!(storage.bucket_store().load_all().await.unwrap().is_empty());
+        assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reclaim_meta_orphans_removes_only_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let gone = object::key("gone.txt").unwrap();
+        let alive = object::key("alive.txt").unwrap();
+        storage.put_object(&b, &gone, body(b"x")).await.unwrap();
+        storage.put_object(&b, &alive, body(b"y")).await.unwrap();
+        fs::remove_file(root.path().join("data/gone.txt"))
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.reclaim_meta_orphans().await.unwrap()).await;
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(storage.meta_store().walk(&b).await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn tmp_directory_entry_reports_a_remove_error() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(state.path().join("tmp/subdir"))
+            .await
+            .unwrap();
+        fs::write(state.path().join("tmp/upload-leftover"), b"x")
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+        let mut errs = 0;
+        while let Some(action) = actions.next().await {
+            if action.is_err() {
+                errs += 1;
             }
-            assert_eq!(errs, 1, "the directory entry fails as a file removal");
-            assert!(!state.path().join("tmp/upload-leftover").exists());
-        });
+        }
+        assert_eq!(errs, 1, "the directory entry fails as a file removal");
+        assert!(!state.path().join("tmp/upload-leftover").exists());
     }
 
     #[cfg(unix)]
-    #[test]
-    fn repair_reports_unreadable_tmp_and_multipart_trees() {
+    #[tokio::test]
+    async fn repair_reports_unreadable_tmp_and_multipart_trees() {
         // Permission failures are REPORTED, never silently skipped: an
         // unreadable `tmp/` and an unreadable `multipart/` root both
         // surface as error actions (the cleanup must not pretend the
         // state is clean when it could not even enumerate it).
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
-            .unwrap();
-            fs::create_dir(state.path().join("tmp")).unwrap();
-            fs::write(state.path().join("tmp/leftover"), b"x").unwrap();
-            fs::create_dir_all(state.path().join("multipart/gone/u1")).unwrap();
-            fs::write(state.path().join("multipart/gone/u1/part-1"), b"x").unwrap();
 
-            fs::set_permissions(state.path().join("tmp"), fs::Permissions::from_mode(0o000))
-                .unwrap();
-            fs::set_permissions(
-                state.path().join("multipart"),
-                fs::Permissions::from_mode(0o000),
-            )
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        fs::create_dir(state.path().join("tmp")).await.unwrap();
+        fs::write(state.path().join("tmp/leftover"), b"x")
+            .await
+            .unwrap();
+        fs::create_dir_all(state.path().join("multipart/gone/u1"))
+            .await
+            .unwrap();
+        fs::write(state.path().join("multipart/gone/u1/part-1"), b"x")
+            .await
             .unwrap();
 
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
-            let mut errs = 0;
-            while let Some(action) = actions.next().await {
-                if action.is_err() {
-                    errs += 1;
-                }
+        fs::set_permissions(state.path().join("tmp"), Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+        fs::set_permissions(
+            state.path().join("multipart"),
+            Permissions::from_mode(0o000),
+        )
+        .await
+        .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+        let mut errs = 0;
+        while let Some(action) = actions.next().await {
+            if action.is_err() {
+                errs += 1;
             }
-            // tmp read (stage 1) + multipart read (stages 3 and 4).
-            assert!(errs >= 2, "unreadable trees must be reported: {errs}");
+        }
+        // tmp read (stage 1) + multipart read (stages 3 and 4).
+        assert!(errs >= 2, "unreadable trees must be reported: {errs}");
 
-            // The repair must not have touched anything.
-            fs::set_permissions(state.path().join("tmp"), fs::Permissions::from_mode(0o700))
-                .unwrap();
-            fs::set_permissions(
-                state.path().join("multipart"),
-                fs::Permissions::from_mode(0o700),
-            )
+        // The repair must not have touched anything.
+        fs::set_permissions(state.path().join("tmp"), Permissions::from_mode(0o700))
+            .await
             .unwrap();
-            assert!(state.path().join("tmp/leftover").exists());
-            assert!(state.path().join("multipart/gone/u1/part-1").exists());
-        });
+        fs::set_permissions(
+            state.path().join("multipart"),
+            Permissions::from_mode(0o700),
+        )
+        .await
+        .unwrap();
+        assert!(state.path().join("tmp/leftover").exists());
+        assert!(state.path().join("multipart/gone/u1/part-1").exists());
     }
 
     #[cfg(unix)]
-    #[test]
-    fn staging_walk_survives_an_unreadable_subdir() {
-        // A bucket subtree that cannot be read must not abort the whole
-        // staging walk — the readable siblings still get cleared.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            fs::create_dir_all(root.path().join("data/blocked")).unwrap();
-            fs::create_dir_all(root.path().join("data/ok/.tinio")).unwrap();
-            fs::write(root.path().join("data/ok/.tinio/aaaa"), b"x").unwrap();
-            fs::set_permissions(
-                root.path().join("data/blocked"),
-                fs::Permissions::from_mode(0o000),
-            )
+    #[tokio::test]
+    async fn staging_walk_survives_an_unreadable_subdir() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        fs::create_dir_all(root.path().join("data/blocked"))
+            .await
             .unwrap();
+        fs::create_dir_all(root.path().join("data/ok/.tinio"))
+            .await
+            .unwrap();
+        fs::write(root.path().join("data/ok/.tinio/aaaa"), b"x")
+            .await
+            .unwrap();
+        fs::set_permissions(
+            root.path().join("data/blocked"),
+            Permissions::from_mode(0o000),
+        )
+        .await
+        .unwrap();
 
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(
-                actions
-                    .iter()
-                    .any(|a| a.description.contains("staging residue")),
-                "{actions:?}"
-            );
-            assert!(!root.path().join("data/ok/.tinio").exists());
-            fs::set_permissions(
-                root.path().join("data/blocked"),
-                fs::Permissions::from_mode(0o700),
-            )
-            .unwrap();
-        });
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("staging residue")),
+            "{actions:?}"
+        );
+        assert!(!root.path().join("data/ok/.tinio").exists());
+        fs::set_permissions(
+            root.path().join("data/blocked"),
+            Permissions::from_mode(0o700),
+        )
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
-    #[test]
-    fn bucket_staging_descents_symlinked_dirs_when_following() {
+    #[tokio::test]
+    async fn bucket_staging_descents_symlinked_dirs_when_following() {
         // A symlinked directory INSIDE a bucket is part of the bucket
         // only when following is enabled (the follow policy, one source
         // of truth): with following the residue behind the link is
         // cleared; without it the link is not descended and the residue
         // survives.
-        let run = |follow_symlinks: bool| {
-            rt(async move {
-                let root = tempfile::tempdir().unwrap();
-                let outside = tempfile::tempdir().unwrap();
-                fs::create_dir_all(outside.path().join(".tinio")).unwrap();
-                fs::write(outside.path().join(".tinio/aaaa"), b"residue").unwrap();
-                let storage = FsStorage::new(
-                    root.path(),
-                    FsOptions {
-                        follow_symlinks,
-                        ..fs_options()
-                    },
-                )
-                .unwrap();
-                let b = bucket::name("data").unwrap();
-                storage.create_bucket(&b).await.unwrap();
-                fs::create_dir(root.path().join("data/real")).unwrap();
-                std::os::unix::fs::symlink(outside.path(), root.path().join("data/link")).unwrap();
-
-                let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-                let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-                (
-                    follow_symlinks,
-                    actions
-                        .iter()
-                        .any(|a| a.description.contains("staging residue")),
-                    outside.path().join(".tinio").exists(),
-                )
-            })
-        };
-        let (following, reported, residue_exists) = run(true);
-        assert!(following && reported && !residue_exists);
-        let (not_following, reported, residue_exists) = run(false);
-        assert!(not_following && !reported && residue_exists);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn full_repair_reports_unreadable_roots_and_probes() {
-        // F11: a probe error is never \"gone\" — an unreadable storage
-        // root surfaces as reported errors across the stages (tmp, bucket
-        // walk, multipart orphan probe, stale-bucket probe), and the
-        // scanner's count path warns-and-keeps instead of pruning.
-        rt(async {
+        async fn run(follow_symlinks: bool) -> (bool, bool, bool) {
             let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::create_dir_all(outside.path().join(".tinio"))
+                .await
+                .unwrap();
+            fs::write(outside.path().join(".tinio/aaaa"), b"residue")
+                .await
+                .unwrap();
             let storage = FsStorage::new(
                 root.path(),
                 FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
+                    follow_symlinks,
                     ..fs_options()
                 },
             )
             .unwrap();
             let b = bucket::name("data").unwrap();
             storage.create_bucket(&b).await.unwrap();
-            let k = object::key("a.txt").unwrap();
-            storage.put_object(&b, &k, body(b"x")).await.unwrap();
-            // A multipart subtree + a stale bucket record to probe.
-            storage
-                .bucket_store()
-                .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
-                .await
-                .unwrap();
-            fs::create_dir_all(state.path().join("multipart/gone-bucket/u1")).unwrap();
+            fs::create_dir(root.path().join("data/real")).await.unwrap();
+            symlink(outside.path(), root.path().join("data/link")).unwrap();
 
-            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
             let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let mut actions = cleanup.repair(RepairKind::Full).await.unwrap();
-            let mut errs = 0;
-            while let Some(action) = actions.next().await {
-                if action.is_err() {
-                    errs += 1;
-                }
-            }
-            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(errs >= 3, "unreadable root must be reported: {errs}");
-            assert!(
-                storage.meta_store().walk(&b).await.unwrap().len() == 1,
-                "the record is kept (a probe error is not gone)"
-            );
-
-            // The scanner count path: probe errors warn and keep the row.
-            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
-            let pruned = cleanup.reclaim_stale_buckets().await.unwrap();
-            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            assert_eq!(pruned, 0, "no record is pruned on a probe error");
-            assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
-        });
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            (
+                follow_symlinks,
+                actions
+                    .iter()
+                    .any(|a| a.description.contains("staging residue")),
+                outside.path().join(".tinio").exists(),
+            )
+        }
+        let (following, reported, residue_exists) = run(true).await;
+        assert!(following && reported && !residue_exists);
+        let (not_following, reported, residue_exists) = run(false).await;
+        assert!(not_following && !reported && residue_exists);
     }
 
-    #[test]
-    fn invalid_bucket_names_skip_the_drain_but_not_the_removal() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_repair_reports_unreadable_roots_and_probes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("a.txt").unwrap();
+        storage.put_object(&b, &k, body(b"x")).await.unwrap();
+        // A multipart subtree + a stale bucket record to probe.
+        storage
+            .bucket_store()
+            .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
+            .await
+            .unwrap();
+        fs::create_dir_all(state.path().join("multipart/gone-bucket/u1"))
+            .await
+            .unwrap();
+
+        fs::set_permissions(root.path(), Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let mut actions = cleanup.repair(RepairKind::Full).await.unwrap();
+        let mut errs = 0;
+        while let Some(action) = actions.next().await {
+            if action.is_err() {
+                errs += 1;
+            }
+        }
+        fs::set_permissions(root.path(), Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        assert!(errs >= 3, "unreadable root must be reported: {errs}");
+        assert!(
+            storage.meta_store().walk(&b).await.unwrap().len() == 1,
+            "the record is kept (a probe error is not gone)"
+        );
+
+        // The scanner count path: probe errors warn and keep the row.
+        fs::set_permissions(root.path(), Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+        let pruned = cleanup.reclaim_stale_buckets().await.unwrap();
+        fs::set_permissions(root.path(), Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        assert_eq!(pruned, 0, "no record is pruned on a probe error");
+        assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_bucket_names_skip_the_drain_but_not_the_removal() {
         // A multipart subtree under an INVALID bucket name (e.g. too
         // short) cannot be drained — the `bucket::name` guard skips the
         // drain (never a panic) but the subtree itself is still removed:
         // stage 3 for a missing bucket dir, stage 4 for a live one.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+
+        // Stage 3: invalid name + missing bucket dir — removed, drain
+        // skipped (the `bucket::name` guard answers `Err`).
+        fs::create_dir_all(state.path().join("multipart/xx/u1"))
+            .await
+            .unwrap();
+        fs::write(state.path().join("multipart/xx/u1/part-1"), b"x")
+            .await
             .unwrap();
 
-            // Stage 3: invalid name + missing bucket dir — removed, drain
-            // skipped (the `bucket::name` guard answers `Err`).
-            fs::create_dir_all(state.path().join("multipart/xx/u1")).unwrap();
-            fs::write(state.path().join("multipart/xx/u1/part-1"), b"x").unwrap();
+        // Stage 4: invalid name + PRESENT bucket dir — the upload dir
+        // is an orphan (never live) and is removed with the drain
+        // skipped.
+        fs::create_dir(root.path().join("xx")).await.unwrap();
+        let orphan_dir = state.path().join("multipart/xx/u-orphan");
+        fs::create_dir_all(&orphan_dir).await.unwrap();
+        fs::write(orphan_dir.join("part-1"), b"x").await.unwrap();
 
-            // Stage 4: invalid name + PRESENT bucket dir — the upload dir
-            // is an orphan (never live) and is removed with the drain
-            // skipped.
-            fs::create_dir(root.path().join("xx")).unwrap();
-            let orphan_dir = state.path().join("multipart/xx/u-orphan");
-            fs::create_dir_all(&orphan_dir).unwrap();
-            fs::write(orphan_dir.join("part-1"), b"x").unwrap();
-
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-                .with_multipart_grace(Duration::ZERO);
-            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
-            assert!(!state.path().join("multipart/xx/u1").exists());
-            assert!(!orphan_dir.exists());
-            // Both removals are reported; neither drain panics.
-            assert_eq!(
-                actions
-                    .iter()
-                    .filter(
-                        |a| a.description.contains("multipart") || a.description.contains("orphaned")
-                    )
-                    .count(),
-                2,
-                "{actions:?}"
-            );
-        });
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+            .with_multipart_grace(Duration::ZERO);
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(!state.path().join("multipart/xx/u1").exists());
+        assert!(!orphan_dir.exists());
+        // Both removals are reported; neither drain panics.
+        assert_eq!(
+            actions
+                .iter()
+                .filter(
+                    |a| a.description.contains("multipart") || a.description.contains("orphaned")
+                )
+                .count(),
+            2,
+            "{actions:?}"
+        );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn orphan_stage_reports_an_unreadable_upload_dir() {
-        // An upload directory that cannot be read is REPORTED (never
-        // silently skipped): the enumeration sees it but the parts read
-        // fails, surfacing as an error action.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn orphan_stage_reports_an_unreadable_upload_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("live").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let blocked = state.path().join("multipart/live/u-blocked");
+        fs::create_dir_all(&blocked).await.unwrap();
+        fs::write(blocked.join("part-1"), b"x").await.unwrap();
+        fs::set_permissions(&blocked, Permissions::from_mode(0o000))
+            .await
             .unwrap();
-            let b = bucket::name("live").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let blocked = state.path().join("multipart/live/u-blocked");
-            fs::create_dir_all(&blocked).unwrap();
-            fs::write(blocked.join("part-1"), b"x").unwrap();
-            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
 
-            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
-            let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
-            let mut errs = 0;
-            while let Some(action) = actions.next().await {
-                if action.is_err() {
-                    errs += 1;
-                }
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+        let mut errs = 0;
+        while let Some(action) = actions.next().await {
+            if action.is_err() {
+                errs += 1;
             }
-            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-            assert_eq!(errs, 1, "the unreadable upload dir must be reported");
-            assert!(blocked.exists(), "nothing is removed on a read failure");
-        });
+        }
+        fs::set_permissions(&blocked, Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        assert_eq!(errs, 1, "the unreadable upload dir must be reported");
+        assert!(blocked.exists(), "nothing is removed on a read failure");
     }
 }

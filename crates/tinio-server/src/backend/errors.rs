@@ -50,9 +50,12 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
 mod tests {
     use std::io;
 
+    use io::Error as IoError;
     use s3s::S3ErrorCode;
-    use tinio_core::storage::{ByteRange, Error as StorageError};
-    use tinio_core::{ETag, bucket, object};
+    use tinio_core::{
+        ETag, bucket, object,
+        storage::{ByteRange, Error as StorageError},
+    };
 
     use super::*;
 
@@ -113,7 +116,7 @@ mod tests {
             ),
             (StorageError::AccessDenied(k), S3ErrorCode::AccessDenied),
             (
-                StorageError::Io(io::Error::other("boom")),
+                StorageError::Io(IoError::other("boom")),
                 S3ErrorCode::InternalError,
             ),
         ];

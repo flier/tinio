@@ -3,9 +3,8 @@
 use async_trait::async_trait;
 use derive_more::Debug;
 
-use crate::{bucket, etag::ETag, object};
-
 use super::{Storage, body::BodyStream, range::ByteRange};
+use crate::{bucket, etag::ETag, object};
 
 /// Result of a successful object write.
 ///
@@ -34,16 +33,19 @@ pub struct PutObjectResult {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{ETag, object, GetObjectResult};
+/// use std::time::SystemTime;
+///
+/// use futures::stream;
+/// use tinio_core::{ETag, GetObjectResult, object};
 ///
 /// let result = GetObjectResult {
 ///     info: object::Info {
 ///         key: object::key("a.txt").unwrap(),
 ///         size: 5,
-///         last_modified: std::time::SystemTime::UNIX_EPOCH,
+///         last_modified: SystemTime::UNIX_EPOCH,
 ///         etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
 ///     },
-///     body: Box::pin(futures::stream::empty()),
+///     body: Box::pin(stream::empty()),
 ///     served_range: Some((0, 4)),
 /// };
 /// assert_eq!(result.served_range, Some((0, 4)));
@@ -65,7 +67,7 @@ pub struct GetObjectResult {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{bucket, ListObjectsParams};
+/// use tinio_core::{ListObjectsParams, bucket};
 ///
 /// let params = ListObjectsParams {
 ///     bucket: bucket::name("data").unwrap(),
@@ -120,13 +122,13 @@ pub struct ObjectListing {
 /// Object operations of the storage contract.
 ///
 /// Implementations MUST reject invalid keys with
-/// [`super::Error::InvalidKey`] **before any filesystem access** (FR-006 —
+/// [`Error::InvalidKey`] **before any filesystem access** (FR-006 —
 /// keys are pre-validated by [`object::key`]; the check is a defensive
 /// backstop), refuse writes whose key is reserved (`.tinio` segment,
-/// FR-020) with [`super::Error::AccessDenied`], and implement folder-marker
+/// FR-020) with [`Error::AccessDenied`], and implement folder-marker
 /// semantics: a key ending in `/` is never an object (put creates a
 /// directory, get/head report `NoSuchKey`). A missing bucket is
-/// [`super::Error::NoSuchBucket`], a missing object [`super::Error::NoSuchKey`].
+/// [`Error::NoSuchBucket`], a missing object [`Error::NoSuchKey`].
 ///
 /// # Examples
 ///

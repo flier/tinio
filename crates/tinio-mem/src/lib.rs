@@ -1,7 +1,7 @@
 //! In-memory storage backend for tinio.
 //!
 //! [`MemoryStorage`] implements the `tinio-core` `Storage` contract over a
-//! redb database on the `redb::backends::InMemoryBackend` — no disk, fast
+//! redb database on the `backends::InMemoryBackend` — no disk, fast
 //! test setup. It serves as the shared buffer layer for other backends (e.g.
 //! a write/cache tier in front of `tinio-fs`) and as the CLI's backend when
 //! no filesystem directory is given.
@@ -18,6 +18,8 @@ mod multipart;
 mod object;
 mod storage;
 
-pub use self::cleanup::MemoryCleanup;
-pub use self::error::{DatabaseError, Error};
-pub use self::storage::{MemoryOptions, MemoryStorage};
+pub use self::{
+    cleanup::MemoryCleanup,
+    error::{DatabaseError, Error},
+    storage::{MemoryOptions, MemoryStorage},
+};

@@ -1,10 +1,11 @@
 //! The IO-pipeline ETag computation task (pipeline-spec.md §3.1, task 2).
 //!
-//! [`ComputeTask`] computes the ETag of one object file **blocking**
-//! (Q4 — plain `std::fs`, 64 KiB bounded streaming reads, incremental
-//! MD5, no internal `.await`): one task occupies one worker thread, so
-//! the hash concurrency and open file-handle count are exactly the IO
-//! pipeline's worker count. The result is [`Result`] —
+//! [`ComputeTask`] computes the ETag of one object file over
+//! `tokio::fs` (Q4 — async: 64 KiB bounded streaming reads, incremental
+//! MD5; the file IO runs on the tokio blocking pool, and one task still
+//! occupies one worker thread, so the hash concurrency and open
+//! file-handle count stay bounded by the IO pipeline's worker count).
+//! The result is [`Result`] —
 //! [`Outcome`]: the key, the (possibly kept) ETag, and the
 //! hash-time metadata (size, mtime, identity) the persisted row must
 //! describe — sent through [`pipeline::Completion`]. Matching entries never reach this task: the
@@ -28,14 +29,16 @@
 //! own — a row never pairs a hash-time ETag with walk-time size/mtime.
 
 use std::{
-    cell::RefCell,
-    io,
+    io, mem,
     path::{Path, PathBuf},
+    result,
+    sync::Mutex,
     time::SystemTime,
 };
 
 use async_trait::async_trait;
 use tinio_core::{ETag, object, pipeline};
+use tokio::fs;
 
 use crate::{Error, database, fsutil, meta, write::CHUNK_SIZE};
 
@@ -58,7 +61,7 @@ pub struct Outcome {
     /// The object mtime at hash time.
     pub mtime: SystemTime,
     /// The file identity at hash time (`0` marks an unavailable platform
-    /// identity; see `crate::fsutil::file_identity`).
+    /// identity; see `fsutil::file_identity`).
     pub identity: u64,
     /// Whether the composed form was kept without hashing (P1).
     pub kept: bool,
@@ -99,13 +102,13 @@ impl Outcome {
 }
 
 /// The per-file compute result: [`Outcome`] or the failure. This is the
-/// IO pipeline's [`pipeline::Task::Output`] (`pipeline-spec.md` P4/P7);
-/// `pipeline::Outcome` comes from the blanket `std::result::Result` impl
+/// IO pipeline's [`Task::Output`] (`pipeline-spec.md` P4/P7);
+/// `pipeline::Outcome` comes from the blanket `result::Result` impl
 /// (pipeline.rs) — `Error` is a `StdError`, so the IO-pipeline runtime
 /// logs compute failures through it (R8) with the original error kept
 /// (P7). Tombstone reclaim lives on the removal pipeline
 /// (`Result<(), Error>`), not here.
-pub type Result = std::result::Result<Outcome, Error>;
+pub type Result = result::Result<Outcome, Error>;
 
 /// A unit of IO-pipeline work: the blocking ETag computation of one
 /// object file (pipeline-spec.md §3.1, P1, R3).
@@ -113,8 +116,8 @@ pub type Result = std::result::Result<Outcome, Error>;
 /// The result is an [`Outcome`] — the producer's batch entry; `set`
 /// needs the identity (and the hash-time size/mtime, F19), so they are
 /// computed here from the already-open handle (P1).
-/// [`pipeline::Task::run`] returns [`Result`]; the runner
-/// [`pipeline::Reply::send`]s it to [`pipeline::Completion`].
+/// [`Task::run`] returns [`Result`]; the runner
+/// [`Reply::send`]s it to [`pipeline::Completion`].
 ///
 /// Constructed by the task-4 producers (list/scanner); the unit tests
 /// construct it directly.
@@ -132,48 +135,67 @@ pub(crate) struct ComputeTask {
     pub follow_symlinks: bool,
 }
 
-thread_local! {
-    /// The per-worker blocking-task hash buffer (item 4, data-path review
-    /// 2026-08-27): one 64 KiB buffer per worker THREAD, reused across
-    /// every blocking task that thread runs — a cold list of 1000 files
-    /// allocates once per worker instead of once per task (the old
-    /// 64 MiB alloc/free churn). A worker runs one task at a time, so the
-    /// borrow is exclusive; `meta::ensure_etag`'s blocking-pool hash
-    /// shares the same per-thread buffer (blocking-pool threads are
-    /// long-lived).
-    static HASH_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+/// A 64 KiB hash read buffer checked out of the shared pool (item 4,
+/// data-path review 2026-08-27): one allocation per hash CONCURRENCY,
+/// never per hashed file — a cold list of 1000 files allocates a few
+/// buffers, not 64 MiB of alloc/free churn. The old `thread_local`
+/// per-worker pool cannot survive the async compute (the future can
+/// migrate between worker threads across `.await` points), so the pool
+/// is shared and owns the buffers; the guard returns its buffer on drop.
+pub(crate) struct HashBuffer(Vec<u8>);
+
+/// The shared pool of returned buffers (bounded by peak hash
+/// concurrency; a buffer is never freed once pooled, matching the old
+/// per-thread buffers' lifetime).
+static HASH_BUFFER_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+impl HashBuffer {
+    /// Check a buffer out of the pool (allocating a fresh one when the
+    /// pool is empty).
+    pub(crate) fn acquire() -> Self {
+        Self(
+            HASH_BUFFER_POOL
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]),
+        )
+    }
+
+    /// The read buffer (the hash overwrites it — never zeroed between
+    /// hashes).
+    pub(crate) fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
 }
 
-/// Borrow the worker-thread hash buffer for `f` (resized to
-/// [`CHUNK_SIZE`] once, on first use; never zeroed between tasks — the
-/// hash reads overwrite it).
-pub(crate) fn with_hash_buffer<T>(f: impl FnOnce(&mut [u8]) -> T) -> T {
-    HASH_BUFFER.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        if buf.is_empty() {
-            buf.resize(CHUNK_SIZE, 0);
-        }
-        f(buf.as_mut_slice())
-    })
+impl Drop for HashBuffer {
+    fn drop(&mut self) {
+        HASH_BUFFER_POOL
+            .lock()
+            .unwrap()
+            .push(mem::take(&mut self.0));
+    }
 }
 
 impl ComputeTask {
-    /// The blocking compute core: open the file under the symlink policy,
-    /// then the shared `ensure_etag` decision (P1, [`meta::composed_keep`]
-    /// — one home for the rule): composed + same size + same file with an
-    /// unchanged mtime (the jitter window is the identity-less fallback)
-    /// → keep the composed form; else stream re-hash (64 KiB bounded,
-    /// incremental MD5, torn-file verified — F19). Matching entries are
-    /// gated by the producer before enqueue (no worker for a cache hit).
-    /// The hash runs on the worker thread's pooled buffer
-    /// ([`with_hash_buffer`], item 4) — one buffer per worker, never one
-    /// per task.
-    fn hash(&self) -> Result {
-        with_hash_buffer(|buf| self.hash_into(buf))
+    /// The compute core: open the file under the symlink policy (async,
+    /// nofollow via the tokio blocking pool), then the shared
+    /// `ensure_etag` decision (P1, [`meta::composed_keep`] — one home
+    /// for the rule): composed + same size + same file with an unchanged
+    /// mtime (the jitter window is the identity-less fallback) → keep the
+    /// composed form; else stream re-hash (64 KiB bounded, incremental
+    /// MD5, torn-file verified — F19). Matching entries are gated by the
+    /// producer before enqueue (no worker for a cache hit). The hash
+    /// reads into a pooled 64 KiB buffer ([`HashBuffer`], item 4) — one
+    /// allocation per hash concurrency, never per task.
+    async fn hash(&self) -> Result {
+        let mut buf = HashBuffer::acquire();
+        self.hash_into(buf.as_mut()).await
     }
 
     /// The [`Self::hash`] body over the caller's buffer.
-    fn hash_into(&self, buf: &mut [u8]) -> Result {
+    async fn hash_into(&self, buf: &mut [u8]) -> Result {
         if let Some(stored) = &self.stored {
             // Timestamp jitter (antivirus, indexer) must not rewrite a
             // multipart `MD5-of-MD5s-N` ETag into a content MD5. The keep
@@ -185,15 +207,18 @@ impl ComputeTask {
             // the platform exposes no identity (stored 0), the mtime
             // jitter window is the fallback.
             if meta::composed_gate(&stored.etag, stored.size, self.size) {
-                let mut file = open_policy(&self.path, self.follow_symlinks)?;
+                let mut file = open_policy(&self.path, self.follow_symlinks).await?;
                 // The path's ONE metadata fetch (data-path review
                 // 2026-08-29, finding 5): the probe's metadata doubles as
                 // the re-hash path's identity source — the identity of an
                 // already-open handle is stable, so the hash never
                 // re-fetches it.
-                let before = file.metadata()?;
+                let before = file.metadata().await?;
                 let mtime = before.modified()?;
-                let current = fsutil::file_identity_handle(&file, &before);
+                // The identity comes from the ALREADY-OPEN handle (R3 —
+                // never a second path-based open;
+                // [`fsutil::file_identity_async`]).
+                let current = fsutil::file_identity_async(&mut file, &before).await;
                 // The keep also requires the CURRENT size to match the
                 // stored one — a file that changed size between the walk
                 // and the open is a content change, never a touch (the
@@ -209,47 +234,44 @@ impl ComputeTask {
                         current,
                     ));
                 }
-                let digest = md5_of_handle(&mut file, buf)?;
-                let after = file.metadata()?;
+                let digest = md5_of_handle(&mut file, buf).await?;
+                let after = file.metadata().await?;
                 if after.len() == before.len() {
                     let mtime = after.modified()?;
+                    let identity = fsutil::file_identity_async(&mut file, &after).await;
                     return Ok(Outcome::hashed(
                         &self.key,
                         digest,
                         after.len(),
                         mtime,
-                        fsutil::file_identity_handle(&file, &after),
+                        identity,
                     ));
                 }
                 // The size changed mid-hash — discard and fall through to
                 // the verified re-open path (F19).
             }
         }
-        let (digest, size, mtime, identity) = md5_of_path(&self.path, self.follow_symlinks, buf)?;
+        let (digest, size, mtime, identity) =
+            md5_of_path(&self.path, self.follow_symlinks, buf).await?;
         Ok(Outcome::hashed(&self.key, digest, size, mtime, identity))
     }
 }
 
-/// Open `path` for reading under the symlink policy (blocking): with
+/// Open `path` for reading under the symlink policy (async): with
 /// following disabled, the nofollow open rejects a link with
 /// `PermissionDenied` — a swap between the walk and the hash cannot
-/// escape the storage root (R3).
-fn open_policy(path: &Path, follow_symlinks: bool) -> io::Result<std::fs::File> {
-    if follow_symlinks {
-        std::fs::File::open(path)
-    } else {
-        fsutil::open_nofollow_std(path)
-    }
+/// escape the storage root (R3). The nofollow open runs on the tokio
+/// blocking pool ([`fsutil::open_file`]).
+async fn open_policy(path: &Path, follow_symlinks: bool) -> io::Result<fs::File> {
+    fsutil::open_file(path, follow_symlinks).await
 }
 
 /// The blocking streaming content MD5 of the file at `path`, opened
 /// under the symlink policy ([`open_policy`], R3), plus the hash-time
 /// size, mtime, and file identity of the same handle — one open serves
 /// the hash, the verification, and the identity (no second path-based
-/// open). `buf` is the caller's 64 KiB read buffer
-/// ([`with_hash_buffer`] — the worker-thread pool, item 4). The
-/// read-path share of the task compute: `meta::ensure_etag` runs it on
-/// the blocking pool.
+/// open). `buf` is the caller's 64 KiB read buffer. The read-path share
+/// of the task compute: `meta::ensure_etag` awaits it directly.
 ///
 /// Torn-file verification (F19): the size is checked before and after
 /// the hash; a size change mid-hash discards the result and the file is
@@ -257,49 +279,41 @@ fn open_policy(path: &Path, follow_symlinks: bool) -> io::Result<std::fs::File> 
 /// reported metadata then still describes the hashed bytes, so the row
 /// is self-consistent and the next gate recomputes once the file
 /// settles.
-pub(crate) fn md5_of_path(
+pub(crate) async fn md5_of_path(
     path: &Path,
     follow_symlinks: bool,
     buf: &mut [u8],
-) -> std::result::Result<([u8; 16], u64, SystemTime, u64), Error> {
-    let mut file = open_policy(path, follow_symlinks)?;
-    let before = file.metadata()?;
-    let digest = md5_of_handle(&mut file, buf)?;
-    let after = file.metadata()?;
+) -> result::Result<([u8; 16], u64, SystemTime, u64), Error> {
+    let mut file = open_policy(path, follow_symlinks).await?;
+    let before = file.metadata().await?;
+    let digest = md5_of_handle(&mut file, buf).await?;
+    let after = file.metadata().await?;
     if after.len() == before.len() {
         let mtime = after.modified()?;
-        return Ok((
-            digest,
-            after.len(),
-            mtime,
-            fsutil::file_identity_handle(&file, &after),
-        ));
+        let identity = fsutil::file_identity_async(&mut file, &after).await;
+        return Ok((digest, after.len(), mtime, identity));
     }
     // The size changed mid-hash — discard the torn result and re-hash
     // (once; a second change is accepted as described above).
-    let mut file = open_policy(path, follow_symlinks)?;
-    let digest = md5_of_handle(&mut file, buf)?;
-    let after = file.metadata()?;
+    let mut file = open_policy(path, follow_symlinks).await?;
+    let digest = md5_of_handle(&mut file, buf).await?;
+    let after = file.metadata().await?;
     let mtime = after.modified()?;
-    Ok((
-        digest,
-        after.len(),
-        mtime,
-        fsutil::file_identity_handle(&file, &after),
-    ))
+    let identity = fsutil::file_identity_async(&mut file, &after).await;
+    Ok((digest, after.len(), mtime, identity))
 }
 
-/// The **blocking** streaming content MD5 of an already-open file
-/// (64 KiB bounded reads into the caller's buffer; no internal `.await`
-/// — one [`ComputeTask`] occupies one worker thread, so the
-/// concurrency is the pipeline's worker count, pipeline-spec.md Q4).
-/// No metadata is fetched here (data-path review 2026-08-29, finding 5):
+/// The async streaming content MD5 of an already-open file (64 KiB
+/// bounded reads into the caller's buffer over `fs::File` — the
+/// IO runs on the tokio blocking pool, pipeline-spec.md Q4). No
+/// metadata is fetched here (data-path review 2026-08-29, finding 5):
 /// the caller's identity comes from metadata it already has — the
 /// composed path reuses its probe's, [`md5_of_path`] verifies with its
-/// own before/after pair. The read loop is the shared [`fsutil::md5_stream`]
+/// own before/after pair. The read loop is the shared
+/// [`fsutil::md5_stream_async`]
 /// (F43).
-fn md5_of_handle(file: &mut std::fs::File, buf: &mut [u8]) -> std::result::Result<[u8; 16], Error> {
-    Ok(fsutil::md5_stream(file, buf)?)
+async fn md5_of_handle(file: &mut fs::File, buf: &mut [u8]) -> result::Result<[u8; 16], Error> {
+    Ok(fsutil::md5_stream_async(file, buf).await?)
 }
 
 #[async_trait]
@@ -311,18 +325,25 @@ impl pipeline::Task for ComputeTask {
     }
 
     async fn run(&mut self) -> Result {
-        self.hash()
+        self.hash().await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io::ErrorKind;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::{
+        fs::{self as std_fs, File},
+        io::Write,
         path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread::sleep,
         time::Duration,
     };
 
@@ -332,6 +353,7 @@ mod tests {
         to_nanos,
     };
     use tinio_util::testing::etag;
+    use tokio::{runtime::Builder, task::yield_now};
 
     use super::*;
 
@@ -352,11 +374,9 @@ mod tests {
     }
 
     /// Run the task on the inline runner and await [`pipeline::Completion`].
-    fn run(task: ComputeTask) -> Result {
+    async fn run(task: ComputeTask) -> Result {
         let runner = InlineRunner::default();
-        crate::testutil::rt(
-            async move { runner.enqueue(Box::new(task)).await.unwrap().await.unwrap() },
-        )
+        runner.enqueue(Box::new(task)).await.unwrap().await.unwrap()
     }
 
     #[test]
@@ -365,14 +385,14 @@ mod tests {
         assert_eq!(task.kind(), "etag");
     }
 
-    #[test]
-    fn recomputes_content_md5_when_nothing_is_stored() {
+    #[tokio::test]
+    async fn recomputes_content_md5_when_nothing_is_stored() {
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("a.txt");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let task = task("a.txt", file.clone(), metadata.len(), None, false);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(&*outcome.key, "a.txt");
         assert_eq!(outcome.etag, ETag::from_content(b"hello"));
         assert!(!outcome.kept);
@@ -380,16 +400,13 @@ mod tests {
         // batch refresh records it), and the outcome carries the
         // hash-time metadata — the row the producer persists describes
         // the hashed file itself (F19).
-        assert_eq!(
-            outcome.identity,
-            crate::fsutil::file_identity(&file, &metadata)
-        );
+        assert_eq!(outcome.identity, fsutil::file_identity(&file, &metadata));
         assert_eq!(outcome.size, metadata.len());
         assert_eq!(outcome.mtime, metadata.modified().unwrap());
     }
 
-    #[test]
-    fn composed_etag_kept_on_identity_less_storage_within_the_jitter_window() {
+    #[tokio::test]
+    async fn composed_etag_kept_on_identity_less_storage_within_the_jitter_window() {
         // The identity-less fallback (stored identity 0 — platforms or
         // filesystems without a file ID): a touch within the mtime jitter
         // window is kept — the composed `MD5-of-MD5s-N` form survives and
@@ -397,8 +414,8 @@ mod tests {
         // impossible without an identity — the documented risk).
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("mp.bin");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = database::StoredMeta {
             etag: composed.clone(),
@@ -406,22 +423,22 @@ mod tests {
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: 0,
         };
-        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        let handle = File::options().write(true).open(&file).unwrap();
         handle
             .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
             .unwrap();
         drop(handle);
-        let now = std::fs::metadata(&file).unwrap();
+        let now = std_fs::metadata(&file).unwrap();
         let task = task("mp.bin", file.clone(), now.len(), Some(stored), false);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(outcome.etag, composed);
         assert!(matches!(outcome.etag, ETag::Composed(_, 2)));
         assert!(outcome.kept);
-        assert_eq!(outcome.identity, crate::fsutil::file_identity(&file, &now));
+        assert_eq!(outcome.identity, fsutil::file_identity(&file, &now));
     }
 
-    #[test]
-    fn composed_etag_rehashes_on_touch_when_identity_is_available() {
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_touch_when_identity_is_available() {
         // F04 on identity platforms: a touch (same file, mtime pushed
         // forward) re-hashes — an in-place same-size rewrite keeps the
         // identity and is indistinguishable from a touch without hashing,
@@ -430,174 +447,171 @@ mod tests {
         // the content MD5).
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("mp.bin");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = database::StoredMeta {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
-            file_identity: crate::fsutil::file_identity(&file, &metadata),
+            file_identity: fsutil::file_identity(&file, &metadata),
         };
-        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        let handle = File::options().write(true).open(&file).unwrap();
         handle
             .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
             .unwrap();
         drop(handle);
-        let now = std::fs::metadata(&file).unwrap();
+        let now = std_fs::metadata(&file).unwrap();
         let task = task("mp.bin", file.clone(), now.len(), Some(stored), false);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(outcome.etag, ETag::from_content(b"hello"));
         assert!(!outcome.kept);
     }
 
-    #[test]
-    fn composed_etag_rehashes_on_in_place_same_size_rewrite() {
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_in_place_same_size_rewrite() {
         // F04 regression: an in-place rewrite (SAME file — identity
         // unchanged — different same-size content) within the old 60 s
         // jitter window must re-hash — the stale composed ETag is never
         // kept and served forever.
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("mp.bin");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = database::StoredMeta {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
-            file_identity: crate::fsutil::file_identity(&file, &metadata),
+            file_identity: fsutil::file_identity(&file, &metadata),
         };
         // Overwrite in place with different same-size content. The sleep
         // lands the rewrite in a later Windows FILETIME tick (~16 ms
         // clock granularity) — a rewrite within the SAME tick as the
         // original write keeps the old mtime and is indistinguishable
         // even from the strict keep (the documented platform limitation).
-        std::thread::sleep(Duration::from_millis(30));
-        let mut handle = std::fs::File::options()
+        sleep(Duration::from_millis(30));
+        let mut handle = File::options()
             .write(true)
             .truncate(true)
             .open(&file)
             .unwrap();
-        std::io::Write::write_all(&mut handle, b"world").unwrap();
+        handle.write_all(b"world").unwrap();
         handle.sync_all().unwrap();
         drop(handle);
-        let now = std::fs::metadata(&file).unwrap();
+        let now = std_fs::metadata(&file).unwrap();
         let task = task("mp.bin", file, now.len(), Some(stored), false);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(outcome.etag, ETag::from_content(b"world"));
         assert!(!outcome.kept);
     }
 
-    #[test]
-    fn composed_etag_rehashes_on_replacement() {
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_replacement() {
         // A same-size out-of-band replacement (a NEW file renamed over):
         // the identity changed and the mtime drift is beyond the jitter
         // window — re-hashed, never the stale composed form.
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("mp.bin");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = database::StoredMeta {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
-            file_identity: crate::fsutil::file_identity(&file, &metadata),
+            file_identity: fsutil::file_identity(&file, &metadata),
         };
         let replacement = state.path().join("replacement.bin");
-        std::fs::write(&replacement, b"hello").unwrap();
-        let handle = std::fs::File::options()
-            .write(true)
-            .open(&replacement)
-            .unwrap();
+        std_fs::write(&replacement, b"hello").unwrap();
+        let handle = File::options().write(true).open(&replacement).unwrap();
         handle
             .set_modified(metadata.modified().unwrap() + Duration::from_secs(120))
             .unwrap();
         drop(handle);
-        std::fs::rename(&replacement, &file).unwrap();
-        let now = std::fs::metadata(&file).unwrap();
+        std_fs::rename(&replacement, &file).unwrap();
+        let now = std_fs::metadata(&file).unwrap();
         let task = task("mp.bin", file, now.len(), Some(stored), false);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(outcome.etag, ETag::from_content(b"hello"));
         assert!(!outcome.kept);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn composed_etag_rehashes_on_quick_replacement() {
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_quick_replacement() {
         // The identity beats the clock: a same-size replacement within
         // the jitter window is still detected (new inode), where the
         // mtime fallback would wrongly keep the composed form.
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("mp.bin");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = database::StoredMeta {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
-            file_identity: crate::fsutil::file_identity(&file, &metadata),
+            file_identity: fsutil::file_identity(&file, &metadata),
         };
         let replacement = state.path().join("replacement.bin");
-        std::fs::write(&replacement, b"hello").unwrap();
+        std_fs::write(&replacement, b"hello").unwrap();
         // Fresh mtime — inside the jitter window.
-        std::fs::rename(&replacement, &file).unwrap();
-        let now = std::fs::metadata(&file).unwrap();
+        std_fs::rename(&replacement, &file).unwrap();
+        let now = std_fs::metadata(&file).unwrap();
         let task = task("mp.bin", file, now.len(), Some(stored), false);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(outcome.etag, ETag::from_content(b"hello"));
         assert!(!outcome.kept);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn rejects_a_symlink_with_permission_denied() {
+    #[tokio::test]
+    async fn rejects_a_symlink_with_permission_denied() {
         // R3: with following disabled the task opens nofollow — a file
         // swapped for a symlink between the walk and the hash is
         // rejected, never followed.
         let state = tempfile::tempdir().unwrap();
         let real = state.path().join("real.bin");
         let link = state.path().join("link.bin");
-        std::fs::write(&real, b"hello").unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let metadata = std::fs::metadata(&real).unwrap();
+        std_fs::write(&real, b"hello").unwrap();
+        symlink(&real, &link).unwrap();
+        let metadata = std_fs::metadata(&real).unwrap();
         let task = task("link.bin", link, metadata.len(), None, false);
-        let err = run(task).unwrap_err();
+        let err = run(task).await.unwrap_err();
         assert!(
-            matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            matches!(err, Error::Io(ref e) if e.kind() == ErrorKind::PermissionDenied),
             "{err:?}"
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn follows_a_symlink_when_enabled() {
+    #[tokio::test]
+    async fn follows_a_symlink_when_enabled() {
         // With following enabled the task opens through the link and
         // hashes the target.
         let state = tempfile::tempdir().unwrap();
         let real = state.path().join("real.bin");
         let link = state.path().join("link.bin");
-        std::fs::write(&real, b"hello").unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let metadata = std::fs::metadata(&real).unwrap();
+        std_fs::write(&real, b"hello").unwrap();
+        symlink(&real, &link).unwrap();
+        let metadata = std_fs::metadata(&real).unwrap();
         let task = task("link.bin", link, metadata.len(), None, true);
-        let outcome = run(task).unwrap();
+        let outcome = run(task).await.unwrap();
         assert_eq!(outcome.etag, ETag::from_content(b"hello"));
     }
 
-    #[test]
-    fn failure_is_reported_through_the_completion() {
+    #[tokio::test]
+    async fn failure_is_reported_through_the_completion() {
         let state = tempfile::tempdir().unwrap();
         let missing = state.path().join("missing.bin");
         let task = task("missing.bin", missing, 0, None, false);
-        let err = run(task).unwrap_err();
+        let err = run(task).await.unwrap_err();
         assert!(matches!(err, Error::Io(_)));
     }
 
-    #[test]
-    fn completion_carries_the_run_failure() {
+    #[tokio::test]
+    async fn completion_carries_the_run_failure() {
         let state = tempfile::tempdir().unwrap();
         let missing = state.path().join("missing.bin");
         let task = ComputeTask {
@@ -607,16 +621,16 @@ mod tests {
             stored: None,
             follow_symlinks: false,
         };
-        let err = run(task).unwrap_err();
+        let err = run(task).await.unwrap_err();
         assert!(matches!(err, Error::Io(_)));
     }
 
-    #[test]
-    fn completion_carries_the_run_success() {
+    #[tokio::test]
+    async fn completion_carries_the_run_success() {
         let state = tempfile::tempdir().unwrap();
         let file = state.path().join("a.txt");
-        std::fs::write(&file, b"hello").unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
+        std_fs::write(&file, b"hello").unwrap();
+        let metadata = std_fs::metadata(&file).unwrap();
         let task = ComputeTask {
             key: object::key("a.txt").unwrap(),
             path: file,
@@ -624,27 +638,22 @@ mod tests {
             stored: None,
             follow_symlinks: false,
         };
-        assert!(run(task).is_ok());
+        assert!(run(task).await.is_ok());
     }
 
     #[test]
-    fn compute_core_never_yields_to_the_runtime() {
-        // Q4 blocking semantics: the compute core is plain std::fs with
-        // no internal `.await`, so on a single-threaded runtime a
-        // concurrently spawned task must not run while the hash is in
-        // progress (one task = one worker thread; the concurrency is the
-        // pipeline's worker count).
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    fn compute_core_completes_on_a_single_threaded_runtime() {
+        // Q4 async semantics: the compute core is `tokio::fs` — the hash
+        // IO runs on the tokio blocking pool, so a big-file hash
+        // completes without deadlock on a single-threaded runtime even
+        // with a concurrently spinning task (the blocking pool is
+        // independent of the worker driver).
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let file = state.path().join("big.bin");
-            tokio::fs::write(&file, vec![b'x'; 4 * 1024 * 1024])
-                .await
-                .unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
+            fs::write(&file, vec![b'x'; 4 * 1024 * 1024]).await.unwrap();
+            let metadata = fs::metadata(&file).await.unwrap();
             let task = task("big.bin", file, metadata.len(), None, false);
             let progress = Arc::new(AtomicUsize::new(0));
             let worker = {
@@ -652,19 +661,25 @@ mod tests {
                 tokio::spawn(async move {
                     loop {
                         progress.fetch_add(1, Ordering::Relaxed);
-                        tokio::task::yield_now().await;
+                        yield_now().await;
                     }
                 })
             };
             let runner = InlineRunner::default();
             let done = runner.enqueue(Box::new(task)).await.unwrap();
-            assert_eq!(
-                progress.load(Ordering::Relaxed),
-                0,
-                "the compute core must not yield to the runtime"
-            );
+            // The hash yields to the runtime (async core) — the worker
+            // is free to run other tasks while the blocking pool hashes.
+            let yielded = progress.load(Ordering::Relaxed) > 0;
             worker.abort();
-            assert!(done.await.unwrap().is_ok());
+            let outcome = done.await.unwrap().unwrap();
+            assert_eq!(outcome.size, 4 * 1024 * 1024);
+            assert_eq!(
+                outcome.etag,
+                ETag::from_content(&vec![b'x'; 4 * 1024 * 1024])
+            );
+            // The no-yield invariant is gone by design (Q4 async) — this
+            // documents that the compute no longer monopolizes a worker.
+            let _ = yielded;
         });
     }
 }

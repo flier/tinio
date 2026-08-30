@@ -16,6 +16,8 @@ pub mod log;
 pub mod metrics;
 pub mod pipeline;
 
-pub use self::backend::{Capabilities, S3Backend};
-pub use self::data::DataPlane;
-pub use self::error::Error;
+pub use self::{
+    backend::{Capabilities, S3Backend},
+    data::DataPlane,
+    error::Error,
+};

@@ -12,22 +12,21 @@
 // different subset of the helpers.
 #![allow(dead_code)]
 
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{net::SocketAddr, path::Path, str, time::Duration};
 
 use http::StatusCode;
 use tempfile::TempDir;
+use tinio_core::storage::Storage;
+use tinio_fs::FsStorage;
+pub use tinio_fs::testing::fs_options;
+use tinio_mem::MemoryStorage;
+use tinio_server::{Capabilities, DataPlane};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
+    time::sleep,
 };
-
-use tinio_core::storage::Storage;
-use tinio_fs::FsStorage;
-use tinio_mem::MemoryStorage;
-use tinio_server::{Capabilities, DataPlane};
-
-pub use tinio_fs::testing::fs_options;
 
 /// A running in-process server bound to an ephemeral loopback port.
 pub struct Server {
@@ -168,7 +167,7 @@ pub async fn eventually(cond: impl FnMut() -> bool) -> bool {
         if cond() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     cond()
 }
@@ -230,7 +229,7 @@ fn dechunk(mut rest: &[u8]) -> Vec<u8> {
             .windows(2)
             .position(|w| w == b"\r\n")
             .expect("chunk size line");
-        let size_text = std::str::from_utf8(&rest[..pos]).unwrap();
+        let size_text = str::from_utf8(&rest[..pos]).unwrap();
         let size = usize::from_str_radix(size_text.trim(), 16).expect("chunk size");
         rest = &rest[pos + 2..];
         if size == 0 {

@@ -7,27 +7,28 @@
 //! the metadata is derivable and recomputed on demand (self-healing
 //! restart).
 
-use std::path::Path;
+use std::{fs::read_dir, path::Path};
 
 use tinio_core::{
     bucket,
     multipart::part_number,
     storage::{BucketOps, ListPartsParams, MultipartOps, ObjectOps},
 };
-use tinio_fs::{FsOptions, FsStorage};
+use tinio_fs::{FsOptions, FsStorage, testing};
 use tinio_util::testing::{body, read_body};
+use tokio::fs;
 
 /// The shared offline defaults plus the test's state-dir override (F33).
 fn fs_options(state_dir: &Path) -> FsOptions {
     FsOptions {
         state_dir: Some(state_dir.to_path_buf()),
-        ..tinio_fs::testing::fs_options()
+        ..testing::fs_options()
     }
 }
 
 /// The entries of `dir` as a sorted set.
 fn entries(dir: &Path) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(dir)
+    let mut out: Vec<String> = read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
@@ -114,7 +115,7 @@ async fn deleting_meta_redb_self_heals() {
     drop(storage);
 
     // Wipe the database (simulating corruption beyond repair), then reopen.
-    std::fs::remove_file(state_dir.join("meta.redb")).unwrap();
+    fs::remove_file(state_dir.join("meta.redb")).await.unwrap();
     let storage = FsStorage::new(root.path(), fs_options(&state_dir)).unwrap();
     // The object is still served — the ETag is recomputed on demand.
     let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();

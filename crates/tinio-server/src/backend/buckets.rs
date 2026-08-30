@@ -6,8 +6,10 @@
 //! (s3-surface.md). Storage errors map to S3 codes via
 //! [`map_backend_error`](crate::backend::map_backend_error).
 
-use s3s::{S3Request, S3Response, S3Result, dto};
-
+use s3s::{
+    S3Request, S3Response, S3Result,
+    dto::{self, BucketLocationConstraint, DeleteBucketOutput, HeadBucketOutput},
+};
 use tinio_core::storage::Storage;
 
 use crate::backend::{S3Backend, map_backend_error};
@@ -36,7 +38,7 @@ impl<S: Storage> S3Backend<S> {
             .delete_bucket(&name)
             .await
             .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::DeleteBucketOutput::default()))
+        Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 
     pub(crate) async fn op_head_bucket(
@@ -48,7 +50,7 @@ impl<S: Storage> S3Backend<S> {
             .head_bucket(&name)
             .await
             .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::HeadBucketOutput::default()))
+        Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
     pub(crate) async fn op_list_buckets(
@@ -85,19 +87,21 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(dto::GetBucketLocationOutput {
-            location_constraint: Some(dto::BucketLocationConstraint::from("us-east-1".to_string())),
+            location_constraint: Some(BucketLocationConstraint::from("us-east-1".to_string())),
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use s3s::{S3, dto::ListBucketsInput};
+    use tinio_core::storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps};
+    use tinio_mem::MemoryStorage;
+    use tinio_util::testing::{assert_conformance, body};
+    use tokio::runtime::Runtime;
+
     use super::*;
     use crate::backend::testutil::s3_request;
-    use s3s::S3;
-    use tinio_core::storage::{self, BucketOps, ObjectOps};
-    use tinio_mem::MemoryStorage;
-    use tinio_util::testing::assert_conformance;
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -113,7 +117,7 @@ mod tests {
             .await
             .unwrap_err()
             .into();
-        assert!(matches!(err, storage::Error::NoSuchBucket(_)));
+        assert!(matches!(err, NoSuchBucket(_)));
 
         let create = backend
             .create_bucket(s3_request(dto::CreateBucketInput {
@@ -145,7 +149,7 @@ mod tests {
 
         // List.
         let list = backend
-            .list_buckets(s3_request(dto::ListBucketsInput::default()))
+            .list_buckets(s3_request(ListBucketsInput::default()))
             .await
             .unwrap();
         let names: Vec<String> = list
@@ -215,11 +219,7 @@ mod tests {
             .unwrap();
         let storage = backend.storage();
         storage
-            .put_object(
-                &"data".into(),
-                &"a.txt".into(),
-                tinio_util::testing::body(b"x"),
-            )
+            .put_object(&"data".into(), &"a.txt".into(), body(b"x"))
             .await
             .unwrap();
         let err = backend
@@ -237,7 +237,7 @@ mod tests {
         // The mapping's storage backend must pass the conformance harness
         // (the reference in-memory backend does; the fs backend is asserted
         // in tinio-fs).
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let storage = MemoryStorage::new().unwrap();
             assert_conformance(&storage).await;

@@ -1,16 +1,24 @@
 //! Small filesystem helpers shared across the store modules.
 
-use std::{
-    fs::{Metadata, OpenOptions},
-    io,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
-
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::{
+    fs::{File, Metadata, OpenOptions},
+    io::{self, Error as IoError, ErrorKind},
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
+
+use md5::Md5;
+#[cfg(unix)]
+use rustix::fs as rustix_fs;
+#[cfg(unix)]
+use rustix::io::Errno;
+use tokio::{fs, fs::File as TokioFile, io::AsyncRead, task::spawn_blocking};
+#[cfg(windows)]
+use winapi_util::file;
 
 use crate::error::Error;
 
@@ -36,26 +44,23 @@ pub(crate) fn is_symlink_or_reparse(metadata: &Metadata) -> bool {
 /// Open `path` for reading. When `follow_symlinks` is false, the leaf
 /// is opened with `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` so a
 /// TOCTOU swap to a symlink cannot escape the storage root.
-pub(crate) async fn open_file(path: &Path, follow_symlinks: bool) -> io::Result<tokio::fs::File> {
+pub(crate) async fn open_file(path: &Path, follow_symlinks: bool) -> io::Result<fs::File> {
     if follow_symlinks {
-        return tokio::fs::File::open(path).await;
+        return TokioFile::open(path).await;
     }
     let path = path.to_path_buf();
-    let std_file = tokio::task::spawn_blocking(move || open_nofollow_std(&path))
+    let std_file = spawn_blocking(move || open_nofollow_std(&path))
         .await
-        .map_err(io::Error::other)??;
-    Ok(tokio::fs::File::from_std(std_file))
+        .map_err(IoError::other)??;
+    Ok(TokioFile::from_std(std_file))
 }
 
 /// `lstat` when not following, `stat` when following.
-pub(crate) async fn object_metadata(
-    path: &Path,
-    follow_symlinks: bool,
-) -> io::Result<std::fs::Metadata> {
+pub(crate) async fn object_metadata(path: &Path, follow_symlinks: bool) -> io::Result<Metadata> {
     if follow_symlinks {
-        tokio::fs::metadata(path).await
+        fs::metadata(path).await
     } else {
-        tokio::fs::symlink_metadata(path).await
+        fs::symlink_metadata(path).await
     }
 }
 
@@ -65,7 +70,7 @@ pub(crate) async fn object_metadata(
 /// handle when it still resolves to a link. The blocking half of
 /// [`open_file`]; also the [`crate::etag::ComputeTask`] open
 /// (R3 — one open serves the hash and the file identity).
-pub(crate) fn open_nofollow_std(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_nofollow_std(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -88,8 +93,8 @@ pub(crate) fn open_nofollow_std(path: &Path) -> io::Result<std::fs::File> {
         // is consulted directly — `ErrorKind::FilesystemLoop` is not
         // stable on every toolchain.
         #[cfg(unix)]
-        Err(err) if err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, err));
+        Err(err) if err.raw_os_error() == Some(Errno::LOOP.raw_os_error()) => {
+            return Err(IoError::new(ErrorKind::PermissionDenied, err));
         }
         result => result?,
     };
@@ -100,7 +105,7 @@ pub(crate) fn open_nofollow_std(path: &Path) -> io::Result<std::fs::File> {
     // on a link, so this check is the only thing that rejects it here.
     #[cfg(windows)]
     if is_symlink_or_reparse(&file.metadata()?) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "symlink"));
+        return Err(IoError::new(ErrorKind::PermissionDenied, "symlink"));
     }
     Ok(file)
 }
@@ -143,7 +148,7 @@ const fn o_nofollow() -> i32 {
 pub(crate) async fn latest_part_mtime(dir: &Path) -> io::Result<Option<SystemTime>> {
     let mut latest = SystemTime::UNIX_EPOCH;
     let mut found = false;
-    let mut entries = tokio::fs::read_dir(dir).await?;
+    let mut entries = fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -152,7 +157,7 @@ pub(crate) async fn latest_part_mtime(dir: &Path) -> io::Result<Option<SystemTim
         if !name.starts_with("part-") {
             continue;
         }
-        if let Ok(metadata) = tokio::fs::metadata(entry.path()).await
+        if let Ok(metadata) = fs::metadata(entry.path()).await
             && let Ok(modified) = metadata.modified()
             && modified > latest
         {
@@ -197,12 +202,10 @@ pub(crate) fn file_identity(path: &Path, metadata: &Metadata) -> u64 {
 /// comes from the handle that was opened under the symlink policy, never
 /// a second path-based open). Same rules as [`file_identity`] — unix
 /// dev+inode from `metadata`, Windows volume serial + file index from
-/// the handle. The read path uses this on its own handle
-/// (`backend/objects.rs` — `tokio::fs::File::into_std()` bridges the
-/// two without unsafe); the remaining path-based [`file_identity`]
-/// callers are the walks and post-commit stats, which have no handle in
-/// hand.
-pub(crate) fn file_identity_handle(file: &std::fs::File, metadata: &Metadata) -> u64 {
+/// the handle. The async sites use the [`file_identity_async`] bridge;
+/// the remaining path-based [`file_identity`] callers are the walks and
+/// post-commit stats, which have no handle in hand.
+pub(crate) fn file_identity_handle(file: &File, metadata: &Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -221,20 +224,49 @@ pub(crate) fn file_identity_handle(file: &std::fs::File, metadata: &Metadata) ->
     }
 }
 
+/// The async bridge of [`file_identity_handle`]: the identity of an
+/// already-open **tokio** file. On unix the identity comes from the
+/// metadata alone (dev+inode — the handle adds nothing); on Windows the
+/// handle is the identity source — `try_clone` + `into_std` bridges to
+/// [`file_identity_handle`] without consuming the caller's file.
+pub(crate) async fn file_identity_async(file: &mut fs::File, metadata: &Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        metadata.dev() ^ metadata.ino().rotate_left(32)
+    }
+    #[cfg(windows)]
+    {
+        // `into_std` takes ownership — clone the handle so the caller's
+        // tokio file stays open for the next read.
+        let Ok(cloned) = file.try_clone().await else {
+            return 0;
+        };
+        let std_file = cloned.into_std().await;
+        file_identity_handle(&std_file, metadata)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, metadata);
+        0
+    }
+}
+
 /// The Windows file identity: volume serial + file index from
 /// `GetFileInformationByHandle` (stable Win32, via the safe `winapi-util`
 /// wrapper). `0` on filesystems without a file ID (FAT/exFAT).
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> io::Result<u64> {
-    let file = std::fs::File::open(path)?;
+    let file = File::open(path)?;
     windows_handle_identity(&file)
 }
 
 /// The Windows identity of an already-open handle (one open serves the
 /// symlink policy, the hash, and the identity — R3).
 #[cfg(windows)]
-fn windows_handle_identity(file: &std::fs::File) -> io::Result<u64> {
-    let info = winapi_util::file::information(file)?;
+fn windows_handle_identity(file: &File) -> io::Result<u64> {
+    let info = file::information(file)?;
     let volume = info.volume_serial_number();
     let index = info.file_index();
     Ok(if volume == 0 && index == 0 {
@@ -251,7 +283,7 @@ fn windows_handle_identity(file: &std::fs::File) -> io::Result<u64> {
 /// "gone", or a live object whose path is temporarily unreadable would
 /// have its meta row (or its bucket's whole derived state) removed (F11).
 pub(crate) async fn is_absent(path: &Path) -> io::Result<bool> {
-    match tokio::fs::try_exists(path).await {
+    match fs::try_exists(path).await {
         Ok(exists) => Ok(!exists),
         Err(err) => Err(err),
     }
@@ -264,21 +296,15 @@ pub(crate) async fn is_absent(path: &Path) -> io::Result<bool> {
 /// round is an unexpected EOF (the source shrank mid-copy — the callers'
 /// torn guard then treats the staged bytes as self-consistent).
 #[cfg(unix)]
-pub(crate) fn copy_file_range(
-    src: &std::fs::File,
-    offset: u64,
-    len: u64,
-    dst: &std::fs::File,
-) -> io::Result<()> {
+pub(crate) fn copy_file_range(src: &File, offset: u64, len: u64, dst: &File) -> io::Result<()> {
     let mut off = offset;
     let mut remaining = len;
     while remaining > 0 {
-        let copied =
-            rustix::fs::copy_file_range(src, Some(&mut off), dst, None, remaining as usize)
-                .map_err(io::Error::from)?;
+        let copied = rustix_fs::copy_file_range(src, Some(&mut off), dst, None, remaining as usize)
+            .map_err(IoError::from)?;
         if copied == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
+            return Err(IoError::new(
+                ErrorKind::UnexpectedEof,
                 "copy_file_range made no progress",
             ));
         }
@@ -287,16 +313,12 @@ pub(crate) fn copy_file_range(
     Ok(())
 }
 
-/// The shared streaming MD5 core (F43): read `reader` through `buf` in
-/// bounded slices into an incremental MD5. The blocking home of the rule
-/// (std readers — the etag task's per-file hash over the worker-thread
-/// pooled buffer); the async tokio-reader form is [`md5_stream_async`].
-/// The multipart assembly deliberately does NOT use it — its copy+hash
-/// loop is fused by design (the part bytes must stream into the output
-/// file).
+/// The sync streaming content MD5 of a `Read` (F43) — the blocking
+/// counterpart of [`md5_stream_async`], used where the hash already
+/// runs on a blocking thread (`write.rs`'s `stage_copy` copy closure).
 pub(crate) fn md5_stream<R: io::Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<[u8; 16]> {
     use md5::Digest;
-    let mut hasher = md5::Md5::new();
+    let mut hasher = Md5::new();
     loop {
         let n = reader.read(buf)?;
         if n == 0 {
@@ -307,15 +329,18 @@ pub(crate) fn md5_stream<R: io::Read>(reader: &mut R, buf: &mut [u8]) -> io::Res
     Ok(hasher.finalize().into())
 }
 
-/// The async share of [`md5_stream`] — a tokio reader (the atomic-write
-/// staging path, which has no blocking-pool buffer).
-pub(crate) async fn md5_stream_async<R: tokio::io::AsyncRead + Unpin>(
+/// The async streaming content MD5 of a tokio reader (F43) — the etag
+/// compute and the atomic-write staging path ([`md5_stream`] is the
+/// sync counterpart for blocking contexts). The multipart assembly
+/// deliberately does NOT use it — its copy+hash loop is fused by design
+/// (the part bytes must stream into the output file).
+pub(crate) async fn md5_stream_async<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
 ) -> io::Result<[u8; 16]> {
     use md5::Digest;
     use tokio::io::AsyncReadExt;
-    let mut hasher = md5::Md5::new();
+    let mut hasher = Md5::new();
     loop {
         let n = reader.read(buf).await?;
         if n == 0 {
@@ -331,34 +356,25 @@ pub(crate) async fn md5_stream_async<R: tokio::io::AsyncRead + Unpin>(
 pub(crate) fn ok_if_missing(result: io::Result<()>) -> io::Result<()> {
     match result {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
 }
 
 /// Remove a directory tree — or a file if `path` is not a directory —
-/// treating a missing target as success. The blocking core shared by the
-/// async removal paths (which run it on the tokio blocking pool) and the
-/// removal-lane [`RemoveTask`](crate::tombstone::RemoveTask) (which runs
-/// on a pipeline worker thread without a runtime).
-pub(crate) fn remove_tree_blocking(path: &Path) -> io::Result<()> {
-    match ok_if_missing(std::fs::remove_dir_all(path)) {
+/// treating a missing target as success. The async home of the rule
+/// (the IO runs on the tokio blocking pool via `tokio::fs`); shared by
+/// the removal pipeline's [`RemoveTask`](crate::tombstone::RemoveTask)
+/// (which runs on the removal-pipeline runtime) and the cleanup stages.
+pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
+    match ok_if_missing(fs::remove_dir_all(path).await) {
         Ok(()) => Ok(()),
         // A `.tinio` *file* planted out-of-band: remove as a file.
-        Err(err) if err.kind() == io::ErrorKind::NotADirectory => {
-            ok_if_missing(std::fs::remove_file(path))
+        Err(err) if err.kind() == ErrorKind::NotADirectory => {
+            ok_if_missing(fs::remove_file(path).await)
         }
         Err(err) => Err(err),
     }
-}
-
-/// Async variant of [`remove_tree_blocking`] — the blocking call runs on
-/// the tokio blocking pool.
-pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || remove_tree_blocking(&path))
-        .await
-        .expect("remove_tree blocking task")
 }
 
 /// The entries of `dir` (a missing directory is empty), as `(path, name)`
@@ -366,9 +382,9 @@ pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
 /// leftover enumeration.
 pub(crate) async fn entries_of(dir: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
     let mut out = Vec::new();
-    let mut entries = match tokio::fs::read_dir(dir).await {
+    let mut entries = match fs::read_dir(dir).await {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(out),
         Err(err) => return Err(err.into()),
     };
     while let Some(entry) = entries.next_entry().await? {
@@ -382,8 +398,12 @@ pub(crate) async fn entries_of(dir: &Path) -> Result<Vec<(PathBuf, String)>, Err
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::{File, metadata, rename, write},
+        time::{Duration, SystemTime},
+    };
+
     use super::*;
-    use std::time::{Duration, SystemTime};
 
     #[cfg(windows)]
     #[test]
@@ -393,23 +413,20 @@ mod tests {
         // ETag forever; one that changes on every touch would rewrite it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obj.bin");
-        std::fs::write(&path, b"original").unwrap();
-        let first = file_identity(&path, &std::fs::metadata(&path).unwrap());
+        write(&path, b"original").unwrap();
+        let first = file_identity(&path, &metadata(&path).unwrap());
         assert_ne!(first, 0, "NTFS must expose a file identity");
         // A touch (mtime rewrite) keeps the identity.
-        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let file = File::options().write(true).open(&path).unwrap();
         file.set_modified(SystemTime::now() + Duration::from_secs(5))
             .unwrap();
         drop(file);
-        assert_eq!(
-            first,
-            file_identity(&path, &std::fs::metadata(&path).unwrap())
-        );
+        assert_eq!(first, file_identity(&path, &metadata(&path).unwrap()));
         // A replacement (a new file renamed over) changes it.
         let fresh = dir.path().join("fresh.bin");
-        std::fs::write(&fresh, b"replacement").unwrap();
-        std::fs::rename(&fresh, &path).unwrap();
-        let replaced = file_identity(&path, &std::fs::metadata(&path).unwrap());
+        write(&fresh, b"replacement").unwrap();
+        rename(&fresh, &path).unwrap();
+        let replaced = file_identity(&path, &metadata(&path).unwrap());
         assert_ne!(first, replaced, "a replacement must change the identity");
     }
 }

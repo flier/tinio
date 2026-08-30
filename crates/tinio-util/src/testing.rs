@@ -14,7 +14,7 @@
 //! #[tokio::test]
 //! async fn conformance() {
 //!     let backend = MyBackend::new(...);
-//!     tinio_util::testing::assert_conformance(&backend).await;
+//!     testing::assert_conformance(&backend).await;
 //! }
 //! ```
 //!
@@ -31,29 +31,34 @@
 
 use std::{
     io,
-    sync::atomic::{AtomicU64, Ordering},
+    process::id,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use bytes::Bytes;
-use futures::StreamExt;
-
+use futures::{StreamExt, stream};
 use tinio_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListObjectsParams, ListPartsParams,
-    ListUploadsParams, Storage, bucket, object, storage, storage::Error::*,
+    ListUploadsParams, Storage, bucket, multipart, object, storage, storage::Error::*,
 };
+use tokio::time::{Instant, sleep};
 
 /// Produce a unique bucket name for the harness (fresh backends may already
 /// hold fixtures).
 pub fn unique_bucket(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{n}-{}", std::process::id())
+    format!("{prefix}-{n}-{}", id())
 }
 
 /// Wrap bytes into a one-chunk body stream.
 pub fn body<C: Into<Vec<u8>>>(bytes: C) -> BodyStream {
     let data: Vec<u8> = bytes.into();
-    Box::pin(futures::stream::iter(vec![Ok(Bytes::from(data))]))
+    Box::pin(stream::iter(vec![Ok(Bytes::from(data))]))
 }
 
 /// Read a body stream to the end.
@@ -147,7 +152,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &src,
             &upload.upload_id,
-            tinio_core::multipart::part_number(1).unwrap(),
+            multipart::part_number(1).unwrap(),
             Some(ByteRange::Inclusive(2, 9)),
         )
         .await
@@ -164,7 +169,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &src,
             &upload.upload_id,
-            tinio_core::multipart::part_number(2).unwrap(),
+            multipart::part_number(2).unwrap(),
             None,
         )
         .await
@@ -741,26 +746,24 @@ mod tests {
 /// the helper formerly duplicated across tinio-fs testutil and the
 /// tinio-server pipeline tests (F30).
 pub async fn wait_for(mut cond: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !cond() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "condition not met within 10 s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        assert!(Instant::now() < deadline, "condition not met within 10 s");
+        sleep(Duration::from_millis(2)).await;
     }
 }
 
 /// An owned `Write` sink for the fmt layers under test (the log.rs and
 /// pipeline.rs test pattern — F32: one definition, three copies removed).
 #[derive(Clone, Default)]
-pub struct SharedBuf(pub std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+pub struct SharedBuf(pub Arc<Mutex<Vec<u8>>>);
 
-impl std::io::Write for SharedBuf {
+impl io::Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }

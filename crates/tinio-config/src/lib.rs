@@ -12,7 +12,7 @@
 //!
 //! Module layout: [`schema`] (structs/enums + serde/garde/smart-default
 //! attributes), [`sources`] (`.env` loading), [`Error`]. Validation is derive-driven
-//! ([`garde::Validate`] on every section); [`schema::Config::parse`] runs it
+//! ([`garde::Validate`] on every section); [`Config::parse`] runs it
 //! after deserialization and maps the report onto [`Error`].
 //!
 //! Section types live under their module path (`log::Config`, `api::Http`);
@@ -22,8 +22,8 @@ mod error;
 pub mod schema;
 pub mod sources;
 
-pub use self::error::Error;
-
 pub use schema::{
     Config, Version, api, auth, log, pipeline, s3, scanner, server, storage, telemetry,
 };
+
+pub use self::error::Error;

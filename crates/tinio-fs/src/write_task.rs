@@ -1,16 +1,18 @@
 //! The DB write-pipeline batch task (pipeline-spec.md §3.1, task 2).
 //!
 //! [`MetaWriteBatchTask`] commits one producer batch through
-//! [`meta::Store::set_batch`] — a single write transaction for the whole
+//! [`Store::set_batch`] — a single write transaction for the whole
 //! batch (per-entry last-write-wins), so the write-transaction count
 //! drops from N to ≈N/batch. Completion is the [`pipeline::Completion`]
 //! `enqueue` returns (Q3b/R8): the list producer awaits it; the scanner
 //! drops it (fire-and-forget).
 
+use std::mem::take;
+
 use async_trait::async_trait;
 use tinio_core::{bucket, pipeline};
 
-use crate::meta;
+use crate::{Error, meta};
 
 /// A unit of DB write-pipeline work: one batch upsert, one write
 /// transaction (pipeline-spec.md §3.2, Q3b, R8).
@@ -31,7 +33,7 @@ pub(crate) struct MetaWriteBatchTask {
 
 #[async_trait]
 impl pipeline::Task for MetaWriteBatchTask {
-    type Output = Result<(), crate::Error>;
+    type Output = Result<(), Error>;
 
     fn kind(&self) -> &'static str {
         "meta_write"
@@ -42,12 +44,12 @@ impl pipeline::Task for MetaWriteBatchTask {
         // write closure, not cloned (data-path review 2026-08-29,
         // finding 2).
         self.meta
-            .set_batch_owned(&self.bucket, std::mem::take(&mut self.entries))
+            .set_batch_owned(&self.bucket, take(&mut self.entries))
             .await
     }
 }
 
-// `pipeline::Outcome` for `Result<(), crate::Error>` comes from the
+// `pipeline::Outcome` for `Result<(), Error>` comes from the
 // blanket `Result` impl in tinio-core pipeline.rs — the DB-pipeline
 // runtime logs batch failures through it (R8) even when the producer
 // dropped the handle (scanner fire-and-forget, Q3b), with the original
@@ -60,6 +62,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use redb::{Database, TableDefinition};
     use tinio_core::{
         bucket, object,
         pipeline::{InlineRunner, Runner, Task},
@@ -68,7 +71,7 @@ mod tests {
     use tinio_util::testing::etag;
 
     use super::*;
-    use crate::{Error, database};
+    use crate::{Error, database::Handle, meta::Store};
 
     fn mtime(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -106,14 +109,14 @@ mod tests {
     /// `TableTypeMismatch` — a genuine write failure, otherwise
     /// untriggerable in tests).
     fn failing_store(state_dir: &Path) -> meta::Store {
-        let db = redb::Database::create(state_dir.join("meta.redb")).unwrap();
+        let db = Database::create(state_dir.join("meta.redb")).unwrap();
         {
             let txn = db.begin_write().unwrap();
-            txn.open_table::<(&str, &str), u64>(redb::TableDefinition::new("object_meta"))
+            txn.open_table::<(&str, &str), u64>(TableDefinition::new("object_meta"))
                 .unwrap();
             txn.commit().unwrap();
         }
-        meta::Store::from_handle(database::Handle::new(db))
+        Store::from_handle(Handle::new(db))
     }
 
     #[test]
@@ -124,37 +127,33 @@ mod tests {
         assert_eq!(task.kind(), "meta_write");
     }
 
-    #[test]
-    fn writes_the_batch_through_the_runner() {
+    #[tokio::test]
+    async fn writes_the_batch_through_the_runner() {
         let state = tempfile::tempdir().unwrap();
         let store = meta::store(state.path()).unwrap();
         let runner = InlineRunner::default();
         let verify = store.clone();
-        crate::testutil::rt(async move {
-            runner
-                .enqueue(Box::new(task(store, entries())))
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-                .unwrap();
-        });
+        runner
+            .enqueue(Box::new(task(store, entries())))
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
         // The batch landed: one write transaction, every entry readable
         // back with its identity.
         let b = bucket::name("data").unwrap();
-        let rows = crate::testutil::rt(async move {
-            verify
-                .load_entries(
-                    &b,
-                    [
-                        object::key("a.txt").unwrap(),
-                        object::key("dir/b.txt").unwrap(),
-                    ]
-                    .iter(),
-                )
-                .await
-                .unwrap()
-        });
+        let rows = verify
+            .load_entries(
+                &b,
+                [
+                    object::key("a.txt").unwrap(),
+                    object::key("dir/b.txt").unwrap(),
+                ]
+                .iter(),
+            )
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2);
         for (row, entry) in rows.iter().zip(&entries()) {
             let stored = row.as_ref().unwrap();
@@ -165,21 +164,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn batch_failure_is_reported_through_the_completion_once() {
+    #[tokio::test]
+    async fn batch_failure_is_reported_through_the_completion_once() {
         // enqueue Ok = accepted; the handle carries run()'s Err (R8).
         let state = tempfile::tempdir().unwrap();
         let store = failing_store(state.path());
         let runner = InlineRunner::default();
-        let err = crate::testutil::rt(async move {
-            runner
-                .enqueue(Box::new(task(store, entries())))
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-                .unwrap_err()
-        });
+        let err = runner
+            .enqueue(Box::new(task(store, entries())))
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(
             matches!(err, Error::Database(_)),
             "the completion must carry the original write error: {err}"
@@ -190,38 +187,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inline_runner_success_returns_ok() {
+    #[tokio::test]
+    async fn inline_runner_success_returns_ok() {
         let state = tempfile::tempdir().unwrap();
         let store = meta::store(state.path()).unwrap();
         let runner = InlineRunner::default();
-        crate::testutil::rt(async move {
-            runner
-                .enqueue(Box::new(task(store, entries())))
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-                .unwrap();
-        });
+        runner
+            .enqueue(Box::new(task(store, entries())))
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
     }
 
-    #[test]
-    fn inline_runner_failure_returns_run_err() {
+    #[tokio::test]
+    async fn inline_runner_failure_returns_run_err() {
         // Scanner fire-and-forget drops the handle; inline tests await it
         // so the Err is visible (the concurrent runtime logs instead).
         let state = tempfile::tempdir().unwrap();
         let store = failing_store(state.path());
         let runner = InlineRunner::default();
-        let err = crate::testutil::rt(async move {
-            runner
-                .enqueue(Box::new(task(store, entries())))
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-                .unwrap_err()
-        });
+        let err = runner
+            .enqueue(Box::new(task(store, entries())))
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(
             matches!(err, Error::Database(_)),
             "the completion must carry the original write error: {err}"

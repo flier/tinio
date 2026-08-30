@@ -10,11 +10,11 @@
 
 mod common;
 
-use http::StatusCode;
-
-use tinio_server::Capabilities;
+use std::fs;
 
 use common::{Server, request};
+use http::StatusCode;
+use tinio_server::Capabilities;
 
 /// The default toggles.
 fn caps() -> Capabilities {
@@ -125,7 +125,7 @@ async fn traversal_keys_rejected_without_fs_access() {
     // are observable.
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("root");
-    std::fs::create_dir(&root).unwrap();
+    fs::create_dir(&root).unwrap();
     let server = Server::fs_at(&root, caps()).await;
     request(server.addr(), "PUT", "/data", &[], &[]).await;
 
@@ -153,7 +153,7 @@ async fn traversal_keys_rejected_without_fs_access() {
 
 /// The sorted entry names of a directory.
 fn sorted_entries(dir: &std::path::Path) -> Vec<String> {
-    let mut entries: Vec<String> = std::fs::read_dir(dir)
+    let mut entries: Vec<String> = fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())

@@ -18,9 +18,9 @@
 
 use std::sync::Mutex;
 
-use redb::backends::InMemoryBackend;
-use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
-
+use redb::{
+    Database, ReadableDatabase, ReadableTable, Table, TableDefinition, backends::InMemoryBackend,
+};
 use tinio_core::{Storage, bucket, object};
 
 use crate::{
@@ -65,12 +65,13 @@ pub(crate) const PART_META: TableDefinition<&str, (&str, u64, u64)> =
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{bucket, BucketOps};
+/// use tinio_core::{BucketOps, bucket};
 /// use tinio_mem::{MemoryOptions, MemoryStorage};
+/// use tokio::runtime::Runtime;
 ///
 /// let storage = MemoryStorage::new().unwrap();
 /// let bucket = bucket::name("data").unwrap();
-/// tokio::runtime::Runtime::new()
+/// Runtime::new()
 ///     .unwrap()
 ///     .block_on(storage.create_bucket(&bucket))
 ///     .unwrap();
@@ -291,11 +292,12 @@ impl Storage for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tinio_core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, bucket, object};
     use tinio_util::testing::{assert_conformance, assert_send_sync, body};
 
     use super::*;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn conformance() {

@@ -24,14 +24,8 @@ use std::{
 /// use tinio_core::storage::group_and_paginate;
 ///
 /// let items = vec!["a.txt".to_string(), "dir/x".to_string()];
-/// let (keys, prefixes, truncated, next) = group_and_paginate(
-///     items,
-///     "",
-///     Some("/"),
-///     None,
-///     1000,
-///     |k| k.as_str(),
-/// );
+/// let (keys, prefixes, truncated, next) =
+///     group_and_paginate(items, "", Some("/"), None, 1000, |k| k.as_str());
 /// assert_eq!(keys, ["a.txt"]);
 /// assert_eq!(prefixes, ["dir/"]);
 /// assert!(!truncated);

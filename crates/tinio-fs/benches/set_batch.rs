@@ -1,7 +1,7 @@
 //! `set_batch` write-throughput benchmark (pipeline-spec.md task 2.5, Q6).
 //!
 //! Write throughput vs batch size × entry byte size for the
-//! `meta::Store::set_batch` primitive the write pipeline commits through.
+//! `Store::set_batch` primitive the write pipeline commits through.
 //! One iteration = one write transaction of `batch` entries with redb's
 //! default `Durability::Immediate` — every commit flushes to disk, so the
 //! measurement includes real durability cost (the single writer
@@ -27,8 +27,10 @@ use std::{
 };
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use meta::Store;
 use tinio_core::{ETag, bucket, object};
 use tinio_fs::meta;
+use tokio::runtime::Runtime;
 
 /// The stored value of one entry: etag hex (32 B) + size/mtime/identity
 /// u64s — the spec's ≈ 56 B before the key bytes (pipeline-spec.md §3.3).
@@ -115,7 +117,7 @@ fn set_batch_cell(
             let store = meta::store(state.path()).unwrap();
             let bucket = bucket::name("data").unwrap();
             let pool = entry_pool(key_fn, key_bytes);
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = Runtime::new().unwrap();
             let mut i = 0usize;
             b.iter(|| {
                 let start = (i * batch) % POOL;

@@ -7,7 +7,7 @@
 //! skips the match gate — a cold list), so each iteration enqueues
 //! `TASKS` compute tasks into the IO pipeline, streams the results into
 //! batches, commits each batch through the DB write pipeline
-//! ([`meta::Store::set_batch`] — one write transaction + fsync), and
+//! ([`Store::set_batch`] — one write transaction + fsync), and
 //! drains the write completions before the "response" (Q2).
 //!
 //! The IO task mirrors the tinio-fs `etag::ComputeTask` compute core
@@ -32,7 +32,10 @@
 //! report.
 
 use std::{
+    fs::{self, File},
     hint::black_box,
+    io::Read,
+    mem,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -41,12 +44,17 @@ use std::{
 use async_trait::async_trait;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use md5::{Digest, Md5};
+use tinio_config::pipeline::{Config, Db, Io};
 use tinio_core::{
     ETag, bucket, object,
-    pipeline::{Completion, Runner, Task},
+    pipeline::{Completion, DEFAULT_CAPACITY, Runner, Task},
 };
-use tinio_fs::{Error as FsError, meta};
-use tinio_server::pipeline::Pipeline;
+use tinio_fs::{
+    Error as FsError, etag,
+    meta::{self, Store},
+};
+use tinio_server::pipeline::{Pipeline, Pipelines as PipelinePair};
+use tokio::runtime::Runtime;
 
 /// Entries per iteration (one cold-list workload).
 const TASKS: usize = 2048;
@@ -72,8 +80,7 @@ const LONG_KEY_BYTES: usize = 508;
 type WriteResult = Result<(), FsError>;
 /// The bench's pipeline pair, typed to the real tinio-fs task outputs
 /// (P4/P7 — the server wiring uses the same types).
-type Pipelines =
-    tinio_server::pipeline::Pipelines<tinio_fs::etag::Result, WriteResult, WriteResult>;
+type Pipelines = PipelinePair<etag::Result, WriteResult, WriteResult>;
 /// One write-batch row (the `set_batch` slice element).
 type Entry = meta::BatchEntry;
 
@@ -112,13 +119,13 @@ fn build_tree(root: &Path, key_fn: fn(usize) -> String) -> Vec<Object> {
     // Every key of one axis shares its parent directory chain.
     let first_key = key_fn(0);
     let parent = root.join(first_key.rsplit_once('/').unwrap().0);
-    std::fs::create_dir_all(&parent).unwrap();
+    fs::create_dir_all(&parent).unwrap();
     let content = vec![b'x'; FILE_BYTES];
     (0..TASKS)
         .map(|i| {
             let key = key_fn(i);
             let path = root.join(&key);
-            std::fs::write(&path, &content).unwrap();
+            fs::write(&path, &content).unwrap();
             Object {
                 key: object::key(&key).unwrap(),
                 path,
@@ -150,26 +157,26 @@ impl BenchEtagTask {
 
 #[async_trait]
 impl Task for BenchEtagTask {
-    type Output = tinio_fs::etag::Result;
+    type Output = etag::Result;
 
     fn kind(&self) -> &'static str {
         "etag"
     }
 
-    async fn run(&mut self) -> tinio_fs::etag::Result {
-        let mut file = std::fs::File::open(&self.path).map_err(FsError::Io)?;
+    async fn run(&mut self) -> etag::Result {
+        let mut file = File::open(&self.path).map_err(FsError::Io)?;
         let mut hasher = Md5::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
-            let n = std::io::Read::read(&mut file, &mut buf).map_err(FsError::Io)?;
+            let n = file.read(&mut buf).map_err(FsError::Io)?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
         }
         let digest: [u8; 16] = hasher.finalize().into();
-        let metadata = std::fs::metadata(&self.path).map_err(FsError::Io)?;
-        Ok(tinio_fs::etag::Outcome {
+        let metadata = fs::metadata(&self.path).map_err(FsError::Io)?;
+        Ok(etag::Outcome {
             key: self.key.clone(),
             etag: ETag::Single(digest),
             size: metadata.len(),
@@ -181,7 +188,7 @@ impl Task for BenchEtagTask {
 }
 
 /// The DB write-pipeline task: mirrors `MetaWriteBatchTask` — one batch
-/// through the real `meta::Store::set_batch` (one write transaction +
+/// through the real `Store::set_batch` (one write transaction +
 /// fsync; the redb single writer serializes commits).
 struct BenchWriteBatchTask {
     meta: meta::Store,
@@ -205,16 +212,16 @@ impl Task for BenchWriteBatchTask {
 /// Build both pipelines from a worker configuration (queue capacity =
 /// the 1024 default).
 fn build_pipelines(io_workers: u8, db_workers: u8) -> Pipelines {
-    Pipelines::build(&tinio_config::pipeline::Config {
-        io: tinio_config::pipeline::Io {
+    Pipelines::build(&Config {
+        io: Io {
             workers: io_workers,
-            capacity: tinio_core::pipeline::DEFAULT_CAPACITY,
+            capacity: DEFAULT_CAPACITY,
             ..Default::default()
         },
         remove: Default::default(),
-        db: tinio_config::pipeline::Db {
+        db: Db {
             workers: db_workers,
-            capacity: tinio_core::pipeline::DEFAULT_CAPACITY,
+            capacity: DEFAULT_CAPACITY,
             ..Default::default()
         },
     })
@@ -228,7 +235,7 @@ fn build_pipelines(io_workers: u8, db_workers: u8) -> Pipelines {
 /// write completions drained (Q2 — the response waits for the final
 /// drain, like the list producer).
 async fn cold_list(
-    io: &Arc<Pipeline<tinio_fs::etag::Result>>,
+    io: &Arc<Pipeline<etag::Result>>,
     db: &Arc<Pipeline<WriteResult>>,
     store: &meta::Store,
     bucket: &bucket::Name,
@@ -311,7 +318,7 @@ fn cold_list_cell(
             let store = meta::store(state.path()).unwrap();
             let pipelines = build_pipelines(io_workers, db_workers);
             let bucket = bucket::name("data").unwrap();
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = Runtime::new().unwrap();
             b.iter(|| {
                 black_box(rt.block_on(cold_list(
                     &pipelines.io(),
@@ -345,7 +352,7 @@ fn pipeline_axis(
     }
     // Leak the tempdir guard: the tree must outlive the whole benchmark
     // run (criterion exits the process afterwards).
-    std::mem::forget(root);
+    mem::forget(root);
     for io_workers in IO_WORKERS {
         for batch in BATCH_SIZES {
             cold_list_cell(c, group_name, &objects, io_workers, 1, batch);
@@ -367,7 +374,7 @@ fn pipeline_long_key(c: &mut Criterion) {
 fn pipeline_db_workers(c: &mut Criterion) {
     let root = tempfile::tempdir().unwrap();
     let objects = build_tree(root.path(), short_key);
-    std::mem::forget(root);
+    mem::forget(root);
     for db_workers in [1, 2] {
         cold_list_cell(c, "pipeline_db_workers", &objects, 4, db_workers, 128);
     }

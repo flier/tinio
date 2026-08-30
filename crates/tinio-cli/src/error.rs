@@ -54,17 +54,20 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use io::Error as IoError;
+    use tinio_config::Error as ConfigError;
     use tinio_core::storage::Error::*;
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn exit_codes_follow_contract() {
         assert_eq!(Error::Usage("bad flag".into()).exit_code(), 2);
         assert_eq!(Error::Operational("bind failed".into()).exit_code(), 1);
-        assert_eq!(Error::Io(io::Error::other("x")).exit_code(), 1);
+        assert_eq!(Error::Io(IoError::other("x")).exit_code(), 1);
         assert_eq!(
-            Error::Config(tinio_config::Error::Missing("api".into())).exit_code(),
+            Error::Config(ConfigError::Missing("api".into())).exit_code(),
             1
         );
         assert_eq!(Error::Storage(NoSuchBucket("data".into())).exit_code(), 1);
@@ -75,7 +78,7 @@ mod tests {
         let cases = [
             (Error::Usage("unknown flag".into()), "unknown flag"),
             (Error::Operational("port in use".into()), "port in use"),
-            (Error::Io(io::Error::other("gone")), "I/O error: gone"),
+            (Error::Io(IoError::other("gone")), "I/O error: gone"),
             (
                 Error::Storage(NoSuchKey("k".into())),
                 "storage error: no such object: `k`",

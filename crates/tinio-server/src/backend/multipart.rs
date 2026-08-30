@@ -10,10 +10,16 @@
 //! `multipart` cargo feature and the runtime `[s3]` toggle answer
 //! `NotImplemented` (FR-021).
 
-use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
+use std::collections::HashMap;
 
+use s3s::{
+    S3Error, S3Request, S3Response, S3Result,
+    dto::{self, AbortMultipartUploadOutput, Range},
+    s3_error,
+};
 use tinio_core::{
-    multipart::{CompletedPart, MIN_PART_BYTES, PartNumber},
+    ETag,
+    multipart::{CompletedPart, MIN_PART_BYTES, PartNumber, part_number as parse_part_number},
     storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
 };
 
@@ -24,8 +30,7 @@ use crate::backend::{
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
 fn part_number(n: i32) -> S3Result<PartNumber> {
-    tinio_core::multipart::part_number(n as u32)
-        .map_err(|_| s3_error!(InvalidPart, "invalid part number: {n}"))
+    parse_part_number(n as u32).map_err(|_| s3_error!(InvalidPart, "invalid part number: {n}"))
 }
 
 /// The `x-amz-copy-source-range` header into a [`ByteRange`], parsed by
@@ -36,7 +41,7 @@ fn part_number(n: i32) -> S3Result<PartNumber> {
 #[cfg(feature = "copy")]
 fn copy_source_range(raw: &str) -> Result<ByteRange, S3Error> {
     let invalid = || s3_error!(InvalidArgument, "invalid copy source range: {raw}");
-    let range = byte_range(dto::Range::parse(raw).map_err(|_| invalid())?);
+    let range = byte_range(Range::parse(raw).map_err(|_| invalid())?);
     match range {
         ByteRange::Inclusive(_, _) => Ok(range),
         _ => Err(invalid()),
@@ -184,8 +189,8 @@ impl<S: Storage> S3Backend<S> {
                 let etag = etag
                     .into_strong()
                     .ok_or_else(|| s3_error!(InvalidPart, "weak part ETag"))?;
-                let etag = tinio_core::ETag::new(&etag)
-                    .map_err(|_| s3_error!(InvalidPart, "invalid part ETag"))?;
+                let etag =
+                    ETag::new(&etag).map_err(|_| s3_error!(InvalidPart, "invalid part ETag"))?;
                 Ok(CompletedPart { part_number, etag })
             })
             .collect::<Result<Vec<CompletedPart>, S3Error>>()?;
@@ -195,7 +200,7 @@ impl<S: Storage> S3Backend<S> {
         // bytes the completion would assemble — a part that does not exist
         // answers InvalidPart, matching the backend's own verification.
         if parts.len() > 1 {
-            let mut sizes = std::collections::HashMap::new();
+            let mut sizes = HashMap::new();
             let mut marker = None;
             loop {
                 let page = self
@@ -264,7 +269,7 @@ impl<S: Storage> S3Backend<S> {
             .abort_multipart_upload(&bucket, &key, &req.input.upload_id)
             .await
             .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::AbortMultipartUploadOutput::default()))
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
     #[cfg(feature = "multipart")]
@@ -380,15 +385,28 @@ impl<S: Storage> S3Backend<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::backend::testutil::{s3_request, setup};
-    use s3s::{S3, S3ErrorCode};
-    use tinio_core::storage::{BucketOps, ObjectOps};
-    use tinio_core::{bucket, object};
+    use std::io;
+
+    use bytes::Bytes;
+    use futures::stream;
+    use s3s::{
+        S3, S3ErrorCode,
+        dto::{CopySource, StreamingBlob, UploadPartCopyInput},
+    };
+    use tinio_core::{
+        bucket, object,
+        storage::{BucketOps, ObjectOps},
+    };
     use tinio_mem::MemoryStorage;
     #[cfg(feature = "copy")]
     use tinio_util::testing::body;
     use tinio_util::testing::read_body;
+
+    use super::*;
+    use crate::backend::{
+        Capabilities,
+        testutil::{s3_request, setup},
+    };
 
     #[cfg(feature = "multipart")]
     #[tokio::test]
@@ -407,7 +425,7 @@ mod tests {
         // Upload three parts: the two non-final parts must satisfy the
         // S3 5 MiB minimum; the final part may be small.
         let mut etags = Vec::new();
-        let min = tinio_core::multipart::MIN_PART_BYTES as usize;
+        let min = MIN_PART_BYTES as usize;
         let parts_data: Vec<Vec<u8>> =
             vec![vec![b'a'; min + 1], vec![b'b'; min + 1], b"tail".to_vec()];
         for (n, data) in parts_data.iter().enumerate() {
@@ -417,11 +435,8 @@ mod tests {
                     key: "big.bin".into(),
                     upload_id: upload_id.clone(),
                     part_number: (n + 1) as i32,
-                    body: Some(dto::StreamingBlob::wrap(futures::stream::iter(vec![Ok::<
-                        _,
-                        std::io::Error,
-                    >(
-                        bytes::Bytes::copy_from_slice(data),
+                    body: Some(StreamingBlob::wrap(stream::iter(vec![Ok::<_, io::Error>(
+                        Bytes::copy_from_slice(data),
                     )]))),
                     ..Default::default()
                 }))
@@ -508,11 +523,8 @@ mod tests {
                     key: "big.bin".into(),
                     upload_id: upload_id.clone(),
                     part_number: n,
-                    body: Some(dto::StreamingBlob::wrap(futures::stream::iter(vec![Ok::<
-                        _,
-                        std::io::Error,
-                    >(
-                        bytes::Bytes::copy_from_slice(b"tiny"),
+                    body: Some(StreamingBlob::wrap(stream::iter(vec![Ok::<_, io::Error>(
+                        Bytes::copy_from_slice(b"tiny"),
                     )]))),
                     ..Default::default()
                 }))
@@ -663,9 +675,9 @@ mod tests {
                 key: "big.bin".into(),
                 upload_id: upload_id.clone(),
                 part_number: 0,
-                body: Some(dto::StreamingBlob::wrap(futures::stream::empty::<
-                    Result<bytes::Bytes, std::io::Error>,
-                >())),
+                body: Some(StreamingBlob::wrap(
+                    stream::empty::<Result<Bytes, io::Error>>(),
+                )),
                 ..Default::default()
             }))
             .await
@@ -688,12 +700,12 @@ mod tests {
         upload_id: &str,
         part_number: i32,
     ) -> dto::UploadPartCopyInput {
-        dto::UploadPartCopyInput::builder()
+        UploadPartCopyInput::builder()
             .bucket(b.to_string())
             .key("copy.bin".to_string())
             .upload_id(upload_id.to_string())
             .part_number(part_number)
-            .copy_source(dto::CopySource::parse(&format!("{b}/src.bin")).unwrap())
+            .copy_source(CopySource::parse(&format!("{b}/src.bin")).unwrap())
             .build()
             .unwrap()
     }
@@ -792,7 +804,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let backend = S3Backend::new(
             storage,
-            crate::backend::Capabilities {
+            Capabilities {
                 copy_object: false,
                 ..Default::default()
             },

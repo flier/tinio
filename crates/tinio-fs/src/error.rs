@@ -11,12 +11,18 @@
 //!
 //! let err: Error = Error::InvalidPath("traversal".into());
 //! let core: storage::Error = err.into();
-//! assert!(matches!(core, storage::Error::InvalidKey(_)));
+//! assert!(matches!(core, Error::InvalidKey(_)));
 //! ```
 
-use std::{io, path::PathBuf};
+use std::{
+    error::Error as StdError,
+    io::{self, Error as IoError},
+    path::PathBuf,
+};
 
 use tinio_core::{pipeline, storage};
+
+use crate::database::{self, Error as DatabaseError};
 
 /// A filesystem backend failure.
 #[derive(Debug, thiserror::Error)]
@@ -37,9 +43,9 @@ pub enum Error {
     /// not-found conditions).
     #[error("{0}")]
     Storage(#[from] storage::Error),
-    /// A redb state-database failure (per-kind, see [`crate::database::Error`]).
+    /// A redb state-database failure (per-kind, see [`database::Error`]).
     #[error(transparent)]
-    Database(crate::database::Error),
+    Database(database::Error),
     /// A construction-option value violates validation rules.
     #[error("invalid options: {0}")]
     InvalidValue(garde::Report),
@@ -66,13 +72,13 @@ pub(crate) fn root_not_directory(path: impl Into<PathBuf>) -> Error {
     Error::RootNotDirectory(path.into())
 }
 
-impl From<crate::database::Error> for Error {
-    fn from(err: crate::database::Error) -> Self {
+impl From<database::Error> for Error {
+    fn from(err: database::Error) -> Self {
         match err {
             // Database I/O unwraps to the public `Io`; everything else —
             // including the version mismatch (a top-level duplicate
             // variant was removed) — stays nested under `Database`.
-            crate::database::Error::Io(e) => Error::Io(e),
+            DatabaseError::Io(e) => Error::Io(e),
             other => Error::Database(other),
         }
     }
@@ -84,11 +90,9 @@ impl From<Error> for storage::Error {
             Error::Io(e) => storage::io(e),
             Error::InvalidPath(p) => storage::invalid_key(p.to_string_lossy().into_owned()),
             Error::Storage(e) => e,
-            Error::Database(e) => storage::io(io::Error::other(e)),
-            Error::Pipeline(e) => storage::io(io::Error::other(e)),
-            Error::InvalidValue(_) | Error::RootNotDirectory(_) => {
-                storage::io(io::Error::other(err))
-            }
+            Error::Database(e) => storage::io(IoError::other(e)),
+            Error::Pipeline(e) => storage::io(IoError::other(e)),
+            Error::InvalidValue(_) | Error::RootNotDirectory(_) => storage::io(IoError::other(err)),
         }
     }
 }
@@ -98,19 +102,24 @@ impl From<Error> for storage::Error {
 /// AsRef<dyn StdError + Send + Sync>`, pipeline.rs) requires it, so the
 /// task-pipeline runtimes can log the original failure (R8, never
 /// stringified).
-impl AsRef<dyn std::error::Error + Send + Sync> for Error {
-    fn as_ref(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+impl AsRef<dyn StdError + Send + Sync> for Error {
+    fn as_ref(&self) -> &(dyn StdError + Send + Sync + 'static) {
         self
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use garde::Validate;
-    use tinio_core::storage::Error::*;
-    use tinio_core::storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT};
+    use redb::DatabaseError::DatabaseAlreadyOpen;
+    use tinio_core::{
+        pipeline::Error::{Dropped, ShutDown},
+        storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
+    };
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
+    use crate::database::Error::{Open, UnsupportedVersion};
 
     #[derive(Validate)]
     struct Probe {
@@ -132,7 +141,7 @@ mod tests {
         .validate()
         .unwrap_err();
         let cases: [(Error, &str); 7] = [
-            (Error::Io(io::Error::other("boom")), "I/O error: boom"),
+            (Error::Io(IoError::other("boom")), "I/O error: boom"),
             (Error::InvalidPath("a/../b".into()), "invalid path: a/../b"),
             (invalid_value(report), "invalid options:"),
             (Error::Storage(NoSuchKey("x".into())), "no such object: `x`"),
@@ -141,7 +150,7 @@ mod tests {
                 "storage root is not a directory: /data/root",
             ),
             (
-                Error::Database(crate::database::Error::UnsupportedVersion {
+                Error::Database(UnsupportedVersion {
                     path,
                     found: 9,
                     expected: 1,
@@ -149,7 +158,7 @@ mod tests {
                 "unsupported /data/root version 9 (expected 1)",
             ),
             (
-                Error::Pipeline(pipeline::Error::ShutDown),
+                Error::Pipeline(ShutDown),
                 "pipeline error: pipeline is shut down",
             ),
         ];
@@ -165,7 +174,7 @@ mod tests {
 
     #[test]
     fn converts_into_contract_error() {
-        let io_err = Error::Io(io::Error::other("disk full"));
+        let io_err = Error::Io(IoError::other("disk full"));
         let core: storage::Error = io_err.into();
         assert!(matches!(core, Io(_)));
 
@@ -175,14 +184,13 @@ mod tests {
 
         // redb failures project onto Io (never misclassified as a
         // contract-domain condition).
-        let db_err: Error =
-            crate::database::Error::Open(redb::DatabaseError::DatabaseAlreadyOpen).into();
+        let db_err: Error = Open(DatabaseAlreadyOpen).into();
         let core: storage::Error = db_err.into();
         assert!(matches!(core, Io(_)));
 
         // Pipeline failures (shutdown/dropped) also project onto Io —
         // they are never contract-domain conditions.
-        let pipeline_err: Error = pipeline::Error::Dropped.into();
+        let pipeline_err: Error = Dropped.into();
         let core: storage::Error = pipeline_err.into();
         assert!(matches!(core, Io(_)));
     }

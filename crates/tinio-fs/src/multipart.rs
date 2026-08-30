@@ -25,24 +25,33 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
 };
 
 use md5::{Digest, Md5};
-
 use tinio_core::{
     BodyStream, ETag, bucket, from_nanos,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object::{self},
-    storage::{self, DEFAULT_MAX_CONCURRENT_UPLOADS, group_and_paginate_unordered, uploads_order},
+    storage::{
+        self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload, group_and_paginate_unordered,
+        uploads_order,
+    },
 };
-use tinio_util::lockmap;
+use tinio_util::lockmap::{Guard, Map};
+use tokio::{
+    fs::{self, File},
+    io::{AsyncReadExt, AsyncWriteExt},
+};
+use uuid::Uuid;
 
 use crate::{
-    Error, database,
+    Error,
+    database::{self, Handle, PartsTable, UploadsTable},
+    fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
     write::{AtomicWriter, CHUNK_SIZE, md5_of_file},
@@ -55,7 +64,7 @@ fn part_path(dir: &Path, n: u32) -> PathBuf {
 
 /// The per-upload part-write lock map: `(bucket, upload_id)` → the
 /// [`Store::part_lock`] mutex slot.
-type PartLocks = lockmap::Map<(String, String)>;
+type PartLocks = Map<(String, String)>;
 
 /// Delete one upload's `UPLOADS` + `PARTS` rows in the caller's write
 /// transaction (`complete` consume, `abort`, and the backend's
@@ -67,8 +76,8 @@ pub(crate) fn drain_upload(
 ) -> Result<(), database::Error> {
     // The UPLOADS half is one exact key (idempotent remove — no range
     // scan); only the PARTS half needs the range.
-    database::UploadsTable::open(txn)?.remove(bucket, upload_id)?;
-    database::PartsTable::open(txn)?.drain_upload(bucket, upload_id)?;
+    UploadsTable::open(txn)?.remove(bucket, upload_id)?;
+    PartsTable::open(txn)?.drain_upload(bucket, upload_id)?;
     Ok(())
 }
 
@@ -79,8 +88,8 @@ pub(crate) fn drain_bucket_uploads(
     txn: &mut redb::WriteTransaction,
     bucket: &bucket::Name,
 ) -> Result<(), database::Error> {
-    database::UploadsTable::open(txn)?.drain_bucket(bucket)?;
-    database::PartsTable::open(txn)?.drain_bucket(bucket)?;
+    UploadsTable::open(txn)?.drain_bucket(bucket)?;
+    PartsTable::open(txn)?.drain_bucket(bucket)?;
     Ok(())
 }
 
@@ -102,7 +111,7 @@ fn upload_from_row(
     initiated_at: u64,
 ) -> Option<MultipartUpload> {
     let key = object::key(key).ok()?;
-    if uuid::Uuid::parse_str(upload_id).is_err() {
+    if Uuid::parse_str(upload_id).is_err() {
         return None;
     }
     Some(MultipartUpload {
@@ -125,15 +134,22 @@ fn upload_from_row(
 /// };
 /// use tinio_fs::multipart;
 /// use tinio_util::testing::body;
+/// use tokio::runtime::Runtime;
 ///
 /// let state = tempfile::tempdir().unwrap();
 /// let store = multipart::store(state.path()).unwrap();
 /// let bucket = bucket::name("data").unwrap();
 /// let key = object::key("big.bin").unwrap();
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// Runtime::new().unwrap().block_on(async {
 ///     let upload = store.create(&bucket, &key).await.unwrap();
 ///     let part = store
-///         .put_part(&bucket, &key, &upload.upload_id, part_number(1).unwrap(), body(b"abc"))
+///         .put_part(
+///             &bucket,
+///             &key,
+///             &upload.upload_id,
+///             part_number(1).unwrap(),
+///             body(b"abc"),
+///         )
 ///         .await
 ///         .unwrap();
 ///     assert_eq!(u32::from(part.part_number), 1);
@@ -146,8 +162,8 @@ fn upload_from_row(
 ///         .complete(&bucket, &key, &upload.upload_id, &[completed])
 ///         .await
 ///         .unwrap();
-///     tokio::fs::rename(&temp, &target).await.unwrap();
-///     assert_eq!(tokio::fs::metadata(&target).await.unwrap().len(), 3);
+///     fs::rename(&temp, &target).await.unwrap();
+///     assert_eq!(fs::metadata(&target).await.unwrap().len(), 3);
 /// });
 /// ```
 #[derive(Debug, Clone)]
@@ -171,7 +187,7 @@ pub struct Store {
 }
 
 /// The held per-upload part-write lock ([`Store::part_lock`]).
-type PartLock = lockmap::Guard<(String, String)>;
+type PartLock = Guard<(String, String)>;
 
 impl Store {
     /// Create a store over a shared state-database handle (the `FsStorage`
@@ -229,7 +245,7 @@ impl Store {
         // Fresh UUID v4 (122 random bits): collisions cannot happen in
         // practice, so a failed insert is a real I/O error.
         let upload = MultipartUpload {
-            upload_id: uuid::Uuid::new_v4().to_string(),
+            upload_id: Uuid::new_v4().to_string(),
             bucket: bucket.clone(),
             key: key.clone(),
             initiated_at: SystemTime::now(),
@@ -241,9 +257,7 @@ impl Store {
         let upload_id = upload.upload_id.clone();
         let initiated_at = upload.initiated_at;
         self.handle
-            .write(move |txn| {
-                database::UploadsTable::open(txn)?.put(&bucket, &upload_id, &key, initiated_at)
-            })
+            .write(move |txn| UploadsTable::open(txn)?.put(&bucket, &upload_id, &key, initiated_at))
             .await
             .map_err(Error::from)?;
         Ok(upload)
@@ -296,7 +310,7 @@ impl Store {
         key: &object::Key,
         upload_id: &str,
         part_number: PartNumber,
-        source: std::fs::File,
+        source: File,
         offset: u64,
         len: u64,
     ) -> Result<PartInfo, Error> {
@@ -332,13 +346,13 @@ impl Store {
         // interleave as rename(A), rename(B), txn(B), txn(A) — the file
         // and the record would disagree and wedge the upload.
         let _lock = self.part_lock(bucket, upload_id).await;
-        if let Err(err) = tokio::fs::create_dir_all(&dir).await {
-            let _ = tokio::fs::remove_file(&temp).await;
+        if let Err(err) = fs::create_dir_all(&dir).await {
+            let _ = fs::remove_file(&temp).await;
             return Err(err.into());
         }
         let part = part_path(&dir, n);
-        if let Err(err) = tokio::fs::rename(&temp, &part).await {
-            let _ = tokio::fs::remove_file(&temp).await;
+        if let Err(err) = fs::rename(&temp, &part).await {
+            let _ = fs::remove_file(&temp).await;
             return Err(err.into());
         }
         // One write transaction: the upload-existence check AND the PARTS
@@ -353,12 +367,12 @@ impl Store {
         let recorded = match self
             .handle
             .write(move |txn| {
-                let uploads = database::UploadsTable::open(txn)?;
+                let uploads = UploadsTable::open(txn)?;
                 if !uploads.key_matches(&bucket, &key, &upload_id_owned)? {
                     return Ok(false);
                 }
                 drop(uploads);
-                database::PartsTable::open(txn)?.put(&bucket, &upload_id_owned, n, &etag_owned)?;
+                PartsTable::open(txn)?.put(&bucket, &upload_id_owned, n, &etag_owned)?;
                 Ok(true)
             })
             .await
@@ -368,17 +382,17 @@ impl Store {
                 // The upload is gone (or a real DB failure) — remove the
                 // renamed part and the empty directory (best-effort; a
                 // racing abort already removed the dir).
-                let _ = tokio::fs::remove_file(&part).await;
-                let _ = tokio::fs::remove_dir(&dir).await;
+                let _ = fs::remove_file(&part).await;
+                let _ = fs::remove_dir(&dir).await;
                 return Err(Error::from(err));
             }
         };
         if !recorded {
-            let _ = tokio::fs::remove_file(&part).await;
-            let _ = tokio::fs::remove_dir(&dir).await;
+            let _ = fs::remove_file(&part).await;
+            let _ = fs::remove_dir(&dir).await;
             return Err(storage::no_such_upload(upload_id).into());
         }
-        let metadata = tokio::fs::metadata(&part).await?;
+        let metadata = fs::metadata(&part).await?;
         Ok(PartInfo {
             part_number,
             size: metadata.len(),
@@ -424,7 +438,7 @@ impl Store {
         let (found, page, truncated) = self
             .handle
             .read(|txn| {
-                let uploads = database::UploadsTable::open_readonly(txn)?;
+                let uploads = UploadsTable::open_readonly(txn)?;
                 if !uploads.key_matches(bucket, key, upload_id)? {
                     return Ok((false, Vec::new(), false));
                 }
@@ -438,7 +452,7 @@ impl Store {
                 let Some(start) = marker.map_or(Some(0), |m| m.checked_add(1)) else {
                     return Ok((true, Vec::new(), false));
                 };
-                let (recorded, truncated) = database::PartsTable::open_readonly(txn)?
+                let (recorded, truncated) = PartsTable::open_readonly(txn)?
                     .list_from(bucket, upload_id, start, max_parts)?;
                 Ok((true, recorded, truncated))
             })
@@ -458,11 +472,11 @@ impl Store {
                 continue;
             };
             let path = part_path(&dir, n);
-            let metadata = match tokio::fs::metadata(&path).await {
+            let metadata = match fs::metadata(&path).await {
                 Ok(metadata) => metadata,
                 // A part can vanish between the passes (a concurrent
                 // abort) — skip it rather than fail the listing.
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
             parts.push(PartInfo {
@@ -488,7 +502,7 @@ impl Store {
     ) -> Result<ETag, Error> {
         let stored = self
             .handle
-            .read(|txn| database::PartsTable::open_readonly(txn)?.get_hex(bucket, upload_id, n))
+            .read(|txn| PartsTable::open_readonly(txn)?.get_hex(bucket, upload_id, n))
             .map_err(Error::from)?;
         if let Some(hex) = stored {
             // A domain-invalid record: fall through to the recompute.
@@ -508,7 +522,7 @@ impl Store {
     /// between the rename and the consume leaves the upload listed and a
     /// client retry completes idempotently (meta-redb-spec §5.3, §5.6).
     ///
-    /// - empty `parts` → `storage::Error::NoParts`;
+    /// - empty `parts` → `Error::NoParts`;
     /// - missing / mismatched / out-of-order part → `InvalidPart`;
     /// - a part file vanishing mid-verify/assembly when the upload was
     ///   consumed (a concurrent abort/sweep) → `NoSuchUpload` (§5.6);
@@ -534,11 +548,11 @@ impl Store {
         let (found, records) = self
             .handle
             .read(|txn| {
-                let uploads = database::UploadsTable::open_readonly(txn)?;
+                let uploads = UploadsTable::open_readonly(txn)?;
                 if !uploads.key_matches(bucket, key, upload_id)? {
                     return Ok((false, HashMap::new()));
                 }
-                let table = database::PartsTable::open_readonly(txn)?;
+                let table = PartsTable::open_readonly(txn)?;
                 let mut records = HashMap::with_capacity(parts.len());
                 for part in parts {
                     let n = u32::from(part.part_number);
@@ -567,9 +581,9 @@ impl Store {
             // a concurrent abort/sweep consumed the upload (then
             // NoSuchUpload, §5.6).
             let path = part_path(&dir, n);
-            let metadata = match tokio::fs::metadata(&path).await {
+            let metadata = match fs::metadata(&path).await {
                 Ok(metadata) if !metadata.is_dir() => metadata,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                Err(err) if err.kind() == ErrorKind::NotFound => {
                     return Err(self.vanished_part(bucket, key, upload_id, n).await);
                 }
                 Ok(_) | Err(_) => return Err(storage::invalid_part(n).into()),
@@ -579,7 +593,7 @@ impl Store {
                 // fallback): recompute from the file, §5.6.
                 None => match md5_of_file(&path).await {
                     Ok((digest, _)) => ETag::Single(digest),
-                    Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
+                    Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => {
                         return Err(self.vanished_part(bucket, key, upload_id, n).await);
                     }
                     Err(err) => return Err(err),
@@ -603,37 +617,37 @@ impl Store {
         // that disagree with the verified ETag and fails the completion
         // (no post-assembly re-read of the parts, §5.6).
         let tmp_dir = self.writer.tmp_dir();
-        tokio::fs::create_dir_all(tmp_dir).await?;
-        let temp = tmp_dir.join(format!("multipart-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(tmp_dir).await?;
+        let temp = tmp_dir.join(format!("multipart-{}", Uuid::new_v4()));
         let assemble = async {
-            let mut out = tokio::fs::File::create(&temp).await?;
+            let mut out = File::create(&temp).await?;
             let mut buf = vec![0u8; CHUNK_SIZE];
             for info in &infos {
                 let n = u32::from(info.part_number);
-                let mut file = match tokio::fs::File::open(part_path(&dir, n)).await {
+                let mut file = match File::open(part_path(&dir, n)).await {
                     Ok(file) => file,
                     // A part can vanish between the verify pass and the
                     // copy (a concurrent abort/sweep consumed the upload,
                     // or out-of-band removal): classify via UPLOADS (§5.6).
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
                         return Err(self.vanished_part(bucket, key, upload_id, n).await);
                     }
                     Err(err) => return Err(err.into()),
                 };
                 let mut hasher = Md5::new();
                 loop {
-                    let read = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
+                    let read = file.read(&mut buf).await?;
                     if read == 0 {
                         break;
                     }
-                    tokio::io::AsyncWriteExt::write_all(&mut out, &buf[..read]).await?;
+                    out.write_all(&buf[..read]).await?;
                     hasher.update(&buf[..read]);
                 }
                 if ETag::Single(hasher.finalize().into()) != info.etag {
                     return Err(Error::from(storage::invalid_part(n)));
                 }
             }
-            tokio::io::AsyncWriteExt::flush(&mut out).await?;
+            out.flush().await?;
             // D1 — content durability: the assembled object's bytes must
             // be on disk before `AtomicWriter::commit` renames it (the
             // rename's directory entry is synced by commit).
@@ -642,16 +656,16 @@ impl Store {
         }
         .await;
         if let Err(err) = assemble {
-            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = fs::remove_file(&temp).await;
             // A concurrent abort/sweep may have consumed the upload while
             // the parts streamed — report that accurately (the upload is
             // gone either way) instead of a raw I/O error. Only the
             // not-found upload maps; a database failure must not be
             // masked as NoSuchUpload.
-            if matches!(&err, Error::Io(io_err) if io_err.kind() == io::ErrorKind::NotFound)
+            if matches!(&err, Error::Io(io_err) if io_err.kind() == ErrorKind::NotFound)
                 && matches!(
                     self.require_upload(bucket, key, upload_id).await,
-                    Err(Error::Storage(storage::Error::NoSuchUpload(_)))
+                    Err(Error::Storage(NoSuchUpload(_)))
                 )
             {
                 return Err(storage::no_such_upload(upload_id).into());
@@ -679,7 +693,7 @@ impl Store {
     pub async fn consume(&self, bucket: &bucket::Name, upload_id: &str) -> Result<(), Error> {
         self.drain_upload_rows(bucket, upload_id).await?;
         let dir = self.upload_dir(bucket, upload_id)?;
-        ok_if_missing(tokio::fs::remove_dir_all(&dir).await)?;
+        ok_if_missing(fs::remove_dir_all(&dir).await)?;
         Ok(())
     }
 
@@ -695,7 +709,7 @@ impl Store {
         upload_id: &str,
     ) -> Result<(), Error> {
         let dir = self.upload_dir(bucket, upload_id)?;
-        ok_if_missing(tokio::fs::remove_dir_all(&dir).await)?;
+        ok_if_missing(fs::remove_dir_all(&dir).await)?;
         Ok(())
     }
 
@@ -736,13 +750,13 @@ impl Store {
         let found = self
             .handle
             .write(move |txn| {
-                let mut uploads = database::UploadsTable::open(txn)?;
+                let mut uploads = UploadsTable::open(txn)?;
                 if !uploads.key_matches(&bucket, &key, &upload_id_owned)? {
                     return Ok(false);
                 }
                 uploads.remove(&bucket, &upload_id_owned)?;
                 drop(uploads);
-                database::PartsTable::open(txn)?.drain_upload(&bucket, &upload_id_owned)?;
+                PartsTable::open(txn)?.drain_upload(&bucket, &upload_id_owned)?;
                 Ok(true)
             })
             .await
@@ -750,7 +764,7 @@ impl Store {
         if !found {
             return Err(storage::no_such_upload(upload_id).into());
         }
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = fs::remove_dir_all(&dir).await;
         Ok(())
     }
 
@@ -764,7 +778,7 @@ impl Store {
         let mut uploads = self
             .handle
             .read(|txn| {
-                let table = database::UploadsTable::open_readonly(txn)?;
+                let table = UploadsTable::open_readonly(txn)?;
                 let mut uploads = Vec::new();
                 table.for_bucket(bucket, |upload_id, (key, initiated_at)| {
                     if let Some(upload) = upload_from_row(bucket, upload_id, key, initiated_at) {
@@ -831,7 +845,7 @@ impl Store {
         let rows: Vec<(String, String, u64)> = self
             .handle
             .read_blocking(move |txn| {
-                let table = database::UploadsTable::open_readonly(txn)?;
+                let table = UploadsTable::open_readonly(txn)?;
                 let mut rows = Vec::new();
                 table.for_bucket(&bucket_txn, |upload_id, (key, initiated_at)| {
                     rows.push((upload_id.to_string(), key.to_string(), initiated_at));
@@ -871,10 +885,10 @@ impl Store {
         upload_id: &str,
     ) -> Result<SystemTime, Error> {
         let dir = self.upload_dir(bucket, upload_id)?;
-        match crate::fsutil::latest_part_mtime(&dir).await {
+        match fsutil::latest_part_mtime(&dir).await {
             // `UNIX_EPOCH` when no parts exist yet (or the dir is gone).
             Ok(latest) => Ok(latest.unwrap_or(SystemTime::UNIX_EPOCH)),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(SystemTime::UNIX_EPOCH),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(SystemTime::UNIX_EPOCH),
             Err(err) => Err(err.into()),
         }
     }
@@ -883,14 +897,14 @@ impl Store {
     /// in-progress uploads make the bucket non-empty).
     pub async fn has_uploads(&self, bucket: &bucket::Name) -> Result<bool, Error> {
         self.handle
-            .read(|txn| database::UploadsTable::open_readonly(txn)?.has_bucket(bucket))
+            .read(|txn| UploadsTable::open_readonly(txn)?.has_bucket(bucket))
             .map_err(Error::from)
     }
 
     /// Remove the whole multipart state of a bucket: one transaction
     /// deletes its `UPLOADS` + `PARTS` records, then the directory subtree
     /// is removed best-effort. Test-only since the production teardown
-    /// goes through [`crate::FsStorage::remove_bucket_state`].
+    /// goes through [`FsStorage::remove_bucket_state`].
     #[cfg(test)]
     pub async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let dir = self.root.join(&**bucket);
@@ -899,7 +913,7 @@ impl Store {
             .write(move |txn| drain_bucket_uploads(txn, &bucket))
             .await
             .map_err(Error::from)?;
-        ok_if_missing(tokio::fs::remove_dir_all(&dir).await)?;
+        ok_if_missing(fs::remove_dir_all(&dir).await)?;
         Ok(())
     }
 
@@ -909,7 +923,7 @@ impl Store {
         let mut uploads = self
             .handle
             .read(|txn| {
-                let table = database::UploadsTable::open_readonly(txn)?;
+                let table = UploadsTable::open_readonly(txn)?;
                 let mut uploads = Vec::new();
                 table.for_each(|b, upload_id, key, initiated_at| {
                     let Ok(bucket) = bucket::name(b) else {
@@ -936,7 +950,7 @@ impl Store {
     pub(crate) async fn live_upload_ids(&self) -> Result<HashSet<(String, String)>, Error> {
         self.handle
             .read(|txn| {
-                let table = database::UploadsTable::open_readonly(txn)?;
+                let table = UploadsTable::open_readonly(txn)?;
                 let mut ids = HashSet::new();
                 table.for_each(|bucket, upload_id, _, _| {
                     ids.insert((bucket.to_string(), upload_id.to_string()));
@@ -962,7 +976,7 @@ impl Store {
         let key = key.to_string();
         self.handle
             .write(move |txn| {
-                database::UploadsTable::open(txn)?
+                UploadsTable::open(txn)?
                     .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0))?;
                 Ok(())
             })
@@ -983,7 +997,7 @@ impl Store {
         let valid = self
             .handle
             .read(|txn| {
-                let table = database::UploadsTable::open_readonly(txn)?;
+                let table = UploadsTable::open_readonly(txn)?;
                 table.key_matches(bucket, key, upload_id)
             })
             .map_err(Error::from)?;
@@ -1008,9 +1022,7 @@ impl Store {
     ) -> Error {
         match self.require_upload(bucket, key, upload_id).await {
             Ok(_) => storage::invalid_part(n).into(),
-            Err(Error::Storage(storage::Error::NoSuchUpload(_))) => {
-                storage::no_such_upload(upload_id).into()
-            }
+            Err(Error::Storage(NoSuchUpload(_))) => storage::no_such_upload(upload_id).into(),
             Err(err) => err,
         }
     }
@@ -1019,7 +1031,7 @@ impl Store {
     /// client-supplied, so only UUIDs (as `create` allocates) may map to a
     /// state-dir path; anything else (e.g. `../`) answers `NoSuchUpload`.
     fn upload_dir(&self, bucket: &bucket::Name, upload_id: &str) -> Result<PathBuf, Error> {
-        if uuid::Uuid::parse_str(upload_id).is_err() {
+        if Uuid::parse_str(upload_id).is_err() {
             return Err(storage::no_such_upload(upload_id).into());
         }
         Ok(self.root.join(&**bucket).join(upload_id))
@@ -1042,7 +1054,7 @@ impl Store {
 #[inline]
 pub fn store(state_dir: &Path) -> Result<Store, Error> {
     Ok(Store::from_handle(
-        database::Handle::open(state_dir)?,
+        Handle::open(state_dir)?,
         state_dir,
         DEFAULT_MAX_CONCURRENT_UPLOADS,
     ))
@@ -1050,10 +1062,10 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testutil::rt;
     use tinio_core::storage::{Error as StorageError, group_and_paginate_ordered};
     use tinio_util::testing::{body, etag};
+
+    use super::*;
 
     fn fixture() -> (tempfile::TempDir, Store) {
         let state = tempfile::tempdir().unwrap();
@@ -1061,1061 +1073,973 @@ mod tests {
         (state, store)
     }
 
-    #[test]
-    fn create_refuses_uploads_at_the_concurrency_cap() {
-        rt(async {
-            let (_, mut store) = fixture();
-            store.set_max_concurrent_uploads(1);
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            store.create(&b, &k).await.unwrap();
+    #[tokio::test]
+    async fn create_refuses_uploads_at_the_concurrency_cap() {
+        let (_, mut store) = fixture();
+        store.set_max_concurrent_uploads(1);
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        store.create(&b, &k).await.unwrap();
 
-            let err = store.create(&b, &k).await.unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    Error::Storage(StorageError::TooManyMultipartUploads { limit: 1 })
-                ),
-                "second create must hit the cap, got {err:?}"
-            );
+        let err = store.create(&b, &k).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Storage(StorageError::TooManyMultipartUploads { limit: 1 })
+            ),
+            "second create must hit the cap, got {err:?}"
+        );
 
-            // A completed upload frees a slot (the count reads live rows).
-            let uploads = store.list_uploads(&b).await.unwrap();
-            assert_eq!(uploads.len(), 1);
-        });
+        // A completed upload frees a slot (the count reads live rows).
+        let uploads = store.list_uploads(&b).await.unwrap();
+        assert_eq!(uploads.len(), 1);
     }
 
-    #[test]
-    fn uploads_page_matches_the_engine_over_the_full_bucket() {
-        // Item 7e equivalence pin: the bounded-memory in-scan page must
-        // equal the old full-load + `group_and_paginate_ordered` path
-        // exactly — page size, resume marker, and order — across a
-        // (prefix, delimiter, marker, max) matrix over same-key groups
-        // and rollup groups (the upload ids are random UUIDs, so the
-        // row order is arbitrary relative to the composite page order —
-        // the exact case the heap must handle).
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let keys = ["a.txt", "dir/x.bin", "dir/sub/y.bin", "dir/z.bin", "z.txt"];
-            let mut uploads = Vec::new();
-            for (i, key) in keys.iter().enumerate() {
-                for _ in 0..(i % 3 + 1) {
-                    uploads.push(store.create(&b, &object::key(*key).unwrap()).await.unwrap());
-                }
+    #[tokio::test]
+    async fn uploads_page_matches_the_engine_over_the_full_bucket() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let keys = ["a.txt", "dir/x.bin", "dir/sub/y.bin", "dir/z.bin", "z.txt"];
+        let mut uploads = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            for _ in 0..(i % 3 + 1) {
+                uploads.push(store.create(&b, &object::key(*key).unwrap()).await.unwrap());
             }
-            // The old path: the full sorted load + the shared engine.
-            async fn engine_page(
-                store: &Store,
-                b: &bucket::Name,
-                prefix: &str,
-                delim: Option<&str>,
-                marker: Option<&str>,
-                max: usize,
-            ) -> (Vec<MultipartUpload>, Vec<String>, bool, Option<String>) {
-                // The old backend filtered by prefix before the engine
-                // (the engine uses the prefix only for rollups).
-                let all = store
-                    .list_uploads(b)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .filter(|u| u.key.starts_with(prefix))
-                    .collect::<Vec<_>>();
-                group_and_paginate_ordered(
-                    all,
-                    prefix,
-                    delim,
-                    marker,
-                    max,
-                    |u| u.key.as_ref(),
-                    |u| uploads_order(&u.key, &u.upload_id),
-                )
-            }
-            // Markers: inside a same-key group, and a bare key marker
-            // (the sentinel upload id).
-            let inside = uploads_order(keys[0], &uploads[0].upload_id);
-            let bare = uploads_order(keys[3], "\u{10FFFF}");
-            let mut combos = 0usize;
-            for (prefix, delim) in [
-                ("", None),
-                ("", Some("/")),
-                ("dir/", Some("/")),
-                ("z", None),
+        }
+        // The old path: the full sorted load + the shared engine.
+        async fn engine_page(
+            store: &Store,
+            b: &bucket::Name,
+            prefix: &str,
+            delim: Option<&str>,
+            marker: Option<&str>,
+            max: usize,
+        ) -> (Vec<MultipartUpload>, Vec<String>, bool, Option<String>) {
+            // The old backend filtered by prefix before the engine
+            // (the engine uses the prefix only for rollups).
+            let all = store
+                .list_uploads(b)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|u| u.key.starts_with(prefix))
+                .collect::<Vec<_>>();
+            group_and_paginate_ordered(
+                all,
+                prefix,
+                delim,
+                marker,
+                max,
+                |u| u.key.as_ref(),
+                |u| uploads_order(&u.key, &u.upload_id),
+            )
+        }
+        // Markers: inside a same-key group, and a bare key marker
+        // (the sentinel upload id).
+        let inside = uploads_order(keys[0], &uploads[0].upload_id);
+        let bare = uploads_order(keys[3], "\u{10FFFF}");
+        let mut combos = 0usize;
+        for (prefix, delim) in [
+            ("", None),
+            ("", Some("/")),
+            ("dir/", Some("/")),
+            ("z", None),
+        ] {
+            for marker in [
+                None,
+                Some("a.txt"),
+                Some(inside.as_str()),
+                Some(bare.as_str()),
             ] {
-                for marker in [
-                    None,
-                    Some("a.txt"),
-                    Some(inside.as_str()),
-                    Some(bare.as_str()),
-                ] {
-                    for max in [0usize, 1, 2, 3, 1000] {
-                        combos += 1;
-                        let (u1, p1, t1, n1) =
-                            engine_page(&store, &b, prefix, delim, marker, max).await;
-                        let (u2, p2, t2, n2) = store
-                            .list_uploads_page(&b, prefix, delim, marker, max)
-                            .await
-                            .unwrap();
-                        fn ids(uploads: &[MultipartUpload]) -> Vec<(&str, &str)> {
-                            uploads
-                                .iter()
-                                .map(|u| (u.key.as_ref().as_str(), u.upload_id.as_str()))
-                                .collect()
-                        }
-                        assert_eq!(
-                            (ids(&u1), p1, t1, n1),
-                            (ids(&u2), p2, t2, n2),
-                            "prefix={prefix:?} delim={delim:?} marker={marker:?} max={max}"
-                        );
+                for max in [0usize, 1, 2, 3, 1000] {
+                    combos += 1;
+                    let (u1, p1, t1, n1) =
+                        engine_page(&store, &b, prefix, delim, marker, max).await;
+                    let (u2, p2, t2, n2) = store
+                        .list_uploads_page(&b, prefix, delim, marker, max)
+                        .await
+                        .unwrap();
+                    fn ids(uploads: &[MultipartUpload]) -> Vec<(&str, &str)> {
+                        uploads
+                            .iter()
+                            .map(|u| (u.key.as_ref().as_str(), u.upload_id.as_str()))
+                            .collect()
                     }
+                    assert_eq!(
+                        (ids(&u1), p1, t1, n1),
+                        (ids(&u2), p2, t2, n2),
+                        "prefix={prefix:?} delim={delim:?} marker={marker:?} max={max}"
+                    );
                 }
             }
-            assert_eq!(combos, 80, "the matrix ran");
-        });
+        }
+        assert_eq!(combos, 80, "the matrix ran");
     }
 
-    #[test]
-    fn marker_inside_a_rollup_absorbs_the_group() {
-        // A marker positioned INSIDE a rolled-up prefix skips the whole
-        // group: a rollup row's order IS the prefix string, so
-        // `"dir/" <= marker` — the page legitimately comes back without
-        // the prefix (the engine's documented resume semantics, shared
-        // by the ordered and unordered variants — the fs page delegates
-        // to the latter).
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            store
-                .create(&b, &object::key("dir/a.txt").unwrap())
-                .await
-                .unwrap();
-            store
-                .create(&b, &object::key("dir/c.txt").unwrap())
-                .await
-                .unwrap();
-            store
-                .create(&b, &object::key("z.txt").unwrap())
-                .await
-                .unwrap();
-            let marker = uploads_order("dir/a.txt", "\u{10FFFF}");
-            let (uploads, prefixes, truncated, next) = store
-                .list_uploads_page(&b, "", Some("/"), Some(&marker), 1000)
-                .await
-                .unwrap();
-            let keys: Vec<&str> = uploads.iter().map(|u| u.key.as_ref().as_str()).collect();
-            assert_eq!(keys, ["z.txt"], "{keys:?}");
-            assert_eq!(prefixes, Vec::<String>::new(), "{prefixes:?}");
-            assert!(!truncated);
-            assert_eq!(next, None);
-        });
+    #[tokio::test]
+    async fn marker_inside_a_rollup_absorbs_the_group() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        store
+            .create(&b, &object::key("dir/a.txt").unwrap())
+            .await
+            .unwrap();
+        store
+            .create(&b, &object::key("dir/c.txt").unwrap())
+            .await
+            .unwrap();
+        store
+            .create(&b, &object::key("z.txt").unwrap())
+            .await
+            .unwrap();
+        let marker = uploads_order("dir/a.txt", "\u{10FFFF}");
+        let (uploads, prefixes, truncated, next) = store
+            .list_uploads_page(&b, "", Some("/"), Some(&marker), 1000)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = uploads.iter().map(|u| u.key.as_ref().as_str()).collect();
+        assert_eq!(keys, ["z.txt"], "{keys:?}");
+        assert_eq!(prefixes, Vec::<String>::new(), "{prefixes:?}");
+        assert!(!truncated);
+        assert_eq!(next, None);
     }
 
-    #[test]
-    fn create_records_upload_without_creating_directory() {
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            assert!(!upload.upload_id.is_empty());
-            // The record is DB-driven; the directory appears only with the
-            // first part (the orphan-cleanup TOCTOU order depends on it).
-            let uploads = store.list_uploads(&b).await.unwrap();
-            assert_eq!(uploads.len(), 1);
-            assert_eq!(uploads[0].upload_id, upload.upload_id);
+    #[tokio::test]
+    async fn create_records_upload_without_creating_directory() {
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        assert!(!upload.upload_id.is_empty());
+        // The record is DB-driven; the directory appears only with the
+        // first part (the orphan-cleanup TOCTOU order depends on it).
+        let uploads = store.list_uploads(&b).await.unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].upload_id, upload.upload_id);
+        assert!(
+            fs::metadata(state.path().join("multipart/data").join(&upload.upload_id))
+                .await
+                .is_err(),
+            "create must not create the upload directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_list_part_round_trip() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let part = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"part-one"))
+            .await
+            .unwrap();
+        assert_eq!(part.size, 8);
+        assert_eq!(part.etag, etag("dede9db222ee612853f44e6e6b1ca792"));
+        let (parts, truncated, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 1000)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(!truncated);
+        assert_eq!(parts[0].etag, part.etag);
+    }
+
+    #[tokio::test]
+    async fn put_part_missing_upload_is_no_such_upload() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = MultipartUpload {
+            upload_id: "ghost".into(),
+            bucket: b.clone(),
+            key: k.clone(),
+            initiated_at: SystemTime::now(),
+        };
+        let err = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
+    }
+
+    #[tokio::test]
+    async fn non_uuid_upload_ids_are_no_such_upload() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        for evil in ["../victim/abc", "a/b", "..", ""] {
+            let err = store
+                .put_part(&b, &k, evil, 1.into(), body(b"x"))
+                .await
+                .unwrap_err();
             assert!(
-                tokio::fs::metadata(state.path().join("multipart/data").join(&upload.upload_id))
-                    .await
-                    .is_err(),
-                "create must not create the upload directory"
+                matches!(err, Error::Storage(StorageError::NoSuchUpload(_))),
+                "{evil}"
             );
-        });
+        }
     }
 
-    #[test]
-    fn put_list_part_round_trip() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
+    #[tokio::test]
+    async fn complete_under_a_different_key_is_no_such_upload() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        let completed = [CompletedPart {
+            part_number: 1.into(),
+            etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
+        }];
+        let err = store
+            .complete(
+                &b,
+                &object::key("b.bin").unwrap(),
+                &upload.upload_id,
+                &completed,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
+    }
+
+    #[tokio::test]
+    async fn put_part_under_a_different_key_is_no_such_upload() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let err = store
+            .put_part(
+                &b,
+                &object::key("b.bin").unwrap(),
+                &upload.upload_id,
+                1.into(),
+                body(b"x"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
+    }
+
+    #[tokio::test]
+    async fn complete_assembles_byte_exact_with_composed_etag() {
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let mut parts = Vec::new();
+        let parts_data: [&[u8]; 3] = [b"part-one-", b"part-two-", b"part-three"];
+        for (i, data) in parts_data.iter().enumerate() {
             let part = store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"part-one"))
-                .await
-                .unwrap();
-            assert_eq!(part.size, 8);
-            assert_eq!(part.etag, etag("dede9db222ee612853f44e6e6b1ca792"));
-            let (parts, truncated, _) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 1000)
-                .await
-                .unwrap();
-            assert_eq!(parts.len(), 1);
-            assert!(!truncated);
-            assert_eq!(parts[0].etag, part.etag);
-        });
-    }
-
-    #[test]
-    fn put_part_missing_upload_is_no_such_upload() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = MultipartUpload {
-                upload_id: "ghost".into(),
-                bucket: b.clone(),
-                key: k.clone(),
-                initiated_at: SystemTime::now(),
-            };
-            let err = store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
-    }
-
-    #[test]
-    fn non_uuid_upload_ids_are_no_such_upload() {
-        // The upload id is client-supplied and maps into the state-dir
-        // path — only UUIDs may do so (no `../` traversal).
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            for evil in ["../victim/abc", "a/b", "..", ""] {
-                let err = store
-                    .put_part(&b, &k, evil, 1.into(), body(b"x"))
-                    .await
-                    .unwrap_err();
-                assert!(
-                    matches!(err, Error::Storage(StorageError::NoSuchUpload(_))),
-                    "{evil}"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn complete_under_a_different_key_is_no_such_upload() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            let completed = [CompletedPart {
-                part_number: 1.into(),
-                etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
-            }];
-            let err = store
-                .complete(
-                    &b,
-                    &object::key("b.bin").unwrap(),
-                    &upload.upload_id,
-                    &completed,
-                )
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
-    }
-
-    #[test]
-    fn put_part_under_a_different_key_is_no_such_upload() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let err = store
                 .put_part(
                     &b,
-                    &object::key("b.bin").unwrap(),
+                    &k,
                     &upload.upload_id,
-                    1.into(),
-                    body(b"x"),
+                    ((i + 1) as u32).into(),
+                    body(data.to_vec()),
                 )
                 .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
-    }
-
-    #[test]
-    fn complete_assembles_byte_exact_with_composed_etag() {
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let mut parts = Vec::new();
-            let parts_data: [&[u8]; 3] = [b"part-one-", b"part-two-", b"part-three"];
-            for (i, data) in parts_data.iter().enumerate() {
-                let part = store
-                    .put_part(
-                        &b,
-                        &k,
-                        &upload.upload_id,
-                        ((i + 1) as u32).into(),
-                        body(data.to_vec()),
-                    )
-                    .await
-                    .unwrap();
-                parts.push(part);
-            }
-            let completed: Vec<CompletedPart> = parts
-                .iter()
-                .map(|p| CompletedPart {
-                    part_number: p.part_number,
-                    etag: p.etag.clone(),
-                })
-                .collect();
-            let target = state.path().join("out.bin");
-            let (temp, etag) = store
-                .complete(&b, &k, &upload.upload_id, &completed)
-                .await
                 .unwrap();
-            // Hard-coded reference composition (MD5 of raw part digests).
-            assert_eq!(etag.as_str(), "aed23cbfc502f1e851e828efe2ca50d0-3");
-            // Not consumed yet: the records and subtree must outlive the
-            // assemble step (the caller renames, then consumes — §5.3).
-            assert!(store.has_uploads(&b).await.unwrap());
-            let upload_dir = state.path().join("multipart/data").join(&upload.upload_id);
-            assert!(tokio::fs::metadata(&upload_dir).await.is_ok());
-            // Rename onto the object, then consume the upload.
-            tokio::fs::rename(&temp, &target).await.unwrap();
-            store.consume(&b, &upload.upload_id).await.unwrap();
-            assert_eq!(
-                tokio::fs::read(&target).await.unwrap(),
-                b"part-one-part-two-part-three"
-            );
-            // The upload records and subtree are gone.
-            assert!(!store.has_uploads(&b).await.unwrap());
-            assert!(tokio::fs::metadata(&upload_dir).await.is_err());
-            // The object is retrievable as a regular object.
-            let content = tokio::fs::read(&target).await.unwrap();
-            assert_eq!(content, b"part-one-part-two-part-three");
-        });
+            parts.push(part);
+        }
+        let completed: Vec<CompletedPart> = parts
+            .iter()
+            .map(|p| CompletedPart {
+                part_number: p.part_number,
+                etag: p.etag.clone(),
+            })
+            .collect();
+        let target = state.path().join("out.bin");
+        let (temp, etag) = store
+            .complete(&b, &k, &upload.upload_id, &completed)
+            .await
+            .unwrap();
+        // Hard-coded reference composition (MD5 of raw part digests).
+        assert_eq!(etag.as_str(), "aed23cbfc502f1e851e828efe2ca50d0-3");
+        // Not consumed yet: the records and subtree must outlive the
+        // assemble step (the caller renames, then consumes — §5.3).
+        assert!(store.has_uploads(&b).await.unwrap());
+        let upload_dir = state.path().join("multipart/data").join(&upload.upload_id);
+        assert!(fs::metadata(&upload_dir).await.is_ok());
+        // Rename onto the object, then consume the upload.
+        fs::rename(&temp, &target).await.unwrap();
+        store.consume(&b, &upload.upload_id).await.unwrap();
+        assert_eq!(
+            fs::read(&target).await.unwrap(),
+            b"part-one-part-two-part-three"
+        );
+        // The upload records and subtree are gone.
+        assert!(!store.has_uploads(&b).await.unwrap());
+        assert!(fs::metadata(&upload_dir).await.is_err());
+        // The object is retrievable as a regular object.
+        let content = fs::read(&target).await.unwrap();
+        assert_eq!(content, b"part-one-part-two-part-three");
     }
 
-    #[test]
-    fn complete_no_parts_is_error() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let err = store
-                .complete(&b, &k, &upload.upload_id, &[])
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoParts)));
-        });
+    #[tokio::test]
+    async fn complete_no_parts_is_error() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let err = store
+            .complete(&b, &k, &upload.upload_id, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoParts)));
     }
 
-    #[test]
-    fn complete_mismatched_or_missing_part_is_invalid_part() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
+    #[tokio::test]
+    async fn complete_mismatched_or_missing_part_is_invalid_part() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
 
-            // Wrong ETag.
-            let wrong = CompletedPart {
-                part_number: 1.into(),
-                etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
-            };
-            let err = store
-                .complete(&b, &k, &upload.upload_id, &[wrong])
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::InvalidPart(1))));
+        // Wrong ETag.
+        let wrong = CompletedPart {
+            part_number: 1.into(),
+            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+        };
+        let err = store
+            .complete(&b, &k, &upload.upload_id, &[wrong])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::InvalidPart(1))));
 
-            // Missing part number 2 after 1.
-            let good = CompletedPart {
-                part_number: 1.into(),
-                etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
-            };
-            let missing = CompletedPart {
-                part_number: 3.into(),
-                etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
-            };
-            let err = store
-                .complete(&b, &k, &upload.upload_id, &[good.clone(), missing.clone()])
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::InvalidPart(3))));
+        // Missing part number 2 after 1.
+        let good = CompletedPart {
+            part_number: 1.into(),
+            etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
+        };
+        let missing = CompletedPart {
+            part_number: 3.into(),
+            etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
+        };
+        let err = store
+            .complete(&b, &k, &upload.upload_id, &[good.clone(), missing.clone()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::InvalidPart(3))));
 
-            // Out of order (a repeated part number is not strictly
-            // ascending).
-            let err = store
-                .complete(&b, &k, &upload.upload_id, &[good.clone(), good.clone()])
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::InvalidPart(1))));
-        });
+        // Out of order (a repeated part number is not strictly
+        // ascending).
+        let err = store
+            .complete(&b, &k, &upload.upload_id, &[good.clone(), good.clone()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::InvalidPart(1))));
     }
 
-    #[test]
-    fn abort_removes_parts_and_is_no_such_upload_after() {
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+    #[tokio::test]
+    async fn abort_removes_parts_and_is_no_such_upload_after() {
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        store.abort(&b, &k, &upload.upload_id).await.unwrap();
+        assert!(
+            fs::metadata(state.path().join("multipart/data").join(&upload.upload_id))
                 .await
-                .unwrap();
-            store.abort(&b, &k, &upload.upload_id).await.unwrap();
-            assert!(
-                tokio::fs::metadata(state.path().join("multipart/data").join(&upload.upload_id))
-                    .await
-                    .is_err()
-            );
-            let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
+                .is_err()
+        );
+        let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
     }
 
-    #[test]
-    fn complete_retry_after_rename_is_idempotent() {
-        // §5.6 crash window: the object is renamed before the upload is
-        // consumed — a crash in between leaves the upload listed, and a
-        // client retry completes again without error.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
+    #[tokio::test]
+    async fn complete_retry_after_rename_is_idempotent() {
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let part = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        let completed = [CompletedPart {
+            part_number: part.part_number,
+            etag: part.etag.clone(),
+        }];
+        let target = state.path().join("out.bin");
+        // First attempt: the rename lands, the consume does not
+        // (the crash). The upload is still listed.
+        let (temp, _) = store
+            .complete(&b, &k, &upload.upload_id, &completed)
+            .await
+            .unwrap();
+        fs::rename(&temp, &target).await.unwrap();
+        assert!(store.has_uploads(&b).await.unwrap());
+        // Retry: verify + assemble + rename + consume all succeed.
+        let (temp, _) = store
+            .complete(&b, &k, &upload.upload_id, &completed)
+            .await
+            .unwrap();
+        fs::rename(&temp, &target).await.unwrap();
+        store.consume(&b, &upload.upload_id).await.unwrap();
+        assert!(!store.has_uploads(&b).await.unwrap());
+        assert_eq!(fs::read(&target).await.unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn abort_after_complete_consume_is_no_such_upload() {
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let part = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        let completed = [CompletedPart {
+            part_number: part.part_number,
+            etag: part.etag.clone(),
+        }];
+        let target = state.path().join("out.bin");
+        let (temp, _) = store
+            .complete(&b, &k, &upload.upload_id, &completed)
+            .await
+            .unwrap();
+        fs::rename(&temp, &target).await.unwrap();
+        store.consume(&b, &upload.upload_id).await.unwrap();
+        let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
+    }
+
+    #[tokio::test]
+    async fn consume_is_idempotent_for_a_missing_upload() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        // No part dir was ever created; consuming twice is a no-op.
+        store.consume(&b, &upload.upload_id).await.unwrap();
+        store.consume(&b, &upload.upload_id).await.unwrap();
+        assert!(!store.has_uploads(&b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn racing_complete_and_abort_leave_a_consistent_state() {
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let mut completed = Vec::new();
+        for i in 1..=4u32 {
+            let data = vec![i as u8; 32 * 1024];
             let part = store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+                .put_part(&b, &k, &upload.upload_id, i.into(), body(data))
                 .await
                 .unwrap();
-            let completed = [CompletedPart {
+            completed.push(CompletedPart {
                 part_number: part.part_number,
                 etag: part.etag.clone(),
-            }];
+            });
+        }
+        let (complete, abort) = tokio::join!(
+            store.complete(&b, &k, &upload.upload_id, &completed),
+            store.abort(&b, &k, &upload.upload_id),
+        );
+        // If the assemble won, the caller renames and consumes; the
+        // consume is a no-op if the abort already removed the records.
+        if let Ok((temp, _)) = complete {
             let target = state.path().join("out.bin");
-            // First attempt: the rename lands, the consume does not
-            // (the crash). The upload is still listed.
-            let (temp, _) = store
-                .complete(&b, &k, &upload.upload_id, &completed)
-                .await
-                .unwrap();
-            tokio::fs::rename(&temp, &target).await.unwrap();
-            assert!(store.has_uploads(&b).await.unwrap());
-            // Retry: verify + assemble + rename + consume all succeed.
-            let (temp, _) = store
-                .complete(&b, &k, &upload.upload_id, &completed)
-                .await
-                .unwrap();
-            tokio::fs::rename(&temp, &target).await.unwrap();
+            fs::rename(&temp, &target).await.unwrap();
             store.consume(&b, &upload.upload_id).await.unwrap();
-            assert!(!store.has_uploads(&b).await.unwrap());
-            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"x");
-        });
-    }
-
-    #[test]
-    fn abort_after_complete_consume_is_no_such_upload() {
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let part = store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            let completed = [CompletedPart {
-                part_number: part.part_number,
-                etag: part.etag.clone(),
-            }];
-            let target = state.path().join("out.bin");
-            let (temp, _) = store
-                .complete(&b, &k, &upload.upload_id, &completed)
-                .await
-                .unwrap();
-            tokio::fs::rename(&temp, &target).await.unwrap();
-            store.consume(&b, &upload.upload_id).await.unwrap();
-            let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
-    }
-
-    #[test]
-    fn consume_is_idempotent_for_a_missing_upload() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            // No part dir was ever created; consuming twice is a no-op.
-            store.consume(&b, &upload.upload_id).await.unwrap();
-            store.consume(&b, &upload.upload_id).await.unwrap();
-            assert!(!store.has_uploads(&b).await.unwrap());
-        });
-    }
-
-    #[test]
-    fn racing_complete_and_abort_leave_a_consistent_state() {
-        // The caller's flow is rename-then-consume, so a racing abort can
-        // never fail a complete after its rename committed: whichever
-        // wins, the upload ends with no records and a late abort answers
+        } else {
+            assert!(abort.is_ok());
+        }
+        // Whatever won, no records remain and a late abort answers
         // NoSuchUpload.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let mut completed = Vec::new();
-            for i in 1..=4u32 {
-                let data = vec![i as u8; 32 * 1024];
-                let part = store
-                    .put_part(&b, &k, &upload.upload_id, i.into(), body(data))
-                    .await
-                    .unwrap();
-                completed.push(CompletedPart {
-                    part_number: part.part_number,
-                    etag: part.etag.clone(),
-                });
-            }
-            let (complete, abort) = tokio::join!(
-                store.complete(&b, &k, &upload.upload_id, &completed),
-                store.abort(&b, &k, &upload.upload_id),
-            );
-            // If the assemble won, the caller renames and consumes; the
-            // consume is a no-op if the abort already removed the records.
-            if let Ok((temp, _)) = complete {
-                let target = state.path().join("out.bin");
-                tokio::fs::rename(&temp, &target).await.unwrap();
-                store.consume(&b, &upload.upload_id).await.unwrap();
-            } else {
-                assert!(abort.is_ok());
-            }
-            // Whatever won, no records remain and a late abort answers
-            // NoSuchUpload.
-            assert!(!store.has_uploads(&b).await.unwrap());
-            let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
+        assert!(!store.has_uploads(&b).await.unwrap());
+        let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
     }
 
-    #[test]
-    fn list_parts_skips_a_part_whose_file_vanished() {
+    #[tokio::test]
+    async fn list_parts_skips_a_part_whose_file_vanished() {
         // A part file can disappear under a concurrent abort (or out-of-
         // band): the listing skips it instead of failing the whole page.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let p1 = store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            let p2 = store
-                .put_part(&b, &k, &upload.upload_id, 2.into(), body(b"yy"))
-                .await
-                .unwrap();
-            let part_dir = state.path().join("multipart/data").join(&upload.upload_id);
-            // Remove part 1's file out-of-band (the record stays).
-            tokio::fs::remove_file(part_dir.join("part-1"))
-                .await
-                .unwrap();
-            let (parts, truncated, _) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 100)
-                .await
-                .unwrap();
-            assert!(!truncated);
-            assert_eq!(parts.len(), 1);
-            assert_eq!(parts[0].part_number, p2.part_number);
-            assert_eq!(parts[0].etag, p2.etag);
-            let _ = p1;
-        });
+
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let p1 = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        let p2 = store
+            .put_part(&b, &k, &upload.upload_id, 2.into(), body(b"yy"))
+            .await
+            .unwrap();
+        let part_dir = state.path().join("multipart/data").join(&upload.upload_id);
+        // Remove part 1's file out-of-band (the record stays).
+        fs::remove_file(part_dir.join("part-1")).await.unwrap();
+        let (parts, truncated, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 100)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, p2.part_number);
+        assert_eq!(parts[0].etag, p2.etag);
+        let _ = p1;
     }
 
-    #[test]
-    fn list_parts_skips_a_part_with_invalid_stored_etag() {
-        // Listing is DB-driven: a domain-invalid PARTS hex is omitted,
-        // not recomputed from the file (that fallback is the point query).
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            let bucket = b.clone();
-            let upload_id = upload.upload_id.clone();
-            store
-                .handle
-                .write(move |txn| {
-                    let mut parts = database::PartsTable::open(txn).unwrap();
-                    parts.insert((&*bucket, upload_id.as_str(), 1u32), "not-an-etag")?;
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            let (parts, _, _) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 100)
-                .await
-                .unwrap();
-            assert!(parts.is_empty(), "{parts:?}");
-            let etag = store.part_etag(&b, &upload.upload_id, 1).await.unwrap();
-            assert_eq!(etag, ETag::from_content(b"x"));
-        });
+    #[tokio::test]
+    async fn list_parts_skips_a_part_with_invalid_stored_etag() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        let bucket = b.clone();
+        let upload_id = upload.upload_id.clone();
+        store
+            .handle
+            .write(move |txn| {
+                let mut parts = PartsTable::open(txn).unwrap();
+                parts.insert((&*bucket, upload_id.as_str(), 1u32), "not-an-etag")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (parts, _, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 100)
+            .await
+            .unwrap();
+        assert!(parts.is_empty(), "{parts:?}");
+        let etag = store.part_etag(&b, &upload.upload_id, 1).await.unwrap();
+        assert_eq!(etag, ETag::from_content(b"x"));
     }
 
-    #[test]
-    fn list_uploads_and_has_uploads() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k1 = object::key("a.bin").unwrap();
-            let k2 = object::key("b.bin").unwrap();
-            let u1 = store.create(&b, &k1).await.unwrap();
-            let u2 = store.create(&b, &k2).await.unwrap();
-            let uploads = store.list_uploads(&b).await.unwrap();
-            assert_eq!(uploads.len(), 2);
-            assert!(store.has_uploads(&b).await.unwrap());
-            store.abort(&b, &k1, &u1.upload_id).await.unwrap();
-            store.abort(&b, &k2, &u2.upload_id).await.unwrap();
-            assert!(!store.has_uploads(&b).await.unwrap());
-        });
+    #[tokio::test]
+    async fn list_uploads_and_has_uploads() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k1 = object::key("a.bin").unwrap();
+        let k2 = object::key("b.bin").unwrap();
+        let u1 = store.create(&b, &k1).await.unwrap();
+        let u2 = store.create(&b, &k2).await.unwrap();
+        let uploads = store.list_uploads(&b).await.unwrap();
+        assert_eq!(uploads.len(), 2);
+        assert!(store.has_uploads(&b).await.unwrap());
+        store.abort(&b, &k1, &u1.upload_id).await.unwrap();
+        store.abort(&b, &k2, &u2.upload_id).await.unwrap();
+        assert!(!store.has_uploads(&b).await.unwrap());
     }
 
-    #[test]
-    fn list_uploads_orders_same_key_group_by_upload_id() {
-        // The composite `key\0upload_id` order positions a page inside a
-        // same-key group: pagination must never skip an upload because a
-        // page cut between two uploads of one key.
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("same.bin").unwrap();
-            store.create(&b, &k).await.unwrap();
-            store.create(&b, &k).await.unwrap();
-            let uploads = store.list_uploads(&b).await.unwrap();
-            assert_eq!(uploads.len(), 2);
-            assert!(
-                uploads[0].upload_id < uploads[1].upload_id,
-                "same-key uploads must be ordered by upload id: {:?}",
-                uploads.iter().map(|u| &u.upload_id).collect::<Vec<_>>()
-            );
-        });
+    #[tokio::test]
+    async fn list_uploads_orders_same_key_group_by_upload_id() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("same.bin").unwrap();
+        store.create(&b, &k).await.unwrap();
+        store.create(&b, &k).await.unwrap();
+        let uploads = store.list_uploads(&b).await.unwrap();
+        assert_eq!(uploads.len(), 2);
+        assert!(
+            uploads[0].upload_id < uploads[1].upload_id,
+            "same-key uploads must be ordered by upload id: {:?}",
+            uploads.iter().map(|u| &u.upload_id).collect::<Vec<_>>()
+        );
     }
 
-    #[test]
-    fn remove_bucket_clears_uploads() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            store.remove_bucket(&b).await.unwrap();
-            assert!(!store.has_uploads(&b).await.unwrap());
-            let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
-            assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-        });
+    #[tokio::test]
+    async fn remove_bucket_clears_uploads() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store.remove_bucket(&b).await.unwrap();
+        assert!(!store.has_uploads(&b).await.unwrap());
+        let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
     }
 
-    #[test]
-    fn walk_uploads_finds_all() {
-        rt(async {
-            let (_, store) = fixture();
-            let b1 = bucket::name("alpha").unwrap();
-            let b2 = bucket::name("zeta").unwrap();
-            store
-                .create(&b1, &object::key("a.bin").unwrap())
-                .await
-                .unwrap();
-            store
-                .create(&b2, &object::key("z.bin").unwrap())
-                .await
-                .unwrap();
-            let uploads = store.walk_uploads().await.unwrap();
-            assert_eq!(uploads.len(), 2);
-        });
+    #[tokio::test]
+    async fn walk_uploads_finds_all() {
+        let (_, store) = fixture();
+        let b1 = bucket::name("alpha").unwrap();
+        let b2 = bucket::name("zeta").unwrap();
+        store
+            .create(&b1, &object::key("a.bin").unwrap())
+            .await
+            .unwrap();
+        store
+            .create(&b2, &object::key("z.bin").unwrap())
+            .await
+            .unwrap();
+        let uploads = store.walk_uploads().await.unwrap();
+        assert_eq!(uploads.len(), 2);
     }
 
-    #[test]
-    fn list_parts_truncated_page_with_vanished_parts_still_marks_resume() {
+    #[tokio::test]
+    async fn list_parts_truncated_page_with_vanished_parts_still_marks_resume() {
         // A truncated page whose parts all vanished in pass 2 must still
         // report a resume marker (from the raw rows) — an empty page with
         // truncated=true and no marker would make the client re-request
         // the identical page forever.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            for n in 1..=4u32 {
-                store
-                    .put_part(&b, &k, &upload.upload_id, n.into(), body(b"x"))
-                    .await
-                    .unwrap();
-            }
-            let dir = state.path().join("multipart/data").join(&upload.upload_id);
-            // Remove the first two part files out-of-band (records stay).
-            tokio::fs::remove_file(dir.join("part-1")).await.unwrap();
-            tokio::fs::remove_file(dir.join("part-2")).await.unwrap();
-            let (parts, truncated, raw_last) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 2)
+
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        for n in 1..=4u32 {
+            store
+                .put_part(&b, &k, &upload.upload_id, n.into(), body(b"x"))
                 .await
                 .unwrap();
-            assert!(truncated);
-            assert!(parts.is_empty(), "{parts:?}");
-            // The marker is the raw last row of the page — the client
-            // resumes past the vanished parts.
-            assert_eq!(raw_last, Some(2));
-            let (parts, truncated, _) = store
-                .list_parts(&b, &k, &upload.upload_id, raw_last, 10)
-                .await
-                .unwrap();
-            assert!(!truncated);
-            assert_eq!(parts.len(), 2, "parts 3-4 still listed: {parts:?}");
-        });
+        }
+        let dir = state.path().join("multipart/data").join(&upload.upload_id);
+        // Remove the first two part files out-of-band (records stay).
+        fs::remove_file(dir.join("part-1")).await.unwrap();
+        fs::remove_file(dir.join("part-2")).await.unwrap();
+        let (parts, truncated, raw_last) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 2)
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert!(parts.is_empty(), "{parts:?}");
+        // The marker is the raw last row of the page — the client
+        // resumes past the vanished parts.
+        assert_eq!(raw_last, Some(2));
+        let (parts, truncated, _) = store
+            .list_parts(&b, &k, &upload.upload_id, raw_last, 10)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(parts.len(), 2, "parts 3-4 still listed: {parts:?}");
     }
 
-    #[test]
-    fn part_lock_slots_are_evicted_after_use() {
+    #[tokio::test]
+    async fn part_lock_slots_are_evicted_after_use() {
         // The per-upload lock map must not grow: every `put_part` releases
         // its slot when the last handle drops (a leak would be unbounded
         // memory on a long-running server with churning uploads).
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            store
-                .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
-                .await
-                .unwrap();
-            assert!(
-                store.part_locks.is_empty(),
-                "lock slots must be evicted after use"
-            );
-        });
+
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .await
+            .unwrap();
+        assert!(
+            store.part_locks.is_empty(),
+            "lock slots must be evicted after use"
+        );
     }
 
-    #[test]
-    fn concurrent_same_part_overwrites_never_mismatch_file_and_record() {
+    #[tokio::test]
+    async fn concurrent_same_part_overwrites_never_mismatch_file_and_record() {
         // Two put_parts of the same part interleaving rename/txn must end
         // with the file and the PARTS record agreeing (the per-upload lock
         // serializes rename + upsert) — otherwise complete verifies the
         // record, then re-hashes the file and fails InvalidPart forever.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let id = upload.upload_id.clone();
-            let (a, b2) = tokio::join!(
-                store.put_part(&b, &k, &id, 1.into(), body(b"AAAA")),
-                store.put_part(&b, &k, &id, 1.into(), body(b"BBBB")),
-            );
-            a.unwrap();
-            b2.unwrap();
-            let (parts, _, _) = store.list_parts(&b, &k, &id, None, 10).await.unwrap();
-            assert_eq!(parts.len(), 1);
-            // The record's etag must be the hash of the file's content.
-            let dir = state.path().join("multipart/data").join(&id);
-            let content = tokio::fs::read(dir.join("part-1")).await.unwrap();
-            assert_eq!(parts[0].etag, ETag::from_content(&content));
-        });
+
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let id = upload.upload_id.clone();
+        let (a, b2) = tokio::join!(
+            store.put_part(&b, &k, &id, 1.into(), body(b"AAAA")),
+            store.put_part(&b, &k, &id, 1.into(), body(b"BBBB")),
+        );
+        a.unwrap();
+        b2.unwrap();
+        let (parts, _, _) = store.list_parts(&b, &k, &id, None, 10).await.unwrap();
+        assert_eq!(parts.len(), 1);
+        // The record's etag must be the hash of the file's content.
+        let dir = state.path().join("multipart/data").join(&id);
+        let content = fs::read(dir.join("part-1")).await.unwrap();
+        assert_eq!(parts[0].etag, ETag::from_content(&content));
     }
 
-    #[test]
-    fn list_parts_is_db_driven_no_ghost_parts() {
+    #[tokio::test]
+    async fn list_parts_is_db_driven_no_ghost_parts() {
         // A part file whose PARTS record never committed (crash window)
         // must not appear in listings — the client retransmits.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            // Write a part file out-of-band (no PARTS record).
-            let dir = state.path().join("multipart/data").join(&upload.upload_id);
-            tokio::fs::create_dir_all(&dir).await.unwrap();
-            tokio::fs::write(dir.join("part-1"), b"orphan")
-                .await
-                .unwrap();
-            let (parts, _, _) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 1000)
-                .await
-                .unwrap();
-            assert!(parts.is_empty(), "no record, no listing: {parts:?}");
-            // But the point query recomputes from the file (complete
-            // fallback for the crash window).
-            let etag = store.part_etag(&b, &upload.upload_id, 1).await.unwrap();
-            assert_eq!(etag, ETag::from_content(b"orphan"));
-        });
+
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        // Write a part file out-of-band (no PARTS record).
+        let dir = state.path().join("multipart/data").join(&upload.upload_id);
+        fs::create_dir_all(&dir).await.unwrap();
+        fs::write(dir.join("part-1"), b"orphan").await.unwrap();
+        let (parts, _, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 1000)
+            .await
+            .unwrap();
+        assert!(parts.is_empty(), "no record, no listing: {parts:?}");
+        // But the point query recomputes from the file (complete
+        // fallback for the crash window).
+        let etag = store.part_etag(&b, &upload.upload_id, 1).await.unwrap();
+        assert_eq!(etag, ETag::from_content(b"orphan"));
     }
 
-    #[test]
-    fn list_parts_pages_by_part_number() {
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            for n in 1..=5u32 {
-                store
-                    .put_part(&b, &k, &upload.upload_id, n.into(), body(vec![n as u8]))
-                    .await
-                    .unwrap();
-            }
-            let (page, truncated, _) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 2)
+    #[tokio::test]
+    async fn list_parts_pages_by_part_number() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        for n in 1..=5u32 {
+            store
+                .put_part(&b, &k, &upload.upload_id, n.into(), body(vec![n as u8]))
                 .await
                 .unwrap();
-            assert!(truncated);
-            assert_eq!(
-                page.iter()
-                    .map(|p| u32::from(p.part_number))
-                    .collect::<Vec<_>>(),
-                [1, 2]
-            );
-            let (page, truncated, _) = store
-                .list_parts(&b, &k, &upload.upload_id, Some(2), 2)
-                .await
-                .unwrap();
-            assert!(truncated);
-            assert_eq!(
-                page.iter()
-                    .map(|p| u32::from(p.part_number))
-                    .collect::<Vec<_>>(),
-                [3, 4]
-            );
-            let (page, truncated, _) = store
-                .list_parts(&b, &k, &upload.upload_id, Some(4), 2)
-                .await
-                .unwrap();
-            assert!(!truncated);
-            assert_eq!(
-                page.iter()
-                    .map(|p| u32::from(p.part_number))
-                    .collect::<Vec<_>>(),
-                [5]
-            );
-        });
+        }
+        let (page, truncated, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 2)
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(
+            page.iter()
+                .map(|p| u32::from(p.part_number))
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let (page, truncated, _) = store
+            .list_parts(&b, &k, &upload.upload_id, Some(2), 2)
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(
+            page.iter()
+                .map(|p| u32::from(p.part_number))
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        let (page, truncated, _) = store
+            .list_parts(&b, &k, &upload.upload_id, Some(4), 2)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            page.iter()
+                .map(|p| u32::from(p.part_number))
+                .collect::<Vec<_>>(),
+            [5]
+        );
     }
 
-    #[test]
-    fn complete_racing_put_part_never_mismatches_content() {
+    #[tokio::test]
+    async fn complete_racing_put_part_never_mismatches_content() {
         // #6: a put_part overwriting a part between complete's
         // verification pass and its copy must either fail the completion
         // (InvalidPart via the post-assembly re-verification) or produce
         // an object whose bytes match the composed ETag — never a success
         // whose content disagrees with the returned ETag.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            let parts_data: [&[u8]; 3] = [b"part-1", b"part-2", b"part-3-original"];
-            for (i, data) in parts_data.iter().enumerate() {
-                store
-                    .put_part(
-                        &b,
-                        &k,
-                        &upload.upload_id,
-                        ((i + 1) as u32).into(),
-                        body(data.to_vec()),
-                    )
-                    .await
-                    .unwrap();
-            }
-            // The client's completion list carries the REAL etags of the
-            // parts it uploaded.
-            let (real, _, _) = store
-                .list_parts(&b, &k, &upload.upload_id, None, 100)
+
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let parts_data: [&[u8]; 3] = [b"part-1", b"part-2", b"part-3-original"];
+        for (i, data) in parts_data.iter().enumerate() {
+            store
+                .put_part(
+                    &b,
+                    &k,
+                    &upload.upload_id,
+                    ((i + 1) as u32).into(),
+                    body(data.to_vec()),
+                )
                 .await
                 .unwrap();
-            let completed: Vec<CompletedPart> = real
-                .iter()
-                .map(|p| CompletedPart {
-                    part_number: p.part_number,
-                    etag: p.etag.clone(),
-                })
-                .collect();
-            // A racer retries UploadPart(3) while the completion runs
-            // (the client misbehaves; errors are fine — the upload may be
-            // consumed).
-            let racer = tokio::spawn({
-                let store = store.clone();
-                let b = b.clone();
-                let k = k.clone();
-                let upload_id = upload.upload_id.clone();
-                async move {
-                    for i in 0..200u32 {
-                        let _ = store
-                            .put_part(
-                                &b,
-                                &k,
-                                &upload_id,
-                                3.into(),
-                                body(format!("part-3-overwrite-{i}")),
-                            )
-                            .await;
-                    }
-                }
-            });
-            let outcome = store.complete(&b, &k, &upload.upload_id, &completed).await;
-            racer.await.unwrap();
-            match outcome {
-                Ok((temp, etag)) => {
-                    // Success means the re-verification passed: no part
-                    // changed between verify and copy — the bytes are
-                    // exactly the original parts and the ETag matches.
-                    let target = state.path().join("out.bin");
-                    tokio::fs::rename(&temp, &target).await.unwrap();
-                    assert_eq!(
-                        tokio::fs::read(&target).await.unwrap(),
-                        b"part-1part-2part-3-original"
-                    );
-                    assert_eq!(etag, ETag::composed_from_parts(&real).unwrap());
-                }
-                Err(err) => {
-                    // Failure is fine — the completion must simply not
-                    // have committed a mismatched object.
-                    assert!(
-                        matches!(
-                            err,
-                            Error::Storage(StorageError::InvalidPart(_))
-                                | Error::Storage(StorageError::NoSuchUpload(_))
-                        ),
-                        "{err:?}"
-                    );
+        }
+        // The client's completion list carries the REAL etags of the
+        // parts it uploaded.
+        let (real, _, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 100)
+            .await
+            .unwrap();
+        let completed: Vec<CompletedPart> = real
+            .iter()
+            .map(|p| CompletedPart {
+                part_number: p.part_number,
+                etag: p.etag.clone(),
+            })
+            .collect();
+        // A racer retries UploadPart(3) while the completion runs
+        // (the client misbehaves; errors are fine — the upload may be
+        // consumed).
+        let racer = tokio::spawn({
+            let store = store.clone();
+            let b = b.clone();
+            let k = k.clone();
+            let upload_id = upload.upload_id.clone();
+            async move {
+                for i in 0..200u32 {
+                    let _ = store
+                        .put_part(
+                            &b,
+                            &k,
+                            &upload_id,
+                            3.into(),
+                            body(format!("part-3-overwrite-{i}")),
+                        )
+                        .await;
                 }
             }
         });
+        let outcome = store.complete(&b, &k, &upload.upload_id, &completed).await;
+        racer.await.unwrap();
+        match outcome {
+            Ok((temp, etag)) => {
+                // Success means the re-verification passed: no part
+                // changed between verify and copy — the bytes are
+                // exactly the original parts and the ETag matches.
+                let target = state.path().join("out.bin");
+                fs::rename(&temp, &target).await.unwrap();
+                assert_eq!(
+                    fs::read(&target).await.unwrap(),
+                    b"part-1part-2part-3-original"
+                );
+                assert_eq!(etag, ETag::composed_from_parts(&real).unwrap());
+            }
+            Err(err) => {
+                // Failure is fine — the completion must simply not
+                // have committed a mismatched object.
+                assert!(
+                    matches!(
+                        err,
+                        Error::Storage(StorageError::InvalidPart(_))
+                            | Error::Storage(StorageError::NoSuchUpload(_))
+                    ),
+                    "{err:?}"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn abort_during_assembly_is_no_such_upload() {
+    #[tokio::test]
+    async fn abort_during_assembly_is_no_such_upload() {
         // §5.6: a part file vanishing mid-verify/assembly because a
         // concurrent abort consumed the upload must surface NoSuchUpload
         // (the NotFound re-checks UPLOADS), never a bare InvalidPart or
         // I/O error. The abort commits its record deletion before
         // touching the directory, so any NotFound implies the upload is
         // gone.
-        rt(async {
-            let (state, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let mut saw_no_such_upload = false;
-            // Enough parts that the assembly window (per-part opens)
-            // reliably intersects the abort; retry on the off chance the
-            // completion wins the race outright.
-            for _ in 0..8 {
-                let upload = store.create(&b, &k).await.unwrap();
-                let mut completed = Vec::new();
-                for n in 1..=8u32 {
-                    let part = store
-                        .put_part(
-                            &b,
-                            &k,
-                            &upload.upload_id,
-                            n.into(),
-                            body(vec![n as u8; 256 * 1024]),
-                        )
-                        .await
-                        .unwrap();
-                    completed.push(CompletedPart {
-                        part_number: part.part_number,
-                        etag: part.etag,
-                    });
+
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let mut saw_no_such_upload = false;
+        // Enough parts that the assembly window (per-part opens)
+        // reliably intersects the abort; retry on the off chance the
+        // completion wins the race outright.
+        for _ in 0..8 {
+            let upload = store.create(&b, &k).await.unwrap();
+            let mut completed = Vec::new();
+            for n in 1..=8u32 {
+                let part = store
+                    .put_part(
+                        &b,
+                        &k,
+                        &upload.upload_id,
+                        n.into(),
+                        body(vec![n as u8; 256 * 1024]),
+                    )
+                    .await
+                    .unwrap();
+                completed.push(CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag,
+                });
+            }
+            let (complete, abort) = tokio::join!(
+                store.complete(&b, &k, &upload.upload_id, &completed),
+                store.abort(&b, &k, &upload.upload_id),
+            );
+            match complete {
+                Ok((temp, _)) => {
+                    // The completion won — finish the caller flow and
+                    // retry the race with a fresh upload.
+                    let target = state.path().join(format!("out-{}.bin", upload.upload_id));
+                    fs::rename(&temp, &target).await.unwrap();
+                    store.consume(&b, &upload.upload_id).await.unwrap();
+                    assert!(
+                        abort.is_ok()
+                            || matches!(abort, Err(Error::Storage(StorageError::NoSuchUpload(_))))
+                    );
                 }
-                let (complete, abort) = tokio::join!(
-                    store.complete(&b, &k, &upload.upload_id, &completed),
-                    store.abort(&b, &k, &upload.upload_id),
-                );
-                match complete {
-                    Ok((temp, _)) => {
-                        // The completion won — finish the caller flow and
-                        // retry the race with a fresh upload.
-                        let target = state.path().join(format!("out-{}.bin", upload.upload_id));
-                        tokio::fs::rename(&temp, &target).await.unwrap();
-                        store.consume(&b, &upload.upload_id).await.unwrap();
-                        assert!(
-                            abort.is_ok()
-                                || matches!(
-                                    abort,
-                                    Err(Error::Storage(StorageError::NoSuchUpload(_)))
-                                )
-                        );
-                    }
-                    Err(err) => {
-                        assert!(
-                            matches!(err, Error::Storage(StorageError::NoSuchUpload(_))),
-                            "abort mid-assembly must surface NoSuchUpload: {err:?}"
-                        );
-                        saw_no_such_upload = true;
-                        break;
-                    }
+                Err(err) => {
+                    assert!(
+                        matches!(err, Error::Storage(StorageError::NoSuchUpload(_))),
+                        "abort mid-assembly must surface NoSuchUpload: {err:?}"
+                    );
+                    saw_no_such_upload = true;
+                    break;
                 }
             }
-            assert!(saw_no_such_upload, "the abort never landed mid-assembly");
-        });
+        }
+        assert!(saw_no_such_upload, "the abort never landed mid-assembly");
     }
 
-    #[test]
-    fn list_parts_marker_at_u32_max_returns_empty_page() {
+    #[tokio::test]
+    async fn list_parts_marker_at_u32_max_returns_empty_page() {
         // The exclusive marker has no successor at u32::MAX — a
         // saturating +1 would re-include the marker part itself.
         // (Unreachable via S3's 1..=10000 range, but this layer must not
         // rely on that.)
-        rt(async {
-            let (_, store) = fixture();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &k).await.unwrap();
-            // A raw row at the boundary (no part file needed — pass 2
-            // skips missing files; the marker logic sees the raw rows).
-            let bucket = b.clone();
-            let upload_id = upload.upload_id.clone();
-            store
-                .handle
-                .write(move |txn| {
-                    database::PartsTable::open(txn).unwrap().insert(
-                        (&*bucket, upload_id.as_str(), u32::MAX),
-                        "9dd4e461268c8034f5c8564e155c67a6",
-                    )?;
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            // Control: the boundary row is reachable from just below it.
-            let (_, truncated, raw_last) = store
-                .list_parts(&b, &k, &upload.upload_id, Some(u32::MAX - 1), 10)
-                .await
-                .unwrap();
-            assert!(!truncated);
-            assert_eq!(raw_last, Some(u32::MAX));
-            // At the boundary: an empty, untruncated page — the marker
-            // part is never re-included.
-            let (parts, truncated, raw_last) = store
-                .list_parts(&b, &k, &upload.upload_id, Some(u32::MAX), 10)
-                .await
-                .unwrap();
-            assert!(parts.is_empty(), "{parts:?}");
-            assert!(!truncated);
-            assert_eq!(raw_last, None);
-        });
+
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        // A raw row at the boundary (no part file needed — pass 2
+        // skips missing files; the marker logic sees the raw rows).
+        let bucket = b.clone();
+        let upload_id = upload.upload_id.clone();
+        store
+            .handle
+            .write(move |txn| {
+                PartsTable::open(txn).unwrap().insert(
+                    (&*bucket, upload_id.as_str(), u32::MAX),
+                    "9dd4e461268c8034f5c8564e155c67a6",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Control: the boundary row is reachable from just below it.
+        let (_, truncated, raw_last) = store
+            .list_parts(&b, &k, &upload.upload_id, Some(u32::MAX - 1), 10)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(raw_last, Some(u32::MAX));
+        // At the boundary: an empty, untruncated page — the marker
+        // part is never re-included.
+        let (parts, truncated, raw_last) = store
+            .list_parts(&b, &k, &upload.upload_id, Some(u32::MAX), 10)
+            .await
+            .unwrap();
+        assert!(parts.is_empty(), "{parts:?}");
+        assert!(!truncated);
+        assert_eq!(raw_last, None);
     }
 }

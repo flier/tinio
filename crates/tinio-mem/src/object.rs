@@ -5,14 +5,12 @@
 //! access; bodies are copied out before the transaction ends (streams are
 //! `'static` and cannot borrow the transaction guard).
 
-use std::iter::from_fn;
-use std::ops::Bound;
+use std::{iter::from_fn, ops::Bound};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::iter;
 use redb::{ReadableDatabase, ReadableTable};
-
 use tinio_core::{
     BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
     PutObjectResult, bucket, collect_body, from_nanos, group_and_paginate, now_nanos, object,

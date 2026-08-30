@@ -4,10 +4,12 @@ use std::time::SystemTime;
 
 use derive_more::{AsRef, Deref, Display, Into};
 
-use crate::bucket;
-use crate::etag::ETag;
-use crate::object;
-use crate::storage::{self, Error::*};
+use crate::{
+    bucket,
+    etag::ETag,
+    object,
+    storage::{self, Error::*},
+};
 
 /// Inclusive part-number range (S3 / the data model).
 const MIN_PART: u32 = 1;
@@ -25,12 +27,14 @@ pub const MIN_PART_BYTES: u64 = 5 * 1024 * 1024;
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::multipart;
-/// use tinio_core::storage::Error::*;
+/// use tinio_core::{multipart, storage::Error::*};
 ///
 /// let n = multipart::part_number(1).unwrap();
 /// assert_eq!(u32::from(n), 1);
-/// assert!(matches!(multipart::part_number(0), Err(InvalidPartNumber(0))));
+/// assert!(matches!(
+///     multipart::part_number(0),
+///     Err(InvalidPartNumber(0))
+/// ));
 /// let trusted: multipart::PartNumber = 7.into();
 /// assert_eq!(u32::from(trusted), 7);
 /// ```
@@ -81,13 +85,15 @@ pub struct CompletedPart {
 /// # Examples
 ///
 /// ```rust
+/// use std::time::SystemTime;
+///
 /// use tinio_core::MultipartUpload;
 ///
 /// let upload = MultipartUpload {
 ///     upload_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
 ///     bucket: "data".into(),
 ///     key: "big.bin".into(),
-///     initiated_at: std::time::SystemTime::UNIX_EPOCH,
+///     initiated_at: SystemTime::UNIX_EPOCH,
 /// };
 /// assert_eq!(upload.upload_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
 /// ```
@@ -108,13 +114,15 @@ pub struct MultipartUpload {
 /// # Examples
 ///
 /// ```rust
+/// use std::time::SystemTime;
+///
 /// use tinio_core::PartInfo;
 ///
 /// let part = PartInfo {
 ///     part_number: 1.into(),
 ///     size: 5_242_880,
 ///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
-///     last_modified: std::time::SystemTime::UNIX_EPOCH,
+///     last_modified: SystemTime::UNIX_EPOCH,
 /// };
 /// assert_eq!(u32::from(part.part_number), 1);
 /// ```
@@ -132,8 +140,9 @@ pub struct PartInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn part_info_round_trip() {

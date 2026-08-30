@@ -12,6 +12,8 @@
 
 mod error;
 
+use std::process::ExitCode;
+
 pub use self::error::Error;
 
 /// Entry point for the `tinio` CLI.
@@ -30,14 +32,16 @@ pub use self::error::Error;
 ///
 /// Returns success without doing anything until task T066 implements the real
 /// argument parsing and command dispatch.
-pub fn run() -> std::process::ExitCode {
-    std::process::ExitCode::SUCCESS
+pub fn run() -> ExitCode {
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process::ExitCode;
+
     #[test]
     fn placeholder_run_returns_success() {
-        assert_eq!(super::run(), std::process::ExitCode::SUCCESS);
+        assert_eq!(super::run(), ExitCode::SUCCESS);
     }
 }

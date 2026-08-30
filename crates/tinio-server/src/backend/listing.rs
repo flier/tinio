@@ -9,7 +9,6 @@
 //! (FR-021).
 
 use s3s::{S3Request, S3Response, S3Result, dto};
-
 use tinio_core::storage::{ListObjectsParams, Storage};
 
 use crate::backend::{S3Backend, map_backend_error, normalize_delimiter};
@@ -149,13 +148,13 @@ impl<S: Storage> S3Backend<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::backend::testutil::{s3_request, setup as base_setup};
     use s3s::S3;
-    use tinio_core::storage::ObjectOps;
-    use tinio_core::{bucket, object};
+    use tinio_core::{bucket, object, storage::ObjectOps};
     use tinio_mem::MemoryStorage;
     use tinio_util::testing::body;
+
+    use super::*;
+    use crate::backend::testutil::{s3_request, setup as base_setup};
 
     async fn setup() -> (S3Backend<MemoryStorage>, String) {
         let (backend, b) = base_setup().await;

@@ -13,11 +13,11 @@
 use std::{
     error::Error as StdError,
     future::Future,
+    io,
     net::SocketAddr,
     pin::Pin,
-    sync::OnceLock,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -34,19 +34,20 @@ use hyper::{
 };
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
-    server::conn::auto,
+    server::conn::auto::Builder,
 };
+use io::Error as IoError;
+use prometheus::{Encoder, TextEncoder, default_registry};
 use s3s::{
     Body as S3Body,
     auth::SimpleAuth,
     service::{S3Service, S3ServiceBuilder},
 };
-use time::{OffsetDateTime, format_description};
-use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tower::Service as TowerService;
-
+use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
 use tinio_core::storage::Storage;
+use tokio::{net::TcpListener, sync::watch};
+use tower::Service as TowerService;
+use tracing::Level;
 
 use crate::{
     backend::{Capabilities, S3Backend},
@@ -131,7 +132,7 @@ impl DataPlane {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let service = WithPeer { service, peer };
-                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                if let Err(err) = Builder::new(TokioExecutor::new())
                     .serve_connection(io, service)
                     .await
                 {
@@ -161,9 +162,9 @@ struct WithPeer {
 }
 
 impl Service<Request<Incoming>> for WithPeer {
-    type Response = Response<CountingBody<S3Body>>;
     type Error = Box<dyn StdError + Send + Sync>;
     type Future = ServiceFuture;
+    type Response = Response<CountingBody<S3Body>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         // The reserved `/metrics` scrape endpoint (F10): served here,
@@ -190,11 +191,7 @@ fn metrics_response(metrics: &MetricsRefresh) -> ServiceFuture {
     let mut buf = Vec::new();
     // TextEncoder::encode is infallible in practice (the error type
     // is a placeholder) — a failure serves an empty body.
-    let _ = prometheus::Encoder::encode(
-        &prometheus::TextEncoder::new(),
-        &prometheus::default_registry().gather(),
-        &mut buf,
-    );
+    let _ = Encoder::encode(&TextEncoder::new(), &default_registry().gather(), &mut buf);
     let response = Response::builder()
         .status(200)
         .header(CONTENT_TYPE, "text/plain; version=0.0.4")
@@ -250,24 +247,23 @@ impl DataPlaneService {
         // on the `tinio::access` target — tracing would filter the event,
         // but the strings (and the `nginx_time` clock read) would still be
         // allocated on every request (T052).
-        let access_log =
-            tracing::enabled!(target: ACCESS_TARGET, tracing::Level::INFO).then(|| {
-                let request = request_line(&method, req.uri());
-                let user_agent = req
-                    .headers()
-                    .get(USER_AGENT)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("-")
-                    .to_string();
-                let referer = strip_query(
-                    req.headers()
-                        .get(REFERER)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("-"),
-                )
+        let access_log = tracing::enabled!(target: ACCESS_TARGET, Level::INFO).then(|| {
+            let request = request_line(&method, req.uri());
+            let user_agent = req
+                .headers()
+                .get(USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
                 .to_string();
-                (peer.ip().to_string(), request, referer, user_agent)
-            });
+            let referer = strip_query(
+                req.headers()
+                    .get(REFERER)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-"),
+            )
+            .to_string();
+            (peer.ip().to_string(), request, referer, user_agent)
+        });
 
         // Count upload bytes on the request body.
         let (parts, body) = req.into_parts();
@@ -286,7 +282,7 @@ impl DataPlaneService {
             // Display form.
             let result = future
                 .await
-                .map_err(|e| std::io::Error::other(format!("{e:?}")).into());
+                .map_err(|e| IoError::other(format!("{e:?}")).into());
             let elapsed = start.elapsed();
             let upload_bytes = upload_counter.load(Ordering::Relaxed);
             metrics::STORAGE_UPLOAD_BYTES.inc_by(upload_bytes);
@@ -443,8 +439,7 @@ fn emit_access(fields: &AccessFields) {
 /// Nginx-style `time_local` (`23/Aug/2026:12:00:00 +0000`).
 fn nginx_time() -> String {
     // The format description is static — parse it once, not per request.
-    static FORMAT: OnceLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
-        OnceLock::new();
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
     let format = FORMAT.get_or_init(|| {
         format_description::parse_borrowed::<2>(
             "[day]/[month repr:short]/[year]:[hour]:[minute]:[second] +0000",
@@ -468,13 +463,34 @@ fn strip_query(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::{HashMap, VecDeque},
+        fmt::Debug,
+        io,
+        sync::{Mutex, atomic::AtomicUsize},
+        thread,
+        time::Duration,
+    };
+
+    use futures::task;
+    use http_body::{Body as _, Frame};
+    use metrics::WriteLockStats;
+    use tinio_core::pipeline::Stats;
+    use tinio_mem::MemoryStorage;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        runtime::Runtime,
+        task::JoinHandle,
+        time::sleep,
+    };
+    use tracing::{
+        Event, Metadata, Subscriber, field,
+        span::{self, Id},
+        subscriber::with_default,
+    };
+
     use super::*;
-    use http_body::Body as _;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tracing::{Event, Metadata, Subscriber, field, span};
 
     /// One captured event: the target and its key/value fields.
     type CaptureEvent = (String, HashMap<String, String>);
@@ -491,11 +507,15 @@ mod tests {
         fn enabled(&self, _: &Metadata<'_>) -> bool {
             true
         }
+
         fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-            span::Id::from_u64(1)
+            Id::from_u64(1)
         }
+
         fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
         fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
         fn event(&self, event: &Event<'_>) {
             let mut fields = HashMap::new();
             event.record(&mut Fields(&mut fields));
@@ -504,7 +524,9 @@ mod tests {
                 .unwrap()
                 .push((event.metadata().target().to_string(), fields));
         }
+
         fn enter(&self, _: &span::Id) {}
+
         fn exit(&self, _: &span::Id) {}
     }
 
@@ -514,7 +536,8 @@ mod tests {
         fn record_str(&mut self, field: &field::Field, value: &str) {
             self.0.insert(field.name().to_string(), value.to_string());
         }
-        fn record_debug(&mut self, field: &field::Field, value: &dyn std::fmt::Debug) {
+
+        fn record_debug(&mut self, field: &field::Field, value: &dyn Debug) {
             self.0
                 .insert(field.name().to_string(), format!("{value:?}"));
         }
@@ -523,7 +546,7 @@ mod tests {
     /// One raw HTTP/1.1 request over a fresh connection (`Connection:
     /// close`); the response body is read to EOF.
     async fn raw_request(addr: SocketAddr, request: &str) -> (u16, Vec<u8>) {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
@@ -536,9 +559,9 @@ mod tests {
         (status, buf)
     }
 
-    async fn spawn_plane() -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
-        let storage = tinio_mem::MemoryStorage::new().unwrap();
-        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+    async fn spawn_plane() -> (SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
+        let storage = MemoryStorage::new().unwrap();
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
@@ -552,7 +575,7 @@ mod tests {
 
     /// A minimal [`http_body::Body`] serving in-memory chunks.
     struct VecBody {
-        chunks: std::collections::VecDeque<Bytes>,
+        chunks: VecDeque<Bytes>,
     }
 
     impl VecBody {
@@ -565,21 +588,21 @@ mod tests {
 
     impl http_body::Body for VecBody {
         type Data = Bytes;
-        type Error = std::io::Error;
+        type Error = io::Error;
 
         fn poll_frame(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             match self.chunks.pop_front() {
-                Some(data) => Poll::Ready(Some(Ok(http_body::Frame::data(data)))),
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
                 None => Poll::Ready(None),
             }
         }
     }
 
     fn cx() -> Context<'static> {
-        Context::from_waker(futures::task::noop_waker_ref())
+        Context::from_waker(task::noop_waker_ref())
     }
 
     fn drain(body: &mut CountingBody<VecBody>) -> u64 {
@@ -677,8 +700,8 @@ mod tests {
         // write-lock snapshot) and answers the Prometheus text format —
         // a management path on the data-plane listener, never routed to
         // the S3 service.
-        let storage = tinio_mem::MemoryStorage::new().unwrap();
-        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage = MemoryStorage::new().unwrap();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
         let plane = DataPlane::new(storage, Capabilities::default()).with_metrics({
             let hook_calls = Arc::clone(&hook_calls);
             Arc::new(move || {
@@ -688,9 +711,9 @@ mod tests {
                 // The write-lock data is the plain metric form (the
                 // backend conversion lives at the wiring point).
                 metrics::refresh(
-                    tinio_core::pipeline::Stats::default(),
-                    tinio_core::pipeline::Stats::default(),
-                    metrics::WriteLockStats::default(),
+                    Stats::default(),
+                    Stats::default(),
+                    WriteLockStats::default(),
                 );
             })
         });
@@ -739,11 +762,11 @@ mod tests {
         // the shutdown signal ends the loop cleanly with `Ok`.
         let (addr, shutdown, handle) = spawn_plane().await;
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"NOT-HTTP-AT-ALL\r\n\r\n").await.unwrap();
         drop(stream);
         // Let hyper fail the connection so the warn path runs.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         shutdown.send(true).unwrap();
         handle.await.unwrap();
@@ -754,8 +777,8 @@ mod tests {
         // `new_with_auth` configures the SigV4 static credential pair:
         // an unsigned request must be refused (s3s `NotSignedUp` → 403),
         // so interop clients cannot bypass the configured keys.
-        let storage = tinio_mem::MemoryStorage::new().unwrap();
-        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        let storage = MemoryStorage::new().unwrap();
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
@@ -791,17 +814,17 @@ mod tests {
         // thread-local dispatcher); the raw client runs on a std thread.
         let capture = CaptureSubscriber::default();
         let capture2 = capture.clone();
-        tracing::subscriber::with_default(capture, || {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let storage = tinio_mem::MemoryStorage::new().unwrap();
-                let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        with_default(capture, || {
+            Runtime::new().unwrap().block_on(async {
+                let storage = MemoryStorage::new().unwrap();
+                let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
                     .await
                     .unwrap();
                 let addr = listener.local_addr().unwrap();
                 let plane = DataPlane::new(storage, Capabilities::default());
 
-                let client = std::thread::spawn(move || {
-                    tokio::runtime::Runtime::new().unwrap().block_on(raw_request(
+                let client = thread::spawn(move || {
+                    Runtime::new().unwrap().block_on(raw_request(
                         addr,
                         "GET /missing-bucket/key HTTP/1.1\r\nHost: localhost\r\nUser-Agent: test-agent/1.0\r\nReferer: https://example.com/x?token=secret\r\nConnection: close\r\n\r\n",
                     ))
@@ -813,7 +836,7 @@ mod tests {
                     service: (*plane.service).clone(),
                     peer,
                 };
-                auto::Builder::new(TokioExecutor::new())
+                Builder::new(TokioExecutor::new())
                     .serve_connection(io, service)
                     .await
                     .unwrap();

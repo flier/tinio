@@ -3,13 +3,15 @@
 //! Pure data types with serde attributes (TOML shape), `SmartDefault` field
 //! defaults, and garde validation attributes. Unknown keys are not rejected
 //! by serde — the internal `parse_at` collects them via `serde_ignored` and
-//! reports [`crate::Error::UnknownKey`] (FR-016, fail-fast).
+//! reports [`Error::UnknownKey`] (FR-016, fail-fast).
 //! Sections are presence-gated: absent optional sections
 //! parse as `None` and are skipped when the config is re-serialized.
 //!
 //! One public module per TOML section (`api`, `auth`, `log`, …); section
 //! types drop the section prefix (`log::Config`, `api::Http`). The root
 //! document is [`Config`].
+
+use garde::Error as GardeError;
 
 pub mod api;
 pub mod auth;
@@ -27,7 +29,7 @@ pub mod telemetry;
 /// messages (one home for the boilerplate, so the rule cannot drift).
 pub(super) fn reject_empty(message: &str, is_empty: bool) -> garde::Result {
     if is_empty {
-        Err(garde::Error::new(message))
+        Err(GardeError::new(message))
     } else {
         Ok(())
     }

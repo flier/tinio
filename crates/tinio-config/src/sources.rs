@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use crate::Error;
+use crate::{Error, error};
 
 /// Load `<state-dir>/.env` if present (FR-016; loaded from the state dir).
 ///
@@ -30,20 +30,22 @@ use crate::Error;
 /// ```rust
 /// use tinio_config::sources::load_env_file;
 ///
-/// let dir = std::env::temp_dir();
+/// let dir = temp_dir();
 /// // No .env in the temp dir — the call must succeed silently.
 /// assert!(load_env_file(&dir).is_ok());
 /// ```
 pub fn load_env_file(state_dir: &Path) -> Result<(), Error> {
     let path = state_dir.join(".env");
     if path.exists() {
-        dotenvy::from_path(&path).map_err(|e| crate::error::env(path, e))?;
+        dotenvy::from_path(&path).map_err(|e| error::env(path, e))?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -52,7 +54,7 @@ mod tests {
         // Unique name: a lingering value from a previous failed run would
         // only fail this test's assertion, never affect other tests.
         let var = "TINIO_TEST_ENV_FILE_LOADED";
-        std::fs::write(dir.path().join(".env"), format!("{var}=yes\n")).unwrap();
+        fs::write(dir.path().join(".env"), format!("{var}=yes\n")).unwrap();
         load_env_file(dir.path()).unwrap();
         assert_eq!(std::env::var(var).unwrap(), "yes");
     }

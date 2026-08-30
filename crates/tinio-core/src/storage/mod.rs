@@ -89,10 +89,11 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 ///
 /// use tinio_core::bucket;
 /// use tinio_mem::MemoryStorage;
+/// use tokio::runtime::Runtime;
 ///
 /// let storage = MemoryStorage::new().unwrap();
 /// let bucket = bucket::name("data").unwrap();
-/// let buckets = tokio::runtime::Runtime::new()
+/// let buckets = Runtime::new()
 ///     .unwrap()
 ///     .block_on(async {
 ///         storage.create_bucket(&bucket).await.unwrap();
@@ -108,7 +109,7 @@ pub trait Storage: Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps 
     ///
     /// It must convert into the contract error [`Error`] so the S3 mapping
     /// layer and the conformance harness can translate any backend failure.
-    type Error: StdError + Send + Sync + 'static + Into<crate::storage::Error>;
+    type Error: StdError + Send + Sync + 'static + Into<Error>;
 }
 
 /// The default symlink policy of the filesystem backend: `false` = reject

@@ -2,41 +2,37 @@
 
 ## Imports
 
-- `use` at module top, paired with usage (`garde::Validate`, `derive_more::{Display, Deref, …}`, `std::error::Error` bound, `async_trait`); nothing inline in signatures/bounds. `use super::server;` → `server::Config`, never inline.
+- Top `use`; never inline. `super::server` → `server::Config`. Nest `foo::{Bar, dto::{self, Baz}}`.
+- 3+ (`a::b::c`): `use` then short form — code, tests, benches, docs. `Type::item`: `use` type then `Type::item` (not item, not module-qualify). Collide → alias (`IoError`); glob `Error::*` only `error.rs`/tests.
+- `tokio::fs` over `std::fs` (sync / `spawn_blocking` / no-async-API / re-exports `Metadata` stay `std::fs`).
 
 ## Types & defaults
 
-- Untrusted input → checked constructors (`bucket::name`, `object::key`, `multipart::part_number`, `ETag::new`); never import `Name`/`Key` raw.
-- In-module names short, cross-module qualified (`bucket::Name`); import module not type. Derives: `derive_more` (`full`) `Display`/`Deref`/`AsRef`/`Into`; `parse-display` enum `Display`/`FromStr`. `From<&str/String>`: trusted literals only (panic on invalid). Defaults: `SmartDefault` + `#[default = …]`, `#[serde(default)]` when needed.
+- Untrusted → ctor (`bucket::name`, …). Qualify (`bucket::Name`); import module. `derive_more` (`full`); `parse-display` enums. `From<&str>`: literals (panic). `SmartDefault`/`#[serde(default)]`.
 
 ## Validation (garde)
 
-- Custom validators `fn(&T, &Context) -> garde::Result` via `#[garde(custom(...))]`; key/bucket rules private in `object`/`bucket`, public entry = checked constructor.
+- `#[garde(custom(...))]` `fn(&T, &Context) -> garde::Result`; rules private; entry = constructor.
 
 ## Modules & lib.rs
 
-- One module per concern; `lib.rs`/`mod.rs` thin (`mod`/`pub use`, primary type — no logic); tests/impls/helpers in sibling files. Expose via module path (`tinio_fs::bucket::Store`), not crate-root re-exports.
-- Import module not type: `use crate::bucket;` → `bucket::Store`; bare `Store`/`Name` only in defining module; no prefixed names (`DatabaseError`, …). Re-export owned contract types from the concern module (`pub use tinio_core::bucket::{Name, name};`).
-- Standalone stores: module-level `store(state_dir)` (not `Store::new`); constructors drop the prefix (`database::open`, `database::storage_error`); production shares one handle via `Store::from_handle` in `FsStorage`.
-- Config `schema/`: one module per TOML section, prefix dropped (`log::Config`, `api::Http`); `pub mod` each, crate re-exports as `tinio_config::log`; no crate-root section re-exports (collide with `Config`); root = `tinio_config::Config` (+ `Version`).
-- `database/`: fns return `database::Error` only; crate lifts via `From` (`Io` → `Error::Io`, rest incl. `UnsupportedVersion` nests under `Database`); per-kind `From`/constructors in `database/error.rs`; modules split by concern.
-- `database/tables.rs`: all redb handles — private `TableDefinition` const + generic handle (`BucketsTable<'txn, T>(T, PhantomData)`); `table_impl!` generates `Deref`/`DerefMut`, `open`/`ensure`/`open_readonly` (`no_ensure` for `STATE`); domain methods on the specialization.
+- Thin `lib.rs`/`mod.rs`; path-expose (`bucket::Store`); `{Name, name}`; module fns; prod `Store::from_handle`.
+- `schema/`: drop prefix; `Config`+`Version`. `database::Error`; `From` (`Io` unwraps, rest `Database`). `table_impl!` → `open`/`ensure` (`no_ensure`: `STATE`).
 
 ## Error
 
-- `Error` per crate (`tinio_fs::Error`), qualified cross-crate (`storage::Error`); private `mod error`, re-export `Error` + `ErrorBody`; `storage::Error` on the contract module. Bare `Error` collides — glob `Error::*` only in `error.rs`/tests; op modules import `crate::error` constructors.
-- Backends wrap `storage::Error` (`Storage(#[from])`) + own variants; redb nests `Database(database::Error)` — per-kind `From` derived (`thiserror #[from]`), struct variants (`UnsupportedVersion`, `CorruptMeta`) use constructor fns; `?` funnels via `From`; extras → `Io`. Payloads keep original types (`#[from] io::Error`, entities `bucket::Name`, `{range, size}`, `PathBuf`, `String`).
-- Constructors: one `#[inline] pub(crate)` per variant (`no_such_bucket`, `database::storage_error`), one-line `///`, cloneable payloads take `&`, clone inside; call `already_exists(name)`, never the variant; crate wrappers only lift.
+- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `Database`; extras → `Io`. One `#[inline] pub(crate)` ctor/variant (`already_exists(name)`).
 
 ## Async traits
 
-- Storage/cleanup: `async-trait` + `async fn`.
-- Contract: `BucketOps`/`ObjectOps`/`MultipartOps` aggregated by `Storage`; `Error: Into<storage::Error>`; category methods use `<Self as Storage>::Error`; `BodyStream`/`ActionStream` pinned aliases — no re-aliasing.
+- `async-trait` + `async fn`. `Storage` aggregates `*Ops`; `Error: Into<storage::Error>`; methods use `<Self as Storage>::Error`; pinned stream aliases (`BodyStream`, …).
 
 ## ETag
 
-- Raw 16-byte MD5: `Single([u8; 16])`, `Composed([u8; 16], u32)` for `-N`; `Deref`/`AsRef` expose digest; `From<ETag> for Bytes` wire. Parse `ETag::new`/hand-written `FromStr`; emit `as_str`/`Display`; `from_content`; `composed_from_parts`.
+- `Single([u8; 16])`/`Composed([u8; 16], u32)`; parse `ETag::new`; emit `Display`; `from_content`/`composed_from_parts`.
 
 ## Docs & scripts
 
-- Docs: terse, exact, bullets, English only. Scripts: temp helpers in `/tmp`, not the repo.
+- English bullets. Scripts → `/tmp`.
+- Compress: drop articles/filler; fragments OK; form `condition (ex): action — scope`. One example per pattern; extra examples only for distinct branches. Inline code, paths, commands exact.
+- CLAUDE.md = always-loaded pointer (name branches, then this file); this file = source of truth. No restating a rule in both.

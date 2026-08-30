@@ -1,3 +1,5 @@
+use std::ops;
+
 use garde::Validate;
 use secrecy::{CloneableSecret, ExposeSecret, SecretBox, SerializableSecret, zeroize::Zeroize};
 use serde::{Deserialize, Serialize};
@@ -25,7 +27,7 @@ impl SerializableSecret for SecretKey {}
 
 impl CloneableSecret for SecretKey {}
 
-impl std::ops::Deref for SecretKey {
+impl ops::Deref for SecretKey {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {

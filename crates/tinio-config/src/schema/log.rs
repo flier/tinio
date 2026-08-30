@@ -9,6 +9,7 @@ use smart_default::SmartDefault;
 ///
 /// ```rust
 /// use std::str::FromStr;
+///
 /// use tinio_config::log::Verbosity;
 ///
 /// assert_eq!(Verbosity::from_str("debug").unwrap(), Verbosity::Debug);
@@ -32,6 +33,7 @@ pub enum Verbosity {
 ///
 /// ```rust
 /// use std::str::FromStr;
+///
 /// use tinio_config::log::Format;
 ///
 /// assert_eq!(Format::from_str("json").unwrap(), Format::Json);

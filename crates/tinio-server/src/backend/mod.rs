@@ -13,7 +13,6 @@
 //! ([`Capabilities`], from the `[s3]` config section) — disabled groups
 //! answer `NotImplemented` (FR-021).
 
-mod capabilities;
 mod conditions;
 mod errors;
 mod locks;
@@ -28,9 +27,14 @@ pub(crate) mod testutil;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use futures::{FutureExt, StreamExt};
+    use std::io;
+
+    use bytes::Bytes;
+    use futures::{FutureExt, StreamExt, stream};
+    use s3s::S3ErrorCode;
     use tinio_mem::MemoryStorage;
+
+    use super::*;
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -53,13 +57,12 @@ mod tests {
         assert!(empty.next().now_or_never().unwrap().is_none());
         // A present body is wrapped into the contract's body stream,
         // each chunk surfacing as `io::Result<Bytes>`.
-        let stream =
-            futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))]);
-        let body = dto::StreamingBlob::wrap(stream);
+        let stream = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"x"))]);
+        let body = StreamingBlob::wrap(stream);
         let mut streamed = S3Backend::<MemoryStorage>::stream_in(Some(body));
         assert_eq!(
             streamed.next().now_or_never().unwrap().unwrap().unwrap(),
-            bytes::Bytes::from_static(b"x")
+            Bytes::from_static(b"x")
         );
     }
 
@@ -68,42 +71,47 @@ mod tests {
         let backend = backend();
         assert!(backend.bucket("valid-bucket".to_string()).is_ok());
         let err = backend.bucket("UPPER".to_string()).unwrap_err();
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidBucketName, "{err:?}");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidBucketName, "{err:?}");
     }
 }
 
-pub use capabilities::Capabilities;
+use std::{io::Error as IoError, sync::Arc, time::SystemTime};
+
 pub(crate) use conditions::{ConditionFailure, ConditionalHeaders, condition_error};
 pub(crate) use errors::map_backend_error;
-
-use std::{io, sync::Arc, time::SystemTime};
-
-use futures::TryStreamExt;
-use s3s::{S3Error, S3Result, dto, s3_error};
+use futures::{TryStreamExt, stream};
+use mime_guess;
+use s3s::{
+    S3Error, S3Result,
+    dto::{self, CopySource, ETag as WireETag, LastModified, Range, StreamingBlob},
+    s3_error,
+};
+pub use tinio_config::s3::Capabilities;
 use tinio_core::{
     BodyStream, ETag, bucket, object,
     storage::{ByteRange, Error as StorageError, Storage},
 };
-use tinio_util::lockmap;
+use tinio_util::lockmap::{self, Map};
 
 /// The S3 mapping over one [`Storage`] backend.
 ///
 /// # Examples
 ///
 /// ```rust
+/// use http::{Extensions, HeaderMap, Method, Uri};
 /// use s3s::{S3, S3Request, dto};
-/// use tinio_core::bucket;
-/// use tinio_core::storage::BucketOps;
+/// use tinio_core::{bucket, storage::BucketOps};
 /// use tinio_mem::MemoryStorage;
 /// use tinio_server::backend::S3Backend;
+/// use tokio::runtime::Runtime;
 ///
 /// fn request(input: dto::CreateBucketInput) -> S3Request<dto::CreateBucketInput> {
 ///     S3Request {
 ///         input,
-///         method: http::Method::PUT,
-///         uri: http::Uri::default(),
-///         headers: http::HeaderMap::new(),
-///         extensions: http::Extensions::new(),
+///         method: Method::PUT,
+///         uri: Uri::default(),
+///         headers: HeaderMap::new(),
+///         extensions: Extensions::new(),
 ///         credentials: None,
 ///         region: None,
 ///         service: None,
@@ -113,7 +121,7 @@ use tinio_util::lockmap;
 ///
 /// let storage = MemoryStorage::new().unwrap();
 /// let backend = S3Backend::new(storage, Default::default());
-/// let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let result = Runtime::new().unwrap().block_on(async {
 ///     backend
 ///         .create_bucket(request(dto::CreateBucketInput {
 ///             bucket: "data".into(),
@@ -147,7 +155,7 @@ impl<S: Storage> S3Backend<S> {
         Self {
             storage: Arc::new(storage),
             caps,
-            conditional_put_locks: lockmap::Map::new(),
+            conditional_put_locks: Map::new(),
         }
     }
 
@@ -189,24 +197,24 @@ impl<S: Storage> S3Backend<S> {
     /// A `StreamingBlob` request body into the contract's [`BodyStream`].
     pub(crate) fn stream_in(body: Option<dto::StreamingBlob>) -> BodyStream {
         match body {
-            Some(body) => Box::pin(body.map_err(io::Error::other)),
-            None => Box::pin(futures::stream::empty()),
+            Some(body) => Box::pin(body.map_err(IoError::other)),
+            None => Box::pin(stream::empty()),
         }
     }
 
     /// The contract's [`BodyStream`] into a response `StreamingBlob`.
     pub(crate) fn stream_out(body: BodyStream) -> dto::StreamingBlob {
-        dto::StreamingBlob::wrap(body)
+        StreamingBlob::wrap(body)
     }
 
     /// The wire ETag of a contract ETag (the framework emits the quotes).
     pub(crate) fn etag_wire(etag: &ETag) -> dto::ETag {
-        dto::ETag::Strong(etag.as_str())
+        WireETag::Strong(etag.as_str())
     }
 
     /// The response `LastModified` timestamp of a [`SystemTime`].
     pub(crate) fn last_modified(t: SystemTime) -> dto::LastModified {
-        dto::LastModified::from(t)
+        LastModified::from(t)
     }
 
     /// The source of a `CopyObject`/`UploadPartCopy` request into a
@@ -218,7 +226,7 @@ impl<S: Storage> S3Backend<S> {
         source: &dto::CopySource,
     ) -> Result<(bucket::Name, object::Key), S3Error> {
         match source {
-            dto::CopySource::Bucket { bucket, key, .. } => {
+            CopySource::Bucket { bucket, key, .. } => {
                 Ok((self.bucket(bucket.to_string())?, self.key(key.to_string())?))
             }
             _ => Err(s3_error!(InvalidArgument, "unsupported copy source")),
@@ -241,12 +249,12 @@ impl<S: Storage> S3Backend<S> {
 /// shape on top of this mapping.
 pub(crate) fn byte_range(r: dto::Range) -> ByteRange {
     match r {
-        dto::Range::Int {
+        Range::Int {
             first,
             last: Some(last),
         } => ByteRange::Inclusive(first, last),
-        dto::Range::Int { first, last: None } => ByteRange::From(first),
-        dto::Range::Suffix { length } => ByteRange::Suffix(length),
+        Range::Int { first, last: None } => ByteRange::From(first),
+        Range::Suffix { length } => ByteRange::Suffix(length),
     }
 }
 

@@ -2,17 +2,16 @@
 
 use async_trait::async_trait;
 
-use crate::bucket::{self, Bucket};
-
 use super::Storage;
+use crate::bucket::{self, Bucket};
 
 /// Bucket operations of the storage contract.
 ///
 /// Implementations MUST reject invalid bucket names with
-/// [`super::Error::InvalidBucketName`] **before any filesystem access**
+/// [`Error::InvalidBucketName`] **before any filesystem access**
 /// (FR-012 — names are pre-validated by [`bucket::name`]; the check is a
 /// defensive backstop), and report a missing bucket as
-/// [`super::Error::NoSuchBucket`] — the S3 mapping layer relies on it.
+/// [`Error::NoSuchBucket`] — the S3 mapping layer relies on it.
 ///
 /// # Examples
 ///

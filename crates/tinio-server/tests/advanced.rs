@@ -6,6 +6,9 @@
 
 mod e2e;
 
+use std::fs;
+
+use e2e::{Rclone, Server};
 use predicates::prelude::*;
 
 #[test]
@@ -17,7 +20,7 @@ fn advanced() {
     e2e::write_bytes(&big, 10 * 1024 * 1024);
 
     // --- multipart: > 8 MiB file → composed ETag "md5-N" -----------------
-    let server = e2e::Server::start_at(dir.path(), Some(true));
+    let server = Server::start_at(dir.path(), Some(true));
     let ep = server.endpoint();
     e2e::aws_s3(ep, "mb", &["s3://adv-bucket"])
         .assert()
@@ -80,9 +83,9 @@ fn advanced() {
     // the first listing computes ETags synchronously; with the scanner
     // running, later listings are warm.
     let cold = dir.path().join("cold-bucket");
-    std::fs::create_dir_all(&cold).unwrap();
+    fs::create_dir_all(&cold).unwrap();
     for i in 1..=50 {
-        std::fs::write(cold.join(format!("file-{i}.txt")), format!("cold file {i}")).unwrap();
+        fs::write(cold.join(format!("file-{i}.txt")), format!("cold file {i}")).unwrap();
     }
     e2e::aws_s3(ep, "ls", &["s3://cold-bucket/"])
         .assert()
@@ -92,7 +95,7 @@ fn advanced() {
     drop(server);
 
     // --- cold listing (scanner OFF, same root) ---------------------------
-    let server = e2e::Server::start_at(dir.path(), Some(false));
+    let server = Server::start_at(dir.path(), Some(false));
     let ep = server.endpoint();
     e2e::aws_s3(ep, "ls", &["s3://cold-bucket/"])
         .assert()
@@ -100,14 +103,14 @@ fn advanced() {
         .stdout(predicate::str::contains("file-50.txt"));
 
     // --- rclone multipart + copy -----------------------------------------
-    let rclone = e2e::Rclone::new(scratch.path().join("rclone.conf"));
+    let rclone = Rclone::new(scratch.path().join("rclone.conf"));
     rclone.remote(ep).assert().success();
     rclone
         .cmd(&["copy", big.to_str().unwrap(), "tinio:adv-bucket/"])
         .assert()
         .success();
     let rclone_dl = scratch.path().join("rclone-dl");
-    std::fs::create_dir_all(&rclone_dl).unwrap();
+    fs::create_dir_all(&rclone_dl).unwrap();
     rclone
         .cmd(&[
             "copy",

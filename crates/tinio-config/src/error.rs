@@ -15,7 +15,10 @@ use std::{io, path::PathBuf};
 /// use tinio_config::Error;
 ///
 /// let err = Error::Missing("api.https.cert".into());
-/// assert_eq!(err.to_string(), "missing required configuration: api.https.cert");
+/// assert_eq!(
+///     err.to_string(),
+///     "missing required configuration: api.https.cert"
+/// );
 ///
 /// let err = Error::InvalidValue {
 ///     key: "server.port".into(),
@@ -129,7 +132,10 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, path::PathBuf};
+    use std::{io::Error as IoError, path::PathBuf};
+
+    use dotenvy::Error as DotenvyError;
+    use garde::Report;
 
     use super::*;
 
@@ -154,7 +160,7 @@ mod tests {
             (
                 Error::Io {
                     path: PathBuf::from("config.toml"),
-                    source: io::Error::other("denied"),
+                    source: IoError::other("denied"),
                 },
                 "failed to read config file `config.toml`: denied",
             ),
@@ -175,7 +181,7 @@ mod tests {
     fn env_constructor_labels_path_and_source() {
         let err = env(
             PathBuf::from(".tinio/.env"),
-            dotenvy::Error::Io(io::Error::other("boom")),
+            DotenvyError::Io(IoError::other("boom")),
         );
         assert!(matches!(err, Error::Env { .. }));
         assert!(err.to_string().contains(".tinio/.env"));
@@ -183,7 +189,7 @@ mod tests {
 
     #[test]
     fn empty_report_maps_to_parse_error() {
-        let err = Error::from_report(garde::Report::new());
+        let err = Error::from_report(Report::new());
         assert!(matches!(err, Error::Parse { .. }));
     }
 }

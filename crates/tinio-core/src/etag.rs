@@ -1,8 +1,9 @@
 //! Validated ETag wire-format and content helpers.
 
-use std::{ops::Deref, str::FromStr};
+use std::{num::ParseIntError, ops::Deref, str::FromStr};
 
 use bytes::Bytes;
+use derive_more::Display;
 use md5::{Digest, Md5};
 
 use crate::{multipart::PartInfo, storage};
@@ -35,7 +36,8 @@ use crate::{multipart::PartInfo, storage};
 ///
 /// assert!(ETag::new("not-a-hex-etag").is_err());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Display)]
+#[display("{}", self.as_str())]
 pub enum ETag {
     /// Content MD5 for a single upload.
     Single([u8; 16]),
@@ -53,7 +55,7 @@ pub enum Error {
     #[error("invalid ETag part count")]
     PartCount {
         #[source]
-        source: std::num::ParseIntError,
+        source: ParseIntError,
     },
 }
 
@@ -161,12 +163,6 @@ impl From<ETag> for Bytes {
     }
 }
 
-impl std::fmt::Display for ETag {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.as_str())
-    }
-}
-
 impl From<&str> for ETag {
     /// Trusted-input convenience (panics on invalid ETags — use
     /// [`ETag::new`] for untrusted input).
@@ -177,8 +173,9 @@ impl From<&str> for ETag {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn etag_validates_formats() {

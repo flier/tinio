@@ -2,9 +2,8 @@
 
 use std::{io, num::ParseIntError};
 
-use crate::{bucket, etag, object};
-
 use super::range::ByteRange;
+use crate::{bucket, etag, object};
 
 /// A backend-agnostic storage failure.
 ///
@@ -17,14 +16,15 @@ use super::range::ByteRange;
 /// # Examples
 ///
 /// ```rust
+/// use std::io;
+///
 /// use tinio_core::storage::{self, Error::*};
 ///
 /// let err = NoSuchBucket("data".into());
 /// assert_eq!(err.to_string(), "no such bucket: `data`");
 ///
 /// // I/O errors convert into the domain error transparently.
-/// let io_err: storage::Error =
-///     std::io::Error::new(std::io::ErrorKind::NotFound, "gone").into();
+/// let io_err: storage::Error = io::Error::new(io::ErrorKind::NotFound, "gone").into();
 /// assert!(matches!(io_err, Io(_)));
 /// ```
 #[derive(Debug, thiserror::Error)]
@@ -229,11 +229,15 @@ pub fn io(err: io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::error::Error as StdError;
+    use std::{
+        error::Error as StdError,
+        io::{Error as IoError, ErrorKind},
+    };
 
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
+    use crate::etag::Error::*;
 
     #[test]
     fn displays_variants() {
@@ -267,7 +271,7 @@ mod tests {
                 "invalid bucket name: `Bad_Name`",
             ),
             (
-                Error::InvalidETag(crate::etag::Error::InvalidFormat),
+                Error::InvalidETag(InvalidFormat),
                 "invalid etag: invalid ETag format",
             ),
             (Error::InvalidPartNumber(0), "invalid part number: 0"),
@@ -285,7 +289,7 @@ mod tests {
                 "access denied: `a/.tinio/b`",
             ),
             (
-                Error::Io(io::Error::from(io::ErrorKind::NotFound)),
+                Error::Io(IoError::from(ErrorKind::NotFound)),
                 "I/O error: entity not found",
             ),
         ];
@@ -302,10 +306,10 @@ mod tests {
 
     #[test]
     fn original_errors_convert_with_from() {
-        let err = Error::from(io::Error::other("boom"));
+        let err = Error::from(IoError::other("boom"));
         assert!(matches!(err, Error::Io(_)));
 
-        let err = Error::from(crate::etag::Error::InvalidFormat);
+        let err = Error::from(InvalidFormat);
         assert!(matches!(err, Error::InvalidETag(_)));
 
         let src = "x".parse::<u32>().unwrap_err();
@@ -332,9 +336,6 @@ mod tests {
             invalid_bucket_name("Bad_Name".into()),
             Error::InvalidBucketName(_)
         ));
-        assert!(matches!(
-            invalid_etag(crate::etag::Error::InvalidFormat),
-            Error::InvalidETag(_)
-        ));
+        assert!(matches!(invalid_etag(InvalidFormat), Error::InvalidETag(_)));
     }
 }

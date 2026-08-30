@@ -34,14 +34,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+pub use object::{Key, key};
 use tinio_core::{etag::ETag, from_nanos, object, to_nanos};
 
-use crate::bucket;
-
 pub use crate::bucket::{Name, name};
-pub use object::{Key, key};
-
-use crate::{Error, database, etag};
+use crate::{
+    Error, bucket,
+    database::{self, Handle, ObjectMetaTable},
+    etag::{self, HashBuffer},
+};
 
 /// The jitter-window fallback when no file identity is available (a
 /// stored identity of `0` — platforms without one, or filesystems
@@ -108,24 +109,16 @@ pub(crate) fn composed_gate(etag: &ETag, stored_size: u64, size: u64) -> bool {
 /// The streaming content MD5 of `path` plus the hash-time size, mtime,
 /// and file identity of the hashed handle: [`etag::md5_of_path`]
 /// (the same symlink-policy open as the IO-pipeline compute task, R3 —
-/// torn-file verified, F19) run on the blocking pool — the store methods
-/// are async, the helper is sync. The hash runs on the blocking thread's
-/// pooled 64 KiB buffer (item 4 — one buffer per worker thread, shared
-/// with the IO-pipeline tasks).
+/// torn-file verified, F19) awaited directly — the hash IO runs on the
+/// tokio blocking pool, reading into a pooled 64 KiB buffer
+/// ([`etag::HashBuffer`], item 4 — one allocation per hash concurrency,
+/// never per request).
 async fn md5_of_file(
     path: &Path,
     follow_symlinks: bool,
 ) -> Result<([u8; 16], u64, SystemTime, u64), Error> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        etag::with_hash_buffer(|buf| etag::md5_of_path(&path, follow_symlinks, buf))
-    })
-    .await
-    // A panicking hash closure re-panics the caller, consistent with
-    // `database::Handle`'s join-error handling (a panic is a bug, not a
-    // recoverable IO error — converting it to `io::Error` would mask it
-    // as a self-healable recompute, data-path review 2026-08-29).
-    .unwrap_or_else(|join| panic!("the file-hash task panicked: {join}"))
+    let mut buf = HashBuffer::acquire();
+    etag::md5_of_path(path, follow_symlinks, buf.as_mut()).await
 }
 
 /// Whether a stored `(size, mtime, identity)` still matches the object
@@ -159,6 +152,7 @@ pub(crate) fn entry_matches(
 ///
 /// ```rust
 /// use std::time::SystemTime;
+///
 /// use tinio_fs::meta::Record;
 ///
 /// let record = Record {
@@ -221,7 +215,7 @@ pub struct BatchEntry {
     /// The object mtime at walk time.
     pub mtime: SystemTime,
     /// The file identity at hash time (`0` marks an unavailable platform
-    /// identity; see `crate::fsutil::file_identity`).
+    /// identity; see `fsutil::file_identity`).
     pub identity: u64,
 }
 
@@ -231,15 +225,20 @@ pub struct BatchEntry {
 ///
 /// ```rust
 /// use std::time::SystemTime;
+///
 /// use tinio_core::{ETag, bucket, object};
 /// use tinio_fs::meta;
+/// use tokio::runtime::Runtime;
 /// let state = tempfile::tempdir().unwrap();
 /// let store = meta::store(state.path()).unwrap();
 /// let bucket = bucket::name("data").unwrap();
 /// let key = object::key("dir/file.txt").unwrap();
 /// let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
-///     store.set(&bucket, &key, &etag, 4, SystemTime::UNIX_EPOCH, 0).await.unwrap();
+/// Runtime::new().unwrap().block_on(async {
+///     store
+///         .set(&bucket, &key, &etag, 4, SystemTime::UNIX_EPOCH, 0)
+///         .await
+///         .unwrap();
 ///     let record = store.get(&bucket, &key).await.unwrap().unwrap();
 ///     assert_eq!(record.etag, etag);
 ///     assert_eq!(record.size, 4);
@@ -250,13 +249,13 @@ pub struct BatchEntry {
 pub struct Store {
     /// The shared state-database handle (the redb single writer replaces
     /// the old in-process lock).
-    handle: Arc<database::Handle>,
+    handle: Arc<Handle>,
 }
 
 impl Store {
     /// Create a store over a shared state-database handle (the `FsStorage`
     /// construction path — one handle across all stores).
-    pub(crate) fn from_handle(handle: Arc<database::Handle>) -> Self {
+    pub(crate) fn from_handle(handle: Arc<Handle>) -> Self {
         Self { handle }
     }
 
@@ -272,7 +271,7 @@ impl Store {
         key: &object::Key,
     ) -> Result<Option<database::StoredMeta>, Error> {
         self.handle
-            .read(|txn| database::ObjectMetaTable::open_readonly(txn)?.get(bucket, key))
+            .read(|txn| ObjectMetaTable::open_readonly(txn)?.get(bucket, key))
             .map_err(Into::into)
     }
 
@@ -407,7 +406,7 @@ impl Store {
 
     /// Store (or overwrite) the entry for `key` — one write transaction.
     /// `identity` is the file identity at record time (see
-    /// `crate::fsutil::file_identity`); `0` marks an unavailable
+    /// `fsutil::file_identity`); `0` marks an unavailable
     /// platform identity.
     pub async fn set(
         &self,
@@ -425,8 +424,7 @@ impl Store {
         let etag = etag.clone();
         self.handle
             .write(move |txn| {
-                database::ObjectMetaTable::open(txn)?
-                    .put(&bucket, &key, &etag, size, mtime, identity)
+                ObjectMetaTable::open(txn)?.put(&bucket, &key, &etag, size, mtime, identity)
             })
             .await
             .map_err(Into::into)
@@ -435,7 +433,7 @@ impl Store {
     /// Upsert a whole batch in ONE write transaction, per-entry
     /// last-write-wins (a duplicated key in `entries` is settled by its
     /// last occurrence; pipeline-spec.md §3.2). Each entry carries its
-    /// file identity at record time (see `crate::fsutil::file_identity`;
+    /// file identity at record time (see `fsutil::file_identity`;
     /// `0` marks an unavailable platform identity). The batching policy
     /// lives in the producers (pipeline-spec.md task 4) — this is the
     /// primitive they call once per batch. An empty `entries` is a no-op:
@@ -473,7 +471,7 @@ impl Store {
         let bucket = bucket.clone();
         self.handle
             .write(move |txn| {
-                let mut table = database::ObjectMetaTable::open(txn)?;
+                let mut table = ObjectMetaTable::open(txn)?;
                 for entry in &entries {
                     table.put(
                         &bucket,
@@ -495,7 +493,7 @@ impl Store {
         let bucket = bucket.clone();
         let key = key.clone();
         self.handle
-            .write(move |txn| database::ObjectMetaTable::open(txn)?.remove(&bucket, &key))
+            .write(move |txn| ObjectMetaTable::open(txn)?.remove(&bucket, &key))
             .await
             .map_err(Into::into)
     }
@@ -520,7 +518,7 @@ impl Store {
     ) -> Result<Vec<Option<database::StoredMeta>>, Error> {
         self.handle
             .read(|txn| {
-                let table = database::ObjectMetaTable::open_readonly(txn)?;
+                let table = ObjectMetaTable::open_readonly(txn)?;
                 keys.into_iter().map(|key| table.get(bucket, key)).collect()
             })
             .map_err(Into::into)
@@ -548,7 +546,7 @@ impl Store {
     pub fn load_bucket(&self, bucket: &bucket::Name) -> Result<Vec<GatedMeta>, Error> {
         self.handle
             .read(|txn| {
-                let table = database::ObjectMetaTable::open_readonly(txn)?;
+                let table = ObjectMetaTable::open_readonly(txn)?;
                 let mut out = Vec::new();
                 table.for_bucket_gated(bucket, |key, stored| {
                     out.push(GatedMeta { key, stored });
@@ -567,14 +565,14 @@ impl Store {
     /// **Async via the blocking pool (P3, data-path review 2026-08-27)**:
     /// the walk is a full-bucket table scan (row-by-row validation +
     /// allocation), so the closure + read transaction run on the tokio
-    /// blocking pool through `database::Handle::read_blocking` — the
+    /// blocking pool through `Handle::read_blocking` — the
     /// same G3 hop shape as the write path — and never block a runtime
     /// worker's request tasks.
     pub async fn walk(&self, bucket: &bucket::Name) -> Result<Vec<Record>, Error> {
         let bucket = bucket.clone();
         self.handle
             .read_blocking(move |txn| {
-                let table = database::ObjectMetaTable::open_readonly(txn)?;
+                let table = ObjectMetaTable::open_readonly(txn)?;
                 let mut out = Vec::new();
                 table.for_bucket(&bucket, |key, etag, size, mtime| {
                     out.push(Record {
@@ -593,12 +591,12 @@ impl Store {
 
     /// Remove the whole meta subtree of `bucket` (one atomic range
     /// deletion). Test-only since the production teardown goes through
-    /// [`crate::FsStorage::remove_bucket_state`].
+    /// [`FsStorage::remove_bucket_state`].
     #[cfg(test)]
     pub async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let bucket = bucket.clone();
         self.handle
-            .write(move |txn| database::ObjectMetaTable::open(txn)?.drain_bucket(&bucket))
+            .write(move |txn| ObjectMetaTable::open(txn)?.drain_bucket(&bucket))
             .await
             .map_err(Into::into)
     }
@@ -618,16 +616,19 @@ impl Store {
 /// `meta.redb`).
 #[inline]
 pub fn store(state_dir: &Path) -> Result<Store, Error> {
-    Ok(Store::from_handle(database::Handle::open(state_dir)?))
+    Ok(Store::from_handle(Handle::open(state_dir)?))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{database, meta, testutil::rt};
-    use std::time::Duration;
+    use std::{fs::File, io::Write, thread::sleep, time::Duration};
+
     use tinio_core::{bucket, object};
     use tinio_util::testing::etag;
+    use tokio::fs;
+
+    use super::*;
+    use crate::{database, fsutil, meta};
 
     fn mtime(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -641,7 +642,7 @@ mod tests {
         let db = database::open(state_dir).unwrap().db;
         let mut txn = db.begin_write().unwrap();
         {
-            let mut table = database::ObjectMetaTable::open(&mut txn).unwrap();
+            let mut table = ObjectMetaTable::open(&mut txn).unwrap();
             table
                 .insert((bucket, key), ("not-an-etag", 1, 1, 0))
                 .unwrap();
@@ -656,7 +657,7 @@ mod tests {
         let db = database::open(state_dir).unwrap().db;
         let mut txn = db.begin_write().unwrap();
         {
-            let mut table = database::ObjectMetaTable::open(&mut txn).unwrap();
+            let mut table = ObjectMetaTable::open(&mut txn).unwrap();
             table
                 .insert((bucket, key), ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 0))
                 .unwrap();
@@ -664,806 +665,720 @@ mod tests {
         txn.commit().unwrap();
     }
 
-    #[test]
-    fn set_get_round_trip() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("dir/file.txt").unwrap();
+    #[tokio::test]
+    async fn set_get_round_trip() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("dir/file.txt").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                4,
+                mtime(100),
+                0,
+            )
+            .await
+            .unwrap();
+        let record = store.get(&b, &k).await.unwrap().unwrap();
+        assert_eq!(record.key, k);
+        assert_eq!(record.etag, etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(record.size, 4);
+        assert!(record.matches(4, mtime(100)));
+        assert!(!record.matches(5, mtime(100)));
+        assert!(!record.matches(4, mtime(101)));
+    }
+
+    #[tokio::test]
+    async fn get_missing_is_none() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("nope.txt").unwrap();
+        assert!(store.get(&b, &k).await.unwrap().is_none());
+        assert_eq!(
+            store.etag_matching(&b, &k, 0, mtime(0), 0).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_matching_requires_size_mtime_and_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        let e = etag("d41d8cd98f00b204e9800998ecf8427e");
+        store.set(&b, &k, &e, 10, mtime(42), 7).await.unwrap();
+        assert_eq!(
+            store.etag_matching(&b, &k, 10, mtime(42), 7).await.unwrap(),
+            Some(e.clone())
+        );
+        assert_eq!(
+            store.etag_matching(&b, &k, 11, mtime(42), 7).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            store.etag_matching(&b, &k, 10, mtime(43), 7).await.unwrap(),
+            None
+        );
+        // F01: the identity is consulted — a mtime-preserving
+        // replacement (same size + mtime, new file) must not match.
+        assert_eq!(
+            store.etag_matching(&b, &k, 10, mtime(42), 8).await.unwrap(),
+            None
+        );
+        // A zero identity on either side falls back to size + mtime.
+        assert_eq!(
+            store.etag_matching(&b, &k, 10, mtime(42), 0).await.unwrap(),
+            Some(e)
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_and_is_idempotent() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                1,
+                mtime(1),
+                0,
+            )
+            .await
+            .unwrap();
+        store.remove(&b, &k).await.unwrap();
+        assert!(store.get(&b, &k).await.unwrap().is_none());
+        store.remove(&b, &k).await.unwrap(); // idempotent
+    }
+
+    #[tokio::test]
+    async fn overwrite_replaces_entry() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                1,
+                mtime(1),
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
+                2,
+                mtime(2),
+                0,
+            )
+            .await
+            .unwrap();
+        let record = store.get(&b, &k).await.unwrap().unwrap();
+        assert_eq!(record.size, 2);
+        assert_eq!(record.etag, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
+    }
+
+    #[tokio::test]
+    async fn set_batch_round_trips_entries_with_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let entries = vec![
+            meta::BatchEntry {
+                key: object::key("a.txt").unwrap(),
+                etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+                size: 1,
+                mtime: mtime(1),
+                identity: 11,
+            },
+            meta::BatchEntry {
+                key: object::key("dir/b.txt").unwrap(),
+                etag: etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
+                size: 2,
+                mtime: mtime(2),
+                identity: 22,
+            },
+            meta::BatchEntry {
+                key: object::key("dir/sub/c.txt").unwrap(),
+                etag: etag("e10adc3949ba59abbe56e057f20f883e"),
+                size: 3,
+                mtime: mtime(3),
+                identity: 33,
+            },
+        ];
+        store.set_batch(&b, &entries).await.unwrap();
+        // The point-read form is index-aligned with the request — the
+        // slots are mapped back by position, not by key.
+        let rows = store
+            .load_entries(&b, entries.iter().map(|e| &e.key))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), entries.len());
+        for (row, entry) in rows.iter().zip(&entries) {
+            let stored = row.as_ref().unwrap();
+            assert_eq!(stored.etag, entry.etag);
+            assert_eq!(stored.size, entry.size);
+            assert_eq!(stored.mtime, to_nanos(entry.mtime));
+            assert_eq!(stored.file_identity, entry.identity);
+        }
+        // The traversal form sees the same stored rows (same
+        // transaction semantics, both forms of the gating load — R1).
+        let walked: Vec<Option<database::StoredMeta>> = store
+            .load_bucket(&b)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.stored)
+            .collect();
+        assert_eq!(walked, rows);
+    }
+
+    #[tokio::test]
+    async fn set_batch_last_write_wins() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let entries = vec![
+            meta::BatchEntry {
+                key: object::key("a.txt").unwrap(),
+                etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+                size: 1,
+                mtime: mtime(1),
+                identity: 11,
+            },
+            meta::BatchEntry {
+                key: object::key("a.txt").unwrap(),
+                etag: etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
+                size: 2,
+                mtime: mtime(2),
+                identity: 22,
+            },
+        ];
+        store.set_batch(&b, &entries).await.unwrap();
+        let rows = store
+            .load_entries(&b, [object::key("a.txt").unwrap()].iter())
+            .await
+            .unwrap();
+        let stored = rows[0].as_ref().unwrap();
+        assert_eq!(stored.etag, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
+        assert_eq!(stored.size, 2);
+        assert_eq!(stored.mtime, to_nanos(mtime(2)));
+        assert_eq!(stored.file_identity, 22);
+    }
+
+    #[tokio::test]
+    async fn set_batch_empty_is_a_no_op() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        store.set_batch(&b, &[]).await.unwrap();
+        assert!(store.walk(&b).await.unwrap().is_empty());
+        store
+            .set(
+                &b,
+                &object::key("a.txt").unwrap(),
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                1,
+                mtime(1),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.walk(&b).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_entries_returns_each_requested_key_in_order() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        store
+            .set(
+                &b,
+                &object::key("a.txt").unwrap(),
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                1,
+                mtime(1),
+                7,
+            )
+            .await
+            .unwrap();
+        let keys = [
+            object::key("a.txt").unwrap(),
+            object::key("missing.txt").unwrap(),
+            object::key("b.txt").unwrap(),
+        ];
+        let rows = store.load_entries(&b, keys.iter()).await.unwrap();
+        assert_eq!(rows.len(), keys.len());
+        assert!(rows[0].is_some());
+        assert!(rows[1].is_none());
+        assert!(rows[2].is_none());
+    }
+
+    #[tokio::test]
+    async fn load_entries_treats_a_corrupt_etag_as_missing() {
+        let state = tempfile::tempdir().unwrap();
+        corrupt_entry(state.path(), "data", "a.txt");
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let rows = store
+            .load_entries(&b, [object::key("a.txt").unwrap()].iter())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_none(), "{:?}", rows[0]);
+    }
+
+    #[tokio::test]
+    async fn load_bucket_walks_rows_in_key_order_with_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        for (key_str, identity) in [("a.txt", 11u64), ("dir/b.txt", 22), ("z.txt", 33)] {
             store
                 .set(
                     &b,
-                    &k,
-                    &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    4,
-                    mtime(100),
-                    0,
-                )
-                .await
-                .unwrap();
-            let record = store.get(&b, &k).await.unwrap().unwrap();
-            assert_eq!(record.key, k);
-            assert_eq!(record.etag, etag("d41d8cd98f00b204e9800998ecf8427e"));
-            assert_eq!(record.size, 4);
-            assert!(record.matches(4, mtime(100)));
-            assert!(!record.matches(5, mtime(100)));
-            assert!(!record.matches(4, mtime(101)));
-        });
-    }
-
-    #[test]
-    fn get_missing_is_none() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("nope.txt").unwrap();
-            assert!(store.get(&b, &k).await.unwrap().is_none());
-            assert_eq!(
-                store.etag_matching(&b, &k, 0, mtime(0), 0).await.unwrap(),
-                None
-            );
-        });
-    }
-
-    #[test]
-    fn etag_matching_requires_size_mtime_and_identity() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.txt").unwrap();
-            let e = etag("d41d8cd98f00b204e9800998ecf8427e");
-            store.set(&b, &k, &e, 10, mtime(42), 7).await.unwrap();
-            assert_eq!(
-                store.etag_matching(&b, &k, 10, mtime(42), 7).await.unwrap(),
-                Some(e.clone())
-            );
-            assert_eq!(
-                store.etag_matching(&b, &k, 11, mtime(42), 7).await.unwrap(),
-                None
-            );
-            assert_eq!(
-                store.etag_matching(&b, &k, 10, mtime(43), 7).await.unwrap(),
-                None
-            );
-            // F01: the identity is consulted — a mtime-preserving
-            // replacement (same size + mtime, new file) must not match.
-            assert_eq!(
-                store.etag_matching(&b, &k, 10, mtime(42), 8).await.unwrap(),
-                None
-            );
-            // A zero identity on either side falls back to size + mtime.
-            assert_eq!(
-                store.etag_matching(&b, &k, 10, mtime(42), 0).await.unwrap(),
-                Some(e)
-            );
-        });
-    }
-
-    #[test]
-    fn remove_deletes_and_is_idempotent() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.txt").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
+                    &object::key(key_str).unwrap(),
                     &etag("d41d8cd98f00b204e9800998ecf8427e"),
                     1,
                     mtime(1),
-                    0,
+                    identity,
                 )
                 .await
                 .unwrap();
-            store.remove(&b, &k).await.unwrap();
-            assert!(store.get(&b, &k).await.unwrap().is_none());
-            store.remove(&b, &k).await.unwrap(); // idempotent
-        });
+        }
+        let rows = store.load_bucket(&b).unwrap();
+        let seen: Vec<(&str, Option<u64>)> = rows
+            .iter()
+            .map(|r| (&*r.key, r.stored.as_ref().map(|s| s.file_identity)))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.txt", Some(11)),
+                ("dir/b.txt", Some(22)),
+                ("z.txt", Some(33))
+            ]
+        );
     }
 
-    #[test]
-    fn overwrite_replaces_entry() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.txt").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    1,
-                    mtime(1),
-                    0,
-                )
-                .await
-                .unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
-                    2,
-                    mtime(2),
-                    0,
-                )
-                .await
-                .unwrap();
-            let record = store.get(&b, &k).await.unwrap().unwrap();
-            assert_eq!(record.size, 2);
-            assert_eq!(record.etag, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
-        });
-    }
-
-    #[test]
-    fn set_batch_round_trips_entries_with_identity() {
-        // One write transaction for the whole batch; every entry comes
-        // back intact, including the file identity (exposed by the
-        // gating-load rows — `Record` hides it by design).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let entries = vec![
-                meta::BatchEntry {
-                    key: object::key("a.txt").unwrap(),
-                    etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    size: 1,
-                    mtime: mtime(1),
-                    identity: 11,
-                },
-                meta::BatchEntry {
-                    key: object::key("dir/b.txt").unwrap(),
-                    etag: etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
-                    size: 2,
-                    mtime: mtime(2),
-                    identity: 22,
-                },
-                meta::BatchEntry {
-                    key: object::key("dir/sub/c.txt").unwrap(),
-                    etag: etag("e10adc3949ba59abbe56e057f20f883e"),
-                    size: 3,
-                    mtime: mtime(3),
-                    identity: 33,
-                },
-            ];
-            store.set_batch(&b, &entries).await.unwrap();
-            // The point-read form is index-aligned with the request — the
-            // slots are mapped back by position, not by key.
-            let rows = store
-                .load_entries(&b, entries.iter().map(|e| &e.key))
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), entries.len());
-            for (row, entry) in rows.iter().zip(&entries) {
-                let stored = row.as_ref().unwrap();
-                assert_eq!(stored.etag, entry.etag);
-                assert_eq!(stored.size, entry.size);
-                assert_eq!(stored.mtime, to_nanos(entry.mtime));
-                assert_eq!(stored.file_identity, entry.identity);
-            }
-            // The traversal form sees the same stored rows (same
-            // transaction semantics, both forms of the gating load — R1).
-            let walked: Vec<Option<database::StoredMeta>> = store
-                .load_bucket(&b)
-                .unwrap()
-                .into_iter()
-                .map(|row| row.stored)
-                .collect();
-            assert_eq!(walked, rows);
-        });
-    }
-
-    #[test]
-    fn set_batch_last_write_wins() {
-        // A key appearing twice in one batch is settled by its LAST
-        // occurrence (the producers batch per key once, but the
-        // primitive's contract is last-write-wins per entry).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let entries = vec![
-                meta::BatchEntry {
-                    key: object::key("a.txt").unwrap(),
-                    etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    size: 1,
-                    mtime: mtime(1),
-                    identity: 11,
-                },
-                meta::BatchEntry {
-                    key: object::key("a.txt").unwrap(),
-                    etag: etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
-                    size: 2,
-                    mtime: mtime(2),
-                    identity: 22,
-                },
-            ];
-            store.set_batch(&b, &entries).await.unwrap();
-            let rows = store
-                .load_entries(&b, [object::key("a.txt").unwrap()].iter())
-                .await
-                .unwrap();
-            let stored = rows[0].as_ref().unwrap();
-            assert_eq!(stored.etag, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
-            assert_eq!(stored.size, 2);
-            assert_eq!(stored.mtime, to_nanos(mtime(2)));
-            assert_eq!(stored.file_identity, 22);
-        });
-    }
-
-    #[test]
-    fn set_batch_empty_is_a_no_op() {
-        // An empty batch must not take the write lock nor fsync an empty
-        // transaction (the producers may flush an empty accumulator — the
-        // early return keeps it off the single-writer path). The return
-        // value is the observable contract; the store stays usable.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            store.set_batch(&b, &[]).await.unwrap();
-            assert!(store.walk(&b).await.unwrap().is_empty());
-            store
-                .set(
-                    &b,
-                    &object::key("a.txt").unwrap(),
-                    &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    1,
-                    mtime(1),
-                    0,
-                )
-                .await
-                .unwrap();
-            assert_eq!(store.walk(&b).await.unwrap().len(), 1);
-        });
-    }
-
-    #[test]
-    fn load_entries_returns_each_requested_key_in_order() {
-        // 1:1 with the request — present rows and missing rows alike, in
-        // request order (the list producer maps the walked keys one-to-one).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            store
-                .set(
-                    &b,
-                    &object::key("a.txt").unwrap(),
-                    &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    1,
-                    mtime(1),
-                    7,
-                )
-                .await
-                .unwrap();
-            let keys = [
-                object::key("a.txt").unwrap(),
-                object::key("missing.txt").unwrap(),
-                object::key("b.txt").unwrap(),
-            ];
-            let rows = store.load_entries(&b, keys.iter()).await.unwrap();
-            assert_eq!(rows.len(), keys.len());
-            assert!(rows[0].is_some());
-            assert!(rows[1].is_none());
-            assert!(rows[2].is_none());
-        });
-    }
-
-    #[test]
-    fn load_entries_treats_a_corrupt_etag_as_missing() {
-        // P2: a domain-invalid etag aligns with `get()` — reported as
-        // missing (the caller recomputes and rewrites — self-healing),
-        // never an error.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            corrupt_entry(state.path(), "data", "a.txt");
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let rows = store
-                .load_entries(&b, [object::key("a.txt").unwrap()].iter())
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert!(rows[0].is_none(), "{:?}", rows[0]);
-        });
-    }
-
-    #[test]
-    fn load_bucket_walks_rows_in_key_order_with_identity() {
-        // The scanner's traversal form (R1): every valid row in key
-        // order, with the file identity intact.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            for (key_str, identity) in [("a.txt", 11u64), ("dir/b.txt", 22), ("z.txt", 33)] {
-                store
-                    .set(
-                        &b,
-                        &object::key(key_str).unwrap(),
-                        &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                        1,
-                        mtime(1),
-                        identity,
-                    )
-                    .await
-                    .unwrap();
-            }
-            let rows = store.load_bucket(&b).unwrap();
-            let seen: Vec<(&str, Option<u64>)> = rows
-                .iter()
-                .map(|r| (&*r.key, r.stored.as_ref().map(|s| s.file_identity)))
-                .collect();
-            assert_eq!(
-                seen,
-                [
-                    ("a.txt", Some(11)),
-                    ("dir/b.txt", Some(22)),
-                    ("z.txt", Some(33))
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn load_bucket_skips_corrupt_keys_and_heals_corrupt_etags() {
-        // P2: a domain-invalid key skips the row; a domain-invalid etag
-        // reports missing (self-heal) — a corrupt row never fails the
-        // walk (the `walk()` CorruptMeta behavior is deliberately NOT
-        // the gating semantics).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            corrupt_entry(state.path(), "data", "bad-etag.txt");
-            corrupt_key_entry(state.path(), "data", "../evil");
-            // A valid row to anchor the order.
+    #[tokio::test]
+    async fn load_bucket_skips_corrupt_keys_and_heals_corrupt_etags() {
+        let state = tempfile::tempdir().unwrap();
+        corrupt_entry(state.path(), "data", "bad-etag.txt");
+        corrupt_key_entry(state.path(), "data", "../evil");
+        // A valid row to anchor the order.
+        {
+            let db = database::open(state.path()).unwrap().db;
+            let mut txn = db.begin_write().unwrap();
             {
-                let db = database::open(state.path()).unwrap().db;
-                let mut txn = db.begin_write().unwrap();
-                {
-                    let mut table = database::ObjectMetaTable::open(&mut txn).unwrap();
-                    table
-                        .insert(
-                            ("data", "a.txt"),
-                            ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9),
-                        )
-                        .unwrap();
-                }
-                txn.commit().unwrap();
-            }
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let rows = store.load_bucket(&b).unwrap();
-            let seen: Vec<(&str, bool)> =
-                rows.iter().map(|r| (&*r.key, r.stored.is_some())).collect();
-            assert_eq!(seen, [("a.txt", true), ("bad-etag.txt", false)]);
-            assert_eq!(rows[1].key.as_ref(), "bad-etag.txt");
-            assert!(rows[1].stored.is_none());
-        });
-    }
-
-    #[test]
-    fn walk_returns_all_entries_and_remove_bucket_clears() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            for (i, key_str) in ["a.txt", "dir/b.txt", "dir/sub/c.txt"].iter().enumerate() {
-                store
-                    .set(
-                        &b,
-                        &object::key(*key_str).unwrap(),
-                        &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                        i as u64,
-                        mtime(i as u64),
-                        0,
+                let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+                table
+                    .insert(
+                        ("data", "a.txt"),
+                        ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9),
                     )
-                    .await
                     .unwrap();
             }
-            let mut keys: Vec<String> = store
-                .walk(&b)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|r| r.key.to_string())
-                .collect();
-            keys.sort();
-            assert_eq!(keys, ["a.txt", "dir/b.txt", "dir/sub/c.txt"]);
-
-            store.remove_bucket(&b).await.unwrap();
-            assert!(store.walk(&b).await.unwrap().is_empty());
-            store.remove_bucket(&b).await.unwrap(); // idempotent
-        });
+            txn.commit().unwrap();
+        }
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let rows = store.load_bucket(&b).unwrap();
+        let seen: Vec<(&str, bool)> = rows.iter().map(|r| (&*r.key, r.stored.is_some())).collect();
+        assert_eq!(seen, [("a.txt", true), ("bad-etag.txt", false)]);
+        assert_eq!(rows[1].key.as_ref(), "bad-etag.txt");
+        assert!(rows[1].stored.is_none());
     }
 
-    #[test]
-    fn entries_with_unicode_keys() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("ümlaut/文件/with spaces.txt").unwrap();
+    #[tokio::test]
+    async fn walk_returns_all_entries_and_remove_bucket_clears() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        for (i, key_str) in ["a.txt", "dir/b.txt", "dir/sub/c.txt"].iter().enumerate() {
             store
                 .set(
                     &b,
-                    &k,
+                    &object::key(*key_str).unwrap(),
                     &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                    0,
-                    mtime(0),
+                    i as u64,
+                    mtime(i as u64),
                     0,
                 )
                 .await
                 .unwrap();
-            let record = store.get(&b, &k).await.unwrap().unwrap();
-            assert_eq!(record.key, k);
-        });
+        }
+        let mut keys: Vec<String> = store
+            .walk(&b)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key.to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["a.txt", "dir/b.txt", "dir/sub/c.txt"]);
+
+        store.remove_bucket(&b).await.unwrap();
+        assert!(store.walk(&b).await.unwrap().is_empty());
+        store.remove_bucket(&b).await.unwrap(); // idempotent
     }
 
-    #[test]
-    fn bucket_scan_boundaries_exclude_other_buckets() {
-        // Keys of `data` must never bleed into a bucket whose name has
-        // `data` as a prefix, and vice versa.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let data = bucket::name("data").unwrap();
-            let data_x = bucket::name("data-x").unwrap();
-            for (b, k) in [
-                (&data, "a.txt"),
-                (&data, "z.txt"),
-                (&data_x, "a.txt"),
-                (&data_x, "z.txt"),
-            ] {
-                store
-                    .set(
-                        b,
-                        &object::key(k).unwrap(),
-                        &etag("d41d8cd98f00b204e9800998ecf8427e"),
-                        1,
-                        mtime(1),
-                        0,
-                    )
-                    .await
-                    .unwrap();
-            }
-            let keys: Vec<String> = store
-                .walk(&data)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|r| r.key.to_string())
-                .collect();
-            assert_eq!(keys, ["a.txt", "z.txt"]);
-            let keys: Vec<String> = store
-                .walk(&data_x)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|r| r.key.to_string())
-                .collect();
-            assert_eq!(keys, ["a.txt", "z.txt"]);
-
-            store.remove_bucket(&data).await.unwrap();
-            assert!(store.walk(&data).await.unwrap().is_empty());
-            assert_eq!(store.walk(&data_x).await.unwrap().len(), 2);
-        });
+    #[tokio::test]
+    async fn entries_with_unicode_keys() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("ümlaut/文件/with spaces.txt").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                0,
+                mtime(0),
+                0,
+            )
+            .await
+            .unwrap();
+        let record = store.get(&b, &k).await.unwrap().unwrap();
+        assert_eq!(record.key, k);
     }
 
-    #[test]
-    fn corrupt_entry_is_treated_as_missing() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            // Corrupt before the store opens (the redb file lock is
-            // exclusive per handle).
-            corrupt_entry(state.path(), "data", "a.txt");
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.txt").unwrap();
-            // Reported as missing (the caller recomputes from the object
-            // file) — never a 500 on reads.
-            assert!(store.get(&b, &k).await.unwrap().is_none());
-            // walk() surfaces corrupt rows (scanner/doctor must not skip).
-            assert!(store.walk(&b).await.is_err());
-        });
-    }
-
-    #[test]
-    fn corrupt_entry_self_heals_on_recompute() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let file = state.path().join("a.txt");
-            tokio::fs::write(&file, b"hello").await.unwrap();
-            // Corrupt the entry first, then the recompute path must
-            // rewrite it.
-            corrupt_entry(state.path(), "data", "a.txt");
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("a.txt").unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let etag = store
-                .etag_for_file(
-                    &b,
-                    &k,
-                    &file,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                    false,
+    #[tokio::test]
+    async fn bucket_scan_boundaries_exclude_other_buckets() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let data = bucket::name("data").unwrap();
+        let data_x = bucket::name("data-x").unwrap();
+        for (b, k) in [
+            (&data, "a.txt"),
+            (&data, "z.txt"),
+            (&data_x, "a.txt"),
+            (&data_x, "z.txt"),
+        ] {
+            store
+                .set(
+                    b,
+                    &object::key(k).unwrap(),
+                    &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                    1,
+                    mtime(1),
+                    0,
                 )
                 .await
                 .unwrap();
-            assert_eq!(etag, ETag::from_content(b"hello"));
-            assert!(store.get(&b, &k).await.unwrap().is_some());
-        });
+        }
+        let keys: Vec<String> = store
+            .walk(&data)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key.to_string())
+            .collect();
+        assert_eq!(keys, ["a.txt", "z.txt"]);
+        let keys: Vec<String> = store
+            .walk(&data_x)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key.to_string())
+            .collect();
+        assert_eq!(keys, ["a.txt", "z.txt"]);
+
+        store.remove_bucket(&data).await.unwrap();
+        assert!(store.walk(&data).await.unwrap().is_empty());
+        assert_eq!(store.walk(&data_x).await.unwrap().len(), 2);
     }
 
-    #[test]
-    fn composed_etag_kept_on_identity_less_storage_within_the_jitter_window() {
+    #[tokio::test]
+    async fn corrupt_entry_is_treated_as_missing() {
+        let state = tempfile::tempdir().unwrap();
+        // Corrupt before the store opens (the redb file lock is
+        // exclusive per handle).
+        corrupt_entry(state.path(), "data", "a.txt");
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        // Reported as missing (the caller recomputes from the object
+        // file) — never a 500 on reads.
+        assert!(store.get(&b, &k).await.unwrap().is_none());
+        // walk() surfaces corrupt rows (scanner/doctor must not skip).
+        assert!(store.walk(&b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn corrupt_entry_self_heals_on_recompute() {
+        let state = tempfile::tempdir().unwrap();
+        let file = state.path().join("a.txt");
+        fs::write(&file, b"hello").await.unwrap();
+        // Corrupt the entry first, then the recompute path must
+        // rewrite it.
+        corrupt_entry(state.path(), "data", "a.txt");
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let etag = store
+            .etag_for_file(
+                &b,
+                &k,
+                &file,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(etag, ETag::from_content(b"hello"));
+        assert!(store.get(&b, &k).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn composed_etag_kept_on_identity_less_storage_within_the_jitter_window() {
         // The identity-less fallback (stored identity 0): a touch within
         // the mtime jitter window is kept — the multipart
         // `MD5-of-MD5s-N` form is preserved (P1; the strict identity
         // check is impossible without an identity — the documented risk).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("mp.bin").unwrap();
-            let file = state.path().join("mp.bin");
-            tokio::fs::write(&file, b"hello").await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &composed,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    0,
-                )
-                .await
-                .unwrap();
-            let handle = std::fs::File::options().write(true).open(&file).unwrap();
-            handle
-                .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
-                .unwrap();
-            drop(handle);
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let etag = store
-                .etag_for_file(
-                    &b,
-                    &k,
-                    &file,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    0,
-                    false,
-                )
-                .await
-                .unwrap();
-            assert_eq!(etag, composed);
-            assert!(matches!(etag, ETag::Composed(_, 2)));
-        });
+
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("mp.bin").unwrap();
+        let file = state.path().join("mp.bin");
+        fs::write(&file, b"hello").await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &composed,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        let handle = File::options().write(true).open(&file).unwrap();
+        handle
+            .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
+            .unwrap();
+        drop(handle);
+        let metadata = fs::metadata(&file).await.unwrap();
+        let etag = store
+            .etag_for_file(
+                &b,
+                &k,
+                &file,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(etag, composed);
+        assert!(matches!(etag, ETag::Composed(_, 2)));
     }
 
-    #[test]
-    fn composed_etag_rehashes_on_touch_when_identity_is_available() {
-        // F04 through the hot path: on identity platforms a touch
-        // re-hashes — an in-place same-size rewrite keeps the identity
-        // and is indistinguishable from a touch without hashing, so any
-        // mtime drift re-hashes (correctness first: the composed form
-        // degrades to the content MD5, but a stale ETag is never served).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("mp.bin").unwrap();
-            let file = state.path().join("mp.bin");
-            tokio::fs::write(&file, b"hello").await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &composed,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                )
-                .await
-                .unwrap();
-            let handle = std::fs::File::options().write(true).open(&file).unwrap();
-            handle
-                .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
-                .unwrap();
-            drop(handle);
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let etag = store
-                .etag_for_file(
-                    &b,
-                    &k,
-                    &file,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                    false,
-                )
-                .await
-                .unwrap();
-            assert_eq!(etag, ETag::from_content(b"hello"));
-            assert!(matches!(etag, ETag::Single(_)));
-        });
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_touch_when_identity_is_available() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("mp.bin").unwrap();
+        let file = state.path().join("mp.bin");
+        fs::write(&file, b"hello").await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &composed,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+            )
+            .await
+            .unwrap();
+        let handle = File::options().write(true).open(&file).unwrap();
+        handle
+            .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
+            .unwrap();
+        drop(handle);
+        let metadata = fs::metadata(&file).await.unwrap();
+        let etag = store
+            .etag_for_file(
+                &b,
+                &k,
+                &file,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(etag, ETag::from_content(b"hello"));
+        assert!(matches!(etag, ETag::Single(_)));
     }
 
-    #[test]
-    fn composed_etag_rehashes_on_in_place_same_size_rewrite() {
-        // F04 regression: an in-place rewrite (SAME file — identity
-        // unchanged — different same-size content) within the old 60 s
-        // jitter window must re-hash — the stale composed ETag is never
-        // served.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("mp.bin").unwrap();
-            let file = state.path().join("mp.bin");
-            tokio::fs::write(&file, b"hello").await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &composed,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                )
-                .await
-                .unwrap();
-            // Overwrite in place with different same-size content. The
-            // sleep lands the rewrite in a later Windows FILETIME tick
-            // (~16 ms clock granularity) — a rewrite within the SAME
-            // tick as the original write keeps the old mtime and is
-            // indistinguishable even from the strict keep (the documented
-            // platform limitation).
-            std::thread::sleep(Duration::from_millis(30));
-            let mut handle = std::fs::File::options()
-                .write(true)
-                .truncate(true)
-                .open(&file)
-                .unwrap();
-            std::io::Write::write_all(&mut handle, b"world").unwrap();
-            handle.sync_all().unwrap();
-            drop(handle);
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let etag = store
-                .etag_for_file(
-                    &b,
-                    &k,
-                    &file,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                    false,
-                )
-                .await
-                .unwrap();
-            assert_eq!(etag, ETag::from_content(b"world"));
-        });
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_in_place_same_size_rewrite() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("mp.bin").unwrap();
+        let file = state.path().join("mp.bin");
+        fs::write(&file, b"hello").await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &composed,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+            )
+            .await
+            .unwrap();
+        // Overwrite in place with different same-size content. The
+        // sleep lands the rewrite in a later Windows FILETIME tick
+        // (~16 ms clock granularity) — a rewrite within the SAME
+        // tick as the original write keeps the old mtime and is
+        // indistinguishable even from the strict keep (the documented
+        // platform limitation).
+        sleep(Duration::from_millis(30));
+        let mut handle = File::options()
+            .write(true)
+            .truncate(true)
+            .open(&file)
+            .unwrap();
+        handle.write_all(b"world").unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+        let metadata = fs::metadata(&file).await.unwrap();
+        let etag = store
+            .etag_for_file(
+                &b,
+                &k,
+                &file,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(etag, ETag::from_content(b"world"));
     }
 
-    #[test]
-    fn composed_etag_rehashes_on_replacement() {
-        // A same-size out-of-band replacement (a NEW file renamed over —
-        // the identity changes on unix; the mtime drift is beyond the
-        // window fallback elsewhere) must be re-hashed — the stale
-        // composed ETag is never served forever (code-review #9).
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("mp.bin").unwrap();
-            let file = state.path().join("mp.bin");
-            tokio::fs::write(&file, b"hello").await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &composed,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                )
-                .await
-                .unwrap();
-            // Replace with a fresh file (old mtime, so the fallback window
-            // also rules out a touch).
-            let replacement = state.path().join("replacement.bin");
-            tokio::fs::write(&replacement, b"hello").await.unwrap();
-            let handle = std::fs::File::options()
-                .write(true)
-                .open(&replacement)
-                .unwrap();
-            handle
-                .set_modified(metadata.modified().unwrap() + Duration::from_secs(120))
-                .unwrap();
-            drop(handle);
-            tokio::fs::rename(&replacement, &file).await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let etag = store
-                .etag_for_file(
-                    &b,
-                    &k,
-                    &file,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                    false,
-                )
-                .await
-                .unwrap();
-            // Re-hashed from the (unchanged) content — the composed form
-            // is replaced by the content MD5.
-            assert_eq!(etag, ETag::from_content(b"hello"));
-        });
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_replacement() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("mp.bin").unwrap();
+        let file = state.path().join("mp.bin");
+        fs::write(&file, b"hello").await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &composed,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+            )
+            .await
+            .unwrap();
+        // Replace with a fresh file (old mtime, so the fallback window
+        // also rules out a touch).
+        let replacement = state.path().join("replacement.bin");
+        fs::write(&replacement, b"hello").await.unwrap();
+        let handle = File::options().write(true).open(&replacement).unwrap();
+        handle
+            .set_modified(metadata.modified().unwrap() + Duration::from_secs(120))
+            .unwrap();
+        drop(handle);
+        fs::rename(&replacement, &file).await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let etag = store
+            .etag_for_file(
+                &b,
+                &k,
+                &file,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+                false,
+            )
+            .await
+            .unwrap();
+        // Re-hashed from the (unchanged) content — the composed form
+        // is replaced by the content MD5.
+        assert_eq!(etag, ETag::from_content(b"hello"));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn composed_etag_rehashes_on_quick_replacement() {
-        // The identity beats the clock: a same-size replacement within
-        // the old 60 s window is still detected (new inode), where the
-        // mtime fallback would wrongly keep the composed form.
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
-            let b = bucket::name("data").unwrap();
-            let k = object::key("mp.bin").unwrap();
-            let file = state.path().join("mp.bin");
-            tokio::fs::write(&file, b"hello").await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
-            store
-                .set(
-                    &b,
-                    &k,
-                    &composed,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                )
-                .await
-                .unwrap();
-            let replacement = state.path().join("replacement.bin");
-            tokio::fs::write(&replacement, b"hello").await.unwrap();
-            // Fresh mtime — inside the old 60 s window.
-            tokio::fs::rename(&replacement, &file).await.unwrap();
-            let metadata = tokio::fs::metadata(&file).await.unwrap();
-            let etag = store
-                .etag_for_file(
-                    &b,
-                    &k,
-                    &file,
-                    metadata.len(),
-                    metadata.modified().unwrap(),
-                    crate::fsutil::file_identity(&file, &metadata),
-                    false,
-                )
-                .await
-                .unwrap();
-            assert_eq!(etag, ETag::from_content(b"hello"));
-        });
+    #[tokio::test]
+    async fn composed_etag_rehashes_on_quick_replacement() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("mp.bin").unwrap();
+        let file = state.path().join("mp.bin");
+        fs::write(&file, b"hello").await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &composed,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+            )
+            .await
+            .unwrap();
+        let replacement = state.path().join("replacement.bin");
+        fs::write(&replacement, b"hello").await.unwrap();
+        // Fresh mtime — inside the old 60 s window.
+        fs::rename(&replacement, &file).await.unwrap();
+        let metadata = fs::metadata(&file).await.unwrap();
+        let etag = store
+            .etag_for_file(
+                &b,
+                &k,
+                &file,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                fsutil::file_identity(&file, &metadata),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(etag, ETag::from_content(b"hello"));
     }
 }

@@ -12,32 +12,45 @@
 //! MinIO-convention pair `minioadmin` / `minioadmin` (unsigned requests are
 //! rejected). Config-based auth lands in US3 (T082/T083).
 
-use std::{net::SocketAddr, time::Duration};
-
-use tokio::sync::watch;
+use std::{
+    env, error::Error, fs, net::SocketAddr, path::PathBuf, process, sync::Arc, time::Duration,
+};
 
 use futures::StreamExt;
-use tinio_config::{log, pipeline};
-use tinio_core::cleanup::{Cleanup, CleanupOptions, RepairKind};
-use tinio_core::pipeline::Runner;
-use tinio_core::storage::{
-    DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+use sweep::{Options, Sweeper};
+use tinio_config::{
+    Config,
+    log::{self, AccessFormat, Format, Verbosity},
+    pipeline,
 };
-use tinio_fs::{FsCleanup, FsOptions, FsStorage, Scanner, ScannerOptions, sweep};
-use tinio_server::{Capabilities, DataPlane, log as server_log, pipeline::Pipelines};
+use tinio_core::{
+    cleanup::{Cleanup, CleanupOptions, RepairKind},
+    pipeline::Runner,
+    storage::{
+        DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+    },
+};
+use tinio_fs::{
+    FsCleanup, FsOptions, FsStorage, Scanner, ScannerOptions, database::WriteLockSnapshot, sweep,
+};
+use tinio_server::{
+    Capabilities, DataPlane, log as server_log,
+    metrics::{self, WriteLockStats},
+    pipeline::Pipelines,
+};
+use tokio::{net::TcpListener, sync::watch};
+use tracing::subscriber;
 
 fn usage() -> ! {
     eprintln!("usage: serve <root> [--port N] [--address HOST:PORT] [--config <config.toml>]");
-    std::process::exit(2);
+    process::exit(2);
 }
 
 /// The write-lock snapshot of the fs storage into the metric layer's
 /// plain-data form — the wiring-point conversion that keeps
 /// `tinio-server`'s metrics decoupled from backend snapshot types.
-fn write_lock_stats(
-    snapshot: tinio_fs::database::WriteLockSnapshot,
-) -> tinio_server::metrics::WriteLockStats {
-    tinio_server::metrics::WriteLockStats {
+fn write_lock_stats(snapshot: WriteLockSnapshot) -> WriteLockStats {
+    WriteLockStats {
         wait_buckets: snapshot.wait_buckets,
         total_buckets: snapshot.total_buckets,
         count: snapshot.count,
@@ -49,14 +62,14 @@ fn write_lock_stats(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut args = std::env::args().skip(1);
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut args = env::args().skip(1);
     let root = match args.next() {
         Some(root) => root,
         None => usage(),
     };
     let mut address: Option<SocketAddr> = None;
-    let mut config_path: Option<std::path::PathBuf> = None;
+    let mut config_path: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -95,19 +108,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // The harness passes a fresh scratch path — create the root if missing
     // (FsStorage itself requires an existing directory).
-    std::fs::create_dir_all(&root)?;
+    fs::create_dir_all(&root)?;
     // The real dual-pipeline runtime (pipeline-spec.md §3.3): `--config
     // <file>` consumes the parsed `[pipeline]` section (F07 — the values
     // an operator sets are no longer silently dropped); without it the
     // section defaults apply (an absent `[pipeline]` resolves to the
     // defaults, Q8).
     let config = match &config_path {
-        Some(path) => Some(tinio_config::Config::load(path)?),
+        Some(path) => Some(Config::load(path)?),
         None => None,
     };
     let pipeline_config = match &config {
         Some(config) => config.pipeline.clone().unwrap_or_default(),
-        None => pipeline::Config::default(),
+        None => Config::default(),
     };
     let pipelines = Pipelines::build(&pipeline_config)?;
     let mut storage = FsStorage::new(
@@ -131,25 +144,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     // Operational logs to stderr (info), access log to `<root>/.tinio/access.log`
     // (T052). The `[log]` config wiring lands with the US2 CLI.
-    std::fs::create_dir_all(storage.state_dir())?;
+    fs::create_dir_all(storage.state_dir())?;
     let subscriber = server_log::build_subscriber(
-        log::Verbosity::Info,
-        log::Format::Text,
-        &log::AccessFormat::Combined,
+        Verbosity::Info,
+        Format::Text,
+        &AccessFormat::Combined,
         &storage.state_dir().join("access.log"),
         None,
     )?;
-    tracing::subscriber::set_global_default(subscriber)?;
+    subscriber::set_global_default(subscriber)?;
 
     // D-B: synchronous Startup repair — the fast, deterministic items
     // (tmp, staging residue, multipart orphans, stale bucket records)
-    // run before readiness; the delete-tombstone stage is routed to the
-    // removal lane through the injected runner. Best-effort: a failed
-    // stage is warned and readiness proceeds — the scanner covers the
-    // residue. The stale-bucket prune runs here, pre-serving, so it
-    // stays lock-free (no request can race it yet).
-    let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
-        .with_remove_runner(pipelines.remove());
+    // run before readiness; the delete-tombstone stage routes through
+    // the storage's removal lane (the `remove_pipeline` wired above).
+    // Best-effort: a failed stage is warned and readiness proceeds — the
+    // scanner covers the residue. The stale-bucket prune runs here,
+    // pre-serving, so it stays lock-free (no request can race it yet).
+    let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
     match cleanup.repair(RepairKind::Startup).await {
         Ok(mut actions) => {
             while let Some(action) = actions.next().await {
@@ -167,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ),
     }
 
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(address).await?;
     println!("listening on {}", listener.local_addr()?);
 
     // Background scanner (FR-024; `TINIO_SCANNER=0` disables).
@@ -185,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Async sweep (temp 24 h, multipart 7 d).
     let (sweep_tx, sweep_rx) = watch::channel(false);
-    let sweeper = sweep::Sweeper::new(storage.clone(), sweep::Options::default());
+    let sweeper = Sweeper::new(storage.clone(), Options::default());
     let sweeper_task = tokio::spawn(async move {
         sweeper.run(sweep_rx).await;
     });
@@ -197,8 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metrics_db = pipelines.db();
     let plane =
         DataPlane::new_with_auth(storage, Capabilities::default(), "minioadmin", "minioadmin")
-            .with_metrics(std::sync::Arc::new(move || {
-                tinio_server::metrics::refresh(
+            .with_metrics(Arc::new(move || {
+                metrics::refresh(
                     metrics_io.stats(),
                     metrics_db.stats(),
                     write_lock_stats(metrics_storage.write_lock_stats()),

@@ -13,11 +13,11 @@
 
 mod common;
 
-use http::StatusCode;
-
-use tinio_server::Capabilities;
+use std::fs;
 
 use common::{Server, abort_mid_upload, eventually, extract, request};
+use http::StatusCode;
+use tinio_server::Capabilities;
 
 /// A fresh fs-backed server with default toggles.
 async fn fs_server() -> Server {
@@ -44,7 +44,7 @@ async fn full_round_trip_with_listing_and_delete() {
 
     // The uploaded file physically appears in the local directory.
     assert_eq!(
-        std::fs::read(server.root().join("data/hello.txt")).unwrap(),
+        fs::read(server.root().join("data/hello.txt")).unwrap(),
         b"hello world"
     );
 
@@ -277,7 +277,7 @@ async fn concurrent_writes_last_write_wins_no_torn_objects() {
 
     // The final object — on disk and over the wire — is one complete
     // writer's payload.
-    let on_disk = std::fs::read(server.root().join("data/shared.bin")).unwrap();
+    let on_disk = fs::read(server.root().join("data/shared.bin")).unwrap();
     assert!(
         payloads.iter().any(|p| p == &on_disk),
         "final object is not any single writer's payload"
@@ -304,8 +304,7 @@ async fn interrupted_upload_leaves_no_partial_object() {
     // it best-effort once the aborted stream errors — poll briefly for
     // the server to notice the dropped connection).
     let tmp = server.root().join(".tinio/tmp");
-    let clean =
-        eventually(|| !tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none()).await;
+    let clean = eventually(|| !tmp.exists() || fs::read_dir(&tmp).unwrap().next().is_none()).await;
     assert!(clean, "temp file left behind under {tmp:?}");
 }
 
@@ -316,7 +315,7 @@ async fn out_of_band_changes_served_immediately() {
     let server = fs_server().await;
     let addr = server.addr();
     request(addr, "PUT", "/data", &[], &[]).await;
-    std::fs::write(server.root().join("data/dropped.txt"), b"out-of-band").unwrap();
+    fs::write(server.root().join("data/dropped.txt"), b"out-of-band").unwrap();
 
     let resp = request(addr, "GET", "/data/dropped.txt", &[], &[]).await;
     assert_eq!(resp.status, StatusCode::OK);

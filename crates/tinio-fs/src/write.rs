@@ -22,8 +22,13 @@
 //! (F03), so "no durable meta row without durable bytes" holds for the
 //! first PUT into a prefix too.
 
+#[cfg(unix)]
+use std::fs::{File as StdFile, remove_file};
+#[cfg(unix)]
+use std::io::Seek;
 use std::{
-    io,
+    fs::Metadata,
+    io::{self, ErrorKind},
     path::{Path, PathBuf},
     pin::pin,
 };
@@ -31,9 +36,15 @@ use std::{
 use futures::StreamExt;
 use md5::{Digest, Md5};
 use tinio_core::{BodyStream, ETag, object::RESERVED_SEGMENT};
+#[cfg(unix)]
+use tokio::task;
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+};
+use uuid::Uuid;
 
-use crate::Error;
-use crate::path::TMP_DIR_NAME;
+use crate::{Error, fsutil, path::TMP_DIR_NAME};
 
 /// Bounded chunk size for the streaming copy/hash loops (constitution V:
 /// no per-object buffering; hyper chunks are typically ≤ 64 KiB anyway).
@@ -50,7 +61,7 @@ pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
 async fn sync_parent_dir(parent: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        tokio::fs::File::open(parent).await?.sync_all().await
+        File::open(parent).await?.sync_all().await
     }
     #[cfg(not(unix))]
     {
@@ -72,44 +83,44 @@ async fn copy_across_volumes(temp: &Path, target: &Path) -> Result<(), Error> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(RESERVED_SEGMENT);
-    tokio::fs::create_dir_all(&staging_dir).await?;
-    let staging = staging_dir.join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&staging_dir).await?;
+    let staging = staging_dir.join(Uuid::new_v4().to_string());
     let copied = async {
-        tokio::fs::copy(temp, &staging).await?;
+        fs::copy(temp, &staging).await?;
         // D1 — the staging copy is what the rename makes visible; `copy`
         // does not sync. Sync its content before the name (the same
         // content-durability promise as [`AtomicWriter::stage`]).
         // Write access: Windows `FlushFileBuffers` refuses read-only
         // handles (the staging file is private to this rename).
-        tokio::fs::File::options()
+        File::options()
             .write(true)
             .open(&staging)
             .await?
             .sync_all()
             .await?;
-        tokio::fs::rename(&staging, target).await?;
+        fs::rename(&staging, target).await?;
         Ok::<_, Error>(())
     }
     .await;
     if copied.is_err() {
-        let _ = tokio::fs::remove_file(&staging).await;
+        let _ = fs::remove_file(&staging).await;
     }
     // Remove the staging directory when empty (a concurrent EXDEV write
     // may still be staging in it — the removal then fails harmlessly).
-    let _ = tokio::fs::remove_dir(&staging_dir).await;
+    let _ = fs::remove_dir(&staging_dir).await;
     copied
 }
 
 /// The streaming content MD5 of the file at `path` plus the metadata of
 /// the opened file (bounded buffers; the metadata is the caller's file
 /// identity — one open serves both, no second stat of the path).
-pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], std::fs::Metadata), Error> {
-    let mut file = tokio::fs::File::open(path).await?;
+pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], Metadata), Error> {
+    let mut file = File::open(path).await?;
     let mut buf = vec![0u8; CHUNK_SIZE];
     // The shared async hashing core (F43); the per-call buffer stays —
     // the write path hashes one object per PUT, unlike the scanner's
     // per-file loop that shares the pooled worker buffer.
-    let digest = crate::fsutil::md5_stream_async(&mut file, &mut buf).await?;
+    let digest = fsutil::md5_stream_async(&mut file, &mut buf).await?;
     let metadata = file.metadata().await?;
     Ok((digest, metadata))
 }
@@ -119,18 +130,19 @@ pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], std::fs::Metad
 /// # Examples
 ///
 /// ```rust
-/// use tinio_util::testing::body;
 /// use tinio_fs::AtomicWriter;
+/// use tinio_util::testing::body;
+/// use tokio::runtime::Runtime;
 ///
 /// let state = tempfile::tempdir().unwrap();
 /// let writer = AtomicWriter::new(state.path());
 /// let target = state.path().join("obj.bin");
-/// let etag = tokio::runtime::Runtime::new()
+/// let etag = Runtime::new()
 ///     .unwrap()
 ///     .block_on(writer.write(&target, body(b"hello")))
 ///     .unwrap();
 /// assert_eq!(etag.as_str(), "5d41402abc4b2a76b9719d911017c592");
-/// assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+/// assert_eq!(read(&target).unwrap(), b"hello");
 /// ```
 #[derive(Debug, Clone)]
 pub struct AtomicWriter {
@@ -201,14 +213,14 @@ impl AtomicWriter {
                 // steady state — one probe instead of `create_dir_all`'s
                 // per-component walk; the create still runs when the
                 // parent is missing (the first PUT into a new prefix).
-                if !tokio::fs::try_exists(parent).await? {
+                if !fs::try_exists(parent).await? {
                     created_parent = true;
-                    tokio::fs::create_dir_all(parent).await?;
+                    fs::create_dir_all(parent).await?;
                 }
             }
-            match tokio::fs::rename(temp, target).await {
+            match fs::rename(temp, target).await {
                 Ok(()) => Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+                Err(err) if err.kind() == ErrorKind::CrossesDevices => {
                     fallback = true;
                     copy_across_volumes(temp, target).await
                 }
@@ -222,7 +234,7 @@ impl AtomicWriter {
         // it is partial residue, and on the EXDEV fallback success the
         // copy did not consume it.
         if fallback || result.is_err() {
-            let _ = tokio::fs::remove_file(temp).await;
+            let _ = fs::remove_file(temp).await;
         }
         // D1 — the rename is not durable until the directory entries are
         // synced (the content was synced before the rename). The rename
@@ -275,25 +287,28 @@ impl AtomicWriter {
         }
     }
 
+    /// Item 7d: the tmp dir exists in steady state — one probe instead
+    /// of the per-component walk (the create still runs when the sweep
+    /// cleared it). Shared by [`Self::stage`] and [`Self::stage_copy`].
+    async fn ensure_tmp_dir(&self) -> io::Result<()> {
+        if !fs::try_exists(&self.tmp_dir).await? {
+            fs::create_dir_all(&self.tmp_dir).await?;
+        }
+        Ok(())
+    }
+
     /// Stream `body` into a fresh temp file under `tmp/`, returning the
     /// temp path and content MD5. The caller controls when the temp
     /// becomes visible (rename under its own lock); on failure the temp is
     /// removed best-effort.
     pub(crate) async fn stage(&self, body: BodyStream) -> Result<(PathBuf, ETag), Error> {
-        // Item 7d: the tmp dir exists in steady state — one probe
-        // instead of the per-component walk (the create still runs when
-        // the sweep cleared it).
-        if !tokio::fs::try_exists(&self.tmp_dir).await? {
-            tokio::fs::create_dir_all(&self.tmp_dir).await?;
-        }
-        let temp = self
-            .tmp_dir
-            .join(format!("upload-{}", uuid::Uuid::new_v4()));
+        self.ensure_tmp_dir().await?;
+        let temp = self.tmp_dir.join(format!("upload-{}", Uuid::new_v4()));
         let result = self.write_temp(&temp, body).await;
         match result {
             Ok(etag) => Ok((temp, etag)),
             Err(err) => {
-                let _ = tokio::fs::remove_file(&temp).await;
+                let _ = fs::remove_file(&temp).await;
                 Err(err)
             }
         }
@@ -302,7 +317,7 @@ impl AtomicWriter {
     /// The stream+hash core: drain `body` into `temp` with bounded
     /// buffers, returning the content MD5.
     async fn write_temp(&self, temp: &Path, body: BodyStream) -> Result<ETag, Error> {
-        let mut file = tokio::fs::File::create(temp).await?;
+        let mut file = File::create(temp).await?;
         let mut hasher = Md5::new();
         let mut stream = pin!(body);
         while let Some(chunk) = stream.next().await {
@@ -310,11 +325,11 @@ impl AtomicWriter {
             // Bound the copy: a single oversized chunk never buffers
             // whole — it is drained in bounded slices.
             for slice in chunk.as_ref().chunks(CHUNK_SIZE) {
-                tokio::io::AsyncWriteExt::write_all(&mut file, slice).await?;
+                file.write_all(slice).await?;
                 hasher.update(slice);
             }
         }
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        file.flush().await?;
         // D1 — content durability: the bytes must be on disk before the
         // rename makes the name visible (the rename's directory entry is
         // synced by `commit`). Also covers the multipart part files —
@@ -340,30 +355,24 @@ impl AtomicWriter {
     #[cfg(unix)]
     pub(crate) async fn stage_copy(
         &self,
-        source: std::fs::File,
+        source: StdFile,
         offset: u64,
         len: u64,
     ) -> Result<(PathBuf, ETag), Error> {
-        // Item 7d: the tmp dir exists in steady state — one probe
-        // instead of the per-component walk (the create still runs when
-        // the sweep cleared it).
-        if !tokio::fs::try_exists(&self.tmp_dir).await? {
-            tokio::fs::create_dir_all(&self.tmp_dir).await?;
-        }
-        let temp = self
-            .tmp_dir
-            .join(format!("upload-{}", uuid::Uuid::new_v4()));
+        self.ensure_tmp_dir().await?;
+        let temp = self.tmp_dir.join(format!("upload-{}", Uuid::new_v4()));
         let temp_task = temp.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut dst = std::fs::File::create(&temp_task).map_err(Error::from)?;
-            crate::fsutil::copy_file_range(&source, offset, len, &dst)?;
+        let result = task::spawn_blocking(move || {
+            let mut dst = StdFile::create(&temp_task).map_err(Error::from)?;
+            fsutil::copy_file_range(&source, offset, len, &dst)?;
             dst.sync_all()?;
             // The kernel copy advanced the file position — rewind for
             // the hash pass.
-            use std::io::Seek as _;
             dst.rewind()?;
+            // The shared streaming MD5 (F43) — one home for the loop,
+            // like every other hashing site.
             let mut buf = vec![0u8; CHUNK_SIZE];
-            let digest = crate::fsutil::md5_stream(&mut dst, &mut buf)?;
+            let digest = fsutil::md5_stream(&mut dst, &mut buf)?;
             Ok::<_, Error>(ETag::Single(digest))
         })
         .await
@@ -374,7 +383,7 @@ impl AtomicWriter {
         match result {
             Ok(etag) => Ok((temp, etag)),
             Err(err) => {
-                let _ = std::fs::remove_file(&temp);
+                let _ = remove_file(&temp);
                 Err(err)
             }
         }
@@ -383,91 +392,83 @@ impl AtomicWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testutil::rt;
-    use std::io;
+    use std::fs::read_dir;
+
+    use bytes::Bytes;
+    use futures::stream;
+    use io::Error as IoError;
     use tinio_util::testing::{body, etag};
 
-    #[test]
-    fn write_stores_content_and_etag() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("obj.bin");
-            let got = writer.write(&target, body(b"hello world")).await.unwrap();
-            assert_eq!(got, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
-            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"hello world");
-            // No temp files left behind on success.
-            let tmp = state.path().join("tmp");
-            let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
-            assert!(entries.next_entry().await.unwrap().is_none());
-        });
+    use super::*;
+
+    #[tokio::test]
+    async fn write_stores_content_and_etag() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let target = state.path().join("obj.bin");
+        let got = writer.write(&target, body(b"hello world")).await.unwrap();
+        assert_eq!(got, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
+        assert_eq!(fs::read(&target).await.unwrap(), b"hello world");
+        // No temp files left behind on success.
+        let tmp = state.path().join("tmp");
+        let mut entries = fs::read_dir(&tmp).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
     }
 
-    #[test]
-    fn write_creates_parent_directories() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("dir/sub/deep/obj.txt");
-            writer.write(&target, body(b"x")).await.unwrap();
-            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"x");
-        });
+    #[tokio::test]
+    async fn write_creates_parent_directories() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let target = state.path().join("dir/sub/deep/obj.txt");
+        writer.write(&target, body(b"x")).await.unwrap();
+        assert_eq!(fs::read(&target).await.unwrap(), b"x");
     }
 
-    #[test]
-    fn write_zero_bytes() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("empty");
-            let got = writer.write(&target, body(b"")).await.unwrap();
-            assert_eq!(got, etag("d41d8cd98f00b204e9800998ecf8427e"));
-            assert_eq!(tokio::fs::metadata(&target).await.unwrap().len(), 0);
-        });
+    #[tokio::test]
+    async fn write_zero_bytes() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let target = state.path().join("empty");
+        let got = writer.write(&target, body(b"")).await.unwrap();
+        assert_eq!(got, etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(fs::metadata(&target).await.unwrap().len(), 0);
     }
 
-    #[test]
-    fn write_last_writer_wins() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("obj");
-            writer.write(&target, body(b"first")).await.unwrap();
-            writer.write(&target, body(b"second")).await.unwrap();
-            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second");
-        });
+    #[tokio::test]
+    async fn write_last_writer_wins() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let target = state.path().join("obj");
+        writer.write(&target, body(b"first")).await.unwrap();
+        writer.write(&target, body(b"second")).await.unwrap();
+        assert_eq!(fs::read(&target).await.unwrap(), b"second");
     }
 
-    #[test]
-    fn interrupted_upload_leaves_no_partial_object() {
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let target = state.path().join("obj");
-            // A stream that yields one good chunk then fails.
-            let stream = futures::stream::iter(vec![
-                Ok(bytes::Bytes::from_static(b"partial")),
-                Err(io::Error::other("connection reset")),
-            ]);
-            let body: BodyStream = Box::pin(stream);
-            let err = writer.write(&target, body).await.unwrap_err();
-            assert!(matches!(err, Error::Io(_)));
-            // The target never appears (previous version absent); the temp
-            // file is removed best-effort (or swept later if cleanup raced).
-            assert!(tokio::fs::metadata(&target).await.is_err());
-        });
+    #[tokio::test]
+    async fn interrupted_upload_leaves_no_partial_object() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let target = state.path().join("obj");
+        // A stream that yields one good chunk then fails.
+        let stream = stream::iter(vec![
+            Ok(Bytes::from_static(b"partial")),
+            Err(IoError::other("connection reset")),
+        ]);
+        let body: BodyStream = Box::pin(stream);
+        let err = writer.write(&target, body).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        // The target never appears (previous version absent); the temp
+        // file is removed best-effort (or swept later if cleanup raced).
+        assert!(fs::metadata(&target).await.is_err());
     }
 
     /// The parent-dir fsync of a real directory succeeds (D1 — the
     /// durability step behind every committed object).
     #[cfg(unix)]
-    #[test]
-    fn sync_parent_dir_syncs_a_real_directory() {
-        rt(async {
-            let dir = tempfile::tempdir().unwrap();
-            sync_parent_dir(dir.path()).await.unwrap();
-        });
+    #[tokio::test]
+    async fn sync_parent_dir_syncs_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_parent_dir(dir.path()).await.unwrap();
     }
 
     /// The dir fsync is not silently dropped: when the parent directory
@@ -478,24 +479,26 @@ mod tests {
     /// self-heal. (Requires an unprivileged run — root bypasses
     /// permission checks.)
     #[cfg(unix)]
-    #[test]
-    fn write_succeeds_when_parent_dir_cannot_be_synced() {
-        use std::os::unix::fs::PermissionsExt;
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            let writer = AtomicWriter::new(state.path());
-            let dir = state.path().join("locked");
-            tokio::fs::create_dir(&dir).await.unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
-            let target = dir.join("obj.bin");
-            let result = writer.write(&target, body(b"x")).await;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(
-                result.is_ok(),
-                "the rename is the commit point — an unsyncable parent must not fail the write (F06)"
-            );
-            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"x");
-        });
+    #[tokio::test]
+    async fn write_succeeds_when_parent_dir_cannot_be_synced() {
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let dir = state.path().join("locked");
+        fs::create_dir(&dir).await.unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o300))
+            .await
+            .unwrap();
+        let target = dir.join("obj.bin");
+        let result = writer.write(&target, body(b"x")).await;
+        fs::set_permissions(&dir, Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "the rename is the commit point — an unsyncable parent must not fail the write (F06)"
+        );
+        assert_eq!(fs::read(&target).await.unwrap(), b"x");
     }
 
     /// F03: the first commit into a NEW prefix syncs the whole ancestor
@@ -505,69 +508,58 @@ mod tests {
     /// bytes"). The sync is unobservable on Windows (a documented
     /// no-op), so the test pins the chain-walk shape on unix.
     #[cfg(unix)]
-    #[test]
-    fn first_commit_syncs_the_new_ancestor_chain() {
-        use std::os::unix::fs::PermissionsExt;
-        rt(async {
-            let state = tempfile::tempdir().unwrap();
-            // `sync_root` = the "bucket" root under the state dir; the
-            // leaf parent is TWO levels deep — both new ancestors are
-            // created by this commit. Making the ROOT unsyncable must
-            // not fail the write: the chain walk warns per failed sync
-            // and continues (the closest syncable entry is the strongest
-            // durability available — F06/F03).
-            let root = state.path().join("bucket");
-            tokio::fs::create_dir(&root).await.unwrap();
-            let target = root.join("a").join("b").join("obj.txt");
-            let temp = state.path().join("staged.tmp");
-            tokio::fs::write(&temp, b"x").await.unwrap();
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
-            let result = AtomicWriter::commit(&temp, &target, Some(&root)).await;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-            // The rename landed and the commit succeeded — the unsyncable
-            // ancestor was warned, not fatal.
-            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"x");
-            assert!(result.is_ok());
-        });
+    #[tokio::test]
+    async fn first_commit_syncs_the_new_ancestor_chain() {
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+        let state = tempfile::tempdir().unwrap();
+        // `sync_root` = the "bucket" root under the state dir; the
+        // leaf parent is TWO levels deep — both new ancestors are
+        // created by this commit. Making the ROOT unsyncable must
+        // not fail the write: the chain walk warns per failed sync
+        // and continues (the closest syncable entry is the strongest
+        // durability available — F06/F03).
+        let root = state.path().join("bucket");
+        fs::create_dir(&root).await.unwrap();
+        let target = root.join("a").join("b").join("obj.txt");
+        let temp = state.path().join("staged.tmp");
+        fs::write(&temp, b"x").await.unwrap();
+        fs::set_permissions(&root, Permissions::from_mode(0o300))
+            .await
+            .unwrap();
+        let result = AtomicWriter::commit(&temp, &target, Some(&root)).await;
+        fs::set_permissions(&root, Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        // The rename landed and the commit succeeded — the unsyncable
+        // ancestor was warned, not fatal.
+        assert_eq!(fs::read(&target).await.unwrap(), b"x");
+        assert!(result.is_ok());
     }
 
-    #[test]
-    fn copy_across_volumes_lands_content_atomically() {
-        // The EXDEV fallback (a cross-volume state dir cannot `rename`):
-        // copy through a staging file next to the target, then rename —
-        // the mechanism test; the trigger is the `CrossesDevices` match.
-        rt(async {
-            let dir = tempfile::tempdir().unwrap();
-            let temp = dir.path().join("staged.bin");
-            tokio::fs::write(&temp, b"cross-volume payload")
-                .await
-                .unwrap();
-            let target = dir.path().join("sub").join("obj.bin");
-            tokio::fs::create_dir_all(target.parent().unwrap())
-                .await
-                .unwrap();
-            copy_across_volumes(&temp, &target).await.unwrap();
-            assert_eq!(
-                tokio::fs::read(&target).await.unwrap(),
-                b"cross-volume payload"
-            );
-            // No staging file left behind on success.
-            let entries: Vec<_> = std::fs::read_dir(dir.path().join("sub"))
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            assert_eq!(entries, ["obj.bin"], "{entries:?}");
-            // A failed copy cleans up the staging file and directory
-            // (no `.tinio` residue).
-            let target2 = dir.path().join("sub2").join("obj.bin");
-            tokio::fs::create_dir_all(target2.parent().unwrap())
-                .await
-                .unwrap();
-            let err = copy_across_volumes(&dir.path().join("missing"), &target2)
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Io(_)), "{err:?}");
-            assert!(!target2.parent().unwrap().join(".tinio").exists());
-        });
+    #[tokio::test]
+    async fn copy_across_volumes_lands_content_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("staged.bin");
+        fs::write(&temp, b"cross-volume payload").await.unwrap();
+        let target = dir.path().join("sub").join("obj.bin");
+        fs::create_dir_all(target.parent().unwrap()).await.unwrap();
+        copy_across_volumes(&temp, &target).await.unwrap();
+        assert_eq!(fs::read(&target).await.unwrap(), b"cross-volume payload");
+        // No staging file left behind on success.
+        let entries: Vec<_> = read_dir(dir.path().join("sub"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, ["obj.bin"], "{entries:?}");
+        // A failed copy cleans up the staging file and directory
+        // (no `.tinio` residue).
+        let target2 = dir.path().join("sub2").join("obj.bin");
+        fs::create_dir_all(target2.parent().unwrap()).await.unwrap();
+        let err = copy_across_volumes(&dir.path().join("missing"), &target2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert!(!target2.parent().unwrap().join(".tinio").exists());
     }
 }

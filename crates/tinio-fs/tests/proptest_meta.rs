@@ -5,17 +5,22 @@
 //! writers never produce torn JSON (atomic temp+rename under the
 //! in-process lock).
 
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime},
+};
 
+use prop::collection;
 use proptest::prelude::*;
 use tinio_core::{ETag, bucket, object};
 use tinio_fs::meta;
+use tokio::runtime::Runtime;
 
 proptest! {
     /// Arbitrary (valid) keys and ETag values round-trip exactly.
     #[test]
     fn entries_round_trip(
-        segs in prop::collection::vec("[a-zA-Z0-9_ -]{1,12}", 1..4),
+        segs in collection::vec("[a-zA-Z0-9_ -]{1,12}", 1..4),
         etag_hex in "[0-9a-f]{32}",
         size in 0u64..(1 << 40),
         secs in 0u64..1_000_000_000,
@@ -23,7 +28,7 @@ proptest! {
         let key = object::key(segs.join("/")).unwrap();
         let etag = ETag::new(&etag_hex).unwrap();
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = meta::store(state.path()).unwrap();
@@ -46,7 +51,7 @@ proptest! {
     #[test]
     fn composed_etags_round_trip(hex in "[0-9a-f]{32}", parts in 1u32..10_000) {
         let etag = ETag::new(&format!("{hex}-{parts}")).unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = meta::store(state.path()).unwrap();
@@ -64,8 +69,8 @@ proptest! {
     /// Concurrent writers of complete JSON payloads never tear: the final
     /// file is exactly one writer's payload.
     #[test]
-    fn concurrent_writes_never_torn(payloads in prop::collection::vec("[a-zA-Z0-9]{1,200}", 4..12)) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+    fn concurrent_writes_never_torn(payloads in collection::vec("[a-zA-Z0-9]{1,200}", 4..12)) {
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = meta::store(state.path()).unwrap();
@@ -103,16 +108,16 @@ proptest! {
     /// serializes them).
     #[test]
     fn concurrent_distinct_key_writes_all_persist(
-        keys in prop::collection::vec("[a-z0-9]{1,16}", 1..16),
+        keys in collection::vec("[a-z0-9]{1,16}", 1..16),
     ) {
         // Deduplicate: "distinct keys" is the property under test.
         let keys: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             keys.into_iter()
                 .filter(|k| seen.insert(k.clone()))
                 .collect()
         };
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();
             let store = meta::store(state.path()).unwrap();

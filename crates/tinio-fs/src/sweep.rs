@@ -9,12 +9,12 @@
 //! event-driven `FsCleanup` startup repair.
 
 use std::{
-    io,
+    io::ErrorKind,
     time::{Duration, SystemTime},
 };
 
 use smart_default::SmartDefault;
-use tokio::sync::watch;
+use tokio::{fs, sync::watch};
 
 use crate::{backend::FsStorage, error::Error, fsutil::entries_of, pacing, path::TMP_DIR_NAME};
 
@@ -24,6 +24,7 @@ use crate::{backend::FsStorage, error::Error, fsutil::entries_of, pacing, path::
 ///
 /// ```rust
 /// use std::time::Duration;
+///
 /// use tinio_fs::sweep::Options;
 ///
 /// let options = Options::default();
@@ -49,11 +50,15 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 ///
 /// ```rust
 /// use std::{sync::Arc, time::Duration};
-/// use tinio_core::pipeline::InlineRunner;
-/// use tinio_core::storage::{
-///     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+///
+/// use tinio_core::{
+///     pipeline::InlineRunner,
+///     storage::{
+///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+///     },
 /// };
 /// use tinio_fs::{FsOptions, FsStorage, sweep};
+/// use tokio::{runtime::Runtime, sync::watch};
 ///
 /// let root = tempfile::tempdir().unwrap();
 /// let options = FsOptions {
@@ -67,9 +72,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 ///     db_pipeline: Arc::new(InlineRunner::default()),
 /// };
 /// let storage = FsStorage::new(root.path(), options).unwrap();
-/// let sweeper = sweep::Sweeper::new(storage.clone(), sweep::Options::default());
-/// let (tx, rx) = tokio::sync::watch::channel(false);
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let sweeper = Sweeper::new(storage.clone(), Options::default());
+/// let (tx, rx) = watch::channel(false);
+/// Runtime::new().unwrap().block_on(async {
 ///     let task = tokio::spawn(async move { sweeper.run(rx).await });
 ///     tx.send(true).unwrap();
 ///     task.await.unwrap();
@@ -144,9 +149,9 @@ impl Sweeper {
         let entries = entries_of(&self.storage.state_dir().join(TMP_DIR_NAME)).await?;
         let mut removed = 0;
         for (path, name) in entries {
-            let metadata = match tokio::fs::metadata(&path).await {
+            let metadata = match fs::metadata(&path).await {
                 Ok(metadata) => metadata,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
             if metadata.is_dir() {
@@ -158,12 +163,12 @@ impl Sweeper {
                     .map(|age| age >= self.options.temp_ttl)
                     .unwrap_or(false)
             {
-                match tokio::fs::remove_file(&path).await {
+                match fs::remove_file(&path).await {
                     Ok(()) => {
                         tracing::info!("swept stale temp file {name}");
                         removed += 1;
                     }
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
                     Err(err) => return Err(err.into()),
                 }
             }
@@ -213,7 +218,10 @@ impl Sweeper {
 /// ```rust
 /// use tinio_fs::sweep::Summary;
 ///
-/// let summary = Summary { temp_files: 1, uploads: 0 };
+/// let summary = Summary {
+///     temp_files: 1,
+///     uploads: 0,
+/// };
 /// assert_eq!(summary.temp_files, 1);
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -226,15 +234,16 @@ pub struct Summary {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        FsOptions,
-        testutil::{fs_options, rt},
-    };
     use std::fs::{self, FileTimes, OpenOptions};
-    use tinio_core::bucket;
-    use tinio_core::storage::{BucketOps, MultipartOps};
+
+    use tinio_core::{
+        bucket,
+        storage::{BucketOps, MultipartOps},
+    };
     use tinio_util::testing::body;
+
+    use super::*;
+    use crate::{FsOptions, testutil::fs_options};
 
     fn old_ttl_options() -> Options {
         Options {
@@ -243,185 +252,164 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sweeps_stale_temps_only() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn sweeps_stale_temps_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        // Stale temp: backdate its mtime deterministically (std
+        // `set_times` — no extra dependency).
+        fs::create_dir(state.path().join("tmp")).unwrap();
+        fs::write(state.path().join("tmp/stale"), b"x").unwrap();
+        fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
+        // Windows requires write access to set times.
+        let f = OpenOptions::new()
+            .write(true)
+            .open(state.path().join("tmp/stale"))
             .unwrap();
-            // Stale temp: backdate its mtime deterministically (std
-            // `set_times` — no extra dependency).
-            fs::create_dir(state.path().join("tmp")).unwrap();
-            fs::write(state.path().join("tmp/stale"), b"x").unwrap();
-            fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
-            // Windows requires write access to set times.
-            let f = OpenOptions::new()
-                .write(true)
-                .open(state.path().join("tmp/stale"))
-                .unwrap();
-            f.set_times(
-                FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)),
-            )
+        f.set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)))
             .unwrap();
-            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
-            let now = SystemTime::now();
-            let summary = sweeper.sweep_once(now).await.unwrap();
-            assert_eq!(summary.temp_files, 1);
-            assert!(!state.path().join("tmp/stale").exists());
-            assert!(state.path().join("tmp/fresh").exists());
-        });
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let now = SystemTime::now();
+        let summary = sweeper.sweep_once(now).await.unwrap();
+        assert_eq!(summary.temp_files, 1);
+        assert!(!state.path().join("tmp/stale").exists());
+        assert!(state.path().join("tmp/fresh").exists());
     }
 
-    #[test]
-    fn sweeps_idle_multipart_uploads() {
-        rt(async {
-            let (root, storage) = {
-                let root = tempfile::tempdir().unwrap();
-                let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-                (root, storage)
-            };
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            storage
-                .create_multipart_upload(&b, &"big.bin".into())
-                .await
-                .unwrap();
-            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
-            // No parts exist, so idle = initiated_at (a moment ago): at the
-            // real `now` the upload is newer than the TTL.
-            let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
-            assert_eq!(summary.uploads, 0);
-            // Well past the TTL, the upload is swept.
-            let far = SystemTime::now() + Duration::from_secs(3600);
-            let summary = sweeper.sweep_once(far).await.unwrap();
-            assert_eq!(summary.uploads, 1);
-            assert!(
-                storage
-                    .multipart_store()
-                    .list_uploads(&b)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            let _ = root;
-        });
-    }
-
-    #[test]
-    fn fresh_uploads_and_temps_survive() {
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    follow_symlinks: true,
-                    compact_threshold_percent: 20,
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
-            .unwrap();
-            fs::create_dir(state.path().join("tmp")).unwrap();
-            fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
-            let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
-            let upload = storage
-                .create_multipart_upload(&b, &"big.bin".into())
-                .await
-                .unwrap();
-            storage
-                .upload_part(
-                    &b,
-                    &"big.bin".into(),
-                    &upload.upload_id,
-                    1.into(),
-                    body(b"x"),
-                )
-                .await
-                .unwrap();
-            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
-            let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
-            assert_eq!(summary.temp_files, 0);
-            assert_eq!(summary.uploads, 0);
-        });
-    }
-
-    #[test]
-    fn run_loop_stops_on_shutdown() {
-        rt(async {
+    #[tokio::test]
+    async fn sweeps_idle_multipart_uploads() {
+        let (root, storage) = {
             let root = tempfile::tempdir().unwrap();
             let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
-            let (tx, rx) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                sweeper.run(rx).await;
-            });
-            tx.send(true).unwrap();
-            task.await.unwrap();
-        });
+            (root, storage)
+        };
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_multipart_upload(&b, &"big.bin".into())
+            .await
+            .unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        // No parts exist, so idle = initiated_at (a moment ago): at the
+        // real `now` the upload is newer than the TTL.
+        let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+        assert_eq!(summary.uploads, 0);
+        // Well past the TTL, the upload is swept.
+        let far = SystemTime::now() + Duration::from_secs(3600);
+        let summary = sweeper.sweep_once(far).await.unwrap();
+        assert_eq!(summary.uploads, 1);
+        assert!(
+            storage
+                .multipart_store()
+                .list_uploads(&b)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = root;
     }
 
-    #[test]
-    fn directories_under_tmp_are_never_swept() {
-        // Only files stage under `tmp/` — a stray directory (a mount
-        // point, a leftover) must not be removed as a temp file.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
+    #[tokio::test]
+    async fn fresh_uploads_and_temps_survive() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        fs::create_dir(state.path().join("tmp")).unwrap();
+        fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &"big.bin".into())
+            .await
             .unwrap();
-            fs::create_dir_all(state.path().join("tmp/nested")).unwrap();
-            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
-            let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
-            assert_eq!(summary.temp_files, 0);
-            assert!(state.path().join("tmp/nested").is_dir());
-        });
+        storage
+            .upload_part(
+                &b,
+                &"big.bin".into(),
+                &upload.upload_id,
+                1.into(),
+                body(b"x"),
+            )
+            .await
+            .unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+        assert_eq!(summary.temp_files, 0);
+        assert_eq!(summary.uploads, 0);
     }
 
-    #[test]
-    fn future_dated_temp_survives() {
-        // A temp whose mtime lies in the future has a negative age —
-        // `duration_since` fails and the file must survive (unwrap_or
-        // false), not be swept as infinitely stale.
-        rt(async {
-            let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let storage = FsStorage::new(
-                root.path(),
-                FsOptions {
-                    state_dir: Some(state.path().to_path_buf()),
-                    ..fs_options()
-                },
-            )
-            .unwrap();
-            fs::create_dir(state.path().join("tmp")).unwrap();
-            let stale = state.path().join("tmp/future");
-            fs::write(&stale, b"x").unwrap();
-            let f = OpenOptions::new().write(true).open(&stale).unwrap();
-            f.set_times(
-                FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(3600)),
-            )
-            .unwrap();
-            let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
-            let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
-            assert_eq!(summary.temp_files, 0);
-            assert!(stale.exists());
+    #[tokio::test]
+    async fn run_loop_stops_on_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            sweeper.run(rx).await;
         });
+        tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directories_under_tmp_are_never_swept() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(state.path().join("tmp/nested")).unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+        assert_eq!(summary.temp_files, 0);
+        assert!(state.path().join("tmp/nested").is_dir());
+    }
+
+    #[tokio::test]
+    async fn future_dated_temp_survives() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        fs::create_dir(state.path().join("tmp")).unwrap();
+        let stale = state.path().join("tmp/future");
+        fs::write(&stale, b"x").unwrap();
+        let f = OpenOptions::new().write(true).open(&stale).unwrap();
+        f.set_times(FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(3600)))
+            .unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+        assert_eq!(summary.temp_files, 0);
+        assert!(stale.exists());
     }
 }

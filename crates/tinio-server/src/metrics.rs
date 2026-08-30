@@ -18,9 +18,8 @@
 //!
 //! ```rust
 //! use std::time::Duration;
-//! use tinio_server::metrics::{
-//!     record_http_request, record_s3_operation, STORAGE_BUCKETS,
-//! };
+//!
+//! use tinio_server::metrics::{STORAGE_BUCKETS, record_http_request, record_s3_operation};
 //!
 //! record_http_request("GET", 200, Duration::from_millis(3));
 //! record_s3_operation("GetObject", 200, Duration::from_millis(5));
@@ -32,19 +31,19 @@ use std::{
     collections::HashMap,
     future::Future,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use lazy_static::lazy_static;
-use prometheus::core::{Collector, Desc};
-use prometheus::proto;
 use prometheus::{
-    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, register_histogram_vec,
-    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Result as PromResult,
+    core::{Collector, Desc},
+    proto::{Bucket, Histogram, Metric, MetricFamily, MetricType},
+    register, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, dto};
-
 use tinio_core::{
     pipeline::Stats,
     storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
@@ -188,7 +187,7 @@ lazy_static! {
     pub static ref WRITE_LOCK_HISTOGRAMS: WriteLockHistograms = {
         let histograms = WriteLockHistograms::new()
             .expect("build the write-lock histogram descriptors");
-        prometheus::register(Box::new(histograms.clone()))
+        register(Box::new(histograms.clone()))
             .expect("register the write-lock histogram families");
         histograms
     };
@@ -288,7 +287,7 @@ impl WriteLockHistograms {
     /// Build the two family descriptors. The bucket bounds are the
     /// shared tinio-core constants — the conversion is positional by
     /// index (the metrics layer reads the buckets by index, not name).
-    fn new() -> prometheus::Result<Self> {
+    fn new() -> PromResult<Self> {
         let wait_desc = Desc::new(
             "tinio_write_lock_wait_duration_seconds".to_string(),
             "Write-lock wait duration of write transactions (the entry-to-begin_write interval, approximating the single-writer lock wait), cumulative histogram"
@@ -321,7 +320,7 @@ impl Collector for WriteLockHistograms {
         vec![&self.wait_desc, &self.total_desc]
     }
 
-    fn collect(&self) -> Vec<proto::MetricFamily> {
+    fn collect(&self) -> Vec<MetricFamily> {
         let snapshot = *self.snapshot.lock().unwrap();
         vec![
             write_lock_family(
@@ -353,45 +352,63 @@ fn write_lock_family(
     buckets: &[u64; WRITE_LOCK_BUCKETS],
     count: u64,
     sum_us: u64,
-) -> proto::MetricFamily {
-    let mut histogram = proto::Histogram::default();
+) -> MetricFamily {
+    let mut histogram = Histogram::default();
     histogram.set_sample_count(count);
     histogram.set_sample_sum(sum_us as f64 / 1_000_000.0);
     let mut cumulative = 0u64;
     let mut proto_buckets = Vec::with_capacity(WRITE_LOCK_BUCKET_BOUNDS_US.len());
     for (bucket, bound_us) in buckets.iter().zip(WRITE_LOCK_BUCKET_BOUNDS_US) {
         cumulative += bucket;
-        let mut proto_bucket = proto::Bucket::default();
+        let mut proto_bucket = Bucket::default();
         proto_bucket.set_cumulative_count(cumulative);
         proto_bucket.set_upper_bound(bound_us as f64 / 1_000_000.0);
         proto_buckets.push(proto_bucket);
     }
     histogram.set_bucket(proto_buckets);
 
-    let mut metric = proto::Metric::default();
+    let mut metric = Metric::default();
     metric.set_histogram(histogram);
 
-    let mut family = proto::MetricFamily::default();
+    let mut family = MetricFamily::default();
     family.set_name(desc.fq_name.clone());
     family.set_help(desc.help.clone());
-    family.set_field_type(proto::MetricType::HISTOGRAM);
+    family.set_field_type(MetricType::HISTOGRAM);
     family.set_metric(vec![metric]);
     family
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, sync::Mutex};
+
+    use http::{Extensions, HeaderMap, Method, Uri};
+    use prometheus::{Encoder, TextEncoder, default_registry};
+    #[cfg(feature = "copy")]
+    use s3s::dto::CopySource;
+    #[cfg(feature = "multipart")]
+    use s3s::dto::{
+        AbortMultipartUploadInput, CompleteMultipartUploadInput, CreateMultipartUploadInput,
+    };
+    use s3s::{
+        dto::{
+            AbortMultipartUploadOutput, CompleteMultipartUploadOutput, CreateBucketInput,
+            CreateBucketOutput, CreateMultipartUploadOutput, Delete,
+        },
+        s3_error,
+    };
+    use tokio::runtime::Runtime;
+
     use super::*;
-    use prometheus::Encoder;
 
     /// Serializes the tests that mutate the shared, label-less
     /// `STORAGE_MULTIPART_IN_PROGRESS` gauge — parallel interleaving would
     /// clobber the exact-value asserts.
-    static MULTIPART_GAUGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static MULTIPART_GAUGE: Mutex<()> = Mutex::new(());
     /// Serializes the tests that refresh the shared write-lock snapshot —
     /// a parallel refresh between the refresh and the encode would clobber
     /// the exact bucket counts.
-    static WRITE_LOCK_SNAPSHOT_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WRITE_LOCK_SNAPSHOT_TEST: Mutex<()> = Mutex::new(());
 
     #[test]
     fn registers_all_families() {
@@ -421,7 +438,7 @@ mod tests {
         // registration path (the server's `/metrics` endpoint calls it on
         // every scrape, F10).
         let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
-        let names: Vec<String> = prometheus::default_registry()
+        let names: Vec<String> = default_registry()
             .gather()
             .iter()
             .map(|f| f.name().to_string())
@@ -429,7 +446,7 @@ mod tests {
         // The tinio_* family set must be exactly the 18 spec'd names
         // (data-model.md Metrics + the pipeline gauges + the write-lock
         // histograms) — a 19th family would fail this equality.
-        let expected: std::collections::HashSet<&str> = [
+        let expected: HashSet<&str> = [
             "tinio_http_requests_total",
             "tinio_http_request_duration_seconds",
             "tinio_http_in_flight",
@@ -451,7 +468,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let actual: std::collections::HashSet<&str> = names
+        let actual: HashSet<&str> = names
             .iter()
             .filter(|n| n.starts_with("tinio_"))
             .map(|n| n.as_str())
@@ -479,8 +496,8 @@ mod tests {
         refresh(Stats::default(), Stats::default(), snapshot);
 
         let mut buf = Vec::new();
-        prometheus::TextEncoder::new()
-            .encode(&prometheus::default_registry().gather(), &mut buf)
+        TextEncoder::new()
+            .encode(&default_registry().gather(), &mut buf)
             .unwrap();
         let text = String::from_utf8(buf).unwrap();
         // Wait distribution: cumulative 10/15/18/20/21/21, sum 0.021 s.
@@ -546,8 +563,8 @@ mod tests {
         record_s3_operation("IncGetObject", 200, Duration::from_millis(3));
 
         let mut buf = Vec::new();
-        prometheus::TextEncoder::new()
-            .encode(&prometheus::default_registry().gather(), &mut buf)
+        TextEncoder::new()
+            .encode(&default_registry().gather(), &mut buf)
             .unwrap();
         let text = String::from_utf8(buf).unwrap();
         // Label-bearing counters are asserted with unique labels so parallel
@@ -598,10 +615,10 @@ mod tests {
             _req: S3Request<dto::CreateBucketInput>,
         ) -> S3Result<S3Response<dto::CreateBucketOutput>> {
             match self.mode {
-                FakeMode::Ok => Ok(S3Response::new(dto::CreateBucketOutput::default())),
-                FakeMode::NoSuchBucket => Err(s3s::s3_error!(NoSuchBucket, "no such bucket")),
-                FakeMode::InternalError => Err(s3s::s3_error!(InternalError, "boom")),
-                FakeMode::NotImplemented => Err(s3s::s3_error!(NotImplemented, "nope")),
+                FakeMode::Ok => Ok(S3Response::new(CreateBucketOutput::default())),
+                FakeMode::NoSuchBucket => Err(s3_error!(NoSuchBucket, "no such bucket")),
+                FakeMode::InternalError => Err(s3_error!(InternalError, "boom")),
+                FakeMode::NotImplemented => Err(s3_error!(NotImplemented, "nope")),
             }
         }
 
@@ -609,33 +626,31 @@ mod tests {
             &self,
             _req: S3Request<dto::CreateMultipartUploadInput>,
         ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
-            Ok(S3Response::new(dto::CreateMultipartUploadOutput::default()))
+            Ok(S3Response::new(CreateMultipartUploadOutput::default()))
         }
 
         async fn complete_multipart_upload(
             &self,
             _req: S3Request<dto::CompleteMultipartUploadInput>,
         ) -> S3Result<S3Response<dto::CompleteMultipartUploadOutput>> {
-            Ok(S3Response::new(
-                dto::CompleteMultipartUploadOutput::default(),
-            ))
+            Ok(S3Response::new(CompleteMultipartUploadOutput::default()))
         }
 
         async fn abort_multipart_upload(
             &self,
             _req: S3Request<dto::AbortMultipartUploadInput>,
         ) -> S3Result<S3Response<dto::AbortMultipartUploadOutput>> {
-            Ok(S3Response::new(dto::AbortMultipartUploadOutput::default()))
+            Ok(S3Response::new(AbortMultipartUploadOutput::default()))
         }
     }
 
     fn request<T>(input: T) -> S3Request<T> {
         S3Request {
             input,
-            method: http::Method::PUT,
-            uri: http::Uri::default(),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
+            method: Method::PUT,
+            uri: Uri::default(),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
             credentials: None,
             region: None,
             service: None,
@@ -660,8 +675,8 @@ mod tests {
             (FakeMode::NotImplemented, 501),
         ] {
             let backend = MetricS3::new(FakeS3 { mode });
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let _ = rt.block_on(backend.create_bucket(request(dto::CreateBucketInput::default())));
+            let rt = Runtime::new().unwrap();
+            let _ = rt.block_on(backend.create_bucket(request(CreateBucketInput::default())));
         }
         assert_eq!(s3_counter("CreateBucket", 200), 1);
         assert_eq!(s3_counter("CreateBucket", 400), 1);
@@ -675,23 +690,20 @@ mod tests {
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
         let backend = MetricS3::new(FakeS3 { mode: FakeMode::Ok });
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(
-            backend.create_multipart_upload(request(dto::CreateMultipartUploadInput::default())),
+            backend.create_multipart_upload(request(CreateMultipartUploadInput::default())),
         )
         .unwrap();
         assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 1);
         rt.block_on(
-            backend
-                .complete_multipart_upload(request(dto::CompleteMultipartUploadInput::default())),
+            backend.complete_multipart_upload(request(CompleteMultipartUploadInput::default())),
         )
         .unwrap();
         assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 0);
         // An abort on an empty gauge must not go negative (saturating).
-        rt.block_on(
-            backend.abort_multipart_upload(request(dto::AbortMultipartUploadInput::default())),
-        )
-        .unwrap();
+        rt.block_on(backend.abort_multipart_upload(request(AbortMultipartUploadInput::default())))
+            .unwrap();
         assert_eq!(STORAGE_MULTIPART_IN_PROGRESS.get(), 0);
     }
 
@@ -703,7 +715,7 @@ mod tests {
         let backend = MetricS3::new(FakeS3 {
             mode: FakeMode::NotImplemented,
         });
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         macro_rules! call {
             ($op:ident, $input:ty) => {
                 let _ = rt.block_on(backend.$op(request(<$input>::default())));
@@ -732,7 +744,7 @@ mod tests {
         // explicitly with every field.
         #[cfg(feature = "copy")]
         {
-            let copy_source = dto::CopySource::parse("src/key").unwrap();
+            let copy_source = CopySource::parse("src/key").unwrap();
             let _ = rt.block_on(backend.copy_object(request(dto::CopyObjectInput {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -779,7 +791,7 @@ mod tests {
             let _ = rt.block_on(backend.upload_part_copy(request(dto::UploadPartCopyInput {
                 bucket: "b".into(),
                 key: "k".into(),
-                copy_source: dto::CopySource::parse("src/key").unwrap(),
+                copy_source: CopySource::parse("src/key").unwrap(),
                 part_number: 1,
                 upload_id: "u".into(),
                 copy_source_if_match: None,
@@ -800,7 +812,7 @@ mod tests {
         }
         let _ = rt.block_on(backend.delete_objects(request(dto::DeleteObjectsInput {
             bucket: "b".into(),
-            delete: dto::Delete::default(),
+            delete: Delete::default(),
             bypass_governance_retention: None,
             checksum_algorithm: None,
             expected_bucket_owner: None,
@@ -850,18 +862,19 @@ mod tests {
 /// # Examples
 ///
 /// ```rust
-/// use s3s::{S3, S3Request, dto};
-/// use tinio_server::backend::S3Backend;
-/// use tinio_server::metrics::MetricS3;
+/// use http::{Extensions, HeaderMap, Method, Uri};
+/// use s3s::{S3, S3Request, dto::ListBucketsInput};
 /// use tinio_mem::MemoryStorage;
+/// use tinio_server::{backend::S3Backend, metrics::MetricS3};
+/// use tokio::runtime::Runtime;
 ///
 /// fn request<T>(input: T) -> S3Request<T> {
 ///     S3Request {
 ///         input,
-///         method: http::Method::GET,
-///         uri: http::Uri::default(),
-///         headers: http::HeaderMap::new(),
-///         extensions: http::Extensions::new(),
+///         method: Method::GET,
+///         uri: Uri::default(),
+///         headers: HeaderMap::new(),
+///         extensions: Extensions::new(),
 ///         credentials: None,
 ///         region: None,
 ///         service: None,
@@ -871,9 +884,9 @@ mod tests {
 ///
 /// let inner = S3Backend::new(MemoryStorage::new().unwrap(), Default::default());
 /// let backend = MetricS3::new(inner);
-/// let out = tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let out = Runtime::new().unwrap().block_on(async {
 ///     backend
-///         .list_buckets(request(dto::ListBucketsInput::default()))
+///         .list_buckets(request(ListBucketsInput::default()))
 ///         .await
 ///         .unwrap()
 /// });
@@ -901,7 +914,7 @@ impl<T> MetricS3<T> {
         op: &'static str,
         fut: impl Future<Output = S3Result<R>> + Send,
     ) -> S3Result<R> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = fut.await;
         let status = match &result {
             Ok(_) => 200u16,
@@ -926,6 +939,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("CreateBucket", self.inner.create_bucket(req))
             .await
     }
+
     async fn delete_bucket(
         &self,
         req: S3Request<dto::DeleteBucketInput>,
@@ -933,12 +947,14 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("DeleteBucket", self.inner.delete_bucket(req))
             .await
     }
+
     async fn head_bucket(
         &self,
         req: S3Request<dto::HeadBucketInput>,
     ) -> S3Result<S3Response<dto::HeadBucketOutput>> {
         self.record("HeadBucket", self.inner.head_bucket(req)).await
     }
+
     async fn list_buckets(
         &self,
         req: S3Request<dto::ListBucketsInput>,
@@ -946,6 +962,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("ListBuckets", self.inner.list_buckets(req))
             .await
     }
+
     async fn get_bucket_location(
         &self,
         req: S3Request<dto::GetBucketLocationInput>,
@@ -961,18 +978,21 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
     ) -> S3Result<S3Response<dto::PutObjectOutput>> {
         self.record("PutObject", self.inner.put_object(req)).await
     }
+
     async fn get_object(
         &self,
         req: S3Request<dto::GetObjectInput>,
     ) -> S3Result<S3Response<dto::GetObjectOutput>> {
         self.record("GetObject", self.inner.get_object(req)).await
     }
+
     async fn head_object(
         &self,
         req: S3Request<dto::HeadObjectInput>,
     ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
         self.record("HeadObject", self.inner.head_object(req)).await
     }
+
     async fn delete_object(
         &self,
         req: S3Request<dto::DeleteObjectInput>,
@@ -980,6 +1000,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("DeleteObject", self.inner.delete_object(req))
             .await
     }
+
     async fn delete_objects(
         &self,
         req: S3Request<dto::DeleteObjectsInput>,
@@ -987,6 +1008,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("DeleteObjects", self.inner.delete_objects(req))
             .await
     }
+
     async fn get_object_tagging(
         &self,
         req: S3Request<dto::GetObjectTaggingInput>,
@@ -1012,6 +1034,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("ListObjects", self.inner.list_objects(req))
             .await
     }
+
     #[cfg(feature = "list-v2")]
     async fn list_objects_v2(
         &self,
@@ -1038,6 +1061,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         }
         out
     }
+
     #[cfg(feature = "multipart")]
     async fn upload_part(
         &self,
@@ -1045,6 +1069,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
     ) -> S3Result<S3Response<dto::UploadPartOutput>> {
         self.record("UploadPart", self.inner.upload_part(req)).await
     }
+
     #[cfg(feature = "multipart")]
     #[cfg(feature = "copy")]
     async fn upload_part_copy(
@@ -1054,6 +1079,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record("UploadPartCopy", self.inner.upload_part_copy(req))
             .await
     }
+
     #[cfg(feature = "multipart")]
     async fn complete_multipart_upload(
         &self,
@@ -1070,6 +1096,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         }
         out
     }
+
     #[cfg(feature = "multipart")]
     async fn abort_multipart_upload(
         &self,
@@ -1086,6 +1113,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         }
         out
     }
+
     #[cfg(feature = "multipart")]
     async fn list_parts(
         &self,
@@ -1093,6 +1121,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
     ) -> S3Result<S3Response<dto::ListPartsOutput>> {
         self.record("ListParts", self.inner.list_parts(req)).await
     }
+
     #[cfg(feature = "multipart")]
     async fn list_multipart_uploads(
         &self,

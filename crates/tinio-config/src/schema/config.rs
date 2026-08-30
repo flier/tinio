@@ -1,11 +1,12 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, fs::read_to_string, path::Path};
 
 use garde::Validate;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
+use toml::Deserializer;
 
 use super::{api, auth, log, pipeline, s3, scanner, server, storage, telemetry};
-use crate::Error;
+use crate::{Error, error};
 
 /// Config format version (currently only `1`).
 ///
@@ -53,7 +54,7 @@ pub struct Version(
 /// .unwrap();
 /// assert_eq!(config.server.host, "0.0.0.0");
 /// assert_eq!(config.server.port, 9000);
-/// assert!(!config.s3.as_ref().unwrap().multipart);
+/// assert!(!config.s3.as_ref().unwrap().capabilities.multipart);
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 pub struct Config {
@@ -109,14 +110,14 @@ impl Config {
 
     /// Read, parse, and validate a config file.
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(path).map_err(|e| crate::error::io(path, e))?;
+        let text = read_to_string(path).map_err(|e| error::io(path, e))?;
         Self::parse_at(&text, path)
     }
 
     /// Parse + validation with errors labeled by `path`.
     fn parse_at(input: &str, path: &Path) -> Result<Self, Error> {
-        let deserializer = toml::Deserializer::parse(input)
-            .map_err(|e| crate::error::parse(path, e.to_string()))?;
+        let deserializer =
+            Deserializer::parse(input).map_err(|e| error::parse(path, e.to_string()))?;
         let mut ignored = BTreeSet::new();
         let config: Config = match serde_ignored::deserialize(deserializer, |p| {
             ignored.insert(p.to_string());
@@ -127,13 +128,13 @@ impl Config {
                     // Unknown keys were present even though deserialization
                     // also failed (e.g. a missing required field) — report
                     // them all, matching the old deny-fail-fast.
-                    return Err(crate::error::unknown_key(sort_keys(&ignored)));
+                    return Err(error::unknown_key(sort_keys(&ignored)));
                 }
-                return Err(crate::error::parse(path, e.to_string()));
+                return Err(error::parse(path, e.to_string()));
             }
         };
         if !ignored.is_empty() {
-            return Err(crate::error::unknown_key(sort_keys(&ignored)));
+            return Err(error::unknown_key(sort_keys(&ignored)));
         }
         config.validate().map_err(Error::from_report)?;
         Ok(config)
@@ -146,8 +147,7 @@ impl Config {
     /// `[pipeline.*]` — are never emitted. The `toml_edit` write path was
     /// an unmotivated second serializer for the same format (F47).
     pub fn to_toml(&self) -> Result<String, Error> {
-        toml::to_string(self)
-            .map_err(|e| crate::error::parse(Path::new("(serialization)"), e.to_string()))
+        toml::to_string(self).map_err(|e| error::parse(Path::new("(serialization)"), e.to_string()))
     }
 }
 
@@ -162,11 +162,17 @@ fn sort_keys(keys: &BTreeSet<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{fs, path::PathBuf, time::Duration};
 
+    use pipeline_mod::Priority;
     use secrecy::ExposeSecret;
 
-    use super::{Config, Version, auth, log};
+    use super::{
+        Config, Version,
+        auth::{self, SecretKey},
+        log::{self, AccessFormat, Format, Verbosity},
+        pipeline as pipeline_mod, s3,
+    };
     use crate::Error;
 
     #[test]
@@ -241,15 +247,12 @@ mod tests {
         assert_eq!(config.server.port, 9001);
         assert_eq!(config.scanner.as_ref().unwrap().delay, 2.5);
         assert_eq!(config.auth.as_ref().unwrap().access_key, "ak");
-        assert_eq!(
-            config.log.as_ref().unwrap().verbosity,
-            log::Verbosity::Debug
-        );
+        assert_eq!(config.log.as_ref().unwrap().verbosity, Verbosity::Debug);
         assert_eq!(
             config.log.as_ref().unwrap().access_log_format,
-            log::AccessFormat::Common
+            AccessFormat::Common
         );
-        assert!(!config.s3.as_ref().unwrap().multipart);
+        assert!(!config.s3.as_ref().unwrap().capabilities.multipart);
         assert!(!config.storage.as_ref().unwrap().fs.follow_symlinks);
         assert_eq!(
             config
@@ -264,10 +267,10 @@ mod tests {
         assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_bytes, 131072);
         let pipeline = config.pipeline.as_ref().unwrap();
         assert_eq!(pipeline.io.workers, 4);
-        assert_eq!(pipeline.io.priority, super::pipeline::Priority::Low);
+        assert_eq!(pipeline.io.priority, Priority::Low);
         assert_eq!(pipeline.io.capacity, 2048);
         assert_eq!(pipeline.db.workers, 2);
-        assert_eq!(pipeline.db.priority, super::pipeline::Priority::High);
+        assert_eq!(pipeline.db.priority, Priority::High);
         assert_eq!(pipeline.db.capacity, 4096);
         assert_eq!(
             config.api.as_ref().unwrap().http.as_ref().unwrap().port,
@@ -320,8 +323,13 @@ mod tests {
 
         let config = Config::parse("version = 1\n[s3]\nmultipart = false").unwrap();
         let s3 = config.s3.as_ref().unwrap();
-        assert!(!s3.multipart);
-        assert!(s3.copy_object && s3.list_objects_v1 && s3.list_objects_v2 && s3.delete_objects);
+        assert!(!s3.capabilities.multipart);
+        assert!(
+            s3.capabilities.copy_object
+                && s3.capabilities.list_objects_v1
+                && s3.capabilities.list_objects_v2
+                && s3.capabilities.delete_objects
+        );
         assert_eq!(s3.temp_ttl_hours, 24);
         assert_eq!(s3.multipart_expire_days, 7);
 
@@ -329,7 +337,7 @@ mod tests {
         // helper (the toggle defaults must match `Config::default`).
         let config = Config::parse("version = 1\n[s3]").unwrap();
         let empty = config.s3.as_ref().unwrap();
-        assert_eq!(empty, &super::s3::Config::default());
+        assert_eq!(empty, &s3::Config::default());
 
         let config = Config::parse("version = 1\n[storage.fs]\nfollow_symlinks = false").unwrap();
         let fs = &config.storage.as_ref().unwrap().fs;
@@ -426,13 +434,13 @@ mod tests {
     #[test]
     fn access_log_format_serialization() {
         let log = log::Config {
-            access_log_format: log::AccessFormat::Combined,
+            access_log_format: AccessFormat::Combined,
             ..Default::default()
         };
         let toml = toml::to_string(&log).unwrap();
         assert!(toml.contains("access_log_format = \"combined\""), "{toml}");
         let custom = log::Config {
-            access_log_format: log::AccessFormat::Custom("$status".into()),
+            access_log_format: AccessFormat::Custom("$status".into()),
             ..Default::default()
         };
         let toml = toml::to_string(&custom).unwrap();
@@ -441,21 +449,18 @@ mod tests {
         let back: log::Config = toml::from_str(&toml).unwrap();
         assert_eq!(
             back.access_log_format,
-            log::AccessFormat::Custom("$status".into())
+            AccessFormat::Custom("$status".into())
         );
     }
 
     #[test]
     fn verbosity_display_and_parse() {
-        assert_eq!(log::Verbosity::Info.to_string(), "info");
-        assert_eq!(log::Verbosity::Debug.to_string(), "debug");
-        assert_eq!(
-            "warn".parse::<log::Verbosity>().unwrap(),
-            log::Verbosity::Warn
-        );
+        assert_eq!(Verbosity::Info.to_string(), "info");
+        assert_eq!(Verbosity::Debug.to_string(), "debug");
+        assert_eq!("warn".parse::<log::Verbosity>().unwrap(), Verbosity::Warn);
         assert!("loud".parse::<log::Verbosity>().is_err());
-        assert_eq!(log::Format::Json.to_string(), "json");
-        assert_eq!("text".parse::<log::Format>().unwrap(), log::Format::Text);
+        assert_eq!(Format::Json.to_string(), "json");
+        assert_eq!("text".parse::<log::Format>().unwrap(), Format::Text);
     }
 
     #[test]
@@ -539,15 +544,15 @@ mod tests {
     fn load_reads_and_validates_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "version = 1").unwrap();
+        fs::write(&path, "version = 1").unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.server.port, 9000);
     }
 
     #[test]
     fn secret_key_conversions() {
-        let from_str = auth::SecretKey::from("sk");
-        let from_string = auth::SecretKey::from("sk".to_string());
+        let from_str = SecretKey::from("sk");
+        let from_string = SecretKey::from("sk".to_string());
         assert_eq!(&*from_str, "sk");
         assert_eq!(&*from_string, "sk");
         let boxed: secrecy::SecretBox<auth::SecretKey> = from_str.into();
@@ -556,19 +561,8 @@ mod tests {
 
     #[test]
     fn access_log_format_as_str() {
-        assert!(
-            log::AccessFormat::Combined
-                .as_str()
-                .contains("$remote_addr")
-        );
-        assert!(
-            log::AccessFormat::Common
-                .as_str()
-                .contains("$body_bytes_sent")
-        );
-        assert_eq!(
-            log::AccessFormat::Custom("$request".into()).as_str(),
-            "$request"
-        );
+        assert!(AccessFormat::Combined.as_str().contains("$remote_addr"));
+        assert!(AccessFormat::Common.as_str().contains("$body_bytes_sent"));
+        assert_eq!(AccessFormat::Custom("$request".into()).as_str(), "$request");
     }
 }

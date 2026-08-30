@@ -1,14 +1,20 @@
 //! Typed handles to redb tables (`StateTable`, `BucketsTable`, …).
 
-use std::{marker::PhantomData, path::Path, time::SystemTime};
+use std::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    path::Path,
+    time::SystemTime,
+};
 
 use redb::{ReadableTable, Table, TableDefinition};
 use tinio_core::{etag::ETag, from_nanos, object, to_nanos};
 
+use super::{
+    error::{Error, corrupt_meta, unsupported_version},
+    scan::{drain_pair, drain_triple, for_each_pair},
+};
 use crate::bucket;
-
-use super::error::{Error, corrupt_meta, unsupported_version};
-use super::scan::{drain_pair, drain_triple, for_each_pair};
 
 /// `Deref`/`DerefMut` plus `open` / `ensure` / `open_readonly` for a table handle.
 macro_rules! table_impl {
@@ -26,7 +32,7 @@ macro_rules! table_impl {
         table_impl!(@read $name, $def, $key, $val);
     };
     (@deref $name:ident) => {
-        impl<'txn, T> std::ops::Deref for $name<'txn, T> {
+        impl<'txn, T> Deref for $name<'txn, T> {
             type Target = T;
 
             fn deref(&self) -> &Self::Target {
@@ -34,7 +40,7 @@ macro_rules! table_impl {
             }
         }
 
-        impl<'txn, T> std::ops::DerefMut for $name<'txn, T> {
+        impl<'txn, T> DerefMut for $name<'txn, T> {
             fn deref_mut(&mut self) -> &mut Self::Target {
                 &mut self.0
             }
@@ -45,12 +51,12 @@ macro_rules! table_impl {
             /// Open the table in a write transaction.
             pub fn open(
                 txn: &'txn mut redb::WriteTransaction,
-            ) -> Result<Self, super::error::Error> {
-                Ok(Self(txn.open_table($def)?, std::marker::PhantomData))
+            ) -> Result<Self, Error> {
+                Ok(Self(txn.open_table($def)?, PhantomData))
             }
 
             /// Create the table if this is a fresh database.
-            pub fn ensure(txn: &mut redb::WriteTransaction) -> Result<(), super::error::Error> {
+            pub fn ensure(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
                 txn.open_table($def)?;
                 Ok(())
             }
@@ -61,8 +67,8 @@ macro_rules! table_impl {
             /// Open the table in a write transaction.
             pub fn open(
                 txn: &'txn mut redb::WriteTransaction,
-            ) -> Result<Self, super::error::Error> {
-                Ok(Self(txn.open_table($def)?, std::marker::PhantomData))
+            ) -> Result<Self, Error> {
+                Ok(Self(txn.open_table($def)?, PhantomData))
             }
         }
     };
@@ -71,8 +77,8 @@ macro_rules! table_impl {
             /// Open the table in a read transaction.
             pub fn open_readonly(
                 txn: &'txn redb::ReadTransaction,
-            ) -> Result<Self, super::error::Error> {
-                Ok(Self(txn.open_table($def)?, std::marker::PhantomData))
+            ) -> Result<Self, Error> {
+                Ok(Self(txn.open_table($def)?, PhantomData))
             }
         }
     };

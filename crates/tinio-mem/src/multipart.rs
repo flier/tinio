@@ -4,9 +4,10 @@
 //! completion, and abort each run in one write transaction; part keys are
 //! zero-padded so string order equals part-number order.
 
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable};
-
 use tinio_core::{
     CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
     PartInfo, PartNumber, PartsListing, UploadsListing, bucket, collect_body, from_nanos,
@@ -54,7 +55,7 @@ impl MultipartOps for MemoryStorage {
             upload_id: Uuid::new_v4().to_string(),
             bucket: bucket.clone(),
             key: key.clone(),
-            initiated_at: std::time::SystemTime::now(),
+            initiated_at: SystemTime::now(),
         };
         let txn = self.db.begin_write()?;
         {

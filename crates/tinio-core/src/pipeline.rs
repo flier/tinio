@@ -45,12 +45,14 @@
 //! `shutdown()`, queued tasks are dropped, in-flight tasks run to
 //! completion, and `enqueue` returns `Err`.
 
-use std::error::Error as StdError;
-use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    error::Error as StdError,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -287,13 +289,10 @@ pub const IO_WORKERS_MAX: u8 = 64;
 /// The default worker count of the removal pipeline (`[pipeline.remove]
 /// workers`) — one worker: tombstone tree deletion is background cleanup
 /// that must not starve ETag compute (the IO pipeline's job), and the
-/// default stays out of the IO workers' way (D-A).
+/// default stays out of the IO workers' way (D-A). The worker range is
+/// the IO pipeline's own ([`IO_WORKERS_MIN`]/[`IO_WORKERS_MAX`] — only
+/// the default differs).
 pub const DEFAULT_REMOVE_WORKERS: u8 = 1;
-
-/// The validation bounds of the removal pipeline worker count (1..=64 —
-/// the same range as the IO pipeline; only the default differs).
-pub const REMOVE_WORKERS_MIN: u8 = 1;
-pub const REMOVE_WORKERS_MAX: u8 = 64;
 
 /// The default worker count of the DB write pipeline (`[pipeline.db]
 /// workers`) — redb is a single-writer store, so more than one worker adds
@@ -331,6 +330,7 @@ pub const CAPACITY_MAX: u32 = 65536;
 /// ```rust
 /// use async_trait::async_trait;
 /// use tinio_core::pipeline::{InlineRunner, Runner, Task};
+/// use tokio::runtime::Runtime;
 ///
 /// struct Echo(&'static str);
 ///
@@ -346,9 +346,14 @@ pub const CAPACITY_MAX: u32 = 65536;
 /// }
 ///
 /// let runner = InlineRunner::default();
-/// let rt = tokio::runtime::Runtime::new().unwrap();
+/// let rt = Runtime::new().unwrap();
 /// rt.block_on(async {
-///     runner.enqueue(Box::new(Echo("hi"))).await.unwrap().await.unwrap();
+///     runner
+///         .enqueue(Box::new(Echo("hi")))
+///         .await
+///         .unwrap()
+///         .await
+///         .unwrap();
 /// });
 /// ```
 #[derive(Default)]
@@ -409,10 +414,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::{
+        cell::Cell,
+        mem::replace,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio::{runtime::Runtime, sync::mpsc, time::timeout};
 
     use super::*;
 
@@ -474,7 +486,7 @@ mod tests {
         }
 
         async fn run(&mut self) -> Result<(), Box<dyn StdError + Send + Sync>> {
-            std::mem::replace(&mut self.outcome, Ok(()))
+            replace(&mut self.outcome, Ok(()))
         }
     }
 
@@ -499,7 +511,7 @@ mod tests {
     /// test "pauses" it by not draining the queue. `shutdown` is a no-op
     /// (shutdown semantics are exercised on [`InlineRunner`]).
     struct PausableStubRunner {
-        queue: tokio::sync::mpsc::Sender<Box<dyn Task<Output = RunOutput>>>,
+        queue: mpsc::Sender<Box<dyn Task<Output = RunOutput>>>,
     }
 
     #[async_trait]
@@ -541,10 +553,9 @@ mod tests {
 
     #[test]
     fn enqueue_blocks_while_the_queue_is_full() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            let (queue, mut rx) =
-                tokio::sync::mpsc::channel::<Box<dyn Task<Output = RunOutput>>>(1);
+            let (queue, mut rx) = mpsc::channel::<Box<dyn Task<Output = RunOutput>>>(1);
             let runner = Arc::new(PausableStubRunner { queue });
 
             // Fill the single slot.
@@ -556,7 +567,7 @@ mod tests {
             let runner2 = Arc::clone(&runner);
             let mut blocked = tokio::spawn(async move { runner2.enqueue(Box::new(task)).await });
             assert!(
-                tokio::time::timeout(Duration::from_millis(50), &mut blocked)
+                timeout(Duration::from_millis(50), &mut blocked)
                     .await
                     .is_err(),
                 "enqueue must block while the queue is full"
@@ -576,7 +587,7 @@ mod tests {
     #[test]
     fn inline_runner_executes_tasks_synchronously() {
         let runner = InlineRunner::default();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let (runs, task) = RecordingTask::new();
             let task = Box::new(task);
@@ -597,7 +608,7 @@ mod tests {
         runner.shutdown();
         runner.shutdown(); // idempotent
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let (_, task) = RecordingTask::new();
             let err = runner.enqueue(Box::new(task)).await.unwrap_err();
@@ -613,7 +624,7 @@ mod tests {
     #[should_panic(expected = "task panicked (R6)")]
     fn inline_runner_passes_panics_through() {
         let runner = InlineRunner::default();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(PanicTask.kind(), "panic");
             runner.enqueue(Box::new(PanicTask)).await.unwrap();
@@ -623,7 +634,7 @@ mod tests {
     #[test]
     fn enqueue_returns_a_completion_that_carries_run_ok() {
         let runner = InlineRunner::default();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(ReportTask { outcome: Ok(()) }.kind(), "report");
             runner
@@ -641,7 +652,7 @@ mod tests {
         // enqueue Ok = accepted; the handle carries run()'s Err (list awaits
         // it; scanner drops it and the concurrent runtime logs instead).
         let runner = InlineRunner::default();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let err = runner
                 .enqueue(Box::new(ReportTask {
@@ -674,7 +685,7 @@ mod tests {
         }
 
         let runner = InlineRunner::default();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(Answer.kind(), "answer");
             let n = runner
@@ -691,7 +702,7 @@ mod tests {
     fn dropped_completion_resolves_dropped() {
         let (reply, done) = Completion::<()>::pair();
         drop(reply);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let err = done.await.unwrap_err();
             assert_eq!(err, Error::Dropped);
@@ -723,7 +734,7 @@ mod tests {
         runner.shutdown(); // idempotent through the delegation
         assert_eq!(runner.stats(), Stats::default());
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let (_, task) = RecordingTask::new();
             let err = runner.enqueue(Box::new(task)).await.unwrap_err();

@@ -8,9 +8,11 @@
 
 use std::sync::Arc;
 
-use tinio_core::pipeline::InlineRunner;
-use tinio_core::storage::{
-    DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+use tinio_core::{
+    pipeline::InlineRunner,
+    storage::{
+        DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+    },
 };
 
 use crate::FsOptions;

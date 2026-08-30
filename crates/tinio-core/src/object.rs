@@ -3,6 +3,7 @@
 use std::time::SystemTime;
 
 use derive_more::{AsRef, Deref, Display, Into};
+use garde::Error as GardeError;
 
 use crate::{
     ETag,
@@ -30,8 +31,10 @@ pub const RESERVED_SEGMENT: &str = ".tinio";
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::object;
-/// use tinio_core::storage::{self, Error::*};
+/// use tinio_core::{
+///     object,
+///     storage::{self, Error::*},
+/// };
 ///
 /// let k = object::key("dir/file.txt").unwrap();
 /// assert_eq!(k.as_ref(), "dir/file.txt");
@@ -40,10 +43,7 @@ pub const RESERVED_SEGMENT: &str = ".tinio";
 /// assert!(object::key("dir/").unwrap().is_folder_marker());
 ///
 /// for bad in ["../evil", "/abs", "a\x00b"] {
-///     assert!(matches!(
-///         object::key(bad),
-///         Err(InvalidKey(_))
-///     ));
+///     assert!(matches!(object::key(bad), Err(InvalidKey(_))));
 /// }
 ///
 /// let reserved = object::key("a/.tinio/b").unwrap(); // syntactically legal
@@ -105,12 +105,14 @@ impl From<String> for Key {
 /// # Examples
 ///
 /// ```rust
+/// use std::time::SystemTime;
+///
 /// use tinio_core::object::Info;
 ///
 /// let info = Info {
 ///     key: "dir/file.txt".into(),
 ///     size: 4,
-///     last_modified: std::time::SystemTime::UNIX_EPOCH,
+///     last_modified: SystemTime::UNIX_EPOCH,
 ///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
 /// };
 /// assert_eq!(info.size, 4);
@@ -135,23 +137,23 @@ pub fn is_reserved_key(key: &str) -> bool {
 
 fn validate_object_key(key: &str) -> garde::Result {
     if key.is_empty() {
-        return Err(garde::Error::new("empty key"));
+        return Err(GardeError::new("empty key"));
     }
     if key.starts_with('/') || key.starts_with('\\') {
         // `\` is a path separator on Windows — a backslash-absolute key
         // would map outside the storage root there.
-        return Err(garde::Error::new(format!("{key:?}: absolute path")));
+        return Err(GardeError::new(format!("{key:?}: absolute path")));
     }
     if key.len() >= 2 && key.as_bytes()[0].is_ascii_alphabetic() && key.as_bytes()[1] == b':' {
         // Drive-letter absolute/relative path (`C:\foo`, `C:foo`) — escapes
         // the storage root on Windows.
-        return Err(garde::Error::new(format!("{key:?}: drive-letter path")));
+        return Err(GardeError::new(format!("{key:?}: drive-letter path")));
     }
     if key.contains("..") {
-        return Err(garde::Error::new(format!("{key:?}: traversal sequence")));
+        return Err(GardeError::new(format!("{key:?}: traversal sequence")));
     }
     if key.split(['/', '\\']).any(|seg| seg == ".") {
-        return Err(garde::Error::new(format!("{key:?}: dot segment")));
+        return Err(GardeError::new(format!("{key:?}: dot segment")));
     }
     // Empty interior segments (`a//b`, `a\\b`, `a/\b`) alias a
     // single-separator key on a filesystem mirror — the mirror cannot
@@ -162,20 +164,19 @@ fn validate_object_key(key: &str) -> garde::Result {
     // a folder marker (`dir/`) is the one legal empty segment.
     let segs: Vec<&str> = key.split(['/', '\\']).collect();
     if segs.len() > 1 && segs[..segs.len() - 1].iter().any(|seg| seg.is_empty()) {
-        return Err(garde::Error::new(format!(
-            "{key:?}: empty interior segment"
-        )));
+        return Err(GardeError::new(format!("{key:?}: empty interior segment")));
     }
     if key.chars().any(|c| c.is_control()) {
-        return Err(garde::Error::new(format!("{key:?}: control character")));
+        return Err(GardeError::new(format!("{key:?}: control character")));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tinio_util::testing::assert_send_sync;
+
+    use super::*;
 
     #[test]
     fn object_key_validates_and_exposes() {
