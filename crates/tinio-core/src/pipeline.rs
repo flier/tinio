@@ -284,6 +284,17 @@ pub const DEFAULT_IO_WORKERS: u8 = 2;
 pub const IO_WORKERS_MIN: u8 = 1;
 pub const IO_WORKERS_MAX: u8 = 64;
 
+/// The default worker count of the removal pipeline (`[pipeline.remove]
+/// workers`) — one worker: tombstone tree deletion is background cleanup
+/// that must not starve ETag compute (the IO pipeline's job), and the
+/// default stays out of the IO workers' way (D-A).
+pub const DEFAULT_REMOVE_WORKERS: u8 = 1;
+
+/// The validation bounds of the removal pipeline worker count (1..=64 —
+/// the same range as the IO pipeline; only the default differs).
+pub const REMOVE_WORKERS_MIN: u8 = 1;
+pub const REMOVE_WORKERS_MAX: u8 = 64;
+
 /// The default worker count of the DB write pipeline (`[pipeline.db]
 /// workers`) — redb is a single-writer store, so more than one worker adds
 /// no write throughput (pipeline-spec.md §3.1).

@@ -10,7 +10,7 @@ These hold under every abnormal condition in this document:
 
 - **No torn objects**: an object is either absent, the previous complete version, or the new complete version — never a mix (temp file + atomic `fs::rename`, FR-011).
 - **No partial object visible**: an interrupted upload never surfaces as a completed object (temp files live under `<state-dir>/tmp/`, invisible to listings).
-- **User data is never cleaned**: bucket directories and object files are never removed by automatic repair. Only tinio-private state (`tmp/`, `meta.redb`, `multipart/`, `state`, socket, logs) is eligible.
+- **User data is never cleaned**: live bucket directories and object files are never removed by automatic repair. Only tinio-private state (`tmp/`, `meta.redb`, `multipart/`, `state`, socket, logs — including unpublished delete tombstones under `<root>/.tinio/deleting/`, residue of a user-initiated DeleteBucket) is eligible.
 - **Atomic state writes**: `state`/socket are written temp+rename (no torn JSON, FR-020/022); derived metadata lives in `meta.redb` — redb transactions are crash-safe by default (commit is atomic; no torn state, no replay corruption).
 - **Fail-request, keep-running**: a mid-operation environment failure (permissions, disk, unlink) fails that request with a meaningful error while the server keeps running.
 - **State/socket lifecycle**: removed on graceful stop; probed and reclaimed at next start after a crash.
@@ -61,7 +61,7 @@ These hold under every abnormal condition in this document:
 |-----------|----------|------------------|
 | Upload interrupted (client drop, crash) | Temp file in `tmp/` | Startup: full `tmp/` clear (T070); runtime: sweep after 24 h mtime (T046) |
 | Multipart upload interrupted | Parts under `multipart/<bucket>/<uploadId>/` | **Kept** — cross-restart completion/abort is legal (quickstart §7); idle > 7 days swept (T046); bucket deleted → subtree removed at startup (T070) or by `doctor --fix` (T074) |
-| Forced kill (`kill -9`) | Stale `state` + socket; orphaned meta entries; stale bucket records; upload directories without a `UPLOADS` record | Startup repair (T070): probe-then-reclaim socket/state, prune stale bucket records, clear `tmp/`, remove bucket-orphaned multipart + no-record upload dirs (idle past the grace); meta orphans reclaimed by the background scanner (T045) |
+| Forced kill (`kill -9`) | Stale `state` + socket; orphaned meta entries; stale bucket records; upload directories without a `UPLOADS` record; unpublished delete tombstones | Startup repair (T070): probe-then-reclaim socket/state, prune stale bucket records, clear `tmp/` + tombstone residue, remove bucket-orphaned multipart + no-record upload dirs (idle past the grace); meta orphans reclaimed by the background scanner (T045) |
 | Concurrent writes to one object | — | Last completed atomic rename wins (FR-011) |
 | Crash during state/meta write | No torn state — redb commits are atomic (crash-safe by default) | Partial temp files swept as above |
 
@@ -86,11 +86,12 @@ Cleanup is a backend contract: the `Cleanup` trait in `tinio-core` defines start
 | Bucket-orphaned multipart subtrees | Remove (cross-restart uploads kept) | — | idle > 7 d | Remove (shared impl) |
 | Stale bucket records (`BUCKETS`, dir gone) | Prune | — | — | Remove (shared impl) |
 | Upload dirs without a `UPLOADS` record | Remove (enumerate first, then read `UPLOADS` — the pinned TOCTOU order, fs-backend.md §8.1) | — | parts idle past the grace | Remove (shared impl) |
+| Delete-bucket tombstones (`<root>/.tinio/deleting/`) | Remove | Clear per pass (count-only, `tombstone::clear_leftovers`) | — | Remove (shared impl) |
 | Stale `state`/socket | Probe-then-reclaim | — | — | Remove (shared impl) |
 | Orphaned meta entries (object gone) | — | Delete during scan | — | Remove (shared impl) |
 | Stale home root-state dirs (root gone) | — | — | — | Remove (shared impl) |
 
-Fs implementation details: [fs-backend.md §8](fs-backend.md). Startup repair, `doctor --fix`, and scanner meta reclamation share the `FsCleanup` implementation so behavior stays consistent by construction. Every repair action is logged to the operational log.
+Fs implementation details: [fs-backend.md §8](fs-backend.md). Startup repair, `doctor --fix`, and scanner reclamation share the `FsCleanup` implementation (the scanner's tombstone clear goes through `tombstone::clear_leftovers`) so behavior stays consistent by construction. Every repair action is logged to the operational log.
 
 ## 4. Ordering and constraints
 

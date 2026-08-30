@@ -59,7 +59,7 @@ Loop shape:
 |--------|----------|
 | `listing.rs` (T043) | Synchronous recompute fallback for missing/stale entries during a listing — the scanner only makes this rare; never a correctness dependency |
 | `sweep.rs` (T046) | Sweep owns time-based cleanup of `tmp/` (24 h) and idle multipart (7 d). Scanner owns meta reconciliation only |
-| `Cleanup` trait (T012) / `FsCleanup` (fs-backend.md §8) | Startup repair owns fast deterministic items (tmp clear, bucket-orphaned multipart, no-record upload dirs, stale bucket records). Meta-orphan reclamation belongs to the scanner (cost: full meta-tree walk). Both go through the `Cleanup` trait (fs details: fs-backend.md §8) |
+| `Cleanup` trait (T012) / `FsCleanup` (fs-backend.md §8) | Startup repair owns fast deterministic items (tmp clear, delete-bucket tombstones, bucket-orphaned multipart, no-record upload dirs, stale bucket records). Meta-orphan reclamation belongs to the scanner (cost: full meta-tree walk); the scanner also clears leftover delete tombstones per pass. Both go through the `Cleanup` trait / `tombstone` module (fs details: fs-backend.md §8) |
 | `doctor` (T073/T074) | Offline checks share the same reclamation semantics via cleanup.rs; the scanner is the runtime counterpart |
 
 ## 7. Testing

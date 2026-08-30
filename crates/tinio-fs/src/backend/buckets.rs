@@ -5,7 +5,7 @@
 //! pre-existing directory. Names are re-validated on create (defensive
 //! backstop, FR-012); the reserved `.tinio/` directory is never a bucket.
 
-use std::{collections::HashMap, io, time::SystemTime};
+use std::{collections::HashMap, io, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use tinio_core::{
@@ -15,7 +15,10 @@ use tinio_core::{
 use tokio::fs;
 
 use super::{Error, FsStorage};
-use crate::path::{STATE_DIR_NAME, bucket_path_lexical};
+use crate::{
+    path::{STATE_DIR_NAME, bucket_path_lexical},
+    tombstone,
+};
 
 /// A bucket counts as empty when it has no files and no directories
 /// anywhere (folder-marker directories are content, per the conformance
@@ -69,7 +72,7 @@ impl BucketOps for FsStorage {
         // The directory creation and its `BUCKETS` record are one
         // critical section against `delete_bucket` (a delete must never
         // remove a bucket a create just reported as created).
-        let _guard = self.bucket_mutation_lock.lock().await;
+        let _guard = self.lock_bucket_mutations(name).await;
         match fs::create_dir(&dir).await {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -82,29 +85,43 @@ impl BucketOps for FsStorage {
     }
 
     async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
-        // The emptiness check and the removal are one critical section
-        // against every write into the bucket: a concurrent PUT's rename
-        // cannot land between them and be destroyed with 200 returned.
-        let _guard = self.bucket_mutation_lock.lock().await;
-        let dir = self.ensure_bucket(name).await?;
-        if !bucket_is_empty(self, name).await? {
-            return Err(not_empty(name).into());
-        }
-        // Empty by the object walk (no files anywhere) — only empty
-        // directories remain, so a recursive remove is safe and handles
-        // leftover folder-marker directories.
-        fs::remove_dir_all(&dir).await?;
-        // Lazy cleanup of the private state (data-model.md) — one write
-        // transaction over BUCKETS + OBJECT_META + UPLOADS + PARTS (G2:
-        // a bucket's whole derived state dies atomically). The directory
-        // is already gone — the delete has succeeded — so a state
-        // failure must NOT fail the response (the client would see an
-        // error for a delete that happened); the leaked rows are
-        // reclaimed by the startup repair (stale bucket records drain
-        // the whole derived state).
-        if let Err(err) = self.remove_bucket_state(name).await {
-            tracing::warn!(error = %err, "bucket state not removed after delete");
-        }
+        // The emptiness check and the unpublish rename are one critical
+        // section against every write into this bucket: a concurrent
+        // PUT's rename cannot land in a directory about to disappear
+        // with 200 returned. Other buckets are not serialized here.
+        let dest = {
+            let _guard = self.lock_bucket_mutations(name).await;
+            self.ensure_bucket(name).await?;
+            if !bucket_is_empty(self, name).await? {
+                return Err(not_empty(name).into());
+            }
+            // Unpublish: rename the lexical root entry onto
+            // `<root>/.tinio/deleting/<id>` (same volume as the name — a
+            // relocated state dir must not receive this rename). The live
+            // name is gone before the tree walk; a crash leaves private
+            // residue the startup repair reclaims. Followed-symlink buckets:
+            // the directory *entry* under root moves (the link), not the
+            // canonical target.
+            let live = bucket_path_lexical(self.root(), name)?;
+            let dest = tombstone::prepare(self.root()).await?;
+            fs::rename(&live, &dest).await?;
+            // The name is gone — the delete has succeeded — so a state
+            // failure must NOT fail the response (the client would see an
+            // error for a delete that happened); leaked rows are
+            // reclaimed by the startup repair.
+            if let Err(err) = self.remove_bucket_state(name).await {
+                tracing::warn!(error = %err, "bucket state not removed after delete");
+            }
+            dest
+        };
+        // The directory is unpublished: the per-bucket mutex still
+        // serializes a parked PUT against recreate (the waiter holds the
+        // slot until it fails `ensure_bucket`). Tree delete is slow IO —
+        // fire-and-forget on the REMOVAL pipeline (D-A, Q4 blocking
+        // `remove_dir_all`), physically isolated from ETag compute so a
+        // large tree walk can never occupy the IO workers. The request
+        // does not wait; a leftover is reclaimed by doctor / the scanner.
+        tombstone::reclaim(Arc::clone(&self.remove_pipeline), dest);
         Ok(())
     }
 
@@ -148,7 +165,10 @@ impl BucketOps for FsStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{rt, storage};
+    use crate::{
+        testutil::{rt, storage, wait_for, wait_for_lock_waiter},
+        tombstone,
+    };
     use std::{fs, time::SystemTime};
     use tinio_core::{
         object,
@@ -189,6 +209,220 @@ mod tests {
             storage.delete_bucket(&b).await.unwrap();
             assert!(storage.head_bucket(&b).await.is_err());
             assert!(!root.path().join("my-bucket").exists());
+        });
+    }
+
+    #[test]
+    fn mutation_lock_is_per_bucket() {
+        // Holding one bucket's mutation lock must not stall create of
+        // another — the table is per-name, not a process-wide mutex.
+        rt(async {
+            let (_root, storage) = storage();
+            let a = bucket::name("alpha").unwrap();
+            let b = bucket::name("beta").unwrap();
+            storage.create_bucket(&a).await.unwrap();
+            let _guard = storage.lock_bucket_mutations(&a).await;
+            let storage2 = storage.clone();
+            let create_b = tokio::spawn(async move { storage2.create_bucket(&b).await });
+            let created = tokio::time::timeout(std::time::Duration::from_millis(500), create_b)
+                .await
+                .expect("create of a different bucket must not wait on another bucket's lock")
+                .unwrap();
+            created.unwrap();
+        });
+    }
+
+    #[test]
+    fn mutation_lock_serializes_same_bucket() {
+        rt(async {
+            let (_root, storage) = storage();
+            let a = bucket::name("alpha").unwrap();
+            let _guard = storage.lock_bucket_mutations(&a).await;
+            let storage2 = storage.clone();
+            let create_a = tokio::spawn(async move { storage2.create_bucket(&a).await });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(80), create_a)
+                    .await
+                    .is_err(),
+                "create of the same bucket must wait on the mutation lock"
+            );
+        });
+    }
+
+    #[test]
+    fn delete_bucket_unpublishes_into_deleting_dir() {
+        // The live name moves under `<root>/.tinio/deleting/` before the
+        // tree walk; delete itself does not wait for `remove_dir_all`.
+        rt(async {
+            let (root, storage) = storage();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            storage.delete_bucket(&b).await.unwrap();
+            assert!(!root.path().join("data").exists());
+            let deleting = tombstone::dir(root.path());
+            assert!(
+                deleting.is_dir(),
+                "delete must stage the bucket under .tinio/deleting"
+            );
+            wait_for(|| {
+                fs::read_dir(&deleting)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false)
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn delete_bucket_tombstone_stays_on_the_data_volume() {
+        // A relocated state dir may be another volume (FR-023); the
+        // tombstone must stay under the storage root so the unpublish
+        // rename cannot hit EXDEV.
+        use crate::{FsOptions, testutil::fs_options};
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            storage.delete_bucket(&b).await.unwrap();
+            assert!(!root.path().join("data").exists());
+            assert!(tombstone::dir(root.path()).is_dir());
+            assert!(!state.path().join("deleting").exists());
+        });
+    }
+
+    #[test]
+    fn delete_bucket_does_not_split_the_mutation_lock() {
+        // A waiter queued behind delete still holds the same mutex after
+        // unpublish. Recreate must wait — yanking the slot would let a
+        // parked PUT land in the new directory (generation split).
+        rt(async {
+            let (_root, storage) = storage();
+            let b = bucket::name("data").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            let held = storage.lock_bucket_mutations(&b).await;
+            let storage_d = storage.clone();
+            let bd = b.clone();
+            let delete = tokio::spawn(async move { storage_d.delete_bucket(&bd).await });
+            wait_for_lock_waiter().await;
+            let storage_w = storage.clone();
+            let bw = b.clone();
+            let waiter = tokio::spawn(async move {
+                let _guard = storage_w.lock_bucket_mutations(&bw).await;
+                std::future::pending::<()>().await;
+            });
+            wait_for_lock_waiter().await;
+            drop(held);
+            delete.await.unwrap().unwrap();
+            let storage_c = storage.clone();
+            let bc = b.clone();
+            let created = tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                tokio::spawn(async move { storage_c.create_bucket(&bc).await }),
+            )
+            .await;
+            waiter.abort();
+            assert!(
+                created.is_err(),
+                "recreate must wait on the doomed waiter of the deleted name"
+            );
+        });
+    }
+
+    #[test]
+    fn delete_create_put_hammer_keeps_successful_puts_in_the_live_generation() {
+        // D-F split-invariant stress: bounded rounds of concurrent
+        // delete_bucket / create_bucket / PUT phase-2 commits on ONE
+        // bucket name. The mutation lock serializes the directory
+        // mutations, so a PUT that reports success must have committed
+        // into a directory that was still live at commit time — and
+        // remains readable from the LIVE bucket afterward (a later
+        // delete can only unpublish an EMPTY bucket, and the object
+        // makes the bucket non-empty). Never may a successful PUT land
+        // only in a tombstoned tree.
+        //
+        // Tolerated benign outcomes: delete may answer `NotEmpty` (a PUT
+        // wrote first) or `Io` (platform rename races); PUT may fail
+        // `NoSuchBucket` (the name was unpublished before its commit
+        // took the lock) or `NoSuchKey` (its pre-lock staging resolve
+        // raced the unpublish rename — the object never committed). The
+        // forbidden outcome is a successful PUT whose object is not in
+        // the current live generation.
+        rt(async {
+            let (root, storage) = storage();
+            let b = bucket::name("hammered").unwrap();
+            let k = object::key("victim.bin").unwrap();
+            for _ in 0..25 {
+                let round = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let mut handles = Vec::new();
+                    for i in 0..6 {
+                        let storage = storage.clone();
+                        let b = b.clone();
+                        let k = k.clone();
+                        handles.push(tokio::spawn(async move {
+                            match i % 3 {
+                                // delete / create: tolerated to fail
+                                // (`NotEmpty`, `Io`, `AlreadyExists`).
+                                0 => {
+                                    let _ = storage.delete_bucket(&b).await;
+                                    None
+                                }
+                                1 => {
+                                    let _ = storage.create_bucket(&b).await;
+                                    None
+                                }
+                                // PUT: only `NoSuchBucket` is benign.
+                                _ => Some(
+                                    storage
+                                        .put_object(&b, &k, body(b"payload"))
+                                        .await
+                                        .map(|_| ()),
+                                ),
+                            }
+                        }));
+                    }
+                    for handle in handles {
+                        let Some(result) = handle.await.unwrap() else {
+                            continue;
+                        };
+                        match result {
+                            Ok(()) => {
+                                assert!(
+                                    storage.head_object(&b, &k).await.is_ok(),
+                                    "a successful PUT must be readable from the live bucket"
+                                );
+                            }
+                            Err(err) => {
+                                let err: StorageError = err.into();
+                                assert!(
+                                    matches!(err, NoSuchBucket(_) | NoSuchKey(_)),
+                                    "a failed PUT must be NoSuchBucket/NoSuchKey (it never committed), not {err:?}"
+                                );
+                            }
+                        }
+                    }
+                })
+                .await;
+                assert!(round.is_ok(), "one hammer round must finish in time");
+            }
+            // The removal lane drains the tombstones: the unpublished
+            // trees disappear from `.tinio/deleting/` (reclaim is async,
+            // like `delete_bucket_unpublishes_into_deleting_dir`).
+            let deleting = tombstone::dir(root.path());
+            wait_for(|| {
+                fs::read_dir(&deleting)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false)
+            })
+            .await;
         });
     }
 

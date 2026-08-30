@@ -250,7 +250,10 @@ fn bucket_names_follows_symlinked_bucket_dirs() {
                 .collect::<Vec<_>>()
         })
     };
-    assert_eq!(list(true), vec!["linked".to_string(), "real-bucket".to_string()]);
+    assert_eq!(
+        list(true),
+        vec!["linked".to_string(), "real-bucket".to_string()]
+    );
     assert_eq!(list(false), vec!["real-bucket".to_string()]);
 }
 
@@ -290,5 +293,26 @@ fn bucket_dir_resolves_dangling_and_looping_links() {
         let looped = bucket::name("loop").unwrap();
         let err = storage.bucket_dir(&looped).await.unwrap_err();
         assert!(matches!(err, Error::Io(_)), "link loop: {err:?}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn bucket_names_skips_non_utf8_directory_names() {
+    // A top-level directory whose name is not valid UTF-8 cannot be a
+    // bucket name (the contract is UTF-8) — skipped, never a panic.
+    use std::os::unix::ffi::OsStrExt;
+    rt(async {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let mut name = b"bad-".to_vec();
+        name.push(0xff);
+        tokio::fs::create_dir(root.path().join(std::ffi::OsStr::from_bytes(&name)))
+            .await
+            .unwrap();
+        let names = storage.bucket_names().await.unwrap();
+        assert_eq!(names, vec![b], "{names:?}");
     });
 }

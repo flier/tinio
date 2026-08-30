@@ -98,14 +98,13 @@ impl Outcome {
     }
 }
 
-/// The per-file compute result: [`Outcome`] or the failure. Public
-/// because `FsOptions` exposes the IO pipeline typed to it
-/// (`Arc<dyn Runner<etag::Result>>`, pipeline-spec.md P4/P7) and the
-/// tinio-server runtime names the type when it builds the IO pipeline;
-/// the task struct itself stays `pub(crate)`. `pipeline::Outcome` comes
-/// from the blanket `std::result::Result` impl (pipeline.rs) — `Error` is a
-/// `StdError`, so the IO-pipeline runtime logs compute failures through
-/// it (R8) with the original error kept (P7).
+/// The per-file compute result: [`Outcome`] or the failure. This is the
+/// IO pipeline's [`pipeline::Task::Output`] (`pipeline-spec.md` P4/P7);
+/// `pipeline::Outcome` comes from the blanket `std::result::Result` impl
+/// (pipeline.rs) — `Error` is a `StdError`, so the IO-pipeline runtime
+/// logs compute failures through it (R8) with the original error kept
+/// (P7). Tombstone reclaim lives on the removal pipeline
+/// (`Result<(), Error>`), not here.
 pub type Result = std::result::Result<Outcome, Error>;
 
 /// A unit of IO-pipeline work: the blocking ETag computation of one
@@ -142,7 +141,7 @@ thread_local! {
     /// borrow is exclusive; `meta::ensure_etag`'s blocking-pool hash
     /// shares the same per-thread buffer (blocking-pool threads are
     /// long-lived).
-    static HASH_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static HASH_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Borrow the worker-thread hash buffer for `f` (resized to

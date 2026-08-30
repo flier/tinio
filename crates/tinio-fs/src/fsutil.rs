@@ -12,7 +12,7 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
-use crate::{error::Error, path::TMP_DIR_NAME};
+use crate::error::Error;
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -336,12 +336,37 @@ pub(crate) fn ok_if_missing(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// The entries of `<state-dir>/tmp/` (a missing directory is empty), as
-/// `(path, name)` pairs. Shared by the startup repair and the sweep.
-pub(crate) async fn tmp_entries(state_dir: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
-    let tmp = state_dir.join(TMP_DIR_NAME);
+/// Remove a directory tree — or a file if `path` is not a directory —
+/// treating a missing target as success. The blocking core shared by the
+/// async removal paths (which run it on the tokio blocking pool) and the
+/// removal-lane [`RemoveTask`](crate::tombstone::RemoveTask) (which runs
+/// on a pipeline worker thread without a runtime).
+pub(crate) fn remove_tree_blocking(path: &Path) -> io::Result<()> {
+    match ok_if_missing(std::fs::remove_dir_all(path)) {
+        Ok(()) => Ok(()),
+        // A `.tinio` *file* planted out-of-band: remove as a file.
+        Err(err) if err.kind() == io::ErrorKind::NotADirectory => {
+            ok_if_missing(std::fs::remove_file(path))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Async variant of [`remove_tree_blocking`] — the blocking call runs on
+/// the tokio blocking pool.
+pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_tree_blocking(&path))
+        .await
+        .expect("remove_tree blocking task")
+}
+
+/// The entries of `dir` (a missing directory is empty), as `(path, name)`
+/// pairs. Shared by the startup repair, the sweep, and the tombstone
+/// leftover enumeration.
+pub(crate) async fn entries_of(dir: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
     let mut out = Vec::new();
-    let mut entries = match tokio::fs::read_dir(&tmp).await {
+    let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
         Err(err) => return Err(err.into()),

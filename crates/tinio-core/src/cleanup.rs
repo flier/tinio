@@ -138,7 +138,10 @@ pub enum RepairKind {
 ///
 /// let options = CleanupOptions::default();
 /// assert!(!options.dry_run); // default: repair for real
-/// let dry = CleanupOptions { dry_run: true };
+/// let dry = CleanupOptions {
+///     dry_run: true,
+///     ..CleanupOptions::default()
+/// };
 /// assert!(dry.dry_run);
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -195,7 +198,10 @@ pub struct CleanupOptions {
 /// }
 ///
 /// let cleanup = Noop;
-/// let _options = CleanupOptions { dry_run: true };
+/// let _options = CleanupOptions {
+///     dry_run: true,
+///     ..CleanupOptions::default()
+/// };
 /// let mut stream = tokio::runtime::Runtime::new()
 ///     .unwrap()
 ///     .block_on(cleanup.repair(RepairKind::Startup))
@@ -252,7 +258,8 @@ mod tests {
 
     #[test]
     fn cleanup_options_default_is_not_dry_run() {
-        assert!(!CleanupOptions::default().dry_run);
+        let options = CleanupOptions::default();
+        assert!(!options.dry_run);
     }
 
     #[test]

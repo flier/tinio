@@ -26,7 +26,7 @@ Validation: canonicalization before use; unix-socket path limit (108 bytes) docu
 | creation_time | timestamp | Persisted in the `BUCKETS` table of `<state-dir>/meta.redb`; lazily recorded on first sight (pre-existing dirs) |
 | path | `PathBuf` | `<root>/<name>` |
 
-Relationships: contains 0..n `Object`s. State: exists ⇔ directory exists. Delete: only when empty (standard S3 `BucketNotEmpty`); removes the directory and the bucket's metadata ranges (`OBJECT_META`/`UPLOADS`/`PARTS`/`BUCKETS`, one redb transaction — lazy cleanup of orphans).
+Relationships: contains 0..n `Object`s. State: exists ⇔ directory exists. Delete: only when empty (standard S3 `BucketNotEmpty`); the directory is **unpublished** first — renamed onto `<root>/.tinio/deleting/<id>` (same volume as the name, so a relocated state dir cannot force EXDEV) — then the bucket's metadata ranges (`OBJECT_META`/`UPLOADS`/`PARTS`/`BUCKETS`) are drained in one redb transaction (lazy cleanup of orphans). The tombstone tree is removed fire-and-forget on the **removal** pipeline (`[pipeline.remove]`, blocking `remove_dir_all` off the request path); a crash between the rename and the removal leaves the unpublished tree as private residue, reclaimed by the startup repair and the scanner.
 
 Case sensitivity follows the host filesystem (amended assumption): on case-insensitive hosts, names differing only in case collide at the FS level and no artificial enforcement is applied.
 

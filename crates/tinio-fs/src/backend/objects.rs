@@ -426,7 +426,7 @@ impl ObjectOps for FsStorage {
         // not be resurrected, and the symlink policy applies to markers
         // too.
         if key.is_folder_marker() {
-            let _guard = self.bucket_mutation_lock.lock().await;
+            let _guard = self.lock_bucket_mutations(bucket).await;
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
             tokio::fs::create_dir_all(&target).await?;
@@ -443,7 +443,7 @@ impl ObjectOps for FsStorage {
         // 200). A failed commit removes the staged temp — a rejected
         // write leaves no residue.
         let result = async {
-            let _guard = self.bucket_mutation_lock.lock().await;
+            let _guard = self.lock_bucket_mutations(bucket).await;
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
             // F03: the bucket root bounds the first-into-a-new-prefix
@@ -1268,6 +1268,7 @@ mod tests {
             let k2 = k.clone();
             retarget_bucket_during_commit(
                 &storage,
+                &b,
                 &link,
                 target_b.path(),
                 wait_for_lock_waiter(),

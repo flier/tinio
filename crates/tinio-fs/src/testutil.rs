@@ -11,10 +11,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tinio_core::pipeline::{self, Completion, Reply, Runner, Stats, Task};
 use tokio::sync::{mpsc, watch};
 
-use crate::{FsOptions, FsStorage};
+use tinio_core::{
+    bucket,
+    pipeline::{self, Completion, Reply, Runner, Stats, Task},
+};
+
+use crate::{FsOptions, FsStorage, etag};
 
 /// Run `f` to completion on a fresh multi-thread runtime.
 pub(crate) fn rt<F, T>(f: F) -> T
@@ -60,11 +64,12 @@ pub(crate) fn files(root: &Path, n: usize) {
 }
 
 /// Retarget a followed bucket symlink while a write is blocked between
-/// staging/assembly and the rename: hold the mutation lock, spawn `op`,
-/// wait until `ready` (phase 1 done), swap `link` to `new_target`, then
-/// release the lock and await `op`.
+/// staging/assembly and the rename: hold `bucket`'s mutation lock, spawn
+/// `op`, wait until `ready` (phase 1 done), swap `link` to `new_target`,
+/// then release the lock and await `op`.
 pub(crate) async fn retarget_bucket_during_commit<F, Fut, R, T>(
     storage: &FsStorage,
+    bucket: &bucket::Name,
     link: &Path,
     new_target: &Path,
     ready: R,
@@ -76,7 +81,7 @@ where
     R: Future<Output = ()>,
     T: Send + 'static,
 {
-    let guard = storage.lock_bucket_mutations().await;
+    let guard = storage.lock_bucket_mutations(bucket).await;
     let handle = tokio::spawn(op());
     ready.await;
     replace_dir_link(link, new_target);
@@ -363,11 +368,11 @@ impl FailingTaskRunner {
 }
 
 #[async_trait]
-impl Runner<crate::etag::Result> for FailingTaskRunner {
+impl Runner<etag::Result> for FailingTaskRunner {
     async fn enqueue(
         &self,
-        _task: Box<dyn Task<Output = crate::etag::Result>>,
-    ) -> Result<Completion<crate::etag::Result>, pipeline::Error> {
+        _task: Box<dyn Task<Output = etag::Result>>,
+    ) -> Result<Completion<etag::Result>, pipeline::Error> {
         let (reply, done) = Completion::pair();
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         let _ = reply.send(Err(crate::Error::Io(std::io::Error::new(

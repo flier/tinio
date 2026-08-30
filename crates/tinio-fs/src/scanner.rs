@@ -81,6 +81,7 @@ pub struct ScannerOptions {
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
 ///     io_pipeline: Arc::new(InlineRunner::default()),
+///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
 /// };
 /// let storage = FsStorage::new(root.path(), options).unwrap();
@@ -218,6 +219,14 @@ impl Scanner {
         match cleanup.reclaim_stale_buckets().await {
             Ok(reclaimed) => summary.reclaimed += reclaimed,
             Err(err) => tracing::warn!(error = %err, "stale-bucket reclamation failed"),
+        }
+        // Unpublished delete-bucket trees (a crash after the unpublish
+        // rename, or a failed fire-and-forget `remove_dir_all`) live
+        // under `<root>/.tinio/deleting/` — not a live bucket name, so
+        // the reconcile loop never sees them.
+        match crate::tombstone::clear_leftovers(self.storage.root()).await {
+            Ok(reclaimed) => summary.reclaimed += reclaimed,
+            Err(err) => tracing::warn!(error = %err, "delete-tombstone reclamation failed"),
         }
         Ok(summary)
     }
@@ -436,13 +445,15 @@ impl Scanner {
                     let Ok(path) = self.storage.key_path(&bucket_dir, &key, true).await else {
                         continue;
                     };
-                    // The probe + remove run under the bucket-mutation
-                    // lock (F05): a concurrent PUT's rename and meta-row
-                    // commit hold the same lock, so a fresh row can never
-                    // be removed by a stale probe — the PUT either
-                    // completes before the probe (the object exists —
-                    // skipped) or after the remove (its row re-lands).
-                    let _guard = self.storage.lock_bucket_mutations().await;
+                    // The probe + remove run under this bucket's
+                    // mutation lock (F05): a concurrent PUT's rename and
+                    // meta-row commit hold the same per-bucket lock, so
+                    // a fresh row can never be removed by a stale probe
+                    // — the PUT either completes before the probe (the
+                    // object exists — skipped) or after the remove (its
+                    // row re-lands). Mutations of other buckets do not
+                    // wait.
+                    let _guard = self.storage.lock_bucket_mutations(name).await;
                     match crate::fsutil::is_absent(&path).await {
                         Ok(true) => {}         // gone — reclaim below
                         Ok(false) => continue, // the object exists — not an orphan
@@ -718,6 +729,21 @@ mod tests {
             let summary = scanner.scan_once().await.unwrap();
             assert_eq!(summary.reclaimed, 1);
             assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn reclaims_delete_tombstones() {
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            let leftover = crate::tombstone::dir(root.path()).join("dead-bucket");
+            fs::create_dir_all(&leftover).unwrap();
+            fs::write(leftover.join("leftover.bin"), b"was-a-bucket").unwrap();
+            let scanner = Scanner::new(storage, options());
+            let summary = scanner.scan_once().await.unwrap();
+            assert_eq!(summary.reclaimed, 1);
+            assert!(!leftover.exists());
         });
     }
 

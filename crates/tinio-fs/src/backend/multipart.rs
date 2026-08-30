@@ -203,7 +203,7 @@ impl MultipartOps for FsStorage {
         // `tmp/` — remove it on the error path. Re-resolve under the
         // lock: `ensure_bucket` returns the current followed target, and
         // `resolve_key` re-runs the symlink policy against it.
-        let _guard = self.bucket_mutation_lock.lock().await;
+        let _guard = self.lock_bucket_mutations(bucket).await;
         let phase2 = async {
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
@@ -642,6 +642,7 @@ mod tests {
             let upload_id = upload.upload_id.clone();
             retarget_bucket_during_commit(
                 &storage,
+                &b,
                 &link,
                 target_b.path(),
                 wait_for_tmp(&storage),

@@ -72,7 +72,8 @@ const LONG_KEY_BYTES: usize = 508;
 type WriteResult = Result<(), FsError>;
 /// The bench's pipeline pair, typed to the real tinio-fs task outputs
 /// (P4/P7 — the server wiring uses the same types).
-type Pipelines = tinio_server::pipeline::Pipelines<tinio_fs::etag::Result, WriteResult>;
+type Pipelines =
+    tinio_server::pipeline::Pipelines<tinio_fs::etag::Result, WriteResult, WriteResult>;
 /// One write-batch row (the `set_batch` slice element).
 type Entry = meta::BatchEntry;
 
@@ -130,7 +131,7 @@ fn build_tree(root: &Path, key_fn: fn(usize) -> String) -> Vec<Object> {
 /// core — blocking open + 64 KiB bounded streaming MD5, no internal
 /// `.await` (Q4: one task occupies one worker thread). The real task is
 /// `pub(crate)` in tinio-fs, so the bench mirrors it; the output type is
-/// the real `tinio_fs::etag::Result` ([`tinio_fs::etag::Outcome`]). The file
+/// the real `tinio_fs::etag::Result`. The file
 /// identity is left at 0 — the write path accepts an unavailable
 /// identity, and identity lookup is not on the throughput path.
 struct BenchEtagTask {
@@ -210,6 +211,7 @@ fn build_pipelines(io_workers: u8, db_workers: u8) -> Pipelines {
             capacity: tinio_core::pipeline::DEFAULT_CAPACITY,
             ..Default::default()
         },
+        remove: Default::default(),
         db: tinio_config::pipeline::Db {
             workers: db_workers,
             capacity: tinio_core::pipeline::DEFAULT_CAPACITY,

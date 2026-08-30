@@ -16,7 +16,7 @@ use std::{
 use smart_default::SmartDefault;
 use tokio::sync::watch;
 
-use crate::{backend::FsStorage, error::Error, fsutil::tmp_entries, pacing};
+use crate::{backend::FsStorage, error::Error, fsutil::entries_of, pacing, path::TMP_DIR_NAME};
 
 /// Sweep construction options (contracts/config.md `[s3]` TTLs).
 ///
@@ -63,6 +63,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
 ///     io_pipeline: Arc::new(InlineRunner::default()),
+///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
 /// };
 /// let storage = FsStorage::new(root.path(), options).unwrap();
@@ -140,7 +141,7 @@ impl Sweeper {
     }
 
     async fn sweep_tmp(&self, now: SystemTime) -> Result<usize, Error> {
-        let entries = tmp_entries(self.storage.state_dir()).await?;
+        let entries = entries_of(&self.storage.state_dir().join(TMP_DIR_NAME)).await?;
         let mut removed = 0;
         for (path, name) in entries {
             let metadata = match tokio::fs::metadata(&path).await {

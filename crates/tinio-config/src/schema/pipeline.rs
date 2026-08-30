@@ -5,7 +5,8 @@ use smart_default::SmartDefault;
 
 use tinio_core::pipeline::{
     CAPACITY_MAX, CAPACITY_MIN, DB_WORKERS_MAX, DB_WORKERS_MIN, DEFAULT_CAPACITY,
-    DEFAULT_DB_WORKERS, DEFAULT_IO_WORKERS, IO_WORKERS_MAX, IO_WORKERS_MIN,
+    DEFAULT_DB_WORKERS, DEFAULT_IO_WORKERS, DEFAULT_REMOVE_WORKERS, IO_WORKERS_MAX, IO_WORKERS_MIN,
+    REMOVE_WORKERS_MAX, REMOVE_WORKERS_MIN,
 };
 
 /// Worker-thread priority of a pipeline (`priority` in `[pipeline.*]`;
@@ -43,6 +44,7 @@ pub enum Priority {
 ///
 /// let config = Config::default();
 /// assert_eq!(config.io.workers, 2);
+/// assert_eq!(config.remove.workers, 1);
 /// assert_eq!(config.db.workers, 1);
 /// assert_eq!(config.io.capacity, 1024);
 /// assert_eq!(config.io.priority, tinio_config::pipeline::Priority::Normal);
@@ -54,6 +56,11 @@ pub struct Config {
     #[serde(default)]
     #[garde(dive)]
     pub io: Io,
+    /// The removal pipeline (delete-bucket tombstone `remove_dir_all` —
+    /// physically isolated from ETag compute, D-A).
+    #[serde(default)]
+    #[garde(dive)]
+    pub remove: Remove,
     /// The DB write pipeline (batched meta writes).
     #[serde(default)]
     #[garde(dive)]
@@ -97,6 +104,10 @@ pub struct Queue<const DEFAULT_WORKERS: u8, const WORKERS_MIN: u8, const WORKERS
 /// The IO pipeline keys (`[pipeline.io]`).
 pub type Io = Queue<DEFAULT_IO_WORKERS, IO_WORKERS_MIN, IO_WORKERS_MAX>;
 
+/// The removal pipeline keys (`[pipeline.remove]`) — same worker range as
+/// the IO pipeline, but a 1-worker default (background cleanup).
+pub type Remove = Queue<DEFAULT_REMOVE_WORKERS, REMOVE_WORKERS_MIN, REMOVE_WORKERS_MAX>;
+
 /// The DB write pipeline keys (`[pipeline.db]`).
 pub type Db = Queue<DEFAULT_DB_WORKERS, DB_WORKERS_MIN, DB_WORKERS_MAX>;
 
@@ -127,23 +138,35 @@ mod tests {
     fn defaults_match_the_contract() {
         let config = Config::default();
         assert_eq!(config.io.workers, DEFAULT_IO_WORKERS);
+        assert_eq!(config.remove.workers, DEFAULT_REMOVE_WORKERS);
         assert_eq!(config.db.workers, DEFAULT_DB_WORKERS);
         assert_eq!(config.io.capacity, DEFAULT_CAPACITY);
+        assert_eq!(config.remove.capacity, DEFAULT_CAPACITY);
         assert_eq!(config.db.capacity, DEFAULT_CAPACITY);
         assert_eq!(config.io.priority, Priority::Normal);
+        assert_eq!(config.remove.priority, Priority::Normal);
         assert_eq!(config.db.priority, Priority::Normal);
     }
 
     #[test]
     fn workers_range_validated() {
-        // io: 1..=64; db: 1..=4 — outside → startup error.
-        for (section, bad) in [("io", 0u8), ("io", 65), ("db", 0), ("db", 5)] {
+        // io/remove: 1..=64; db: 1..=4 — outside → startup error.
+        for (section, bad) in [
+            ("io", 0u8),
+            ("io", 65),
+            ("remove", 0),
+            ("remove", 65),
+            ("db", 0),
+            ("db", 5),
+        ] {
             let text = format!("version = 1\n[pipeline.{section}]\nworkers = {bad}");
             let err = crate::Config::parse(&text).unwrap_err();
             assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
         }
         let config = crate::Config::parse("version = 1\n[pipeline.io]\nworkers = 64").unwrap();
         assert_eq!(config.pipeline.as_ref().unwrap().io.workers, 64);
+        let config = crate::Config::parse("version = 1\n[pipeline.remove]\nworkers = 64").unwrap();
+        assert_eq!(config.pipeline.as_ref().unwrap().remove.workers, 64);
         let config = crate::Config::parse("version = 1\n[pipeline.db]\nworkers = 4").unwrap();
         assert_eq!(config.pipeline.as_ref().unwrap().db.workers, 4);
     }
@@ -154,12 +177,18 @@ mod tests {
             let text = format!("version = 1\n[pipeline.io]\ncapacity = {bad}");
             let err = crate::Config::parse(&text).unwrap_err();
             assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
+            let text = format!("version = 1\n[pipeline.remove]\ncapacity = {bad}");
+            let err = crate::Config::parse(&text).unwrap_err();
+            assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
             let text = format!("version = 1\n[pipeline.db]\ncapacity = {bad}");
             let err = crate::Config::parse(&text).unwrap_err();
             assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
         }
         let config = crate::Config::parse("version = 1\n[pipeline.io]\ncapacity = 65536").unwrap();
         assert_eq!(config.pipeline.as_ref().unwrap().io.capacity, 65536);
+        let config =
+            crate::Config::parse("version = 1\n[pipeline.remove]\ncapacity = 65536").unwrap();
+        assert_eq!(config.pipeline.as_ref().unwrap().remove.capacity, 65536);
     }
 
     #[test]
@@ -200,6 +229,7 @@ mod tests {
         let config = crate::Config::parse("version = 1\n[pipeline]").unwrap();
         let pipeline = config.pipeline.as_ref().unwrap();
         assert_eq!(pipeline.io, Io::default());
+        assert_eq!(pipeline.remove, Remove::default());
         assert_eq!(pipeline.db, Db::default());
     }
 }

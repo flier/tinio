@@ -476,12 +476,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::{Event, Metadata, Subscriber, field, span};
 
+    /// One captured event: the target and its key/value fields.
+    type CaptureEvent = (String, HashMap<String, String>);
+
     /// A bare subscriber capturing `(target, fields)` of every event —
     /// enough to assert the access-log records without pulling in a
     /// subscriber dependency.
     #[derive(Clone, Default)]
     struct CaptureSubscriber {
-        events: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+        events: Arc<Mutex<Vec<CaptureEvent>>>,
     }
 
     impl Subscriber for CaptureSubscriber {

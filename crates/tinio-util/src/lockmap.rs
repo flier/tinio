@@ -5,33 +5,42 @@
 //! handle drops, so the table stays bounded by the number of
 //! concurrently locked keys.
 
-use std::{collections::HashMap, hash::Hash, sync::Arc};
+use std::{hash::Hash, sync::Arc};
 
-use tokio::sync::{self, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
-/// The slot table: key → per-key mutex. `Arc` so the table outlives any
-/// [`Guard`] that still references it for eviction.
-type Table<K> = Arc<std::sync::Mutex<HashMap<K, Arc<sync::Mutex<()>>>>>;
+/// One per-key mutex. The table holds one `Arc`; a holder's [`Guard`] —
+/// through its `OwnedMutexGuard` — another; a waiter holds a third.
+type Slot = Arc<Mutex<()>>;
+
+/// The slot table: key → per-key mutex. `Arc` so [`Map`] clones share
+/// the table (`papaya::HashMap` itself clones by snapshot).
+type Table<K> = Arc<papaya::HashMap<K, Slot>>;
 
 /// The per-key lock table. Slots are evicted when the last [`Guard`] for
 /// a key drops: the table holds one `Arc` to the slot and the guard the
 /// other (`strong_count == 2`); a waiter holds a third and its own `Drop`
 /// performs the eviction later.
 ///
-/// The table is a `std::sync::Mutex`: the critical sections are the slot
-/// clone and the removal only (never held across an await), and `Drop`
-/// can therefore block on it — the removal is never skipped under
-/// contention (a `try_lock` + early return would leak the slot forever,
-/// since only `Drop` removes entries).
+/// The table is a lock-free [`papaya::HashMap`]. `lock` probes the table
+/// first (one lookup on the hot path) and inserts only on a miss. Between
+/// `get`/`get_or_insert_with` handing out a slot reference and the caller
+/// cloning it, a concurrent [`Guard::drop`] can `remove_if` the slot (its
+/// eviction predicate sees `strong_count == 2` — the clone has not landed
+/// yet); the clone then holds the only reference (`strong_count == 1`),
+/// which `lock` detects and retries — it never locks an orphaned mutex
+/// while a fresh slot occupies the key. `Drop` uses `remove_if` so it
+/// never deletes a slot another waiter has already cloned (a later `lock`
+/// would otherwise see a fresh mutex and split the key).
 #[derive(Debug, Clone)]
-pub struct Map<K> {
+pub struct Map<K: Hash + Eq> {
     map: Table<K>,
 }
 
-impl<K> Default for Map<K> {
+impl<K: Hash + Eq> Default for Map<K> {
     fn default() -> Self {
         Self {
-            map: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            map: Arc::new(papaya::HashMap::new()),
         }
     }
 }
@@ -44,38 +53,54 @@ impl<K: Clone + Eq + Hash> Map<K> {
 
     /// The number of held slots (live locks plus waiters).
     pub fn len(&self) -> usize {
-        self.map
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+        self.map.pin().len()
     }
 
     /// Whether no slot is held.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.map.pin().is_empty()
     }
 
     /// Lock `key`, awaiting the per-key mutex. The returned [`Guard`]
     /// evicts the slot on drop when it is the last handle.
     pub async fn lock(&self, key: K) -> Guard<K> {
         let map = Arc::clone(&self.map);
-        let slot = {
-            // The clone happens under the table lock, and the count check
-            // + removal in `Drop` run under the same lock, so a slot is
-            // never removed while a waiter still references it (a later
-            // task would otherwise lock a fresh slot concurrently).
-            let mut table = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            table
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(sync::Mutex::new(())))
-                .clone()
+        let slot = loop {
+            let pinned = map.pin();
+            // Hot path: the slot usually exists — clone it and check it is
+            // still the live entry. A concurrent `Drop` may have
+            // `remove_if`'d it between the `get` reference and the clone
+            // (its eviction predicate saw `strong_count == 2` before the
+            // clone landed); our clone then holds the only reference
+            // (`strong_count == 1`) and we retry instead of locking an
+            // orphaned mutex while a fresh slot occupies the key.
+            let slot = if let Some(live) = pinned.get(&key) {
+                let slot = Arc::clone(live);
+                if Arc::strong_count(&slot) >= 2 {
+                    break slot;
+                }
+                continue;
+            } else {
+                pinned
+                    .get_or_insert_with(key.clone(), || Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            // Cold path: the slot was inserted a moment ago — the same
+            // eviction race applies, verified by identity against the
+            // current live entry.
+            if pinned
+                .get(&key)
+                .is_some_and(|live| Arc::ptr_eq(live, &slot))
+            {
+                break slot;
+            }
         };
-        let guard = Arc::clone(&slot).lock_owned().await;
+        // `lock_owned` runs after the pin is dropped (no pin across
+        // `.await`).
         Guard {
             key,
-            slot: Some(slot),
             map,
-            guard: Some(guard),
+            guard: Some(slot.lock_owned().await),
         }
     }
 }
@@ -84,28 +109,24 @@ impl<K: Clone + Eq + Hash> Map<K> {
 /// last handle.
 pub struct Guard<K: Clone + Eq + Hash> {
     key: K,
-    slot: Option<Arc<sync::Mutex<()>>>,
     map: Table<K>,
     guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl<K: Clone + Eq + Hash> Drop for Guard<K> {
     fn drop(&mut self) {
-        // Release the mutex first so a waiter can proceed, then evict the
-        // slot only if we were the last handle.
-        drop(self.guard.take());
-        let Some(slot) = self.slot.take() else {
+        let Some(guard) = self.guard.take() else {
             return;
         };
-        let mut table = match self.map.lock() {
-            Ok(table) => table,
-            // Poison recovery: a panicked predecessor must not leak the
-            // slot forever.
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if Arc::strong_count(&slot) == 2 {
-            table.remove(&self.key);
-        }
+        // Evict the slot only if we were the last handle: the same `Arc`
+        // still in the table and no waiter clones (`strong_count == 2`).
+        // The mutex is still held here — harmless: the eviction predicate
+        // already proves no other handle exists, so nobody can queue on
+        // it; `guard` drops right after, releasing the mutex.
+        let slot = OwnedMutexGuard::<()>::mutex(&guard);
+        let _ = self.map.pin().remove_if(&self.key, |_, live| {
+            Arc::ptr_eq(live, slot) && Arc::strong_count(live) == 2
+        });
     }
 }
 
@@ -186,20 +207,5 @@ mod tests {
         assert_eq!(map.len(), 1);
         drop(_held);
         assert!(map.is_empty());
-    }
-
-    #[test]
-    fn poisoned_table_recovers_and_evicts() {
-        let map = Map::new();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = map.map.lock().unwrap();
-            panic!("poison the table");
-        }));
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let _held = map.lock("k".to_string()).await;
-            drop(_held);
-        });
-        assert!(map.is_empty(), "poison recovery must not leak the slot");
     }
 }

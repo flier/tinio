@@ -16,12 +16,14 @@ use std::{net::SocketAddr, time::Duration};
 
 use tokio::sync::watch;
 
+use futures::StreamExt;
 use tinio_config::{log, pipeline};
+use tinio_core::cleanup::{Cleanup, CleanupOptions, RepairKind};
 use tinio_core::pipeline::Runner;
 use tinio_core::storage::{
     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
 };
-use tinio_fs::{FsOptions, FsStorage, Scanner, ScannerOptions, sweep};
+use tinio_fs::{FsCleanup, FsOptions, FsStorage, Scanner, ScannerOptions, sweep};
 use tinio_server::{Capabilities, DataPlane, log as server_log, pipeline::Pipelines};
 
 fn usage() -> ! {
@@ -117,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             meta_batch_size: DEFAULT_META_BATCH_SIZE,
             meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
             io_pipeline: pipelines.io(),
+            remove_pipeline: pipelines.remove(),
             db_pipeline: pipelines.db(),
         },
     )?;
@@ -137,6 +140,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None,
     )?;
     tracing::subscriber::set_global_default(subscriber)?;
+
+    // D-B: synchronous Startup repair — the fast, deterministic items
+    // (tmp, staging residue, multipart orphans, stale bucket records)
+    // run before readiness; the delete-tombstone stage is routed to the
+    // removal lane through the injected runner. Best-effort: a failed
+    // stage is warned and readiness proceeds — the scanner covers the
+    // residue. The stale-bucket prune runs here, pre-serving, so it
+    // stays lock-free (no request can race it yet).
+    let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+        .with_remove_runner(pipelines.remove());
+    match cleanup.repair(RepairKind::Startup).await {
+        Ok(mut actions) => {
+            while let Some(action) = actions.next().await {
+                if let Err(err) = action {
+                    tracing::warn!(
+                        error = %err,
+                        "startup repair step failed; the scanner covers the residue"
+                    );
+                }
+            }
+        }
+        Err(err) => tracing::warn!(
+            error = %err,
+            "startup repair failed; the scanner covers the residue"
+        ),
+    }
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     println!("listening on {}", listener.local_addr()?);

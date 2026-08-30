@@ -7,12 +7,15 @@
 //! worker threads (blocking-task model, Q4), so the configured thread
 //! priority applies exactly to the threads doing the work.
 //!
-//! Two instances are built from the config section (pipeline-spec.md §3.3):
-//! the IO pipeline (`[pipeline.io]`, default 2 workers) for CPU/IO-bound
-//! work and the DB write pipeline (`[pipeline.db]`, default 1 worker — redb
-//! is single-writer) for batched meta writes. [`Pipelines`] owns both and
-//! shuts them down in the required order (R5): **IO first, DB last**, so
-//! in-flight list batches queued in the DB pipeline can still drain.
+//! Three instances are built from the config section (pipeline-spec.md
+//! §3.3): the IO pipeline (`[pipeline.io]`, default 2 workers) for
+//! CPU/IO-bound work, the removal pipeline (`[pipeline.remove]`, default
+//! 1 worker) for delete-bucket tombstone `remove_dir_all` — physically
+//! isolated from ETag compute (D-A) — and the DB write pipeline
+//! (`[pipeline.db]`, default 1 worker — redb is single-writer) for batched
+//! meta writes. [`Pipelines`] owns all three and shuts them down in the
+//! required order (R5): **IO/remove first, DB last**, so in-flight list
+//! batches queued in the DB pipeline can still drain.
 //!
 //! # Semantics (contract)
 //!
@@ -59,7 +62,8 @@ pub const CONSECUTIVE_FAILURE_ESCALATION: u32 = 10;
 /// by the `[pipeline.*]` schema).
 #[derive(Debug, Clone, Copy)]
 struct PipelineSpec {
-    /// The pipeline label (`"io"` / `"db"`), used in thread names and logs.
+    /// The pipeline label (`"io"` / `"remove"` / `"db"`), used in thread
+    /// names and logs.
     pub kind: &'static str,
     /// Worker-thread count (blocking-task model: one task per worker).
     pub workers: u8,
@@ -142,19 +146,20 @@ impl Deref for AlignedCounter {
     }
 }
 
-/// The two server pipelines with their construction-time and shutdown
+/// The three server pipelines with their construction-time and shutdown
 /// wiring (pipeline-spec.md §3.3, R5).
 ///
-/// Parameterized by each pipeline's [`Task::Output`] (default
-/// [`RunOutput`]): `FsOptions` types the IO pipeline to the
-/// tinio-fs `etag::Result` and the DB pipeline to `Result<(), tinio_fs::Error>`
-/// (P4/P7), and the server builds `Pipelines` with those outputs — the
-/// two fields are independent, so the pipelines can carry different task
-/// types. The `Outcome` bounds live on the impl blocks (see
-/// [`Pipeline`]).
-pub struct Pipelines<Oio = RunOutput, Odb = RunOutput> {
-    io: Arc<Pipeline<Oio>>,
-    db: Arc<Pipeline<Odb>>,
+/// Parameterized by each pipeline's [`Task::Output`]: `FsOptions` types
+/// the IO pipeline to [`tinio_fs::etag::Result`], the removal pipeline to
+/// `Result<(), tinio_fs::Error>` (D-A — physically isolated from ETag
+/// compute), and the DB pipeline to `Result<(), tinio_fs::Error>`
+/// (P4/P7). The three type parameters are independent so the lanes can
+/// carry different task types. The `Outcome` bounds live on the impl
+/// blocks (see [`Pipeline`]).
+pub struct Pipelines<IoResult, RemoveResult, DbResult> {
+    io: Arc<Pipeline<IoResult>>,
+    remove: Arc<Pipeline<RemoveResult>>,
+    db: Arc<Pipeline<DbResult>>,
 }
 
 impl<O> Pipeline<O>
@@ -340,21 +345,31 @@ where
     }
 }
 
-impl<Oio, Odb> Pipelines<Oio, Odb>
+impl<IoResult, RemoveResult, DbResult> Pipelines<IoResult, RemoveResult, DbResult>
 where
-    Oio: Outcome,
-    Odb: Outcome,
+    IoResult: Outcome,
+    RemoveResult: Outcome,
+    DbResult: Outcome,
 {
-    /// Build the IO and DB pipelines from the config section (`[pipeline]`;
-    /// an absent top-level section resolves to defaults before this call).
-    /// The output types are inferred from the construction site (the
-    /// server passes the tinio-fs task outputs when wiring `FsOptions`).
+    /// Build the IO, removal, and DB pipelines from the config section
+    /// (`[pipeline]`; an absent top-level section resolves to defaults
+    /// before this call). The output types are inferred from the
+    /// construction site (the server passes the tinio-fs task outputs when
+    /// wiring `FsOptions`). IO is ETag compute (`tinio_fs::etag::Result`);
+    /// removal is unit-success tombstone work (`Result<(), tinio_fs::Error>`).
     pub fn build(config: &pipeline_config::Config) -> Result<Self, Error> {
         let io = Pipeline::new(PipelineSpec {
             kind: "io",
             workers: config.io.workers,
             capacity: config.io.capacity as usize,
             priority: thread_priority(config.io.priority),
+            track_consecutive_failures: false,
+        })?;
+        let remove = Pipeline::new(PipelineSpec {
+            kind: "remove",
+            workers: config.remove.workers,
+            capacity: config.remove.capacity as usize,
+            priority: thread_priority(config.remove.priority),
             track_consecutive_failures: false,
         })?;
         let db = Pipeline::new(PipelineSpec {
@@ -366,45 +381,60 @@ where
         })?;
         Ok(Self {
             io: Arc::new(io),
+            remove: Arc::new(remove),
             db: Arc::new(db),
         })
     }
 
     /// The IO pipeline (ETag computation: bounded file reads + hashing).
-    pub fn io(&self) -> Arc<Pipeline<Oio>> {
+    pub fn io(&self) -> Arc<Pipeline<IoResult>> {
         Arc::clone(&self.io)
     }
 
+    /// The removal pipeline (delete-bucket tombstone `remove_dir_all`).
+    pub fn remove(&self) -> Arc<Pipeline<RemoveResult>> {
+        Arc::clone(&self.remove)
+    }
+
     /// The DB write pipeline (batched meta writes).
-    pub fn db(&self) -> Arc<Pipeline<Odb>> {
+    pub fn db(&self) -> Arc<Pipeline<DbResult>> {
         Arc::clone(&self.db)
     }
 
-    /// Shut both pipelines down in the required order (R5): **IO first, DB
-    /// last** — in-flight list batches queued in the DB pipeline can still
-    /// drain. Idempotent.
+    /// Shut all pipelines down in the required order (R5): **IO/remove
+    /// first, DB last** — in-flight list batches queued in the DB pipeline
+    /// can still drain. Idempotent.
     pub fn shutdown(&self) {
         self.io.shutdown_inner();
+        self.remove.shutdown_inner();
         self.db.shutdown_inner();
     }
 
-    /// Await both pipelines' workers after [`Self::shutdown`] — the R5
-    /// order again (IO first, DB last), so in-flight list batches queued
-    /// in the DB pipeline drain first. Observability (item 6c): the Q3
-    /// semantics are unchanged — this awaits what shutdown already
+    /// Await the IO and DB pipelines' workers after [`Self::shutdown`] —
+    /// the R5 order again (IO first, DB last), so in-flight list batches
+    /// queued in the DB pipeline drain first. Observability (item 6c): the
+    /// Q3 semantics are unchanged — this awaits what shutdown already
     /// guarantees.
+    ///
+    /// The removal lane is deliberately not awaited: its work is
+    /// fire-and-forget everywhere else (`tombstone::reclaim` and the
+    /// cleanup stage's `tombstone::enqueue_one`), and a `remove_dir_all`
+    /// tree walk is unbounded — awaiting it would make shutdown latency
+    /// the tree walk. An interrupted walk leaves a partial tombstone,
+    /// reclaimed by the next startup repair (D-B) or scanner pass.
     pub async fn drain(&self) {
         self.io.drain().await;
         self.db.drain().await;
     }
 }
 
-impl<Oio, Odb> Drop for Pipelines<Oio, Odb> {
+impl<IoResult, RemoveResult, DbResult> Drop for Pipelines<IoResult, RemoveResult, DbResult> {
     fn drop(&mut self) {
         // Safety net with the same order — the fields drop in declaration
-        // order, io before db (R5). Inline: `shutdown` needs the Outcome
-        // bounds, which the Drop impl cannot carry.
+        // order, io/remove before db (R5). Inline: `shutdown` needs the
+        // Outcome bounds, which the Drop impl cannot carry.
         self.io.shutdown_inner();
+        self.remove.shutdown_inner();
         self.db.shutdown_inner();
     }
 }
@@ -752,12 +782,12 @@ mod tests {
         async fn run(&mut self) -> tinio_fs::etag::Result {
             self.ran.store(true, Ordering::Relaxed);
             Ok(tinio_fs::etag::Outcome {
-                key: tinio_core::object::key("a.txt").unwrap(),
-                etag: tinio_core::ETag::from_content(b"x"),
-                size: 1,
-                mtime: std::time::UNIX_EPOCH,
+                key: tinio_core::object::key("probe").unwrap(),
+                etag: tinio_core::ETag::EMPTY,
+                size: 0,
+                mtime: std::time::SystemTime::UNIX_EPOCH,
                 identity: 0,
-                kept: false,
+                kept: true,
             })
         }
     }
@@ -836,14 +866,19 @@ mod tests {
         (guard, buf.0.clone())
     }
 
-    /// Build both pipelines from a config with the given workers/capacity.
-    fn pipelines(io_workers: u8, db_workers: u8, capacity: u32) -> Pipelines {
+    /// Build the pipelines from a config with the given workers/capacity.
+    fn pipelines(
+        io_workers: u8,
+        db_workers: u8,
+        capacity: u32,
+    ) -> Pipelines<RunOutput, RunOutput, RunOutput> {
         Pipelines::build(&pipeline_config::Config {
             io: pipeline_config::Io {
                 workers: io_workers,
                 capacity,
                 ..Default::default()
             },
+            remove: Default::default(),
             db: pipeline_config::Db {
                 workers: db_workers,
                 capacity,
@@ -1246,22 +1281,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn io_pipeline_does_not_escalate_consecutive_failures() {
-        // R7 applies to the DB write pipeline only — 12 consecutive IO
-        // failures stay ordinary warns.
+    async fn io_and_remove_pipelines_do_not_escalate_consecutive_failures() {
+        // R7 applies to the DB write pipeline only — 12 consecutive IO or
+        // removal failures stay ordinary warns (D-A: the removal lane is
+        // an IO-class lane, not a streak-tracking one).
         let (_guard, buf) = capture_warns().await;
         let pipelines = pipelines(1, 1, 64);
-        let runs = Arc::new(AtomicUsize::new(0));
+        let io_runs = Arc::new(AtomicUsize::new(0));
+        let remove_runs = Arc::new(AtomicUsize::new(0));
         for _ in 0..12 {
             pipelines
                 .io()
                 .enqueue(Box::new(FailingTask {
-                    runs: Arc::clone(&runs),
+                    runs: Arc::clone(&io_runs),
+                }))
+                .await
+                .unwrap();
+            pipelines
+                .remove()
+                .enqueue(Box::new(FailingTask {
+                    runs: Arc::clone(&remove_runs),
                 }))
                 .await
                 .unwrap();
         }
-        wait_for(|| runs.load(Ordering::Relaxed) == 12).await;
+        wait_for(|| io_runs.load(Ordering::Relaxed) == 12).await;
+        wait_for(|| remove_runs.load(Ordering::Relaxed) == 12).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(!text.contains("likely systemic"), "{text}");
@@ -1398,20 +1443,21 @@ mod tests {
             .unwrap();
     }
 
-    /// The mandatory `FsOptions.io_pipeline`/`db_pipeline` handles (P4)
-    /// accept the real runtimes — typed to the tinio-fs task outputs
-    /// (P4/P7) — and a task flows through the injected IO pipeline.
+    /// The mandatory `FsOptions.io_pipeline`/`remove_pipeline`/`db_pipeline`
+    /// handles (P4) accept the real runtimes — typed to the tinio-fs task
+    /// outputs (P4/P7) — and a task flows through the injected IO pipeline.
     #[tokio::test]
     async fn pipelines_inject_into_fs_options() {
         // The `Pipelines` output types are inferred from the `FsOptions`
-        // fields: IO = the etag task's `etag::Result`, DB = the write
-        // task's `Result<(), tinio_fs::Error>`.
+        // fields: IO = [`tinio_fs::etag::Result`], remove and DB =
+        // `Result<(), tinio_fs::Error>` (D-A).
         let pipelines = Pipelines::build(&pipeline_config::Config {
             io: pipeline_config::Io {
                 workers: 1,
                 capacity: 16,
                 ..Default::default()
             },
+            remove: Default::default(),
             db: pipeline_config::Db {
                 workers: 1,
                 capacity: 16,
@@ -1429,6 +1475,7 @@ mod tests {
                 meta_batch_size: tinio_core::storage::DEFAULT_META_BATCH_SIZE,
                 meta_batch_bytes: tinio_core::storage::DEFAULT_META_BATCH_BYTES,
                 io_pipeline: pipelines.io(),
+                remove_pipeline: pipelines.remove(),
                 db_pipeline: pipelines.db(),
             },
         )

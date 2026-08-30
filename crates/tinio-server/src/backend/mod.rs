@@ -30,8 +30,6 @@ pub(crate) mod testutil;
 mod tests {
     use super::*;
     use futures::{FutureExt, StreamExt};
-    use tinio_core::bucket;
-    use tinio_core::storage::BucketOps;
     use tinio_mem::MemoryStorage;
 
     fn backend() -> S3Backend<MemoryStorage> {
@@ -40,8 +38,10 @@ mod tests {
 
     #[test]
     fn capabilities_accessor_returns_the_toggles() {
-        let mut caps = Capabilities::default();
-        caps.multipart = false;
+        let caps = Capabilities {
+            multipart: false,
+            ..Default::default()
+        };
         let backend = S3Backend::new(MemoryStorage::new().unwrap(), caps);
         assert_eq!(backend.capabilities(), caps);
     }

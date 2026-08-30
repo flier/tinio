@@ -36,6 +36,7 @@ pub fn fs_options() -> FsOptions {
         meta_batch_size: DEFAULT_META_BATCH_SIZE,
         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
         io_pipeline: Arc::new(InlineRunner::default()),
+        remove_pipeline: Arc::new(InlineRunner::default()),
         db_pipeline: Arc::new(InlineRunner::default()),
     }
 }

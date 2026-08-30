@@ -8,8 +8,11 @@
 //! The implementation is split by concern per fs-backend.md: `path` (path
 //! mapping), `write` (atomic streaming writes), `meta` (the ETag store),
 //! `bucket` (creation times), `listing`, `multipart`, `scanner`, `sweep`,
-//! and `cleanup` (`Cleanup` trait impl); the `backend/` modules implement
-//! the `Storage` contract over those primitives.
+//! `tombstone` (unpublished delete-bucket trees), and `cleanup`
+//! (`Cleanup` trait impl); the `backend/` modules implement the
+//! `Storage` contract over those primitives. The IO pipeline's job
+//! output is [`etag::Result`]; the removal pipeline's is
+//! `Result<(), Error>`.
 
 mod backend;
 pub mod bucket;
@@ -28,6 +31,7 @@ pub mod sweep;
 pub mod testing;
 #[cfg(test)]
 mod testutil;
+pub mod tombstone;
 mod write;
 mod write_task;
 

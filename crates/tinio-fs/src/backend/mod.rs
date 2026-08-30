@@ -25,8 +25,6 @@ use std::{
 use derive_more::Debug;
 use garde::Validate;
 use getset::{CopyGetters, Getters};
-use tokio::sync;
-
 use tinio_core::{
     ETag, object, pipeline,
     storage::{
@@ -35,6 +33,7 @@ use tinio_core::{
         META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
     },
 };
+use tinio_util::lockmap;
 
 use crate::{
     bucket,
@@ -52,17 +51,20 @@ use crate::{
 
 /// Construction options of [`FsStorage`].
 ///
-/// The two pipelines are **mandatory** (P4, pipeline-spec.md §7): the cold
-/// list/scanner paths enqueue ETag-computation and batch meta-write tasks
-/// into them — there is no inline fallback. Offline contexts (doctor,
-/// benches, examples, unit tests) pass [`pipeline::InlineRunner`]
-/// (tinio-core Q1); the server passes its two pipeline runtimes.
+/// The three pipelines are **mandatory** (P4, pipeline-spec.md §7): the
+/// cold list/scanner paths enqueue ETag-computation and batch meta-write
+/// tasks into them, and delete enqueues tombstone removal — there is no
+/// inline fallback. Offline contexts (doctor, benches, examples, unit
+/// tests) pass [`pipeline::InlineRunner`] (tinio-core Q1); the server
+/// passes its pipeline runtimes.
 ///
 /// Each pipeline is typed to its task [`pipeline::Task::Output`] (P4/P7):
-/// the IO pipeline accepts `crate::etag::ComputeTask`
-/// ([`etag::Result`]), the DB pipeline accepts
-/// `crate::write_task::MetaWriteBatchTask` (`Result<(), Error>` — the
-/// original error, never boxed into `RunOutput`).
+/// the IO pipeline accepts blocking ETag compute ([`etag::Result`]), the
+/// removal pipeline accepts unit-success tombstone jobs
+/// (`Result<(), Error>` — D-A, physically isolated from ETag compute),
+/// and the DB pipeline accepts `crate::write_task::MetaWriteBatchTask`
+/// (`Result<(), Error>` — the original error, never boxed into
+/// `RunOutput`).
 ///
 /// # Examples
 ///
@@ -81,6 +83,7 @@ use crate::{
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
 ///     io_pipeline: Arc::new(InlineRunner::default()),
+///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
 /// };
 /// assert!(!options.follow_symlinks);
@@ -119,14 +122,20 @@ pub struct FsOptions {
     /// (≈ 56 B + key length per entry) reaches this (pipeline-spec.md Q5).
     #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
     pub meta_batch_bytes: u32,
-    /// The ETag-computation pipeline (pipeline-spec.md §3.1): the cold
-    /// list/scanner paths enqueue `crate::etag::ComputeTask`
-    /// instances here. Mandatory (P4) — the pipeline (or `InlineRunner`
-    /// in offline contexts) is a construction-time decision. Typed to the
-    /// task's output [`etag::Result`] (P4/P7).
+    /// The IO pipeline (pipeline-spec.md §3.1): the cold list/scanner
+    /// paths enqueue `crate::etag::ComputeTask` instances here. Mandatory
+    /// (P4) — the pipeline (or `InlineRunner` in offline contexts) is a
+    /// construction-time decision. Typed to [`etag::Result`] (P4/P7).
     #[garde(skip)]
     #[debug("<runner>")]
     pub io_pipeline: Arc<dyn pipeline::Runner<etag::Result>>,
+    /// The removal pipeline (D-A, `[pipeline.remove]`): `delete_bucket`
+    /// enqueues tombstone `remove_dir_all` here — physically isolated
+    /// from ETag compute, so a large tree walk can never occupy the IO
+    /// workers' capacity. Mandatory (P4). Typed to `Result<(), Error>`.
+    #[garde(skip)]
+    #[debug("<runner>")]
+    pub remove_pipeline: Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
     /// The batch meta-write pipeline (pipeline-spec.md §3.1): the
     /// producers enqueue `crate::write_task::MetaWriteBatchTask` batches
     /// here. Mandatory (P4). Typed to the task's output
@@ -166,6 +175,7 @@ pub struct FsOptions {
 ///         meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
 ///         io_pipeline: Arc::new(InlineRunner::default()),
+///         remove_pipeline: Arc::new(InlineRunner::default()),
 ///         db_pipeline: Arc::new(InlineRunner::default()),
 ///     },
 /// )
@@ -215,18 +225,30 @@ pub struct FsStorage {
     /// The tree-walk listing (shared with the scanner).
     #[getset(get = "pub(crate)")]
     listing: FsListing,
-    /// Serializes bucket-directory mutations (rename/create/remove) so a
-    /// `delete_bucket` can never remove a just-written object (the
-    /// emptiness check and `remove_dir_all` are one critical section
-    /// against every write into the bucket).
+    /// The removal pipeline (D-A): `delete_bucket` enqueues the tombstone
+    /// `remove_dir_all` here — the tree walk is physically isolated from
+    /// ETag compute on the IO pipeline.
     #[getset(skip)]
-    bucket_mutation_lock: Arc<sync::Mutex<()>>,
+    #[debug("<runner>")]
+    remove_pipeline: Arc<dyn pipeline::Runner<Result<(), crate::Error>>>,
+    /// Per-bucket directory-mutation locks (rename/create/remove). A
+    /// `delete_bucket` of A cannot remove a just-written object of A
+    /// (emptiness check and unpublish are one critical section against
+    /// writes into A); mutations of B do not wait.
+    #[getset(skip)]
+    bucket_mutation_locks: lockmap::Map<bucket::Name>,
     /// Validated path boundaries (root + per-bucket), identity-checked
     /// and bounded — the containment proof of [`bucket_dir`](Self::bucket_dir)
     /// and [`key_path`](Self::key_path).
     #[getset(skip)]
     boundary_cache: BoundaryCache,
 }
+
+/// The per-bucket mutation-lock wait above which [`FsStorage::lock_bucket_mutations`]
+/// warns (D-E) — a second: delete/create/PUT-commit of the same name
+/// should never hold the mutex that long in normal operation, so the
+/// warn marks a stuck peer, not routine contention.
+const MUTATION_LOCK_WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl FsStorage {
     /// Open (or create) the backend over `root` — the convenience path:
@@ -277,15 +299,32 @@ impl FsStorage {
         Self::from_resolved(canonical, state_dir, options, db)
     }
 
-    /// Hold the bucket-mutation lock so a concurrent write's phase-2
-    /// commit blocks until the guard is dropped. The scanner's orphan
-    /// reclamation and the cleanup stale-bucket pruning hold it across
-    /// their probe + remove (F02/F05 — a fresh row or a recreated
-    /// bucket's state can never be destroyed by a stale probe); tests
-    /// use it to retarget a followed bucket symlink between resolve and
-    /// rename.
-    pub(crate) async fn lock_bucket_mutations(&self) -> sync::MutexGuard<'_, ()> {
-        self.bucket_mutation_lock.lock().await
+    /// Hold `name`'s directory-mutation lock so a concurrent write's
+    /// phase-2 commit into this bucket blocks until the guard is dropped.
+    /// The scanner's orphan reclamation and the cleanup stale-bucket
+    /// pruning hold it across their probe + remove (F02/F05 — a fresh
+    /// row or a recreated bucket's state can never be destroyed by a
+    /// stale probe); tests use it to retarget a followed bucket symlink
+    /// between resolve and rename.
+    ///
+    /// A wait past [`MUTATION_LOCK_WARN_THRESHOLD`] is warned (D-E): a
+    /// delete/create/commit of the same name is holding the mutex — long
+    /// enough to see in the logs, never silently absorbed.
+    pub(crate) async fn lock_bucket_mutations(
+        &self,
+        name: &bucket::Name,
+    ) -> lockmap::Guard<bucket::Name> {
+        let started = std::time::Instant::now();
+        let guard = self.bucket_mutation_locks.lock(name.clone()).await;
+        let waited = started.elapsed();
+        if waited > MUTATION_LOCK_WARN_THRESHOLD {
+            tracing::warn!(
+                bucket = %name,
+                waited_ms = waited.as_millis() as u64,
+                "bucket mutation lock wait exceeded the warn threshold"
+            );
+        }
+        guard
     }
 
     fn resolve(root: PathBuf, options: FsOptions) -> Result<(PathBuf, PathBuf, FsOptions), Error> {
@@ -314,6 +353,7 @@ impl FsStorage {
             meta_batch_size,
             meta_batch_bytes,
             io_pipeline,
+            remove_pipeline,
             db_pipeline,
         } = options;
         let handle = Handle::new(db);
@@ -330,6 +370,7 @@ impl FsStorage {
                 meta_batch_size,
                 meta_batch_bytes,
             ),
+            remove_pipeline,
             bucket_store: bucket::Store::from_handle(handle.clone()),
             meta_store: meta::Store::from_handle(handle.clone()),
             multipart_store: crate::multipart::Store::from_handle(
@@ -339,7 +380,7 @@ impl FsStorage {
             ),
             handle,
             writer: AtomicWriter::new(&state_dir),
-            bucket_mutation_lock: Arc::new(sync::Mutex::new(())),
+            bucket_mutation_locks: lockmap::Map::new(),
             boundary_cache: BoundaryCache::new(),
             root: canonical,
             state_dir,

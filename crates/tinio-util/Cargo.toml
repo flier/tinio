@@ -8,11 +8,18 @@ publish = false
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
-tinio-core = { workspace = true, optional = true }
+papaya.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
+tinio-core = { workspace = true, optional = true }
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+] }
 
 [features]
 testing = ["dep:tinio-core", "tokio/time"]

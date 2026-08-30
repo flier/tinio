@@ -70,13 +70,15 @@ Related: [failure-handling.md](failure-handling.md) (abnormal conditions, reclam
 
 ## 8. FsCleanup — `Cleanup` trait impl (`crates/tinio-fs/src/cleanup.rs`, T070)
 
-The fs implementation of the `Cleanup` trait (tinio-core, T012). Three callers: the start orchestration (startup repair, T068), `doctor` (diagnostics + `--fix`, T073/T074), and the scanner (meta-orphan reclamation, T045). All modes share one code path with a `dry_run` flag; every action is logged to the operational log; **user data (bucket directories and objects) is never touched**.
+The fs implementation of the `Cleanup` trait (tinio-core, T012). Three callers: the start orchestration (startup repair, T068), `doctor` (diagnostics + `--fix`, T073/T074), and the scanner (meta-orphan reclamation, T045). All modes share one code path with a `dry_run` flag; every action is logged to the operational log; **user data (live bucket directories and objects) is never touched** — only tinio-private state (including unpublished delete tombstones under `<root>/.tinio/deleting/`).
 
 ### 8.1 Startup repair
 
 Runs after single-instance binding, before readiness (SC-005). Fast, deterministic items only — nothing that requires a full-tree walk:
 
 - **`tmp/` full clear**: at startup there are no active writers, so every file under `<state-dir>/tmp/` is a crash leftover — the whole directory is emptied unconditionally (unlike the sweep, which is mtime-driven because it runs while the server is live).
+- **Unpublished delete-bucket tombstones**: leftover trees under `<root>/.tinio/deleting/` — a crash after the unpublish rename, or a failed fire-and-forget `remove_dir_all` — are removed. The bucket's live name is already gone, so this is private residue, not user data.
+- **Bucket `.tinio/` staging residue**: a crashed/failed cross-volume commit (the EXDEV fallback, §2) leaves its staging file under a `.tinio/` directory at any depth of a bucket; cleared at startup like `tmp/`. A `.tinio` *file* (out-of-band) is cleared too — the reserved name is tinio's at any depth.
 - **Bucket-orphaned multipart subtrees**: `multipart/<bucket>/<uploadId>/` whose `<bucket>` directory no longer exists at `<root>/<bucket>` is removed. Cross-restart uploads (bucket still exists) are **never** touched — completing or aborting them after a restart is legal (quickstart §7).
 - **Upload directories without a `UPLOADS` record** (complete/abort committed but the directory removal failed; revived subtrees from a `put_part` racing a bucket removal): the multipart tree is **enumerated first, then `UPLOADS` is read in one transaction** (the TOCTOU order — a directory exists only after its record commit, so the read sees every live upload); a judged orphan is deleted only after its parts have been idle past the sweep's `multipart_ttl` grace (a slow `put_part` must not be interrupted).
 - **Stale bucket records**: `BUCKETS` entries whose bucket directory is gone are pruned.

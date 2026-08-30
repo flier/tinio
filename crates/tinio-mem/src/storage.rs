@@ -138,10 +138,10 @@ impl MemoryStorage {
 
     /// Enforce `max_object_bytes` on a single object/part of `size` bytes.
     pub(crate) fn check_object_size(&self, size: u64) -> Result<(), Error> {
-        if let Some(limit) = self.options.max_object_bytes {
-            if size > limit {
-                return Err(entity_too_large(size, limit));
-            }
+        if let Some(limit) = self.options.max_object_bytes
+            && size > limit
+        {
+            return Err(entity_too_large(size, limit));
         }
         Ok(())
     }

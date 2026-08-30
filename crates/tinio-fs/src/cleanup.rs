@@ -2,13 +2,14 @@
 //! foundation; scanner reclamation per T045).
 //!
 //! Per fs-backend.md §8 and failure-handling.md §3: startup repair handles
-//! the fast, deterministic items (full `tmp/` clear, bucket `.tinio/`
-//! staging residue, bucket-orphaned multipart subtrees, stale bucket
-//! records); the full repair adds meta-orphan reclamation;
-//! `reclaim_meta_orphans` is the scanner's background path. All modes
-//! share one code path with a `dry_run` flag ([`CleanupOptions`]); **user
-//! data (bucket directories and objects) is never touched** — only
-//! tinio-private state.
+//! the fast, deterministic items (full `tmp/` clear, unpublished delete
+//! tombstones under `<root>/.tinio/deleting/`, bucket `.tinio/` staging
+//! residue, bucket-orphaned multipart subtrees, stale bucket records); the
+//! full repair adds meta-orphan reclamation; `reclaim_meta_orphans` is the
+//! scanner's background path. All modes share one code path with a
+//! `dry_run` flag ([`CleanupOptions`]); **user data (live bucket
+//! directories and objects) is never touched** — only tinio-private state
+//! (including unpublished tombstones).
 //!
 //! Home root-state-dir GC (part of the `Full` scope per failure-handling.md
 //! §3) needs read-only-mode state relocation and lands with US2 (T076).
@@ -16,22 +17,25 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
+use derive_more::Debug;
 use futures::stream;
 use tinio_core::cleanup::{
     ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
 };
+use tinio_core::pipeline::Runner;
 
 use crate::{
     backend::FsStorage,
     bucket,
     error::Error,
-    fsutil::{ok_if_missing, tmp_entries},
-    path::{MULTIPART_DIR_NAME, STATE_DIR_NAME},
-    sweep,
+    fsutil::{entries_of, ok_if_missing, remove_tree},
+    path::{MULTIPART_DIR_NAME, STATE_DIR_NAME, TMP_DIR_NAME},
+    sweep, tombstone,
 };
 
 /// The idle anchor of an orphan upload dir: the latest part mtime,
@@ -92,6 +96,7 @@ async fn record_repair(
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
 ///     io_pipeline: Arc::new(InlineRunner::default()),
+///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
 /// };
 /// let storage = FsStorage::new(root.path(), options).unwrap();
@@ -114,6 +119,12 @@ pub struct FsCleanup {
     storage: FsStorage,
     /// Report-only mode (doctor `--dry-run`): never touches anything.
     dry_run: bool,
+    /// The removal lane (D-B): when present, `repair` routes the
+    /// delete-tombstone stage to it as `RemoveTask`s (fire-and-forget)
+    /// instead of clearing inline. The server startup sets it; doctor
+    /// keeps the default — `None` repairs tombstones inline.
+    #[debug("<runner>")]
+    remove_runner: Option<Arc<dyn Runner<Result<(), Error>>>>,
     /// Idle grace for upload directories without a `UPLOADS` record:
     /// an orphan is deleted only when its parts have been idle at least
     /// this long (the sweep's `multipart_ttl` default; the startup
@@ -129,8 +140,24 @@ impl FsCleanup {
             state_dir: storage.state_dir().to_path_buf(),
             storage: storage.clone(),
             dry_run: options.dry_run,
+            remove_runner: None,
             multipart_grace: sweep::Options::default().multipart_ttl,
         }
+    }
+
+    /// Route the delete-tombstone stage of `repair` through `runner` —
+    /// the removal lane (D-B): the server startup runs the rest of the
+    /// repair synchronously before readiness and hands every tombstone to
+    /// the lane (fire-and-forget; an enqueue failure is warned inside and
+    /// the leftover stays for the scanner — with the scanner OFF the
+    /// startup enqueue still clears it). Doctor does not set this and
+    /// repairs tombstones inline.
+    pub fn with_remove_runner(
+        mut self,
+        runner: Arc<dyn Runner<Result<(), Error>>>,
+    ) -> Self {
+        self.remove_runner = Some(runner);
+        self
     }
 
     /// Override the orphan-upload idle grace (default: the sweep's
@@ -143,7 +170,7 @@ impl FsCleanup {
 
     /// Stage 1: full `tmp/` clear (no active writers at startup).
     async fn repair_tmp(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
-        let entries = match tmp_entries(&self.state_dir).await {
+        let entries = match entries_of(&self.state_dir.join(TMP_DIR_NAME)).await {
             Ok(entries) => entries,
             Err(err) => {
                 actions.push(Err(err));
@@ -164,6 +191,50 @@ impl FsCleanup {
                         Err(err) => Err(err.into()),
                     }
                 },
+            )
+            .await;
+        }
+    }
+
+    /// Unpublished delete-bucket tombstones under `<root>/.tinio/deleting/`
+    /// — a crash after the unpublish rename leaves the tree as private
+    /// residue (the live name is already gone). Not the relocated state
+    /// dir: the rename stays on the data volume (FR-023).
+    async fn repair_delete_tombstones(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
+        let entries = match tombstone::leftovers(&self.root).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                actions.push(Err(err));
+                return;
+            }
+        };
+        if let Some(runner) = &self.remove_runner {
+            // D-B: the server startup routes this stage to the removal
+            // lane — one `RemoveTask` per leftover (fire-and-forget; an
+            // enqueue failure is warned inside and the leftover stays for
+            // the scanner).
+            for (name, path) in entries {
+                record_repair(
+                    actions,
+                    self.dry_run,
+                    format!("would enqueue leftover bucket tombstone {name} on the removal lane"),
+                    format!("enqueued leftover bucket tombstone {name} on the removal lane"),
+                    async {
+                        tombstone::enqueue_one(path, runner).await;
+                        Ok(())
+                    },
+                )
+                .await;
+            }
+            return;
+        }
+        for (name, path) in entries {
+            record_repair(
+                actions,
+                self.dry_run,
+                format!("would clear leftover bucket tombstone {name}"),
+                format!("cleared leftover bucket tombstone {name}"),
+                tombstone::clear_one(&path),
             )
             .await;
         }
@@ -238,15 +309,9 @@ impl FsCleanup {
                     format!("would clear bucket staging residue {name} of {bucket}"),
                     format!("cleared bucket staging residue {name} of {bucket}"),
                     async {
-                        if let Err(err) = ok_if_missing(tokio::fs::remove_dir_all(&dir).await) {
-                            // A `.tinio` *file* (out-of-band): remove as a
-                            // file.
-                            if err.kind() == io::ErrorKind::NotADirectory {
-                                ok_if_missing(tokio::fs::remove_file(&dir).await)?;
-                            } else {
-                                return Err(err.into());
-                            }
-                        }
+                        // Tree, or a `.tinio` *file* planted out-of-band:
+                        // the shared tree-or-file removal.
+                        remove_tree(&dir).await?;
                         Ok(())
                     },
                 )
@@ -465,13 +530,13 @@ impl FsCleanup {
     /// failed prune is warned and skipped (the trait path keeps its
     /// action reporting — this is the count-only form the scanner needs).
     ///
-    /// The probe + wipe run under the bucket-mutation lock (F02): a
+    /// The probe + wipe run under that bucket's mutation lock (F02): a
     /// bucket deleted out-of-band and RECREATED between the probe and
     /// the wipe would have its fresh derived state (BUCKETS, UPLOADS,
     /// PARTS, OBJECT_META rows) destroyed in one write transaction. Under
     /// the lock the recreation cannot interleave — the probe sees the
     /// fresh directory, or the wipe drains before any of its rows commit
-    /// (create/put hold the same lock).
+    /// (create/put of the same name hold the same per-bucket lock).
     pub(crate) async fn reclaim_stale_buckets(&self) -> Result<usize, Error> {
         let entries = self.storage.bucket_store().load_all().await?;
         let mut pruned = 0usize;
@@ -479,7 +544,7 @@ impl FsCleanup {
             let Ok(name) = bucket::name(name) else {
                 continue;
             };
-            let _guard = self.storage.lock_bucket_mutations().await;
+            let _guard = self.storage.lock_bucket_mutations(&name).await;
             match crate::fsutil::is_absent(&self.root.join(&*name)).await {
                 Ok(true) => {}         // the bucket dir is gone — prune
                 Ok(false) => continue, // live bucket — keep the record
@@ -569,6 +634,7 @@ impl Cleanup for FsCleanup {
     async fn repair(&self, kind: RepairKind) -> Result<ActionStream<Error>, Error> {
         let mut actions = Vec::new();
         self.repair_tmp(&mut actions).await;
+        self.repair_delete_tombstones(&mut actions).await;
         self.repair_bucket_staging(&mut actions).await;
         self.repair_multipart_orphans(&mut actions).await;
         self.repair_orphan_upload_dirs(&mut actions).await;
@@ -603,6 +669,7 @@ mod tests {
     use futures::StreamExt;
     use std::fs;
     use std::time::SystemTime;
+    use tinio_core::pipeline::InlineRunner;
     use tinio_core::storage::{BucketOps, ObjectOps};
     use tinio_core::{bucket, object};
     use tinio_util::testing::body;
@@ -711,6 +778,77 @@ mod tests {
             assert!(!root.path().join("data/sub/.tinio").exists());
             assert!(!root.path().join("data/emptydir/.tinio").exists());
             assert!(root.path().join("data/sub").is_dir());
+        });
+    }
+
+    #[test]
+    fn startup_repair_clears_delete_tombstones() {
+        // A crash after the unpublish rename leaves the bucket tree under
+        // `<root>/.tinio/deleting/<id>/` — private residue, reclaimed at
+        // startup like `tmp/` (the live name is already gone).
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            let tombstone = root
+                .path()
+                .join(".tinio")
+                .join("deleting")
+                .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+            fs::create_dir_all(&tombstone).unwrap();
+            fs::write(tombstone.join("leftover.bin"), b"was-a-bucket").unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert!(
+                actions.iter().any(|a| a.description.contains("tombstone")),
+                "{actions:?}"
+            );
+            assert!(!tombstone.exists());
+        });
+    }
+
+    #[test]
+    fn startup_repair_with_remove_runner_enqueues_delete_tombstones() {
+        // D-B: the server's pre-readiness repair routes the tombstone
+        // stage to the removal lane — with the runner injected (an inline
+        // runner executes the `RemoveTask`s synchronously) the leftover
+        // is cleared by the lane while the other stages still run.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            let tombstone = root
+                .path()
+                .join(".tinio")
+                .join("deleting")
+                .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+            fs::create_dir_all(&tombstone).unwrap();
+            fs::write(tombstone.join("leftover.bin"), b"was-a-bucket").unwrap();
+            // A stale bucket record the runner repair must still prune.
+            storage
+                .bucket_store()
+                .record(&bucket::name("gone-bucket").unwrap(), SystemTime::now())
+                .await
+                .unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+                .with_remove_runner(Arc::new(InlineRunner::default()));
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert!(
+                actions.iter().any(|a| a.description.contains("tombstone")),
+                "{actions:?}"
+            );
+            assert!(
+                !tombstone.exists(),
+                "the removal lane (inline runner) cleared the leftover"
+            );
+            // The other stages still run: the stale record is pruned.
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| a.description.contains("stale bucket record")),
+                "{actions:?}"
+            );
+            assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 0);
         });
     }
 
@@ -973,8 +1111,14 @@ mod tests {
                 .unwrap();
             drop(handle);
 
-            let cleanup = FsCleanup::new(&storage, CleanupOptions { dry_run: true })
-                .with_multipart_grace(Duration::from_secs(60));
+            let cleanup = FsCleanup::new(
+                &storage,
+                CleanupOptions {
+                    dry_run: true,
+                    ..CleanupOptions::default()
+                },
+            )
+            .with_multipart_grace(Duration::from_secs(60));
             let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
             assert!(
                 actions
@@ -1004,7 +1148,13 @@ mod tests {
             fs::create_dir(state.path().join("tmp")).unwrap();
             fs::write(state.path().join("tmp/upload-leftover"), b"x").unwrap();
 
-            let cleanup = FsCleanup::new(&storage, CleanupOptions { dry_run: true });
+            let cleanup = FsCleanup::new(
+                &storage,
+                CleanupOptions {
+                    dry_run: true,
+                    ..CleanupOptions::default()
+                },
+            );
             let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
             assert!(
                 actions
@@ -1451,6 +1601,98 @@ mod tests {
             fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(pruned, 0, "no record is pruned on a probe error");
             assert_eq!(storage.bucket_store().load_all().await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn invalid_bucket_names_skip_the_drain_but_not_the_removal() {
+        // A multipart subtree under an INVALID bucket name (e.g. too
+        // short) cannot be drained — the `bucket::name` guard skips the
+        // drain (never a panic) but the subtree itself is still removed:
+        // stage 3 for a missing bucket dir, stage 4 for a live one.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    compact_threshold_percent: 20,
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+
+            // Stage 3: invalid name + missing bucket dir — removed, drain
+            // skipped (the `bucket::name` guard answers `Err`).
+            fs::create_dir_all(state.path().join("multipart/xx/u1")).unwrap();
+            fs::write(state.path().join("multipart/xx/u1/part-1"), b"x").unwrap();
+
+            // Stage 4: invalid name + PRESENT bucket dir — the upload dir
+            // is an orphan (never live) and is removed with the drain
+            // skipped.
+            fs::create_dir(root.path().join("xx")).unwrap();
+            let orphan_dir = state.path().join("multipart/xx/u-orphan");
+            fs::create_dir_all(&orphan_dir).unwrap();
+            fs::write(orphan_dir.join("part-1"), b"x").unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default())
+                .with_multipart_grace(Duration::ZERO);
+            let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+            assert!(!state.path().join("multipart/xx/u1").exists());
+            assert!(!orphan_dir.exists());
+            // Both removals are reported; neither drain panics.
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(
+                        |a| a.description.contains("multipart") || a.description.contains("orphaned")
+                    )
+                    .count(),
+                2,
+                "{actions:?}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_stage_reports_an_unreadable_upload_dir() {
+        // An upload directory that cannot be read is REPORTED (never
+        // silently skipped): the enumeration sees it but the parts read
+        // fails, surfacing as an error action.
+        rt(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let storage = FsStorage::new(
+                root.path(),
+                FsOptions {
+                    follow_symlinks: true,
+                    compact_threshold_percent: 20,
+                    state_dir: Some(state.path().to_path_buf()),
+                    ..fs_options()
+                },
+            )
+            .unwrap();
+            let b = bucket::name("live").unwrap();
+            storage.create_bucket(&b).await.unwrap();
+            let blocked = state.path().join("multipart/live/u-blocked");
+            fs::create_dir_all(&blocked).unwrap();
+            fs::write(blocked.join("part-1"), b"x").unwrap();
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+            let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+            let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+            let mut errs = 0;
+            while let Some(action) = actions.next().await {
+                if action.is_err() {
+                    errs += 1;
+                }
+            }
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(errs, 1, "the unreadable upload dir must be reported");
+            assert!(blocked.exists(), "nothing is removed on a read failure");
         });
     }
 }

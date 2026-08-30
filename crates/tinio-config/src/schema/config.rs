@@ -166,7 +166,7 @@ mod tests {
 
     use secrecy::ExposeSecret;
 
-    use super::{Config, Version, auth, log, s3};
+    use super::{Config, Version, auth, log};
     use crate::Error;
 
     #[test]
