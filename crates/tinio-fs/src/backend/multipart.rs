@@ -9,21 +9,23 @@
 
 // The Windows stream fallback of `copy_part` calls the ObjectOps trait
 // method (the unix fast path never does).
-#[cfg(not(unix))]
-use tinio_core::storage::ObjectOps;
-use tinio_core::{
-    BodyStream, bucket,
-    multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
-    object::{self, Info},
-    storage::{
-        ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
-        access_denied, invalid_key, key_marker_order, split_uploads_order,
-    },
-};
 use tokio::fs;
 
 use super::{Error, FsStorage};
-use crate::write::AtomicWriter;
+#[cfg(not(unix))]
+use crate::_core::storage::ObjectOps;
+use crate::{
+    _core::{
+        BodyStream, bucket,
+        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
+        object::{self, Info},
+        storage::{
+            ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing,
+            UploadsListing, access_denied, invalid_key, key_marker_order, split_uploads_order,
+        },
+    },
+    write::AtomicWriter,
+};
 
 /// The unix fast path of the part-copy primitive: `copy_file_range` the
 /// source's (range of) bytes into a staged part file, then the store's
@@ -309,14 +311,15 @@ impl MultipartOps for FsStorage {
 
 #[cfg(test)]
 mod tests {
-    use tinio_core::{
-        object,
-        storage::{BucketOps, ObjectOps},
-    };
-    use tinio_util::testing::{body, read_body};
-
     use super::*;
-    use crate::testutil::{fs_options, storage};
+    use crate::{
+        _core::{
+            object,
+            storage::{BucketOps, ObjectOps},
+        },
+        _util::testing::{body, read_body},
+        testutil::{fs_options, storage},
+    };
 
     #[tokio::test]
     async fn multipart_lifecycle_via_contract() {

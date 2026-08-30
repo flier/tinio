@@ -22,14 +22,27 @@
 //! }
 //! ```
 
-mod error;
+#[cfg(feature = "api")]
+#[doc(hidden)]
+pub extern crate tinio_api as _api;
+#[doc(hidden)]
+pub extern crate tinio_cli as _cli;
+#[doc(hidden)]
+pub extern crate tinio_config as _config;
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+#[doc(hidden)]
+pub extern crate tinio_server as _server;
 
-pub use tinio_config::Config;
-pub use tinio_core::{
-    BodyStream, Bucket, BucketOps, ByteRange, ETag, MultipartOps, MultipartUpload, ObjectOps,
-    PartInfo, Storage, bucket, cleanup, etag, object, storage,
-};
+mod error;
 
 #[cfg(feature = "api")]
 pub use self::error::ApiError;
 pub use self::error::{CliError, ConfigError, ServerError, StorageError};
+pub use crate::{
+    _config::Config,
+    _core::{
+        BodyStream, Bucket, BucketOps, ByteRange, ETag, MultipartOps, MultipartUpload, ObjectOps,
+        PartInfo, Storage, bucket, cleanup, etag, object, storage,
+    },
+};

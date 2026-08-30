@@ -13,6 +13,9 @@
 //! [`bucket::name`], and [`ETag::new`]: untrusted input MUST go
 //! through the checked constructors before any backend is called.
 
+#[cfg(test)]
+extern crate tinio_util as _util;
+
 pub mod bucket;
 pub mod cleanup;
 pub mod etag;

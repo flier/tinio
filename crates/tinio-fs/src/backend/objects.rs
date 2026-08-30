@@ -20,14 +20,6 @@ use std::{
 
 use bytes::{BufMut, BytesMut};
 use futures::stream;
-use tinio_core::{
-    BodyStream, ETag, bucket,
-    object::{self, Info},
-    storage::{
-        ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, PutObjectResult,
-        access_denied, no_such_bucket, no_such_key,
-    },
-};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt},
@@ -37,6 +29,14 @@ use tokio::{
 
 use super::{Error, FsStorage};
 use crate::{
+    _core::{
+        BodyStream, ETag, bucket,
+        object::{self, Info},
+        storage::{
+            ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
+            PutObjectResult, access_denied, no_such_bucket, no_such_key,
+        },
+    },
     fsutil,
     write::{AtomicWriter, CHUNK_SIZE},
 };
@@ -631,17 +631,19 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use md5::{Digest, Md5};
-    #[cfg(unix)]
-    use tinio_core::storage::MultipartOps;
-    use tinio_core::{
-        object,
-        storage::{BucketOps, Error as StorageError},
-    };
-    use tinio_util::testing::{assert_conformance, body, etag, read_body};
     use tokio::{fs, time::timeout};
 
     use super::*;
-    use crate::testutil::{fs_options, storage};
+    #[cfg(unix)]
+    use crate::_core::storage::MultipartOps;
+    use crate::{
+        _core::{
+            object,
+            storage::{BucketOps, Error as StorageError},
+        },
+        _util::testing::{assert_conformance, body, etag, read_body},
+        testutil::{fs_options, storage},
+    };
 
     #[tokio::test]
     async fn conformance_green() {
@@ -724,11 +726,11 @@ mod tests {
             .await
             .unwrap();
         let completed = [
-            tinio_core::CompletedPart {
+            crate::_core::CompletedPart {
                 part_number: p1.part_number,
                 etag: p1.etag,
             },
-            tinio_core::CompletedPart {
+            crate::_core::CompletedPart {
                 part_number: p2.part_number,
                 etag: p2.etag,
             },
@@ -1070,7 +1072,7 @@ mod tests {
     async fn dropped_staged_body_leaves_no_temp() {
         // A rejected conditional PUT (412) drops the staged body without
         // a commit — the full body must not stay in `tmp/` for the sweep.
-        use tinio_core::storage::ObjectOps;
+        use crate::_core::storage::ObjectOps;
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();

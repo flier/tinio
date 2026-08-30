@@ -11,7 +11,6 @@ use std::{
 };
 
 use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
-use tinio_core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS};
 use tokio::task::spawn_blocking;
 
 use super::{
@@ -20,6 +19,7 @@ use super::{
     open::open,
     tables::StateTable,
 };
+use crate::_core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS};
 
 /// The histogram bucket of a duration in microseconds.
 pub(crate) fn write_lock_bucket(duration_us: u64) -> usize {

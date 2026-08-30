@@ -7,7 +7,8 @@ use s3s::{
     s3_error,
 };
 use time::OffsetDateTime;
-use tinio_core::ETag;
+
+use crate::_core::ETag;
 
 /// The conditional header whose evaluation failed (the read and write
 /// paths map them to different S3 error codes).
@@ -150,9 +151,9 @@ mod tests {
         S3ErrorCode,
         dto::{self, Timestamp},
     };
-    use tinio_core::ETag;
 
     use super::*;
+    use crate::_core::ETag;
 
     fn etag(value: &str) -> ETag {
         value.parse().unwrap()

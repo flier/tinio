@@ -27,20 +27,20 @@ use getset::{CopyGetters, Getters};
 use lockmap::Map;
 use meta::Store;
 pub use objects::StagedBody;
-use tinio_core::{
-    ETag, object, pipeline,
-    storage::{
-        COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
-        DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
-        META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
-    },
-};
-use tinio_util::lockmap;
 use tokio::fs;
 
 pub use crate::error::Error;
 pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
 use crate::{
+    _core::{
+        ETag, object, pipeline,
+        storage::{
+            COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
+            DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
+            META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
+        },
+    },
+    _util::lockmap,
     bucket,
     database::{self, BucketsTable, Handle, ObjectMetaTable, compact_if_needed},
     etag, fsutil,

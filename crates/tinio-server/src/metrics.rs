@@ -44,7 +44,8 @@ use prometheus::{
     register_int_gauge, register_int_gauge_vec,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, dto};
-use tinio_core::{
+
+use crate::_core::{
     pipeline::Stats,
     storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
 };

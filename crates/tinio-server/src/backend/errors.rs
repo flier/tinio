@@ -1,5 +1,6 @@
 use s3s::{S3Error, s3_error};
-use tinio_core::storage::Error as StorageError;
+
+use crate::_core::storage::Error as StorageError;
 
 /// Map a backend error (any `S::Error`, which converts into the contract
 /// error) onto its S3 error code (FR-005).
@@ -52,12 +53,12 @@ mod tests {
 
     use io::Error as IoError;
     use s3s::S3ErrorCode;
-    use tinio_core::{
+
+    use super::*;
+    use crate::_core::{
         ETag, bucket, object,
         storage::{ByteRange, Error as StorageError},
     };
-
-    use super::*;
 
     fn s3_code(err: StorageError) -> S3ErrorCode {
         map_backend_error(err).code().clone()

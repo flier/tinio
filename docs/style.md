@@ -4,6 +4,7 @@
 
 - Top `use`; never inline. `super::server` → `server::Config`. Nest `foo::{Bar, dto::{self, Baz}}`.
 - 3+ (`a::b::c`): `use` then short form — code, tests, benches, docs. `Type::item`: `use` type then `Type::item` (not item, not module-qualify). Collide → alias (`IoError`); glob `Error::*` only `error.rs`/tests.
+- Workspace `tinio_*` → `_`+rest: `lib.rs` `#[doc(hidden)] pub extern crate tinio_core as _core;` (`#[cfg(feature)]`; test `#[cfg(test)] extern crate`). In-crate: `crate::{_core::{...}, path}`; else `tinio_fs::`.
 - `tokio::fs` over `std::fs` (sync / `spawn_blocking` / no-async-API / re-exports `Metadata` stay `std::fs`).
 
 ## Types & defaults
@@ -34,5 +35,5 @@
 ## Docs & scripts
 
 - English bullets. Scripts → `/tmp`.
-- Compress: drop articles/filler; fragments OK; form `condition (ex): action — scope`. One example per pattern; extra examples only for distinct branches. Inline code, paths, commands exact.
+- Compress hard: no articles/filler/hedging; fragments; `condition (ex): action — scope`. 1 ex/pattern (extra = distinct branch). Merge overlap; positive > ban. Cut till drop changes behavior. Inline code/paths/commands exact.
 - CLAUDE.md = always-loaded pointer (name branches, then this file); this file = source of truth. No restating a rule in both.

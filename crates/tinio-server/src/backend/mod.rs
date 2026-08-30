@@ -32,9 +32,9 @@ mod tests {
     use bytes::Bytes;
     use futures::{FutureExt, StreamExt, stream};
     use s3s::S3ErrorCode;
-    use tinio_mem::MemoryStorage;
 
     use super::*;
+    use crate::_mem::MemoryStorage;
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -86,12 +86,15 @@ use s3s::{
     dto::{self, CopySource, ETag as WireETag, LastModified, Range, StreamingBlob},
     s3_error,
 };
-pub use tinio_config::s3::Capabilities;
-use tinio_core::{
-    BodyStream, ETag, bucket, object,
-    storage::{ByteRange, Error as StorageError, Storage},
+
+pub use crate::_config::s3::Capabilities;
+use crate::{
+    _core::{
+        BodyStream, ETag, bucket, object,
+        storage::{ByteRange, Error as StorageError, Storage},
+    },
+    _util::lockmap::{self, Map},
 };
-use tinio_util::lockmap::{self, Map};
 
 /// The S3 mapping over one [`Storage`] backend.
 ///

@@ -10,9 +10,11 @@ use s3s::{
     S3Request, S3Response, S3Result,
     dto::{self, BucketLocationConstraint, DeleteBucketOutput, HeadBucketOutput},
 };
-use tinio_core::storage::Storage;
 
-use crate::backend::{S3Backend, map_backend_error};
+use crate::{
+    _core::storage::Storage,
+    backend::{S3Backend, map_backend_error},
+};
 
 impl<S: Storage> S3Backend<S> {
     pub(crate) async fn op_create_bucket(
@@ -95,13 +97,15 @@ impl<S: Storage> S3Backend<S> {
 #[cfg(test)]
 mod tests {
     use s3s::{S3, dto::ListBucketsInput};
-    use tinio_core::storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps};
-    use tinio_mem::MemoryStorage;
-    use tinio_util::testing::{assert_conformance, body};
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::backend::testutil::s3_request;
+    use crate::{
+        _core::storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps},
+        _mem::MemoryStorage,
+        _util::testing::{assert_conformance, body},
+        backend::testutil::s3_request,
+    };
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())

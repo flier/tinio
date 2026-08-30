@@ -15,13 +15,16 @@ use s3s::{
     dto::{self, DeleteObjectOutput, ETagCondition},
     s3_error,
 };
-use tinio_core::{
-    bucket, object,
-    storage::{Error as StorageError, GetObjectResult, Storage},
-};
 
-use crate::backend::{
-    ConditionFailure, ConditionalHeaders, S3Backend, byte_range, condition_error, map_backend_error,
+use crate::{
+    _core::{
+        bucket, object,
+        storage::{Error as StorageError, GetObjectResult, Storage},
+    },
+    backend::{
+        ConditionFailure, ConditionalHeaders, S3Backend, byte_range, condition_error,
+        map_backend_error,
+    },
 };
 
 /// Parse an ETag-condition header (`x-amz-if-match`, `x-amz-if-none-match`)
@@ -368,12 +371,14 @@ mod tests {
         dto::{CopyObjectInput, CopySource, Range, StreamingBlob, Timestamp},
     };
     use time::OffsetDateTime;
-    use tinio_core::{bucket, storage::ObjectOps};
-    use tinio_mem::MemoryStorage;
-    use tinio_util::testing::{body, read_body};
 
     use super::*;
-    use crate::backend::testutil::{s3_request, setup};
+    use crate::{
+        _core::{bucket, storage::ObjectOps},
+        _mem::MemoryStorage,
+        _util::testing::{body, read_body},
+        backend::testutil::{s3_request, setup},
+    };
 
     async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
         let (backend, b) = setup().await;

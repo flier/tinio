@@ -8,6 +8,20 @@
 //! cargo features (default on); `otel` enables the opt-in OpenTelemetry
 //! export layer.
 
+#[cfg(feature = "api")]
+#[doc(hidden)]
+pub extern crate tinio_api as _api;
+#[doc(hidden)]
+pub extern crate tinio_config as _config;
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+#[cfg(test)]
+extern crate tinio_fs as _fs;
+#[cfg(test)]
+extern crate tinio_mem as _mem;
+#[doc(hidden)]
+pub extern crate tinio_util as _util;
+
 pub mod backend;
 
 mod data;

@@ -41,11 +41,12 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tinio_core::{
+use tokio::time::{Instant, sleep};
+
+use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListObjectsParams, ListPartsParams,
     ListUploadsParams, Storage, bucket, multipart, object, storage, storage::Error::*,
 };
-use tokio::time::{Instant, sleep};
 
 /// Produce a unique bucket name for the harness (fresh backends may already
 /// hold fixtures).

@@ -234,10 +234,8 @@ mod tests {
         io::{Error as IoError, ErrorKind},
     };
 
-    use tinio_util::testing::assert_send_sync;
-
     use super::*;
-    use crate::etag::Error::*;
+    use crate::{_util::testing::assert_send_sync, etag::Error::*};
 
     #[test]
     fn displays_variants() {

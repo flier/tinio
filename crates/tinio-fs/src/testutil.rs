@@ -17,18 +17,20 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tinio_core::{
-    bucket,
-    pipeline::{self, Completion, Error::ShutDown, Reply, Runner, Stats, Task},
-};
-use tinio_util::testing::wait_for as util_wait_for;
 use tokio::{
     fs as tokio_fs,
     sync::{Mutex, mpsc, watch},
     task, time,
 };
 
-use crate::{Error, FsOptions, FsStorage, etag, testing};
+use crate::{
+    _core::{
+        bucket,
+        pipeline::{self, Completion, Error::ShutDown, Reply, Runner, Stats, Task},
+    },
+    _util::testing::wait_for as util_wait_for,
+    Error, FsOptions, FsStorage, etag, testing,
+};
 
 /// Poll `cond` until true or a 10 s deadline passes (the test runners'
 /// workers are asynchronous, so assertions must wait). The shared

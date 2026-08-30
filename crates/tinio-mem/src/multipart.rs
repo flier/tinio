@@ -8,15 +8,15 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable};
-use tinio_core::{
-    CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
-    PartInfo, PartNumber, PartsListing, UploadsListing, bucket, collect_body, from_nanos,
-    group_and_paginate_ordered, key_marker_order, now_nanos, object, split_uploads_order,
-    uploads_order,
-};
 use uuid::Uuid;
 
 use crate::{
+    _core::{
+        CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
+        PartInfo, PartNumber, PartsListing, UploadsListing, bucket, collect_body, from_nanos,
+        group_and_paginate_ordered, key_marker_order, now_nanos, object, split_uploads_order,
+        uploads_order,
+    },
     Error,
     error::{
         access_denied, database_storage, invalid_etag, invalid_key, invalid_part, no_parts,
@@ -84,7 +84,7 @@ impl MultipartOps for MemoryStorage {
         key: &object::Key,
         upload_id: &str,
         part_number: PartNumber,
-        body: tinio_core::BodyStream,
+        body: crate::_core::BodyStream,
     ) -> Result<PartInfo, Error> {
         // Fast-fail on a missing bucket before buffering the body (the write
         // transaction re-checks, closing the race).
@@ -407,14 +407,15 @@ impl MultipartOps for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use tinio_core::{
-        BucketOps, CompletedPart, ListPartsParams, ListUploadsParams, MultipartOps, ObjectOps,
-        PartInfo, bucket, multipart::part_number, object, storage::Error::*,
-    };
-    use tinio_util::testing::{body, read_body};
-
     use super::*;
-    use crate::MemoryOptions;
+    use crate::{
+        _core::{
+            BucketOps, CompletedPart, ListPartsParams, ListUploadsParams, MultipartOps, ObjectOps,
+            PartInfo, bucket, multipart::part_number, object, storage::Error::*,
+        },
+        _util::testing::{body, read_body},
+        MemoryOptions,
+    };
 
     fn completed(part: &PartInfo) -> CompletedPart {
         CompletedPart {

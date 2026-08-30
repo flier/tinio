@@ -44,12 +44,12 @@ use s3s::{
     service::{S3Service, S3ServiceBuilder},
 };
 use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
-use tinio_core::storage::Storage;
 use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
 use tracing::Level;
 
 use crate::{
+    _core::storage::Storage,
     backend::{Capabilities, S3Backend},
     error::Error,
     log::{ACCESS_TARGET, AccessField, AccessFields},
@@ -475,8 +475,6 @@ mod tests {
     use futures::task;
     use http_body::{Body as _, Frame};
     use metrics::WriteLockStats;
-    use tinio_core::pipeline::Stats;
-    use tinio_mem::MemoryStorage;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
@@ -491,6 +489,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{_core::pipeline::Stats, _mem::MemoryStorage};
 
     /// One captured event: the target and its key/value fields.
     type CaptureEvent = (String, HashMap<String, String>);

@@ -1,9 +1,10 @@
 //! The per-object write lock for conditional PUT (RFC 7232 exclusivity).
 
-use tinio_core::{bucket, object, storage::Storage};
-use tinio_util::lockmap;
-
 use super::S3Backend;
+use crate::{
+    _core::{bucket, object, storage::Storage},
+    _util::lockmap,
+};
 
 /// The held per-object lock — a [`lockmap::Guard`] over the
 /// [`S3Backend::conditional_put_locks`] table (see [`lockmap::Map`] for

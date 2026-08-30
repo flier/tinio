@@ -173,9 +173,8 @@ impl From<&str> for ETag {
 
 #[cfg(test)]
 mod tests {
-    use tinio_util::testing::assert_send_sync;
-
     use super::*;
+    use crate::_util::testing::assert_send_sync;
 
     #[test]
     fn etag_validates_formats() {

@@ -21,9 +21,9 @@ use std::sync::Mutex;
 use redb::{
     Database, ReadableDatabase, ReadableTable, Table, TableDefinition, backends::InMemoryBackend,
 };
-use tinio_core::{Storage, bucket, object};
 
 use crate::{
+    _core::{Storage, bucket, object},
     Error,
     error::{database_storage, entity_too_large, no_such_bucket, no_such_upload},
 };
@@ -294,10 +294,11 @@ impl Storage for MemoryStorage {
 mod tests {
     use std::sync::Arc;
 
-    use tinio_core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, bucket, object};
-    use tinio_util::testing::{assert_conformance, assert_send_sync, body};
-
     use super::*;
+    use crate::{
+        _core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, bucket, object},
+        _util::testing::{assert_conformance, assert_send_sync, body},
+    };
 
     #[tokio::test]
     async fn conformance() {
@@ -360,11 +361,11 @@ mod tests {
                 &key,
                 &upload.upload_id,
                 &[
-                    tinio_core::CompletedPart {
+                    crate::_core::CompletedPart {
                         part_number: p1.part_number,
                         etag: p1.etag.clone(),
                     },
-                    tinio_core::CompletedPart {
+                    crate::_core::CompletedPart {
                         part_number: p2.part_number,
                         etag: p2.etag.clone(),
                     },

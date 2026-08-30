@@ -35,7 +35,6 @@ use std::{
 
 use futures::StreamExt;
 use md5::{Digest, Md5};
-use tinio_core::{BodyStream, ETag, object::RESERVED_SEGMENT};
 #[cfg(unix)]
 use tokio::task;
 use tokio::{
@@ -44,7 +43,11 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{Error, fsutil, path::TMP_DIR_NAME};
+use crate::{
+    _core::{BodyStream, ETag, object::RESERVED_SEGMENT},
+    Error, fsutil,
+    path::TMP_DIR_NAME,
+};
 
 /// Bounded chunk size for the streaming copy/hash loops (constitution V:
 /// no per-object buffering; hyper chunks are typically ≤ 64 KiB anyway).
@@ -397,9 +400,9 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use io::Error as IoError;
-    use tinio_util::testing::{body, etag};
 
     use super::*;
+    use crate::_util::testing::{body, etag};
 
     #[tokio::test]
     async fn write_stores_content_and_etag() {

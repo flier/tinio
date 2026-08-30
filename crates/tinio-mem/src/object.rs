@@ -11,12 +11,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::iter;
 use redb::{ReadableDatabase, ReadableTable};
-use tinio_core::{
-    BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
-    PutObjectResult, bucket, collect_body, from_nanos, group_and_paginate, now_nanos, object,
-};
 
 use crate::{
+    _core::{
+        BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
+        PutObjectResult, bucket, collect_body, from_nanos, group_and_paginate, now_nanos, object,
+    },
     Error,
     error::{access_denied, database_storage, no_such_bucket, no_such_key},
     storage::{BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, object_key},
@@ -301,14 +301,16 @@ impl ObjectOps for MemoryStorage {
 mod tests {
     use bytes::Bytes;
     use futures::stream::iter;
-    use tinio_core::{
-        BodyStream, BucketOps, ByteRange, ETag, ListObjectsParams, ObjectListing, ObjectOps,
-        bucket, object, storage::Error::*,
-    };
-    use tinio_util::testing::{body, read_body};
 
     use super::*;
-    use crate::MemoryOptions;
+    use crate::{
+        _core::{
+            BodyStream, BucketOps, ByteRange, ETag, ListObjectsParams, ObjectListing, ObjectOps,
+            bucket, object, storage::Error::*,
+        },
+        _util::testing::{body, read_body},
+        MemoryOptions,
+    };
 
     async fn with_bucket() -> (MemoryStorage, bucket::Name) {
         let storage = MemoryStorage::new().unwrap();
@@ -469,7 +471,7 @@ mod tests {
         ));
         assert!(matches!(
             storage
-                .list_objects(tinio_core::ListObjectsParams {
+                .list_objects(crate::_core::ListObjectsParams {
                     bucket: bucket.clone(),
                     prefix: String::new(),
                     delimiter: None,
@@ -629,7 +631,7 @@ mod tests {
             .await
             .unwrap();
         let page = storage
-            .list_objects(tinio_core::ListObjectsParams {
+            .list_objects(crate::_core::ListObjectsParams {
                 bucket: bucket.clone(),
                 prefix: String::new(),
                 delimiter: None,

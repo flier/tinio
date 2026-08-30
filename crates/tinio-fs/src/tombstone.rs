@@ -13,11 +13,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tinio_core::pipeline;
 use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
+    _core::pipeline,
     error::Error,
     fsutil::{entries_of, remove_tree},
     path::STATE_DIR_NAME,
@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_task_completes_as_done() {
-        use tinio_core::pipeline::{InlineRunner, Runner};
+        use crate::_core::pipeline::{InlineRunner, Runner};
 
         let root = tempfile::tempdir().unwrap();
         let path = dir(root.path()).join("gone");

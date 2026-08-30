@@ -35,10 +35,10 @@ use std::{
 };
 
 pub use object::{Key, key};
-use tinio_core::{etag::ETag, from_nanos, object, to_nanos};
 
 pub use crate::bucket::{Name, name};
 use crate::{
+    _core::{etag::ETag, from_nanos, object, to_nanos},
     Error, bucket,
     database::{self, Handle, ObjectMetaTable},
     etag::{self, HashBuffer},
@@ -623,12 +623,14 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
 mod tests {
     use std::{fs::File, io::Write, thread::sleep, time::Duration};
 
-    use tinio_core::{bucket, object};
-    use tinio_util::testing::etag;
     use tokio::fs;
 
     use super::*;
-    use crate::{database, fsutil, meta};
+    use crate::{
+        _core::{bucket, object},
+        _util::testing::etag,
+        database, fsutil, meta,
+    };
 
     fn mtime(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)

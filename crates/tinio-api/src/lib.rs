@@ -9,6 +9,11 @@
 //! Module layout is populated by the US2 tasks (router, transport, state,
 //! openapi, client, error); nothing is public yet.
 
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+#[cfg(test)]
+extern crate tinio_util as _util;
+
 mod error;
 
 pub use self::error::{Error, ErrorBody};

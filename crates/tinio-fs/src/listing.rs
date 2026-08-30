@@ -41,16 +41,18 @@ use futures::{
     FutureExt, Stream, StreamExt,
     stream::{self, FuturesUnordered},
 };
-use tinio_core::{
-    ETag, bucket,
-    object::{self, Info},
-    pipeline::{self, Completion},
-    storage::{self, ListObjectsParams, ObjectListing, group_and_paginate},
-};
 use tokio::fs;
 
 use crate::{
-    Error, etag, fsutil, meta, path, path::STATE_DIR_NAME, write_task::MetaWriteBatchTask,
+    _core::{
+        ETag, bucket,
+        object::{self, Info},
+        pipeline::{self, Completion},
+        storage::{self, ListObjectsParams, ObjectListing, group_and_paginate},
+    },
+    Error, etag, fsutil, meta, path,
+    path::STATE_DIR_NAME,
+    write_task::MetaWriteBatchTask,
 };
 
 /// The per-entry meta-batch size estimate (pipeline-spec.md Q5): a stored
@@ -802,18 +804,18 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use tinio_core::{
-        pipeline::{Error::Dropped, InlineRunner},
-        storage::{
-            DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, Error::NoSuchBucket,
-            ListObjectsParams,
-        },
-    };
-    use tinio_util::testing;
     use tokio::fs;
 
     use super::*;
     use crate::{
+        _core::{
+            pipeline::{Error::Dropped, InlineRunner},
+            storage::{
+                DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, Error::NoSuchBucket,
+                ListObjectsParams,
+            },
+        },
+        _util::testing,
         database,
         database::ObjectMetaTable,
         testutil::{GatedRunner, LossyRunner, PacedRunner, files, wait_for},
@@ -1352,7 +1354,7 @@ mod tests {
     }
 
     /// The etag of one fixture file.
-    fn file_etag(root: &Path, key: &str) -> tinio_core::ETag {
+    fn file_etag(root: &Path, key: &str) -> crate::_core::ETag {
         ETag::from_content(&read(root.join("data").join(key)).unwrap())
     }
 

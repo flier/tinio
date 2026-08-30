@@ -2,7 +2,8 @@ use garde::Validate;
 use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
-use tinio_core::pipeline::{
+
+use crate::_core::pipeline::{
     CAPACITY_MAX, CAPACITY_MIN, DB_WORKERS_MAX, DB_WORKERS_MIN, DEFAULT_CAPACITY,
     DEFAULT_DB_WORKERS, DEFAULT_IO_WORKERS, DEFAULT_REMOVE_WORKERS, IO_WORKERS_MAX, IO_WORKERS_MIN,
 };

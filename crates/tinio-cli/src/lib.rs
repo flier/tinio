@@ -10,6 +10,23 @@
 //! The command implementations land in `commands/` (start, status, stop,
 //! doctor).
 
+#[cfg(feature = "api")]
+#[doc(hidden)]
+pub extern crate tinio_api as _api;
+#[doc(hidden)]
+pub extern crate tinio_config as _config;
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+#[doc(hidden)]
+pub extern crate tinio_fs as _fs;
+#[cfg(feature = "mem")]
+#[doc(hidden)]
+pub extern crate tinio_mem as _mem;
+#[doc(hidden)]
+pub extern crate tinio_server as _server;
+#[cfg(test)]
+extern crate tinio_util as _util;
+
 mod error;
 
 use std::process::ExitCode;

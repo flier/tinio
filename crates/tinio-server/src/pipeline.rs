@@ -48,17 +48,19 @@ use async_trait::async_trait;
 use derive_more::Deref;
 use futures::FutureExt;
 use thread_priority::{Error as ThreadPriorityError, ThreadPriority, ThreadPriorityValue};
-use tinio_config::pipeline::{self as pipeline_config, Priority};
-use tinio_core::pipeline::{
-    self, Completion, Error::ShutDown, Outcome, Reply, RunOutput, Runner, Stats, Task,
-};
 use tokio::{
     runtime::{Builder, Runtime},
     sync::{Mutex as TokioMutex, mpsc, watch},
     task::JoinHandle,
 };
 
-use crate::Error;
+use crate::{
+    _config::pipeline::{self as pipeline_config, Priority},
+    _core::pipeline::{
+        self, Completion, Error::ShutDown, Outcome, Reply, RunOutput, Runner, Stats, Task,
+    },
+    Error,
+};
 
 /// One queued job: the task plus the reply the worker sends after `run()`
 /// (the other end is [`Completion`]).
@@ -681,15 +683,6 @@ mod tests {
     };
 
     use pipeline::Error::{Dropped, ShutDown};
-    use tinio_core::{
-        ETag, object,
-        pipeline::Task,
-        storage::{
-            DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
-        },
-    };
-    use tinio_fs::etag::{self, Outcome as EtagOutcome};
-    use tinio_util::testing::{SharedBuf, wait_for};
     use tokio::{
         sync::{MutexGuard as TokioMutexGuard, oneshot},
         time::{sleep, timeout},
@@ -698,6 +691,18 @@ mod tests {
     use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
     use super::*;
+    use crate::{
+        _core::{
+            ETag, object,
+            pipeline::Task,
+            storage::{
+                DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
+                DEFAULT_META_BATCH_SIZE,
+            },
+        },
+        _fs::etag::{self, Outcome as EtagOutcome},
+        _util::testing::{SharedBuf, wait_for},
+    };
 
     /// A task that flips a flag on `run()` and on drop — pins the
     /// drop-after-completion contract (the box is dropped by the worker
@@ -1472,7 +1477,7 @@ mod tests {
     /// outputs (P4/P7) — and a task flows through the injected IO pipeline.
     #[tokio::test]
     async fn pipelines_inject_into_fs_options() {
-        use tinio_fs::{FsOptions, FsStorage};
+        use crate::_fs::{FsOptions, FsStorage};
 
         // The `Pipelines` output types are inferred from the `FsOptions`
         // fields: IO = [`tinio_fs::etag::Result`], remove and DB =

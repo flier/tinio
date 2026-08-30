@@ -11,6 +11,11 @@
 //! `MultipartOps` impl), with the shared database layout and helpers in
 //! `storage`. Backend failures are [`Error`].
 
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+#[cfg(test)]
+extern crate tinio_util as _util;
+
 mod bucket;
 mod cleanup;
 mod error;

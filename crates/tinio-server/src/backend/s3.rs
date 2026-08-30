@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use s3s::{S3, S3Request, S3Response, S3Result, dto};
-use tinio_core::storage::Storage;
 
 use super::S3Backend;
+use crate::_core::storage::Storage;
 
 #[async_trait]
 impl<S: Storage> S3 for S3Backend<S> {

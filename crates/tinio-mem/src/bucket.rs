@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable};
-use tinio_core::{Bucket, BucketOps, bucket, from_nanos, now_nanos};
 
 use crate::{
+    _core::{Bucket, BucketOps, bucket, from_nanos, now_nanos},
     Error,
     error::{already_exists, no_such_bucket, not_empty},
     storage::{BUCKETS, MemoryStorage, OBJECTS, UPLOADS},
@@ -100,10 +100,11 @@ impl BucketOps for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use tinio_core::{MultipartOps, ObjectOps, bucket, object, storage::Error::*};
-    use tinio_util::testing::body;
-
     use super::*;
+    use crate::{
+        _core::{MultipartOps, ObjectOps, bucket, object, storage::Error::*},
+        _util::testing::body,
+    };
 
     #[tokio::test]
     async fn list_buckets_is_lexicographic() {
@@ -173,7 +174,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                &[tinio_core::CompletedPart {
+                &[crate::_core::CompletedPart {
                     part_number: part.part_number,
                     etag: part.etag.clone(),
                 }],

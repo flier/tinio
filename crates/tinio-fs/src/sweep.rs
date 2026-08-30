@@ -236,14 +236,16 @@ pub struct Summary {
 mod tests {
     use std::fs::{self, FileTimes, OpenOptions};
 
-    use tinio_core::{
-        bucket,
-        storage::{BucketOps, MultipartOps},
-    };
-    use tinio_util::testing::body;
-
     use super::*;
-    use crate::{FsOptions, testutil::fs_options};
+    use crate::{
+        _core::{
+            bucket,
+            storage::{BucketOps, MultipartOps},
+        },
+        _util::testing::body,
+        FsOptions,
+        testutil::fs_options,
+    };
 
     fn old_ttl_options() -> Options {
         Options {

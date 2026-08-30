@@ -174,9 +174,8 @@ fn validate_object_key(key: &str) -> garde::Result {
 
 #[cfg(test)]
 mod tests {
-    use tinio_util::testing::assert_send_sync;
-
     use super::*;
+    use crate::_util::testing::assert_send_sync;
 
     #[test]
     fn object_key_validates_and_exposes() {

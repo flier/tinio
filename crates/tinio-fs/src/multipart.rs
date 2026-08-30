@@ -32,16 +32,6 @@ use std::{
 };
 
 use md5::{Digest, Md5};
-use tinio_core::{
-    BodyStream, ETag, bucket, from_nanos,
-    multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
-    object::{self},
-    storage::{
-        self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload, group_and_paginate_unordered,
-        uploads_order,
-    },
-};
-use tinio_util::lockmap::{Guard, Map};
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -49,6 +39,16 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    _core::{
+        BodyStream, ETag, bucket, from_nanos,
+        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
+        object::{self},
+        storage::{
+            self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload,
+            group_and_paginate_unordered, uploads_order,
+        },
+    },
+    _util::lockmap::{Guard, Map},
     Error,
     database::{self, Handle, PartsTable, UploadsTable},
     fsutil,
@@ -1062,10 +1062,11 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
 
 #[cfg(test)]
 mod tests {
-    use tinio_core::storage::{Error as StorageError, group_and_paginate_ordered};
-    use tinio_util::testing::{body, etag};
-
     use super::*;
+    use crate::{
+        _core::storage::{Error as StorageError, group_and_paginate_ordered},
+        _util::testing::{body, etag},
+    };
 
     fn fixture() -> (tempfile::TempDir, Store) {
         let state = tempfile::tempdir().unwrap();

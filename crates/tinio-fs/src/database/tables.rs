@@ -8,13 +8,15 @@ use std::{
 };
 
 use redb::{ReadableTable, Table, TableDefinition};
-use tinio_core::{etag::ETag, from_nanos, object, to_nanos};
 
 use super::{
     error::{Error, corrupt_meta, unsupported_version},
     scan::{drain_pair, drain_triple, for_each_pair},
 };
-use crate::bucket;
+use crate::{
+    _core::{etag::ETag, from_nanos, object, to_nanos},
+    bucket,
+};
 
 /// `Deref`/`DerefMut` plus `open` / `ensure` / `open_readonly` for a table handle.
 macro_rules! table_impl {

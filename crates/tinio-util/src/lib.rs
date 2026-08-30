@@ -7,6 +7,10 @@
 //! - `testing` — the conformance test harness (behind the `testing`
 //!   feature: requires `tinio-core` types).
 
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+
 pub mod lockmap;
 
 #[cfg(feature = "testing")]

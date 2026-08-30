@@ -11,8 +11,6 @@ use redb::{
     Database, ReadableDatabase, StorageError::ValueTooLarge, TableError::TableDoesNotExist,
     TransactionError::Storage as TxnStorage,
 };
-use tinio_core::{bucket, object};
-use tinio_util::testing::assert_send_sync;
 use tokio::{runtime::Builder, sync::oneshot, time::timeout};
 
 use super::{
@@ -22,6 +20,10 @@ use super::{
     handle::Handle,
     open::{Integrity, check_integrity, open},
     tables::{BucketsTable, ObjectMetaTable, PartsTable, StateTable, UploadsTable},
+};
+use crate::{
+    _core::{bucket, object},
+    _util::testing::assert_send_sync,
 };
 
 fn open_db() -> (tempfile::TempDir, Database, Stats) {

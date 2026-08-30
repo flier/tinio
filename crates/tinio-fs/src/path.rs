@@ -33,12 +33,16 @@ use std::{
 #[cfg(unix)]
 use moka::sync::Cache;
 use strict_path::{PathBoundary, StrictPathError};
-#[cfg(windows)]
-use tinio_core::storage::Error::InvalidBucketName;
-use tinio_core::{bucket, object, storage};
 use tokio::task::spawn_blocking;
 
-use crate::{Error, backend::invalid_path, fsutil};
+#[cfg(windows)]
+use crate::_core::storage::Error::InvalidBucketName;
+use crate::{
+    _core::{bucket, object, storage},
+    Error,
+    backend::invalid_path,
+    fsutil,
+};
 
 /// The reserved state-directory name — never served, never listed
 /// (FR-020). One source of truth with the contract crate's reserved
@@ -526,9 +530,8 @@ mod tests {
         io::{Error as IoError, ErrorKind},
     };
 
-    use tinio_core::{bucket, object, storage::Error as StorageError};
-
     use super::*;
+    use crate::_core::{bucket, object, storage::Error as StorageError};
 
     fn bucket_dir(root: &Path, name: &str) -> PathBuf {
         let dir = root.join(name);

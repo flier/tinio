@@ -17,7 +17,6 @@ use std::{
     sync::Mutex,
 };
 
-use tinio_config::log::{self, Format, Verbosity};
 use tracing::{
     Event, Level, Subscriber,
     field::{Field, Visit},
@@ -31,6 +30,8 @@ use tracing_subscriber::{
     layer::{Context, SubscriberExt},
     registry::LookupSpan,
 };
+
+use crate::_config::log::{self, Format, Verbosity};
 
 /// The access-log event target (the data-plane middleware emits events
 /// with this target).
@@ -364,11 +365,10 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
     };
 
-    use tinio_config::log::AccessFormat;
-    use tinio_util::testing::SharedBuf;
     use tracing::subscriber::with_default;
 
     use super::*;
+    use crate::{_config::log::AccessFormat, _util::testing::SharedBuf};
 
     fn fields(remote_addr: &str, request: &str, status: u16, body_bytes_sent: u64) -> AccessFields {
         AccessFields::new(

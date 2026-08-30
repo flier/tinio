@@ -14,6 +14,11 @@
 //! output is [`etag::Result`]; the removal pipeline's is
 //! `Result<(), Error>`.
 
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+#[doc(hidden)]
+pub extern crate tinio_util as _util;
+
 mod backend;
 pub mod bucket;
 mod cleanup;

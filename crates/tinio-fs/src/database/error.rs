@@ -3,7 +3,7 @@
 
 use std::{io, path::PathBuf};
 
-use tinio_core::storage;
+use crate::_core::storage;
 
 /// A redb or state-database failure.
 #[derive(Debug, thiserror::Error)]

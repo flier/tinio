@@ -7,7 +7,8 @@
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use tinio_core::storage;
+
+use crate::_core::storage;
 
 /// Wire body for management-plane errors: `{"error": "<message>"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,10 +78,9 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use io::Error as IoError;
-    use tinio_core::storage::Error::*;
-    use tinio_util::testing::assert_send_sync;
 
     use super::*;
+    use crate::{_core::storage::Error::*, _util::testing::assert_send_sync};
 
     #[test]
     fn maps_to_status_codes() {

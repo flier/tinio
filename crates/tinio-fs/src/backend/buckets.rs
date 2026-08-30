@@ -8,14 +8,14 @@
 use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
-use tinio_core::{
-    bucket::{self, Bucket},
-    storage::{BucketOps, already_exists, no_such_bucket, not_empty},
-};
 use tokio::fs;
 
 use super::{Error, FsStorage};
 use crate::{
+    _core::{
+        bucket::{self, Bucket},
+        storage::{BucketOps, already_exists, no_such_bucket, not_empty},
+    },
     path::{STATE_DIR_NAME, bucket_path_lexical},
     tombstone,
 };
@@ -172,15 +172,15 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use tinio_core::{
-        object,
-        storage::{Error as StorageError, Error::*, MultipartOps, ObjectOps},
-    };
-    use tinio_util::testing::{assert_conformance, body, etag};
     use tokio::time::timeout;
 
     use super::*;
     use crate::{
+        _core::{
+            object,
+            storage::{Error as StorageError, Error::*, MultipartOps, ObjectOps},
+        },
+        _util::testing::{assert_conformance, body, etag},
         testutil::{storage, wait_for, wait_for_lock_waiter},
         tombstone,
     };
@@ -412,10 +412,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_bucket_follows_when_enabled_and_invisible_when_disabled() {
-        use tinio_core::storage::ListObjectsParams;
-        use tinio_util::testing::read_body;
-
-        use crate::{FsOptions, testutil::fs_options};
+        use crate::{
+            _core::storage::ListObjectsParams, _util::testing::read_body, FsOptions,
+            testutil::fs_options,
+        };
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), root.path().join("linked")).unwrap();

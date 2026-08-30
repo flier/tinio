@@ -11,9 +11,9 @@
 use std::{path::Path, sync::Arc, time::SystemTime};
 
 pub use bucket::{Name, name};
-use tinio_core::bucket;
 
 use crate::{
+    _core::bucket,
     Error,
     database::{self, BucketsTable, Handle},
 };
@@ -138,10 +138,9 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
 mod tests {
     use std::time::Duration;
 
-    use tinio_util::testing::assert_send_sync;
-
     use super::*;
     use crate::{
+        _util::testing::assert_send_sync,
         bucket,
         database::{self, Error::UnsupportedVersion, StateTable},
     };

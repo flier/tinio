@@ -18,6 +18,9 @@
 //! Section types live under their module path (`log::Config`, `api::Http`);
 //! the root document is [`Config`].
 
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+
 mod error;
 pub mod schema;
 pub mod sources;

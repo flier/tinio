@@ -26,7 +26,6 @@ use std::{
 };
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use tinio_core::{bucket, cleanup::CleanupOptions, object, pipeline::Completion};
 use tokio::{
     sync::watch,
     task::{spawn_blocking, yield_now},
@@ -34,8 +33,14 @@ use tokio::{
 };
 
 use crate::{
-    FsCleanup, backend::FsStorage, database, error::Error, etag, fsutil,
-    listing::MetaBatchAccumulator, meta, pacing, tombstone,
+    _core::{bucket, cleanup::CleanupOptions, object, pipeline::Completion},
+    FsCleanup,
+    backend::FsStorage,
+    database,
+    error::Error,
+    etag, fsutil,
+    listing::MetaBatchAccumulator,
+    meta, pacing, tombstone,
 };
 
 /// Entries per batch: after each batch of **enqueued compute tasks** the
@@ -620,16 +625,16 @@ mod tests {
         sync::{Arc, atomic::Ordering},
     };
 
-    use tinio_core::{
-        ETag, object,
-        pipeline::{InlineRunner, Runner},
-        storage::{BucketOps, ObjectOps},
-    };
-    use tinio_util::testing::body;
     use tokio::{fs, time::sleep};
 
     use super::*;
     use crate::{
+        _core::{
+            ETag, object,
+            pipeline::{InlineRunner, Runner},
+            storage::{BucketOps, ObjectOps},
+        },
+        _util::testing::body,
         FsOptions, testutil,
         testutil::{
             FailingBatchRunner, FailingTaskRunner, GatedRunner, PacedRunner, fs_options, wait_for,
@@ -1083,7 +1088,8 @@ mod tests {
         use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
         use meta::Store;
-        use tinio_core::ETag;
+
+        use crate::_core::ETag;
 
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();

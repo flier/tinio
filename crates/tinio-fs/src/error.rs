@@ -20,9 +20,10 @@ use std::{
     path::PathBuf,
 };
 
-use tinio_core::{pipeline, storage};
-
-use crate::database::{self, Error as DatabaseError};
+use crate::{
+    _core::{pipeline, storage},
+    database::{self, Error as DatabaseError},
+};
 
 /// A filesystem backend failure.
 #[derive(Debug, thiserror::Error)]
@@ -112,14 +113,16 @@ impl AsRef<dyn StdError + Send + Sync> for Error {
 mod tests {
     use garde::Validate;
     use redb::DatabaseError::DatabaseAlreadyOpen;
-    use tinio_core::{
-        pipeline::Error::{Dropped, ShutDown},
-        storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
-    };
-    use tinio_util::testing::assert_send_sync;
 
     use super::*;
-    use crate::database::Error::{Open, UnsupportedVersion};
+    use crate::{
+        _core::{
+            pipeline::Error::{Dropped, ShutDown},
+            storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
+        },
+        _util::testing::assert_send_sync,
+        database::Error::{Open, UnsupportedVersion},
+    };
 
     #[derive(Validate)]
     struct Probe {

@@ -3,12 +3,12 @@ use std::fs::{read_dir, write};
 use std::os::unix::fs::symlink;
 
 use redb::ReadableDatabase;
-use tinio_core::storage::{BucketOps, Error as StorageError, ObjectOps};
-use tinio_util::testing::body;
 use tokio::fs;
 
 use super::*;
 use crate::{
+    _core::storage::{BucketOps, Error as StorageError, ObjectOps},
+    _util::testing::body,
     database::{self, StateTable},
     testutil::fs_options,
 };

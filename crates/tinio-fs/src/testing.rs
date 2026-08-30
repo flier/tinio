@@ -8,14 +8,15 @@
 
 use std::sync::Arc;
 
-use tinio_core::{
-    pipeline::InlineRunner,
-    storage::{
-        DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+use crate::{
+    _core::{
+        pipeline::InlineRunner,
+        storage::{
+            DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+        },
     },
+    FsOptions,
 };
-
-use crate::FsOptions;
 
 /// The standard offline [`FsOptions`]: the fs defaults plus the mandatory
 /// inline pipelines (P4 — offline contexts pass [`InlineRunner`], Q1).

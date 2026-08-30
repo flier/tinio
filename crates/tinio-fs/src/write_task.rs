@@ -10,9 +10,11 @@
 use std::mem::take;
 
 use async_trait::async_trait;
-use tinio_core::{bucket, pipeline};
 
-use crate::{Error, meta};
+use crate::{
+    _core::{bucket, pipeline},
+    Error, meta,
+};
 
 /// A unit of DB write-pipeline work: one batch upsert, one write
 /// transaction (pipeline-spec.md §3.2, Q3b, R8).
@@ -63,15 +65,19 @@ mod tests {
     };
 
     use redb::{Database, TableDefinition};
-    use tinio_core::{
-        bucket, object,
-        pipeline::{InlineRunner, Runner, Task},
-        to_nanos,
-    };
-    use tinio_util::testing::etag;
 
     use super::*;
-    use crate::{Error, database::Handle, meta::Store};
+    use crate::{
+        _core::{
+            bucket, object,
+            pipeline::{InlineRunner, Runner, Task},
+            to_nanos,
+        },
+        _util::testing::etag,
+        Error,
+        database::Handle,
+        meta::Store,
+    };
 
     fn mtime(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)

@@ -37,10 +37,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tinio_core::{ETag, object, pipeline};
 use tokio::fs;
 
-use crate::{Error, database, fsutil, meta, write::CHUNK_SIZE};
+use crate::{
+    _core::{ETag, object, pipeline},
+    Error, database, fsutil, meta,
+    write::CHUNK_SIZE,
+};
 
 /// One compute outcome: the key, the (possibly kept) ETag, and the
 /// **hash-time** metadata (size, mtime, identity) that the persisted row
@@ -347,15 +350,17 @@ mod tests {
         time::Duration,
     };
 
-    use tinio_core::{
-        ETag, object,
-        pipeline::{InlineRunner, Runner, Task},
-        to_nanos,
-    };
-    use tinio_util::testing::etag;
     use tokio::{runtime::Builder, task::yield_now};
 
     use super::*;
+    use crate::{
+        _core::{
+            ETag, object,
+            pipeline::{InlineRunner, Runner, Task},
+            to_nanos,
+        },
+        _util::testing::etag,
+    };
 
     fn task(
         key: &str,

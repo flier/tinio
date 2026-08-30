@@ -1,7 +1,8 @@
 use garde::{Error as GardeError, Validate};
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
-use tinio_core::storage::{
+
+use crate::_core::storage::{
     COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
     DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_FOLLOW_SYMLINKS, DEFAULT_META_BATCH_BYTES,
     DEFAULT_META_BATCH_SIZE, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN, META_BATCH_SIZE_MAX,

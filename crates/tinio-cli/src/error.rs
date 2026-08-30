@@ -5,7 +5,7 @@
 
 use std::io;
 
-use tinio_core::storage;
+use crate::_core::storage;
 
 /// A CLI failure carrying its exit code.
 ///
@@ -32,14 +32,14 @@ pub enum Error {
     Io(#[from] io::Error),
     /// A configuration failure — exit code 1.
     #[error("configuration error: {0}")]
-    Config(#[from] tinio_config::Error),
+    Config(#[from] crate::_config::Error),
     /// A storage-contract failure — exit code 1.
     #[error("storage error: {0}")]
     Storage(#[from] storage::Error),
     /// A management-plane failure — exit code 1.
     #[cfg(feature = "api")]
     #[error("management error: {0}")]
-    Api(#[from] tinio_api::Error),
+    Api(#[from] crate::_api::Error),
 }
 
 impl Error {
@@ -55,11 +55,11 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use io::Error as IoError;
-    use tinio_config::Error as ConfigError;
-    use tinio_core::storage::Error::*;
-    use tinio_util::testing::assert_send_sync;
 
     use super::*;
+    use crate::{
+        _config::Error as ConfigError, _core::storage::Error::*, _util::testing::assert_send_sync,
+    };
 
     #[test]
     fn exit_codes_follow_contract() {

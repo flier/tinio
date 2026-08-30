@@ -17,14 +17,14 @@ use s3s::{
     dto::{self, AbortMultipartUploadOutput, Range},
     s3_error,
 };
-use tinio_core::{
-    ETag,
-    multipart::{CompletedPart, MIN_PART_BYTES, PartNumber, part_number as parse_part_number},
-    storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
-};
 
-use crate::backend::{
-    ConditionalHeaders, S3Backend, byte_range, map_backend_error, normalize_delimiter,
+use crate::{
+    _core::{
+        ETag,
+        multipart::{CompletedPart, MIN_PART_BYTES, PartNumber, part_number as parse_part_number},
+        storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
+    },
+    backend::{ConditionalHeaders, S3Backend, byte_range, map_backend_error, normalize_delimiter},
 };
 
 /// A request part number into the validated [`PartNumber`] (invalid →
@@ -393,19 +393,21 @@ mod tests {
         S3, S3ErrorCode,
         dto::{CopySource, StreamingBlob, UploadPartCopyInput},
     };
-    use tinio_core::{
-        bucket, object,
-        storage::{BucketOps, ObjectOps},
-    };
-    use tinio_mem::MemoryStorage;
-    #[cfg(feature = "copy")]
-    use tinio_util::testing::body;
-    use tinio_util::testing::read_body;
 
     use super::*;
-    use crate::backend::{
-        Capabilities,
-        testutil::{s3_request, setup},
+    #[cfg(feature = "copy")]
+    use crate::_util::testing::body;
+    use crate::{
+        _core::{
+            bucket, object,
+            storage::{BucketOps, ObjectOps},
+        },
+        _mem::MemoryStorage,
+        _util::testing::read_body,
+        backend::{
+            Capabilities,
+            testutil::{s3_request, setup},
+        },
     };
 
     #[cfg(feature = "multipart")]

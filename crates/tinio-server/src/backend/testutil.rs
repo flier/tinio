@@ -2,10 +2,12 @@
 
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::S3Request;
-use tinio_core::{bucket, storage::BucketOps};
-use tinio_mem::MemoryStorage;
 
 use super::S3Backend;
+use crate::{
+    _core::{bucket, storage::BucketOps},
+    _mem::MemoryStorage,
+};
 
 /// A minimal `S3Request` with default headers (tests fill the input).
 pub(crate) fn s3_request<T>(input: T) -> S3Request<T> {

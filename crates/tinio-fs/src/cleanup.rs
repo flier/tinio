@@ -24,12 +24,12 @@ use std::{
 use async_trait::async_trait;
 use derive_more::Debug;
 use futures::stream;
-use tinio_core::cleanup::{
-    ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
-};
 use tokio::fs;
 
 use crate::{
+    _core::cleanup::{
+        ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
+    },
     backend::FsStorage,
     bucket,
     error::Error,
@@ -653,15 +653,18 @@ mod tests {
     use std::{fs::OpenOptions, time::SystemTime};
 
     use futures::StreamExt;
-    use tinio_core::{
-        bucket, object,
-        storage::{BucketOps, ObjectOps},
-    };
-    use tinio_util::testing::body;
     use tokio::fs;
 
     use super::*;
-    use crate::{FsOptions, testutil::fs_options};
+    use crate::{
+        _core::{
+            bucket, object,
+            storage::{BucketOps, ObjectOps},
+        },
+        _util::testing::body,
+        FsOptions,
+        testutil::fs_options,
+    };
 
     async fn collect(actions: ActionStream<Error>) -> Vec<RepairAction> {
         let mut out = Vec::new();

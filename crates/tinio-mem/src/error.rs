@@ -10,7 +10,7 @@ use std::{
     num::ParseIntError,
 };
 
-use tinio_core::{bucket, etag, object, storage, storage::Error::*};
+use crate::_core::{bucket, etag, object, storage, storage::Error::*};
 
 /// An in-memory backend failure.
 ///
@@ -255,10 +255,12 @@ mod tests {
         TableError::TableDoesNotExist,
         TransactionError::Storage as TxnStorage,
     };
-    use tinio_core::{etag::Error::InvalidFormat, storage::ByteRange};
-    use tinio_util::testing::assert_send_sync;
 
     use super::*;
+    use crate::{
+        _core::{etag::Error::InvalidFormat, storage::ByteRange},
+        _util::testing::assert_send_sync,
+    };
 
     #[test]
     fn displays_wrapped_contract_errors() {

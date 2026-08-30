@@ -2,6 +2,8 @@
 
 use std::process::ExitCode;
 
+use tinio::_cli;
+
 fn main() -> ExitCode {
-    tinio_cli::run()
+    _cli::run()
 }
