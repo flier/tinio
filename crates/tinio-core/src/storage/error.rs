@@ -56,6 +56,9 @@ pub enum Error {
     /// Stored or wire-format ETag could not be parsed.
     #[error("invalid etag: {0}")]
     InvalidETag(#[from] etag::Error),
+    /// Stored checksum algorithm or type wire name could not be parsed.
+    #[error("invalid checksum: `{0}`")]
+    InvalidChecksum(String),
     /// Part number outside `1..=10000`.
     #[error("invalid part number: {0}")]
     InvalidPartNumber(u32),
@@ -161,6 +164,12 @@ pub fn invalid_bucket_name(raw: String) -> Error {
 #[inline]
 pub fn invalid_etag(err: etag::Error) -> Error {
     Error::InvalidETag(err)
+}
+
+/// Stored checksum algorithm or type wire name could not be parsed.
+#[inline]
+pub fn invalid_checksum(raw: impl Into<String>) -> Error {
+    Error::InvalidChecksum(raw.into())
 }
 
 /// Part number outside `1..=10000`.
@@ -272,6 +281,10 @@ mod tests {
                 Error::InvalidETag(InvalidFormat),
                 "invalid etag: invalid ETag format",
             ),
+            (
+                Error::InvalidChecksum("BLAKE3".into()),
+                "invalid checksum: `BLAKE3`",
+            ),
             (Error::InvalidPartNumber(0), "invalid part number: 0"),
             (Error::InvalidPart(2), "invalid part: 2"),
             (Error::NoParts, "no parts uploaded"),
@@ -335,6 +348,10 @@ mod tests {
             Error::InvalidBucketName(_)
         ));
         assert!(matches!(invalid_etag(InvalidFormat), Error::InvalidETag(_)));
+        assert!(matches!(
+            invalid_checksum("BLAKE3"),
+            Error::InvalidChecksum(_)
+        ));
         let err = part_too_small(2, 5 * 1024 * 1024, 100);
         match err {
             Error::PartTooSmall {

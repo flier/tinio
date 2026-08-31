@@ -72,6 +72,13 @@ pub struct Capabilities {
     #[serde(default)]
     #[default = false]
     pub allow_zero_page_size: bool,
+
+    /// Validate and echo `x-amz-checksum-*` on multipart uploads
+    /// (spec 2026-08-31). Default false: checksums are accepted and
+    /// dropped, exactly as before.
+    #[serde(default)]
+    #[default = false]
+    pub checksum: bool,
 }
 
 /// S3 section (`[s3]`; runtime level, FR-021). Disabled capability groups
@@ -259,6 +266,16 @@ mod tests {
         // The knob flows through the capability pipeline.
         let caps = Capabilities::from(config.s3.as_ref().unwrap());
         assert!(caps.allow_zero_page_size);
+    }
+
+    #[test]
+    fn checksum_defaults_off_and_parses() {
+        assert!(!Capabilities::default().checksum);
+        let config = RootConfig::parse("version = 1\n[s3]\nchecksum = true").unwrap();
+        assert!(config.s3.as_ref().unwrap().capabilities.checksum);
+        // The knob flows through the capability pipeline.
+        let caps = Capabilities::from(config.s3.as_ref().unwrap());
+        assert!(caps.checksum);
     }
 
     #[test]

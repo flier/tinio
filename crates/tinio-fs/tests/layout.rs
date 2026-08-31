@@ -52,7 +52,10 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
 
     // Multipart lifecycle leaves part files only.
     let key = "big.bin".into();
-    let upload = storage.create_multipart_upload(&b, &key).await.unwrap();
+    let upload = storage
+        .create_multipart_upload(&b, &key, None)
+        .await
+        .unwrap();
     storage
         .upload_part(
             &b,
@@ -60,6 +63,7 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
             &upload.upload_id,
             part_number(1).unwrap(),
             body(b"x"),
+            None,
         )
         .await
         .unwrap();

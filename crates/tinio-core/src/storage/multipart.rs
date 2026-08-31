@@ -1,10 +1,12 @@
 //! Multipart upload types and the [`MultipartOps`] contract category.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::{Storage, body::BodyStream, range::ByteRange};
 use crate::{
-    bucket,
+    bucket, checksum,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object,
 };
@@ -144,17 +146,37 @@ pub struct UploadsListing {
 #[async_trait]
 pub trait MultipartOps: Send + Sync + 'static {
     /// Start a multipart upload; returns the upload state with a fresh
-    /// upload id.
+    /// upload id. `checksum` is the create-time checksum spec
+    /// (persisted; echoed by `get_multipart_upload`/`list_multipart_uploads`).
     async fn create_multipart_upload(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
+        checksum: Option<checksum::Upload>,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage;
 
-    /// Upload one part (number 1..=10000). `NoSuchUpload` when the upload
-    /// does not exist.
+    /// The persisted upload state (create-time checksum algorithm/type
+    /// included). `NoSuchUpload` when the upload does not exist or the
+    /// key does not match.
+    async fn get_multipart_upload(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<MultipartUpload, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Upload one part (number 1..=10000). `checksum` is the server's
+    /// tee slot (spec 2026-08-31): the backend persists its digest in
+    /// the SAME transaction as the part row when present — a re-upload
+    /// overwrites both atomically, so no CAS is needed — and clears the
+    /// checksum row when absent (a re-uploaded part must not keep a
+    /// stale value). The backends never hash; with `etag_md5` the slot
+    /// also supplies the part ETag. `NoSuchUpload` when the upload does
+    /// not exist.
     async fn upload_part(
         &self,
         bucket: &bucket::Name,
@@ -162,6 +184,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         upload_id: &str,
         part_number: PartNumber,
         body: BodyStream,
+        checksum: Option<Arc<checksum::PartChecksum>>,
     ) -> Result<PartInfo, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -171,7 +194,8 @@ pub trait MultipartOps: Send + Sync + 'static {
     /// default implementation streams the source through the body
     /// contract (get range → upload part); a backend may override with a
     /// filesystem-level copy. A part's ETag is always the content MD5 of
-    /// the part bytes (the range, when present).
+    /// the part bytes (the range, when present). The copy path carries
+    /// no client checksum (R1) — no tee slot.
     #[allow(clippy::too_many_arguments)]
     async fn copy_part(
         &self,
@@ -187,7 +211,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         Self: Storage,
     {
         let get = self.get_object(src_bucket, src_key, range).await?;
-        self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body)
+        self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body, None)
             .await
     }
 

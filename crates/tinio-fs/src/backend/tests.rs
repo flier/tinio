@@ -180,8 +180,16 @@ async fn set_max_concurrent_uploads_is_enforced() {
     storage.create_bucket(&b).await.unwrap();
     let k = object::key("k").unwrap();
     storage.set_max_concurrent_uploads(1);
-    storage.multipart_store().create(&b, &k).await.unwrap();
-    let err = storage.multipart_store().create(&b, &k).await.unwrap_err();
+    storage
+        .multipart_store()
+        .create(&b, &k, None)
+        .await
+        .unwrap();
+    let err = storage
+        .multipart_store()
+        .create(&b, &k, None)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("uploads"), "{err}");
 }
 

@@ -301,7 +301,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         storage
-            .create_multipart_upload(&b, &"big.bin".into())
+            .create_multipart_upload(&b, &"big.bin".into(), None)
             .await
             .unwrap();
         let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
@@ -343,7 +343,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into())
+            .create_multipart_upload(&b, &"big.bin".into(), None)
             .await
             .unwrap();
         storage
@@ -353,6 +353,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"x"),
+                None,
             )
             .await
             .unwrap();

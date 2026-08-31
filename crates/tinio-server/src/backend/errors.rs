@@ -19,6 +19,9 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
             s3_error!(InvalidBucketName, "invalid bucket name: {name}")
         }
         StorageError::InvalidETag(_) => s3_error!(InvalidArgument, "invalid ETag"),
+        StorageError::InvalidChecksum(raw) => {
+            s3_error!(InternalError, "invalid checksum: `{raw}`")
+        }
         StorageError::InvalidPartNumber(n) => {
             s3_error!(InvalidArgument, "invalid part number: {n}")
         }
@@ -97,6 +100,10 @@ mod tests {
             (
                 StorageError::InvalidETag("x".parse::<ETag>().unwrap_err()),
                 S3ErrorCode::InvalidArgument,
+            ),
+            (
+                StorageError::InvalidChecksum("BLAKE3".into()),
+                S3ErrorCode::InternalError,
             ),
             (
                 StorageError::InvalidPartNumber(10001),

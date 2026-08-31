@@ -1,14 +1,15 @@
 //! The redb state database — `<state-dir>/meta.redb` (meta-redb-spec §5).
 //!
-//! All derived metadata lives in one file across five tables (`OBJECT_META`,
-//! `BUCKETS`, `UPLOADS`, `PARTS`, `STATE`); the file system keeps only the
-//! multipart part contents and the `tmp/` staging directory.
+//! All derived metadata lives in one file across seven tables (`OBJECT_META`,
+//! `BUCKETS`, `UPLOADS`, `PARTS`, `UPLOAD_CHECKSUMS`, `PART_CHECKSUMS`,
+//! `STATE`); the file system keeps only the multipart part contents and the
+//! `tmp/` staging directory.
 //!
-//! [`open`] opens-or-creates the database and its five tables in one write
+//! [`open`] opens-or-creates the database and its tables in one write
 //! transaction (read transactions refuse to open a table that does not
 //! exist yet) and checks the `STATE` version: a missing version is written
 //! (fresh database), a mismatch is [`Error::UnsupportedVersion`] (nested
-//! under [`Error::Database`] at the crate boundary).
+//! under [`crate::error::Error::Database`] at the crate boundary).
 //!
 //! [`Handle`] is the shared access handle (meta-redb-spec G2): closure
 //! based — a transaction's lifetime is sealed inside the closure, so a
@@ -20,8 +21,9 @@
 //! transaction (write-lock histograms, pipeline-spec.md §4).
 //!
 //! Per-kind redb errors live in [`Error`]; every function in this module
-//! returns it. The crate lifts it via [`From`] into [`Error::Database`]
-//! (database I/O unwraps to [`Error::Io`]).
+//! returns it. The crate lifts it via [`From`] into
+//! [`crate::error::Error::Database`] (database I/O unwraps to
+//! [`Error::Io`]).
 
 mod compact;
 mod error;
@@ -39,5 +41,7 @@ pub use handle::{Handle, WriteLockSnapshot};
 pub use open::{Integrity, Open, check_integrity, open};
 #[cfg(test)]
 pub(crate) use tables::StateTable;
-pub(crate) use tables::{BucketsTable, PartsTable, UploadsTable};
+pub(crate) use tables::{
+    BucketsTable, PartChecksumsTable, PartsTable, UploadChecksumsTable, UploadsTable,
+};
 pub use tables::{ObjectMetaTable, StoredMeta};

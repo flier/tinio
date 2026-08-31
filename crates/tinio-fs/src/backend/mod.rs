@@ -63,7 +63,7 @@ use crate::{
 /// tests) pass [`pipeline::InlineRunner`] (tinio-core Q1); the server
 /// passes its pipeline runtimes.
 ///
-/// Each pipeline is typed to its task [`Task::Output`] (P4/P7):
+/// Each pipeline is typed to its task [`pipeline::Task::Output`] (P4/P7):
 /// the IO pipeline accepts blocking ETag compute ([`etag::Result`]), the
 /// removal pipeline accepts unit-success tombstone jobs
 /// (`Result<(), Error>` — D-A, physically isolated from ETag compute),

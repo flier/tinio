@@ -213,7 +213,7 @@ mod tests {
         storage.create_bucket(&bucket).await.unwrap();
         let key = object::key("pending.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let part = storage
@@ -223,6 +223,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"part".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -246,7 +247,7 @@ mod tests {
         assert_eq!(completed.size, 4);
         // A bucket with an upload but no parts yet is also not empty.
         let idle = storage
-            .create_multipart_upload(&bucket, &object::key("idle.bin").unwrap())
+            .create_multipart_upload(&bucket, &object::key("idle.bin").unwrap(), None)
             .await
             .unwrap();
         assert!(matches!(

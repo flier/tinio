@@ -102,7 +102,10 @@ jobs:
         run: |
           ver=$(cargo metadata --no-deps --format-version 1 | \
             python -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='tinio'))")
-          if cargo info "tinio@${ver}" >/dev/null 2>&1; then
+          # `cargo info` exits 0 for a never-published crate, so probe the
+          # crates.io API instead: 404 = no published baseline yet.
+          if curl -fsS -H "User-Agent: tinio-ci" \
+            "https://crates.io/api/v1/crates/tinio/${ver}" >/dev/null 2>&1; then
             cargo semver-checks check-release --package tinio
           else
             echo "tinio@${ver} is not on crates.io yet — semver-checks baseline starts with the first release"

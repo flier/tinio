@@ -135,7 +135,7 @@ pub struct FsCleanup {
 impl FsCleanup {
     /// Construct the cleanup pipeline for `storage`. The delete-tombstone
     /// stage always routes through the storage's removal lane (D-B — see
-    /// [`Self::repair_delete_tombstones`]).
+    /// `repair_delete_tombstones`).
     pub fn new(storage: &FsStorage, options: CleanupOptions) -> Self {
         Self {
             root: storage.root().to_path_buf(),
@@ -720,7 +720,7 @@ mod tests {
         storage.create_bucket(&live).await.unwrap();
         storage
             .multipart_store()
-            .create(&live, &object::key("k").unwrap())
+            .create(&live, &object::key("k").unwrap(), None)
             .await
             .unwrap();
 
@@ -857,7 +857,11 @@ mod tests {
         let gone = bucket::name("gone-bucket").unwrap();
         storage.create_bucket(&gone).await.unwrap();
         let k = object::key("k").unwrap();
-        storage.multipart_store().create(&gone, &k).await.unwrap();
+        storage
+            .multipart_store()
+            .create(&gone, &k, None)
+            .await
+            .unwrap();
         assert!(storage.multipart_store().has_uploads(&gone).await.unwrap());
         fs::remove_dir_all(root.path().join("gone-bucket"))
             .await
@@ -890,7 +894,11 @@ mod tests {
 
         // A live upload: record committed, directory present.
         let k = object::key("k").unwrap();
-        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        let upload = storage
+            .multipart_store()
+            .create(&b, &k, None)
+            .await
+            .unwrap();
         let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
         fs::create_dir_all(&live_dir).await.unwrap();
         fs::write(live_dir.join("part-1"), b"x").await.unwrap();
@@ -943,10 +951,14 @@ mod tests {
         let b = bucket::name("live").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("k").unwrap();
-        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        let upload = storage
+            .multipart_store()
+            .create(&b, &k, None)
+            .await
+            .unwrap();
         storage
             .multipart_store()
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
             .unwrap();
         // Corrupt the stored key out-of-band: the validated view no
@@ -1017,7 +1029,11 @@ mod tests {
         // Half 1: record committed, no directory yet (the state of a
         // `create` racing the enumeration) — nothing to judge, the
         // record survives.
-        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        let upload = storage
+            .multipart_store()
+            .create(&b, &k, None)
+            .await
+            .unwrap();
         let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
         assert!(
             !actions
@@ -1032,7 +1048,7 @@ mod tests {
         // without any idle grace.
         storage
             .multipart_store()
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
             .unwrap();
         let live_dir = state.path().join("multipart/live").join(&upload.upload_id);

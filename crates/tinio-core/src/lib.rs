@@ -8,7 +8,8 @@
 //! harness behind the `testing` feature of `tinio-util`.
 //!
 //! Contract domain types: [`Bucket`] and [`bucket::Name`], [`object::Key`]
-//! and [`object::Info`], [`ETag`], [`MultipartUpload`] and [`PartInfo`].
+//! and [`object::Info`], [`ETag`], [`MultipartUpload`] and [`PartInfo`],
+//! [`checksum::Algorithm`] and [`checksum::Type`].
 //! The newtypes carry validation in [`object::key`],
 //! [`bucket::name`], and [`ETag::new`]: untrusted input MUST go
 //! through the checked constructors before any backend is called.
@@ -17,6 +18,7 @@
 extern crate tinio_util as _util;
 
 pub mod bucket;
+pub mod checksum;
 pub mod cleanup;
 pub mod etag;
 pub mod multipart;

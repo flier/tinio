@@ -44,7 +44,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    _core::{BodyStream, ETag, object::RESERVED_SEGMENT},
+    _core::{BodyStream, ETag, checksum, object::RESERVED_SEGMENT},
     Error, fsutil,
     path::TMP_DIR_NAME,
 };
@@ -173,7 +173,7 @@ impl AtomicWriter {
     /// ETag. On failure the target is untouched; the temp file is left for
     /// the sweep / startup repair (failure-handling.md §2C).
     pub async fn write(&self, target: &Path, body: BodyStream) -> Result<ETag, Error> {
-        let (temp, etag) = self.stage(body).await?;
+        let (temp, etag) = self.stage(body, None).await?;
         Self::commit(&temp, target, None).await?;
         Ok(etag)
     }
@@ -301,11 +301,17 @@ impl AtomicWriter {
     /// Stream `body` into a fresh temp file under `tmp/`, returning the
     /// temp path and content MD5. The caller controls when the temp
     /// becomes visible (rename under its own lock); on failure the temp is
-    /// removed best-effort.
-    pub(crate) async fn stage(&self, body: BodyStream) -> Result<(PathBuf, ETag), Error> {
+    /// removed best-effort. `checksum` is the server's tee slot: with
+    /// `etag_md5` the slot already holds the content MD5 (a part's ETag
+    /// IS its content MD5), so the write is not hashed a second time.
+    pub(crate) async fn stage(
+        &self,
+        body: BodyStream,
+        checksum: Option<&checksum::PartChecksum>,
+    ) -> Result<(PathBuf, ETag), Error> {
         self.ensure_tmp_dir().await?;
         let temp = self.tmp_dir.join(format!("upload-{}", Uuid::new_v4()));
-        let result = self.write_temp(&temp, body).await;
+        let result = self.write_temp(&temp, body, checksum).await;
         match result {
             Ok(etag) => Ok((temp, etag)),
             Err(err) => {
@@ -316,10 +322,16 @@ impl AtomicWriter {
     }
 
     /// The stream+hash core: drain `body` into `temp` with bounded
-    /// buffers, returning the content MD5.
-    async fn write_temp(&self, temp: &Path, body: BodyStream) -> Result<ETag, Error> {
+    /// buffers, returning the content MD5 (from the tee slot when
+    /// `etag_md5` — the write skips its own hash).
+    async fn write_temp(
+        &self,
+        temp: &Path,
+        body: BodyStream,
+        checksum: Option<&checksum::PartChecksum>,
+    ) -> Result<ETag, Error> {
         let mut file = File::create(temp).await?;
-        let mut hasher = Md5::new();
+        let mut hasher = (!checksum.is_some_and(|c| c.etag_md5)).then(Md5::new);
         let mut stream = pin!(body);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -327,7 +339,9 @@ impl AtomicWriter {
             // whole — it is drained in bounded slices.
             for slice in chunk.as_ref().chunks(CHUNK_SIZE) {
                 file.write_all(slice).await?;
-                hasher.update(slice);
+                if let Some(hasher) = &mut hasher {
+                    hasher.update(slice);
+                }
             }
         }
         file.flush().await?;
@@ -341,7 +355,23 @@ impl AtomicWriter {
         // could drop this sync if the cost matters — the assemble-time
         // sync still covers the completed object (F26, documented).
         file.sync_all().await?;
-        Ok(ETag::Single(hasher.finalize().into()))
+        match hasher {
+            // The write was hashed inline.
+            Some(hasher) => Ok(ETag::Single(hasher.finalize().into())),
+            // The tee's MD5 (etag_md5): decode the wire base64 into the
+            // raw digest — the tee fills the slot before the stream's
+            // final `None`, so the value is there.
+            None => {
+                let slot = checksum
+                    .and_then(|c| c.digest.get())
+                    .expect("the etag_md5 tee fills the slot at stream end");
+                let digest = slot
+                    .value
+                    .md5_raw()
+                    .expect("the tee's md5 is valid and 16 bytes");
+                Ok(ETag::Single(digest))
+            }
+        }
     }
 
     /// Stage `len` bytes at `offset` of an already-open `source` into a
@@ -477,7 +507,7 @@ mod tests {
         let writer = AtomicWriter::new(state.path());
         let target = state.path().join("existing-dir");
         fs::create_dir(&target).await.unwrap();
-        let (temp, _) = writer.stage(body(b"x")).await.unwrap();
+        let (temp, _) = writer.stage(body(b"x"), None).await.unwrap();
         // rename(file, existing-directory) fails on every platform — the
         // target stays untouched and the failed temp is removed (item 7c).
         let err = AtomicWriter::commit(&temp, &target, None)

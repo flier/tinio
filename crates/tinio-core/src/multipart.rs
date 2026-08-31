@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use derive_more::{AsRef, Deref, Display, Into};
 
 use crate::{
-    bucket,
+    bucket, checksum,
     etag::ETag,
     object,
     storage::{self, Error::*},
@@ -94,6 +94,7 @@ pub struct CompletedPart {
 ///     bucket: "data".into(),
 ///     key: "big.bin".into(),
 ///     initiated_at: SystemTime::UNIX_EPOCH,
+///     checksum: None,
 /// };
 /// assert_eq!(upload.upload_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
 /// ```
@@ -107,6 +108,8 @@ pub struct MultipartUpload {
     pub key: object::Key,
     /// Upload initiation timestamp (used for idle-expiration).
     pub initiated_at: SystemTime,
+    /// The create-time checksum spec (`None` = no checksum upload).
+    pub checksum: Option<checksum::Upload>,
 }
 
 /// Metadata of a single uploaded multipart part.
@@ -123,6 +126,7 @@ pub struct MultipartUpload {
 ///     size: 5_242_880,
 ///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
 ///     last_modified: SystemTime::UNIX_EPOCH,
+///     checksum: None,
 /// };
 /// assert_eq!(u32::from(part.part_number), 1);
 /// ```
@@ -136,6 +140,8 @@ pub struct PartInfo {
     pub etag: ETag,
     /// Last write time of the part (used for idle-expiration).
     pub last_modified: SystemTime,
+    /// The stored checksum of the part (`None` = none was computed).
+    pub checksum: Option<checksum::Part>,
 }
 
 #[cfg(test)]
@@ -150,6 +156,7 @@ mod tests {
             size: 100,
             etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
             last_modified: SystemTime::UNIX_EPOCH,
+            checksum: None,
         };
         assert_eq!(u32::from(p.part_number), 7);
         assert_eq!(p.size, 100);
@@ -162,6 +169,7 @@ mod tests {
             bucket: "data".into(),
             key: "big.bin".into(),
             initiated_at: SystemTime::UNIX_EPOCH,
+            checksum: None,
         };
         assert_eq!(m.upload_id, "uuid-v4");
         assert_eq!(m.key.as_ref(), "big.bin");

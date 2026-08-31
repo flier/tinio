@@ -12,7 +12,7 @@ mod common;
 
 use std::fs;
 
-use common::{Server, request};
+use common::{Server, extract, request};
 use http::StatusCode;
 use tinio_server::Capabilities;
 
@@ -161,4 +161,44 @@ fn sorted_entries(dir: &std::path::Path) -> Vec<String> {
         .collect();
     entries.sort();
     entries
+}
+
+#[tokio::test]
+async fn upload_part_checksum_mismatch_is_bad_digest() {
+    // The `[s3] checksum` toggle on: a wrong `x-amz-checksum-crc32` on
+    // UploadPart fails the request with BadDigest (spec 2026-08-31).
+    let server = Server::mem(Capabilities {
+        checksum: true,
+        ..Default::default()
+    })
+    .await;
+    request(server.addr(), "PUT", "/data", &[], &[]).await;
+
+    let resp = request(server.addr(), "POST", "/data/big.bin?uploads", &[], &[]).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let upload_id = extract(&resp.text(), "<UploadId>", "</UploadId>");
+    assert!(!upload_id.is_empty(), "create must return an upload id");
+
+    // A wrong checksum → 400 BadDigest; the part is never stored.
+    let resp = request(
+        server.addr(),
+        "PUT",
+        &format!("/data/big.bin?partNumber=1&uploadId={upload_id}"),
+        &[("x-amz-checksum-crc32", "y/Q5Jg==")], // crc32("123456789") ≠ the body
+        b"hello world",
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.error_code(), "BadDigest");
+
+    // The correct value passes.
+    let resp = request(
+        server.addr(),
+        "PUT",
+        &format!("/data/big.bin?partNumber=1&uploadId={upload_id}"),
+        &[("x-amz-checksum-crc32", "DUoRhQ==")],
+        b"hello world",
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
 }

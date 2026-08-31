@@ -338,6 +338,22 @@ where
             .unwrap_or(false))
     }
 
+    /// The stored row, present only when the upload exists AND records
+    /// `key` (S3 identity is `(bucket, key, uploadId)`) — the
+    /// `key_matches` + `get` pair of `get_upload` in one lookup.
+    pub fn get_matching(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<Option<(String, u64)>, Error> {
+        Ok(self
+            .0
+            .get((&**bucket, upload_id))?
+            .map(|guard| (guard.value().0.to_string(), guard.value().1))
+            .filter(|(stored_key, _)| stored_key == &**key))
+    }
+
     /// Visit every upload row of `bucket` (contiguous from `(bucket, "")`).
     pub fn for_bucket<F>(&self, bucket: &bucket::Name, mut visit: F) -> Result<(), Error>
     where
@@ -482,6 +498,140 @@ impl<'txn> PartsTable<'txn, Table<'txn, PartKey, &'static str>> {
         drain_triple(&mut self.0, (bucket, upload_id, 0), |b, id, _| {
             b == bucket && id == upload_id
         })
+    }
+}
+
+// --- UPLOAD_CHECKSUMS ---
+
+/// `(bucket, upload_id)` → `(algorithm wire name, checksum-type wire
+/// name or "")` — the upload's create-time checksum spec (spec
+/// 2026-08-31). `""` for a checksum type that was never fixed.
+type UploadChecksumValue = (&'static str, &'static str);
+const UPLOAD_CHECKSUMS: TableDefinition<UploadKey, UploadChecksumValue> =
+    TableDefinition::new("upload_checksums");
+
+/// Handle to the `UPLOAD_CHECKSUMS` table (writable or read-only).
+pub struct UploadChecksumsTable<'txn, T>(T, PhantomData<&'txn ()>);
+
+table_impl!(
+    UploadChecksumsTable,
+    UPLOAD_CHECKSUMS,
+    UploadKey,
+    UploadChecksumValue
+);
+
+impl<'txn, T> UploadChecksumsTable<'txn, T>
+where
+    T: ReadableTable<UploadKey, UploadChecksumValue>,
+{
+    /// The stored row: `(algorithm wire name, checksum-type wire name or
+    /// "")` (owned — the guard cannot outlive the closure).
+    pub fn get(&self, bucket: &str, upload_id: &str) -> Result<Option<(String, String)>, Error> {
+        Ok(self
+            .0
+            .get((bucket, upload_id))?
+            .map(|v| (v.value().0.to_string(), v.value().1.to_string())))
+    }
+}
+
+impl<'txn> UploadChecksumsTable<'txn, Table<'txn, UploadKey, UploadChecksumValue>> {
+    /// Insert or replace the upload's checksum spec.
+    pub fn put(
+        &mut self,
+        bucket: &str,
+        upload_id: &str,
+        algorithm: &str,
+        checksum_type: &str,
+    ) -> Result<(), Error> {
+        self.0
+            .insert((bucket, upload_id), (algorithm, checksum_type))?;
+        Ok(())
+    }
+
+    /// Remove the row (idempotent).
+    pub fn remove(&mut self, bucket: &str, upload_id: &str) -> Result<(), Error> {
+        self.0.remove((bucket, upload_id))?;
+        Ok(())
+    }
+
+    /// Delete every row of `bucket` (bucket teardown).
+    pub fn drain_bucket(&mut self, bucket: &bucket::Name) -> Result<(), Error> {
+        let bucket = &**bucket;
+        drain_pair(&mut self.0, (bucket, ""), |b, _| b == bucket)
+    }
+}
+
+// --- PART_CHECKSUMS ---
+
+/// `(bucket, upload_id, part_number)` → `(algorithm wire name, base64
+/// value)` — one part's computed checksum (spec 2026-08-31).
+type PartChecksumValue = (&'static str, &'static str);
+const PART_CHECKSUMS: TableDefinition<PartKey, PartChecksumValue> =
+    TableDefinition::new("part_checksums");
+
+/// Handle to the `PART_CHECKSUMS` table (writable or read-only).
+pub struct PartChecksumsTable<'txn, T>(T, PhantomData<&'txn ()>);
+
+table_impl!(
+    PartChecksumsTable,
+    PART_CHECKSUMS,
+    PartKey,
+    PartChecksumValue
+);
+
+impl<'txn, T> PartChecksumsTable<'txn, T>
+where
+    T: ReadableTable<PartKey, PartChecksumValue>,
+{
+    /// The stored row: `(algorithm wire name, base64 value)` (owned —
+    /// the guard cannot outlive the closure).
+    pub fn get(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<Option<(String, String)>, Error> {
+        Ok(self
+            .0
+            .get((bucket, upload_id, part_number))?
+            .map(|v| (v.value().0.to_string(), v.value().1.to_string())))
+    }
+}
+
+impl<'txn> PartChecksumsTable<'txn, Table<'txn, PartKey, PartChecksumValue>> {
+    /// Insert or replace the part's checksum.
+    pub fn put(
+        &mut self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u32,
+        algorithm: &str,
+        value: &str,
+    ) -> Result<(), Error> {
+        self.0
+            .insert((bucket, upload_id, part_number), (algorithm, value))?;
+        Ok(())
+    }
+
+    /// Remove the part's checksum row (idempotent — re-upload clears the
+    /// stale value).
+    pub fn remove(&mut self, bucket: &str, upload_id: &str, part_number: u32) -> Result<(), Error> {
+        self.0.remove((bucket, upload_id, part_number))?;
+        Ok(())
+    }
+
+    /// Delete every row of one upload (mirror `PartsTable::drain_upload`).
+    pub fn drain_upload(&mut self, bucket: &bucket::Name, upload_id: &str) -> Result<(), Error> {
+        let bucket = &**bucket;
+        drain_triple(&mut self.0, (bucket, upload_id, 0), |b, id, _| {
+            b == bucket && id == upload_id
+        })
+    }
+
+    /// Delete every row of `bucket` (bucket teardown).
+    pub fn drain_bucket(&mut self, bucket: &bucket::Name) -> Result<(), Error> {
+        let bucket = &**bucket;
+        drain_triple(&mut self.0, (bucket, "", 0), |b, _, _| b == bucket)
     }
 }
 

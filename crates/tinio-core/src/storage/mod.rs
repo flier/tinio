@@ -35,9 +35,10 @@ use std::error::Error as StdError;
 pub use body::{BodyStream, collect_body};
 pub use bucket::{BucketOps, BucketsListing, ListBucketsParams};
 pub use error::{
-    Error, access_denied, already_exists, entity_too_large, invalid_bucket_name, invalid_etag,
-    invalid_key, invalid_part, invalid_part_key, invalid_part_number, invalid_range, io, no_parts,
-    no_such_bucket, no_such_key, no_such_upload, not_empty, part_too_small, too_many_uploads,
+    Error, access_denied, already_exists, entity_too_large, invalid_bucket_name, invalid_checksum,
+    invalid_etag, invalid_key, invalid_part, invalid_part_key, invalid_part_number, invalid_range,
+    io, no_parts, no_such_bucket, no_such_key, no_such_upload, not_empty, part_too_small,
+    too_many_uploads,
 };
 pub use listing::{
     RollupMirror, UnorderedPager, common_prefix, group_and_paginate, group_and_paginate_ordered,

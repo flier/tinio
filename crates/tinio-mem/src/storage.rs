@@ -2,8 +2,8 @@
 //! [`MemoryStorage`] core.
 //!
 //! All state lives in a redb database over the [`redb::InMemoryBackend`],
-//! organized into six tables (buckets, objects, object_meta, uploads,
-//! parts, part_meta). Every check-and-write sequence (e.g. `put_object` checking the
+//! organized into eight tables (buckets, objects, object_meta, uploads,
+//! parts, part_meta, upload_checksums, part_checksums). Every check-and-write sequence (e.g. `put_object` checking the
 //! bucket before inserting) runs inside one redb **write transaction**:
 //! transactions are atomic and serialized (redb is a single-writer
 //! database), so `delete_bucket`'s empty-check + removal and a concurrent
@@ -60,6 +60,16 @@ pub(crate) const PARTS: TableDefinition<&str, &[u8]> = TableDefinition::new("par
 /// `upload_id\0part_number` → `(etag wire form, size, last-modified unix nanos)`.
 pub(crate) const PART_META: TableDefinition<&str, (&str, u64, u64)> =
     TableDefinition::new("part_meta");
+/// `bucket\0key\0upload_id` → `(algorithm wire name, checksum-type wire
+/// name or "")` — the upload's create-time checksum spec (spec
+/// 2026-08-31). Same key shape as `UPLOADS`.
+pub(crate) const UPLOAD_CHECKSUMS: TableDefinition<&str, (&str, &str)> =
+    TableDefinition::new("upload_checksums");
+/// `upload_id\0part_number` → `(algorithm wire name, base64 value)` —
+/// one part's computed checksum (spec 2026-08-31). Same key shape as
+/// `PARTS`/`PART_META`.
+pub(crate) const PART_CHECKSUMS: TableDefinition<&str, (&str, &str)> =
+    TableDefinition::new("part_checksums");
 
 /// A minimal in-memory backend over redb's in-memory backend.
 ///
@@ -143,6 +153,8 @@ impl MemoryStorage {
             txn.open_table(UPLOADS)?;
             txn.open_table(PARTS)?;
             txn.open_table(PART_META)?;
+            txn.open_table(UPLOAD_CHECKSUMS)?;
+            txn.open_table(PART_CHECKSUMS)?;
             txn.commit()?;
         }
         Ok(Self {
@@ -300,15 +312,18 @@ where
     Ok(())
 }
 
-/// Remove all `PARTS` and `PART_META` keys under `prefix` (complete/abort).
+/// Remove all `PARTS`, `PART_META`, and `PART_CHECKSUMS` keys under
+/// `prefix` (complete/abort).
 pub(crate) fn remove_all_parts(
     parts: &mut Table<'_, &str, &[u8]>,
     meta: &mut Table<'_, &str, (&str, u64, u64)>,
+    checksums: &mut Table<'_, &str, (&str, &str)>,
     prefix: &str,
 ) -> Result<(), Error> {
     for key in collect_part_keys(parts, prefix)? {
         parts.remove(key.as_str())?;
         meta.remove(key.as_str())?;
+        checksums.remove(key.as_str())?;
     }
     Ok(())
 }
@@ -359,7 +374,7 @@ mod tests {
         storage.create_bucket(&bucket).await.unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let p1 = storage
@@ -369,6 +384,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"abc".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -379,6 +395,7 @@ mod tests {
                 &upload.upload_id,
                 2.into(),
                 body(b"def".to_vec()),
+                None,
             )
             .await
             .unwrap();

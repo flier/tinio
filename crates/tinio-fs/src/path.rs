@@ -746,8 +746,14 @@ mod tests {
         #[cfg(unix)]
         {
             let before = DirId::of(dir.path()).unwrap();
+            // Replacement = a live directory renamed over the path: its
+            // inode is still allocated, so the identity is guaranteed to
+            // change. rm + mkdir under the same name can reuse the freed
+            // inode on ext4 — the identity then matches and the cache
+            // (correctly) treats the path as unchanged.
+            let repl = tempfile::tempdir().unwrap();
             fs::remove_dir(dir.path()).unwrap();
-            fs::create_dir(dir.path()).unwrap();
+            fs::rename(repl.path(), dir.path()).unwrap();
             assert_ne!(before, DirId::of(dir.path()).unwrap());
             assert!(cache.boundary(dir.path()).await.is_ok());
         }

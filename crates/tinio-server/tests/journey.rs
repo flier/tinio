@@ -114,3 +114,53 @@ fn journey() {
         .assert()
         .success();
 }
+
+#[test]
+#[ignore = "requires aws cli v2 on PATH"]
+fn journey_checksum_multipart() {
+    // The multipart checksum feature end-to-end with a real client (spec
+    // 2026-08-31): `[s3] checksum = true` + aws-cli's default
+    // CRC64NVME — create-algorithm upload, per-part trailer/header
+    // values, FULL_OBJECT linearization at complete, all validated
+    // server-side.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = dir.path().join("config.toml");
+    fs::write(&config, "version = 1\n\n[s3]\nchecksum = true\n").unwrap();
+    let server = Server::start_with_config(&root, &config);
+    let ep = server.endpoint();
+    let scratch = tempfile::tempdir().unwrap();
+
+    e2e::aws_s3(ep, "mb", &["s3://checksum-bucket"])
+        .assert()
+        .success();
+    // > 8 MiB forces multipart; CRC64NVME is aws-cli's default checksum.
+    let big = scratch.path().join("big.bin");
+    let content: Vec<u8> = (0..(10 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    fs::write(&big, &content).unwrap();
+    e2e::aws_s3(
+        ep,
+        "cp",
+        &[
+            big.to_str().unwrap(),
+            "s3://checksum-bucket/big.bin",
+            "--checksum-algorithm",
+            "CRC64NVME",
+        ],
+    )
+    .assert()
+    .success();
+    let down = scratch.path().join("down.bin");
+    e2e::aws_s3(
+        ep,
+        "cp",
+        &["s3://checksum-bucket/big.bin", down.to_str().unwrap()],
+    )
+    .assert()
+    .success();
+    e2e::files_equal(&big, &down);
+    e2e::aws_s3(ep, "rb", &["s3://checksum-bucket", "--force"])
+        .assert()
+        .success();
+}

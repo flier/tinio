@@ -410,7 +410,7 @@ impl ObjectOps for FsStorage {
                 etag: ETag::EMPTY,
             });
         }
-        let (temp, etag) = self.writer.stage(body).await?;
+        let (temp, etag) = self.writer.stage(body, None).await?;
         Ok(StagedBody {
             temp: Some(temp),
             etag,
@@ -727,13 +727,27 @@ mod tests {
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let dst = object::key("copy.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k).await.unwrap();
+        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
         let p1 = storage
-            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"part-one-"))
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                1.into(),
+                body(b"part-one-"),
+                None,
+            )
             .await
             .unwrap();
         let p2 = storage
-            .upload_part(&b, &k, &upload.upload_id, 2.into(), body(b"part-two-"))
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                2.into(),
+                body(b"part-two-"),
+                None,
+            )
             .await
             .unwrap();
         let completed = [

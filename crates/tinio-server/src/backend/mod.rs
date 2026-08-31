@@ -19,6 +19,7 @@ mod locks;
 mod s3;
 
 pub(crate) mod buckets;
+pub(crate) mod checksum;
 pub(crate) mod listing;
 pub(crate) mod multipart;
 pub(crate) mod objects;

@@ -1,6 +1,6 @@
 //! The IO-pipeline ETag computation task (pipeline-spec.md §3.1, task 2).
 //!
-//! [`ComputeTask`] computes the ETag of one object file over
+//! `ComputeTask` computes the ETag of one object file over
 //! `tokio::fs` (Q4 — async: 64 KiB bounded streaming reads, incremental
 //! MD5; the file IO runs on the tokio blocking pool, and one task still
 //! occupies one worker thread, so the hash concurrency and open
@@ -105,7 +105,7 @@ impl Outcome {
 }
 
 /// The per-file compute result: [`Outcome`] or the failure. This is the
-/// IO pipeline's [`Task::Output`] (`pipeline-spec.md` P4/P7);
+/// IO pipeline's [`pipeline::Task::Output`] (`pipeline-spec.md` P4/P7);
 /// `pipeline::Outcome` comes from the blanket `result::Result` impl
 /// (pipeline.rs) — `Error` is a `StdError`, so the IO-pipeline runtime
 /// logs compute failures through it (R8) with the original error kept

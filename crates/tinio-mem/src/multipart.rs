@@ -4,7 +4,7 @@
 //! completion, and abort each run in one write transaction; part keys are
 //! zero-padded so string order equals part-number order.
 
-use std::{ops::Bound, time::SystemTime};
+use std::{ops::Bound, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable};
@@ -13,19 +13,19 @@ use uuid::Uuid;
 use crate::{
     _core::{
         CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
-        PartInfo, PartNumber, PartsListing, UploadsListing, bucket, collect_body, from_nanos,
-        group_and_paginate_ordered, key_marker_order, now_nanos, object, split_uploads_order,
-        uploads_order,
+        PartInfo, PartNumber, PartsListing, UploadsListing, bucket, checksum, collect_body,
+        from_nanos, group_and_paginate_ordered, key_marker_order, now_nanos, object,
+        split_uploads_order, uploads_order,
     },
     Error,
     error::{
         access_denied, database_storage, invalid_etag, invalid_key, invalid_part, no_parts,
-        no_such_bucket,
+        no_such_bucket, no_such_upload,
     },
     storage::{
-        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, band_start,
-        check_bucket, check_upload, collect_part_keys, object_key, parse_part_number, part_key,
-        remove_all_parts, upload_key,
+        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_CHECKSUMS, PART_META, PARTS,
+        UPLOAD_CHECKSUMS, UPLOADS, band_start, check_bucket, check_upload, collect_part_keys,
+        object_key, parse_part_number, part_key, remove_all_parts, upload_key,
     },
 };
 
@@ -36,6 +36,7 @@ struct UploadRow {
     key: object::Key,
     upload_id: String,
     initiated_at: u64,
+    checksum: Option<checksum::Upload>,
 }
 
 #[async_trait]
@@ -44,6 +45,7 @@ impl MultipartOps for MemoryStorage {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
+        checksum: Option<checksum::Upload>,
     ) -> Result<MultipartUpload, Error> {
         // Bucket existence first, like the fs backend and every S3 op: a
         // reserved/marker key on a missing bucket answers NoSuchBucket,
@@ -65,6 +67,7 @@ impl MultipartOps for MemoryStorage {
             bucket: bucket.clone(),
             key: key.clone(),
             initiated_at: SystemTime::now(),
+            checksum: checksum.clone(),
         };
         let txn = self.db.begin_write()?;
         {
@@ -82,9 +85,61 @@ impl MultipartOps for MemoryStorage {
                 .as_str(),
                 now_nanos(),
             )?;
+            // The create-time checksum spec, persisted alongside the
+            // UPLOADS row (spec 2026-08-31).
+            if let Some(c) = checksum {
+                let mut cs = txn.open_table(UPLOAD_CHECKSUMS)?;
+                let (algo, ty) = c.to_wire();
+                cs.insert(
+                    upload_key(
+                        upload.bucket.as_ref().as_str(),
+                        upload.key.as_ref().as_str(),
+                        &upload.upload_id,
+                    )
+                    .as_str(),
+                    (algo.as_str(), ty.as_str()),
+                )?;
+            }
         }
         txn.commit()?;
         Ok(upload)
+    }
+
+    async fn get_multipart_upload(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<MultipartUpload, Error> {
+        if !self.has_bucket(bucket)? {
+            return Err(no_such_bucket(bucket));
+        }
+        if key.is_reserved() {
+            return Err(access_denied(key));
+        }
+        let ukey = upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id);
+        let txn = self.db.begin_read()?;
+        // One `UPLOADS` row fetch serves both the existence check and
+        // `initiated_at` (the compound key already encodes the identity).
+        let uploads = txn.open_table(UPLOADS)?;
+        let initiated = uploads
+            .get(ukey.as_str())?
+            .ok_or_else(|| no_such_upload(upload_id))?
+            .value();
+        let checksums = txn.open_table(UPLOAD_CHECKSUMS)?;
+        let checksum_row = checksums.get(ukey.as_str())?.map(|v| {
+            let (a, t) = v.value();
+            (a.to_string(), t.to_string())
+        });
+        Ok(MultipartUpload {
+            upload_id: upload_id.to_string(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: from_nanos(initiated),
+            checksum: checksum_row
+                .map(|(a, t)| checksum::Upload::from_wire(&a, &t))
+                .transpose()?,
+        })
     }
 
     async fn upload_part(
@@ -94,6 +149,7 @@ impl MultipartOps for MemoryStorage {
         upload_id: &str,
         part_number: PartNumber,
         body: crate::_core::BodyStream,
+        checksum: Option<Arc<checksum::PartChecksum>>,
     ) -> Result<PartInfo, Error> {
         // Fast-fail on a missing bucket before buffering the body (the write
         // transaction re-checks, closing the race).
@@ -104,7 +160,22 @@ impl MultipartOps for MemoryStorage {
         // Enforce the per-part size limit before opening the write
         // transaction (fast fail).
         self.check_object_size(data.len() as u64)?;
-        let etag = ETag::from_content(&data);
+        // The tee's MD5 (etag_md5): a part's ETag IS its content MD5 —
+        // the slot value replaces the second hash over the buffer.
+        let etag = match checksum
+            .as_ref()
+            .filter(|c| c.etag_md5)
+            .and_then(|c| c.digest.get())
+        {
+            Some(part) => {
+                let digest = part
+                    .value
+                    .md5_raw()
+                    .expect("the tee's md5 is valid and 16 bytes");
+                ETag::Single(digest)
+            }
+            None => ETag::from_content(&data),
+        };
         let now = now_nanos();
         let txn = self.db.begin_write()?;
         let delta = {
@@ -122,6 +193,22 @@ impl MultipartOps for MemoryStorage {
             self.adjust_total(delta)?;
             parts.insert(pk.as_str(), data.as_slice())?;
             meta.insert(pk.as_str(), (etag_str.as_str(), data.len() as u64, now))?;
+            // The checksum row commits atomically with the part row:
+            // write the tee's digest, or clear a stale row from a
+            // previous upload of this part number (it would corrupt the
+            // Complete composition).
+            let mut checksums = txn.open_table(PART_CHECKSUMS)?;
+            match checksum.as_ref().and_then(|c| c.digest.get()) {
+                Some(part) => {
+                    checksums.insert(
+                        pk.as_str(),
+                        (part.algorithm.wire_name(), part.value.as_str()),
+                    )?;
+                }
+                None => {
+                    checksums.remove(pk.as_str())?;
+                }
+            }
             delta
         };
         if let Err(err) = txn.commit() {
@@ -133,6 +220,8 @@ impl MultipartOps for MemoryStorage {
             size: data.len() as u64,
             etag,
             last_modified: from_nanos(now),
+            // The digest committed atomically with the part row.
+            checksum: checksum.as_ref().and_then(|c| c.digest.get()).cloned(),
         })
     }
 
@@ -158,6 +247,9 @@ impl MultipartOps for MemoryStorage {
             });
         }
         let meta = txn.open_table(PART_META)?;
+        // The stored part checksums use the identical `upload_id\0part`
+        // key — join them per row (spec 2026-08-31).
+        let checksums = txn.open_table(PART_CHECKSUMS)?;
         let prefix = format!("{}\0", params.upload_id);
         // The zero-padded part keys are string-ordered by number, so the
         // scan starts just after the marker and stops one probe part past
@@ -182,11 +274,20 @@ impl MultipartOps for MemoryStorage {
                 let (k, v) = entry?;
                 let part_number = parse_part_number(&k.value()[prefix.len()..])?;
                 let (etag, size, mtime) = v.value();
+                let checksum_row = checksums.get(k.value())?.map(|v| {
+                    let (a, value) = v.value();
+                    (a.to_string(), value.to_string())
+                });
+                let checksum = match checksum_row {
+                    None => None,
+                    Some((a, value)) => Some(checksum::Part::from_wire(&a, value)?),
+                };
                 Ok(PartInfo {
                     part_number: part_number.into(),
                     size,
                     etag: etag.parse().map_err(invalid_etag)?,
                     last_modified: from_nanos(mtime),
+                    checksum,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -256,6 +357,7 @@ impl MultipartOps for MemoryStorage {
                         size,
                         etag: stored_etag,
                         last_modified: from_nanos(mtime),
+                        checksum: None,
                     });
                     data.extend_from_slice(body.value());
                 }
@@ -272,15 +374,21 @@ impl MultipartOps for MemoryStorage {
             }
             {
                 let mut uploads = txn.open_table(UPLOADS)?;
-                uploads.remove(
-                    upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id).as_str(),
-                )?;
+                let ukey = upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id);
+                uploads.remove(ukey.as_str())?;
+                txn.open_table(UPLOAD_CHECKSUMS)?.remove(ukey.as_str())?;
             }
             {
                 let mut stored_parts = txn.open_table(PARTS)?;
                 let mut stored_meta = txn.open_table(PART_META)?;
+                let mut stored_checksums = txn.open_table(PART_CHECKSUMS)?;
                 let prefix = format!("{upload_id}\0");
-                remove_all_parts(&mut stored_parts, &mut stored_meta, &prefix)?;
+                remove_all_parts(
+                    &mut stored_parts,
+                    &mut stored_meta,
+                    &mut stored_checksums,
+                    &prefix,
+                )?;
             }
             (data, etag, now)
         };
@@ -316,13 +424,14 @@ impl MultipartOps for MemoryStorage {
             }
             {
                 let mut uploads = txn.open_table(UPLOADS)?;
-                uploads.remove(
-                    upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id).as_str(),
-                )?;
+                let ukey = upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id);
+                uploads.remove(ukey.as_str())?;
+                txn.open_table(UPLOAD_CHECKSUMS)?.remove(ukey.as_str())?;
             }
             {
                 let mut stored_parts = txn.open_table(PARTS)?;
                 let mut stored_meta = txn.open_table(PART_META)?;
+                let mut stored_checksums = txn.open_table(PART_CHECKSUMS)?;
                 let prefix = format!("{upload_id}\0");
                 let keys = collect_part_keys(&stored_parts, &prefix)?;
                 let mut removed = 0u64;
@@ -331,7 +440,12 @@ impl MultipartOps for MemoryStorage {
                         removed += v.value().len() as u64;
                     }
                 }
-                remove_all_parts(&mut stored_parts, &mut stored_meta, &prefix)?;
+                remove_all_parts(
+                    &mut stored_parts,
+                    &mut stored_meta,
+                    &mut stored_checksums,
+                    &prefix,
+                )?;
                 removed
             }
         };
@@ -355,6 +469,9 @@ impl MultipartOps for MemoryStorage {
             }
         }
         let uploads = txn.open_table(UPLOADS)?;
+        // The create-time checksum specs use the identical compound key —
+        // join them per row (spec 2026-08-31).
+        let checksums = txn.open_table(UPLOAD_CHECKSUMS)?;
         let bucket_prefix = format!("{}\0", params.bucket.as_ref().as_str());
         // The resume marker (composite `key\0upload_id`; a bare key
         // marker sorts after every upload of that key) is computed BEFORE
@@ -409,10 +526,35 @@ impl MultipartOps for MemoryStorage {
                     let Ok(key) = object::key(key) else {
                         return None; // tampered row — skipped like list_objects
                     };
+                    let checksum_row = match checksums.get(k.value()) {
+                        Ok(row) => row.map(|v| {
+                            let (a, t) = v.value();
+                            (a.to_string(), t.to_string())
+                        }),
+                        Err(e) => {
+                            if scan_error.is_none() {
+                                scan_error = Some(database_storage(e));
+                            }
+                            return None;
+                        }
+                    };
+                    let checksum = match checksum_row {
+                        None => None,
+                        Some((a, t)) => match checksum::Upload::from_wire(&a, &t) {
+                            Ok(upload) => Some(upload),
+                            Err(e) => {
+                                if scan_error.is_none() {
+                                    scan_error = Some(e.into());
+                                }
+                                return None;
+                            }
+                        },
+                    };
                     Some(UploadRow {
                         key,
                         upload_id: upload_id.to_string(),
                         initiated_at: v.value(),
+                        checksum,
                     })
                 }
                 Err(e) => {
@@ -447,6 +589,7 @@ impl MultipartOps for MemoryStorage {
                 bucket: params.bucket.clone(),
                 key: u.key,
                 initiated_at: from_nanos(u.initiated_at),
+                checksum: u.checksum,
             })
             .collect();
         let (next_key, next_upload_id) = match next {
@@ -502,7 +645,10 @@ mod tests {
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         let key = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&name, &key).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&name, &key, None)
+            .await
+            .unwrap();
 
         let err = storage
             .upload_part(
@@ -511,6 +657,7 @@ mod tests {
                 &upload.upload_id,
                 part_number(1).unwrap(),
                 body(b"12345"),
+                None,
             )
             .await
             .unwrap_err();
@@ -525,6 +672,7 @@ mod tests {
                 &upload.upload_id,
                 part_number(1).unwrap(),
                 body(b"1234"),
+                None,
             )
             .await
             .unwrap();
@@ -540,7 +688,10 @@ mod tests {
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         let key = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&name, &key).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&name, &key, None)
+            .await
+            .unwrap();
 
         storage
             .upload_part(
@@ -549,6 +700,7 @@ mod tests {
                 &upload.upload_id,
                 part_number(1).unwrap(),
                 body(b"12345"),
+                None,
             )
             .await
             .unwrap();
@@ -559,6 +711,7 @@ mod tests {
                 &upload.upload_id,
                 part_number(2).unwrap(),
                 body(b"1234"),
+                None,
             )
             .await
             .unwrap_err();
@@ -573,6 +726,7 @@ mod tests {
                 &upload.upload_id,
                 part_number(2).unwrap(),
                 body(b"123"),
+                None,
             )
             .await
             .unwrap();
@@ -585,7 +739,10 @@ mod tests {
         assert_eq!(storage.total_bytes(), 0);
 
         // The freed capacity is reusable by a new upload.
-        let u2 = storage.create_multipart_upload(&name, &key).await.unwrap();
+        let u2 = storage
+            .create_multipart_upload(&name, &key, None)
+            .await
+            .unwrap();
         storage
             .upload_part(
                 &name,
@@ -593,6 +750,7 @@ mod tests {
                 &u2.upload_id,
                 part_number(1).unwrap(),
                 body(b"12345678"),
+                None,
             )
             .await
             .unwrap();
@@ -603,11 +761,11 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let a = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let b = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         assert_ne!(a.upload_id, b.upload_id);
@@ -631,7 +789,7 @@ mod tests {
         let key = object::key("a.bin").unwrap();
         let other_key = object::key("b.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -641,7 +799,8 @@ mod tests {
                     &key,
                     &upload.upload_id,
                     1.into(),
-                    body(b"x".to_vec())
+                    body(b"x".to_vec()),
+                    None
                 )
                 .await
                 .unwrap_err(),
@@ -654,7 +813,8 @@ mod tests {
                     &other_key,
                     &upload.upload_id,
                     1.into(),
-                    body(b"x".to_vec())
+                    body(b"x".to_vec()),
+                    None
                 )
                 .await
                 .unwrap_err(),
@@ -662,7 +822,14 @@ mod tests {
         ));
         assert!(matches!(
             storage
-                .upload_part(&bucket, &key, "no-such", 1.into(), body(b"x".to_vec()))
+                .upload_part(
+                    &bucket,
+                    &key,
+                    "no-such",
+                    1.into(),
+                    body(b"x".to_vec()),
+                    None
+                )
                 .await
                 .unwrap_err(),
             Error::Storage(NoSuchUpload(_))
@@ -674,7 +841,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         storage
@@ -684,6 +851,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"old".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -694,6 +862,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"newer".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -713,7 +882,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -730,7 +899,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let phantom = CompletedPart {
@@ -754,7 +923,7 @@ mod tests {
         let key = object::key("a.bin").unwrap();
         let other_key = object::key("b.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let part = storage
@@ -764,6 +933,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"x".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -788,7 +958,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let part = storage
@@ -798,6 +968,7 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 body(b"x".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -832,7 +1003,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         for n in 1..=3 {
@@ -843,6 +1014,7 @@ mod tests {
                     &upload.upload_id,
                     n.into(),
                     body(format!("p{n}").into_bytes()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -893,7 +1065,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         for key in ["a.bin", "b.bin", "c.bin"] {
             storage
-                .create_multipart_upload(&bucket, &object::key(key).unwrap())
+                .create_multipart_upload(&bucket, &object::key(key).unwrap(), None)
                 .await
                 .unwrap();
         }
@@ -948,11 +1120,11 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("same.bin").unwrap();
         let u1 = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let page = storage
@@ -975,7 +1147,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key)
+            .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
         let mut uploaded = Vec::new();
@@ -988,6 +1160,7 @@ mod tests {
                         &upload.upload_id,
                         n.into(),
                         body(data.to_vec()),
+                        None,
                     )
                     .await
                     .unwrap(),

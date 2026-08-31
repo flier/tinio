@@ -14,7 +14,10 @@ use redb::Database;
 use super::{
     compact::{Stats, snapshot},
     error::Error,
-    tables::{BucketsTable, ObjectMetaTable, PartsTable, StateTable, UploadsTable},
+    tables::{
+        BucketsTable, ObjectMetaTable, PartChecksumsTable, PartsTable, StateTable,
+        UploadChecksumsTable, UploadsTable,
+    },
 };
 
 const META_DB_FILE: &str = "meta.redb";
@@ -46,7 +49,7 @@ pub struct Open {
 
 /// Open (or create) the state database at `<state_dir>/meta.redb`.
 ///
-/// The state dir is created if missing. The five tables are created in one
+/// The state dir is created if missing. The tables are created in one
 /// write transaction, and the `STATE` version is checked: a missing version
 /// is written (fresh database), a mismatch fails with
 /// [`Error::UnsupportedVersion`]. The `compact_needed` and `stats` fields
@@ -82,6 +85,8 @@ pub fn open(state_dir: &Path) -> Result<Open, Error> {
         BucketsTable::ensure(&mut txn)?;
         UploadsTable::ensure(&mut txn)?;
         PartsTable::ensure(&mut txn)?;
+        UploadChecksumsTable::ensure(&mut txn)?;
+        PartChecksumsTable::ensure(&mut txn)?;
         let stats = snapshot(&txn.stats()?);
         txn.commit()?;
         (compact_needed, stats)

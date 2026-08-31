@@ -45,7 +45,9 @@ use tokio::time::{Instant, sleep};
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
-    ListPartsParams, ListUploadsParams, Storage, bucket, multipart, object, storage,
+    ListPartsParams, ListUploadsParams, Storage, bucket,
+    checksum::{self, Algorithm, Type},
+    multipart, object, storage,
     storage::Error::*,
 };
 
@@ -146,7 +148,10 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // UploadPartCopy: the part holds the source's bytes (optionally a
     // byte range); the part ETag is the content MD5 of the part bytes.
-    let upload = storage.create_multipart_upload(b, &src).await.unwrap();
+    let upload = storage
+        .create_multipart_upload(b, &src, None)
+        .await
+        .unwrap();
     let part = storage
         .copy_part(
             b,
@@ -686,7 +691,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     let reserved = object::key("a/.tinio/b").unwrap();
     let err = into_core_error(
         storage
-            .create_multipart_upload(b, &reserved)
+            .create_multipart_upload(b, &reserved, None)
             .await
             .unwrap_err(),
     );
@@ -697,7 +702,10 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // Full lifecycle: create → upload 3 parts → list → complete.
     let big = object::key("big.bin").unwrap();
-    let upload = storage.create_multipart_upload(b, &big).await.unwrap();
+    let upload = storage
+        .create_multipart_upload(b, &big, None)
+        .await
+        .unwrap();
     check(!upload.upload_id.is_empty(), "upload id must be non-empty");
 
     let parts_data: [&[u8]; 3] = [b"part-one-", b"part-two-", b"part-three"];
@@ -710,6 +718,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                 &upload.upload_id,
                 ((i + 1) as u32).into(),
                 body(data.to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -790,7 +799,10 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // Complete with no parts is an error.
     let empty_mp = object::key("empty-mp.bin").unwrap();
-    let u = storage.create_multipart_upload(b, &empty_mp).await.unwrap();
+    let u = storage
+        .create_multipart_upload(b, &empty_mp, None)
+        .await
+        .unwrap();
     let err = into_core_error(
         storage
             .complete_multipart_upload(b, &empty_mp, &u.upload_id, &[])
@@ -808,7 +820,10 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // A bucket with in-progress uploads is not empty.
     let busy = object::key("busy.bin").unwrap();
-    let busy_upload = storage.create_multipart_upload(b, &busy).await.unwrap();
+    let busy_upload = storage
+        .create_multipart_upload(b, &busy, None)
+        .await
+        .unwrap();
     let err = into_core_error(storage.delete_bucket(b).await.unwrap_err());
     check(
         matches!(err, NotEmpty(_)),
@@ -822,11 +837,18 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Abort removes parts and leaves no object.
     let abort_bin = object::key("abort.bin").unwrap();
     let upload2 = storage
-        .create_multipart_upload(b, &abort_bin)
+        .create_multipart_upload(b, &abort_bin, None)
         .await
         .unwrap();
     storage
-        .upload_part(b, &abort_bin, &upload2.upload_id, 1.into(), body(b"x"))
+        .upload_part(
+            b,
+            &abort_bin,
+            &upload2.upload_id,
+            1.into(),
+            body(b"x"),
+            None,
+        )
         .await
         .unwrap();
     storage
@@ -841,7 +863,10 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // List uploads.
     let pending = object::key("pending.bin").unwrap();
-    let upload3 = storage.create_multipart_upload(b, &pending).await.unwrap();
+    let upload3 = storage
+        .create_multipart_upload(b, &pending, None)
+        .await
+        .unwrap();
     let listing = storage
         .list_multipart_uploads(ListUploadsParams {
             bucket: b.clone(),
@@ -864,6 +889,153 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         .abort_multipart_upload(b, &pending, &upload3.upload_id)
         .await
         .unwrap();
+
+    // Checksum persistence through the contract (spec 2026-08-31): the
+    // backends store and return what the server hands over.
+    let cs_big = object::key("checksum.bin").unwrap();
+    let cs_spec = checksum::Upload {
+        algorithm: Algorithm::Crc32,
+        r#type: Some(Type::FullObject),
+    };
+    let cs_upload = storage
+        .create_multipart_upload(b, &cs_big, Some(cs_spec.clone()))
+        .await
+        .unwrap();
+    check(
+        cs_upload.checksum == Some(cs_spec.clone()),
+        "create must echo the persisted checksum spec",
+    );
+    let fetched = storage
+        .get_multipart_upload(b, &cs_big, &cs_upload.upload_id)
+        .await
+        .unwrap();
+    check(
+        fetched.checksum.as_ref().map(|c| c.algorithm) == Some(Algorithm::Crc32),
+        "get_multipart_upload must return the persisted algorithm",
+    );
+    // The tee slot (what the server hands the backend): the digest
+    // commits atomically with the part row.
+    let value = checksum::Value("y/Q5Jg==".into());
+    let slot = Arc::new(checksum::PartChecksum::default());
+    let _ = slot.digest.set(checksum::Part {
+        algorithm: Algorithm::Crc32,
+        value: value.clone(),
+    });
+    let cs_part = storage
+        .upload_part(
+            b,
+            &cs_big,
+            &cs_upload.upload_id,
+            1.into(),
+            body(b"abc"),
+            Some(slot),
+        )
+        .await
+        .unwrap();
+    check(
+        cs_part.checksum
+            == Some(checksum::Part {
+                algorithm: Algorithm::Crc32,
+                value: value.clone(),
+            }),
+        "upload_part must return the checksum committed with the part",
+    );
+    let listing = storage
+        .list_parts(ListPartsParams {
+            bucket: b.clone(),
+            key: cs_big.clone(),
+            upload_id: cs_upload.upload_id.clone(),
+            max_parts: 1000,
+            part_number_marker: None,
+        })
+        .await
+        .unwrap();
+    check(
+        listing.parts[0].checksum
+            == Some(checksum::Part {
+                algorithm: Algorithm::Crc32,
+                value: value.clone(),
+            }),
+        "list_parts must echo the stored part checksum",
+    );
+    // A re-upload without a tee slot clears the stale checksum row
+    // (the atomic commit writes-or-clears in the part's transaction).
+    storage
+        .upload_part(
+            b,
+            &cs_big,
+            &cs_upload.upload_id,
+            1.into(),
+            body(b"xyz"),
+            None,
+        )
+        .await
+        .unwrap();
+    let listing = storage
+        .list_parts(ListPartsParams {
+            bucket: b.clone(),
+            key: cs_big.clone(),
+            upload_id: cs_upload.upload_id.clone(),
+            max_parts: 1000,
+            part_number_marker: None,
+        })
+        .await
+        .unwrap();
+    check(
+        listing.parts[0].checksum.is_none(),
+        "a re-uploaded part must not keep a stale checksum",
+    );
+    // A re-upload with a NEW slot overwrites the row — the two rows
+    // commit in one transaction, so no CAS can ever go stale.
+    let new_slot = Arc::new(checksum::PartChecksum::default());
+    let _ = new_slot.digest.set(checksum::Part {
+        algorithm: Algorithm::Crc32,
+        value: checksum::Value("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+    });
+    storage
+        .upload_part(
+            b,
+            &cs_big,
+            &cs_upload.upload_id,
+            1.into(),
+            body(b"abc"),
+            Some(new_slot),
+        )
+        .await
+        .unwrap();
+    let listing = storage
+        .list_parts(ListPartsParams {
+            bucket: b.clone(),
+            key: cs_big.clone(),
+            upload_id: cs_upload.upload_id.clone(),
+            max_parts: 1000,
+            part_number_marker: None,
+        })
+        .await
+        .unwrap();
+    check(
+        listing.parts[0].checksum
+            == Some(checksum::Part {
+                algorithm: Algorithm::Crc32,
+                value: checksum::Value("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+            }),
+        "a re-uploaded part's checksum row follows the new content",
+    );
+    // Abort drains the new tables (get_multipart_upload → NoSuchUpload).
+    storage
+        .abort_multipart_upload(b, &cs_big, &cs_upload.upload_id)
+        .await
+        .unwrap();
+    let err = into_core_error(
+        storage
+            .get_multipart_upload(b, &cs_big, &cs_upload.upload_id)
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(err, NoSuchUpload(_)),
+        "abort must drain the checksum rows",
+    );
 
     storage.delete_object(b, &big).await.unwrap();
     storage.delete_bucket(b).await.unwrap();

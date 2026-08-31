@@ -9,6 +9,8 @@
 
 // The Windows stream fallback of `copy_part` calls the ObjectOps trait
 // method (the unix fast path never does).
+use std::sync::Arc;
+
 use tokio::fs;
 
 use super::{Error, FsStorage};
@@ -16,7 +18,7 @@ use super::{Error, FsStorage};
 use crate::_core::storage::ObjectOps;
 use crate::{
     _core::{
-        BodyStream, bucket,
+        BodyStream, bucket, checksum,
         multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
         object::{self, Info},
         storage::{
@@ -78,6 +80,7 @@ impl MultipartOps for FsStorage {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
+        checksum: Option<checksum::Upload>,
     ) -> Result<MultipartUpload, Error> {
         self.ensure_bucket(bucket).await?;
         // The multipart path must not be a backdoor for `.tinio` (FR-020).
@@ -89,7 +92,22 @@ impl MultipartOps for FsStorage {
         if key.is_folder_marker() {
             return Err(invalid_key(key.to_string()).into());
         }
-        self.multipart_store.create(bucket, key).await
+        self.multipart_store.create(bucket, key, checksum).await
+    }
+
+    async fn get_multipart_upload(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<MultipartUpload, Error> {
+        self.ensure_bucket(bucket).await?;
+        if key.is_reserved() {
+            return Err(access_denied(key).into());
+        }
+        self.multipart_store
+            .get_upload(bucket, key, upload_id)
+            .await
     }
 
     async fn upload_part(
@@ -99,13 +117,14 @@ impl MultipartOps for FsStorage {
         upload_id: &str,
         part_number: PartNumber,
         body: BodyStream,
+        checksum: Option<Arc<checksum::PartChecksum>>,
     ) -> Result<PartInfo, Error> {
         self.ensure_bucket(bucket).await?;
         if key.is_reserved() {
             return Err(access_denied(key).into());
         }
         self.multipart_store
-            .put_part(bucket, key, upload_id, part_number, body)
+            .put_part(bucket, key, upload_id, part_number, body, checksum)
             .await
     }
 
@@ -135,9 +154,10 @@ impl MultipartOps for FsStorage {
         #[cfg(not(unix))]
         {
             // No kernel copy primitive on Windows — the contract's
-            // stream default (get range → upload part).
+            // stream default (get range → upload part). The copy path
+            // carries no client checksum (R1) — no tee slot.
             let get = self.get_object(src_bucket, src_key, range).await?;
-            self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body)
+            self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body, None)
                 .await
         }
     }
@@ -312,6 +332,9 @@ impl MultipartOps for FsStorage {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use futures::stream;
+
     use super::*;
     use crate::{
         _core::{
@@ -323,12 +346,56 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn upload_part_stream_error_aborts_staging() {
+        // A body stream that errors mid-way (the checksum tee fails the
+        // stream the same way) must leave no part file and no PARTS row.
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        let err = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                1.into(),
+                Box::pin(stream::iter(vec![
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"x")),
+                    Err(std::io::Error::other("boom")),
+                ])),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        let listing = storage
+            .list_parts(ListPartsParams {
+                bucket: b.clone(),
+                key: k.clone(),
+                upload_id: upload.upload_id.clone(),
+                max_parts: 1000,
+                part_number_marker: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            listing.parts.is_empty(),
+            "a failed stream must not commit a part"
+        );
+        storage
+            .abort_multipart_upload(&b, &k, &upload.upload_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn multipart_lifecycle_via_contract() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k).await.unwrap();
+        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
         let mut parts = Vec::new();
         let parts_data: [&[u8]; 3] = [b"abc", b"defgh", b"ij"];
         for (i, data) in parts_data.iter().enumerate() {
@@ -339,6 +406,7 @@ mod tests {
                     &upload.upload_id,
                     ((i + 1) as u32).into(),
                     body(data.to_vec()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -401,10 +469,10 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k).await.unwrap();
+        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
         for i in 1..=5u32 {
             storage
-                .upload_part(&b, &k, &upload.upload_id, i.into(), body(b"x"))
+                .upload_part(&b, &k, &upload.upload_id, i.into(), body(b"x"), None)
                 .await
                 .unwrap();
         }
@@ -452,11 +520,11 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         storage
-            .create_multipart_upload(&b, &object::key("a.bin").unwrap())
+            .create_multipart_upload(&b, &object::key("a.bin").unwrap(), None)
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&b, &object::key("b.bin").unwrap())
+            .create_multipart_upload(&b, &object::key("b.bin").unwrap(), None)
             .await
             .unwrap();
         let page = storage
@@ -485,7 +553,7 @@ mod tests {
         storage.create_bucket(&b).await.unwrap();
         for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
             storage
-                .create_multipart_upload(&b, &object::key(key).unwrap())
+                .create_multipart_upload(&b, &object::key(key).unwrap(), None)
                 .await
                 .unwrap();
         }
@@ -533,8 +601,8 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("same.bin").unwrap();
-        let u1 = storage.create_multipart_upload(&b, &k).await.unwrap();
-        storage.create_multipart_upload(&b, &k).await.unwrap();
+        let u1 = storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        storage.create_multipart_upload(&b, &k, None).await.unwrap();
         let page = storage
             .list_multipart_uploads(ListUploadsParams {
                 bucket: b.clone(),
@@ -556,8 +624,8 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("same.bin").unwrap();
-        storage.create_multipart_upload(&b, &k).await.unwrap();
-        storage.create_multipart_upload(&b, &k).await.unwrap();
+        storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        storage.create_multipart_upload(&b, &k, None).await.unwrap();
         let page1 = storage
             .list_multipart_uploads(ListUploadsParams {
                 bucket: b.clone(),
@@ -611,9 +679,9 @@ mod tests {
         .unwrap();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k).await.unwrap();
+        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
         let part = storage
-            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"hello"))
+            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"hello"), None)
             .await
             .unwrap();
         let completed = vec![CompletedPart {

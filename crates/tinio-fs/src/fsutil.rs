@@ -421,18 +421,47 @@ pub(crate) async fn is_absent(path: &Path) -> io::Result<bool> {
 /// torn guard then treats the staged bytes as self-consistent).
 #[cfg(unix)]
 pub(crate) fn copy_file_range(src: &File, offset: u64, len: u64, dst: &File) -> io::Result<()> {
-    let mut off = offset;
-    let mut remaining = len;
-    while remaining > 0 {
-        let copied = rustix_fs::copy_file_range(src, Some(&mut off), dst, None, remaining as usize)
-            .map_err(IoError::from)?;
-        if copied == 0 {
-            return Err(IoError::new(
-                ErrorKind::UnexpectedEof,
-                "copy_file_range made no progress",
-            ));
+    // Linux: kernel-side `copy_file_range` (zero userspace buffering).
+    // Other unix (macOS/BSD): rustix gates `copy_file_range` on
+    // `linux_kernel`, so fall back to the buffered loop of the
+    // contract's stream path (E3) — same result, userspace copies.
+    #[cfg(target_os = "linux")]
+    {
+        let mut off = offset;
+        let mut remaining = len;
+        while remaining > 0 {
+            let copied =
+                rustix_fs::copy_file_range(src, Some(&mut off), dst, None, remaining as usize)
+                    .map_err(IoError::from)?;
+            if copied == 0 {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    "copy_file_range made no progress",
+                ));
+            }
+            remaining -= copied as u64;
         }
-        remaining -= copied as u64;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        use crate::write::CHUNK_SIZE;
+        src.seek(SeekFrom::Start(offset))?;
+        let mut remaining = len;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = src.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    "copy made no progress",
+                ));
+            }
+            dst.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
     }
     Ok(())
 }

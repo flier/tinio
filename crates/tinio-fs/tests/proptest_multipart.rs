@@ -44,7 +44,7 @@ proptest! {
             let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &key).await.unwrap();
+            let upload = store.create(&b, &key, None).await.unwrap();
 
             let mut parts = Vec::new();
             let mut expected = Vec::new();
@@ -52,7 +52,7 @@ proptest! {
                 let data: Vec<u8> = (0..*size).map(|j| (i * 31 + j) as u8).collect();
                 expected.extend_from_slice(&data);
                 let part = store
-                    .put_part(&b, &key, &upload.upload_id, ((i + 1) as u32).into(), body(data))
+                    .put_part(&b, &key, &upload.upload_id, ((i + 1) as u32).into(), body(data), None)
                     .await
                     .unwrap();
                 parts.push(part);
@@ -98,11 +98,11 @@ proptest! {
             let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &key).await.unwrap();
+            let upload = store.create(&b, &key, None).await.unwrap();
             let first_data: Vec<u8> = (0..first).map(|i| i as u8).collect();
             let second_data: Vec<u8> = (0..second).map(|i| (i as u8).wrapping_mul(7)).collect();
-            let p1 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(first_data.clone())).await.unwrap();
-            let p2 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(second_data.clone())).await.unwrap();
+            let p1 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(first_data.clone()), None).await.unwrap();
+            let p2 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(second_data.clone()), None).await.unwrap();
             prop_assert_eq!(p1.part_number, p2.part_number);
             // The stored part is the second write.
             let (listed, truncated, _) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();
@@ -138,10 +138,10 @@ proptest! {
             let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &key).await.unwrap();
+            let upload = store.create(&b, &key, None).await.unwrap();
             let pn: PartNumber = n.into();
             prop_assert!(u32::from(pn) == n);
-            let part = store.put_part(&b, &key, &upload.upload_id, pn, body(b"x")).await.unwrap();
+            let part = store.put_part(&b, &key, &upload.upload_id, pn, body(b"x"), None).await.unwrap();
             prop_assert_eq!(u32::from(part.part_number), n);
             // A part at the extreme edge is listable.
             let (listed, _, _) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();

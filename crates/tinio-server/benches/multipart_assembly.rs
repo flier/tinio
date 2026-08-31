@@ -41,7 +41,10 @@ fn multipart_assembly(c: &mut Criterion) {
             async move {
                 // Re-create the upload each iteration (a completed upload is
                 // consumed).
-                let upload = storage.create_multipart_upload(&bname, &key).await.unwrap();
+                let upload = storage
+                    .create_multipart_upload(&bname, &key, None)
+                    .await
+                    .unwrap();
                 let part_data: Vec<u8> = vec![b'p'; PART_SIZE];
                 let mut completed = Vec::with_capacity(PARTS);
                 for i in 1..=PARTS {
@@ -52,6 +55,7 @@ fn multipart_assembly(c: &mut Criterion) {
                             &upload.upload_id,
                             (i as u32).into(),
                             body(part_data.clone()),
+                            None,
                         )
                         .await
                         .unwrap();

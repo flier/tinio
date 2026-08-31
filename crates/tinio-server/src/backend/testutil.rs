@@ -3,7 +3,7 @@
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::S3Request;
 
-use super::S3Backend;
+use super::{Capabilities, S3Backend};
 use crate::{
     _core::{bucket, storage::BucketOps},
     _mem::MemoryStorage,
@@ -27,7 +27,13 @@ pub(crate) fn s3_request<T>(input: T) -> S3Request<T> {
 /// A fresh backend over `MemoryStorage` with a `data` bucket created;
 /// returns the bucket name as a string.
 pub(crate) async fn setup() -> (S3Backend<MemoryStorage>, String) {
-    let backend = S3Backend::new(MemoryStorage::new().unwrap(), Default::default());
+    setup_with_caps(Default::default()).await
+}
+
+/// Like [`setup`], with explicit runtime capabilities (tests opt in to
+/// the checksum toggle).
+pub(crate) async fn setup_with_caps(caps: Capabilities) -> (S3Backend<MemoryStorage>, String) {
+    let backend = S3Backend::new(MemoryStorage::new().unwrap(), caps);
     let storage = backend.storage();
     let b = "data".to_string();
     storage

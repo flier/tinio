@@ -561,7 +561,7 @@ mod tests {
         let b = bucket::name("my-bucket").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into())
+            .create_multipart_upload(&b, &"big.bin".into(), None)
             .await
             .unwrap();
         let err: StorageError = storage.delete_bucket(&b).await.unwrap_err().into();
@@ -654,10 +654,14 @@ mod tests {
             .await
             .unwrap();
         // Upload + part rows.
-        let upload = storage.multipart_store().create(&b, &k).await.unwrap();
+        let upload = storage
+            .multipart_store()
+            .create(&b, &k, None)
+            .await
+            .unwrap();
         storage
             .multipart_store()
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"))
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
             .unwrap();
 
