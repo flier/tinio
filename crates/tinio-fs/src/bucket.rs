@@ -79,6 +79,42 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The creation time of a bucket, recorded on first sight in ONE
+    /// write transaction — the record-only form of [`Self::get_or_record`]
+    /// for callers that already established the row is missing (the
+    /// `list_buckets` miss arm, whose `load_many` did the pre-read): the
+    /// atomic upsert stays, the read transaction goes. Concurrent
+    /// first-sights converge exactly like `get_or_record`'s write arm —
+    /// the upsert reads the stored value inside the single-writer
+    /// transaction.
+    pub async fn get_or_insert(
+        &self,
+        name: &bucket::Name,
+        now: SystemTime,
+    ) -> Result<SystemTime, Error> {
+        let name = name.clone();
+        self.handle
+            .write(move |txn| BucketsTable::open(txn)?.get_or_insert(&name, now))
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The creation times of the given buckets, in order — one read
+    /// transaction for the whole page (the ListBuckets analogue of
+    /// `meta::Store::load_entries`; a missing entry is `None` — the
+    /// caller lazily records first sight).
+    pub async fn load_many(
+        &self,
+        names: &[bucket::Name],
+    ) -> Result<Vec<Option<SystemTime>>, Error> {
+        self.handle
+            .read(|txn| {
+                let table = BucketsTable::open_readonly(txn)?;
+                names.iter().map(|name| table.get(name)).collect()
+            })
+            .map_err(Into::into)
+    }
+
     /// Record (or overwrite) the creation time of a bucket.
     pub async fn record(&self, name: &bucket::Name, created_at: SystemTime) -> Result<(), Error> {
         let name = name.clone();

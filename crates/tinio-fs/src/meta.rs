@@ -498,6 +498,37 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Remove every entry of `keys` in ONE write transaction (idempotent
+    /// per key — a missing entry is Ok), the remove-side counterpart of
+    /// the upsert batch [`Self::set_batch_owned`]: the scanner's orphan
+    /// pass removes its confirmed orphans with one redb write-lock
+    /// acquisition instead of one transaction per key (P04 — a mass
+    /// out-of-band `rm` no longer serializes M write locks against live
+    /// PUTs). The keys are **moved** into the write closure — the caller
+    /// owns the `Vec` (data-path review 2026-08-29, finding 2 — no
+    /// re-copy on the reclamation path). An empty `keys` is a no-op: no
+    /// write transaction is opened.
+    pub async fn remove_many(
+        &self,
+        bucket: &bucket::Name,
+        keys: Vec<object::Key>,
+    ) -> Result<(), Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let bucket = bucket.clone();
+        self.handle
+            .write(move |txn| {
+                let mut table = ObjectMetaTable::open(txn)?;
+                for key in &keys {
+                    table.remove(&bucket, key)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// The gating-load **batch point read** (pipeline-spec.md P2/R1) —
     /// the list producer's page read: one read transaction, `get` per
     /// requested key in request order, hot-path cost O(page). Returns
@@ -759,6 +790,36 @@ mod tests {
         store.remove(&b, &k).await.unwrap();
         assert!(store.get(&b, &k).await.unwrap().is_none());
         store.remove(&b, &k).await.unwrap(); // idempotent
+    }
+
+    #[tokio::test]
+    async fn remove_many_deletes_all_and_is_idempotent() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let keys: Vec<object::Key> = ["a.txt", "dir/b.txt", "c.txt"]
+            .into_iter()
+            .map(|k| object::key(k).unwrap())
+            .collect();
+        for key in &keys {
+            store
+                .set(
+                    &b,
+                    key,
+                    &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                    1,
+                    mtime(1),
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+        // One write transaction removes every entry; an empty batch opens
+        // no transaction and a repeat batch is idempotent per key.
+        store.remove_many(&b, vec![]).await.unwrap();
+        store.remove_many(&b, keys.clone()).await.unwrap();
+        assert!(store.walk(&b).await.unwrap().is_empty());
+        store.remove_many(&b, keys).await.unwrap(); // idempotent
     }
 
     #[tokio::test]

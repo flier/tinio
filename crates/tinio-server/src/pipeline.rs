@@ -42,6 +42,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -416,17 +417,25 @@ where
     /// Q3 semantics are unchanged — this awaits what shutdown already
     /// guarantees.
     ///
-    /// The removal lane is deliberately not awaited: its work is
-    /// fire-and-forget everywhere else (`tombstone::reclaim` and the
-    /// cleanup stage's `tombstone::enqueue_one`), and a `remove_dir_all`
-    /// tree walk is unbounded — awaiting it would make shutdown latency
-    /// the tree walk. An interrupted walk leaves a partial tombstone,
+    /// The removal lane is awaited with a bounded timeout (F07): its work
+    /// is fire-and-forget everywhere else (`tombstone::reclaim` and the
+    /// cleanup stage's `tombstone::enqueue_one`), but a graceful stop
+    /// should not ORPHAN in-flight tree walks — while an unbounded wait
+    /// would make shutdown latency the tree walk. The wait overlaps the
+    /// IO drain; an interrupted walk leaves a partial tombstone,
     /// reclaimed by the next startup repair (D-B) or scanner pass.
     pub async fn drain(&self) {
-        self.io.drain().await;
+        let removal = tokio::time::timeout(REMOVAL_DRAIN_TIMEOUT, self.remove.drain());
+        let ((), _) = tokio::join!(self.io.drain(), removal);
         self.db.drain().await;
     }
 }
+
+/// The maximum time a graceful stop waits for the removal lane's
+/// in-flight `remove_dir_all` tree walks (F07): a huge tree must not
+/// stall shutdown, and an interrupted walk is reclaimed at the next
+/// startup repair (D-B) or scanner pass.
+const REMOVAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl<IoResult, RemoveResult, DbResult> Drop for Pipelines<IoResult, RemoveResult, DbResult> {
     fn drop(&mut self) {
@@ -870,10 +879,6 @@ mod tests {
             panic!("simulated task panic (R6)");
         }
     }
-
-    /// An owned `Write` sink the fmt layer can hold — the shared
-    /// `tinio_util::testing` definition (F32 — log.rs's two copies are
-    /// gone too).
 
     /// Serializes the log-capturing tests (they share one global buffer).
     /// A tokio mutex: the guard is deliberately held across the whole test.
@@ -1514,5 +1519,74 @@ mod tests {
         let (ran, task) = EtagTask::new();
         pipelines.io().enqueue(Box::new(task)).await.unwrap();
         wait_for(|| ran.load(Ordering::Relaxed)).await;
+    }
+
+    /// A task whose `kind()` panics (F09: the kind probe is caught
+    /// separately from `run()` — the task cannot even be identified, the
+    /// reply is cancelled, the worker stays alive).
+    struct KindPanicTask;
+
+    #[async_trait]
+    impl Task for KindPanicTask {
+        type Output = RunOutput;
+
+        fn kind(&self) -> &'static str {
+            panic!("simulated kind() panic (F09)");
+        }
+
+        async fn run(&mut self) -> Result<(), Box<dyn StdError + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pipeline_kind_accessor_labels_each_lane() {
+        let pipelines = pipelines(1, 1, 16);
+        assert_eq!(pipelines.io().kind(), "io");
+        assert_eq!(pipelines.remove().kind(), "remove");
+        assert_eq!(pipelines.db().kind(), "db");
+    }
+
+    #[tokio::test]
+    async fn pipelines_drain_awaits_the_workers_after_shutdown() {
+        // Item 6c, R5 order: `Pipelines::drain` awaits the IO pipeline
+        // (with the removal lane, under the bounded F07 timeout), then
+        // DB; after shutdown all three return.
+        let pipelines = pipelines(1, 1, 8);
+        pipelines.shutdown();
+        pipelines.drain().await;
+        // Idempotent — a second drain returns immediately.
+        pipelines.drain().await;
+    }
+
+    #[tokio::test]
+    async fn panicking_kind_warns_and_the_worker_survives() {
+        // F09: a panicking `kind()` must not kill the worker — the task
+        // is dropped, the warn fires, a follow-up task still runs.
+        let (_guard, buf) = capture_warns().await;
+        let pipelines = pipelines(1, 1, 16);
+        pipelines
+            .io()
+            .enqueue(Box::new(KindPanicTask))
+            .await
+            .unwrap();
+        wait_for(|| {
+            String::from_utf8(buf.lock().unwrap().clone())
+                .unwrap()
+                .contains("task kind() panicked")
+        })
+        .await;
+        let (ran, _dropped, task) = FlagTask::new();
+        pipelines.io().enqueue(Box::new(task)).await.unwrap();
+        wait_for(|| ran.load(Ordering::Relaxed)).await;
+    }
+
+    #[test]
+    fn panic_message_renders_every_payload_shape() {
+        // R6: the payload downcast covers `&str`, `String`, and anything
+        // else (the fallback text).
+        assert_eq!(panic_message(&"str message"), "str message");
+        assert_eq!(panic_message(&"owned".to_string()), "owned");
+        assert_eq!(panic_message(&42i32), "unknown panic payload");
     }
 }

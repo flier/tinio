@@ -42,6 +42,7 @@ pub enum Error {
 ///
 /// ```rust
 /// use StorageError::ValueTooLarge;
+/// use redb::StorageError;
 /// use tinio_mem::{DatabaseError, Error};
 ///
 /// let err = Error::from(ValueTooLarge(1));
@@ -338,6 +339,10 @@ mod tests {
         assert!(matches!(
             no_such_upload("u"),
             Error::Storage(NoSuchUpload(_))
+        ));
+        assert!(matches!(
+            invalid_key("dir/".into()),
+            Error::Storage(InvalidKey(_))
         ));
         assert!(matches!(
             access_denied(&key),

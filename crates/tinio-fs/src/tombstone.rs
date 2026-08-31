@@ -13,13 +13,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
-    _core::pipeline,
+    _core::pipeline::{self, Completion},
     error::Error,
-    fsutil::{entries_of, remove_tree},
+    fsutil::{ensure_dir, entries_of, remove_tree},
     path::STATE_DIR_NAME,
 };
 
@@ -38,12 +37,10 @@ pub(crate) fn dir(root: &Path) -> PathBuf {
 /// [`Error::Io`] when the parent directory cannot be created.
 pub(crate) async fn prepare(root: &Path) -> Result<PathBuf, Error> {
     let dir = dir(root);
-    // Item 7d: the deleting dir exists in steady state — one probe
-    // instead of the per-component walk (the create still runs on the
-    // first delete).
-    if !fs::try_exists(&dir).await? {
-        fs::create_dir_all(&dir).await?;
-    }
+    // The deleting dir exists in steady state — one probe instead of
+    // the per-component walk (the create still runs on the first
+    // delete).
+    ensure_dir(&dir).await?;
     Ok(dir.join(Uuid::new_v4().to_string()))
 }
 
@@ -57,19 +54,28 @@ pub(crate) async fn leftovers(root: &Path) -> Result<Vec<(PathBuf, String)>, Err
 
 /// Enqueue one [`RemoveTask`] on the removal pipeline — the shared
 /// fire-and-forget handoff of [`reclaim`] and the cleanup stage (D-B):
-/// the completion is dropped, an enqueue failure is warned and the
-/// leftover is left for doctor / scanner repair. Returns whether the
-/// enqueue succeeded.
+/// the completion is awaited on a detached task so a failed removal is
+/// logged at error level (F03 — a dropped completion would swallow the
+/// failure the task now propagates), and an enqueue failure is warned
+/// and the leftover is left for doctor / scanner repair. Returns
+/// whether the enqueue succeeded.
 pub(crate) async fn enqueue_one(
     path: PathBuf,
     pipeline: &Arc<dyn pipeline::Runner<Result<(), Error>>>,
 ) -> bool {
-    match pipeline
-        .enqueue(Box::new(RemoveTask { path: path.clone() }))
-        .await
-    {
+    // The enqueue handoff is [`enqueue_tracked`]'s; this wrapper adds
+    // only the fire-and-forget error log.
+    match enqueue_tracked(path.clone(), pipeline).await {
         Ok(done) => {
-            drop(done);
+            tokio::spawn(async move {
+                if let Err(err) = done.await {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %err,
+                        "bucket tombstone not removed; left for doctor / scanner repair"
+                    );
+                }
+            });
             true
         }
         Err(err) => {
@@ -81,6 +87,17 @@ pub(crate) async fn enqueue_one(
             false
         }
     }
+}
+
+/// Enqueue one [`RemoveTask`] and return its completion — the scanner's
+/// leftover stage awaits it so the pass summary counts ACTUAL removals,
+/// not enqueues (F03). The completion resolves the removal's own
+/// `Result` — `Err` is the tree that could not be removed.
+pub(crate) async fn enqueue_tracked(
+    path: PathBuf,
+    pipeline: &Arc<dyn pipeline::Runner<Result<(), Error>>>,
+) -> Result<Completion<Result<(), Error>>, pipeline::Error> {
+    pipeline.enqueue(Box::new(RemoveTask { path })).await
 }
 
 /// Enqueue `remove_tree` on the removal pipeline and
@@ -109,14 +126,12 @@ impl pipeline::Task for RemoveTask {
     }
 
     async fn run(&mut self) -> Result<(), Error> {
-        if let Err(err) = remove_tree(&self.path).await {
-            tracing::warn!(
-                path = %self.path.display(),
-                error = %err,
-                "bucket tombstone not removed after delete"
-            );
-        }
-        Ok(())
+        // F03: the failure PROPAGATES to the awaiter instead of being
+        // swallowed by a warn — the scanner counts only actual removals
+        // and logs a stuck tree once; the fire-and-forget paths log it
+        // from their detached awaiter (`enqueue_one`). The removal
+        // lane's worker warns on the `Err` without escalating (D-A).
+        remove_tree(&self.path).await.map_err(Error::from)
     }
 }
 
@@ -142,5 +157,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn enqueue_one_returns_false_after_shutdown() {
+        use crate::_core::pipeline::{InlineRunner, Runner};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = dir(root.path()).join("gone");
+        let runner: Arc<dyn Runner<Result<(), Error>>> = Arc::new(InlineRunner::default());
+        // A shut-down runner rejects the enqueue (Q3) — the leftover is
+        // left for doctor / scanner repair, and `false` is reported.
+        runner.shutdown();
+        let ok = enqueue_one(path, &runner).await;
+        assert!(!ok);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_task_reports_failure_when_removal_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use crate::_core::pipeline::{InlineRunner, Runner};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = dir(root.path()).join("stuck");
+        fs::create_dir_all(&path).unwrap();
+        // An open handle with sharing denied blocks the Windows tree
+        // removal (std's default share mode includes FILE_SHARE_DELETE,
+        // and `remove_dir_all` clears the read-only attribute, so only a
+        // share-mode-0 handle counts as a lock); the task must report
+        // the failure (F03) so the awaiting scanner counts no removal
+        // and logs the stuck tree — fire-and-forget callers log it from
+        // their detached awaiter instead.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(path.join("open.txt"))
+            .unwrap();
+        let runner = InlineRunner::default();
+        let done = runner
+            .enqueue(Box::new(RemoveTask { path: path.clone() }))
+            .await
+            .unwrap();
+        assert!(done.await.unwrap().is_err(), "the failure must propagate");
+        assert!(path.exists());
+        drop(file);
     }
 }

@@ -11,7 +11,7 @@
 //!
 //! let err: Error = Error::InvalidPath("traversal".into());
 //! let core: storage::Error = err.into();
-//! assert!(matches!(core, Error::InvalidKey(_)));
+//! assert!(matches!(core, storage::Error::InvalidKey(_)));
 //! ```
 
 use std::{
@@ -201,5 +201,35 @@ mod tests {
     #[test]
     fn errors_are_send_sync_and_static() {
         assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn invalid_value_and_root_errors_project_onto_io() {
+        let report = Probe {
+            compact_threshold_percent: 0,
+        }
+        .validate()
+        .unwrap_err();
+        let core: storage::Error = invalid_value(report).into();
+        assert!(matches!(core, Io(_)));
+        let core: storage::Error = root_not_directory("/x").into();
+        assert!(matches!(core, Io(_)));
+    }
+
+    #[test]
+    fn database_io_errors_unwrap_to_io() {
+        // A database I/O failure surfaces as the public `Io` — everything
+        // else stays nested under `Database`.
+        let err: Error = database::Error::Io(IoError::other("boom")).into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn error_serves_as_a_std_error_trait_object() {
+        // The pipeline runtimes require `AsRef<dyn StdError + Send + Sync>`
+        // (R8) — the failure must stay typed through the object.
+        let err = Error::InvalidPath("a/../b".into());
+        let obj: &(dyn StdError + Send + Sync) = err.as_ref();
+        assert_eq!(obj.to_string(), "invalid path: a/../b");
     }
 }

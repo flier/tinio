@@ -1,13 +1,21 @@
-use std::fs::{read_dir, write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+use std::{
+    fs::{read_dir, write},
+    time::Duration,
+};
 
 use redb::ReadableDatabase;
 use tokio::fs;
 
 use super::*;
+#[cfg(windows)]
+use crate::testutil::link_directory;
 use crate::{
-    _core::storage::{BucketOps, Error as StorageError, ObjectOps},
+    _core::{
+        object,
+        storage::{BucketOps, Error as StorageError, ObjectOps},
+    },
     _util::testing::body,
     database::{self, StateTable},
     testutil::fs_options,
@@ -48,7 +56,7 @@ async fn new_from_db_constructs_over_an_opened_database() {
     assert_eq!(storage.state_dir(), state.path());
     let b = bucket::name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
-    assert!(storage.bucket_names().await.unwrap() == vec![b]);
+    assert!(storage.bucket_names("").await.unwrap() == vec![b]);
 }
 
 #[tokio::test]
@@ -186,8 +194,72 @@ async fn bucket_names_skips_root_level_files() {
     fs::write(root.path().join("notes.txt"), b"not a bucket")
         .await
         .unwrap();
-    let names = storage.bucket_names().await.unwrap();
+    let names = storage.bucket_names("").await.unwrap();
     assert_eq!(names, vec![b], "{names:?}");
+}
+
+#[tokio::test]
+async fn bucket_names_filters_by_prefix() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    for name in ["alpha-1", "alpha-2", "beta-1"] {
+        storage
+            .create_bucket(&bucket::name(name).unwrap())
+            .await
+            .unwrap();
+    }
+    let names = storage
+        .bucket_names("alpha")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| n.as_ref().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["alpha-1", "alpha-2"], "{names:?}");
+    // The empty-prefix form keeps the scanner/cleanup behavior.
+    assert_eq!(storage.bucket_names("").await.unwrap().len(), 3);
+}
+
+/// The follow-policy fixture of the two bucket-name tests (R3 — one
+/// copy, used by both): a real bucket, a linked bucket directory, and a
+/// broken link — returns `bucket_names("")` under the policy.
+/// Platform-split inside: `symlink` on unix, `link_directory` (junction)
+/// on Windows.
+async fn bucket_names_with_links(follow_symlinks: bool) -> Vec<String> {
+    let root = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            follow_symlinks,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+    let b = bucket::name("real-bucket").unwrap();
+    storage.create_bucket(&b).await.unwrap();
+    #[cfg(unix)]
+    symlink(target.path(), root.path().join("linked")).unwrap();
+    #[cfg(windows)]
+    link_directory(target.path(), &root.path().join("linked"));
+    #[cfg(unix)]
+    symlink(
+        root.path().join("does-not-exist"),
+        root.path().join("broken"),
+    )
+    .unwrap();
+    #[cfg(windows)]
+    link_directory(
+        &root.path().join("does-not-exist"),
+        &root.path().join("broken"),
+    );
+    storage
+        .bucket_names("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| n.as_ref().to_string())
+        .collect()
 }
 
 #[cfg(unix)]
@@ -196,38 +268,14 @@ async fn bucket_names_follows_symlinked_bucket_dirs() {
     // A symlinked bucket directory is a bucket only when following is
     // enabled (the follow policy, one source of truth); a broken link is
     // never a bucket.
-    async fn list(follow_symlinks: bool) -> Vec<String> {
-        let root = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks,
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("real-bucket").unwrap();
-        storage.create_bucket(&b).await.unwrap();
-        symlink(target.path(), root.path().join("linked")).unwrap();
-        symlink(
-            root.path().join("does-not-exist"),
-            root.path().join("broken"),
-        )
-        .unwrap();
-        storage
-            .bucket_names()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|n| n.as_ref().to_string())
-            .collect::<Vec<_>>()
-    }
     assert_eq!(
-        list(true).await,
+        bucket_names_with_links(true).await,
         vec!["linked".to_string(), "real-bucket".to_string()]
     );
-    assert_eq!(list(false).await, vec!["real-bucket".to_string()]);
+    assert_eq!(
+        bucket_names_with_links(false).await,
+        vec!["real-bucket".to_string()]
+    );
 }
 
 #[cfg(unix)]
@@ -276,6 +324,109 @@ async fn bucket_names_skips_non_utf8_directory_names() {
     fs::create_dir(root.path().join(OsStr::from_bytes(&name)))
         .await
         .unwrap();
-    let names = storage.bucket_names().await.unwrap();
+    let names = storage.bucket_names("").await.unwrap();
     assert_eq!(names, vec![b], "{names:?}");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn bucket_dir_of_a_dangling_junction_is_no_such_bucket() {
+    // A bucket dir that is a DANGLING junction resolves to no target:
+    // `bucket_dir` answers NoSuchBucket (the bucket is the target, and
+    // the target is gone — F13).
+    let root = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            follow_symlinks: true,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+    link_directory(
+        &root.path().join("no-such-target"),
+        &root.path().join("data"),
+    );
+    let b = bucket::name("data").unwrap();
+    let err = storage.bucket_dir(&b).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
+        "{err:?}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn bucket_names_follows_junction_bucket_dirs() {
+    // A junction bucket directory is a bucket only when following is
+    // enabled (the follow policy, one source of truth); a broken link
+    // is never a bucket.
+    assert_eq!(
+        bucket_names_with_links(true).await,
+        vec!["linked".to_string(), "real-bucket".to_string()]
+    );
+    assert_eq!(
+        bucket_names_with_links(false).await,
+        vec!["real-bucket".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn lock_bucket_mutations_warns_after_the_threshold() {
+    // A waiter past the warn threshold (1 s) still acquires the lock —
+    // the wait is warned (D-E), never silently absorbed and never
+    // failed.
+    let root = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    let b = bucket::name("data").unwrap();
+    let held = storage.lock_bucket_mutations(&b).await;
+    let task = tokio::spawn({
+        let storage = storage.clone();
+        let b = b.clone();
+        async move {
+            let guard = storage.lock_bucket_mutations(&b).await;
+            drop(guard);
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    drop(held);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn ensure_bucket_refuses_a_file_in_place_of_a_bucket() {
+    // A bucket path that exists as a FILE is no bucket (NoSuchBucket,
+    // never an IO error).
+    let root = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    let b = bucket::name("data").unwrap();
+    fs::write(root.path().join("data"), b"not-a-dir")
+        .await
+        .unwrap();
+    let err = storage.ensure_bucket(&b).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
+        "{err:?}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn resolve_object_file_rejects_a_junction_leaf_when_following_is_disabled() {
+    // A key whose path resolves through a junction is refused with
+    // AccessDenied when following is disabled (the documented 403 — a
+    // link inside the bucket never escapes the root, s3-surface.md).
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    let b = bucket::name("data").unwrap();
+    storage.create_bucket(&b).await.unwrap();
+    fs::write(outside.path().join("x.txt"), b"s").await.unwrap();
+    link_directory(outside.path(), &root.path().join("data/subdir"));
+    let k = object::key("subdir/x.txt").unwrap();
+    let err = storage.resolve_object_file(&b, &k).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Storage(StorageError::AccessDenied(_))),
+        "{err:?}"
+    );
 }

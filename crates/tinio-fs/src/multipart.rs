@@ -23,6 +23,10 @@
 //! record never committed is invisible — the client retransmits, and the
 //! point query recomputes from the file as a fallback, §5.6).
 
+// `put_part_copy` (the unix copy_file_range fast path) takes the std
+// handle — tokio's `File` stays for the async assembly reads below.
+#[cfg(unix)]
+use std::fs::File as StdFile;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
@@ -134,7 +138,7 @@ fn upload_from_row(
 /// };
 /// use tinio_fs::multipart;
 /// use tinio_util::testing::body;
-/// use tokio::runtime::Runtime;
+/// use tokio::{fs, runtime::Runtime};
 ///
 /// let state = tempfile::tempdir().unwrap();
 /// let store = multipart::store(state.path()).unwrap();
@@ -304,13 +308,14 @@ impl Store {
     /// Unix-only: the backend's `copy_part` uses the contract's stream
     /// default elsewhere.
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn put_part_copy(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         upload_id: &str,
         part_number: PartNumber,
-        source: File,
+        source: StdFile,
         offset: u64,
         len: u64,
     ) -> Result<PartInfo, Error> {
@@ -1064,7 +1069,10 @@ pub fn store(state_dir: &Path) -> Result<Store, Error> {
 mod tests {
     use super::*;
     use crate::{
-        _core::storage::{Error as StorageError, group_and_paginate_ordered},
+        _core::{
+            ETag,
+            storage::{Error as StorageError, group_and_paginate_ordered},
+        },
         _util::testing::{body, etag},
     };
 
@@ -2042,5 +2050,254 @@ mod tests {
         assert!(parts.is_empty(), "{parts:?}");
         assert!(!truncated);
         assert_eq!(raw_last, None);
+    }
+
+    #[tokio::test]
+    async fn list_parts_max_parts_zero_is_an_empty_page() {
+        // `max_parts = 0` asks for nothing: an empty, untruncated page
+        // with no marker (an exclusive-after marker would skip the first
+        // part of the next page forever).
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap();
+        let (parts, truncated, next) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 0)
+            .await
+            .unwrap();
+        assert!(parts.is_empty());
+        assert!(!truncated);
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn list_parts_of_a_mismatched_stored_key_is_no_such_upload() {
+        // The upload check is against the RECORDED key: a stored key
+        // diverged out-of-band answers NoSuchUpload, never a page of
+        // parts belonging to another key.
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .overwrite_stored_key(&b, &upload.upload_id, "other.bin")
+            .await
+            .unwrap();
+        let err = store
+            .list_parts(&b, &k, &upload.upload_id, None, 100)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::NoSuchUpload(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_recomputes_a_part_whose_record_is_missing() {
+        // A part file WITHOUT a PARTS row (a crash between the file
+        // rename and the record commit, §5.6): the completion recomputes
+        // the ETag from the file instead of failing.
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap();
+        // An out-of-band part file with no record.
+        let dir = state.path().join("multipart/data").join(&upload.upload_id);
+        fs::write(dir.join("part-2"), b"bbb").await.unwrap();
+        let recomputed = ETag::from_content(b"bbb");
+        let completed = [
+            CompletedPart {
+                part_number: 1.into(),
+                etag: ETag::from_content(b"aaa"),
+            },
+            CompletedPart {
+                part_number: 2.into(),
+                etag: recomputed,
+            },
+        ];
+        let (temp, _etag) = store
+            .complete(&b, &k, &upload.upload_id, &completed)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&temp).await.unwrap(),
+            b"aaabbb",
+            "the recomputed part joins the assembly"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_refuses_a_part_that_is_a_directory() {
+        // A part path that is a directory is never a part: InvalidPart
+        // (a directory open would otherwise classify as a permission
+        // denial).
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let part = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap();
+        let dir = state.path().join("multipart/data").join(&upload.upload_id);
+        fs::remove_file(dir.join("part-1")).await.unwrap();
+        fs::create_dir(dir.join("part-1")).await.unwrap();
+        let err = store
+            .complete(
+                &b,
+                &k,
+                &upload.upload_id,
+                &[CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag.clone(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::InvalidPart(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_part_content_that_disagrees_with_the_record() {
+        // The verify pass trusts the PARTS record, but the assembly
+        // re-hashes the file: out-of-band content that disagrees with
+        // the record fails the completion (the verify-then-copy race
+        // closes here, §5.6).
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        let part = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap();
+        let dir = state.path().join("multipart/data").join(&upload.upload_id);
+        fs::write(dir.join("part-1"), b"zzz").await.unwrap();
+        let err = store
+            .complete(
+                &b,
+                &k,
+                &upload.upload_id,
+                &[CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag.clone(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::InvalidPart(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_part_returns_the_stage_error_when_the_upload_is_live() {
+        // The staging write fails (state `tmp/` is a file) while the
+        // upload is still live: the original stage error is returned —
+        // never NoSuchUpload.
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        fs::write(state.path().join("tmp"), b"blocked")
+            .await
+            .unwrap();
+        let err = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a live upload must keep the stage error: {err:?}"
+        );
+        assert!(store.has_uploads(&b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn publish_part_cleans_the_temp_when_the_upload_dir_cannot_be_created() {
+        // `multipart/<bucket>` is a file: the upload dir cannot be
+        // created — the staged temp is removed and the error returned.
+        // The `multipart` parent is created by the test (the store
+        // creates upload dirs lazily, so it must exist to plant the
+        // blocking file).
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        fs::create_dir_all(state.path().join("multipart"))
+            .await
+            .unwrap();
+        fs::write(state.path().join("multipart/data"), b"blocked")
+            .await
+            .unwrap();
+        let err = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "the dir-creation error propagates: {err:?}"
+        );
+        let temp = state.path().join("tmp");
+        assert!(
+            fs::read_dir(&temp)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none(),
+            "no staged temp survives the failed publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_part_cleans_the_temp_when_the_part_path_is_a_directory() {
+        // The rename cannot land onto a directory: the staged temp is
+        // removed and the error returned (a same-part overwrite never
+        // leaves a half-published file).
+        let (state, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k).await.unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"))
+            .await
+            .unwrap();
+        let dir = state.path().join("multipart/data").join(&upload.upload_id);
+        fs::remove_file(dir.join("part-1")).await.unwrap();
+        fs::create_dir(dir.join("part-1")).await.unwrap();
+        let err = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"bbb"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "the rename error propagates: {err:?}"
+        );
+        let temp = state.path().join("tmp");
+        assert!(
+            fs::read_dir(&temp)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none(),
+            "no staged temp survives"
+        );
     }
 }

@@ -1,9 +1,11 @@
 //! Object listing over the storage root (task T043).
 //!
-//! A directory-tree walk (buckets → files, keys in lexicographic order)
-//! with prefix filtering, delimiter-based grouping (common-prefix roll-up),
-//! and pagination per S3 semantics (FR-004) — via the shared engine
-//! `group_and_paginate`.
+//! A directory-tree walk (buckets → files) with prefix filtering,
+//! delimiter-based grouping (common-prefix roll-up), and pagination per
+//! S3 semantics (FR-004) — the streaming walk fed into the shared
+//! bounded [`UnorderedPager`] engine: the page comes out in key order
+//! with only the `max_keys + 1` smallest entries ever held (no
+//! full-bucket collect and sort, P01).
 //!
 //! ETags are included: missing/stale entries of the emitted page are
 //! recomputed through the **IO pipeline** (`etag::ComputeTask`, pipeline-spec.md
@@ -15,10 +17,11 @@
 //! are excluded when `follow_symlinks` is disabled. No listing latency
 //! bound is promised; listings remain correct and complete at all times.
 //!
-//! The scanner walks the same tree through [`FsListing::walk_files_streaming`]
-//! — the one source of truth for what an object is, emitted one file at a
-//! time in walk order (no full-bucket collection, no sort; the scanner
-//! needs no order, pipeline-spec.md §3.7).
+//! The list producer and the scanner walk the same tree through
+//! [`FsListing::walk_files_streaming`] — the one source of truth for
+//! what an object is, emitted one file at a time in walk order (no
+//! full-bucket collection, no sort: the scanner needs no order,
+//! pipeline-spec.md §3.7, and the pager needs only the page).
 //!
 //! This module also hosts the **streaming batch accumulator** shared with
 //! the scanner producer: [`MetaBatchAccumulator`] groups computed entries
@@ -48,7 +51,7 @@ use crate::{
         ETag, bucket,
         object::{self, Info},
         pipeline::{self, Completion},
-        storage::{self, ListObjectsParams, ObjectListing, group_and_paginate},
+        storage::{self, ListObjectsParams, ObjectListing, UnorderedPager},
     },
     Error, etag, fsutil, meta, path,
     path::STATE_DIR_NAME,
@@ -200,7 +203,10 @@ impl<'a> MetaBatchAccumulator<'a> {
 /// # Examples
 ///
 /// ```rust
-/// use std::sync::Arc;
+/// use std::{
+///     fs::{create_dir, write},
+///     sync::Arc,
+/// };
 ///
 /// use tinio_core::{
 ///     bucket,
@@ -326,24 +332,60 @@ impl FsListing {
     /// ALL batches are enqueued — the batch completions are awaited (the
     /// final drain, Q2: every batch committed before the page is
     /// answered).
+    ///
+    /// The page is selected incrementally during the walk (the bounded
+    /// [`UnorderedPager`] — P01): only the `max_keys + 1` smallest
+    /// entries are held, never a full-bucket collect and sort.
     pub async fn list(&self, params: &ListObjectsParams) -> Result<ObjectListing, Error> {
+        // The engine's empty-page contract, answered after the bucket
+        // existence check (the walk's own await) but before the tree
+        // walk: a `max_keys = 0` request never pays the full-bucket stat
+        // sweep — it still answers NoSuchBucket for a missing bucket.
+        if params.max_keys == 0 {
+            // The stream is built purely for the existence probe and
+            // dropped un-polled — `let _` so the `#[must_use]` stream
+            // does not warn on every build (F10).
+            let _ = self
+                .walk_files_streaming(&params.bucket, &params.prefix)
+                .await?;
+            return Ok(ObjectListing {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                truncated: false,
+                next_start_after: None,
+            });
+        }
         // Paginate on the walked keys first — grouping, the marker skip,
         // and the truncation probe need no per-object I/O. ETags are then
         // resolved for the emitted page only: a `max_keys=1` request
         // costs one meta read, not one per object in the bucket (P3).
-        let walked = self
-            .walk_files(&params.bucket, &params.prefix)
-            .await?
-            .into_iter()
-            .filter(|w| w.key.starts_with(&params.prefix));
-        let (page, common_prefixes, truncated, next) = group_and_paginate(
-            walked,
+        // The walk is the STREAMING form fed into the bounded
+        // `UnorderedPager`: memory and the page sort drop to O(max_keys)
+        // (P01 — the old collect + sort paid O(M) memory and an O(M log
+        // M) sort per page). Syscalls stay O(M) per page — `read_dir`
+        // cannot seek. The `starts_with` re-filter stays: the walk's
+        // directory-level pruning does not guarantee every walked file
+        // matches the prefix. The keyed `offer_keyed` compares the
+        // borrowed key and materializes the order String only for
+        // entries that enter the heap — O(page) allocations, not
+        // O(entries).
+        let mut walk = self
+            .walk_files_streaming(&params.bucket, &params.prefix)
+            .await?;
+        let mut pager = UnorderedPager::new(
             &params.prefix,
             params.delimiter.as_deref(),
             params.start_after.as_deref(),
             params.max_keys,
-            |w| w.key.as_ref(),
+            |w: &WalkedFile| w.key.as_ref(),
         );
+        while let Some(file) = walk.next().await {
+            let file = file?; // a mid-walk error is the stream's terminal item — propagates
+            if file.key.starts_with(&params.prefix) {
+                pager.offer_keyed(file);
+            }
+        }
+        let (page, common_prefixes, truncated, next) = pager.finish();
         // R1: the page's keys in ONE read transaction; each slot aligns
         // with `get()` — a missing or corrupt entry reports `None`
         // (recompute + rewrite, self-healing, P2). The slots answer in
@@ -442,26 +484,29 @@ impl FsListing {
         // order IS key order; a vanished file's slot stays `None` and
         // the entry is skipped).
         let mut objects: Vec<Info> = Vec::with_capacity(page.len());
-        for (walked, result) in page.iter().zip(&results) {
+        // The page is consumed here — the assembly is its last use, so
+        // the walked keys and paths are moved, not cloned.
+        for (walked, result) in page.into_iter().zip(&results) {
             if let Some(etag) = result {
                 objects.push(Info {
-                    key: walked.key.clone(),
+                    key: walked.key,
                     size: walked.size,
                     last_modified: walked.mtime,
                     etag: etag.clone(),
                 });
             }
         }
-        // F15: a page whose entries ALL vanished between the walk and the
-        // hash (mass concurrent deletion) must not advertise a resume
-        // marker — an empty truncated page would make the client page
-        // through dead ranges forever. The listing is a snapshot; the
-        // deleted keys are gone.
-        let (truncated, next) = if truncated && objects.is_empty() && common_prefixes.is_empty() {
-            (false, None)
-        } else {
-            (truncated, next)
-        };
+        // T01: the pager's `(truncated, next)` propagate unconditionally —
+        // a page whose entries ALL vanished between the walk and the hash
+        // (mass concurrent deletion) still reports the resume marker. The
+        // marker is exclusive-after and does not require the marker key to
+        // exist: the client resumes past it and either finds the probe
+        // entry that set `truncated` (still live — a truncated page always
+        // has one) or an empty untruncated page. Either way the sweep
+        // terminates; suppressing the marker here would hide live keys
+        // (an F15-era guard did exactly that — the deleted keys are gone,
+        // but the truncated page's probe is a key the client must still
+        // see).
         Ok(ObjectListing {
             objects,
             common_prefixes,
@@ -508,38 +553,17 @@ impl FsListing {
         Ok(())
     }
 
-    /// Walk every object file of a bucket, in key order, with the size,
-    /// mtime, and identity from the same stat (listings resolve ETags
-    /// against these — one syscall per entry; the identity is the gate's
-    /// replacement detector, F01). Directories are never objects, `.tinio`
-    /// entries are skipped at any depth (FR-020), symlink entries are
-    /// excluded when `follow_symlinks` is disabled. `key_prefix` prunes
-    /// directories that cannot contain matching keys (a listing passes
-    /// its prefix). This is the **collected, key-sorted** form of the
-    /// walk — the list producer needs order; the scanner streams the
-    /// same walk via `Self::walk_files_streaming` (one source of truth
-    /// for what an object is, no full-bucket materialization).
-    /// `NoSuchBucket` when the bucket does not exist.
-    pub async fn walk_files(
-        &self,
-        bucket: &bucket::Name,
-        key_prefix: &str,
-    ) -> Result<Vec<WalkedFile>, Error> {
-        let mut out = Vec::new();
-        let mut walked = self.walk_files_streaming(bucket, key_prefix).await?;
-        while let Some(file) = walked.next().await {
-            out.push(file?);
-        }
-        out.sort_by(|a, b| a.key.as_ref().cmp(b.key.as_ref()));
-        Ok(out)
-    }
-
     /// The **streaming** form of the walk: every object file of a bucket,
     /// one at a time, in walk order (a directory's `read_dir` order,
     /// worklist-depth-first — never a key sort; the scanner needs no
-    /// order, pipeline-spec.md §3.7). Same per-entry rules and errors as
-    /// [`Self::walk_files`] — the one source of truth for what an object
-    /// is. The bucket-existence check happens here, before the first
+    /// order, pipeline-spec.md §3.7, and the list producer paginates
+    /// through the bounded `UnorderedPager`, which holds only the
+    /// page). Directories are never objects, `.tinio` entries are
+    /// skipped at any depth (FR-020), symlink entries are excluded when
+    /// `follow_symlinks` is disabled, and `key_prefix` prunes
+    /// directories that cannot contain matching keys (a listing passes
+    /// its prefix) — the one source of truth for what an object is.
+    /// The bucket-existence check happens here, before the first
     /// item; a mid-walk error is the stream's terminal item. Memory is
     /// O(1) beyond the walk's own cursor state. The stream is boxed
     /// (one allocation per walk) because the per-poll state machine
@@ -662,16 +686,28 @@ impl WalkState {
                     if name == STATE_DIR_NAME {
                         continue; // reserved at any depth (FR-020)
                     }
-                    let lmeta = match fs::symlink_metadata(entry.path()).await {
-                        Ok(metadata) => metadata,
+                    let path = entry.path(); // one join per entry (the old code re-joined up to six times)
+                    // P02/A1: classify before any stat — the platform
+                    // split and the follow policy live in
+                    // `fsutil::dir_entry_kind` (one home, shared with the
+                    // bucket-name sweep); `stat` carries the metadata a
+                    // leaf reuses as its object stat — Windows find-data,
+                    // or a followed symlink/junction's probe (E2: a
+                    // link-to-file leaf pays ONE stat; the reuse widens
+                    // the probe→stat window by one stat's duration — the
+                    // same snapshot class as a regular file's
+                    // classification-then-stat). The vanished-entry skip
+                    // and the fatal-error mapping stay here, per the
+                    // walk's policy.
+                    let kind = match fsutil::dir_entry_kind(&entry, self.follow_symlinks).await {
+                        Ok(kind) => kind,
                         Err(err) if err.kind() == ErrorKind::NotFound => continue,
                         Err(err) => return self.fatal(err.into()),
                     };
-                    let is_symlink = fsutil::is_symlink_or_reparse(&lmeta);
+                    let is_symlink = kind.is_symlink;
                     if is_symlink && !self.follow_symlinks {
                         continue;
                     }
-                    let file_type = lmeta.file_type();
                     let rel = prefix.join(name);
                     let key = rel.to_string_lossy().into_owned();
                     // Windows renders joined path separators as `\` (the
@@ -680,18 +716,12 @@ impl WalkState {
                     // character and must survive intact.
                     #[cfg(windows)]
                     let key = key.replace('\\', "/");
-                    if file_type.is_dir()
-                        || (is_symlink
-                            && fs::metadata(entry.path())
-                                .await
-                                .map(|m| m.is_dir())
-                                .unwrap_or(false))
-                    {
+                    if kind.is_dir {
                         // A symlinked directory may point at an ancestor
                         // (a cycle): never descend into a resolved target
                         // twice.
                         if is_symlink {
-                            let target = match fs::canonicalize(entry.path()).await {
+                            let target = match fs::canonicalize(&path).await {
                                 Ok(target) => target,
                                 Err(err) => return self.fatal(err.into()),
                             };
@@ -721,7 +751,7 @@ impl WalkState {
                                 continue;
                             }
                         }
-                        self.stack.push((entry.path(), rel));
+                        self.stack.push((path, rel));
                         continue;
                     }
                     let Ok(key) = object::key(key) else {
@@ -730,21 +760,29 @@ impl WalkState {
                     if key.is_reserved() || key.is_folder_marker() {
                         continue;
                     }
-                    // One stat per entry. Symlinks are followed to the
-                    // target (the served object's own size/mtime); a
-                    // dangling link (target gone) is skipped — one broken
-                    // link must not fail the whole bucket walk.
-                    let metadata = if is_symlink {
-                        match fs::metadata(entry.path()).await {
+                    // The object's stat. A regular file pays ONE stat
+                    // (P02 — the old lstat probe plus this second stat
+                    // were two syscalls; d_type already ruled out a
+                    // link, so size/mtime and the stored identity come
+                    // from a single `stat`); on Windows the free
+                    // find-data metadata from the classification is
+                    // reused outright — zero syscalls for a regular
+                    // file. A followed symlink reuses the directory
+                    // probe's target stat (E2 — one stat for the leaf);
+                    // a dangling link (target gone) is skipped — one
+                    // broken link must not fail the whole bucket walk.
+                    let metadata = match kind.stat {
+                        Some(stat) => stat,
+                        None => match fs::metadata(&path).await {
                             Ok(metadata) => metadata,
-                            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                            // The dangling-link skip is the symlink branch's
+                            // today; a vanished REGULAR file was a fatal
+                            // error before this change and stays one.
+                            Err(err) if err.kind() == ErrorKind::NotFound && is_symlink => {
+                                continue;
+                            }
                             Err(err) => return self.fatal(err.into()),
-                        }
-                    } else {
-                        match entry.metadata().await {
-                            Ok(metadata) => metadata,
-                            Err(err) => return self.fatal(err.into()),
-                        }
+                        },
                     };
                     let modified = match metadata.modified() {
                         Ok(modified) => modified,
@@ -753,7 +791,7 @@ impl WalkState {
                     self.current = Some((dir, prefix, entries));
                     return Some(Ok(WalkedFile {
                         key,
-                        path: entry.path(),
+                        path,
                         size: metadata.len(),
                         mtime: modified,
                         // The identity is lazy (see `WalkedFile`): the
@@ -800,7 +838,6 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::{
         fs::{File, OpenOptions, create_dir, create_dir_all, metadata, read, read_dir, write},
-        process::Command,
         time::{Duration, Instant},
     };
 
@@ -818,7 +855,7 @@ mod tests {
         _util::testing,
         database,
         database::ObjectMetaTable,
-        testutil::{GatedRunner, LossyRunner, PacedRunner, files, wait_for},
+        testutil::{GatedRunner, LossyRunner, PacedRunner, files, link_directory, wait_for},
     };
 
     /// The standard test listing: the fs defaults plus the mandatory
@@ -1052,37 +1089,19 @@ mod tests {
                 root.path().join("data/link.txt"),
             )
             .unwrap();
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
-            let page = listing
+            let no_link = listing(root.path(), meta::store(state.path()).unwrap(), false);
+            let page = no_link
                 .list(&params(&b, "", None, None, 1000))
                 .await
                 .unwrap();
             assert!(!page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-            let page = listing
+            drop(no_link);
+            let with_link = listing(root.path(), meta::store(state.path()).unwrap(), true);
+            let page = with_link
                 .list(&params(&b, "", None, None, 1000))
                 .await
                 .unwrap();
             assert!(page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
-        }
-    }
-
-    fn link_directory(src: &Path, dst: &Path) {
-        #[cfg(unix)]
-        symlink(src, dst).unwrap();
-        #[cfg(windows)]
-        {
-            let status = Command::new("cmd")
-                .args([
-                    "/C",
-                    "mklink",
-                    "/J",
-                    &dst.to_string_lossy(),
-                    &src.to_string_lossy(),
-                ])
-                .status()
-                .expect("spawn mklink");
-            assert!(status.success(), "mklink /J failed with {status}");
         }
     }
 
@@ -1216,8 +1235,9 @@ mod tests {
     async fn walk_stream_emits_files_in_read_dir_order() {
         // The stream is the scanner's walk: files come out one at a
         // time, in the directory's OWN enumeration order — never a key
-        // sort (the scanner needs no order; the sorted form is
-        // `walk_files`'s collect + sort). The order is pinned against a
+        // sort (the scanner needs no order; the list producer's page
+        // sort is the pager's bounded heap, not the walk). The order is
+        // pinned against a
         // fresh `read_dir` of the same static directory — deterministic
         // on the same filesystem (NTFS enumerates B-tree order, ext4
         // hash order; neither is a key sort, so a future sort-regression
@@ -1330,13 +1350,24 @@ mod tests {
             .iter()
             .map(|o| o.key.as_ref().as_str())
             .collect();
-        assert!(
-            !keys.iter().any(|k| k.starts_with("link2/")),
-            "second link to the same target must be skipped: {keys:?}"
+        // Readdir order decides which link the walk meets first — the
+        // invariant is the target's contents surface exactly once, not
+        // under a specific link name.
+        let link_keys: Vec<&str> = keys
+            .iter()
+            .filter(|k| k.starts_with("link1/") || k.starts_with("link2/"))
+            .copied()
+            .collect();
+        assert_eq!(
+            link_keys.len(),
+            3,
+            "the shared target must be listed through exactly one link: {keys:?}"
         );
         assert!(
-            keys.iter().any(|k| k.starts_with("link1/")),
-            "first link is a real object path: {keys:?}"
+            !link_keys
+                .iter()
+                .any(|k| k.starts_with("link1/") && k.starts_with("link2/")),
+            "keys from both links: {keys:?}"
         );
     }
 
@@ -1570,10 +1601,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (store, b) = files_fixture(root.path(), 1);
         let io = GatedRunner::<etag::Result>::new(1, 8);
+        // follow=false: the swapped-in link is REFUSED by the nofollow
+        // open (R3 — PermissionDenied), which must fail the listing. A
+        // follow-enabled listing would instead resolve the dangling
+        // link to NotFound and skip the vanished object (fold_compute's
+        // NotFound short-circuit) — correct snapshot semantics, not the
+        // escape signal this test drives.
         let listing = listing_with(
             root.path(),
             store.clone(),
-            true,
+            false,
             io.clone(),
             Arc::new(InlineRunner::default()),
             DEFAULT_META_BATCH_SIZE,
@@ -1704,7 +1741,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_whose_entries_all_vanish_is_untruncated() {
+    async fn page_whose_entries_all_vanish_keeps_the_resume_marker() {
+        // T01: a page whose entries ALL vanished between the walk and
+        // the hash (mass concurrent deletion) still reports the resume
+        // marker — the marker is exclusive-after and needs no live key:
+        // resuming past it either finds the truncation probe (still
+        // live — `truncated` was set by a real key) or an empty
+        // untruncated page, so the sweep terminates either way. The old
+        // F15 guard suppressed the marker over a dead page, which hid
+        // exactly those live keys from the client.
         let root = tempfile::tempdir().unwrap();
         let (store, b) = files_fixture(root.path(), 3);
         let io = GatedRunner::<etag::Result>::new(1, 8);
@@ -1732,10 +1777,10 @@ mod tests {
         let page = page.await.unwrap().unwrap();
         assert!(page.objects.is_empty());
         assert!(
-            !page.truncated,
-            "no resume marker over a dead range: {page:?}"
+            page.truncated,
+            "the probe entry set truncation, and it may still be live: {page:?}"
         );
-        assert!(page.next_start_after.is_none());
+        assert_eq!(page.next_start_after.as_deref(), Some("f01.txt"));
     }
 
     #[tokio::test]
@@ -1775,6 +1820,88 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_stream_bucket_dir_vanishing_mid_walk_is_no_such_bucket() {
+        // The bucket directory vanishing between stream construction and
+        // the first poll is no bucket at all: the walk's initial
+        // `read_dir` answers NotFound and the empty relative prefix maps
+        // it to NoSuchBucket — never an empty, untruncated 200.
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        create_dir(root.path().join("data")).unwrap();
+        write(root.path().join("data/a.txt"), "x").unwrap();
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let mut stream = listing.walk_files_streaming(&b, "").await.unwrap();
+        fs::remove_dir_all(root.path().join("data")).await.unwrap();
+        let first = stream.next().await.unwrap();
+        assert!(
+            matches!(first, Err(Error::Storage(NoSuchBucket(_)))),
+            "a vanished bucket dir must fail the walk: {first:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dangling_bucket_junction_is_no_such_bucket() {
+        // A bucket dir that is a DANGLING junction resolves to no
+        // target: the walk answers NoSuchBucket with following disabled
+        // (the unseeded-worklist path must not answer an empty 200) and
+        // with following enabled (the canonicalize path, F13).
+        for follow in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            link_directory(&root.path().join("gone-target"), &root.path().join("data"));
+            let listing = listing(root.path(), meta::store(state.path()).unwrap(), follow);
+            let b = bucket::name("data").unwrap();
+            // The Ok side is the stream — never Debug — so the error is
+            // extracted through `map(|_| ())`.
+            let err = listing
+                .walk_files_streaming(&b, "")
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Storage(NoSuchBucket(_))),
+                "dangling junction (follow={follow}): {err:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn junction_inside_bucket_is_followed_and_cycles_terminate() {
+        // With following enabled a junction inside a bucket is descended
+        // (the files behind it are objects); a cycle (the bucket linked
+        // to itself) terminates through the visited set.
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        create_dir_all(root.path().join("data/real/sub")).unwrap();
+        write(root.path().join("data/real/sub/x.txt"), "x").unwrap();
+        link_directory(
+            &root.path().join("data/real"),
+            &root.path().join("data/jlink"),
+        );
+        // A self-cycle: the bucket linked to itself.
+        link_directory(&root.path().join("data"), &root.path().join("data/cycle"));
+        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let page = listing
+            .list(&params(&b, "", None, None, 1000))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|o| o.key.as_ref().as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["jlink/sub/x.txt", "real/sub/x.txt"],
+            "junction descended, cycle skipped: {keys:?}"
         );
     }
 }

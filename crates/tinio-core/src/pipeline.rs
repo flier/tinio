@@ -551,6 +551,18 @@ mod tests {
         assert_eq!(task.kind(), "not_sync");
     }
 
+    #[tokio::test]
+    async fn not_sync_task_runs_through_the_inline_runner() {
+        // The compile-time `Send`-but-not-`Sync` task is also runnable
+        // (its run body is otherwise never executed). The inline runner
+        // is runtime-agnostic — a plain `#[tokio::test]` runtime (no
+        // `block_on` wrapper, per CLAUDE.md).
+        let runner = InlineRunner::default();
+        let task: Box<dyn Task<Output = RunOutput>> = Box::new(NotSyncTask(Cell::new(1)));
+        assert_eq!(task.kind(), "not_sync");
+        runner.enqueue(task).await.unwrap().await.unwrap().unwrap();
+    }
+
     #[test]
     fn enqueue_blocks_while_the_queue_is_full() {
         let rt = Runtime::new().unwrap();

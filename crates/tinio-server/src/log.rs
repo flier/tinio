@@ -214,7 +214,7 @@ impl Visit for FieldCollector {
 /// ```rust
 /// use std::io::sink;
 ///
-/// use tinio_config::log;
+/// use tinio_config::log::AccessFormat;
 /// use tinio_server::log::{ACCESS_TARGET, AccessFields, AccessLogLayer};
 /// use tracing_subscriber::layer::SubscriberExt;
 ///
@@ -576,6 +576,45 @@ mod tests {
                 content.contains("201 GET /data/x HTTP/1.1"),
                 "{suffix} format: {content}"
             );
+        }
+    }
+
+    #[test]
+    fn build_subscriber_accepts_every_verbosity_and_format() {
+        // The verbosity→level mapping and the text/JSON format split are
+        // the two axis of the operational subscriber; every combination
+        // must build and accept an access event.
+        for verbosity in [
+            Verbosity::Error,
+            Verbosity::Warn,
+            Verbosity::Info,
+            Verbosity::Debug,
+        ] {
+            for format in [Format::Text, Format::Json] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("access.log");
+                let sub = build_subscriber(
+                    verbosity,
+                    format,
+                    &AccessFormat::Custom("$status $request".into()),
+                    &path,
+                    None,
+                )
+                .expect("every verbosity/format combination builds");
+                with_default(sub, || {
+                    tracing::info!(
+                        target: ACCESS_TARGET,
+                        status = 200u16,
+                        request = "GET /data/y HTTP/1.1",
+                        "s3 request completed"
+                    );
+                });
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    content.contains("200 GET /data/y HTTP/1.1"),
+                    "{verbosity:?} {format:?}: {content}"
+                );
+            }
         }
     }
 }

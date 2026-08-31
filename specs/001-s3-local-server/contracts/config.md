@@ -41,6 +41,9 @@ copy_object = true
 list_objects_v1 = true
 list_objects_v2 = true
 delete_objects = true
+max_buckets = 10000   # ListBuckets page-size cap (0 = unlimited; larger max-buckets requests are clamped — the AWS documented ceiling; values above 10,000 are REJECTED at parse — the wire ceiling makes them dead config, F04)
+max_keys = 0          # ListObjects page-size cap (0 = unlimited, the default — preserves current behavior)
+allow_zero_page_size = false # escape hatch: true restores the legacy empty page for max-keys / max-parts / max-uploads = 0 (ListBuckets stays strict 1..=10,000)
 sig_v2 = false            # SigV2 off by default; DEPRECATED (weaker scheme; aws cli v2 / rclone never use it) — enabling prints a startup warning; slated for removal in v2
 temp_ttl_hours = 24       # stale temp-write sweep timeout
 multipart_expire_days = 7 # abandoned-upload sweep timeout
@@ -118,6 +121,8 @@ CLI flags > process environment > .env > config file
 - Credential presence rules: no creds + no anonymous → generated session creds (printed once); first start → config auto-created with persisted creds.
 - Backend selection is deferred: v1 is filesystem-only (`tinio-fs`); the `[storage]` section holds backend behavior keys (nested per backend — `[storage.fs]` for the filesystem), and a `type` selection key will be added when a second backend (`tinio-s3`, `tinio-webdav`) lands.
 - `[s3]` capability groups are also strippable at compile time via default-on cargo features (`multipart`, `copy`, `list-v1`, `list-v2`); when a group is not compiled, its keys here are schema-known and silently ignored.
+- `[s3] max_buckets` / `max_keys`: the ListBuckets / ListObjects page-size caps, `u32`. `max_buckets` defaults to 10,000 (the AWS documented maximum); `max_keys` defaults to 0 (unlimited, preserving current behavior). Multipart listings have no caps (AWS documents none). The wire also rejects `max-buckets` above 10,000 (`InvalidArgument`, never a silent clamp). Effective range for `max_buckets` is **0..=10,000** (F04): a value above 10,000 is rejected at config parse — the wire ceiling makes it dead configuration (it could never clamp a request the wire lets through).
+- `[s3] allow_zero_page_size`: boolean, default **false** (strict). **Breaking-change signal** (F06): since 2026-08, the pre-existing listing surfaces (`max-keys` V1/V2, `max-parts`, `max-uploads`) answer `InvalidArgument` for values below 1 — where the pre-2026-08 server answered an empty page (`.max(0)`). A client that has always sent `0` breaks with 400 after an upgrade; set `allow_zero_page_size = true` to restore the legacy empty page (0 — and negatives, clamped to 0 — accepted on those surfaces). ListBuckets keeps the AWS-documented 1..=10,000 validation regardless.
 - The `[api.https]` section (or `--api https://`) requires both `cert` and `key` (PEM paths); missing → startup error.
 - `http` and `https` are mutually exclusive transports (three-choose-one with the local channel): at most one of `unix`/`pipe`/`http`/`https` may be enabled — the local channel is `unix` on Linux/macOS and `pipe` on Windows, so `unix` and `pipe` are mutually exclusive too; more than one is a startup error.
 - The local channel has two platform forms: `[api.unix]` `path` (Linux/macOS — socket path, relative to `.tinio/` unless absolute; default `tinio.sock`) and `[api.pipe]` `path` (Windows — named-pipe name, empty = derived `tinio-<sha1(root)>`). Use the platform-appropriate section; both participate in the three-choose-one exclusivity.

@@ -3,14 +3,19 @@
 //! Bucket lifecycle over the `buckets` table; the empty-check and removal of
 //! `delete_bucket` are one atomic write transaction (see [`crate::storage`]).
 
+use std::ops::Bound;
+
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::{
-    _core::{Bucket, BucketOps, bucket, from_nanos, now_nanos},
+    _core::{
+        Bucket, BucketOps, BucketsListing, ListBucketsParams, bucket, from_nanos, now_nanos,
+        paginate_ordered,
+    },
     Error,
     error::{already_exists, no_such_bucket, not_empty},
-    storage::{BUCKETS, MemoryStorage, OBJECTS, UPLOADS},
+    storage::{BUCKETS, MemoryStorage, OBJECTS, UPLOADS, band_start},
 };
 
 #[async_trait]
@@ -80,21 +85,73 @@ impl BucketOps for MemoryStorage {
             .ok_or_else(|| no_such_bucket(name))
     }
 
-    async fn list_buckets(&self) -> Result<Vec<Bucket>, Error> {
+    async fn list_buckets(&self, params: ListBucketsParams) -> Result<BucketsListing, Error> {
         let txn = self.db.begin_read()?;
         let buckets = txn.open_table(BUCKETS)?;
-        let out: Vec<Bucket> = buckets
-            .iter()?
-            .map(|entry| {
-                let (name, created) = entry?;
-                Ok(Bucket {
-                    name: name.value().into(),
-                    creation_time: from_nanos(created.value()),
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
         // BUCKETS is keyed by name, so iteration is already name order.
-        Ok(out)
+        // The range starts at the later of the key-prefix band and the
+        // resume marker (T06 — a deep resume never re-reads the skipped
+        // rows; the same seek as the object listing, mem/src/object.rs),
+        // and `take_while` stops at the first non-matching name — the
+        // prefix band is contiguous, so the scan never runs past it (an
+        // `Err` row passes through to the error cell; only a
+        // non-matching name ends the band). The engine stops one probe
+        // entry past the page; the sync scan runs inline on the async
+        // executor by design (mem is the reference backend, rows are
+        // owned copies, and the redb read txn is MVCC — no lock is
+        // held). A mid-scan table error fails the listing (the
+        // error-cell pattern of the object listing, mem/src/object.rs).
+        // F05: the lazy scan only touches the rows the engine visits
+        // (page + one probe), so a corrupt row BEYOND the page is never
+        // reached — the eager `collect` this replaced failed the whole
+        // listing on any error row in the band. Documented shift, not a
+        // bug: the full-band validation pass is exactly the cost P05
+        // removed; revisit if mem gains production use.
+        let mut scan_error = None;
+        let start = band_start(&params.prefix, params.start_after.as_deref());
+        let items = buckets
+            .range::<&str>((start, Bound::Unbounded))?
+            .take_while(|entry| {
+                entry
+                    .as_ref()
+                    .map(|(name, _)| name.value().starts_with(&params.prefix))
+                    .unwrap_or(true)
+            })
+            .filter_map(|entry| match entry {
+                Ok((name, created)) => {
+                    let name = name.value();
+                    if !name.starts_with(&params.prefix) {
+                        return None;
+                    }
+                    Some(Bucket {
+                        name: name.into(),
+                        creation_time: from_nanos(created.value()),
+                    })
+                }
+                Err(err) => {
+                    if scan_error.is_none() {
+                        scan_error = Some(err.into());
+                    }
+                    None
+                }
+            });
+        let (page, truncated, next) = paginate_ordered(
+            items,
+            None, // the scan applied the marker skip
+            params.max_buckets,
+            // One `String` order per scanned entry — the engine's owned
+            // order; immaterial at bucket counts (the S3 account ceiling
+            // is ~1,000 buckets).
+            |b| b.name.to_string(),
+        );
+        if let Some(err) = scan_error {
+            return Err(err);
+        }
+        Ok(BucketsListing {
+            buckets: page,
+            truncated,
+            next_start_after: next,
+        })
     }
 }
 
@@ -116,9 +173,14 @@ mod tests {
                 .unwrap();
         }
         let names: Vec<_> = storage
-            .list_buckets()
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
             .await
             .unwrap()
+            .buckets
             .into_iter()
             .map(|b| b.name.to_string())
             .collect();

@@ -75,9 +75,25 @@ impl<K: Clone + Eq + Hash> Map<K> {
             // clone landed); our clone then holds the only reference
             // (`strong_count == 1`) and we retry instead of locking an
             // orphaned mutex while a fresh slot occupies the key.
+            //
+            // F02: the clone is re-verified by IDENTITY against the live
+            // table entry, not by the count — the count reads `>= 2` for
+            // an orphaned slot too, when a concurrent `Guard::drop` is
+            // mid-flight (its own ref not yet dropped) after the
+            // eviction: the waiter would break and lock the orphaned
+            // mutex while a fresh slot already owns the key. The identity
+            // check is airtight: once this clone exists, the eviction
+            // predicate (`strong_count == 2`) can never fire for this
+            // slot, so a slot that passes the check cannot be evicted
+            // before `lock_owned`; a slot that fails it is retried (the
+            // cold path below inserts or finds the fresh owner).
             let slot = if let Some(live) = pinned.get(&key) {
                 let slot = Arc::clone(live);
-                if Arc::strong_count(&slot) >= 2 {
+                if Arc::strong_count(&slot) >= 2
+                    && pinned
+                        .get(&key)
+                        .is_some_and(|live| Arc::ptr_eq(live, &slot))
+                {
                     break slot;
                 }
                 continue;
@@ -133,7 +149,10 @@ impl<K: Clone + Eq + Hash> Drop for Guard<K> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use tokio::{task::yield_now, time::timeout};
 
@@ -206,5 +225,47 @@ mod tests {
         assert_eq!(map.len(), 1);
         drop(_held);
         assert!(map.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lock_split_is_impossible_under_contention() {
+        // F02 regression net: the hot path must never hand out a slot
+        // that was evicted between the table lookup and the clone. The
+        // bad interleaving: a waiter pins and borrows the slot, the
+        // holder's `Guard::drop` evicts it (the predicate saw
+        // `strong_count == 2` before the clone landed), then the waiter
+        // clones and — with the old `strong_count >= 2` check alone —
+        // locks the ORPHANED mutex while a fresh slot already owns the
+        // key. Two tasks then hold DIFFERENT mutexes for one key (the
+        // delete-vs-PUT race the map exists to prevent). The window is
+        // ~10ns of OS preemption, so no practical iteration count makes
+        // this test *reliably* fail on the old code; it is a probabilistic
+        // invariant net (and a deterministic failure if a future change
+        // widens the window). The fix's own airtightness is the identity
+        // re-check: once a waiter holds a clone, the eviction predicate
+        // (`strong_count == 2`) can never fire for that slot, so a slot
+        // that passes the identity check cannot be evicted before
+        // `lock_owned`. Deliberate runtime shape: a single-thread runtime
+        // cannot preempt mid-pin.
+        let map = Map::new();
+        let holders = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let map = map.clone();
+            let holders = Arc::clone(&holders);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..20_000 {
+                    let _guard = map.lock("k".to_string()).await;
+                    let prev = holders.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(prev, 0, "two tasks hold one key: the slot split (F02)");
+                    tokio::task::yield_now().await;
+                    holders.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(map.is_empty(), "the last drop must evict the slot");
     }
 }

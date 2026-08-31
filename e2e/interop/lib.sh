@@ -29,6 +29,19 @@ mkdir -p "$SCRATCH/root"
 # pids by command line; on Linux `ps -W` does not exist and we fall back to
 # the `$!` pid.
 stop_server() {
+    # The tracked PID always goes first (T03/F08): a pattern sweep must
+    # never REPLACE it — with a custom --server-binary the pattern would
+    # miss the script's own server, which would leak holding the redb
+    # lock (a later restart on the same root fails DatabaseAlreadyOpen).
+    # The pid/bin written by `start_server`'s subshell are the parent's
+    # only view of the tracked server (command substitution loses the
+    # variables themselves).
+    if [[ -z "$SERVER_PID" && -f "$SCRATCH/server.pid" ]]; then
+        SERVER_PID="$(cat "$SCRATCH/server.pid")"
+    fi
+    if [[ -n "$SERVER_PID" ]]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+    fi
     local pids
     pids="$(ps -W 2>/dev/null | awk '/debug[\\/]examples[\\/]serve/ {print $1}')" || true
     if [[ -n "$pids" ]]; then
@@ -44,7 +57,28 @@ stop_server() {
             sleep 0.1
         done
     else
-        [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
+        # POSIX fallback: `ps -W` does not exist; find serve processes
+        # by command line (the Windows pattern-kill above already
+        # handled Git Bash/MSYS). Anchored to OUR resolved binary path —
+        # a bare pattern like 'debug/examples/serve' would kill every
+        # matching process on the machine (other checkouts, a manual
+        # test session).
+        if [[ -z "$SERVER_BIN" && -f "$SCRATCH/server.bin" ]]; then
+            SERVER_BIN="$(cat "$SCRATCH/server.bin")"
+        fi
+        if [[ -n "$SERVER_BIN" ]]; then
+            local pgrep_pids
+            pgrep_pids="$(pgrep -f "$SERVER_BIN" 2>/dev/null)" || true
+            if [[ -n "$pgrep_pids" ]]; then
+                kill $pgrep_pids 2>/dev/null || true
+                for _ in $(seq 1 50); do
+                    if ! pgrep -f "$SERVER_BIN" > /dev/null 2>&1; then
+                        break
+                    fi
+                    sleep 0.1
+                done
+            fi
+        fi
     fi
     SERVER_PID=""
 }
@@ -75,17 +109,29 @@ ensure_server_binary() {
             fi
         fi
     fi
+    # `start_server` runs inside a command substitution: its subshell
+    # assignments are invisible to the parent, and `stop_server` needs
+    # the binary path for the Linux pid sweep. Persist it to the scratch
+    # root, the one path both sides share.
+    echo "$SERVER_BIN" > "$SCRATCH/server.bin"
 }
 
 # Start the server on an ephemeral port and echo the endpoint (after
 # polling the log for the readiness marker). The optional third argument
 # sets TINIO_SCANNER; any value other than 0/1 falls back to the config
-# gate, so passing "" is the unset behavior.
+# gate, so passing "" is the unset behavior. The optional fourth argument
+# is a config file passed through `--config` ("" = none).
 start_server() {
-    local root="$1" log="$2" scanner="${3:-}"
+    local root="$1" log="$2" scanner="${3:-}" config="${4:-}"
     ensure_server_binary
-    TINIO_SCANNER="$scanner" "$SERVER_BIN" "$root" --port 0 > "$log" 2>&1 &
+    local args=("$SERVER_BIN" "$root" --port 0)
+    if [[ -n "$config" ]]; then
+        args+=(--config "$config")
+    fi
+    TINIO_SCANNER="$scanner" "${args[@]}" > "$log" 2>&1 &
     SERVER_PID=$!
+    echo "$SERVER_PID" > "$SCRATCH/server.pid"
+
     local endpoint=""
     for _ in $(seq 1 50); do
         if grep -q "listening on" "$log" 2>/dev/null; then

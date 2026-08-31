@@ -33,6 +33,8 @@ use std::{
 #[cfg(unix)]
 use moka::sync::Cache;
 use strict_path::{PathBoundary, StrictPathError};
+#[cfg(unix)]
+use tokio::fs;
 use tokio::task::spawn_blocking;
 
 #[cfg(windows)]
@@ -168,7 +170,7 @@ impl DirId {
     #[cfg(test)]
     fn of(dir: &Path) -> IoResult<Self> {
         use std::os::unix::fs::MetadataExt;
-        let meta = metadata(dir)?;
+        let meta = std::fs::metadata(dir)?;
         Ok(Self {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -254,10 +256,10 @@ impl BoundaryCache {
     async fn boundary(&self, dir: &Path) -> Result<PathBoundary, Error> {
         #[cfg(unix)]
         {
-            if let Some((boundary, id)) = self.0.get(dir) {
-                if DirId::of_async(dir).await.ok() == Some(id) {
-                    return Ok(boundary);
-                }
+            if let Some((boundary, id)) = self.0.get(dir)
+                && DirId::of_async(dir).await.ok() == Some(id)
+            {
+                return Ok(boundary);
             }
         }
         let dir = dir.to_path_buf();
@@ -574,6 +576,42 @@ mod tests {
         // `.tinio` branch of `bucket_path` is unreachable through the
         // public constructor — defense in depth against a future change.
         assert!(bucket::name(".tinio").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bucket_path_refuses_windows_reserved_device_names() {
+        // "con" passes the S3 name grammar but aliases the console device
+        // on Windows — the platform charset refusal must reject it before
+        // any filesystem access.
+        let root = tempfile::tempdir().unwrap();
+        let name = bucket::name("con").unwrap();
+        let err = bucket_path_lexical(root.path(), &name).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Storage(StorageError::InvalidBucketName(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn map_key_path_refuses_a_missing_bucket_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = BoundaryCache::new();
+        let key = object::key("a.txt").unwrap();
+        // A vanished bucket dir (racing delete_bucket / out-of-band
+        // removal) cannot prove containment — the object cannot exist.
+        let missing = root.path().join("nope");
+        let err = map_key_path(&cache, &missing, &key, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(StorageError::NoSuchKey(_))));
+        // With a real bucket dir the same call proves containment and
+        // returns the lexical join.
+        let dir = bucket_dir(root.path(), "data");
+        assert_eq!(
+            map_key_path(&cache, &dir, &key, true).await.unwrap(),
+            dir.join("a.txt")
+        );
     }
 
     #[test]

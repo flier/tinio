@@ -509,44 +509,78 @@ impl FsStorage {
         Ok(path)
     }
 
-    /// Every bucket of the root: top-level directories with valid names
-    /// (the reserved `.tinio` state dir excluded), in name order. The
-    /// scanner and `list_buckets` share this walk — one source of truth
-    /// for what a bucket is.
+    /// Every bucket of the root matching `prefix`: top-level directories
+    /// with valid names (the reserved `.tinio` state dir excluded), in
+    /// name order. The scanner, cleanup, and `list_buckets` share this
+    /// walk — one source of truth for what a bucket is. The prefix
+    /// filter, UTF-8 validity, and name validity all run on the bare
+    /// `file_name()` BEFORE any stat — only prefix-matching candidate
+    /// names pay the entry classification, and a plain directory pays
+    /// nothing at all (the free dirent type decides; the bucket-level
+    /// analogue of the object walk's subtree pruning; `""` = no filter).
     ///
     /// A symlinked/junction bucket directory is a bucket only when
     /// `follow_symlinks` is enabled (it resolves to its target — the
     /// bucket *is* the target); with following disabled it is invisible.
-    pub(crate) async fn bucket_names(&self) -> Result<Vec<bucket::Name>, Error> {
+    ///
+    /// The collected form of the streaming [`Self::for_each_bucket_name`]
+    /// — the scanner and cleanup need the full list; `list_buckets`
+    /// feeds the stream into the bounded pagination engine instead.
+    pub(crate) async fn bucket_names(&self, prefix: &str) -> Result<Vec<bucket::Name>, Error> {
         let mut out = Vec::new();
+        self.for_each_bucket_name(prefix, |name| out.push(name))
+            .await?;
+        out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        Ok(out)
+    }
+
+    /// Visit every bucket of the root matching `prefix`, one at a time —
+    /// the streaming form of [`Self::bucket_names`] (the same name
+    /// checks, the same follow policy; one source of truth for what a
+    /// bucket is). The `list_buckets` producer feeds the visitor into
+    /// the bounded pagination engine, so a page costs O(page) memory —
+    /// no full collection, no sort.
+    async fn for_each_bucket_name(
+        &self,
+        prefix: &str,
+        mut visit: impl FnMut(bucket::Name),
+    ) -> Result<(), Error> {
         let mut entries = fs::read_dir(self.root()).await?;
         while let Some(entry) = entries.next_entry().await? {
-            // lstat: a link entry is judged by its resolved target only
-            // when following is enabled (a broken link is skipped).
-            let lmeta = match fs::symlink_metadata(entry.path()).await {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue; // non-UTF8 names cannot be bucket names
             };
-            let mut is_dir = lmeta.is_dir();
-            if self.follow_symlinks && fsutil::is_symlink_or_reparse(&lmeta) {
-                is_dir = fs::metadata(entry.path())
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
-            }
-            if !is_dir {
-                continue; // root-level files (and non-dir links) are not buckets
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            // No I/O and no allocation before this point: a non-matching
+            // name is dropped on the borrowed `&str`.
+            if !name.starts_with(prefix) {
                 continue;
-            };
+            }
             let Ok(name) = bucket::name(name) else {
                 continue; // invalid names (incl. `.tinio`) are not buckets
             };
-            out.push(name);
+            if self.entry_is_bucket_dir(&entry).await {
+                visit(name);
+            }
         }
-        out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        Ok(out)
+        Ok(())
+    }
+
+    /// Whether a root entry is a bucket directory under the follow policy
+    /// (the caller has already filtered the name). A plain directory is a
+    /// bucket with NO stat — the entry type is free on both platforms
+    /// (unix `d_type`, Windows `FindNextFile` data) — and a root-level
+    /// file is not a bucket with no stat either; only a symlinked/junction
+    /// entry pays, and only when following is enabled (its resolved
+    /// target must be a directory; a broken link is skipped). The
+    /// follow-policy classification itself lives in
+    /// [`fsutil::dir_entry_kind`] (A1 — the same policy the object walk
+    /// uses).
+    async fn entry_is_bucket_dir(&self, entry: &fs::DirEntry) -> bool {
+        match fsutil::dir_entry_kind(entry, self.follow_symlinks).await {
+            Ok(kind) => kind.is_dir,
+            Err(_) => false, // vanished mid-sweep — skipped
+        }
     }
 
     /// Delete the whole derived state of a bucket — the `BUCKETS` row and

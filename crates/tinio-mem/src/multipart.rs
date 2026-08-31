@@ -4,7 +4,7 @@
 //! completion, and abort each run in one write transaction; part keys are
 //! zero-padded so string order equals part-number order.
 
-use std::time::SystemTime;
+use std::{ops::Bound, time::SystemTime};
 
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable};
@@ -23,11 +23,20 @@ use crate::{
         no_such_bucket,
     },
     storage::{
-        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, check_bucket,
-        check_upload, collect_part_keys, object_key, parse_part_number, part_key, remove_all_parts,
-        upload_key,
+        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_META, PARTS, UPLOADS, band_start,
+        check_bucket, check_upload, collect_part_keys, object_key, parse_part_number, part_key,
+        remove_all_parts, upload_key,
     },
 };
+
+/// One in-progress upload of the lazy `list_multipart_uploads` scan — the
+/// engine's item without the bucket. `params.bucket` is attached when the
+/// page is built: one clone per emitted upload, not per scanned row.
+struct UploadRow {
+    key: object::Key,
+    upload_id: String,
+    initiated_at: u64,
+}
 
 #[async_trait]
 impl MultipartOps for MemoryStorage {
@@ -152,7 +161,10 @@ impl MultipartOps for MemoryStorage {
         let prefix = format!("{}\0", params.upload_id);
         // The zero-padded part keys are string-ordered by number, so the
         // scan starts just after the marker and stops one probe part past
-        // the page — a page costs O(page) reads, not O(total parts).
+        // the page — a page costs O(page) reads, not O(total parts). The
+        // sync scan runs inline on the async executor by design (mem is
+        // the reference backend, rows are owned copies, and the redb read
+        // txn is MVCC — no lock is held).
         let start = match params.part_number_marker {
             Some(marker) => part_key(&params.upload_id, marker.saturating_add(1)),
             None => prefix.clone(),
@@ -344,43 +356,80 @@ impl MultipartOps for MemoryStorage {
         }
         let uploads = txn.open_table(UPLOADS)?;
         let bucket_prefix = format!("{}\0", params.bucket.as_ref().as_str());
-        let upload_list: Vec<MultipartUpload> = uploads
-            .range(bucket_prefix.as_str()..)?
+        // The resume marker (composite `key\0upload_id`; a bare key
+        // marker sorts after every upload of that key) is computed BEFORE
+        // the range so the scan can seek past it (T02).
+        let marker = key_marker_order(
+            params.key_marker.as_deref(),
+            params.upload_id_marker.as_deref(),
+        );
+        // T02: the scan starts at the later of the key-prefix band and
+        // the resume marker (exclusive) — a deep resume or a sparse
+        // prefix never re-reads the rows before the marker (the seek the
+        // object listing already uses, mem/src/object.rs).
+        let prefix_bound = format!("{bucket_prefix}{}", params.prefix);
+        let marker_bound = marker.as_deref().map(|m| format!("{bucket_prefix}{m}"));
+        let start = band_start(&prefix_bound, marker_bound.as_deref());
+        // The lazy scan feeds the engine directly — it stops one probe
+        // entry past the page, so only the rows the page touches are
+        // materialized (no full-bucket Vec). The engine's item carries no
+        // bucket; `params.bucket` is attached when the page is built (one
+        // clone per emitted upload, not per scanned row). The sync scan
+        // runs inline on the async executor by design (mem is the
+        // reference backend, rows are owned copies, and the redb read txn
+        // is MVCC — no lock is held). An `Err` row fails the listing via
+        // the error cell (the pattern of mem/src/object.rs).
+        let mut scan_error = None;
+        let items = uploads
+            .range::<&str>((start, Bound::Unbounded))?
             .take_while(|entry| {
+                // `Err` rows pass through to the error cell — only a
+                // non-matching key ends the scan: the bucket's key-prefix
+                // band (the bucket bound is implied by the range start,
+                // but the explicit check also guards the slice below and
+                // terminates at the next bucket's rows — keys never
+                // contain `\0`, so the band is contiguous).
                 entry
                     .as_ref()
-                    .map(|(k, _)| k.value().starts_with(&bucket_prefix))
-                    .unwrap_or(false)
+                    .map(|(k, _)| {
+                        let rest = &k.value()[bucket_prefix.len()..];
+                        k.value().starts_with(&bucket_prefix) && rest.starts_with(&params.prefix)
+                    })
+                    .unwrap_or(true)
             })
             .filter_map(|entry| match entry {
                 Ok((k, v)) => {
                     let rest = &k.value()[bucket_prefix.len()..];
-                    let (key, upload_id) = rest.rsplit_once('\0')?;
+                    let Some((key, upload_id)) = rest.rsplit_once('\0') else {
+                        return None; // malformed row — skipped, never a panic
+                    };
                     if !key.starts_with(&params.prefix) {
                         return None;
                     }
-                    Some(Ok(MultipartUpload {
+                    let Ok(key) = object::key(key) else {
+                        return None; // tampered row — skipped like list_objects
+                    };
+                    Some(UploadRow {
+                        key,
                         upload_id: upload_id.to_string(),
-                        bucket: params.bucket.clone(),
-                        key: object::key(key).ok()?,
-                        initiated_at: from_nanos(v.value()),
-                    }))
+                        initiated_at: v.value(),
+                    })
                 }
-                Err(e) => Some(Err(database_storage(e))),
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+                Err(e) => {
+                    if scan_error.is_none() {
+                        scan_error = Some(database_storage(e));
+                    }
+                    None
+                }
+            });
         // Compound keys (`bucket\0key\0upload_id`) scan in (key, id) order,
         // so key order — and thus delimiter grouping — needs no re-sort.
         // The resume marker pairs the key with the upload id, so a page
         // can position inside a same-key group (S3 `upload-id-marker`); a
         // bare key marker skips the whole key group — the conversion has
         // one home in tinio-core (shared with the fs backend).
-        let marker = key_marker_order(
-            params.key_marker.as_deref(),
-            params.upload_id_marker.as_deref(),
-        );
-        let (keys, common_prefixes, truncated, next) = group_and_paginate_ordered(
-            upload_list,
+        let (rows, common_prefixes, truncated, next) = group_and_paginate_ordered(
+            items,
             &params.prefix,
             params.delimiter.as_deref(),
             marker.as_deref(),
@@ -388,6 +437,18 @@ impl MultipartOps for MemoryStorage {
             |u| u.key.as_ref(),
             |u| uploads_order(&u.key, &u.upload_id),
         );
+        if let Some(err) = scan_error {
+            return Err(err);
+        }
+        let uploads = rows
+            .into_iter()
+            .map(|u| MultipartUpload {
+                upload_id: u.upload_id,
+                bucket: params.bucket.clone(),
+                key: u.key,
+                initiated_at: from_nanos(u.initiated_at),
+            })
+            .collect();
         let (next_key, next_upload_id) = match next {
             Some(next) => {
                 let (key, upload_id) = split_uploads_order(&next);
@@ -396,7 +457,7 @@ impl MultipartOps for MemoryStorage {
             None => (None, None),
         };
         Ok(UploadsListing {
-            uploads: keys,
+            uploads,
             common_prefixes,
             truncated,
             next_key_marker: next_key,

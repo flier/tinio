@@ -196,10 +196,12 @@ impl FsCleanup {
         };
         // D-B: this stage always routes through the removal lane — one
         // `RemoveTask` per leftover (fire-and-forget; an enqueue failure
-        // is warned inside and the leftover stays for the scanner). The
-        // lane is the storage's own (`FsStorage::remove_pipeline`):
-        // offline contexts wire an `InlineRunner` there, so the inline
-        // form is the same lane's synchronous run.
+        // is warned inside and the leftover stays for the scanner; a
+        // removal failure is error-logged from the detached awaiter,
+        // F03). The lane is the storage's own
+        // (`FsStorage::remove_pipeline`): offline contexts wire an
+        // `InlineRunner` there, so the inline form is the same lane's
+        // synchronous run.
         let runner = self.storage.remove_pipeline();
         for (path, name) in entries {
             record_repair(
@@ -232,7 +234,7 @@ impl FsCleanup {
     /// A `.tinio` *file* (out-of-band) is cleared too — the reserved name
     /// is tinio's at any depth.
     async fn repair_bucket_staging(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
-        let buckets = match self.storage.bucket_names().await {
+        let buckets = match self.storage.bucket_names("").await {
             Ok(buckets) => buckets,
             Err(err) => {
                 actions.push(Err(err));
@@ -552,7 +554,7 @@ impl FsCleanup {
     async fn repair_meta_orphans(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
         // Every live bucket (the store's own source of truth), then the
         // `OBJECT_META` entries of each — one bucket range scan per walk.
-        let buckets = match self.storage.bucket_names().await {
+        let buckets = match self.storage.bucket_names("").await {
             Ok(buckets) => buckets,
             Err(err) => {
                 actions.push(Err(err));
@@ -650,7 +652,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    use std::{fs::OpenOptions, time::SystemTime};
+    use std::{fs::OpenOptions, sync::Arc, time::SystemTime};
 
     use futures::StreamExt;
     use tokio::fs;
@@ -659,6 +661,7 @@ mod tests {
     use crate::{
         _core::{
             bucket, object,
+            pipeline::InlineRunner,
             storage::{BucketOps, ObjectOps},
         },
         _util::testing::body,
@@ -1506,8 +1509,8 @@ mod tests {
         }
         let (following, reported, residue_exists) = run(true).await;
         assert!(following && reported && !residue_exists);
-        let (not_following, reported, residue_exists) = run(false).await;
-        assert!(not_following && !reported && residue_exists);
+        let (follow, reported, residue_exists) = run(false).await;
+        assert!(!follow && !reported && residue_exists);
     }
 
     #[cfg(unix)]
@@ -1663,5 +1666,96 @@ mod tests {
             .unwrap();
         assert_eq!(errs, 1, "the unreadable upload dir must be reported");
         assert!(blocked.exists(), "nothing is removed on a read failure");
+    }
+
+    #[tokio::test]
+    async fn stray_files_in_the_multipart_tree_are_ignored() {
+        // Stage 4 (orphan upload dirs) skips non-directory entries at
+        // both levels of the `multipart/` tree: a stray file where a
+        // bucket dir is expected, and one where an upload dir is
+        // expected. Neither is an orphan, neither is removed, and the
+        // repair reports no error for them.
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("live").unwrap();
+        let stray = bucket::name("stray").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&stray).await.unwrap();
+        fs::create_dir_all(state.path().join("multipart/live"))
+            .await
+            .unwrap();
+        // A stray file where the upload dir is expected.
+        fs::write(state.path().join("multipart/live/stray-part"), b"x")
+            .await
+            .unwrap();
+        // A stray file where a bucket dir is expected (the name is a
+        // live bucket, so stage 3's orphan probe skips it too).
+        fs::write(state.path().join("multipart/stray"), b"x")
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+        let mut errs = 0;
+        while let Some(action) = actions.next().await {
+            if action.is_err() {
+                errs += 1;
+            }
+        }
+        assert_eq!(errs, 0, "stray files must not fail the repair");
+        assert!(state.path().join("multipart/live/stray-part").exists());
+        assert!(state.path().join("multipart/stray").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_tombstone_enqueue_failure_is_reported() {
+        // A tombstone whose removal-lane enqueue is rejected (a
+        // shut-down pipeline) is REPORTED as an error action — the
+        // action stream must never say "enqueued" when it was not — and
+        // the leftover stays for the scanner.
+        let root = tempfile::tempdir().unwrap();
+        let lane = Arc::new(InlineRunner::default());
+        lane.shutdown();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                remove_pipeline: lane,
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let tombstone = root
+            .path()
+            .join(".tinio")
+            .join("deleting")
+            .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        fs::create_dir_all(&tombstone).await.unwrap();
+        fs::write(tombstone.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let mut actions = cleanup.repair(RepairKind::Startup).await.unwrap();
+        let mut errs = 0;
+        while let Some(action) = actions.next().await {
+            if action.is_err() {
+                errs += 1;
+            }
+        }
+        assert_eq!(errs, 1, "the rejected enqueue must be reported");
+        assert!(
+            tombstone.exists(),
+            "the leftover stays for the scanner (never a false removal)"
+        );
     }
 }

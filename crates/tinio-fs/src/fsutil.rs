@@ -41,6 +41,135 @@ pub(crate) fn is_symlink_or_reparse(metadata: &Metadata) -> bool {
     }
 }
 
+/// The follow-policy classification of a dirent — one shared home for
+/// both walks (the object listing's [`crate::listing`] and the
+/// bucket-name sweep, A1): `is_dir` under `follow_symlinks`, plus
+/// `stat`, the metadata a caller can reuse as the entry's object stat.
+/// Reuse rules: Windows find-data is free and always carried for a
+/// plain entry (zero-syscall object stat); a followed symlink/junction
+/// keeps its directory probe's target metadata, so a link-to-file leaf
+/// pays ONE stat (E2); a broken or unfollowed link carries `None` and
+/// the caller's own stat path reports it. `Err` = the classification
+/// itself failed (a vanished entry, an unreadable dirent) — the callers
+/// map it per their error policy (the bucket sweep skips, the object
+/// walk skips `NotFound` and fails on anything else).
+pub(crate) struct EntryKind {
+    pub(crate) is_dir: bool,
+    pub(crate) is_symlink: bool,
+    pub(crate) stat: Option<Metadata>,
+}
+
+pub(crate) async fn dir_entry_kind(
+    entry: &fs::DirEntry,
+    follow_symlinks: bool,
+) -> io::Result<EntryKind> {
+    // Unix: the free `d_type` classifies first (DT_UNKNOWN auto-falls
+    // back to a stat inside std — T07 platform assumption: that
+    // fallback lstat runs inline on the async worker, unobservable on
+    // mainstream filesystems, which always return d_type); a plain
+    // directory needs no stat, and a plain file is dropped without one.
+    #[cfg(unix)]
+    {
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            return Ok(EntryKind {
+                is_dir: true,
+                is_symlink: false,
+                stat: None,
+            });
+        }
+        if !file_type.is_symlink() {
+            return Ok(EntryKind {
+                is_dir: false,
+                is_symlink: false,
+                stat: None,
+            });
+        }
+        if !follow_symlinks {
+            return Ok(EntryKind {
+                is_dir: false,
+                is_symlink: true,
+                stat: None,
+            });
+        }
+        // The resolved target must be a directory; a broken link (or an
+        // unreadable target) is not — the caller's stat path reports it.
+        match fs::metadata(entry.path()).await {
+            Ok(probe) => {
+                let is_dir = probe.is_dir();
+                Ok(EntryKind {
+                    is_dir,
+                    is_symlink: true,
+                    stat: Some(probe),
+                })
+            }
+            Err(_) => Ok(EntryKind {
+                is_dir: false,
+                is_symlink: true,
+                stat: None,
+            }),
+        }
+    }
+    // Windows: the entry metadata is free (the `FindNextFile` data) and
+    // carries the reparse-point attribute the junction detection needs —
+    // one free call replaces the paid path lstat, and the same metadata
+    // doubles as the object's stat. A followed junction probes the
+    // target (E2); a broken junction carries `None` (the caller's stat
+    // path reports it, NotFound → skipped).
+    #[cfg(windows)]
+    {
+        let metadata = entry.metadata().await?;
+        let is_symlink = is_symlink_or_reparse(&metadata);
+        if !is_symlink {
+            return Ok(EntryKind {
+                is_dir: metadata.is_dir(),
+                is_symlink: false,
+                stat: Some(metadata),
+            });
+        }
+        if !follow_symlinks {
+            return Ok(EntryKind {
+                is_dir: false,
+                is_symlink: true,
+                stat: None,
+            });
+        }
+        match fs::metadata(entry.path()).await {
+            Ok(probe) => {
+                let is_dir = probe.is_dir();
+                Ok(EntryKind {
+                    is_dir,
+                    is_symlink: true,
+                    stat: Some(probe),
+                })
+            }
+            Err(_) => Ok(EntryKind {
+                is_dir: false,
+                is_symlink: true,
+                stat: None,
+            }),
+        }
+    }
+    // Other platforms: the paid lstat path (no free dirent type).
+    #[cfg(not(any(unix, windows)))]
+    {
+        let lmeta = fs::symlink_metadata(entry.path()).await?;
+        let mut is_dir = lmeta.is_dir();
+        let is_symlink = is_symlink_or_reparse(&lmeta);
+        if follow_symlinks
+            && is_symlink
+            && let Ok(meta) = fs::metadata(entry.path()).await
+        {
+            is_dir = meta.is_dir();
+        }
+        Ok(EntryKind {
+            is_dir,
+            is_symlink,
+            stat: None,
+        })
+    }
+}
+
 /// Open `path` for reading. When `follow_symlinks` is false, the leaf
 /// is opened with `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` so a
 /// TOCTOU swap to a symlink cannot escape the storage root.
@@ -168,6 +297,14 @@ pub(crate) async fn latest_part_mtime(dir: &Path) -> io::Result<Option<SystemTim
     Ok(found.then_some(latest))
 }
 
+/// The unix identity formula (dev ^ ino, rotated) — one definition for
+/// all three identity functions.
+#[cfg(unix)]
+fn unix_dev_ino(metadata: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.dev() ^ metadata.ino().rotate_left(32)
+}
+
 /// The stable identity of a file: unix dev+inode; Windows volume serial
 /// combined with file index (`GetFileInformationByHandle` — std's
 /// `MetadataExt` equivalents are nightly-gated). `0` where the platform
@@ -179,9 +316,8 @@ pub(crate) async fn latest_part_mtime(dir: &Path) -> io::Result<Option<SystemTim
 pub(crate) fn file_identity(path: &Path, metadata: &Metadata) -> u64 {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         let _ = path;
-        metadata.dev() ^ metadata.ino().rotate_left(32)
+        unix_dev_ino(metadata)
     }
     #[cfg(windows)]
     {
@@ -200,28 +336,17 @@ pub(crate) fn file_identity(path: &Path, metadata: &Metadata) -> u64 {
 
 /// The stable identity of an **already-open** file (R3 — the identity
 /// comes from the handle that was opened under the symlink policy, never
-/// a second path-based open). Same rules as [`file_identity`] — unix
-/// dev+inode from `metadata`, Windows volume serial + file index from
-/// the handle. The async sites use the [`file_identity_async`] bridge;
-/// the remaining path-based [`file_identity`] callers are the walks and
-/// post-commit stats, which have no handle in hand.
+/// a second path-based open). Windows-only: the identity is the volume
+/// serial + file index from the handle — unix derives dev+inode from
+/// the metadata alone (no handle needed), and the remaining platforms
+/// report 0 from the path-based [`file_identity`]. The async sites use
+/// the [`file_identity_async`] bridge; the path-based [`file_identity`]
+/// callers are the walks and post-commit stats, which have no handle in
+/// hand.
+#[cfg(windows)]
 pub(crate) fn file_identity_handle(file: &File, metadata: &Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let _ = file;
-        metadata.dev() ^ metadata.ino().rotate_left(32)
-    }
-    #[cfg(windows)]
-    {
-        let _ = metadata;
-        windows_handle_identity(file).unwrap_or(0)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (file, metadata);
-        0
-    }
+    let _ = metadata;
+    windows_handle_identity(file).unwrap_or(0)
 }
 
 /// The async bridge of [`file_identity_handle`]: the identity of an
@@ -232,9 +357,8 @@ pub(crate) fn file_identity_handle(file: &File, metadata: &Metadata) -> u64 {
 pub(crate) async fn file_identity_async(file: &mut fs::File, metadata: &Metadata) -> u64 {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         let _ = file;
-        metadata.dev() ^ metadata.ino().rotate_left(32)
+        unix_dev_ino(metadata)
     }
     #[cfg(windows)]
     {
@@ -316,6 +440,9 @@ pub(crate) fn copy_file_range(src: &File, offset: u64, len: u64, dst: &File) -> 
 /// The sync streaming content MD5 of a `Read` (F43) — the blocking
 /// counterpart of [`md5_stream_async`], used where the hash already
 /// runs on a blocking thread (`write.rs`'s `stage_copy` copy closure).
+/// The sole caller (`stage_copy`) is unix-gated (`copy_file_range`), so
+/// the function is unix-only.
+#[cfg(unix)]
 pub(crate) fn md5_stream<R: io::Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<[u8; 16]> {
     use md5::Digest;
     let mut hasher = Md5::new();
@@ -377,6 +504,22 @@ pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Ensure `dir` exists — one probe instead of the per-component walk of
+/// `create_dir_all` (the fs-backed directory idiom: the dir exists in
+/// steady state — the write tmp dir, a PUT's parent chain, the
+/// tombstone staging dir). Returns whether it was created (the commit
+/// path's ancestor-chain sync decision, F03).
+pub(crate) async fn ensure_dir(dir: &Path) -> io::Result<bool> {
+    match fs::try_exists(dir).await {
+        Ok(true) => Ok(false),
+        Ok(false) => {
+            fs::create_dir_all(dir).await?;
+            Ok(true)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// The entries of `dir` (a missing directory is empty), as `(path, name)`
 /// pairs. Shared by the startup repair, the sweep, and the tombstone
 /// leftover enumeration.
@@ -398,8 +541,13 @@ pub(crate) async fn entries_of(dir: &Path) -> Result<Vec<(PathBuf, String)>, Err
 
 #[cfg(test)]
 mod tests {
+    use std::fs::write;
+    #[cfg(unix)]
+    use std::io::Cursor;
+    #[cfg(windows)]
     use std::{
-        fs::{File, metadata, rename, write},
+        fs::{File, metadata, rename},
+        io::ErrorKind,
         time::{Duration, SystemTime},
     };
 
@@ -428,5 +576,149 @@ mod tests {
         rename(&fresh, &path).unwrap();
         let replaced = file_identity(&path, &metadata(&path).unwrap());
         assert_ne!(first, replaced, "a replacement must change the identity");
+    }
+
+    #[tokio::test]
+    async fn object_metadata_follows_symlinks_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        write(&path, b"x").unwrap();
+        // Both policies on a plain file: the follow toggle is the only
+        // difference (stat vs lstat).
+        let followed = object_metadata(&path, true).await.unwrap();
+        let not_followed = object_metadata(&path, false).await.unwrap();
+        assert!(followed.is_file() && not_followed.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn md5_stream_hashes_chunked_and_empty_input() {
+        // The sync counterpart of the async hash (F43) — the same
+        // streaming loop over a caller-sized buffer.
+        let mut buf = [0u8; 8];
+        let digest = md5_stream(&mut Cursor::new(b"hello world"), &mut buf).unwrap();
+        assert_eq!(
+            digest,
+            *b"\x5e\xb6\x3b\xbb\xe0\x1e\xee\xd0\x93\xcb\x22\xbb\x8f\x5a\xcd\xc3"
+        );
+        let empty = md5_stream(&mut Cursor::new(Vec::<u8>::new()), &mut buf).unwrap();
+        assert_eq!(
+            empty,
+            *b"\xd4\x1d\x8c\xd9\x8f\x00\xb2\x04\xe9\x80\x09\x98\xec\xf8\x42\x7e"
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_of_missing_is_empty_and_files_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing directory is empty — never an error (startup repair,
+        // sweep, tombstone enumeration all rely on it).
+        let missing = dir.path().join("nope");
+        assert_eq!(
+            entries_of(&missing).await.unwrap(),
+            Vec::<(PathBuf, String)>::new()
+        );
+        // A file where a directory is expected is an error (NotADirectory),
+        // never a silent empty list.
+        let file = dir.path().join("f");
+        write(&file, b"x").unwrap();
+        assert!(entries_of(&file).await.is_err());
+        // Normal directory listing: path + lossy name pairs.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        write(sub.join("a.txt"), b"1").unwrap();
+        let out = entries_of(&sub).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, sub.join("a.txt"));
+        assert_eq!(out[0].1, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn latest_part_mtime_tracks_only_part_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path().join("other.txt"), b"x").unwrap();
+        write(dir.path().join("part-1"), b"x").unwrap();
+        // Non-part entries are skipped; the part mtime wins.
+        assert!(latest_part_mtime(dir.path()).await.unwrap().is_some());
+        // No part files at all: the callers apply their own fallback.
+        let empty = tempfile::tempdir().unwrap();
+        write(empty.path().join("other.txt"), b"x").unwrap();
+        assert!(latest_part_mtime(empty.path()).await.unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_part_mtime_skips_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A non-UTF8 name is skipped, not fatal.
+        let name = std::ffi::OsString::from_vec(b"part-\xFF".to_vec());
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+        assert!(latest_part_mtime(dir.path()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn is_absent_never_reports_errors_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing → true; present → false.
+        assert!(is_absent(&dir.path().join("missing")).await.unwrap());
+        let file = dir.path().join("f");
+        write(&file, b"x").unwrap();
+        assert!(!is_absent(&file).await.unwrap());
+        // F11: any non-NotFound error propagates — a live object whose
+        // path is temporarily unreadable must not look "gone".
+        #[cfg(windows)]
+        {
+            // `:` is the NTFS alternate-data-stream separator (so
+            // `bad:name` is a missing base file → NotFound); an
+            // unresolvable character is a hard non-NotFound error.
+            let bad = dir.path().join("bad<name>");
+            let err = is_absent(&bad).await.unwrap_err();
+            assert_ne!(err.kind(), ErrorKind::NotFound);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_nofollow_rejects_a_symlink_leaf() {
+        use std::os::windows::fs::symlink_file;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        write(&target, b"x").unwrap();
+        // A plain file opens fine under the nofollow policy.
+        assert!(open_nofollow_std(&target).is_ok());
+        // A symlink leaf: FILE_FLAG_OPEN_REPARSE_POINT opens the link and
+        // the post-open check refuses it (R3) — skip when the link cannot
+        // be created (no Developer Mode / privilege).
+        let link = dir.path().join("link.txt");
+        if symlink_file(&target, &link).is_err() {
+            return;
+        }
+        let err = open_nofollow_std(&link).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_tree_propagates_a_locked_tree() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        // An open handle with sharing denied blocks the Windows tree
+        // removal — the error must propagate (a live tree is never
+        // "gone"). Neither the read-only attribute (std's
+        // `remove_dir_all` clears it before deleting) nor the default
+        // share mode (std opens with FILE_SHARE_DELETE) counts as a
+        // lock; only a share-mode-0 handle does.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(inner.join("locked.txt"))
+            .unwrap();
+        assert!(remove_tree(&inner).await.is_err());
+        drop(file);
     }
 }

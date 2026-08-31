@@ -335,5 +335,14 @@ mod tests {
             Error::InvalidBucketName(_)
         ));
         assert!(matches!(invalid_etag(InvalidFormat), Error::InvalidETag(_)));
+        let err = part_too_small(2, 5 * 1024 * 1024, 100);
+        match err {
+            Error::PartTooSmall {
+                part_number,
+                min_bytes,
+                actual,
+            } => assert_eq!((part_number, min_bytes, actual), (2, 5 * 1024 * 1024, 100)),
+            other => panic!("expected PartTooSmall, got {other:?}"),
+        }
     }
 }

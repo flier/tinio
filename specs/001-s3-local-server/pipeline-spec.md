@@ -6,6 +6,7 @@
 > Scope: pipelined batched ETag computation and batched meta writes for the cold-list/cold-scan paths, write-lock latency statistics, and pipeline observability
 > Revision (2026-08-29, F47/F10): the `toml_edit` write path was dropped as unmotivated (F47 — plain `toml` is the single serializer and the root `toml_edit` pin was removed, §3.3/Q8); the pipeline/write-lock families are registered once at startup and served by a reserved `GET /metrics` on the data-plane listener (F10, decided at the data-path review — the token-gated management-plane endpoint follows T075, §4)
 > Revision (2026-08-30, removal lane): a third pipeline `[pipeline.remove]` (default 1 worker, capacity 1024) walks unpublished delete-bucket trees; `Pipelines<IoResult, RemoveResult, DbResult>` — IO is `etag::Result`, remove and DB are `Result<(), tinio_fs::Error>`. Shutdown still IO/remove first, DB last; removal drain is not awaited (unbounded `remove_dir_all`).
+> Revision (2026-08-31, F07): `Pipelines::drain` now awaits the removal lane with a bounded 10 s timeout (overlapping the IO drain) — a graceful stop no longer orphans in-flight tree walks, while a huge `remove_dir_all` still cannot stall shutdown; an interrupted walk is reclaimed by the next startup repair (D-B) or scanner pass.
 
 ---
 

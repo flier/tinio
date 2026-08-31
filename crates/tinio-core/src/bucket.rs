@@ -149,6 +149,14 @@ mod tests {
     }
 
     #[test]
+    fn bucket_name_from_owned_string() {
+        // The owned-string conversion (used by wire payloads) accepts a
+        // valid name.
+        let n = Name::from("my-bucket".to_string());
+        assert_eq!(n.as_ref(), "my-bucket");
+    }
+
+    #[test]
     #[should_panic]
     fn bucket_name_from_invalid_panics() {
         let _: Name = "Big".into();

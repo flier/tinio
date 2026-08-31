@@ -20,7 +20,7 @@ use futures::StreamExt;
 use sweep::{Options, Sweeper};
 use tinio_config::{
     Config,
-    log::{self, AccessFormat, Format, Verbosity},
+    log::{AccessFormat, Format, Verbosity},
     pipeline,
 };
 use tinio_core::{
@@ -58,6 +58,17 @@ fn write_lock_stats(snapshot: WriteLockSnapshot) -> WriteLockStats {
         wait_max_us: snapshot.wait_max_us,
         total_sum_us: snapshot.total_sum_us,
         total_max_us: snapshot.total_max_us,
+    }
+}
+
+/// `[s3]` capability toggles and page-size caps from the parsed config
+/// (FR-021); without an `[s3]` section the defaults apply. (The bool
+/// toggles used to be dropped here — the plane was built with
+/// `Capabilities::default()` even when a config set them.)
+fn capabilities_for(config: &Option<Config>) -> Capabilities {
+    match config.as_ref().and_then(|c| c.s3.as_ref()) {
+        Some(s3) => Capabilities::from(s3),
+        None => Capabilities::default(),
     }
 }
 
@@ -120,7 +131,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let pipeline_config = match &config {
         Some(config) => config.pipeline.clone().unwrap_or_default(),
-        None => Config::default(),
+        None => pipeline::Config::default(),
     };
     let pipelines = Pipelines::build(&pipeline_config)?;
     let mut storage = FsStorage::new(
@@ -202,20 +213,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         sweeper.run(sweep_rx).await;
     });
 
+    let caps = capabilities_for(&config);
+
     // The `/metrics` scrape endpoint (F10): the plane's hook refreshes
     // the pipeline gauges and the write-lock histograms on every scrape.
     let metrics_storage = storage.clone();
     let metrics_io = pipelines.io();
     let metrics_db = pipelines.db();
-    let plane =
-        DataPlane::new_with_auth(storage, Capabilities::default(), "minioadmin", "minioadmin")
-            .with_metrics(Arc::new(move || {
-                metrics::refresh(
-                    metrics_io.stats(),
-                    metrics_db.stats(),
-                    write_lock_stats(metrics_storage.write_lock_stats()),
-                );
-            }));
+    let plane = DataPlane::new_with_auth(storage, caps, "minioadmin", "minioadmin").with_metrics(
+        Arc::new(move || {
+            metrics::refresh(
+                metrics_io.stats(),
+                metrics_db.stats(),
+                write_lock_stats(metrics_storage.write_lock_stats()),
+            );
+        }),
+    );
     plane.serve(listener, shutdown_tx.subscribe()).await?;
     // Stop the scanner and the sweeper BEFORE the pipelines: the watch
     // signals take effect at the next pass boundary, so awaiting the
@@ -237,4 +250,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // new shutdown semantics).
     pipelines.drain().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_for_maps_s3_max_buckets() {
+        // A regression back to `Capabilities::default()` here would make
+        // this 10,000 and pass CI silently — this pins the wiring.
+        let config = Config::parse("version = 1\n[s3]\nmax_buckets = 3").unwrap();
+        assert_eq!(capabilities_for(&Some(config)).max_buckets, 3);
+    }
+
+    #[test]
+    fn capabilities_for_defaults_without_s3_section() {
+        assert_eq!(capabilities_for(&None), Capabilities::default());
+    }
 }

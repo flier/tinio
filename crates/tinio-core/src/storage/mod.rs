@@ -33,15 +33,16 @@ mod time;
 use std::error::Error as StdError;
 
 pub use body::{BodyStream, collect_body};
-pub use bucket::BucketOps;
+pub use bucket::{BucketOps, BucketsListing, ListBucketsParams};
 pub use error::{
     Error, access_denied, already_exists, entity_too_large, invalid_bucket_name, invalid_etag,
     invalid_key, invalid_part, invalid_part_key, invalid_part_number, invalid_range, io, no_parts,
     no_such_bucket, no_such_key, no_such_upload, not_empty, part_too_small, too_many_uploads,
 };
 pub use listing::{
-    common_prefix, group_and_paginate, group_and_paginate_ordered, group_and_paginate_unordered,
-    key_marker_order, paginate_ordered, split_uploads_order, uploads_order,
+    RollupMirror, UnorderedPager, common_prefix, group_and_paginate, group_and_paginate_ordered,
+    group_and_paginate_unordered, key_marker_order, paginate_ordered, split_uploads_order,
+    uploads_order,
 };
 pub use multipart::{
     ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
@@ -87,7 +88,7 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 /// impl MultipartOps for X { ... }
 /// impl Storage for X { type Error = MyError; }
 ///
-/// use tinio_core::bucket;
+/// use tinio_core::{bucket, ListBucketsParams};
 /// use tinio_mem::MemoryStorage;
 /// use tokio::runtime::Runtime;
 ///
@@ -97,7 +98,15 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 ///     .unwrap()
 ///     .block_on(async {
 ///         storage.create_bucket(&bucket).await.unwrap();
-///         storage.list_buckets().await.unwrap()
+///         storage
+///             .list_buckets(ListBucketsParams {
+///                 prefix: String::new(),
+///                 start_after: None,
+///                 max_buckets: 10,
+///             })
+///             .await
+///             .unwrap()
+///             .buckets
 ///     });
 /// assert_eq!(buckets.len(), 1);
 /// ```

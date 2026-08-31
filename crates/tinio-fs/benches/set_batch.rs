@@ -27,7 +27,6 @@ use std::{
 };
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use meta::Store;
 use tinio_core::{ETag, bucket, object};
 use tinio_fs::meta;
 use tokio::runtime::Runtime;

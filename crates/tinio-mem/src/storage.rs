@@ -16,7 +16,11 @@
 //! [`crate::bucket`], [`crate::object`], and [`crate::multipart`] and share
 //! the items below.
 
-use std::sync::Mutex;
+use std::{
+    cell::Cell,
+    ops::Bound,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use redb::{
     Database, ReadableDatabase, ReadableTable, Table, TableDefinition, backends::InMemoryBackend,
@@ -27,6 +31,17 @@ use crate::{
     Error,
     error::{database_storage, entity_too_large, no_such_bucket, no_such_upload},
 };
+
+/// The range start of a mem listing scan: the later of the key-prefix
+/// band and the resume marker (exclusive-after) — a deep resume never
+/// re-reads the rows before the marker. One home for the rule the
+/// object, bucket, and multipart scans all apply (A2).
+pub(crate) fn band_start<'a>(band: &'a str, marker: Option<&'a str>) -> Bound<&'a str> {
+    match marker {
+        Some(marker) if marker > band => Bound::Excluded(marker),
+        _ => Bound::Included(band),
+    }
+}
 
 /// `name` → creation time (unix nanoseconds).
 pub(crate) const BUCKETS: TableDefinition<&str, u64> = TableDefinition::new("buckets");
@@ -87,7 +102,7 @@ pub struct MemoryStorage {
     options: MemoryOptions,
     /// Current total stored bytes across `OBJECTS` and `PARTS` (updated
     /// only when a limit is configured).
-    total_bytes: Mutex<u64>,
+    total_bytes: AtomicU64,
 }
 
 /// Optional resource limits for [`MemoryStorage`].
@@ -133,7 +148,7 @@ impl MemoryStorage {
         Ok(Self {
             db,
             options,
-            total_bytes: Mutex::new(0),
+            total_bytes: AtomicU64::new(0),
         })
     }
 
@@ -155,31 +170,43 @@ impl MemoryStorage {
         let Some(limit) = self.options.max_total_bytes else {
             return Ok(());
         };
-        let mut total = self.total_bytes.lock().unwrap();
-        let new_total = *total as i128 + delta as i128;
-        if new_total < 0 {
-            // Defensive: internal accounting must never go negative.
-            *total = 0;
-            return Ok(());
-        }
-        if new_total as u64 > limit {
-            return Err(entity_too_large(new_total as u64, limit));
-        }
-        *total = new_total as u64;
+        // The projected size is carried out of the closure (T04): the
+        // error must report the size the write WOULD have produced, not
+        // the current total (`fetch_update`'s `Err` carries only the
+        // latter, and it is racy under concurrent deltas).
+        let projected = Cell::new(0u64);
+        self.total_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                let new_total = total as i128 + delta as i128;
+                if new_total < 0 {
+                    // Defensive: internal accounting must never go negative.
+                    return Some(0);
+                }
+                let new_total = new_total as u64;
+                if new_total > limit {
+                    projected.set(new_total);
+                    return None;
+                }
+                Some(new_total)
+            })
+            .map_err(|_| entity_too_large(projected.get(), limit))?;
         Ok(())
     }
 
     /// Roll back a [`Self::adjust_total`] delta after a failed commit.
     pub(crate) fn rollback_total(&self, delta: i64) {
-        let mut total = self.total_bytes.lock().unwrap();
-        *total = ((*total as i128 - delta as i128).max(0)) as u64;
+        self.total_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(((total as i128 - delta as i128).max(0)) as u64)
+            })
+            .ok();
     }
 
     /// The currently tracked total bytes (objects + parts). Meaningful only
     /// when a total limit is configured; 0 otherwise. Test hook.
     #[cfg(test)]
     pub(crate) fn total_bytes(&self) -> u64 {
-        *self.total_bytes.lock().unwrap()
+        self.total_bytes.load(Ordering::Relaxed)
     }
 
     /// Fast-fail bucket existence check (own read transaction). Backend
@@ -443,5 +470,72 @@ mod tests {
     #[test]
     fn storage_is_send_sync() {
         assert_send_sync::<MemoryStorage>();
+    }
+
+    #[test]
+    fn total_accounting_clamps_and_rolls_back() {
+        // `adjust_total` must never let the tracked total go negative
+        // (defensive), and `rollback_total` clamps at zero too — the
+        // failed-commit recovery path.
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(8),
+        })
+        .unwrap();
+        storage.adjust_total(4).unwrap();
+        assert_eq!(storage.total_bytes(), 4);
+        // A delta below zero clamps the total to 0 instead of going
+        // negative.
+        storage.adjust_total(-5).unwrap();
+        assert_eq!(storage.total_bytes(), 0);
+        // Rollback subtracts without going negative.
+        storage.adjust_total(3).unwrap();
+        storage.rollback_total(2);
+        assert_eq!(storage.total_bytes(), 1);
+        storage.rollback_total(10);
+        assert_eq!(storage.total_bytes(), 0);
+    }
+
+    #[test]
+    fn limit_breach_reports_the_projected_size() {
+        // T04: the `EntityTooLarge` payload is the size the write WOULD
+        // have produced (current 4 + delta 10), not the current total —
+        // the old code reported 4 and was racy under concurrency.
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(8),
+        })
+        .unwrap();
+        storage.adjust_total(4).unwrap();
+        let err = storage.adjust_total(10).unwrap_err();
+        let Error::Storage(crate::_core::storage::Error::EntityTooLarge { size, limit }) = err
+        else {
+            panic!("expected EntityTooLarge, got {err:?}");
+        };
+        assert_eq!((size, limit), (14, 8));
+        // The failed delta left the total unchanged.
+        assert_eq!(storage.total_bytes(), 4);
+    }
+
+    #[test]
+    fn collect_part_keys_stops_at_a_non_prefix_key() {
+        // A part-key scan is bounded by the `upload_id\0` prefix: a key
+        // of another upload ends the scan, never crossing into it.
+        let storage = MemoryStorage::new().unwrap();
+        let txn = storage.db.begin_write().unwrap();
+        {
+            let mut parts = txn.open_table(PARTS).unwrap();
+            parts
+                .insert(part_key("u1", 1).as_str(), b"a".as_slice())
+                .unwrap();
+            parts
+                .insert(part_key("u2", 1).as_str(), b"b".as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let txn = storage.db.begin_write().unwrap();
+        let parts = txn.open_table(PARTS).unwrap();
+        let keys = collect_part_keys(&parts, "u1\0").unwrap();
+        assert_eq!(keys, [part_key("u1", 1)]);
     }
 }

@@ -16,7 +16,10 @@ Thumbs.db
 *.swp
 *.tmp
 
-.claude-flow/
+# Python files
+*.pyc
 
 # tobihagemann/turbo temp files
 .turbo/
+
+piolium/

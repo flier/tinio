@@ -4,6 +4,8 @@
 use std::os::unix::fs::symlink;
 #[cfg(windows)]
 use std::os::windows::fs::symlink_dir;
+#[cfg(windows)]
+use std::process::Command;
 use std::{
     fs,
     future::Future,
@@ -127,6 +129,29 @@ pub(crate) fn link_dir(original: &Path, link: &Path) {
     symlink(original, link).unwrap();
     #[cfg(windows)]
     symlink_dir(original, link).unwrap();
+}
+
+/// Create a directory link (symlink on unix, **junction** on Windows) —
+/// the shared fixture of the follow-policy tests (the listing walk and
+/// the bucket-name sweep). The junction form (`mklink /J`) needs no
+/// Developer Mode, unlike [`link_dir`]'s `symlink_dir`.
+pub(crate) fn link_directory(src: &Path, dst: &Path) {
+    #[cfg(unix)]
+    symlink(src, dst).unwrap();
+    #[cfg(windows)]
+    {
+        // `mklink` parses the destination with cmd's tokenizer: a
+        // forward slash from a `join("a/b")` path reads as a switch
+        // ("syntax incorrect at the leaf") — normalize to the native
+        // separator first.
+        let dst = dst.to_string_lossy().replace('/', "\\");
+        let src = src.to_string_lossy().replace('/', "\\");
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J", &dst, &src])
+            .status()
+            .expect("spawn mklink");
+        assert!(status.success(), "mklink /J failed with {status}");
+    }
 }
 
 fn replace_dir_link(link: &Path, new_target: &Path) {

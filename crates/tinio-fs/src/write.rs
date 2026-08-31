@@ -23,7 +23,7 @@
 //! first PUT into a prefix too.
 
 #[cfg(unix)]
-use std::fs::{File as StdFile, remove_file};
+use std::fs::{File as StdFile, OpenOptions, remove_file};
 #[cfg(unix)]
 use std::io::Seek;
 use std::{
@@ -133,6 +133,8 @@ pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], Metadata), Err
 /// # Examples
 ///
 /// ```rust
+/// use std::fs::read;
+///
 /// use tinio_fs::AtomicWriter;
 /// use tinio_util::testing::body;
 /// use tokio::runtime::Runtime;
@@ -212,14 +214,12 @@ impl AtomicWriter {
         let mut created_parent = false;
         let result = async {
             if let Some(parent) = target.parent() {
-                // Cheap existence check (item 7d): the parent exists in
-                // steady state — one probe instead of `create_dir_all`'s
-                // per-component walk; the create still runs when the
-                // parent is missing (the first PUT into a new prefix).
-                if !fs::try_exists(parent).await? {
-                    created_parent = true;
-                    fs::create_dir_all(parent).await?;
-                }
+                // One probe instead of `create_dir_all`'s per-component
+                // walk (item 7d): the parent exists in steady state; the
+                // create still runs when the parent is missing (the
+                // first PUT into a new prefix), and the created flag
+                // drives the ancestor-chain sync (F03).
+                created_parent = fsutil::ensure_dir(parent).await?;
             }
             match fs::rename(temp, target).await {
                 Ok(()) => Ok(()),
@@ -290,13 +290,11 @@ impl AtomicWriter {
         }
     }
 
-    /// Item 7d: the tmp dir exists in steady state — one probe instead
-    /// of the per-component walk (the create still runs when the sweep
-    /// cleared it). Shared by [`Self::stage`] and [`Self::stage_copy`].
+    /// The tmp dir exists in steady state — one probe instead of the
+    /// per-component walk (the create still runs when the sweep cleared
+    /// it). Shared by [`Self::stage`] and [`Self::stage_copy`].
     async fn ensure_tmp_dir(&self) -> io::Result<()> {
-        if !fs::try_exists(&self.tmp_dir).await? {
-            fs::create_dir_all(&self.tmp_dir).await?;
-        }
+        fsutil::ensure_dir(&self.tmp_dir).await?;
         Ok(())
     }
 
@@ -366,7 +364,15 @@ impl AtomicWriter {
         let temp = self.tmp_dir.join(format!("upload-{}", Uuid::new_v4()));
         let temp_task = temp.clone();
         let result = task::spawn_blocking(move || {
-            let mut dst = StdFile::create(&temp_task).map_err(Error::from)?;
+            // Read+write: the hash pass reads the temp back after the
+            // kernel copy (a write-only handle would fail it with EBADF).
+            let mut dst = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_task)
+                .map_err(Error::from)?;
             fsutil::copy_file_range(&source, offset, len, &dst)?;
             dst.sync_all()?;
             // The kernel copy advanced the file position — rewind for
@@ -463,6 +469,25 @@ mod tests {
         // The target never appears (previous version absent); the temp
         // file is removed best-effort (or swept later if cleanup raced).
         assert!(fs::metadata(&target).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn commit_fails_onto_a_directory_and_cleans_the_temp() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = AtomicWriter::new(state.path());
+        let target = state.path().join("existing-dir");
+        fs::create_dir(&target).await.unwrap();
+        let (temp, _) = writer.stage(body(b"x")).await.unwrap();
+        // rename(file, existing-directory) fails on every platform — the
+        // target stays untouched and the failed temp is removed (item 7c).
+        let err = AtomicWriter::commit(&temp, &target, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        assert!(
+            !fs::try_exists(&temp).await.unwrap(),
+            "the failed commit must remove its temp residue"
+        );
     }
 
     /// The parent-dir fsync of a real directory succeeds (D1 — the

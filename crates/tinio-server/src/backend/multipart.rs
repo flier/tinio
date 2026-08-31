@@ -24,7 +24,10 @@ use crate::{
         multipart::{CompletedPart, MIN_PART_BYTES, PartNumber, part_number as parse_part_number},
         storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
     },
-    backend::{ConditionalHeaders, S3Backend, byte_range, map_backend_error, normalize_delimiter},
+    backend::{
+        ConditionalHeaders, S3Backend, byte_range, map_backend_error, normalize_delimiter,
+        normalize_page_size,
+    },
 };
 
 /// A request part number into the validated [`PartNumber`] (invalid →
@@ -72,8 +75,8 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(dto::CreateMultipartUploadOutput {
-            bucket: Some(bucket.to_string()),
-            key: Some(key.to_string()),
+            bucket: Some(String::from(bucket)),
+            key: Some(String::from(key)),
             upload_id: Some(upload.upload_id),
             ..Default::default()
         }))
@@ -248,11 +251,12 @@ impl<S: Storage> S3Backend<S> {
             .complete_multipart_upload(&bucket, &key, &upload_id, &parts)
             .await
             .map_err(map_backend_error)?;
+        let location = Some(format!("/{bucket}/{}", info.key));
         Ok(S3Response::new(dto::CompleteMultipartUploadOutput {
-            bucket: Some(bucket.to_string()),
-            key: Some(key.to_string()),
+            bucket: Some(String::from(bucket)),
+            key: Some(String::from(key)),
             e_tag: Some(Self::etag_wire(&info.etag)),
-            location: Some(format!("/{bucket}/{}", info.key)),
+            location,
             ..Default::default()
         }))
     }
@@ -281,7 +285,13 @@ impl<S: Storage> S3Backend<S> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         let upload_id = req.input.upload_id;
-        let max_parts = req.input.max_parts.unwrap_or(1000).max(0);
+        let max_parts = req.input.max_parts.unwrap_or(1000);
+        // Unified page-size policy: < 1 is rejected before any storage
+        // call unless the `allow_zero_page_size` escape hatch restores
+        // the legacy empty page. Multipart listings stay uncapped
+        // (AWS documents no cap).
+        let max_parts =
+            normalize_page_size(max_parts, "max-parts", self.caps.allow_zero_page_size)?;
         // A negative marker would wrap to a huge u32 and silently mask
         // every part as "already listed" — reject it like the
         // part-number validation does.
@@ -316,11 +326,11 @@ impl<S: Storage> S3Backend<S> {
             })
             .collect();
         Ok(S3Response::new(dto::ListPartsOutput {
-            bucket: Some(bucket.to_string()),
-            key: Some(key.to_string()),
+            bucket: Some(String::from(bucket)),
+            key: Some(String::from(key)),
             upload_id: Some(upload_id),
             is_truncated: Some(page.truncated),
-            max_parts: Some(max_parts),
+            max_parts: Some(max_parts as i32),
             next_part_number_marker: page.next_part_number_marker.map(|n| n as i32),
             part_number_marker: req.input.part_number_marker,
             parts: Some(parts),
@@ -335,7 +345,9 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::ListMultipartUploadsOutput>> {
         self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
-        let max_uploads = req.input.max_uploads.unwrap_or(1000).max(0);
+        let max_uploads = req.input.max_uploads.unwrap_or(1000);
+        let max_uploads =
+            normalize_page_size(max_uploads, "max-uploads", self.caps.allow_zero_page_size)?;
         // An empty `delimiter=` means "no delimiter" (the shared
         // boundary rule, `normalize_delimiter`).
         let delimiter = normalize_delimiter(req.input.delimiter.clone());
@@ -356,7 +368,7 @@ impl<S: Storage> S3Backend<S> {
             .into_iter()
             .map(|u| dto::MultipartUpload {
                 initiated: Some(Self::last_modified(u.initiated_at)),
-                key: Some(u.key.to_string()),
+                key: Some(String::from(u.key)),
                 upload_id: Some(u.upload_id),
                 ..Default::default()
             })
@@ -367,9 +379,9 @@ impl<S: Storage> S3Backend<S> {
             .map(|p| dto::CommonPrefix { prefix: Some(p) })
             .collect();
         Ok(S3Response::new(dto::ListMultipartUploadsOutput {
-            bucket: Some(bucket.to_string()),
+            bucket: Some(String::from(bucket)),
             is_truncated: Some(page.truncated),
-            max_uploads: Some(max_uploads),
+            max_uploads: Some(max_uploads as i32),
             next_key_marker: page.next_key_marker,
             next_upload_id_marker: page.next_upload_id_marker,
             prefix: req.input.prefix,
@@ -458,6 +470,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.output.parts.as_ref().unwrap().len(), 3);
+
+        // The effective page size is echoed (unclamped — multipart
+        // listings are uncapped).
+        let two = backend
+            .list_parts(s3_request(dto::ListPartsInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                upload_id: upload_id.clone(),
+                max_parts: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(two.max_parts, Some(2));
+        assert_eq!(two.is_truncated, Some(true));
+        assert_eq!(two.parts.as_ref().unwrap().len(), 2);
 
         // Complete → composed ETag MD5-of-MD5s-3.
         let complete = backend
@@ -592,6 +621,7 @@ mod tests {
             .await
             .unwrap()
             .output;
+        assert_eq!(page1.max_uploads, Some(1));
         assert_eq!(page1.is_truncated, Some(true));
         let page1_id = page1.uploads.as_ref().unwrap()[0]
             .upload_id
@@ -841,5 +871,121 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "NotImplemented");
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn list_parts_rejects_max_parts_below_one() {
+        // The rejection is wire-level: it fires before any storage call,
+        // so no upload is needed.
+        let (backend, b) = setup().await;
+        for max_parts in [0, -1] {
+            let err = backend
+                .list_parts(s3_request(dto::ListPartsInput {
+                    bucket: b.clone(),
+                    key: "k".into(),
+                    upload_id: "u".into(),
+                    max_parts: Some(max_parts),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code().as_str(),
+                "InvalidArgument",
+                "max-parts = {max_parts}"
+            );
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn list_multipart_uploads_rejects_max_uploads_below_one() {
+        let (backend, b) = setup().await;
+        for max_uploads in [0, -1] {
+            let err = backend
+                .list_multipart_uploads(s3_request(dto::ListMultipartUploadsInput {
+                    bucket: b.clone(),
+                    max_uploads: Some(max_uploads),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code().as_str(),
+                "InvalidArgument",
+                "max-uploads = {max_uploads}"
+            );
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn list_parts_allow_zero_page_size_restores_the_legacy_empty_page() {
+        // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
+        // empty page (the legacy behavior), never InvalidArgument.
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                allow_zero_page_size: true,
+                ..Default::default()
+            },
+        );
+        let storage = backend.storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: "data".into(),
+                key: "big.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let out = backend
+            .list_parts(s3_request(dto::ListPartsInput {
+                bucket: "data".into(),
+                key: "big.bin".into(),
+                upload_id: create.output.upload_id.unwrap(),
+                max_parts: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.max_parts, Some(0));
+        assert!(out.parts.as_ref().unwrap().is_empty());
+        assert_eq!(out.is_truncated, Some(false));
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn list_multipart_uploads_allow_zero_page_size_restores_the_legacy_empty_page() {
+        // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
+        // empty page (the legacy behavior), never InvalidArgument.
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                allow_zero_page_size: true,
+                ..Default::default()
+            },
+        );
+        let storage = backend.storage();
+        storage
+            .create_bucket(&bucket::name("data").unwrap())
+            .await
+            .unwrap();
+        let out = backend
+            .list_multipart_uploads(s3_request(dto::ListMultipartUploadsInput {
+                bucket: "data".into(),
+                max_uploads: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.max_uploads, Some(0));
+        assert!(out.uploads.as_ref().unwrap().is_empty());
+        assert_eq!(out.is_truncated, Some(false));
     }
 }

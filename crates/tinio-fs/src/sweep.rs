@@ -57,7 +57,10 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 ///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
 ///     },
 /// };
-/// use tinio_fs::{FsOptions, FsStorage, sweep};
+/// use tinio_fs::{
+///     FsOptions, FsStorage,
+///     sweep::{Options, Sweeper},
+/// };
 /// use tokio::{runtime::Runtime, sync::watch};
 ///
 /// let root = tempfile::tempdir().unwrap();
@@ -368,6 +371,55 @@ mod tests {
         let task = tokio::spawn(async move {
             sweeper.run(rx).await;
         });
+        tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_loop_executes_a_pass_then_stops_on_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            // One full pass runs (the Ok branch), then the 1 h interval
+            // sleep notices the shutdown within one 1 s chunk.
+            sweeper.run(rx).await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_loop_warns_and_keeps_running_on_a_failed_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // `tmp` as a file: the pass fails at entries_of (NotADirectory) —
+        // the loop must warn and continue, then stop on shutdown.
+        fs::write(state.path().join("tmp"), b"not a directory").unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            sweeper.run(rx).await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
         tx.send(true).unwrap();
         task.await.unwrap();
     }

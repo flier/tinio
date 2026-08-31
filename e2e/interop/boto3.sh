@@ -34,56 +34,35 @@ fi
 
 ENDPOINT="$(start_server "$SCRATCH/root" "$SCRATCH/server.log")" || exit 1
 
-"$BOTO3_PYTHON" - "$ENDPOINT" <<'PY'
-import sys
+# The journey client lives in the checked-in boto3_journey.py (driven
+# by tests/boto3.rs too) — one copy, not a heredoc twin.
+"$BOTO3_PYTHON" "$REPO/crates/tinio-server/tests/boto3_journey.py" "$ENDPOINT"
 
-import boto3
-from botocore.client import Config
+# Stop the journey server before starting the second one: on POSIX
+# `stop_server`'s fallback kills only `$SERVER_PID` (which the second
+# start would overwrite), so the journey server would leak. Safe here —
+# the journey client has already exited.
+stop_server
 
-endpoint = sys.argv[1]
-s3 = boto3.client(
-    "s3",
-    endpoint_url=f"http://{endpoint}",
-    aws_access_key_id="minioadmin",
-    aws_secret_access_key="minioadmin",
-    region_name="us-east-1",
-    config=Config(signature_version="s3v4"),
-)
+# ListBuckets pagination: the `[s3] max_buckets = 3` cap forces a small
+# page size below the bucket count. Paginate with the boto3 list_buckets
+# paginator; assert at least two pages occur — a dropped or ignored cap
+# (default max_buckets = 10000) returns everything in one page and fails
+# that assertion — and every bucket is seen exactly once.
+cat > "$SCRATCH/paginate.toml" <<'CFG'
+version = 1
 
-# Basic journey.
-s3.create_bucket(Bucket="boto3-bucket")
-s3.put_object(Bucket="boto3-bucket", Key="hello.txt", Body=b"hello from boto3")
-got = s3.get_object(Bucket="boto3-bucket", Key="hello.txt")["Body"].read()
-assert got == b"hello from boto3", "download not byte-identical"
+[s3]
+max_buckets = 3
+CFG
+PAGINATE_ENDPOINT="$(start_server "$SCRATCH/root-paginate" "$SCRATCH/paginate.log" "" "$SCRATCH/paginate.toml")" || exit 1
 
-# Zero-byte round-trip.
-s3.put_object(Bucket="boto3-bucket", Key="empty", Body=b"")
-assert s3.get_object(Bucket="boto3-bucket", Key="empty")["Body"].read() == b""
+# The client lives in the checked-in boto3_buckets_pagination.py (driven
+# by tests/boto3.rs too) — one copy, not a heredoc twin.
+"$BOTO3_PYTHON" "$REPO/crates/tinio-server/tests/boto3_buckets_pagination.py" "$PAGINATE_ENDPOINT"
 
-# List with prefix/delimiter.
-s3.put_object(Bucket="boto3-bucket", Key="dir/nested.txt", Body=b"nested")
-page = s3.list_objects_v2(Bucket="boto3-bucket", Delimiter="/")
-assert "dir/" in [p["Prefix"] for p in page.get("CommonPrefixes", [])]
-page = s3.list_objects_v2(Bucket="boto3-bucket", Prefix="dir/")
-assert page["KeyCount"] == 1
-
-# Multipart via upload_file (> 8 MiB → composed ETag with -N suffix).
-with open("/tmp/tinio-boto3-big.bin", "wb") as f:
-    f.write(b"x" * (10 * 1024 * 1024))
-s3.upload_file("/tmp/tinio-boto3-big.bin", "boto3-bucket", "big.bin")
-head = s3.head_object(Bucket="boto3-bucket", Key="big.bin")
-assert "-" in head["ETag"].strip('"'), f"composed ETag expected, got {head['ETag']}"
-dl = s3.download_file("boto3-bucket", "big.bin", "/tmp/tinio-boto3-big-dl.bin")
-with open("/tmp/tinio-boto3-big-dl.bin", "rb") as f:
-    assert f.read() == b"x" * (10 * 1024 * 1024)
-
-# Delete object.
-s3.delete_object(Bucket="boto3-bucket", Key="hello.txt")
-try:
-    s3.head_object(Bucket="boto3-bucket", Key="hello.txt")
-    raise AssertionError("object still exists after delete")
-except s3.exceptions.ClientError as e:
-    assert e.response["Error"]["Code"] == "404"
-
-print("BOTO3 JOURNEY OK")
-PY
+# Stop the pagination server explicitly, mirroring the journey server
+# above (F08): relying on the EXIT trap's pattern kill alone would leak
+# a server started from a custom --server-binary path (the pattern
+# misses it, and only the LAST $SERVER_PID would be killed).
+stop_server

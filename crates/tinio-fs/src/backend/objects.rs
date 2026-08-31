@@ -576,7 +576,18 @@ impl ObjectOps for FsStorage {
             }
             return Ok(());
         }
-        match fs::remove_file(&path).await {
+        // With following enabled, a leaf link resolves to the object it
+        // aliases — DELETE removes the target (the bytes get/head
+        // serve), not the link (a dangling link is removed as itself:
+        // the object is already gone). Mirrors put/get, which address
+        // the target.
+        let remove_path = match fs::symlink_metadata(&path).await {
+            Ok(m) if self.follow_symlinks && fsutil::is_symlink_or_reparse(&m) => {
+                fs::canonicalize(&path).await.unwrap_or(path.clone())
+            }
+            _ => path.clone(),
+        };
+        match fs::remove_file(&remove_path).await {
             Ok(()) => {}
             // Missing or a directory (DELETE of a marker key without the
             // trailing slash) — DELETE is idempotent, always 204.
@@ -1178,8 +1189,16 @@ mod tests {
         assert!(matches!(err, StorageError::AccessDenied(_)), "{err:?}");
         assert!(root.path().join("outside.txt").exists());
 
-        // With following enabled (default), the link is served.
-        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        // With following enabled, the link is served.
+        drop(storage);
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                ..fs_options()
+            },
+        )
+        .unwrap();
         let head = storage.head_object(&b, &k).await.unwrap();
         assert_eq!(head.size, 6);
         // ... and DELETE resolves through it (the follow policy).

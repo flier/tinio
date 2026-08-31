@@ -6,35 +6,47 @@
 //! (s3-surface.md). Storage errors map to S3 codes via
 //! [`map_backend_error`](crate::backend::map_backend_error).
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use s3s::{
     S3Request, S3Response, S3Result,
-    dto::{self, BucketLocationConstraint, DeleteBucketOutput, HeadBucketOutput},
+    dto::{
+        Bucket, BucketLocationConstraint, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
+        DeleteBucketOutput, GetBucketLocationInput, GetBucketLocationOutput, HeadBucketInput,
+        HeadBucketOutput, ListBucketsInput, ListBucketsOutput,
+    },
+    s3_error,
 };
 
 use crate::{
-    _core::storage::Storage,
-    backend::{S3Backend, map_backend_error},
+    _config::s3::MAX_BUCKETS,
+    _core::storage::{ListBucketsParams, Storage},
+    backend::{S3Backend, clamp_page_size, map_backend_error},
 };
+
+/// The ListBuckets default page size when `max-buckets` is absent — the
+/// AWS documented default (2025-03 API), the config's `max_buckets` cap
+/// default ([`MAX_BUCKETS`]): one home for the number.
+const DEFAULT_MAX_BUCKETS: i32 = MAX_BUCKETS as i32;
 
 impl<S: Storage> S3Backend<S> {
     pub(crate) async fn op_create_bucket(
         &self,
-        req: S3Request<dto::CreateBucketInput>,
-    ) -> S3Result<S3Response<dto::CreateBucketOutput>> {
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
         let name = self.bucket(req.input.bucket)?;
         self.storage
             .create_bucket(&name)
             .await
             .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::CreateBucketOutput {
+        Ok(S3Response::new(CreateBucketOutput {
             location: Some(format!("/{name}")),
         }))
     }
 
     pub(crate) async fn op_delete_bucket(
         &self,
-        req: S3Request<dto::DeleteBucketInput>,
-    ) -> S3Result<S3Response<dto::DeleteBucketOutput>> {
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let name = self.bucket(req.input.bucket)?;
         self.storage
             .delete_bucket(&name)
@@ -45,8 +57,8 @@ impl<S: Storage> S3Backend<S> {
 
     pub(crate) async fn op_head_bucket(
         &self,
-        req: S3Request<dto::HeadBucketInput>,
-    ) -> S3Result<S3Response<dto::HeadBucketOutput>> {
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
         let name = self.bucket(req.input.bucket)?;
         self.storage
             .head_bucket(&name)
@@ -57,38 +69,98 @@ impl<S: Storage> S3Backend<S> {
 
     pub(crate) async fn op_list_buckets(
         &self,
-        _req: S3Request<dto::ListBucketsInput>,
-    ) -> S3Result<S3Response<dto::ListBucketsOutput>> {
-        let buckets = self
+        req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let ListBucketsInput {
+            bucket_region: _,
+            continuation_token,
+            max_buckets,
+            prefix,
+        } = req.input;
+        // AWS documents `max-buckets` as 1..=10,000: out-of-range values
+        // answer InvalidArgument — never a silent clamp that would hand
+        // a buggy client a ContinuationToken it did not ask for. (The
+        // contract keeps the engine's `max = 0` empty-page semantics
+        // for direct calls.)
+        if let Some(max) = max_buckets
+            && !(1..=DEFAULT_MAX_BUCKETS).contains(&max)
+        {
+            return Err(s3_error!(
+                InvalidArgument,
+                "max-buckets must be between 1 and {DEFAULT_MAX_BUCKETS}"
+            ));
+        }
+        // The continuation token is the URL-safe no-pad base64 of the
+        // previous page's last bucket name — opaque to clients (AWS:
+        // "obfuscated and is not a real bucket"), no server-side token
+        // state. Bad base64 AND non-UTF-8 payloads answer
+        // InvalidArgument; the empty token decodes to the empty marker,
+        // which skips nothing.
+        let start_after = continuation_token
+            .map(|token| {
+                // T08: legitimate tokens are the base64 of a bucket name
+                // (≤63 ASCII chars), so a longer token can only be
+                // malformed — rejected BEFORE the decode, which would
+                // allocate ~¾ of the input length en route to
+                // InvalidArgument (the token length is bounded only by
+                // the HTTP head buffer).
+                if token.len() > 256 {
+                    return Err(s3_error!(InvalidArgument, "invalid continuation token"));
+                }
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(token.as_bytes())
+                    .map_err(|_| s3_error!(InvalidArgument, "invalid continuation token"))?;
+                String::from_utf8(bytes)
+                    .map_err(|_| s3_error!(InvalidArgument, "invalid continuation token"))
+            })
+            .transpose()?;
+        // The configured cap clamps the requested page size — and the
+        // default (a cap of 5 clamps the no-parameter request to 5).
+        let requested = max_buckets.unwrap_or(DEFAULT_MAX_BUCKETS) as usize;
+        let effective = clamp_page_size(requested, self.caps.max_buckets);
+        let listing = self
             .storage
-            .list_buckets()
+            .list_buckets(ListBucketsParams {
+                prefix: prefix.clone().unwrap_or_default(),
+                start_after,
+                max_buckets: effective,
+            })
             .await
             .map_err(map_backend_error)?;
-        let buckets = buckets
+        let buckets = listing
+            .buckets
             .into_iter()
-            .map(|b| dto::Bucket {
-                name: Some(b.name.to_string()),
+            .map(|b| Bucket {
+                name: Some(String::from(b.name)),
                 creation_date: Some(Self::last_modified(b.creation_time)),
                 ..Default::default()
             })
             .collect();
-        Ok(S3Response::new(dto::ListBucketsOutput {
+        // `ContinuationToken` presence is the truncation signal (s3s
+        // 0.15 has no `IsTruncated` on this wire); the engine returns
+        // the resume marker only when truncated. `Prefix` is echoed iff
+        // the client sent one (AWS).
+        Ok(S3Response::new(ListBucketsOutput {
             buckets: Some(buckets),
+            continuation_token: listing
+                .next_start_after
+                .map(|name| URL_SAFE_NO_PAD.encode(name.as_bytes())),
+            prefix,
             ..Default::default()
         }))
     }
 
     pub(crate) async fn op_get_bucket_location(
         &self,
-        req: S3Request<dto::GetBucketLocationInput>,
-    ) -> S3Result<S3Response<dto::GetBucketLocationOutput>> {
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
         // Existence is checked per AWS (a missing bucket → NoSuchBucket).
         let name = self.bucket(req.input.bucket)?;
         self.storage
             .head_bucket(&name)
             .await
             .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::GetBucketLocationOutput {
+        Ok(S3Response::new(GetBucketLocationOutput {
             location_constraint: Some(BucketLocationConstraint::from("us-east-1".to_string())),
         }))
     }
@@ -96,19 +168,36 @@ impl<S: Storage> S3Backend<S> {
 
 #[cfg(test)]
 mod tests {
-    use s3s::{S3, dto::ListBucketsInput};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use s3s::S3;
     use tokio::runtime::Runtime;
 
-    use super::*;
+    use super::{
+        CreateBucketInput, DeleteBucketInput, GetBucketLocationInput, HeadBucketInput,
+        ListBucketsInput, ListBucketsOutput, *,
+    };
     use crate::{
-        _core::storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps},
+        _core::{
+            bucket,
+            storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps},
+        },
         _mem::MemoryStorage,
         _util::testing::{assert_conformance, body},
-        backend::testutil::s3_request,
+        backend::{Capabilities, testutil::s3_request},
     };
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
+    }
+
+    fn backend_with(caps: Capabilities) -> S3Backend<MemoryStorage> {
+        S3Backend::new(MemoryStorage::new().unwrap(), caps)
+    }
+
+    /// The URL-safe no-pad base64 of a bucket name — the continuation
+    /// token a client would send back.
+    fn token(name: &str) -> String {
+        URL_SAFE_NO_PAD.encode(name.as_bytes())
     }
 
     #[tokio::test]
@@ -124,7 +213,7 @@ mod tests {
         assert!(matches!(err, NoSuchBucket(_)));
 
         let create = backend
-            .create_bucket(s3_request(dto::CreateBucketInput {
+            .create_bucket(s3_request(CreateBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -134,7 +223,7 @@ mod tests {
 
         // Duplicate create → BucketAlreadyExists.
         let err = backend
-            .create_bucket(s3_request(dto::CreateBucketInput {
+            .create_bucket(s3_request(CreateBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -144,7 +233,7 @@ mod tests {
 
         // Head.
         backend
-            .head_bucket(s3_request(dto::HeadBucketInput {
+            .head_bucket(s3_request(HeadBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -167,7 +256,7 @@ mod tests {
 
         // Location.
         let loc = backend
-            .get_bucket_location(s3_request(dto::GetBucketLocationInput {
+            .get_bucket_location(s3_request(GetBucketLocationInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -180,7 +269,7 @@ mod tests {
 
         // Delete.
         backend
-            .delete_bucket(s3_request(dto::DeleteBucketInput {
+            .delete_bucket(s3_request(DeleteBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -189,7 +278,7 @@ mod tests {
 
         // Missing bucket → NoSuchBucket.
         let err = backend
-            .head_bucket(s3_request(dto::HeadBucketInput {
+            .head_bucket(s3_request(HeadBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -202,7 +291,7 @@ mod tests {
     async fn invalid_bucket_names_rejected() {
         let backend = backend();
         let err = backend
-            .create_bucket(s3_request(dto::CreateBucketInput {
+            .create_bucket(s3_request(CreateBucketInput {
                 bucket: "Bad_Name".into(),
                 ..Default::default()
             }))
@@ -215,7 +304,7 @@ mod tests {
     async fn delete_non_empty_is_bucket_not_empty() {
         let backend = backend();
         backend
-            .create_bucket(s3_request(dto::CreateBucketInput {
+            .create_bucket(s3_request(CreateBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -227,7 +316,7 @@ mod tests {
             .await
             .unwrap();
         let err = backend
-            .delete_bucket(s3_request(dto::DeleteBucketInput {
+            .delete_bucket(s3_request(DeleteBucketInput {
                 bucket: "data".into(),
                 ..Default::default()
             }))
@@ -246,5 +335,386 @@ mod tests {
             let storage = MemoryStorage::new().unwrap();
             assert_conformance(&storage).await;
         });
+    }
+
+    #[tokio::test]
+    async fn list_buckets_paginates_and_resumes() {
+        let backend = backend();
+        let storage = backend.storage();
+        for name in ["zeta", "alpha-1", "alpha-2", "mid", "beta-1", "beta-2"] {
+            storage
+                .create_bucket(&bucket::name(name).unwrap())
+                .await
+                .unwrap();
+        }
+        let names = |out: &ListBucketsOutput| {
+            out.buckets
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter_map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let page1 = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                max_buckets: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(names(&page1), ["alpha-1", "alpha-2"]);
+        assert_eq!(page1.prefix, None, "no prefix sent, none echoed");
+        let t1 = page1.continuation_token.clone().unwrap();
+
+        let page2 = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(t1),
+                max_buckets: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(names(&page2), ["beta-1", "beta-2"]);
+        let t2 = page2.continuation_token.unwrap();
+
+        let page3 = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(t2),
+                max_buckets: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(names(&page3), ["mid", "zeta"]);
+        assert!(
+            page3.continuation_token.is_none(),
+            "the final page must carry no continuation token"
+        );
+
+        // Token exhaustion: a stale-but-decodable token past the end
+        // yields an empty page (a plain start_after marker — no error).
+        let exhausted = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(token("zzz")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert!(names(&exhausted).is_empty());
+        assert!(exhausted.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_prefix_filters_and_echoes() {
+        let backend = backend();
+        let storage = backend.storage();
+        for name in ["alpha-1", "alpha-2", "beta-1"] {
+            storage
+                .create_bucket(&bucket::name(name).unwrap())
+                .await
+                .unwrap();
+        }
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                prefix: Some("alpha".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let names: Vec<String> = out
+            .buckets
+            .unwrap()
+            .into_iter()
+            .filter_map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["alpha-1", "alpha-2"]);
+        assert_eq!(
+            out.prefix.as_deref(),
+            Some("alpha"),
+            "the prefix is echoed when the client sent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_buckets_ignores_bucket_region() {
+        // `bucket-region` is accepted and ignored (single-region server —
+        // GetBucketLocation answers us-east-1).
+        let backend = backend();
+        let storage = backend.storage();
+        storage
+            .create_bucket(&bucket::name("data").unwrap())
+            .await
+            .unwrap();
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                bucket_region: Some("us-west-2".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.buckets.as_ref().unwrap().len(), 1);
+        assert!(out.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_rejects_page_size_below_one() {
+        let backend = backend();
+        for max in [0, -1] {
+            let err = backend
+                .list_buckets(s3_request(ListBucketsInput {
+                    max_buckets: Some(max),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code().as_str(),
+                "InvalidArgument",
+                "max_buckets = {max}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_buckets_stays_strict_under_the_zero_page_escape_hatch() {
+        // The escape hatch restores the legacy empty page on the
+        // pre-existing surfaces only; ListBuckets keeps the
+        // AWS-documented 1..=10,000 validation regardless.
+        let backend = backend_with(Capabilities {
+            allow_zero_page_size: true,
+            ..Default::default()
+        });
+        for max in [0, -1, 10_001] {
+            let err = backend
+                .list_buckets(s3_request(ListBucketsInput {
+                    max_buckets: Some(max),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code().as_str(),
+                "InvalidArgument",
+                "max_buckets = {max}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_buckets_clamps_to_the_configured_cap() {
+        let backend = backend_with(Capabilities {
+            max_buckets: 3,
+            ..Default::default()
+        });
+        let storage = backend.storage();
+        for name in ["zeta", "alpha-1", "alpha-2", "mid", "beta-1", "beta-2"] {
+            storage
+                .create_bucket(&bucket::name(name).unwrap())
+                .await
+                .unwrap();
+        }
+        // A max-buckets = 10 request clamps to the cap (3), truncated.
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                max_buckets: Some(10),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.buckets.as_ref().unwrap().len(), 3);
+        assert!(out.continuation_token.is_some());
+        // The no-parameter default (10,000) clamps to the cap too.
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput::default()))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.buckets.as_ref().unwrap().len(), 3);
+        assert!(out.continuation_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_rejects_page_size_above_the_aws_ceiling() {
+        // AWS documents max-buckets 1..=10,000: an out-of-range request
+        // is InvalidArgument — never a silent clamp that would hand a
+        // buggy client a ContinuationToken it did not ask for.
+        let backend = backend();
+        for max in [10_001, 50_000] {
+            let err = backend
+                .list_buckets(s3_request(ListBucketsInput {
+                    max_buckets: Some(max),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code().as_str(),
+                "InvalidArgument",
+                "max_buckets = {max}"
+            );
+        }
+        // The ceiling itself is legal.
+        let storage = backend.storage();
+        storage
+            .create_bucket(&bucket::name("data").unwrap())
+            .await
+            .unwrap();
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                max_buckets: Some(DEFAULT_MAX_BUCKETS),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let names: Vec<String> = out
+            .buckets
+            .unwrap()
+            .into_iter()
+            .filter_map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["data"]);
+        assert!(out.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_rejects_an_overlong_continuation_token() {
+        // T08: legitimate tokens are the base64 of a bucket name (≤63
+        // ASCII chars — ≤84 token bytes); a token beyond the 256-byte
+        // bound can only be malformed, so it is rejected before the
+        // decode allocates proportional to its length.
+        let backend = backend();
+        let overlong = "a".repeat(300);
+        let err = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(overlong),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+        // The boundary itself is legal: a 256-byte token decodes to a
+        // stale marker past the end — an empty page, never an error.
+        // (`'A'` decodes to NUL bytes — valid UTF-8 — while `'b'` decodes
+        // to 0xB6/0xDB, invalid UTF-8, which is correctly rejected.)
+        let boundary = "A".repeat(256);
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(boundary),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert!(out.buckets.as_ref().unwrap().is_empty());
+        assert!(out.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_default_page_size_is_ten_thousand() {
+        // The AWS-documented default (10,000) applies when no
+        // max-buckets is sent: 10,001 buckets yield a truncated page of
+        // 10,000 plus a continuation token.
+        let backend = backend();
+        let storage = backend.storage();
+        for i in 0..10_001 {
+            storage
+                .create_bucket(&bucket::name(format!("b-{i}")).unwrap())
+                .await
+                .unwrap();
+        }
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput::default()))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.buckets.as_ref().unwrap().len(), 10_000);
+        assert!(out.continuation_token.is_some());
+        // The token resumes exactly onto the remaining bucket.
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: out.continuation_token,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.buckets.as_ref().unwrap().len(), 1);
+        assert!(out.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_rejects_bad_tokens() {
+        let backend = backend();
+        // Undecodable base64.
+        let err = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some("!!!not-base64!!!".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+        // Base64 of non-UTF-8 bytes.
+        let raw = URL_SAFE_NO_PAD.encode([0xFF]);
+        let err = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(raw),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+    }
+
+    #[tokio::test]
+    async fn list_buckets_empty_token_is_a_noop() {
+        // The empty token decodes to the empty marker — it skips nothing.
+        let backend = backend();
+        let storage = backend.storage();
+        for name in ["alpha", "beta"] {
+            storage
+                .create_bucket(&bucket::name(name).unwrap())
+                .await
+                .unwrap();
+        }
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(String::new()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let names: Vec<String> = out
+            .buckets
+            .unwrap()
+            .into_iter()
+            .filter_map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["alpha", "beta"]);
+        // A stale-but-decodable token resumes like a start_after marker.
+        let out = backend
+            .list_buckets(s3_request(ListBucketsInput {
+                continuation_token: Some(token("alpha")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let names: Vec<String> = out
+            .buckets
+            .unwrap()
+            .into_iter()
+            .filter_map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["beta"]);
     }
 }

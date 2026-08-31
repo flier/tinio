@@ -28,6 +28,8 @@ use crate::{Error, error};
 /// # Examples
 ///
 /// ```rust
+/// use std::env::temp_dir;
+///
 /// use tinio_config::sources::load_env_file;
 ///
 /// let dir = temp_dir();

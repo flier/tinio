@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     _core::{bucket, object},
-    _util::testing::assert_send_sync,
+    _util::testing::{assert_send_sync, etag},
 };
 
 fn open_db() -> (tempfile::TempDir, Database, Stats) {
@@ -542,5 +542,112 @@ async fn a_panicking_write_closure_panics_the_caller() {
         .write(move |_txn| -> Result<(), Error> { panic!("boom") })
         .await
         .unwrap();
+    drop(state);
+}
+
+#[tokio::test]
+async fn bucket_get_or_insert_returns_the_stored_creation_time() {
+    let (state, db, _) = open_db();
+    let handle = Handle::new(db);
+    let name = bucket::name("data").unwrap();
+    let write_name = name.clone();
+    let now = UNIX_EPOCH + Duration::from_nanos(42);
+    handle
+        .write(move |txn| {
+            let mut table = BucketsTable::open(txn)?;
+            // Insert-absent path, then the stored-value path: a later
+            // call must return the first recorded time, not overwrite it.
+            let first = table.get_or_insert(&write_name, now)?;
+            let second = table.get_or_insert(&write_name, now + Duration::from_secs(1))?;
+            assert_eq!(first, second);
+            Ok(second)
+        })
+        .await
+        .unwrap();
+    drop(state);
+}
+
+#[tokio::test]
+async fn object_meta_put_round_trips() {
+    let (state, db, _) = open_db();
+    let handle = Handle::new(db);
+    let name = bucket::name("data").unwrap();
+    let write_name = name.clone();
+    let key = object::key("dir/a.txt").unwrap();
+    let write_key = key.clone();
+    let written = etag("5eb63bbbe01eeed093cb22bb8f5acdc3");
+    let write_etag = written.clone();
+    handle
+        .write(move |txn| {
+            let mut table = ObjectMetaTable::open(txn)?;
+            table.put(&write_name, &write_key, &write_etag, 2, UNIX_EPOCH, 7)
+        })
+        .await
+        .unwrap();
+    let got = handle
+        .read(|txn| ObjectMetaTable::open_readonly(txn)?.get(&name, &key))
+        .unwrap();
+    let row = got.expect("the put row must be readable");
+    assert_eq!(row.etag, written);
+    assert_eq!(row.size, 2);
+    assert_eq!(row.file_identity, 7);
+    drop(state);
+}
+
+#[tokio::test]
+async fn upload_and_part_rows_round_trip_and_list_from_stops_at_the_next_upload() {
+    let (state, db, _) = open_db();
+    let handle = Handle::new(db);
+    let name = bucket::name("data").unwrap();
+    let write_name = name.clone();
+    let key = object::key("big.bin").unwrap();
+    let write_key = key.clone();
+    let part_etag = etag("d41d8cd98f00b204e9800998ecf8427e");
+    let write_etag = part_etag.clone();
+    handle
+        .write(move |txn| {
+            {
+                let mut uploads = UploadsTable::open(txn)?;
+                uploads.put(&write_name, "aaa", &write_key, UNIX_EPOCH)?;
+                uploads.put(&write_name, "bbb", &write_key, UNIX_EPOCH)?;
+            }
+            let mut parts = PartsTable::open(txn)?;
+            parts.put(&write_name, "aaa", 1, &write_etag)?;
+            parts.put(&write_name, "bbb", 1, &write_etag)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // Paging past the last part of `aaa` must stop at the `bbb` row —
+    // the mismatch break, never a cross-upload bleed.
+    let (page, truncated) = handle
+        .read(|txn| PartsTable::open_readonly(txn)?.list_from(&name, "aaa", 0, 10))
+        .unwrap();
+    assert_eq!(page, vec![(1, part_etag.to_string())]);
+    assert!(!truncated);
+    drop(state);
+}
+
+#[tokio::test]
+async fn compact_if_needed_unchanged_when_nothing_to_reclaim() {
+    let (state, mut db, _) = open_db();
+    // Reach the compact fixpoint first: a fresh database has initial
+    // slack to reclaim, and `compact_if_needed`'s own marker-clear
+    // write would leave COW residue for a following call (the first
+    // `compact()` after any write reports progress). Only at the
+    // fixpoint is "nothing to reclaim" true.
+    while db.compact().unwrap() {}
+    // Marker set (passed in, as `open` would) on the small, clean
+    // database: `compact()` has nothing to reclaim — `Unchanged` is
+    // reported and the marker is still cleared.
+    let stats = Stats {
+        allocated_bytes: 0,
+        fragmented_bytes: 0,
+    };
+    let report = compact_if_needed(&mut db, true, stats, 20).unwrap();
+    assert!(matches!(report, Compaction::Unchanged));
+    let txn = db.begin_read().unwrap();
+    let state_table = StateTable::open_readonly(&txn).unwrap();
+    assert!(!state_table.compact_marker().unwrap());
     drop(state);
 }

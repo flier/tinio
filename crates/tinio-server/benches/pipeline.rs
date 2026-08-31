@@ -51,7 +51,7 @@ use tinio_core::{
 };
 use tinio_fs::{
     Error as FsError, etag,
-    meta::{self, Store},
+    meta::{self},
 };
 use tinio_server::pipeline::{Pipeline, Pipelines as PipelinePair};
 use tokio::runtime::Runtime;

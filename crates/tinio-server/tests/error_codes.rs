@@ -92,6 +92,7 @@ async fn disabled_capabilities_answer_not_implemented() {
         list_objects_v1: false,
         list_objects_v2: false,
         delete_objects: false,
+        ..Default::default()
     };
     let server = Server::mem(caps).await;
     request(server.addr(), "PUT", "/data", &[], &[]).await;

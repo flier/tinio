@@ -73,6 +73,28 @@ mod tests {
         let err = backend.bucket("UPPER".to_string()).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidBucketName, "{err:?}");
     }
+
+    #[test]
+    fn clamp_page_size_zero_cap_is_no_clamp() {
+        assert_eq!(clamp_page_size(5, 0), 5);
+        assert_eq!(clamp_page_size(10_000, 0), 10_000);
+        assert_eq!(clamp_page_size(3, 10_000), 3);
+        assert_eq!(clamp_page_size(50_000, 10_000), 10_000);
+    }
+
+    #[test]
+    fn normalize_page_size_boundary_and_escape_hatch() {
+        // Strict (default): < 1 is rejected before any storage call.
+        assert!(normalize_page_size(0, "n", false).is_err());
+        assert!(normalize_page_size(-1, "n", false).is_err());
+        assert_eq!(normalize_page_size(1, "n", false).unwrap(), 1);
+        assert_eq!(normalize_page_size(10_000, "n", false).unwrap(), 10_000);
+        // Escape hatch: < 1 clamps to the legacy empty page (negatives
+        // included — the old `.max(0)`).
+        assert_eq!(normalize_page_size(0, "n", true).unwrap(), 0);
+        assert_eq!(normalize_page_size(-1, "n", true).unwrap(), 0);
+        assert_eq!(normalize_page_size(5, "n", true).unwrap(), 5);
+    }
 }
 
 use std::{io::Error as IoError, sync::Arc, time::SystemTime};
@@ -268,4 +290,37 @@ pub(crate) fn byte_range(r: dto::Range) -> ByteRange {
 /// listings.
 pub(crate) fn normalize_delimiter(delimiter: Option<String>) -> Option<String> {
     delimiter.filter(|d| !d.is_empty())
+}
+
+/// Clamp a requested page size to the configured cap. `cap = 0` means
+/// "no clamp" — a literal `min(requested, 0)` would turn the permissive
+/// contract's `max = 0` empty-page semantics on for every uncapped
+/// listing (the default `[s3] max_keys` config). One home for the
+/// boundary rule, shared by the ListBuckets and ListObjects mappings.
+pub(crate) fn clamp_page_size(requested: usize, cap: u32) -> usize {
+    if cap == 0 {
+        requested
+    } else {
+        requested.min(cap as usize)
+    }
+}
+
+/// The unified listing page-size policy (design 2026-08-29): a page
+/// size < 1 is rejected before any storage call unless `allow_zero` —
+/// the `[s3] allow_zero_page_size` escape hatch of the pre-existing
+/// surfaces — which restores the legacy clamp-to-0 empty page
+/// (negatives included, the old `.max(0)`). ListBuckets does not use
+/// this helper: its AWS-documented 1..=10,000 range is always strict.
+pub(crate) fn normalize_page_size(
+    requested: i32,
+    param: &str,
+    allow_zero: bool,
+) -> S3Result<usize> {
+    if requested < 1 {
+        if allow_zero {
+            return Ok(0);
+        }
+        return Err(s3_error!(InvalidArgument, "{param} must be at least 1"));
+    }
+    Ok(requested as usize)
 }

@@ -5,7 +5,7 @@
 //! pre-existing directory. Names are re-validated on create (defensive
 //! backstop, FR-012); the reserved `.tinio/` directory is never a bucket.
 
-use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::SystemTime};
+use std::{io::ErrorKind, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use tokio::fs;
@@ -13,8 +13,9 @@ use tokio::fs;
 use super::{Error, FsStorage};
 use crate::{
     _core::{
+        BucketsListing, ListBucketsParams,
         bucket::{self, Bucket},
-        storage::{BucketOps, already_exists, no_such_bucket, not_empty},
+        storage::{BucketOps, UnorderedPager, already_exists, no_such_bucket, not_empty},
     },
     path::{STATE_DIR_NAME, bucket_path_lexical},
     tombstone,
@@ -137,28 +138,65 @@ impl BucketOps for FsStorage {
         })
     }
 
-    async fn list_buckets(&self) -> Result<Vec<Bucket>, Error> {
-        let names = self.bucket_names().await?;
-        // Load the creation-time file once (not once per bucket): the
-        // recorded map, then lazily record first-sight buckets.
-        let recorded: HashMap<String, SystemTime> =
-            self.bucket_store.load_all().await?.into_iter().collect();
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            let creation_time = match recorded.get(name.as_ref()) {
-                Some(created) => *created,
+    async fn list_buckets(&self, params: ListBucketsParams) -> Result<BucketsListing, Error> {
+        // The bounded pagination engine (`UnorderedPager`, the
+        // uploads-page engine) consumes the root sweep incrementally:
+        // the streaming walk offers only prefix-matching, name-valid
+        // candidates, and the engine keeps only the page — a max-heap of
+        // `max + 1` entries — so neither the full collection nor the
+        // O(N log N) sort of the old `bucket_names` sweep survives
+        // (memory is O(page), never O(matches)). `max = 0` still
+        // short-circuits the root sweep — no dirent scan, no stats, no
+        // metadata reads (the cost-profile parity with the mem backend,
+        // which never drains the table for an empty page); the engine
+        // produces the empty page itself, so the contract has one home.
+        let max = params.max_buckets;
+        let mut pager = UnorderedPager::new(
+            &params.prefix,
+            None,
+            params.start_after.as_deref(),
+            max,
+            |name: &bucket::Name| name.as_ref().as_str(),
+        );
+        if max > 0 {
+            self.for_each_bucket_name(&params.prefix, |name| pager.offer_keyed(name))
+                .await?;
+        }
+        let (page, _prefixes, truncated, next) = pager.finish();
+        // Creation times resolve only for the page's buckets — the
+        // metadata-per-page analogue of the object listing's page-driven
+        // ETag gate (P3) — in ONE read transaction (`load_many`, the
+        // `meta::Store::load_entries` pattern; the old per-bucket
+        // `get_or_record` opened one transaction per bucket). First-sight
+        // recording stays page-driven: a bucket not reached by
+        // pagination stays unrecorded until listed; still lazy, no
+        // visible behavior change. A miss keeps the atomic upsert of
+        // `get_or_record` — through the record-only `get_or_insert` (one
+        // write transaction, no pre-read; `load_many` already
+        // established the row is missing), so concurrent first-sights
+        // converge; misses are rare in steady state, so their own
+        // transactions are fine.
+        let created = self.bucket_store.load_many(&page).await?;
+        let mut buckets = Vec::with_capacity(page.len());
+        for (name, creation_time) in page.into_iter().zip(created) {
+            let creation_time = match creation_time {
+                Some(created) => created,
                 None => {
                     self.bucket_store
-                        .get_or_record(&name, SystemTime::now())
+                        .get_or_insert(&name, SystemTime::now())
                         .await?
                 }
             };
-            out.push(Bucket {
+            buckets.push(Bucket {
                 name,
                 creation_time,
             });
         }
-        Ok(out)
+        Ok(BucketsListing {
+            buckets,
+            truncated,
+            next_start_after: next,
+        })
     }
 }
 
@@ -178,7 +216,9 @@ mod tests {
     use crate::{
         _core::{
             object,
-            storage::{Error as StorageError, Error::*, MultipartOps, ObjectOps},
+            storage::{
+                Error as StorageError, Error::*, ListBucketsParams, MultipartOps, ObjectOps,
+            },
         },
         _util::testing::{assert_conformance, body, etag},
         testutil::{storage, wait_for, wait_for_lock_waiter},
@@ -203,9 +243,16 @@ mod tests {
         // The bucket is a real directory.
         assert!(root.path().join("my-bucket").is_dir());
 
-        let buckets = storage.list_buckets().await.unwrap();
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].name, b);
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.buckets.len(), 1);
+        assert_eq!(listing.buckets[0].name, b);
 
         // Duplicate create.
         let err: StorageError = storage.create_bucket(&b).await.unwrap_err().into();
@@ -443,12 +490,20 @@ mod tests {
         assert!(matches!(err, NoSuchBucket(_)), "{err:?}");
         let err: StorageError = storage.create_bucket(&b).await.unwrap_err().into();
         assert!(matches!(err, AlreadyExists(_)), "{err:?}");
-        let buckets = storage.list_buckets().await.unwrap();
-        assert!(buckets.is_empty(), "{buckets:?}");
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
+            .await
+            .unwrap();
+        assert!(listing.buckets.is_empty(), "{listing:?}");
 
         // follow_symlinks = true: the bucket IS the target — full
         // CRUD through the link, listed and discovered like any
         // other bucket.
+        drop(storage);
         let storage = FsStorage::new(
             root.path(),
             FsOptions {
@@ -463,9 +518,16 @@ mod tests {
         assert_eq!(head.size, 5);
         let got = storage.get_object(&b, &k, None).await.unwrap();
         assert_eq!(read_body(got.body).await.unwrap(), b"hello");
-        let buckets = storage.list_buckets().await.unwrap();
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].name, b);
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.buckets.len(), 1);
+        assert_eq!(listing.buckets[0].name, b);
         let page = storage
             .list_objects(ListObjectsParams {
                 bucket: b.clone(),
@@ -515,9 +577,16 @@ mod tests {
     async fn pre_existing_directories_are_buckets_with_lazy_creation_time() {
         let (root, storage) = storage();
         fs::create_dir(root.path().join("existing")).unwrap();
-        let buckets = storage.list_buckets().await.unwrap();
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].name.as_ref(), "existing");
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.buckets.len(), 1);
+        assert_eq!(listing.buckets[0].name.as_ref(), "existing");
         // The lazy record persists.
         let head = storage
             .head_bucket(&bucket::name("existing").unwrap())
@@ -534,8 +603,15 @@ mod tests {
         fs::create_dir_all(root.path().join(".tinio")).unwrap();
         fs::write(root.path().join("file.txt"), b"x").unwrap();
         fs::create_dir(root.path().join("Big")).unwrap(); // invalid name
-        let buckets = storage.list_buckets().await.unwrap();
-        assert!(buckets.is_empty(), "{buckets:?}");
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
+            .await
+            .unwrap();
+        assert!(listing.buckets.is_empty(), "{listing:?}");
     }
 
     #[tokio::test]
@@ -609,8 +685,55 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let buckets = storage.list_buckets().await.unwrap();
-        let names: Vec<&str> = buckets.iter().map(|b| b.name.as_ref().as_str()).collect();
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 1000,
+            })
+            .await
+            .unwrap();
+        let names: Vec<&str> = listing
+            .buckets
+            .iter()
+            .map(|b| b.name.as_ref().as_str())
+            .collect();
         assert_eq!(names, ["alpha", "mid", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_max_zero_short_circuits_the_root_sweep() {
+        // The state dir is relocated so nothing open lives under the
+        // root: the empty-page request must not touch the root at all —
+        // it succeeds even when any sweep would fail (the cost-profile
+        // parity with the mem backend, which pages without draining).
+        use crate::{FsOptions, testutil::fs_options};
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        // Move the root aside: `bucket_names` would fail its `read_dir`.
+        let moved = root.path().with_extension("swept");
+        fs::rename(root.path(), &moved).unwrap();
+        let listing = storage
+            .list_buckets(ListBucketsParams {
+                prefix: String::new(),
+                start_after: None,
+                max_buckets: 0,
+            })
+            .await;
+        fs::rename(&moved, root.path()).unwrap();
+        let listing = listing.expect("max_buckets = 0 must not touch the storage root");
+        assert!(listing.buckets.is_empty());
+        assert!(!listing.truncated);
+        assert_eq!(listing.next_start_after, None);
     }
 }

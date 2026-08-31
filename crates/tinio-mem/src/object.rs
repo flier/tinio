@@ -16,10 +16,11 @@ use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
         PutObjectResult, bucket, collect_body, from_nanos, group_and_paginate, now_nanos, object,
+        storage::{RollupMirror, common_prefix},
     },
     Error,
     error::{access_denied, database_storage, no_such_bucket, no_such_key},
-    storage::{BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, object_key},
+    storage::{BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, band_start, object_key},
 };
 
 #[async_trait]
@@ -233,15 +234,27 @@ impl ObjectOps for MemoryStorage {
             .start_after
             .as_deref()
             .map(|after| object_key(params.bucket.as_ref().as_str(), after));
-        let start = match after_key.as_deref() {
-            Some(after) if after > scan_prefix.as_str() => Bound::Excluded(after),
-            _ => Bound::Included(scan_prefix.as_str()),
-        };
+        let start = band_start(&scan_prefix, after_key.as_deref());
         let mut range = meta.range::<&str>((start, Bound::Unbounded))?;
         let mut scan_error = None;
         // `bucket\0key` order is already lexicographic. Folder markers and
         // reserved keys are skipped; `group_and_paginate` stops after one
-        // probe entry past `max_keys`, so the range is not drained.
+        // probe entry past `max_keys`, so the range is not drained. The
+        // sync scan runs inline on the async executor by design (mem is
+        // the reference backend, rows are owned copies, and the redb read
+        // txn is MVCC — no lock is held).
+        // The rollup mirror (`last_cp`) drops rows a delimiter group
+        // absorbs before they pay for the key copy, validation, or the
+        // ETag parse (only emitted objects carry an etag). The skips are
+        // state-free and the group updates mirror the engine's — an
+        // object row resets the group, a rollup row is its group's first
+        // — so the pre-filter cannot change the engine's output (it
+        // re-checks every surviving row). The mirror is the shared
+        // [`RollupMirror`] (A4 — one home with the engines); its
+        // two-phase shape matches the engine's ordering: the dedup check
+        // runs before this row's validation, the record after it, so a
+        // discarded row never advances the group.
+        let mut rollup = RollupMirror::new();
         let objects = from_fn(|| {
             loop {
                 let (k, v) = match range.next() {
@@ -255,20 +268,56 @@ impl ObjectOps for MemoryStorage {
                 if !k.value().starts_with(&scan_prefix) {
                     return None;
                 }
-                let key = k.value()[bucket_prefix.len()..].to_string();
-                let (etag, size, mtime) = v.value();
+                let raw_key = &k.value()[bucket_prefix.len()..];
+                let cp = params
+                    .delimiter
+                    .as_deref()
+                    .and_then(|delim| common_prefix(raw_key, &params.prefix, delim));
+                if let Some(cp) = cp
+                    && rollup.is_rolled(cp)
+                {
+                    continue; // the group already rolled up — skip the row
+                }
                 // A tampered row (a key/etag that cannot be domain-valid)
                 // is skipped, never a panic — same tolerance as the fs
-                // walk's unrepresentable entries.
-                let Ok(key) = object::key(key) else {
+                // walk's unrepresentable entries. Rows were validated at
+                // insert; read-side checks are defense-in-depth.
+                let Ok(key) = object::key(raw_key) else {
                     continue;
                 };
                 if key.is_folder_marker() || key.is_reserved() {
                     continue;
                 }
+                let (etag, size, mtime) = v.value();
                 let Ok(etag) = etag.parse() else {
                     continue;
                 };
+                // The engine's rollup state, mirrored (kept through the
+                // marker skip, like the engine's `last_prefix`); the
+                // marker skip lands here too, so a row the engine would
+                // discard never builds an `Info`.
+                match cp {
+                    Some(cp) => {
+                        rollup.record_rollup(cp);
+                        if params
+                            .start_after
+                            .as_deref()
+                            .is_some_and(|after| cp <= after)
+                        {
+                            continue;
+                        }
+                    }
+                    None => {
+                        rollup.reset();
+                        if params
+                            .start_after
+                            .as_deref()
+                            .is_some_and(|after| raw_key <= after)
+                        {
+                            continue;
+                        }
+                    }
+                }
                 return Some(object::Info {
                     key,
                     size,

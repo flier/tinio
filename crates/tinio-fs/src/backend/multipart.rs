@@ -33,6 +33,7 @@ use crate::{
 /// a range never carries the source's ETag.
 #[cfg(unix)]
 impl FsStorage {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn copy_part_fast(
         &self,
         src_bucket: &bucket::Name,

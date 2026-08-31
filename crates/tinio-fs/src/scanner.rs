@@ -22,6 +22,8 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     io::ErrorKind,
+    path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -74,7 +76,7 @@ pub struct ScannerOptions {
 /// # Examples
 ///
 /// ```rust
-/// use std::{sync::Arc, time::Duration};
+/// use std::{fs, sync::Arc, time::Duration};
 ///
 /// use tinio_core::{
 ///     pipeline::InlineRunner,
@@ -122,6 +124,12 @@ pub struct ScannerOptions {
 pub struct Scanner {
     storage: FsStorage,
     options: ScannerOptions,
+    /// F03: delete-tombstone trees whose removal failed in a previous
+    /// pass — the path is error-logged ONCE per tree, not once per pass
+    /// (the scanner re-enqueues the leftover every pass until it is
+    /// gone; a successful removal clears the entry). `Arc` so the
+    /// scanner stays `Clone` (the shared set is the same across clones).
+    stuck_tombstones: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 /// Resolve the enabled gate: `TINIO_SCANNER` is a strict `0`/`1` toggle
@@ -145,6 +153,7 @@ impl Scanner {
         Self {
             storage,
             options: ScannerOptions { enabled, ..options },
+            stuck_tombstones: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -164,6 +173,7 @@ impl Scanner {
                         reconciled = summary.reconciled,
                         recomputed = summary.recomputed,
                         reclaimed = summary.reclaimed,
+                        removal_failures = summary.removal_failures,
                         "scanner pass complete"
                     );
                 }
@@ -207,7 +217,7 @@ impl Scanner {
     /// aborts the pass.
     pub async fn scan_once(&self) -> Result<ScanSummary, Error> {
         let mut summary = ScanSummary::default();
-        for name in self.storage.bucket_names().await? {
+        for name in self.storage.bucket_names("").await? {
             match self.reconcile_bucket(&name).await {
                 Ok((reconciled, recomputed, reclaimed)) => {
                     summary.reconciled += reconciled;
@@ -238,19 +248,56 @@ impl Scanner {
         // rename, or a failed fire-and-forget `remove_dir_all`) live
         // under `<root>/.tinio/deleting/` — not a live bucket name, so
         // the reconcile loop never sees them. They are enqueued on the
-        // removal lane (D-A), never removed inline — a huge tree must
-        // not block the scan cycle, and the lane is the storage's own
-        // (an inline runner offline, so the enqueue still clears).
+        // removal lane (D-A) — never removed inline — and the
+        // completions are AWAITED so the summary counts ACTUAL removals
+        // (F03): an enqueue is not a removal, and a stuck tree must
+        // read as zero reclamation (plus a `removal_failures` count),
+        // never as a climbing counter. The cycle waits for the leftover
+        // tree walks — leftovers are crash/failure residue, rare by
+        // construction, and the removal lane's own workers do the IO —
+        // while the lane stays the storage's own (an inline runner
+        // offline, so the enqueue still clears). A tree that fails is
+        // error-logged ONCE (the known-stuck set suppresses the repeat
+        // passes' retries); a later success clears it.
         let leftover_runner = self.storage.remove_pipeline();
+        let mut pending = FuturesUnordered::new();
         match tombstone::leftovers(self.storage.root()).await {
             Ok(leftovers) => {
                 for (path, _) in leftovers {
-                    if tombstone::enqueue_one(path, &leftover_runner).await {
-                        summary.reclaimed += 1;
+                    match tombstone::enqueue_tracked(path.clone(), &leftover_runner).await {
+                        Ok(done) => pending.push(async move { (path, done.await) }),
+                        Err(err) => tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "bucket tombstone not enqueued; the scanner covers it"
+                        ),
                     }
                 }
             }
             Err(err) => tracing::warn!(error = %err, "delete-tombstone reclamation failed"),
+        }
+        while let Some((path, result)) = pending.next().await {
+            match result {
+                Ok(Ok(())) => {
+                    summary.reclaimed += 1;
+                    self.stuck_tombstones.lock().unwrap().remove(&path);
+                }
+                Ok(Err(err)) => {
+                    summary.removal_failures += 1;
+                    if self.stuck_tombstones.lock().unwrap().insert(path.clone()) {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %err,
+                            "bucket tombstone stuck; removal failed (retried next pass)"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "bucket tombstone completion failed"
+                ),
+            }
         }
         Ok(summary)
     }
@@ -460,7 +507,7 @@ impl Scanner {
             // like the old reclaim (the containment proof cannot address
             // such buckets).
             if let Ok(bucket_dir) = self.storage.bucket_dir(name).await {
-                // The probes + removes of the whole candidate pass run
+                // The probes + remove of the whole candidate pass run
                 // under this bucket's mutation lock (F05): a concurrent
                 // PUT's rename and meta-row commit hold the same
                 // per-bucket lock, so a fresh row can never be removed
@@ -469,6 +516,11 @@ impl Scanner {
                 // remove (its row re-lands). Mutations of other buckets
                 // do not wait; the pass is bounded by the candidate list.
                 let _guard = self.storage.lock_bucket_mutations(name).await;
+                // The confirmed orphans — probed one by one, removed in
+                // ONE write transaction below (P04: a mass out-of-band
+                // `rm` must not serialize one redb write-lock
+                // acquisition per orphan against live PUTs).
+                let mut orphans: Vec<object::Key> = Vec::new();
                 for key in candidates {
                     // The object path through the crate's own mapping
                     // (one source of truth — the same key_path the
@@ -479,8 +531,8 @@ impl Scanner {
                         continue;
                     };
                     match fsutil::is_absent(&path).await {
-                        Ok(true) => {}         // gone — reclaim below
-                        Ok(false) => continue, // the object exists — not an orphan
+                        Ok(true) => orphans.push(key), // gone — reclaimed below
+                        Ok(false) => continue,         // the object exists — not an orphan
                         Err(err) => {
                             // F11: an IO error must never be treated as
                             // "gone" — a live object whose path is
@@ -495,16 +547,23 @@ impl Scanner {
                             continue;
                         }
                     }
-                    if let Err(err) = self.storage.meta_store().remove(name, &key).await {
-                        tracing::warn!(
-                            bucket = %name,
-                            key = %key,
-                            error = %err,
-                            "orphaned meta entry not reclaimed"
-                        );
-                        continue;
-                    }
-                    reclaimed += 1;
+                }
+                // One write transaction for the whole orphan set (the
+                // MetaWriteBatchTask pattern — M per-orphan removes
+                // become one redb write-lock acquisition). A failed
+                // batch keeps every row of it (re-probed on the next
+                // pass) — the same keep-on-error stance as the old
+                // per-key remove.
+                let count = orphans.len();
+                if let Err(err) = meta.remove_many(name, orphans).await {
+                    tracing::warn!(
+                        bucket = %name,
+                        count,
+                        error = %err,
+                        "orphaned meta entries not reclaimed"
+                    );
+                } else {
+                    reclaimed += count;
                 }
             }
         }
@@ -602,6 +661,7 @@ async fn compute_outcome(
 ///     reconciled: 3,
 ///     recomputed: 1,
 ///     reclaimed: 0,
+///     removal_failures: 0,
 /// };
 /// assert_eq!(summary.reconciled, 3);
 /// ```
@@ -613,6 +673,12 @@ pub struct ScanSummary {
     pub recomputed: usize,
     /// Orphaned meta entries reclaimed.
     pub reclaimed: usize,
+    /// Delete-tombstone removals that failed this pass (the tree is
+    /// still under `.tinio/deleting/` — the error was logged once per
+    /// tree, F03/F07). Zero in steady state; a stuck tree reads as
+    /// zero reclamation plus a non-zero failure count, never as a
+    /// climbing `reclaimed`.
+    pub removal_failures: usize,
 }
 
 #[cfg(test)]
@@ -623,6 +689,7 @@ mod tests {
         fs::File,
         path::Path,
         sync::{Arc, atomic::Ordering},
+        time::SystemTime,
     };
 
     use tokio::{fs, time::sleep};
@@ -634,7 +701,7 @@ mod tests {
             pipeline::{InlineRunner, Runner},
             storage::{BucketOps, ObjectOps},
         },
-        _util::testing::body,
+        _util::testing::{body, etag},
         FsOptions, testutil,
         testutil::{
             FailingBatchRunner, FailingTaskRunner, GatedRunner, PacedRunner, fs_options, wait_for,
@@ -773,7 +840,43 @@ mod tests {
         let scanner = Scanner::new(storage, options());
         let summary = scanner.scan_once().await.unwrap();
         assert_eq!(summary.reclaimed, 1);
+        assert_eq!(summary.removal_failures, 0);
         assert!(!leftover.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stuck_tombstone_counts_as_a_failure_not_as_reclaimed() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let leftover = tombstone::dir(root.path()).join("dead-bucket");
+        fs::create_dir_all(&leftover).await.unwrap();
+        // A share-mode-0 handle blocks the Windows tree removal (the
+        // tombstone tests' lock) — the tree stays, so the pass must
+        // report zero reclamation and one failure (F03: an enqueue is
+        // not a removal; a stuck tree never reads as progress).
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(leftover.join("open.txt"))
+            .unwrap();
+        let scanner = Scanner::new(storage, options());
+        let first = scanner.scan_once().await.unwrap();
+        assert_eq!(first.reclaimed, 0);
+        assert_eq!(first.removal_failures, 1);
+        assert!(leftover.exists());
+        // A second pass re-enqueues the leftover (still stuck) — the
+        // same counts, and the error is not re-logged (the known-stuck
+        // set suppresses the repeat, F03).
+        let second = scanner.scan_once().await.unwrap();
+        assert_eq!(second.reclaimed, 0);
+        assert_eq!(second.removal_failures, 1);
+        assert!(leftover.exists());
+        drop(file);
     }
 
     #[tokio::test]
@@ -986,7 +1089,7 @@ mod tests {
     fn swap_all_for_symlinks(root: &Path, n: usize) {
         for i in 0..n {
             let path = root.join("data").join(format!("f{i:02}.txt"));
-            remove_file(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
             symlink(root.join("gone"), &path).unwrap();
         }
     }
@@ -1087,8 +1190,6 @@ mod tests {
     async fn one_failing_bucket_does_not_starve_the_pass() {
         use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
-        use meta::Store;
-
         use crate::_core::ETag;
 
         let root = tempfile::tempdir().unwrap();
@@ -1185,5 +1286,85 @@ mod tests {
         let summary = scanner.scan_once().await.unwrap();
         assert_eq!(summary.recomputed, 0);
         assert_eq!(io.enqueued(), 3, "hot pass: no compute tasks (P6)");
+    }
+
+    #[tokio::test]
+    async fn drain_loop_paces_write_batches_after_the_walk() {
+        // Outcomes still in flight when the walk ends are folded by the
+        // drain loop (P3) — and each flushed batch paces the same way as
+        // the walk's own batches (R2).
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("data")).await.unwrap();
+        for i in 0..3 {
+            fs::write(
+                root.path().join(format!("data/f{i:02}.txt")),
+                format!("payload {i}"),
+            )
+            .await
+            .unwrap();
+        }
+        let io = GatedRunner::<etag::Result>::new(1, 8);
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                meta_batch_size: 1,
+                io_pipeline: io.clone(),
+                db_pipeline: Arc::new(InlineRunner::default()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let scanner = Scanner::new(
+            storage,
+            ScannerOptions {
+                enabled: true,
+                delay: Duration::from_millis(10),
+                max_wait: Duration::from_millis(10),
+                cycle: Duration::from_millis(50),
+            },
+        );
+        let task = tokio::spawn(async move { scanner.scan_once().await.unwrap() });
+        // The walk has enqueued and is now draining the parked tasks.
+        wait_for(|| io.enqueued() == 3).await;
+        io.open_gate();
+        let summary = task.await.unwrap();
+        assert_eq!(summary.recomputed, 3);
+        assert_eq!(summary.reconciled, 3);
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_rows_whose_path_still_exists() {
+        // A snapshot row the walk never emits (a folder-marker row
+        // planted out-of-band — a directory is not an object) is a
+        // candidate whose path still exists: the probe keeps it (an
+        // existing path is never an orphan, F11).
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        fs::create_dir(root.path().join("data/dir")).await.unwrap();
+        fs::write(root.path().join("data/a.txt"), b"x")
+            .await
+            .unwrap();
+        storage
+            .meta_store()
+            .set(
+                &b,
+                &object::key("dir/").unwrap(),
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                0,
+                SystemTime::now(),
+                0,
+            )
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage.clone(), options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 0);
+        assert_eq!(
+            storage.meta_store().walk(&b).await.unwrap().len(),
+            2,
+            "the existing path keeps its row"
+        );
     }
 }

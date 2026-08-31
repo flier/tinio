@@ -342,15 +342,11 @@ mod tests {
         fs::{self as std_fs, File},
         io::Write,
         path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
         thread::sleep,
         time::Duration,
     };
 
-    use tokio::{runtime::Builder, task::yield_now};
+    use tokio::runtime::Builder;
 
     use super::*;
     use crate::{
@@ -650,9 +646,8 @@ mod tests {
     fn compute_core_completes_on_a_single_threaded_runtime() {
         // Q4 async semantics: the compute core is `tokio::fs` — the hash
         // IO runs on the tokio blocking pool, so a big-file hash
-        // completes without deadlock on a single-threaded runtime even
-        // with a concurrently spinning task (the blocking pool is
-        // independent of the worker driver).
+        // completes without deadlock on a single-threaded runtime (the
+        // blocking pool is independent of the worker driver).
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let state = tempfile::tempdir().unwrap();
@@ -660,31 +655,14 @@ mod tests {
             fs::write(&file, vec![b'x'; 4 * 1024 * 1024]).await.unwrap();
             let metadata = fs::metadata(&file).await.unwrap();
             let task = task("big.bin", file, metadata.len(), None, false);
-            let progress = Arc::new(AtomicUsize::new(0));
-            let worker = {
-                let progress = Arc::clone(&progress);
-                tokio::spawn(async move {
-                    loop {
-                        progress.fetch_add(1, Ordering::Relaxed);
-                        yield_now().await;
-                    }
-                })
-            };
             let runner = InlineRunner::default();
             let done = runner.enqueue(Box::new(task)).await.unwrap();
-            // The hash yields to the runtime (async core) — the worker
-            // is free to run other tasks while the blocking pool hashes.
-            let yielded = progress.load(Ordering::Relaxed) > 0;
-            worker.abort();
             let outcome = done.await.unwrap().unwrap();
             assert_eq!(outcome.size, 4 * 1024 * 1024);
             assert_eq!(
                 outcome.etag,
                 ETag::from_content(&vec![b'x'; 4 * 1024 * 1024])
             );
-            // The no-yield invariant is gone by design (Q4 async) — this
-            // documents that the compute no longer monopolizes a worker.
-            let _ = yielded;
         });
     }
 }

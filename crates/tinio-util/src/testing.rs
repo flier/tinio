@@ -44,8 +44,9 @@ use futures::{StreamExt, stream};
 use tokio::time::{Instant, sleep};
 
 use crate::_core::{
-    BodyStream, ByteRange, CompletedPart, ETag, ListObjectsParams, ListPartsParams,
-    ListUploadsParams, Storage, bucket, multipart, object, storage, storage::Error::*,
+    BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
+    ListPartsParams, ListUploadsParams, Storage, bucket, multipart, object, storage,
+    storage::Error::*,
 };
 
 /// Produce a unique bucket name for the harness (fresh backends may already
@@ -201,21 +202,168 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.delete_bucket(b).await.unwrap();
 }
 
+/// One ListBuckets request of the conformance fixture — the
+/// `prefix: String::new()`-heavy literal built at every pagination
+/// step below.
+fn page(prefix: &str, start_after: Option<String>, max_buckets: usize) -> ListBucketsParams {
+    ListBucketsParams {
+        prefix: prefix.to_string(),
+        start_after,
+        max_buckets,
+    }
+}
+
 async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // Start empty.
-    let buckets = storage.list_buckets().await.unwrap();
+    let buckets = storage
+        .list_buckets(page("", None, usize::MAX))
+        .await
+        .unwrap();
     check(
-        buckets.iter().all(|x| x.name != *b),
+        buckets.buckets.iter().all(|x| x.name != *b),
         "fresh bucket already listed",
     );
 
     // Create.
     storage.create_bucket(b).await.unwrap();
-    let buckets = storage.list_buckets().await.unwrap();
+    let buckets = storage
+        .list_buckets(page("", None, usize::MAX))
+        .await
+        .unwrap();
     check(
-        buckets.iter().any(|x| x.name == *b),
+        buckets.buckets.iter().any(|x| x.name == *b),
         "created bucket must be listed",
     );
+
+    // Paginated parity — pins every backend to identical page/marker
+    // semantics (the per-backend unit tests alone would not catch a
+    // drift): page over ALL buckets with a small page size and assert
+    // the union of pages equals the full listing, in name order.
+    let extra1 = bucket::name(unique_bucket("conform")).unwrap();
+    let extra2 = bucket::name(unique_bucket("conform")).unwrap();
+    storage.create_bucket(&extra1).await.unwrap();
+    storage.create_bucket(&extra2).await.unwrap();
+    let full = storage
+        .list_buckets(page("", None, usize::MAX))
+        .await
+        .unwrap();
+    check(
+        full.buckets.len() >= 3,
+        "the full listing must hold the fixture buckets",
+    );
+    let mut paged = Vec::new();
+    let mut start_after = None;
+    loop {
+        let page = storage
+            .list_buckets(page("", start_after.clone(), 2))
+            .await
+            .unwrap();
+        check(
+            page.buckets.len() <= 2,
+            "a page must not exceed its max_buckets",
+        );
+        check(
+            !page.truncated || page.next_start_after.is_some(),
+            "a truncated page must carry a resume marker",
+        );
+        check(
+            page.next_start_after.is_none() || page.truncated,
+            "a resume marker without truncation must not be emitted",
+        );
+        paged.extend(page.buckets.iter().map(|x| x.name.clone()));
+        match page.next_start_after {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+    check(
+        paged
+            == full
+                .buckets
+                .iter()
+                .map(|x| x.name.clone())
+                .collect::<Vec<_>>(),
+        "the paged union must equal the full listing, in name order",
+    );
+    // Edge pages: an exact fill (max = the full count) is not
+    // truncated; a marker past the end yields an empty, untruncated
+    // page; the contract-level `max_buckets = 0` asks for an empty,
+    // untruncated page.
+    let exact = storage
+        .list_buckets(page("", None, full.buckets.len()))
+        .await
+        .unwrap();
+    check(
+        exact.buckets.len() == full.buckets.len()
+            && !exact.truncated
+            && exact.next_start_after.is_none(),
+        "an exact fill must return the full listing, untruncated",
+    );
+    let last = full
+        .buckets
+        .last()
+        .expect("fixture buckets")
+        .name
+        .to_string();
+    let exhausted = storage
+        .list_buckets(page("", Some(last), 1000))
+        .await
+        .unwrap();
+    check(
+        exhausted.buckets.is_empty()
+            && !exhausted.truncated
+            && exhausted.next_start_after.is_none(),
+        "a marker past the end must yield an empty, untruncated page",
+    );
+    let empty = storage.list_buckets(page("", None, 0)).await.unwrap();
+    check(
+        empty.buckets.is_empty() && !empty.truncated && empty.next_start_after.is_none(),
+        "max_buckets = 0 must yield an empty, untruncated page",
+    );
+    // Prefix filtering: the fixture bucket's full name matches exactly
+    // that bucket (the counter in `unique_bucket` differs for the rest).
+    let prefixed = storage
+        .list_buckets(page(b.as_ref(), None, 1000))
+        .await
+        .unwrap();
+    check(
+        prefixed.buckets.len() == 1 && prefixed.buckets[0].name == *b,
+        "the prefix filter must match exactly the fixture bucket",
+    );
+    check(
+        !prefixed.truncated && prefixed.next_start_after.is_none(),
+        "a complete prefixed page must carry no resume marker",
+    );
+    storage.delete_bucket(&extra1).await.unwrap();
+    storage.delete_bucket(&extra2).await.unwrap();
+
+    // Prefix + marker: a marker inside a prefix-filtered stream
+    // positions the next page (exclusive-after). The pair shares the
+    // `pg` prefix (the `conform` prefix would match the fixture bucket
+    // too); the resume target is read from the listing, never assumed
+    // from creation order.
+    let p1 = bucket::name(unique_bucket("pg")).unwrap();
+    let p2 = bucket::name(unique_bucket("pg")).unwrap();
+    storage.create_bucket(&p1).await.unwrap();
+    storage.create_bucket(&p2).await.unwrap();
+    let prefixed = storage.list_buckets(page("pg", None, 1000)).await.unwrap();
+    check(
+        prefixed.buckets.len() == 2,
+        "the pg pair must be the only prefix matches",
+    );
+    let resumed = storage
+        .list_buckets(page("pg", Some(prefixed.buckets[0].name.to_string()), 1000))
+        .await
+        .unwrap();
+    check(
+        resumed.buckets.len() == 1
+            && resumed.buckets[0].name == prefixed.buckets[1].name
+            && !resumed.truncated
+            && resumed.next_start_after.is_none(),
+        "a marker inside the filtered stream must resume exactly",
+    );
+    storage.delete_bucket(&p1).await.unwrap();
+    storage.delete_bucket(&p2).await.unwrap();
 
     // Head.
     let head = storage.head_bucket(b).await.unwrap();

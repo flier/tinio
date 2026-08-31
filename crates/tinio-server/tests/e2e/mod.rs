@@ -71,19 +71,34 @@ impl Server {
     pub fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        Self::start_inner(&root, None, Some(dir))
+        Self::start_inner(&root, None, Some(dir), None)
     }
 
     /// Serve `root` (caller keeps it) with `TINIO_SCANNER` set per
     /// `scanner` (None leaves it unset) — advanced.rs reuses one root for
     /// the scanner-on / scanner-off pair.
     pub fn start_at(root: &Path, scanner: Option<bool>) -> Self {
-        Self::start_inner(root, scanner, None)
+        Self::start_inner(root, scanner, None, None)
     }
 
-    fn start_inner(root: &Path, scanner: Option<bool>, dir: Option<tempfile::TempDir>) -> Self {
+    /// Serve `root` (caller keeps it) with an additional
+    /// `--config <path>` — the serve-wiring proof: a configured
+    /// `[s3] max_buckets` must reach the running plane.
+    pub fn start_with_config(root: &Path, config: &Path) -> Self {
+        Self::start_inner(root, None, None, Some(config))
+    }
+
+    fn start_inner(
+        root: &Path,
+        scanner: Option<bool>,
+        dir: Option<tempfile::TempDir>,
+        config: Option<&Path>,
+    ) -> Self {
         let mut cmd = Command::new(serve_bin());
         cmd.arg(root).arg("--port").arg("0");
+        if let Some(config) = config {
+            cmd.arg("--config").arg(config);
+        }
         if let Some(s) = scanner {
             cmd.env("TINIO_SCANNER", if s { "1" } else { "0" });
         }

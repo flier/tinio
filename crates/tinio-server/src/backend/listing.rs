@@ -12,7 +12,9 @@ use s3s::{S3Request, S3Response, S3Result, dto};
 
 use crate::{
     _core::storage::{ListObjectsParams, Storage},
-    backend::{S3Backend, map_backend_error, normalize_delimiter},
+    backend::{
+        S3Backend, clamp_page_size, map_backend_error, normalize_delimiter, normalize_page_size,
+    },
 };
 
 /// One mapped listing page shared by the V1/V2 XML surfaces.
@@ -41,7 +43,18 @@ impl<S: Storage> S3Backend<S> {
         max_keys: Option<i32>,
     ) -> S3Result<ListPage> {
         let bucket = self.bucket(bucket)?;
-        let max_keys = max_keys.unwrap_or(1000).max(0) as usize;
+        let requested = max_keys.unwrap_or(1000);
+        // Unified page-size policy: a page size < 1 is rejected before
+        // any storage call (AWS documents no max-keys range; the
+        // strictness is deliberate) — unless the
+        // `[s3] allow_zero_page_size` escape hatch restores the legacy
+        // clamp-to-0 empty page. The configured `[s3] max_keys` cap
+        // clamps the requested size (0 = no clamp); the echoed
+        // `MaxKeys` element carries the effective value.
+        let max_keys = clamp_page_size(
+            normalize_page_size(requested, "max-keys", self.caps.allow_zero_page_size)?,
+            self.caps.max_keys,
+        );
         // An empty `delimiter=` value means "no delimiter" (S3 semantics;
         // clients like mc always send it) — a `Some("")` would roll every
         // object up into an empty common prefix and empty the page. The
@@ -59,7 +72,7 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         Ok(ListPage {
-            bucket: bucket.to_string(),
+            bucket: String::from(bucket),
             prefix,
             delimiter,
             start_after,
@@ -69,7 +82,7 @@ impl<S: Storage> S3Backend<S> {
                 .into_iter()
                 .map(|o| dto::Object {
                     e_tag: Some(Self::etag_wire(&o.etag)),
-                    key: Some(o.key.to_string()),
+                    key: Some(String::from(o.key)),
                     last_modified: Some(Self::last_modified(o.last_modified)),
                     size: Some(o.size as i64),
                     ..Default::default()
@@ -120,14 +133,17 @@ impl<S: Storage> S3Backend<S> {
         req: S3Request<dto::ListObjectsV2Input>,
     ) -> S3Result<S3Response<dto::ListObjectsV2Output>> {
         Self::require_cap(self.caps.list_objects_v2, "ListObjectsV2")?;
-        let continuation_token = req.input.continuation_token.clone();
-        let start_after = req.input.start_after.clone();
+        let continuation_token = req.input.continuation_token;
+        let start_after = req.input.start_after;
         let page = self
             .list_page(
                 req.input.bucket,
                 req.input.prefix,
                 req.input.delimiter,
-                continuation_token.clone().or(start_after.clone()),
+                // The winner feeds the listing; the echo keeps both
+                // originals, so the chosen token alone is cloned
+                // (`or_else` spares the loser).
+                continuation_token.clone().or_else(|| start_after.clone()),
                 req.input.max_keys,
             )
             .await?;
@@ -154,10 +170,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{bucket, object, storage::ObjectOps},
+        _core::{
+            bucket, object,
+            storage::{BucketOps, ObjectOps},
+        },
         _mem::MemoryStorage,
         _util::testing::body,
-        backend::testutil::{s3_request, setup as base_setup},
+        backend::{
+            Capabilities,
+            testutil::{s3_request, setup as base_setup},
+        },
     };
 
     async fn setup() -> (S3Backend<MemoryStorage>, String) {
@@ -290,5 +312,182 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "NoSuchBucket");
+    }
+
+    #[cfg(feature = "list-v1")]
+    #[tokio::test]
+    async fn v1_rejects_max_keys_below_one() {
+        let (backend, b) = setup().await;
+        for max_keys in [0, -1] {
+            let err = backend
+                .list_objects(s3_request(dto::ListObjectsInput {
+                    bucket: b.clone(),
+                    max_keys: Some(max_keys),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code().as_str(),
+                "InvalidArgument",
+                "max-keys = {max_keys}"
+            );
+        }
+    }
+
+    #[cfg(feature = "list-v2")]
+    #[tokio::test]
+    async fn v2_rejects_max_keys_below_one() {
+        let (backend, b) = setup().await;
+        let err = backend
+            .list_objects_v2(s3_request(dto::ListObjectsV2Input {
+                bucket: b,
+                max_keys: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+    }
+
+    #[cfg(feature = "list-v1")]
+    #[tokio::test]
+    async fn v1_allow_zero_page_size_restores_the_legacy_empty_page() {
+        // The `[s3] allow_zero_page_size` escape hatch: 0 and negative
+        // values answer the empty page (the legacy `.max(0)` clamp),
+        // never InvalidArgument.
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                allow_zero_page_size: true,
+                ..Default::default()
+            },
+        );
+        let storage = backend.storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        storage
+            .put_object(&b, &object::key("a.txt").unwrap(), body("a"))
+            .await
+            .unwrap();
+        for max_keys in [0, -1] {
+            let out = backend
+                .list_objects(s3_request(dto::ListObjectsInput {
+                    bucket: "data".into(),
+                    max_keys: Some(max_keys),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .output;
+            assert_eq!(out.max_keys, Some(0), "max-keys = {max_keys}");
+            assert!(out.contents.as_ref().unwrap().is_empty());
+            assert_eq!(out.is_truncated, Some(false));
+        }
+    }
+
+    #[cfg(feature = "list-v2")]
+    #[tokio::test]
+    async fn v2_allow_zero_page_size_restores_the_legacy_empty_page() {
+        // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
+        // empty page (the legacy behavior), never InvalidArgument.
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                allow_zero_page_size: true,
+                ..Default::default()
+            },
+        );
+        let storage = backend.storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        storage
+            .put_object(&b, &object::key("a.txt").unwrap(), body("a"))
+            .await
+            .unwrap();
+        for max_keys in [0, -1] {
+            let out = backend
+                .list_objects_v2(s3_request(dto::ListObjectsV2Input {
+                    bucket: "data".into(),
+                    max_keys: Some(max_keys),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .output;
+            assert_eq!(out.max_keys, Some(0), "max-keys = {max_keys}");
+            assert!(out.contents.as_ref().unwrap().is_empty());
+            assert_eq!(out.is_truncated, Some(false));
+        }
+    }
+
+    #[cfg(feature = "list-v1")]
+    #[tokio::test]
+    async fn v1_echoes_the_effective_page_size_after_a_clamp() {
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                max_keys: 2,
+                ..Default::default()
+            },
+        );
+        let storage = backend.storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        for key in ["a.txt", "b.txt", "c.txt"] {
+            storage
+                .put_object(&b, &object::key(key).unwrap(), body(key))
+                .await
+                .unwrap();
+        }
+        let out = backend
+            .list_objects(s3_request(dto::ListObjectsInput {
+                bucket: "data".into(),
+                max_keys: Some(1000),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(
+            out.max_keys,
+            Some(2),
+            "the response echoes the effective (clamped) page size"
+        );
+        assert_eq!(out.is_truncated, Some(true));
+        assert_eq!(out.contents.as_ref().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "list-v2")]
+    #[tokio::test]
+    async fn v2_echoes_the_effective_page_size_after_a_clamp() {
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                max_keys: 2,
+                ..Default::default()
+            },
+        );
+        let storage = backend.storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        for key in ["a.txt", "b.txt", "c.txt"] {
+            storage
+                .put_object(&b, &object::key(key).unwrap(), body(key))
+                .await
+                .unwrap();
+        }
+        let out = backend
+            .list_objects_v2(s3_request(dto::ListObjectsV2Input {
+                bucket: "data".into(),
+                max_keys: Some(1000),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.max_keys, Some(2));
+        assert_eq!(out.is_truncated, Some(true));
+        assert_eq!(out.key_count, Some(2));
     }
 }
