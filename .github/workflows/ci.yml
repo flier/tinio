@@ -59,7 +59,7 @@ jobs:
       # cargo check level, no dev-deps.
       - uses: taiki-e/install-action@v2
         with:
-          tools: cargo-hack
+          tool: cargo-hack
 
       - name: feature-matrix check (tinio)
         run: cargo hack check --package tinio --feature-powerset --no-dev-deps
@@ -93,7 +93,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tools: cargo-semver-checks
+          tool: cargo-semver-checks
 
       # constitution VI: API changes MUST be checked with cargo-semver-checks.
       # check-release compares against the last published version on crates.io;
@@ -123,7 +123,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tools: cargo-audit
+          tool: cargo-audit
 
       - name: cargo audit
         run: cargo audit
@@ -146,7 +146,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tools: aws-cli, rclone
+          tool: aws-cli, rclone
 
       - name: build facade binary
         run: cargo build --package tinio
