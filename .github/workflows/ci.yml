@@ -130,9 +130,7 @@ jobs:
 
   interop:
     name: Interop (aws cli v2 + rclone)
-    # Gated on the harness existing: e2e/interop/journey.sh lands with task
-    # T032 (US1); until then this job is skipped so setup-phase CI stays green.
-    if: hashFiles('e2e/interop/journey.sh') != ''
+    # harness e2e/interop/journey.sh is committed (T032), job always runs
     needs: quality
     strategy:
       fail-fast: false
