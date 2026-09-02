@@ -639,14 +639,21 @@ impl<'txn> PartChecksumsTable<'txn, Table<'txn, PartKey, PartChecksumValue>> {
 
 type StateKey = &'static str;
 
-/// The `STATE` table's format version.
-const STATE_VERSION: u64 = 1;
+/// The `STATE` table's format version — ONE current version, no
+/// migration (F06, user decision): any stored version that is not this
+/// one is refused, old and new alike. The version history is additive
+/// (`UPLOAD_CHECKSUMS` + `PART_CHECKSUMS` landed in 2, spec 2026-08-31),
+/// but a pre-checksum v1 database cannot be told apart from a future
+/// format, so it must not open silently — the state is derivable, and
+/// `UnsupportedVersion` tells the operator to delete and rebuild.
+const STATE_VERSION: u64 = 2;
 /// The `STATE` version key.
 const STATE_VERSION_KEY: &str = "version";
 /// The `STATE` compact-needed marker key (0 = clean, 1 = needs compact).
 const COMPACT_NEEDED_KEY: &str = "compact_needed";
 
-/// `"version"` → 1; `"compact_needed"` → 0/1 (compact marker).
+/// `"version"` → the current [`STATE_VERSION`]; `"compact_needed"` → 0/1
+/// (compact marker).
 const STATE: TableDefinition<StateKey, u64> = TableDefinition::new("state");
 
 /// Handle to the `STATE` table (writable or read-only).
@@ -670,7 +677,8 @@ where
 }
 
 impl<'txn> StateTable<'txn, Table<'txn, StateKey, u64>> {
-    /// Check the format version: write on first open, reject on mismatch.
+    /// Check the format version: write on first open, reject ANY
+    /// mismatch (one current version — F06; no migration).
     pub fn ensure_version(&mut self, path: &Path) -> Result<u64, Error> {
         match self.stored(STATE_VERSION_KEY)? {
             None => {

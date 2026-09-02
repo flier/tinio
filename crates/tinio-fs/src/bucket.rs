@@ -254,7 +254,7 @@ mod tests {
                 Error::Database(UnsupportedVersion {
                     path: _,
                     found: 9,
-                    expected: 1
+                    expected: 2
                 })
             ),
             "{err:?}"

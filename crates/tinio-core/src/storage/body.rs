@@ -33,3 +33,38 @@ pub async fn collect_body(mut body: BodyStream) -> io::Result<Vec<u8>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::stream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_stream_collects_to_empty() {
+        let body: BodyStream = Box::pin(stream::empty());
+        assert_eq!(collect_body(body).await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn chunks_are_concatenated_in_order() {
+        let body: BodyStream = Box::pin(stream::iter([
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+            Ok(Bytes::from_static(b"!")),
+        ]));
+        assert_eq!(collect_body(body).await.unwrap(), b"hello world!".to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_aborts_with_its_error() {
+        let body: BodyStream = Box::pin(stream::iter([
+            Ok(Bytes::from_static(b"head")),
+            Err(io::Error::other("boom")),
+            Ok(Bytes::from_static(b"tail")),
+        ]));
+        let err = collect_body(body).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "boom");
+    }
+}

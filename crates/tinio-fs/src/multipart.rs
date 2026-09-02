@@ -164,9 +164,11 @@ fn upload_from_row(
         bucket: bucket.clone(),
         key,
         initiated_at: from_nanos(initiated_at),
-        checksum: checksum_row
-            .map(|(algo, ty)| checksum::Upload::from_wire(&algo, &ty))
-            .transpose()?,
+        // A domain-invalid checksum row self-heals: the upload is served
+        // without a spec (F07) — the invalid ETag rows are skipped the
+        // same way, and a hard error here would also kill the multipart
+        // sweep (walk_uploads) forever.
+        checksum: checksum_row.and_then(|(algo, ty)| checksum::Upload::from_wire_opt(&algo, &ty)),
     }))
 }
 
@@ -376,8 +378,8 @@ impl Store {
     /// Stream one part (number `1..=10000`) into the upload. `checksum`
     /// is the server's tee slot (spec 2026-08-31): its digest is
     /// persisted in the SAME transaction as the part row (atomic — no
-    /// CAS), and with `etag_md5` it supplies the part ETag. `NoSuchUpload`
-    /// when the upload does not exist.
+    /// CAS), and the slot's `etag` cell supplies the part ETag.
+    /// `NoSuchUpload` when the upload does not exist.
     pub async fn put_part(
         &self,
         bucket: &bucket::Name,
@@ -598,11 +600,30 @@ impl Store {
                     .list_from(bucket, upload_id, start, max_parts)?;
                 // Join the `PART_CHECKSUMS` row of each part (raw
                 // `(algorithm, value)` wire names; pass 2 parses them).
+                // Probed once per page: an upload with no checksum rows
+                // at all (the checksum feature off ⇒ the table is
+                // guaranteed empty) skips the per-part point reads —
+                // one probe read instead of one per part (F03).
                 let checksums = PartChecksumsTable::open_readonly(txn)?;
+                let has_checksums = checksums
+                    .range((bucket.as_ref().as_str(), upload_id, 0)..)?
+                    .next()
+                    .transpose()?
+                    .is_some_and(|(k, _)| {
+                        let (b, id, _) = k.value();
+                        b == bucket.as_ref().as_str() && id == upload_id
+                    });
+                let checksums = has_checksums
+                    .then(|| PartChecksumsTable::open_readonly(txn))
+                    .transpose()?;
                 let page = recorded
                     .into_iter()
                     .map(|(n, hex)| {
-                        let checksum = checksums.get(bucket.as_ref().as_str(), upload_id, n)?;
+                        let checksum = checksums
+                            .as_ref()
+                            .map(|table| table.get(bucket.as_ref().as_str(), upload_id, n))
+                            .transpose()?
+                            .flatten();
                         Ok((n, hex, checksum))
                     })
                     .collect::<Result<Vec<_>, database::Error>>()?;
@@ -631,11 +652,11 @@ impl Store {
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
-            // A domain-invalid checksum row fails the listing.
-            let checksum = match checksum_row {
-                None => None,
-                Some((algo, value)) => Some(checksum::Part::from_wire(&algo, value)?),
-            };
+            // A domain-invalid checksum row self-heals: the part is
+            // listed without a checksum (F07 — the invalid ETag rows are
+            // skipped the same way).
+            let checksum =
+                checksum_row.and_then(|(algo, value)| checksum::Part::from_wire_opt(&algo, value));
             parts.push(PartInfo {
                 part_number: n.into(),
                 size: metadata.len(),
@@ -1243,7 +1264,7 @@ mod tests {
             checksum::Algorithm,
             storage::{Error as StorageError, group_and_paginate_ordered},
         },
-        _util::testing::{body, etag},
+        _util::testing::body,
     };
 
     fn fixture() -> (tempfile::TempDir, Store) {
@@ -1409,224 +1430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_list_part_round_trip() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        let part = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"part-one"), None)
-            .await
-            .unwrap();
-        assert_eq!(part.size, 8);
-        assert_eq!(part.etag, etag("dede9db222ee612853f44e6e6b1ca792"));
-        let (parts, truncated, _) = store
-            .list_parts(&b, &k, &upload.upload_id, None, 1000)
-            .await
-            .unwrap();
-        assert_eq!(parts.len(), 1);
-        assert!(!truncated);
-        assert_eq!(parts[0].etag, part.etag);
-    }
-
-    #[tokio::test]
-    async fn put_part_missing_upload_is_no_such_upload() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = MultipartUpload {
-            upload_id: "ghost".into(),
-            bucket: b.clone(),
-            key: k.clone(),
-            initiated_at: SystemTime::now(),
-            checksum: None,
-        };
-        let err = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-    }
-
-    #[tokio::test]
-    async fn non_uuid_upload_ids_are_no_such_upload() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        for evil in ["../victim/abc", "a/b", "..", ""] {
-            let err = store
-                .put_part(&b, &k, evil, 1.into(), body(b"x"), None)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, Error::Storage(StorageError::NoSuchUpload(_))),
-                "{evil}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn complete_under_a_different_key_is_no_such_upload() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("a.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
-            .await
-            .unwrap();
-        let completed = [CompletedPart {
-            part_number: 1.into(),
-            etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
-        }];
-        let err = store
-            .complete(
-                &b,
-                &object::key("b.bin").unwrap(),
-                &upload.upload_id,
-                &completed,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-    }
-
-    #[tokio::test]
-    async fn put_part_under_a_different_key_is_no_such_upload() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("a.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        let err = store
-            .put_part(
-                &b,
-                &object::key("b.bin").unwrap(),
-                &upload.upload_id,
-                1.into(),
-                body(b"x"),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
-    }
-
-    #[tokio::test]
-    async fn complete_assembles_byte_exact_with_composed_etag() {
-        let (state, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        let mut parts = Vec::new();
-        let parts_data: [&[u8]; 3] = [b"part-one-", b"part-two-", b"part-three"];
-        for (i, data) in parts_data.iter().enumerate() {
-            let part = store
-                .put_part(
-                    &b,
-                    &k,
-                    &upload.upload_id,
-                    ((i + 1) as u32).into(),
-                    body(data.to_vec()),
-                    None,
-                )
-                .await
-                .unwrap();
-            parts.push(part);
-        }
-        let completed: Vec<CompletedPart> = parts
-            .iter()
-            .map(|p| CompletedPart {
-                part_number: p.part_number,
-                etag: p.etag.clone(),
-            })
-            .collect();
-        let target = state.path().join("out.bin");
-        let (temp, etag) = store
-            .complete(&b, &k, &upload.upload_id, &completed)
-            .await
-            .unwrap();
-        // Hard-coded reference composition (MD5 of raw part digests).
-        assert_eq!(etag.as_str(), "aed23cbfc502f1e851e828efe2ca50d0-3");
-        // Not consumed yet: the records and subtree must outlive the
-        // assemble step (the caller renames, then consumes — §5.3).
-        assert!(store.has_uploads(&b).await.unwrap());
-        let upload_dir = state.path().join("multipart/data").join(&upload.upload_id);
-        assert!(fs::metadata(&upload_dir).await.is_ok());
-        // Rename onto the object, then consume the upload.
-        fs::rename(&temp, &target).await.unwrap();
-        store.consume(&b, &upload.upload_id).await.unwrap();
-        assert_eq!(
-            fs::read(&target).await.unwrap(),
-            b"part-one-part-two-part-three"
-        );
-        // The upload records and subtree are gone.
-        assert!(!store.has_uploads(&b).await.unwrap());
-        assert!(fs::metadata(&upload_dir).await.is_err());
-        // The object is retrievable as a regular object.
-        let content = fs::read(&target).await.unwrap();
-        assert_eq!(content, b"part-one-part-two-part-three");
-    }
-
-    #[tokio::test]
-    async fn complete_no_parts_is_error() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        let err = store
-            .complete(&b, &k, &upload.upload_id, &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::NoParts)));
-    }
-
-    #[tokio::test]
-    async fn complete_mismatched_or_missing_part_is_invalid_part() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
-            .await
-            .unwrap();
-
-        // Wrong ETag.
-        let wrong = CompletedPart {
-            part_number: 1.into(),
-            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
-        };
-        let err = store
-            .complete(&b, &k, &upload.upload_id, &[wrong])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::InvalidPart(1))));
-
-        // Missing part number 2 after 1.
-        let good = CompletedPart {
-            part_number: 1.into(),
-            etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
-        };
-        let missing = CompletedPart {
-            part_number: 3.into(),
-            etag: etag("9dd4e461268c8034f5c8564e155c67a6"),
-        };
-        let err = store
-            .complete(&b, &k, &upload.upload_id, &[good.clone(), missing.clone()])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::InvalidPart(3))));
-
-        // Out of order (a repeated part number is not strictly
-        // ascending).
-        let err = store
-            .complete(&b, &k, &upload.upload_id, &[good.clone(), good.clone()])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::InvalidPart(1))));
-    }
-
-    #[tokio::test]
     async fn abort_drains_the_checksum_rows() {
         // F1 regression: `abort`'s inlined drain must remove the
         // `UPLOAD_CHECKSUMS` + `PART_CHECKSUMS` rows too — the shared
@@ -1674,8 +1477,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_removes_parts_and_is_no_such_upload_after() {
-        let (state, store) = fixture();
+    async fn corrupt_checksum_spec_rows_self_heal() {
+        // F07: a domain-invalid UPLOAD_CHECKSUMS row must not fail the
+        // read paths — the upload still answers (checksum dropped),
+        // listings still list it, and the sweep keeps walking.
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k, None).await.unwrap();
+        let b2 = b.clone();
+        let id = upload.upload_id.clone();
+        store
+            .handle
+            .write(move |txn| {
+                UploadChecksumsTable::open(txn)?.put(&b2, &id, "BLAKE3", "")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let got = store.get_upload(&b, &k, &upload.upload_id).await.unwrap();
+        assert!(got.checksum.is_none(), "get_upload drops the corrupt spec");
+        let listed = store.list_uploads(&b).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].checksum.is_none());
+        let walked = store.walk_uploads().await.unwrap();
+        assert_eq!(walked.len(), 1, "the sweep keeps walking");
+    }
+
+    #[tokio::test]
+    async fn corrupt_part_checksum_rows_self_heal() {
+        // F07: a domain-invalid PART_CHECKSUMS row must not fail the
+        // listing — the part is listed without a checksum (the invalid
+        // ETag rows are skipped the same way).
+        let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store.create(&b, &k, None).await.unwrap();
@@ -1683,14 +1517,53 @@ mod tests {
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
             .unwrap();
-        store.abort(&b, &k, &upload.upload_id).await.unwrap();
+        let b2 = b.clone();
+        let id = upload.upload_id.clone();
+        store
+            .handle
+            .write(move |txn| {
+                PartChecksumsTable::open(txn)?.put(&b2, &id, 1, "BLAKE3", "AAAA")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (parts, _, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 1);
         assert!(
-            fs::metadata(state.path().join("multipart/data").join(&upload.upload_id))
-                .await
-                .is_err()
+            parts[0].checksum.is_none(),
+            "the corrupt row is dropped, the part is listed"
         );
-        let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
+    }
+
+    #[tokio::test]
+    async fn list_parts_joins_a_stored_checksum() {
+        // The probe (F03) finds the upload's row and joins it — a part
+        // with a stored PART_CHECKSUMS entry comes back with its checksum.
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store.create(&b, &k, None).await.unwrap();
+        let slot = Arc::new(checksum::PartChecksum::default());
+        let _ = slot.digest.set(checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value("y/Q5Jg==".into()),
+        });
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), Some(slot))
+            .await
+            .unwrap();
+        let (parts, _, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            parts[0].checksum.as_ref().map(|c| c.algorithm),
+            Some(Algorithm::Crc32),
+            "the stored checksum joins"
+        );
     }
 
     #[tokio::test]
@@ -1725,31 +1598,6 @@ mod tests {
         store.consume(&b, &upload.upload_id).await.unwrap();
         assert!(!store.has_uploads(&b).await.unwrap());
         assert_eq!(fs::read(&target).await.unwrap(), b"x");
-    }
-
-    #[tokio::test]
-    async fn abort_after_complete_consume_is_no_such_upload() {
-        let (state, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        let part = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
-            .await
-            .unwrap();
-        let completed = [CompletedPart {
-            part_number: part.part_number,
-            etag: part.etag.clone(),
-        }];
-        let target = state.path().join("out.bin");
-        let (temp, _) = store
-            .complete(&b, &k, &upload.upload_id, &completed)
-            .await
-            .unwrap();
-        fs::rename(&temp, &target).await.unwrap();
-        store.consume(&b, &upload.upload_id).await.unwrap();
-        let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
-        assert!(matches!(err, Error::Storage(StorageError::NoSuchUpload(_))));
     }
 
     #[tokio::test]
@@ -2000,7 +1848,10 @@ mod tests {
         );
         a.unwrap();
         b2.unwrap();
-        let (parts, _, _) = store.list_parts(&b, &k, &id, None, 10).await.unwrap();
+        let (parts, _, _) = store
+            .list_parts(&b, &k, &id, None, 10)
+            .await
+            .unwrap();
         assert_eq!(parts.len(), 1);
         // The record's etag must be the hash of the file's content.
         let dir = state.path().join("multipart/data").join(&id);
@@ -2030,60 +1881,6 @@ mod tests {
         // fallback for the crash window).
         let etag = store.part_etag(&b, &upload.upload_id, 1).await.unwrap();
         assert_eq!(etag, ETag::from_content(b"orphan"));
-    }
-
-    #[tokio::test]
-    async fn list_parts_pages_by_part_number() {
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
-        for n in 1..=5u32 {
-            store
-                .put_part(
-                    &b,
-                    &k,
-                    &upload.upload_id,
-                    n.into(),
-                    body(vec![n as u8]),
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        let (page, truncated, _) = store
-            .list_parts(&b, &k, &upload.upload_id, None, 2)
-            .await
-            .unwrap();
-        assert!(truncated);
-        assert_eq!(
-            page.iter()
-                .map(|p| u32::from(p.part_number))
-                .collect::<Vec<_>>(),
-            [1, 2]
-        );
-        let (page, truncated, _) = store
-            .list_parts(&b, &k, &upload.upload_id, Some(2), 2)
-            .await
-            .unwrap();
-        assert!(truncated);
-        assert_eq!(
-            page.iter()
-                .map(|p| u32::from(p.part_number))
-                .collect::<Vec<_>>(),
-            [3, 4]
-        );
-        let (page, truncated, _) = store
-            .list_parts(&b, &k, &upload.upload_id, Some(4), 2)
-            .await
-            .unwrap();
-        assert!(!truncated);
-        assert_eq!(
-            page.iter()
-                .map(|p| u32::from(p.part_number))
-                .collect::<Vec<_>>(),
-            [5]
-        );
     }
 
     #[tokio::test]

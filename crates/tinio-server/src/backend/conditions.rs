@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use derive_more::Display;
 use s3s::{
@@ -96,6 +96,10 @@ impl<'a> ConditionalHeaders<'a> {
         // RFC 9110 §13.2.2: If-Unmodified-Since comes BEFORE If-None-Match
         // — a failing date must answer 412 even when the ETag condition
         // would 304. It is ignored while If-Match is present (§13.1.4).
+        // Both date comparisons run against the second-truncated mtime
+        // (F08): HTTP dates carry no sub-second part, and a date equal to
+        // the echoed Last-Modified must not count as "modified after".
+        let last_modified = truncate_to_second(last_modified);
         if self.if_match.is_none()
             && let Some(since) = self.if_unmodified_since
             && last_modified > to_system_time(since)
@@ -143,13 +147,26 @@ fn to_system_time(t: dto::Timestamp) -> SystemTime {
     OffsetDateTime::from(t).into()
 }
 
+/// The storage mtime truncated to whole seconds — the granularity HTTP
+/// dates (and S3's stored mtimes) carry (F08). A 12:00:00.500 write
+/// echoes `Last-Modified: 12:00:00Z`; a client that round-trips that
+/// date into a condition header must get S3's answer, not "modified
+/// after" by half a second.
+fn truncate_to_second(t: SystemTime) -> SystemTime {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
 
     use s3s::{
         S3ErrorCode,
-        dto::{self, Timestamp},
+        dto::{self},
     };
 
     use super::*;
@@ -157,15 +174,6 @@ mod tests {
 
     fn etag(value: &str) -> ETag {
         value.parse().unwrap()
-    }
-
-    /// `If-Match`/`If-None-Match` conditions, parsed from the wire form.
-    fn cond(value: &str) -> dto::ETagCondition {
-        value.parse().unwrap()
-    }
-
-    fn timestamp(seconds: u64) -> dto::Timestamp {
-        Timestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
     }
 
     const LM: u64 = 100;
@@ -178,14 +186,35 @@ mod tests {
         if_unmodified_since: Option<dto::Timestamp>,
         write_path: bool,
     ) -> Option<S3ErrorCode> {
-        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(LM);
+        check_at(
+            etag,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(LM),
+            if_match,
+            if_none_match,
+            if_modified_since,
+            if_unmodified_since,
+            write_path,
+        )
+    }
+
+    /// [`check`] against an explicit storage mtime (the F08 sub-second
+    /// cases).
+    fn check_at(
+        etag: &ETag,
+        mtime: SystemTime,
+        if_match: Option<dto::ETagCondition>,
+        if_none_match: Option<dto::ETagCondition>,
+        if_modified_since: Option<dto::Timestamp>,
+        if_unmodified_since: Option<dto::Timestamp>,
+        write_path: bool,
+    ) -> Option<S3ErrorCode> {
         let result = ConditionalHeaders::new(
             if_match.as_ref(),
             if_none_match.as_ref(),
             if_modified_since,
             if_unmodified_since,
         )
-        .check(etag, t, write_path);
+        .check(etag, mtime, write_path);
         match result {
             Ok(()) => None,
             Err(err) => Some(err.code().clone()),
@@ -199,168 +228,37 @@ mod tests {
     }
 
     #[test]
-    fn if_match_requires_exact_strong_match() {
+    fn date_conditions_compare_at_second_granularity() {
+        // F08: the storage mtime is sub-second; HTTP dates are
+        // second-truncated (the echoed Last-Modified). A client that
+        // round-trips the echoed date must get S3 behavior: a date equal
+        // to the truncated mtime is "not modified" — If-Unmodified-Since
+        // passes, If-Modified-Since answers 304.
         let e = etag("5d41402abc4b2a76b9719d911017c592");
-        // Matching strong tag passes.
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(LM) + Duration::from_millis(500);
+        let since = dto::Timestamp::from(OffsetDateTime::from_unix_timestamp(LM as i64).unwrap());
+        // The truncated-second boundary: the object was stored 500 ms
+        // into second 100; the echoed Last-Modified is 100:00Z.
         assert_eq!(
-            check(
-                &e,
-                Some(cond(r#""5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                None,
-                None,
-                false
-            ),
+            check_at(&e, mtime, None, None, None, Some(since.clone()), false),
+            None,
+            "If-Unmodified-Since at the truncated mtime must pass"
+        );
+        assert_eq!(
+            check_at(&e, mtime, None, None, Some(since), None, false),
+            Some(S3ErrorCode::NotModified),
+            "If-Modified-Since at the truncated mtime must answer 304"
+        );
+        // The second before still counts as modified-after / not-modified.
+        let earlier =
+            dto::Timestamp::from(OffsetDateTime::from_unix_timestamp(LM as i64 - 1).unwrap());
+        assert_eq!(
+            check_at(&e, mtime, None, None, None, Some(earlier.clone()), false),
+            Some(S3ErrorCode::PreconditionFailed)
+        );
+        assert_eq!(
+            check_at(&e, mtime, None, None, Some(earlier), None, false),
             None
-        );
-        // Mismatch fails 412 on both paths.
-        assert_eq!(
-            check(&e, Some(cond(r#""zzz""#)), None, None, None, false),
-            Some(S3ErrorCode::PreconditionFailed)
-        );
-        assert_eq!(
-            check(&e, Some(cond(r#""zzz""#)), None, None, None, true),
-            Some(S3ErrorCode::PreconditionFailed)
-        );
-        // A weak tag never strong-matches.
-        assert_eq!(
-            check(
-                &e,
-                Some(cond(r#"W/"5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                None,
-                None,
-                false
-            ),
-            Some(S3ErrorCode::PreconditionFailed)
-        );
-        // Wildcard matches any existing object.
-        assert_eq!(check(&e, Some(cond("*")), None, None, None, false), None);
-    }
-
-    #[test]
-    fn if_unmodified_since_fails_when_modified_after() {
-        let e = etag("5d41402abc4b2a76b9719d911017c592");
-        // last_modified (100) > since (50) → fail, 412 on both paths.
-        assert_eq!(
-            check(&e, None, None, None, Some(timestamp(50)), false),
-            Some(S3ErrorCode::PreconditionFailed)
-        );
-        assert_eq!(
-            check(&e, None, None, None, Some(timestamp(50)), true),
-            Some(S3ErrorCode::PreconditionFailed)
-        );
-        // last_modified <= since → pass.
-        assert_eq!(
-            check(&e, None, None, None, Some(timestamp(200)), false),
-            None
-        );
-        // Ignored while If-Match is present (RFC 9110 §13.1.4).
-        assert_eq!(
-            check(
-                &e,
-                Some(cond(r#""5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                None,
-                Some(timestamp(50)),
-                false
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn if_none_match_fails_on_match() {
-        let e = etag("5d41402abc4b2a76b9719d911017c592");
-        // Matching tag → 304 on the read path, 412 on the write path.
-        assert_eq!(
-            check(
-                &e,
-                None,
-                Some(cond(r#""5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                None,
-                false
-            ),
-            Some(S3ErrorCode::NotModified)
-        );
-        assert_eq!(
-            check(
-                &e,
-                None,
-                Some(cond(r#""5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                None,
-                true
-            ),
-            Some(S3ErrorCode::PreconditionFailed)
-        );
-        // Weak comparison: W/"abc" still matches "abc".
-        assert_eq!(
-            check(
-                &e,
-                None,
-                Some(cond(r#"W/"5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                None,
-                false
-            ),
-            Some(S3ErrorCode::NotModified)
-        );
-        // Wildcard matches.
-        assert_eq!(
-            check(&e, None, Some(cond("*")), None, None, false),
-            Some(S3ErrorCode::NotModified)
-        );
-        // Non-matching passes.
-        assert_eq!(
-            check(&e, None, Some(cond(r#""zzz""#)), None, None, false),
-            None
-        );
-    }
-
-    #[test]
-    fn if_modified_since_fails_when_not_modified_after() {
-        let e = etag("5d41402abc4b2a76b9719d911017c592");
-        // last_modified (100) <= since (200) → 304 on the read path.
-        assert_eq!(
-            check(&e, None, None, Some(timestamp(200)), None, false),
-            Some(S3ErrorCode::NotModified)
-        );
-        // last_modified > since → pass.
-        assert_eq!(
-            check(&e, None, None, Some(timestamp(50)), None, false),
-            None
-        );
-        // Ignored while If-None-Match is present (RFC 9110 §13.2.2).
-        assert_eq!(
-            check(
-                &e,
-                None,
-                Some(cond(r#""zzz""#)),
-                Some(timestamp(200)),
-                None,
-                false
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn precedence_failing_date_wins_over_matching_etag() {
-        let e = etag("5d41402abc4b2a76b9719d911017c592");
-        // If-None-Match matches (would 304) but If-Unmodified-Since fails
-        // → 412: a caching client must not reuse a stale body.
-        assert_eq!(
-            check(
-                &e,
-                None,
-                Some(cond(r#""5d41402abc4b2a76b9719d911017c592""#)),
-                None,
-                Some(timestamp(50)),
-                false
-            ),
-            Some(S3ErrorCode::PreconditionFailed)
         );
     }
 

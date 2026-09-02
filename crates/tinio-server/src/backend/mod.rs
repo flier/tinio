@@ -98,7 +98,19 @@ mod tests {
     }
 }
 
-use std::{io::Error as IoError, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    io::Error as IoError,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
+
+/// The checksum-spec cache's hard bound — see
+/// [`S3Backend::put_checksum_spec`]. Roughly 200-400 bytes per entry
+/// (a UUID key + the spec), so this is a few MB worst case; the API
+/// abort/complete eviction covers the live-upload paths, this covers
+/// the uploads the store-level sweep aborts out from under the backend.
+const CHECKSUM_SPEC_CACHE_CAP: usize = 8192;
 
 pub(crate) use conditions::{ConditionFailure, ConditionalHeaders, condition_error};
 pub(crate) use errors::map_backend_error;
@@ -113,7 +125,7 @@ use s3s::{
 pub use crate::_config::s3::Capabilities;
 use crate::{
     _core::{
-        BodyStream, ETag, bucket, object,
+        BodyStream, ETag, bucket, checksum as core_checksum, object,
         storage::{ByteRange, Error as StorageError, Storage},
     },
     _util::lockmap::{self, Map},
@@ -173,6 +185,23 @@ pub struct S3Backend<S: Storage> {
     /// exclusivity — without stalling unrelated keys (see
     /// [`lockmap::Map`] for the eviction semantics).
     pub(crate) conditional_put_locks: lockmap::Map<String>,
+    /// The uploads' persisted checksum specs, cached read-through (F04):
+    /// `upload_id` → the create-time spec (`None` = the upload carries
+    /// no spec). Keyed by the upload id alone — a UUID (both backends
+    /// generate `Uuid::new_v4()`), so the hit path borrows the request's
+    /// upload_id with no key allocation. A spec is immutable after
+    /// create, so an entry never goes stale — and the storage layer
+    /// still enforces existence at write time, so a cached spec of an
+    /// aborted upload can never resurrect a part. Saves the serialized
+    /// pre-body `get_multipart_upload` read on every `UploadPart` (10k
+    /// parts = 10k reads) and the second read in `ListParts`. Entries
+    /// live for the upload's lifetime: abort/complete evict them, the
+    /// create seed is skipped while the checksum toggle is off (the
+    /// readers are gated the same way), and the map is hard-bounded at
+    /// [`CHECKSUM_SPEC_CACHE_CAP`] — the store-level sweep can abort an
+    /// upload without the backend hearing, so that stale entry would
+    /// otherwise live forever.
+    pub(crate) checksum_specs: Arc<Mutex<HashMap<String, Option<Arc<core_checksum::Upload>>>>>,
 }
 
 impl<S: Storage> S3Backend<S> {
@@ -182,6 +211,7 @@ impl<S: Storage> S3Backend<S> {
             storage: Arc::new(storage),
             caps,
             conditional_put_locks: Map::new(),
+            checksum_specs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -226,6 +256,73 @@ impl<S: Storage> S3Backend<S> {
             Some(body) => Box::pin(body.map_err(IoError::other)),
             None => Box::pin(stream::empty()),
         }
+    }
+
+    /// The upload's persisted checksum spec, cached read-through (F04):
+    /// the spec is immutable after create, so a cache hit is always
+    /// current; the storage layer still enforces existence at write
+    /// time, so a stale entry of an aborted upload can never resurrect
+    /// a part (the write answers `NoSuchUpload` itself).
+    pub(crate) async fn upload_checksum_spec(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> S3Result<Option<Arc<core_checksum::Upload>>> {
+        // The map's `get`/`remove` borrow the request's upload_id — no
+        // key allocation on the hit path (the id is the whole key; see
+        // the field doc). Bucket/key still feed the storage fallback
+        // read on a miss.
+        if let Some(spec) = self
+            .checksum_specs
+            .lock()
+            .expect("checksum-spec cache poisoned")
+            .get(upload_id)
+            .cloned()
+        {
+            return Ok(spec);
+        }
+        let spec = self
+            .storage
+            .get_multipart_upload(bucket, key, upload_id)
+            .await
+            .map_err(map_backend_error)?
+            .checksum
+            .map(Arc::new);
+        self.put_checksum_spec(upload_id.to_string(), spec.clone());
+        Ok(spec)
+    }
+
+    /// Insert a spec into the cache, bounded at
+    /// [`CHECKSUM_SPEC_CACHE_CAP`]: past the cap one arbitrary entry is
+    /// evicted per insert. Eviction is always safe — the cache is
+    /// read-through, so a miss (even of a live upload) just re-reads the
+    /// storage row, which still enforces existence.
+    pub(crate) fn put_checksum_spec(
+        &self,
+        upload_id: String,
+        spec: Option<Arc<core_checksum::Upload>>,
+    ) {
+        let mut map = self
+            .checksum_specs
+            .lock()
+            .expect("checksum-spec cache poisoned");
+        map.insert(upload_id, spec);
+        if map.len() > CHECKSUM_SPEC_CACHE_CAP
+            && let Some(id) = map.keys().next().cloned()
+        {
+            map.remove(&id);
+        }
+    }
+
+    /// Forget the cached spec of a finished upload (abort/complete): the
+    /// entry would otherwise outlive the upload it describes — the cache
+    /// would grow with every upload ever created, not the live ones.
+    pub(crate) fn evict_checksum_spec(&self, upload_id: &str) {
+        self.checksum_specs
+            .lock()
+            .expect("checksum-spec cache poisoned")
+            .remove(upload_id);
     }
 
     /// The contract's [`BodyStream`] into a response `StreamingBlob`.

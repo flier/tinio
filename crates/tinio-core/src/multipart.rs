@@ -184,17 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn part_number_rejects_out_of_range() {
-        assert!(part_number(1).is_ok());
-        assert!(part_number(10_000).is_ok());
-        assert!(matches!(part_number(0), Err(InvalidPartNumber(0))));
-        assert!(matches!(
-            part_number(10_001),
-            Err(InvalidPartNumber(10_001))
-        ));
-    }
-
-    #[test]
     #[should_panic]
     fn part_number_from_invalid_panics() {
         let _: PartNumber = 0.into();

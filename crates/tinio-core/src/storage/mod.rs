@@ -173,3 +173,25 @@ pub const META_BATCH_BYTES_MAX: u32 = 16 * 1024 * 1024;
 /// exhausting disk, inodes, and metadata rows. Shared by the `[s3]` config
 /// schema and the filesystem backend so the two defaults cannot drift.
 pub const DEFAULT_MAX_CONCURRENT_UPLOADS: u32 = 1000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The histogram spec (pipeline-spec.md §4) pinned: strictly
+    /// ascending bounds, and one open overflow bucket beyond the last
+    /// bound. The two consumers (fs `write_lock_bucket`, the prometheus
+    /// `le=` families) rely on these invariants and cannot drift apart.
+    #[test]
+    fn write_lock_buckets_match_the_spec() {
+        assert_eq!(
+            WRITE_LOCK_BUCKET_BOUNDS_US,
+            [10, 100, 1_000, 5_000, 20_000, 100_000]
+        );
+        assert_eq!(WRITE_LOCK_BUCKETS, WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1);
+        assert_eq!(WRITE_LOCK_BUCKETS, 7);
+        for w in WRITE_LOCK_BUCKET_BOUNDS_US.windows(2) {
+            assert!(w[0] < w[1], "bounds must be strictly ascending");
+        }
+    }
+}

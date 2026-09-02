@@ -174,7 +174,7 @@ pub trait MultipartOps: Send + Sync + 'static {
     /// the SAME transaction as the part row when present — a re-upload
     /// overwrites both atomically, so no CAS is needed — and clears the
     /// checksum row when absent (a re-uploaded part must not keep a
-    /// stale value). The backends never hash; with `etag_md5` the slot
+    /// stale value). The backends never hash; the slot's `etag` cell
     /// also supplies the part ETag. `NoSuchUpload` when the upload does
     /// not exist.
     async fn upload_part(

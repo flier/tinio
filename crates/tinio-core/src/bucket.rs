@@ -163,48 +163,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_bucket_names_accepted() {
-        for name in ["aaa", "data", "my-bucket", "my.bucket", "123", "a.b-c.d"] {
-            validate_bucket_name(name).unwrap_or_else(|e| panic!("{name:?} should be valid: {e}"));
-        }
-    }
-
-    #[test]
-    fn invalid_bucket_names_rejected() {
-        let too_long = "a".repeat(64);
-        for name in [
-            "",
-            "a",
-            "ab",
-            "BIG",
-            "under_score",
-            "-lead",
-            "trail-",
-            ".lead",
-            "trail.",
-            "a..b",
-            "sp ace",
-            "sla/sh",
-            too_long.as_str(),
-        ] {
-            assert!(
-                validate_bucket_name(name).is_err(),
-                "{name:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn bucket_dot_segments_rejected() {
-        for name in [".", "..", "...", "a..", "..a"] {
-            assert!(
-                validate_bucket_name(name).is_err(),
-                "{name:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
     fn bucket_equality() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let b = Bucket {

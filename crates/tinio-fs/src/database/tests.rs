@@ -65,6 +65,38 @@ async fn open_creates_database_and_all_tables() {
 }
 
 #[tokio::test]
+async fn v1_databases_are_refused() {
+    // F06 (user decision): ONE current version, no migration — a
+    // pre-checksum v1 database is refused like any other mismatch (the
+    // state is derivable; the operator deletes and rebuilds). The
+    // checksum tables landed without a version bump, so v1 cannot be
+    // told apart from a newer format and must not open silently.
+    let (state, db, _) = open_db();
+    {
+        let mut txn = db.begin_write().unwrap();
+        StateTable::open(&mut txn)
+            .unwrap()
+            .insert("version", 1)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    drop(db);
+    let err = open(state.path()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::UnsupportedVersion {
+                found: 1,
+                expected: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    drop(state);
+}
+
+#[tokio::test]
 async fn open_twice_is_idempotent() {
     let (state, _, _) = open_db();
     // A second open on the same file must succeed.
@@ -74,7 +106,7 @@ async fn open_twice_is_idempotent() {
         .unwrap()
         .ensure_version(state.path())
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[tokio::test]
@@ -96,7 +128,7 @@ async fn version_mismatch_is_unsupported_version() {
             err,
             Error::UnsupportedVersion {
                 found: 9,
-                expected: 1,
+                expected: 2,
                 ..
             }
         ),
@@ -300,6 +332,38 @@ async fn write_closure_aborts_on_error() {
 }
 
 // --- write-lock histograms (pipeline-spec.md §4) ---
+
+/// The bucket boundaries are pinned by the shared constants: a duration
+/// `d` lands in bucket `i` where `bounds[i-1] <= d < bounds[i]` (bucket
+/// 0: `d < 10 µs`), and the open last bucket holds `d >= 100 000 µs`.
+#[test]
+fn write_lock_bucket_boundaries() {
+    // Just below each bound → the previous bucket; exactly on a bound →
+    // the bound's own bucket (partition_point on `<=`).
+    let cases: &[(u64, usize)] = &[
+        (0, 0),
+        (9, 0),
+        (10, 1),
+        (99, 1),
+        (100, 2),
+        (999, 2),
+        (1_000, 3),
+        (4_999, 3),
+        (5_000, 4),
+        (19_999, 4),
+        (20_000, 5),
+        (99_999, 5),
+        (100_000, 6),
+        (u64::MAX, 6),
+    ];
+    for (duration, expected) in cases {
+        assert_eq!(
+            handle::write_lock_bucket(*duration),
+            *expected,
+            "duration {duration} µs"
+        );
+    }
+}
 
 /// The recorded snapshot of a fresh handle: zero write transactions must
 /// produce a fully zero histogram — no spurious empty buckets.

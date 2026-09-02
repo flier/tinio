@@ -136,9 +136,10 @@ impl MultipartOps for MemoryStorage {
             bucket: bucket.clone(),
             key: key.clone(),
             initiated_at: from_nanos(initiated),
-            checksum: checksum_row
-                .map(|(a, t)| checksum::Upload::from_wire(&a, &t))
-                .transpose()?,
+            // A domain-invalid checksum row self-heals: the upload is
+            // served without a spec (F07 — the fs backend skips the
+            // same way).
+            checksum: checksum_row.and_then(|(a, t)| checksum::Upload::from_wire_opt(&a, &t)),
         })
     }
 
@@ -160,20 +161,11 @@ impl MultipartOps for MemoryStorage {
         // Enforce the per-part size limit before opening the write
         // transaction (fast fail).
         self.check_object_size(data.len() as u64)?;
-        // The tee's MD5 (etag_md5): a part's ETag IS its content MD5 —
-        // the slot value replaces the second hash over the buffer.
-        let etag = match checksum
-            .as_ref()
-            .filter(|c| c.etag_md5)
-            .and_then(|c| c.digest.get())
-        {
-            Some(part) => {
-                let digest = part
-                    .value
-                    .md5_raw()
-                    .expect("the tee's md5 is valid and 16 bytes");
-                ETag::Single(digest)
-            }
+        // The tee's MD5: a part's ETag IS its content MD5 — the raw
+        // digest in the etag cell replaces the second hash over the
+        // buffer (filled by the stream end, which `collect_body` drained).
+        let etag = match checksum.as_ref().and_then(|c| c.etag_digest()) {
+            Some(digest) => ETag::Single(digest),
             None => ETag::from_content(&data),
         };
         let now = now_nanos();
@@ -248,9 +240,20 @@ impl MultipartOps for MemoryStorage {
         }
         let meta = txn.open_table(PART_META)?;
         // The stored part checksums use the identical `upload_id\0part`
-        // key — join them per row (spec 2026-08-31).
-        let checksums = txn.open_table(PART_CHECKSUMS)?;
+        // key — join them per row (spec 2026-08-31). Probed once: an
+        // upload with no checksum rows at all (the checksum feature off
+        // ⇒ the table is guaranteed empty) skips the per-part point
+        // reads — one probe read instead of one per part (F03).
         let prefix = format!("{}\0", params.upload_id);
+        let checksums = txn.open_table(PART_CHECKSUMS)?;
+        let has_checksums = checksums
+            .range(prefix.as_str()..)?
+            .next()
+            .transpose()?
+            .is_some_and(|(k, _)| k.value().starts_with(&prefix));
+        let checksums = has_checksums
+            .then(|| txn.open_table(PART_CHECKSUMS))
+            .transpose()?;
         // The zero-padded part keys are string-ordered by number, so the
         // scan starts just after the marker and stops one probe part past
         // the page — a page costs O(page) reads, not O(total parts). The
@@ -274,14 +277,20 @@ impl MultipartOps for MemoryStorage {
                 let (k, v) = entry?;
                 let part_number = parse_part_number(&k.value()[prefix.len()..])?;
                 let (etag, size, mtime) = v.value();
-                let checksum_row = checksums.get(k.value())?.map(|v| {
-                    let (a, value) = v.value();
-                    (a.to_string(), value.to_string())
-                });
-                let checksum = match checksum_row {
-                    None => None,
-                    Some((a, value)) => Some(checksum::Part::from_wire(&a, value)?),
-                };
+                let checksum_row = checksums
+                    .as_ref()
+                    .map(|table| table.get(k.value()))
+                    .transpose()?
+                    .flatten()
+                    .map(|v| {
+                        let (a, value) = v.value();
+                        (a.to_string(), value.to_string())
+                    });
+                // A domain-invalid checksum row self-heals: the part is
+                // listed without a checksum (F07 — the fs backend skips
+                // the same way).
+                let checksum =
+                    checksum_row.and_then(|(a, value)| checksum::Part::from_wire_opt(&a, value));
                 Ok(PartInfo {
                     part_number: part_number.into(),
                     size,
@@ -538,18 +547,12 @@ impl MultipartOps for MemoryStorage {
                             return None;
                         }
                     };
-                    let checksum = match checksum_row {
-                        None => None,
-                        Some((a, t)) => match checksum::Upload::from_wire(&a, &t) {
-                            Ok(upload) => Some(upload),
-                            Err(e) => {
-                                if scan_error.is_none() {
-                                    scan_error = Some(e.into());
-                                }
-                                return None;
-                            }
-                        },
-                    };
+                    // A domain-invalid checksum row self-heals: the
+                    // upload is listed without a spec (F07 — the fs
+                    // backend skips the same way; a hard error here
+                    // would fail the whole listing for one bad row).
+                    let checksum =
+                        checksum_row.and_then(|(a, t)| checksum::Upload::from_wire_opt(&a, &t));
                     Some(UploadRow {
                         key,
                         upload_id: upload_id.to_string(),
@@ -614,8 +617,8 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            BucketOps, CompletedPart, ListPartsParams, ListUploadsParams, MultipartOps, ObjectOps,
-            PartInfo, bucket, multipart::part_number, object, storage::Error::*,
+            BucketOps, CompletedPart, ListUploadsParams, MultipartOps, ObjectOps, PartInfo, bucket,
+            multipart::part_number, object, storage::Error::*,
         },
         _util::testing::{body, read_body},
         MemoryOptions,
@@ -633,6 +636,78 @@ mod tests {
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         (storage, name)
+    }
+
+    #[tokio::test]
+    async fn corrupt_checksum_rows_self_heal() {
+        // F07: domain-invalid UPLOAD_CHECKSUMS/PART_CHECKSUMS rows must
+        // not fail the read paths — the upload/part still answers with
+        // the checksum dropped (the fs backend self-heals the same way).
+        let (storage, name) = with_bucket().await;
+        let key = object::key("big.bin").unwrap();
+        let upload = storage
+            .create_multipart_upload(&name, &key, None)
+            .await
+            .unwrap();
+        storage
+            .upload_part(
+                &name,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"x"),
+                None,
+            )
+            .await
+            .unwrap();
+        let ukey = upload_key(
+            name.as_ref().as_str(),
+            key.as_ref().as_str(),
+            &upload.upload_id,
+        );
+        let pk = part_key(&upload.upload_id, 1);
+        {
+            let txn = storage.db.begin_write().unwrap();
+            txn.open_table(UPLOAD_CHECKSUMS)
+                .unwrap()
+                .insert(ukey.as_str(), ("BLAKE3", ""))
+                .unwrap();
+            txn.open_table(PART_CHECKSUMS)
+                .unwrap()
+                .insert(pk.as_str(), ("BLAKE3", "AAAA"))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let got = storage
+            .get_multipart_upload(&name, &key, &upload.upload_id)
+            .await
+            .unwrap();
+        assert!(got.checksum.is_none(), "get drops the corrupt spec");
+        let page = storage
+            .list_parts(ListPartsParams {
+                bucket: name.clone(),
+                key: key.clone(),
+                upload_id: upload.upload_id.clone(),
+                max_parts: 1000,
+                part_number_marker: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.parts.len(), 1);
+        assert!(page.parts[0].checksum.is_none());
+        let listed = storage
+            .list_multipart_uploads(ListUploadsParams {
+                bucket: name,
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.uploads.len(), 1, "the listing still answers");
+        assert!(listed.uploads[0].checksum.is_none());
     }
 
     #[tokio::test]
@@ -770,376 +845,6 @@ mod tests {
             .unwrap();
         assert_ne!(a.upload_id, b.upload_id);
         assert_eq!(a.upload_id.len(), 36);
-    }
-
-    #[tokio::test]
-    async fn upload_part_rejects_part_numbers_outside_1_to_10000() {
-        assert!(matches!(part_number(0), Err(InvalidPartNumber(0))));
-        assert!(matches!(
-            part_number(10_001),
-            Err(InvalidPartNumber(10_001))
-        ));
-    }
-
-    #[tokio::test]
-    async fn upload_part_rejects_mismatched_bucket_or_key() {
-        let (storage, bucket) = with_bucket().await;
-        let other = bucket::name("other").unwrap();
-        storage.create_bucket(&other).await.unwrap();
-        let key = object::key("a.bin").unwrap();
-        let other_key = object::key("b.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            storage
-                .upload_part(
-                    &other,
-                    &key,
-                    &upload.upload_id,
-                    1.into(),
-                    body(b"x".to_vec()),
-                    None
-                )
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-        assert!(matches!(
-            storage
-                .upload_part(
-                    &bucket,
-                    &other_key,
-                    &upload.upload_id,
-                    1.into(),
-                    body(b"x".to_vec()),
-                    None
-                )
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-        assert!(matches!(
-            storage
-                .upload_part(
-                    &bucket,
-                    &key,
-                    "no-such",
-                    1.into(),
-                    body(b"x".to_vec()),
-                    None
-                )
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn overwrite_part_replaces_previous() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("a.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        storage
-            .upload_part(
-                &bucket,
-                &key,
-                &upload.upload_id,
-                1.into(),
-                body(b"old".to_vec()),
-                None,
-            )
-            .await
-            .unwrap();
-        let part = storage
-            .upload_part(
-                &bucket,
-                &key,
-                &upload.upload_id,
-                1.into(),
-                body(b"newer".to_vec()),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(part.size, 5);
-        assert_eq!(part.etag, ETag::from_content(b"newer"));
-        let completed = storage
-            .complete_multipart_upload(&bucket, &key, &upload.upload_id, &[completed(&part)])
-            .await
-            .unwrap();
-        assert_eq!(completed.size, 5);
-        let got = storage.get_object(&bucket, &key, None).await.unwrap();
-        assert_eq!(read_body(got.body).await.unwrap(), b"newer");
-    }
-
-    #[tokio::test]
-    async fn complete_without_parts_is_invalid() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("a.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            storage
-                .complete_multipart_upload(&bucket, &key, &upload.upload_id, &[])
-                .await
-                .unwrap_err(),
-            Error::Storage(NoParts)
-        ));
-    }
-
-    #[tokio::test]
-    async fn complete_rejects_unknown_part_number() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("a.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        let phantom = CompletedPart {
-            part_number: 7.into(),
-            etag: ETag::from_content(b"never-uploaded"),
-        };
-        assert!(matches!(
-            storage
-                .complete_multipart_upload(&bucket, &key, &upload.upload_id, &[phantom])
-                .await
-                .unwrap_err(),
-            Error::Storage(InvalidPart(7))
-        ));
-    }
-
-    #[tokio::test]
-    async fn complete_and_abort_reject_mismatched_identity() {
-        let (storage, bucket) = with_bucket().await;
-        let other = bucket::name("other").unwrap();
-        storage.create_bucket(&other).await.unwrap();
-        let key = object::key("a.bin").unwrap();
-        let other_key = object::key("b.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        let part = storage
-            .upload_part(
-                &bucket,
-                &key,
-                &upload.upload_id,
-                1.into(),
-                body(b"x".to_vec()),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            storage
-                .complete_multipart_upload(&other, &key, &upload.upload_id, &[completed(&part)])
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-        assert!(matches!(
-            storage
-                .abort_multipart_upload(&bucket, &other_key, &upload.upload_id)
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn complete_removes_upload_and_parts() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("a.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        let part = storage
-            .upload_part(
-                &bucket,
-                &key,
-                &upload.upload_id,
-                1.into(),
-                body(b"x".to_vec()),
-                None,
-            )
-            .await
-            .unwrap();
-        storage
-            .complete_multipart_upload(&bucket, &key, &upload.upload_id, &[completed(&part)])
-            .await
-            .unwrap();
-        assert!(matches!(
-            storage
-                .complete_multipart_upload(&bucket, &key, &upload.upload_id, &[completed(&part)])
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-        assert!(matches!(
-            storage
-                .list_parts(ListPartsParams {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    upload_id: upload.upload_id.clone(),
-                    max_parts: 1000,
-                    part_number_marker: None,
-                })
-                .await
-                .unwrap_err(),
-            Error::Storage(NoSuchUpload(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn list_parts_paginates() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("a.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        for n in 1..=3 {
-            storage
-                .upload_part(
-                    &bucket,
-                    &key,
-                    &upload.upload_id,
-                    n.into(),
-                    body(format!("p{n}").into_bytes()),
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        let page = storage
-            .list_parts(ListPartsParams {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                upload_id: upload.upload_id.clone(),
-                max_parts: 2,
-                part_number_marker: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            page.parts
-                .iter()
-                .map(|p| u32::from(p.part_number))
-                .collect::<Vec<_>>(),
-            [1, 2]
-        );
-        assert!(page.truncated);
-        assert_eq!(page.next_part_number_marker, Some(2));
-        let page2 = storage
-            .list_parts(ListPartsParams {
-                bucket,
-                key,
-                upload_id: upload.upload_id,
-                max_parts: 2,
-                part_number_marker: Some(2),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            page2
-                .parts
-                .iter()
-                .map(|p| u32::from(p.part_number))
-                .collect::<Vec<_>>(),
-            [3]
-        );
-        assert!(!page2.truncated);
-        assert!(page2.next_part_number_marker.is_none());
-    }
-
-    #[tokio::test]
-    async fn list_uploads_filters_and_paginates() {
-        let (storage, bucket) = with_bucket().await;
-        for key in ["a.bin", "b.bin", "c.bin"] {
-            storage
-                .create_multipart_upload(&bucket, &object::key(key).unwrap(), None)
-                .await
-                .unwrap();
-        }
-        let prefixed = storage
-            .list_multipart_uploads(ListUploadsParams {
-                bucket: bucket.clone(),
-                prefix: "b".into(),
-                delimiter: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: 1000,
-            })
-            .await
-            .unwrap();
-        let keys: Vec<_> = prefixed.uploads.iter().map(|u| u.key.as_ref()).collect();
-        assert_eq!(keys, ["b.bin"]);
-        let page = storage
-            .list_multipart_uploads(ListUploadsParams {
-                bucket: bucket.clone(),
-                prefix: String::new(),
-                delimiter: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: 1,
-            })
-            .await
-            .unwrap();
-        assert_eq!(page.uploads.len(), 1);
-        assert!(page.truncated);
-        assert_eq!(page.next_key_marker.as_deref(), Some("a.bin"));
-        let page2 = storage
-            .list_multipart_uploads(ListUploadsParams {
-                bucket,
-                prefix: String::new(),
-                delimiter: None,
-                key_marker: page.next_key_marker.clone(),
-                upload_id_marker: page.next_upload_id_marker.clone(),
-                max_uploads: 10,
-            })
-            .await
-            .unwrap();
-        let keys: Vec<_> = page2.uploads.iter().map(|u| u.key.as_ref()).collect();
-        assert_eq!(keys, ["b.bin", "c.bin"]);
-        assert!(!page2.truncated);
-    }
-
-    #[tokio::test]
-    async fn bare_key_marker_skips_the_whole_key_group() {
-        // A key-marker without an upload-id-marker skips the entire
-        // same-key group (S3: only keys strictly greater than the marker
-        // are listed).
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("same.bin").unwrap();
-        let u1 = storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        storage
-            .create_multipart_upload(&bucket, &key, None)
-            .await
-            .unwrap();
-        let page = storage
-            .list_multipart_uploads(ListUploadsParams {
-                bucket,
-                prefix: String::new(),
-                delimiter: None,
-                key_marker: Some(u1.key.to_string()),
-                upload_id_marker: None,
-                max_uploads: 10,
-            })
-            .await
-            .unwrap();
-        assert!(page.uploads.is_empty(), "{:?}", page.uploads);
-        assert!(!page.truncated);
     }
 
     #[tokio::test]

@@ -930,69 +930,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_listing_is_lexicographic() {
-        let (_root, _state, listing, b) = fixture();
-        let page = listing
-            .list(&params(&b, "", None, None, 1000))
-            .await
-            .unwrap();
-        let keys: Vec<&str> = page
-            .objects
-            .iter()
-            .map(|o| o.key.as_ref().as_str())
-            .collect();
-        assert_eq!(
-            keys,
-            ["a.txt", "b.txt", "dir/c.txt", "dir/e.txt", "dir/sub/d.txt"]
-        );
-        // ETags were computed (sync recompute pass) and persisted.
-        for info in &page.objects {
-            assert_eq!(
-                info.etag,
-                ETag::from_content(format!("{}!", info.key).as_bytes())
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn prefix_and_delimiter_grouping() {
-        let (_root, _state, listing, b) = fixture();
-        let page = listing
-            .list(&params(&b, "dir/", None, None, 1000))
-            .await
-            .unwrap();
-        assert!(page.objects.iter().all(|o| o.key.starts_with("dir/")));
-        assert_eq!(page.objects.len(), 3);
-
-        let page = listing
-            .list(&params(&b, "", Some("/"), None, 1000))
-            .await
-            .unwrap();
-        let keys: Vec<&str> = page
-            .objects
-            .iter()
-            .map(|o| o.key.as_ref().as_str())
-            .collect();
-        assert_eq!(keys, ["a.txt", "b.txt"]);
-        assert_eq!(page.common_prefixes, ["dir/"]);
-    }
-
-    #[tokio::test]
-    async fn pagination_rolls_over() {
-        let (_root, _state, listing, b) = fixture();
-        let page = listing.list(&params(&b, "", None, None, 2)).await.unwrap();
-        assert_eq!(page.objects.len(), 2);
-        assert!(page.truncated);
-        let resume = page.next_start_after.clone().unwrap();
-        let page2 = listing
-            .list(&params(&b, "", None, Some(&resume), 1000))
-            .await
-            .unwrap();
-        assert_eq!(page.objects.len() + page2.objects.len(), 5);
-        assert!(!page2.truncated);
-    }
-
-    #[tokio::test]
     async fn missing_bucket_is_no_such_bucket() {
         let (_, _, listing, _) = fixture();
         let missing = bucket::name("ghost").unwrap();
@@ -1001,34 +938,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn tinio_entries_skipped_at_any_depth() {
-        let (_root, _, listing, b) = fixture();
-        let root = _root;
-        fs::create_dir_all(root.path().join("data/dir/.tinio"))
-            .await
-            .unwrap();
-        fs::write(root.path().join("data/dir/.tinio/state"), b"x")
-            .await
-            .unwrap();
-        // A file literally named `.tinio` at the bucket root is
-        // reserved too (FR-020, exact segment).
-        fs::write(root.path().join("data/.tinio"), b"x")
-            .await
-            .unwrap();
-        let page = listing
-            .list(&params(&b, "", None, None, 1000))
-            .await
-            .unwrap();
-        let keys: Vec<&str> = page
-            .objects
-            .iter()
-            .map(|o| o.key.as_ref().as_str())
-            .collect();
-        assert!(!keys.iter().any(|k| k.contains(".tinio")));
-        assert_eq!(keys.len(), 5);
     }
 
     #[cfg(unix)]
@@ -1129,70 +1038,6 @@ mod tests {
             keys.is_empty(),
             "must not list through a bucket-dir symlink: {keys:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn out_of_band_edit_recomputes_etag() {
-        let (root, _, listing, b) = fixture();
-        // First listing persists the entries.
-        listing
-            .list(&params(&b, "", None, None, 1000))
-            .await
-            .unwrap();
-        // Out-of-band modification (new size).
-        fs::write(root.path().join("data/a.txt"), b"changed content")
-            .await
-            .unwrap();
-        let page = listing
-            .list(&params(&b, "", None, None, 1000))
-            .await
-            .unwrap();
-        let a = page
-            .objects
-            .iter()
-            .find(|o| o.key.as_ref() == "a.txt")
-            .unwrap();
-        assert_eq!(a.etag, ETag::from_content(b"changed content"));
-    }
-
-    #[tokio::test]
-    async fn directories_never_objects() {
-        let (root, _, listing, b) = fixture();
-        fs::create_dir_all(root.path().join("data/empty-dir"))
-            .await
-            .unwrap();
-        let page = listing
-            .list(&params(&b, "", None, None, 1000))
-            .await
-            .unwrap();
-        assert!(!page.objects.iter().any(|o| o.key.as_ref() == "empty-dir"));
-    }
-
-    #[tokio::test]
-    async fn prefix_prunes_whole_subtrees() {
-        let (_root, _state, listing, b) = fixture();
-        let page = listing
-            .list(&params(&b, "b.txt", None, None, 1000))
-            .await
-            .unwrap();
-        let keys: Vec<&str> = page
-            .objects
-            .iter()
-            .map(|o| o.key.as_ref().as_str())
-            .collect();
-        assert_eq!(keys, ["b.txt"], "dir/ subtree must be pruned");
-        // An ancestor prefix still descends (dir/ is an ancestor of
-        // dir/sub/): the sub-tree is not pruned away.
-        let page = listing
-            .list(&params(&b, "dir/sub/d", None, None, 1000))
-            .await
-            .unwrap();
-        let keys: Vec<&str> = page
-            .objects
-            .iter()
-            .map(|o| o.key.as_ref().as_str())
-            .collect();
-        assert_eq!(keys, ["dir/sub/d.txt"]);
     }
 
     // --- the streaming walk (P2) ---

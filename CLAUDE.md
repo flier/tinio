@@ -14,10 +14,7 @@
 
 - Cargo conventions: `docs/cargo.md`.
 - Code style: `docs/style.md` — garde, imports (3+ segments, enum variants, `tokio::fs`), Error, lib.rs, newtypes, compressed prose.
-
-## Tests
-
-- Async: `#[tokio::test]` / `async fn` directly — no `Runtime::block_on` / `rt(...)` wrappers. Sync: `#[test]`. Exception: deliberate runtime shape under test.
+- Tests: `docs/tests.md` — async harness, cucumber/e2e cargo+run, Gherkin, migration vs unit/conformance.
 
 ## Manual Edits
 

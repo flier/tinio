@@ -268,6 +268,14 @@ impl<S: Storage> S3Backend<S> {
             .create_multipart_upload(&bucket, &key, checksum)
             .await
             .map_err(map_backend_error)?;
+        // Seed the spec cache (F04): the spec is immutable after create
+        // — the first UploadPart pays no read at all. Gated: with the
+        // toggle off the entry is never read (the readers are gated the
+        // same way), so an unseeded entry would leak for the upload's
+        // lifetime.
+        if self.caps.checksum {
+            self.put_checksum_spec(upload.upload_id.clone(), upload.checksum.clone().map(Arc::new));
+        }
         Ok(S3Response::new(dto::CreateMultipartUploadOutput {
             bucket: Some(String::from(bucket)),
             key: Some(String::from(key)),
@@ -305,16 +313,15 @@ impl<S: Storage> S3Backend<S> {
         let tee: Option<(Arc<VerifyState>, checksum::Spec)> = if self.caps.checksum {
             // Parse the request spec FIRST — a malformed request (two
             // value fields, bare algorithm) answers InvalidRequest
-            // without paying the storage read.
+            // without paying the storage read. The upload's spec comes
+            // from the read-through cache (F04): immutable after create,
+            // so no per-part storage read.
             let spec = checksum::Spec::from_upload_part(&req.input, &req.headers)?;
-            let upload = self
-                .storage
-                .get_multipart_upload(&bucket, &key, &upload_id)
-                .await
-                .map_err(map_backend_error)?;
+            let upload = self.upload_checksum_spec(&bucket, &key, &upload_id).await?;
+            let upload_algo = upload.as_ref().map(|u| u.algorithm);
             let spec = match spec {
                 Some(spec) => {
-                    if let (Some(upload_algo), Some(algo)) = (upload_algo(&upload), spec.algorithm)
+                    if let (Some(upload_algo), Some(algo)) = (upload_algo, spec.algorithm)
                         && upload_algo != algo
                     {
                         return Err(s3_error!(
@@ -329,18 +336,20 @@ impl<S: Storage> S3Backend<S> {
                     // only part of an algorithm upload still gets the
                     // upload's checksum computed and persisted.
                     Some(checksum::Spec {
-                        algorithm: spec.algorithm.or(upload_algo(&upload)),
+                        algorithm: spec.algorithm.or(upload_algo),
                         ..spec
                     })
                 }
-                None => upload
-                    .checksum
-                    .map(|c| checksum::Spec::compute_only(c.algorithm)),
+                None => upload.map(|u| checksum::Spec::compute_only(u.algorithm)),
             };
             spec.map(|spec| {
-                // etag_md5: the tee computes MD5 over the body — the
-                // backend may use the slot as the part ETag.
-                let state = Arc::new(VerifyState::new(spec.algorithm == Some(Algorithm::Md5)));
+                // The tee computes MD5 over the body — for the algorithm
+                // slot (a part's ETag IS its content MD5) or for the
+                // Content-MD5 check (F05: that digest must not be thrown
+                // away) — the backend may use the slot as the part ETag.
+                let state = Arc::new(VerifyState::new(
+                    spec.algorithm == Some(Algorithm::Md5) || spec.content_md5.is_some(),
+                ));
                 (state, spec)
             })
         } else {
@@ -409,20 +418,24 @@ impl<S: Storage> S3Backend<S> {
         // Source conditionals (412 on failure, per S3 copy semantics):
         // the head's info carries the source ETag + mtime (no body — the
         // copy primitive moves the bytes). The source head and the
-        // destination upload's persisted checksum spec are independent
-        // reads — run them concurrently.
-        let (head, algo) = tokio::join!(self.storage.head_object(&src_bucket, &src_key), async {
-            if self.caps.checksum {
-                self.storage
-                    .get_multipart_upload(&bucket, &key, &upload_id)
-                    .await
-                    .map(|u| u.checksum.map(|c| c.algorithm))
-            } else {
-                Ok(None)
-            }
-        },);
+        // destination upload's checksum spec are independent reads — run
+        // them concurrently (the spec comes from the read-through cache,
+        // F04: a 10k-part copy flow pays the same zero storage reads as
+        // UploadPart).
+        let (head, algo) = tokio::join!(
+            self.storage.head_object(&src_bucket, &src_key),
+            async {
+                if self.caps.checksum {
+                    self.upload_checksum_spec(&bucket, &key, &upload_id)
+                        .await
+                        .map(|spec| spec.map(|c| c.algorithm))
+                } else {
+                    Ok(None)
+                }
+            },
+        );
         let info = head.map_err(map_backend_error)?;
-        let algo = algo.map_err(map_backend_error)?;
+        let algo = algo?;
         ConditionalHeaders::new(
             req.input.copy_source_if_match.as_ref(),
             req.input.copy_source_if_none_match.as_ref(),
@@ -528,11 +541,17 @@ impl<S: Storage> S3Backend<S> {
             let etag = ETag::new(&etag).map_err(|_| s3_error!(InvalidPart, "invalid part ETag"))?;
             // The client's checksum entry of this part: exactly one of
             // the six value fields (a second → `InvalidRequest`,
-            // mirroring UploadPart — F6).
-            client_part_checksums.push(single_checksum_value(p)?.map(|(algo, value)| Part {
-                algorithm: algo,
-                value: Value(value.to_string()),
-            }));
+            // mirroring UploadPart — F6). Gated: with the toggle off the
+            // entries are accepted and dropped (F01 — off ⇒ v1's
+            // pass-through; the scan trigger below stays false).
+            client_part_checksums.push(if self.caps.checksum {
+                single_checksum_value(p)?.map(|(algo, value)| Part {
+                    algorithm: algo,
+                    value: Value(value.to_string()),
+                })
+            } else {
+                None
+            });
             parts.push(CompletedPart { part_number, etag });
         }
         // Serialize the whole complete with the per-object write lock
@@ -562,7 +581,10 @@ impl<S: Storage> S3Backend<S> {
         };
         // The stored sizes + part checksums of the listed parts: the 5
         // MiB minimum-size rule and the pre-commit validation both read
-        // this snapshot. The scan runs only when something consumes it.
+        // this snapshot. The scan runs only when something consumes it
+        // (the per-page checksum join itself is the backends' internal
+        // probe, F03 — a checksum-less upload pays one probe, not one
+        // point read per part).
         let mut stored: HashMap<u32, (u64, Option<Part>)> = HashMap::new();
         if parts.len() > 1
             || upload.as_ref().is_some_and(|u| u.checksum.is_some())
@@ -718,6 +740,9 @@ impl<S: Storage> S3Backend<S> {
             .complete_multipart_upload(&bucket, &key, &upload_id, &parts)
             .await
             .map_err(map_backend_error)?;
+        // The upload is finished — its spec entry would otherwise stay
+        // in the cache forever (see [`S3Backend::evict_checksum_spec`]).
+        self.evict_checksum_spec(&upload_id);
         let location = Some(format!("/{bucket}/{}", info.key));
         let mut output = dto::CompleteMultipartUploadOutput {
             bucket: Some(String::from(bucket)),
@@ -744,6 +769,9 @@ impl<S: Storage> S3Backend<S> {
             .abort_multipart_upload(&bucket, &key, &req.input.upload_id)
             .await
             .map_err(map_backend_error)?;
+        // The upload is gone — forget its spec entry (see
+        // [`S3Backend::evict_checksum_spec`]).
+        self.evict_checksum_spec(&req.input.upload_id);
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
@@ -786,14 +814,13 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         // The upload's persisted checksum spec (spec 2026-08-31), echoed
-        // on the listing — one extra lookup, gated like the rest of the
-        // feature (off ⇒ today's output).
+        // on the listing — from the read-through cache (F04: immutable
+        // after create, no second storage read), gated like the rest of
+        // the feature (off ⇒ today's output).
         let upload_checksum = if self.caps.checksum {
-            self.storage
-                .get_multipart_upload(&bucket, &key, &upload_id)
-                .await
-                .map_err(map_backend_error)?
-                .checksum
+            self.upload_checksum_spec(&bucket, &key, &upload_id)
+                .await?
+                .map(|c| c.as_ref().clone())
         } else {
             None
         };
@@ -872,15 +899,25 @@ impl<S: Storage> S3Backend<S> {
                 initiated: Some(Self::last_modified(u.initiated_at)),
                 key: Some(String::from(u.key)),
                 upload_id: Some(u.upload_id),
-                checksum_algorithm: u
-                    .checksum
-                    .as_ref()
-                    .map(|c| checksum::wire_algo(c.algorithm)),
-                checksum_type: u
-                    .checksum
-                    .as_ref()
-                    .and_then(|c| c.r#type)
-                    .map(checksum::wire_type),
+                // The persisted checksum spec is echoed only while the
+                // toggle is on — ListParts gates the same data (F4), and
+                // the two list ops must agree (F02; off = accept-and-drop,
+                // even for rows persisted by an earlier on-run).
+                checksum_algorithm: if self.caps.checksum {
+                    u.checksum
+                        .as_ref()
+                        .map(|c| checksum::wire_algo(c.algorithm))
+                } else {
+                    None
+                },
+                checksum_type: if self.caps.checksum {
+                    u.checksum
+                        .as_ref()
+                        .and_then(|c| c.r#type)
+                        .map(checksum::wire_type)
+                } else {
+                    None
+                },
                 ..Default::default()
             })
             .collect();
@@ -914,7 +951,7 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use s3s::{
-        S3, S3ErrorCode,
+        S3,
         checksum::ChecksumHasher,
         crypto::{Checksum as _, Sha256},
         dto::{CopySource, StreamingBlob, UploadPartCopyInput},
@@ -929,7 +966,6 @@ mod tests {
             storage::{BucketOps, MultipartOps, ObjectOps},
         },
         _mem::MemoryStorage,
-        _util::testing::read_body,
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},
@@ -1000,155 +1036,6 @@ mod tests {
 
     #[cfg(feature = "multipart")]
     #[tokio::test]
-    async fn multipart_lifecycle() {
-        let (backend, b) = setup().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-
-        // Upload three parts: the two non-final parts must satisfy the
-        // S3 5 MiB minimum; the final part may be small.
-        let mut etags = Vec::new();
-        let parts_data = big_parts();
-        for (n, data) in parts_data.iter().enumerate() {
-            let part = backend
-                .upload_part(s3_request(dto::UploadPartInput {
-                    bucket: b.clone(),
-                    key: "big.bin".into(),
-                    upload_id: upload_id.clone(),
-                    part_number: (n + 1) as i32,
-                    body: Some(StreamingBlob::wrap(stream::iter(vec![Ok::<_, io::Error>(
-                        Bytes::copy_from_slice(data),
-                    )]))),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap();
-            etags.push(part.output.e_tag.unwrap());
-        }
-
-        // List parts.
-        let listed = backend
-            .list_parts(s3_request(dto::ListPartsInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        assert_eq!(listed.output.parts.as_ref().unwrap().len(), 3);
-
-        // The effective page size is echoed (unclamped — multipart
-        // listings are uncapped).
-        let two = backend
-            .list_parts(s3_request(dto::ListPartsInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                max_parts: Some(2),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .output;
-        assert_eq!(two.max_parts, Some(2));
-        assert_eq!(two.is_truncated, Some(true));
-        assert_eq!(two.parts.as_ref().unwrap().len(), 2);
-
-        // Complete → composed ETag MD5-of-MD5s-3.
-        let complete = backend
-            .complete_multipart_upload(s3_request(dto::CompleteMultipartUploadInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                multipart_upload: Some(dto::CompletedMultipartUpload {
-                    parts: Some(
-                        etags
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, e)| dto::CompletedPart {
-                                part_number: Some((i + 1) as i32),
-                                e_tag: Some(e),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    ),
-                }),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        let etag_owned = complete.output.e_tag.unwrap();
-        let etag = etag_owned.as_strong().unwrap().to_string();
-        assert!(etag.ends_with("-3"), "composed multipart ETag, got {etag}");
-        let got = read_body(
-            backend
-                .storage()
-                .get_object(
-                    &bucket::name(&b).unwrap(),
-                    &object::key("big.bin").unwrap(),
-                    None,
-                )
-                .await
-                .unwrap()
-                .body,
-        )
-        .await
-        .unwrap();
-        let expected: Vec<u8> = parts_data.iter().flatten().copied().collect();
-        assert_eq!(got, expected);
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn complete_rejects_non_final_parts_below_5_mib() {
-        let (backend, b) = setup().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-
-        let mut etags = Vec::new();
-        for n in 1..=3 {
-            let part = backend
-                .upload_part(s3_request(dto::UploadPartInput {
-                    bucket: b.clone(),
-                    key: "big.bin".into(),
-                    upload_id: upload_id.clone(),
-                    part_number: n,
-                    body: Some(StreamingBlob::wrap(stream::iter(vec![Ok::<_, io::Error>(
-                        Bytes::copy_from_slice(b"tiny"),
-                    )]))),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap();
-            etags.push(part.output.e_tag.unwrap());
-        }
-
-        let err = backend
-            .complete_multipart_upload(s3_request(dto::CompleteMultipartUploadInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                multipart_upload: Some(dto::CompletedMultipartUpload {
-                    parts: Some(
-                        etags
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, e)| dto::CompletedPart {
-                                part_number: Some((i + 1) as i32),
-                                e_tag: Some(e),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    ),
-                }),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::EntityTooSmall);
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
     async fn list_multipart_uploads_resumes_inside_a_same_key_group() {
         let (backend, b) = setup().await;
         // Two uploads of the same key: the second is reachable only when
@@ -1212,62 +1099,6 @@ mod tests {
         assert_ne!(page2_ids[0], page1_id);
     }
 
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn abort_removes_upload() {
-        let (backend, b) = setup().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-        backend
-            .abort_multipart_upload(s3_request(dto::AbortMultipartUploadInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        let err = backend
-            .list_parts(s3_request(dto::ListPartsInput {
-                bucket: b,
-                key: "big.bin".into(),
-                upload_id,
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "NoSuchUpload");
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn invalid_part_numbers_rejected() {
-        let (backend, b) = setup().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-        let err = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 0,
-                body: Some(StreamingBlob::wrap(
-                    stream::empty::<Result<Bytes, io::Error>>(),
-                )),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidPart");
-        backend
-            .abort_multipart_upload(s3_request(dto::AbortMultipartUploadInput {
-                bucket: b,
-                key: "big.bin".into(),
-                upload_id,
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-    }
-
     #[cfg(feature = "copy")]
     fn upload_part_copy_input(
         b: &str,
@@ -1282,94 +1113,6 @@ mod tests {
             .copy_source(CopySource::parse(&format!("{b}/src.bin")).unwrap())
             .build()
             .unwrap()
-    }
-
-    #[cfg(feature = "copy")]
-    #[tokio::test]
-    async fn upload_part_copy_range_and_conditionals() {
-        let (backend, b) = setup().await;
-        backend
-            .storage()
-            .put_object(
-                &bucket::name(&b).unwrap(),
-                &object::key("src.bin").unwrap(),
-                body(b"0123456789"),
-            )
-            .await
-            .unwrap();
-        let create = backend
-            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
-                bucket: b.clone(),
-                key: "copy.bin".into(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        let upload_id = create.output.upload_id.unwrap();
-
-        // A valid byte range copies just that slice.
-        let mut input = upload_part_copy_input(&b, &upload_id, 1);
-        input.copy_source_range = Some("bytes=2-5".into());
-        let part = backend.upload_part_copy(s3_request(input)).await.unwrap();
-        let etag = part.output.copy_part_result.unwrap().e_tag.unwrap();
-        backend
-            .complete_multipart_upload(s3_request(dto::CompleteMultipartUploadInput {
-                bucket: b.clone(),
-                key: "copy.bin".into(),
-                upload_id: upload_id.clone(),
-                multipart_upload: Some(dto::CompletedMultipartUpload {
-                    parts: Some(vec![dto::CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(etag),
-                        ..Default::default()
-                    }]),
-                }),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        let got = read_body(
-            backend
-                .storage()
-                .get_object(
-                    &bucket::name(&b).unwrap(),
-                    &object::key("copy.bin").unwrap(),
-                    None,
-                )
-                .await
-                .unwrap()
-                .body,
-        )
-        .await
-        .unwrap();
-        assert_eq!(got, b"2345");
-
-        // Malformed range → InvalidArgument.
-        let mut input = upload_part_copy_input(&b, &upload_id, 2);
-        input.copy_source_range = Some("junk".into());
-        let err = backend
-            .upload_part_copy(s3_request(input))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidArgument");
-
-        // Source conditional failure → 412 (never 304 on the copy path).
-        let src_etag = "781e5e245d69b566979b86e28d23f2c7";
-        let mut input = upload_part_copy_input(&b, &upload_id, 2);
-        input.copy_source_if_none_match = Some(format!("\"{src_etag}\"").parse().unwrap());
-        let err = backend
-            .upload_part_copy(s3_request(input))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "PreconditionFailed");
-
-        // Invalid part number → InvalidPart.
-        let input = upload_part_copy_input(&b, &upload_id, 0);
-        let err = backend
-            .upload_part_copy(s3_request(input))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidPart");
     }
 
     #[cfg(feature = "copy")]
@@ -1525,52 +1268,6 @@ mod tests {
 
     #[cfg(feature = "multipart")]
     #[tokio::test]
-    async fn list_parts_rejects_max_parts_below_one() {
-        // The rejection is wire-level: it fires before any storage call,
-        // so no upload is needed.
-        let (backend, b) = setup().await;
-        for max_parts in [0, -1] {
-            let err = backend
-                .list_parts(s3_request(dto::ListPartsInput {
-                    bucket: b.clone(),
-                    key: "k".into(),
-                    upload_id: "u".into(),
-                    max_parts: Some(max_parts),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.code().as_str(),
-                "InvalidArgument",
-                "max-parts = {max_parts}"
-            );
-        }
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn list_multipart_uploads_rejects_max_uploads_below_one() {
-        let (backend, b) = setup().await;
-        for max_uploads in [0, -1] {
-            let err = backend
-                .list_multipart_uploads(s3_request(dto::ListMultipartUploadsInput {
-                    bucket: b.clone(),
-                    max_uploads: Some(max_uploads),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.code().as_str(),
-                "InvalidArgument",
-                "max-uploads = {max_uploads}"
-            );
-        }
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
     async fn list_parts_allow_zero_page_size_restores_the_legacy_empty_page() {
         // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
         // empty page (the legacy behavior), never InvalidArgument.
@@ -1637,239 +1334,6 @@ mod tests {
         assert_eq!(out.max_uploads, Some(0));
         assert!(out.uploads.as_ref().unwrap().is_empty());
         assert_eq!(out.is_truncated, Some(false));
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn create_echoes_the_checksum_algorithm() {
-        let (backend, b) = setup_checksum().await;
-        let create = backend
-            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                checksum_algorithm: Some("CRC32".parse().unwrap()),
-                checksum_type: Some("FULL_OBJECT".parse().unwrap()),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        assert_eq!(
-            create
-                .output
-                .checksum_algorithm
-                .as_ref()
-                .map(|a| a.as_str()),
-            Some("CRC32")
-        );
-        assert_eq!(
-            create.output.checksum_type.as_ref().map(|t| t.as_str()),
-            Some("FULL_OBJECT")
-        );
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn create_rejects_an_invalid_algorithm_type_combination() {
-        // F5: SHA with FULL_OBJECT is outside the algorithm × type
-        // table — create must answer InvalidRequest (the Complete
-        // branch already rejects it; create must not accept the
-        // combination in the first place).
-        let (backend, b) = setup_checksum().await;
-        for (algo, ty) in [("SHA256", "FULL_OBJECT"), ("SHA1", "FULL_OBJECT")] {
-            let err = backend
-                .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
-                    bucket: b.clone(),
-                    key: "big.bin".into(),
-                    checksum_algorithm: Some(algo.parse().unwrap()),
-                    checksum_type: Some(ty.parse().unwrap()),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(err.code().as_str(), "InvalidRequest", "{algo} + {ty}");
-        }
-        // The valid combinations stay accepted.
-        for (algo, ty) in [
-            ("SHA256", "COMPOSITE"),
-            ("CRC32", "FULL_OBJECT"),
-            ("CRC64NVME", "FULL_OBJECT"),
-            ("CRC32C", "COMPOSITE"),
-        ] {
-            backend
-                .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
-                    bucket: b.clone(),
-                    key: "big.bin".into(),
-                    checksum_algorithm: Some(algo.parse().unwrap()),
-                    checksum_type: Some(ty.parse().unwrap()),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap();
-        }
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn upload_part_validates_and_echoes_the_checksum() {
-        let (backend, b) = setup_checksum().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-        let data = b"hello world";
-        let expected = client_checksum(Algorithm::Crc32, data);
-        let part = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                checksum_crc32: Some(expected.clone()),
-                body: part_body(data),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        assert_eq!(
-            part.output.checksum_crc32.as_deref(),
-            Some(expected.as_str())
-        );
-        // Persisted → ListParts echoes it.
-        let listed = backend
-            .list_parts(s3_request(dto::ListPartsInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id,
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        assert_eq!(
-            listed.output.parts.as_ref().unwrap()[0]
-                .checksum_crc32
-                .as_deref(),
-            Some(expected.as_str())
-        );
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn upload_part_checksum_mismatch_is_bad_digest_and_stores_nothing() {
-        let (backend, b) = setup_checksum().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-        let err = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                checksum_crc32: Some("y/Q5Jg==".into()), // crc32("123456789") ≠ the body
-                body: part_body(b"hello world"),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "BadDigest");
-        // The part was never stored.
-        let listed = backend
-            .list_parts(s3_request(dto::ListPartsInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id,
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        assert!(listed.output.parts.as_ref().unwrap().is_empty());
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn upload_part_validates_content_md5() {
-        let (backend, b) = setup_checksum().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-        let data = b"abc";
-        // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72 → base64
-        // "kAFQmDzST7DWlj99KOF/cg==".
-        let md5 = STANDARD.encode(<md5::Md5 as md5::Digest>::digest(data));
-        backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                content_md5: Some(md5.clone()),
-                body: part_body(data),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
-        let err = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 2,
-                content_md5: Some("AAAAAAAAAAAAAAAAAAAAAA==".into()),
-                body: part_body(b"def"),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "BadDigest");
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn upload_part_rejects_conflicting_sources_and_bare_algorithm() {
-        let (backend, b) = setup_checksum().await;
-        let upload_id = create_upload(&backend, &b, None, None).await;
-        // Two value fields → InvalidRequest.
-        let err = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                checksum_crc32: Some("y/Q5Jg==".into()),
-                checksum_sha256: Some("y/Q5Jg==".into()),
-                body: part_body(b"x"),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidRequest");
-        // Algorithm without a value → InvalidRequest (S3: 400).
-        let err = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id: upload_id.clone(),
-                part_number: 2,
-                checksum_algorithm: Some("CRC32".parse().unwrap()),
-                body: part_body(b"x"),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidRequest");
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn upload_part_algorithm_must_match_the_create_algorithm() {
-        let (backend, b) = setup_checksum().await;
-        let upload_id = create_upload(&backend, &b, Some("SHA256"), None).await;
-        let err = backend
-            .upload_part(s3_request(dto::UploadPartInput {
-                bucket: b.clone(),
-                key: "big.bin".into(),
-                upload_id,
-                part_number: 1,
-                checksum_crc32: Some("y/Q5Jg==".into()),
-                body: part_body(b"x"),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidRequest");
     }
 
     #[cfg(feature = "multipart")]
@@ -2036,50 +1500,6 @@ mod tests {
             complete.output.checksum_crc32.as_deref(),
             Some(full.as_str())
         );
-    }
-
-    #[cfg(feature = "multipart")]
-    #[tokio::test]
-    async fn complete_checksum_mismatch_is_bad_digest_and_preserves_the_old_object() {
-        let (backend, b) = setup_checksum().await;
-        // A pre-existing object of the same key — a failed complete must
-        // leave it untouched (pre-commit validation).
-        backend
-            .storage()
-            .put_object(
-                &bucket::name(&b).unwrap(),
-                &object::key("big.bin").unwrap(),
-                body(b"precious"),
-            )
-            .await
-            .unwrap();
-        let upload_id = create_upload(&backend, &b, Some("CRC32"), None).await;
-        let parts = big_parts();
-        let (etags, _) =
-            upload_parts_with_checksums(&backend, &b, &upload_id, Algorithm::Crc32, &parts).await;
-        let mut input = complete_input(&upload_id, &etags);
-        input.checksum_crc32 = Some("y/Q5Jg==".into()); // wrong
-        let err = backend
-            .complete_multipart_upload(s3_request(input))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "BadDigest");
-        // The old object survived; the upload is still live.
-        let got = read_body(
-            backend
-                .storage()
-                .get_object(
-                    &bucket::name(&b).unwrap(),
-                    &object::key("big.bin").unwrap(),
-                    None,
-                )
-                .await
-                .unwrap()
-                .body,
-        )
-        .await
-        .unwrap();
-        assert_eq!(got, b"precious");
     }
 
     #[cfg(feature = "multipart")]
@@ -2284,5 +1704,122 @@ mod tests {
                 .checksum_crc32
                 .is_none()
         );
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn checksum_toggle_off_accepts_and_drops_part_checksum_entries() {
+        // F01: with the toggle off, a CompletedPart carrying TWO checksum
+        // fields is accepted and dropped (v1 pass-through) — it must not
+        // answer InvalidRequest, and the single-part complete must not
+        // force the full snapshot scan.
+        let (backend, b) = setup().await;
+        let upload_id = create_upload(&backend, &b, None, None).await;
+        let part = backend
+            .upload_part(s3_request(dto::UploadPartInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                body: part_body(b"hello"),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let mut input = complete_input(
+            &upload_id,
+            std::slice::from_ref(part.output.e_tag.as_ref().unwrap()),
+        );
+        if let Some(parts) = input
+            .multipart_upload
+            .as_mut()
+            .and_then(|m| m.parts.as_mut())
+        {
+            parts[0].checksum_crc32 = Some("y/Q5Jg==".into());
+            parts[0].checksum_sha256 = Some("DUoRhQ==".into());
+        }
+        let complete = backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap();
+        assert!(complete.output.checksum_crc32.is_none());
+        assert!(complete.output.checksum_sha256.is_none());
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn cached_checksum_specs_never_resurrect_aborted_uploads() {
+        // F04 guard: the spec cache must not mask existence — after an
+        // abort, a part upload whose spec is still cached answers
+        // NoSuchUpload (the storage write txn is the existence
+        // authority; a stale entry never resurrects a part).
+        let (backend, b) = setup_checksum().await;
+        let upload_id = create_upload(&backend, &b, Some("SHA256"), None).await;
+        // Warm the cache (this part upload reads the spec through).
+        let part = backend
+            .upload_part(s3_request(dto::UploadPartInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                body: part_body(b"x"),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(part.output.e_tag.is_some());
+        backend
+            .abort_multipart_upload(s3_request(dto::AbortMultipartUploadInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                upload_id: upload_id.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let err = backend
+            .upload_part(s3_request(dto::UploadPartInput {
+                bucket: b,
+                key: "big.bin".into(),
+                upload_id,
+                part_number: 2,
+                body: part_body(b"y"),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchUpload");
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn checksum_toggle_off_list_uploads_drops_a_persisted_spec() {
+        // F02: a checksum spec persisted by an earlier on-run must not be
+        // echoed by ListMultipartUploads while the toggle is off (off =
+        // accept-and-drop) — ListParts already gates its echo, the two
+        // list ops must agree.
+        let (backend, b) = setup().await; // caps.checksum = false
+        backend
+            .storage
+            .create_multipart_upload(
+                &bucket::name(&b).unwrap(),
+                &object::key("big.bin").unwrap(),
+                Some(crate::_core::checksum::Upload {
+                    algorithm: Algorithm::Crc32,
+                    r#type: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let listed = backend
+            .list_multipart_uploads(s3_request(dto::ListMultipartUploadsInput {
+                bucket: b,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload = &listed.output.uploads.as_ref().unwrap()[0];
+        assert!(upload.checksum_algorithm.is_none());
+        assert!(upload.checksum_type.is_none());
     }
 }

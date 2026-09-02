@@ -15,6 +15,12 @@ env:
 jobs:
   quality:
     name: Quality (fmt/clippy/test/doc/features)
+    # PR test reports (BDD cucumber migration): the e2e runs below write
+    # JSON reports; every leg uploads them as artifacts, the ubuntu legs
+    # publish a pass/fail summary comment to the PR.
+    permissions:
+      checks: write
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
@@ -42,11 +48,40 @@ jobs:
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The cucumber e2e suite (crates/tinio-e2e, harness = false) runs in
+      # its own steps below with report output — exclude it here so it does
+      # not run twice (and does not accidentally run @external scenarios).
       - name: test (default features)
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude tinio-e2e
 
       - name: test (--no-default-features)
-        run: cargo test --workspace --no-default-features
+        run: cargo test --workspace --no-default-features --exclude tinio-e2e
+
+      # Cucumber e2e suite: in-process scenarios; the default @external
+      # exclusion is built into the runner, no --tags needed on the fs pass.
+      # The mem pass skips @fs-only scenarios (traversal, nested-root,
+      # out-of-band); backend-neutral scenarios run on mem via
+      # TINIO_E2E_BACKEND, @mem-only ones by their tag. --test cucumber
+      # keeps the args from reaching the plain-harness traceability target
+      # (which runs in its own step below), and the explicit --tags must
+      # repeat the @external exclusion (it replaces the runner's default
+      # filter). --retry 1 on both passes mitigates the ConnectionAborted
+      # flake.
+      - name: e2e cucumber (fs backend)
+        run: cargo test -p tinio-e2e --test cucumber -- --retry 1
+        env:
+          TINIO_E2E_REPORT: cucumber-report-fs.json
+
+      - name: e2e cucumber (mem backend)
+        run: cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 1
+        env:
+          TINIO_E2E_BACKEND: mem
+          TINIO_E2E_REPORT: cucumber-report-mem.json
+
+      # The spec↔tag cross-check: a plain-harness libtest target, no
+      # cucumber argv, so it cannot share the scoped runs above.
+      - name: e2e traceability
+        run: cargo test -p tinio-e2e --test traceability
 
       - name: doc (no warnings)
         env:
@@ -63,6 +98,137 @@ jobs:
 
       - name: feature-matrix check (tinio)
         run: cargo hack check --package tinio --feature-powerset --no-dev-deps
+
+      # PR test reports. The reports land in crates/tinio-e2e/ (cargo runs
+      # the test binary with the package root as cwd), hence the ** glob.
+      - name: upload cucumber report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}-${{ matrix.os }}-cucumber-report
+          path: '**/*-report*.json'
+
+      # dorny/test-reporter has no cucumber reporter (its README documents
+      # 13 reporter identifiers, none of them cucumber — verified
+      # 2026-09-01), so the tier-3 fallback publishes the report: a step
+      # summary plus a PR comment with pass/fail counts and the failed
+      # scenario names. Never fails the job (fail-on-error: 'false' analog).
+      - name: publish test report to PR
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Find the cucumber JSON reports (same files the artifact
+            // step uploads: *-report*.json anywhere in the workspace).
+            function findReports(dir, acc) {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (entry.name === '.git' || entry.name === 'target') continue;
+                const p = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  findReports(p, acc);
+                } else if (/^.*-report.*\.json$/.test(entry.name)) {
+                  acc.push(p);
+                }
+              }
+              return acc;
+            }
+
+            const reports = findReports(process.env.GITHUB_WORKSPACE, []).sort();
+            const rows = [];
+            const failures = [];
+
+            for (const file of reports) {
+              let data;
+              try {
+                data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              } catch (err) {
+                core.warning(`could not parse report ${file}: ${err.message}`);
+                continue;
+              }
+              const row = { file: path.basename(file), scenarios: 0, passed: 0, failed: 0, skipped: 0 };
+              for (const feature of data) {
+                for (const el of feature.elements || []) {
+                  if (el.type !== 'scenario') continue;
+                  row.scenarios += 1;
+                  // cucumber-rs 0.23's JSON writer accumulates events across
+                  // retry attempts on the same element (steps are never
+                  // cleared between attempts; element identity is
+                  // name+line+type), so a flake recovered by --retry 1
+                  // carries failed attempt-1 statuses AND passed attempt-2
+                  // statuses for the same step lines. Keep only the LAST
+                  // status per step line (the gherkin position line is
+                  // stable across attempts); hooks have no stable key in
+                  // the JSON, so keep the last status per hook kind.
+                  const statuses = new Set();
+                  const lastByLine = new Map();
+                  for (const step of el.steps || []) {
+                    const status = step.result && step.result.status;
+                    if (typeof step.line === 'number') {
+                      lastByLine.set(step.line, status);
+                    } else {
+                      statuses.add(status);
+                    }
+                  }
+                  for (const status of lastByLine.values()) {
+                    statuses.add(status);
+                  }
+                  const lastHookByKind = new Map();
+                  for (const kind of ['before', 'after']) {
+                    for (const hook of el[kind] || []) {
+                      lastHookByKind.set(kind, hook.result && hook.result.status);
+                    }
+                  }
+                  for (const status of lastHookByKind.values()) {
+                    statuses.add(status);
+                  }
+                  if (statuses.has('failed') || statuses.has('undefined') || statuses.has('ambiguous')) {
+                    row.failed += 1;
+                    failures.push(`- \`${feature.uri}\` — ${el.name}`);
+                  } else if (statuses.size === 0 || (statuses.size === 1 && statuses.has('passed'))) {
+                    row.passed += 1;
+                  } else {
+                    row.skipped += 1;
+                  }
+                }
+              }
+              rows.push(row);
+            }
+
+            const table = rows.length > 0
+              ? ['| report | scenarios | passed | failed | skipped |', '|---|---|---|---|---|']
+                  .concat(rows.map((r) => `| ${r.file} | ${r.scenarios} | ${r.passed} | ${r.failed} | ${r.skipped} |`))
+                  .join('\n')
+              : 'No cucumber report found — the e2e run did not produce a JSON report.';
+
+            const body = [
+              `## e2e cucumber report (\`${process.env.GITHUB_JOB}\`)`,
+              '',
+              table,
+              failures.length > 0
+                ? `\n**${failures.length} failed scenario(s):**\n${failures.join('\n')}`
+                : rows.length > 0 ? '\nAll scenarios passed.' : '',
+            ].join('\n');
+
+            // Step summary: visible on every run, including fork PRs
+            // without comment permissions.
+            await core.summary.addRaw(body).write();
+
+            // PR comment (pull_request runs only — context.issue.number is
+            // unset on push). A permission failure must not fail the job.
+            if (context.issue.number) {
+              try {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              } catch (err) {
+                core.warning(`could not post PR comment: ${err.message}`);
+              }
+            }
 
   bench-smoke:
     name: Benchmark smoke (criterion --test)
@@ -133,8 +299,12 @@ jobs:
 
   interop:
     name: Interop (aws cli v2 + rclone)
-    # harness e2e/interop/journey.sh is committed (T032), job always runs
+    # cucumber @interop harness (crates/tinio-e2e) is committed, job always runs
     needs: quality
+    # PR test reports: same artifact + ubuntu-only comment scheme as quality.
+    permissions:
+      checks: write
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
@@ -151,18 +321,140 @@ jobs:
         with:
           tool: aws-cli, rclone
 
-      - name: build facade binary
-        run: cargo build --package tinio
+      # The @external cucumber steps spawn the serve example binary
+      # (serve_bin() resolves it in the workspace target dir).
+      - name: build serve example (interop harness)
+        run: cargo build -p tinio-server --example serve
 
-      # FR-025: aws cli v2 + rclone are the CI-gated clients. The harness
-      # contract (server spawn, addressing, scenario set) is defined by
-      # e2e/interop/journey.sh (T032).
-      - name: interop journey
-        shell: bash
-        run: bash e2e/interop/journey.sh
+      # FR-025: aws cli v2 + rclone are the CI-gated clients. The cucumber
+      # @interop run replaces the deleted bash scripts (e2e/interop/*.sh).
+      # --test cucumber keeps the tags from reaching the plain-harness
+      # traceability target; --retry 1 mitigates external-client flakes.
+      - name: interop cucumber (@interop)
+        run: cargo test -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
+        env:
+          TINIO_E2E_REPORT: interop-report.json
 
-      # T033: multipart (> 8 MiB), server-side copy, cold listing with and
-      # without the scanner.
-      - name: interop advanced
-        shell: bash
-        run: bash e2e/interop/advanced.sh
+      - name: upload cucumber report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}-${{ matrix.os }}-cucumber-report
+          path: '**/*-report*.json'
+
+      - name: publish test report to PR
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Find the cucumber JSON reports (same files the artifact
+            // step uploads: *-report*.json anywhere in the workspace).
+            function findReports(dir, acc) {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (entry.name === '.git' || entry.name === 'target') continue;
+                const p = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  findReports(p, acc);
+                } else if (/^.*-report.*\.json$/.test(entry.name)) {
+                  acc.push(p);
+                }
+              }
+              return acc;
+            }
+
+            const reports = findReports(process.env.GITHUB_WORKSPACE, []).sort();
+            const rows = [];
+            const failures = [];
+
+            for (const file of reports) {
+              let data;
+              try {
+                data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              } catch (err) {
+                core.warning(`could not parse report ${file}: ${err.message}`);
+                continue;
+              }
+              const row = { file: path.basename(file), scenarios: 0, passed: 0, failed: 0, skipped: 0 };
+              for (const feature of data) {
+                for (const el of feature.elements || []) {
+                  if (el.type !== 'scenario') continue;
+                  row.scenarios += 1;
+                  // cucumber-rs 0.23's JSON writer accumulates events across
+                  // retry attempts on the same element (steps are never
+                  // cleared between attempts; element identity is
+                  // name+line+type), so a flake recovered by --retry 1
+                  // carries failed attempt-1 statuses AND passed attempt-2
+                  // statuses for the same step lines. Keep only the LAST
+                  // status per step line (the gherkin position line is
+                  // stable across attempts); hooks have no stable key in
+                  // the JSON, so keep the last status per hook kind.
+                  const statuses = new Set();
+                  const lastByLine = new Map();
+                  for (const step of el.steps || []) {
+                    const status = step.result && step.result.status;
+                    if (typeof step.line === 'number') {
+                      lastByLine.set(step.line, status);
+                    } else {
+                      statuses.add(status);
+                    }
+                  }
+                  for (const status of lastByLine.values()) {
+                    statuses.add(status);
+                  }
+                  const lastHookByKind = new Map();
+                  for (const kind of ['before', 'after']) {
+                    for (const hook of el[kind] || []) {
+                      lastHookByKind.set(kind, hook.result && hook.result.status);
+                    }
+                  }
+                  for (const status of lastHookByKind.values()) {
+                    statuses.add(status);
+                  }
+                  if (statuses.has('failed') || statuses.has('undefined') || statuses.has('ambiguous')) {
+                    row.failed += 1;
+                    failures.push(`- \`${feature.uri}\` — ${el.name}`);
+                  } else if (statuses.size === 0 || (statuses.size === 1 && statuses.has('passed'))) {
+                    row.passed += 1;
+                  } else {
+                    row.skipped += 1;
+                  }
+                }
+              }
+              rows.push(row);
+            }
+
+            const table = rows.length > 0
+              ? ['| report | scenarios | passed | failed | skipped |', '|---|---|---|---|---|']
+                  .concat(rows.map((r) => `| ${r.file} | ${r.scenarios} | ${r.passed} | ${r.failed} | ${r.skipped} |`))
+                  .join('\n')
+              : 'No cucumber report found — the e2e run did not produce a JSON report.';
+
+            const body = [
+              `## e2e cucumber report (\`${process.env.GITHUB_JOB}\`)`,
+              '',
+              table,
+              failures.length > 0
+                ? `\n**${failures.length} failed scenario(s):**\n${failures.join('\n')}`
+                : rows.length > 0 ? '\nAll scenarios passed.' : '',
+            ].join('\n');
+
+            // Step summary: visible on every run, including fork PRs
+            // without comment permissions.
+            await core.summary.addRaw(body).write();
+
+            // PR comment (pull_request runs only — context.issue.number is
+            // unset on push). A permission failure must not fail the job.
+            if (context.issue.number) {
+              try {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              } catch (err) {
+                core.warning(`could not post PR comment: ${err.message}`);
+              }
+            }

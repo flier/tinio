@@ -316,42 +316,6 @@ mod tests {
 
     #[cfg(feature = "list-v1")]
     #[tokio::test]
-    async fn v1_rejects_max_keys_below_one() {
-        let (backend, b) = setup().await;
-        for max_keys in [0, -1] {
-            let err = backend
-                .list_objects(s3_request(dto::ListObjectsInput {
-                    bucket: b.clone(),
-                    max_keys: Some(max_keys),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.code().as_str(),
-                "InvalidArgument",
-                "max-keys = {max_keys}"
-            );
-        }
-    }
-
-    #[cfg(feature = "list-v2")]
-    #[tokio::test]
-    async fn v2_rejects_max_keys_below_one() {
-        let (backend, b) = setup().await;
-        let err = backend
-            .list_objects_v2(s3_request(dto::ListObjectsV2Input {
-                bucket: b,
-                max_keys: Some(0),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code().as_str(), "InvalidArgument");
-    }
-
-    #[cfg(feature = "list-v1")]
-    #[tokio::test]
     async fn v1_allow_zero_page_size_restores_the_legacy_empty_page() {
         // The `[s3] allow_zero_page_size` escape hatch: 0 and negative
         // values answer the empty page (the legacy `.max(0)` clamp),

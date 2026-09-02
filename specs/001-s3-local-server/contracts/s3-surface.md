@@ -18,7 +18,7 @@ The S3 protocol surface implemented by the backend over s3s (routing, XML, error
 - **ETag**: single uploads `"<md5hex>"`; multipart `"<md5hex>-N"`; served only when meta-store size/mtime matches, else recomputed streaming (FR-022). Listings include ETags — missing/stale entries are recomputed synchronously during the listing (one-time full-content pass over externally-added files, documented cost of SC-006).
 - **Range**: framework parses the header; backend seeks and returns the correct range + `Content-Range`.
 - **Content-Type**: inferred from extension (`mime_guess`, fallback `application/octet-stream`); user `x-amz-meta-*` accepted and dropped.
-- **Checksums** (`x-amz-checksum-*`): validated and echoed on multipart uploads behind `[s3] checksum = true` (default `false` = accepted and dropped, the v1 behavior); see [Multipart upload checksum validation design](../../../docs/superpowers/specs/2026-08-31-multipart-checksum-validation-design.md). Effective validation coverage (which request combinations are actually validated when the toggle is on):
+- **Checksums** (FR-026; `x-amz-checksum-*`): validated and echoed on multipart uploads behind `[s3] checksum = true` (default `false` = accepted and dropped, the v1 behavior); see [Multipart upload checksum validation design](../../../docs/superpowers/specs/2026-08-31-multipart-checksum-validation-design.md). Effective validation coverage (which request combinations are actually validated when the toggle is on):
   - `UploadPart` — at most one `x-amz-checksum-<algo>` value (header field or aws-chunked trailer; `Content-MD5` may coexist and is validated in the same pass); a mismatch answers `BadDigest` and the part is never stored. A part whose algorithm differs from the upload's create-time algorithm answers `InvalidRequest`.
   - `UploadPartCopy` — no client checksum value exists on the wire (AWS defines none); for create-algorithm uploads the server computes and persists the copied part's checksum and echoes it in `CopyPartResult`.
   - `CompleteMultipartUpload` — `CompletedPart` checksum entries are cross-checked against the stored values; the full-object value is validated pre-commit (`COMPOSITE` = the algorithm over the concatenated raw part digests; `FULL_OBJECT` = CRC linearization, CRC algorithms only) with algorithm/type/size consistency (`BadDigest` on value or type conflicts, `InvalidRequest` on algorithm/type/size shape violations).
@@ -26,7 +26,7 @@ The S3 protocol surface implemented by the backend over s3s (routing, XML, error
   - Deviations: a Complete-time checksum value without a create-time algorithm is accepted but not validated (documented AWS behavior for CRC32/CRC32C/SHA-1/SHA-256; assumed for CRC64NVME); Complete validation is skipped (warn) when any listed part lacks a stored checksum; create-algorithm uploads' `UploadPartCopy` gives up the zero-copy fast path.
 - **Error codes** (FR-005): `NoSuchBucket`, `NoSuchKey`, `InvalidBucketName`, `BucketAlreadyExists`, `BucketNotEmpty`, `InvalidAccessKeyId`/`SignatureDoesNotMatch` (framework), `NotImplemented` (disabled/unsupported ops), etc.
 - **Traversal** (FR-006): keys containing `..`/absolute/control sequences rejected before any FS access.
-- **Conditional requests**: `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since` honored on Get/Head (`If-None-Match` / `If-Modified-Since` failure → `304 Not Modified`; `If-Match` / `If-Unmodified-Since` failure → `412 Precondition Failed`) and on Put/Copy (any precondition failure → `412 Precondition Failed`); the Copy source is evaluated per S3 semantics. Conditional checks reuse the meta-store ETag + filesystem mtime.
+- **Conditional requests**: `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since` honored on Get/Head (`If-None-Match` / `If-Modified-Since` failure → `304 Not Modified`; `If-Match` / `If-Unmodified-Since` failure → `412 Precondition Failed`); on the PUT write path only `If-Match` / `If-None-Match` are evaluated (any precondition failure → `412 Precondition Failed`) — `If-Modified-Since` / `If-Unmodified-Since` on PUT are not supported. The Copy source is evaluated per S3 semantics. Conditional checks reuse the meta-store ETag + filesystem mtime.
 - **Folder markers**: keys ending in `/` are not objects. PUT `dir/` creates the directory (idempotent); GET/HEAD on `dir/` return `NoSuchKey`; DELETE `dir/` always returns `204` (idempotent, mirroring AWS DeleteObject marker semantics) and removes the directory only when it is empty — a non-empty directory is left in place.
 - **Key charset**: universal rules (all backends): traversal, absolute paths, control characters → rejected. Platform charset restrictions follow the backend: the filesystem backend rejects keys that cannot exist on the host OS (e.g. Windows-invalid characters on Windows); other platforms allow them.
 - **Symlinks**: rejected by default (`[storage.fs] follow_symlinks = false`) — access resolving through a symlink is refused and symlink entries are excluded from listings (a link inside a bucket cannot escape the storage root). Opt-in `true` follows links, which may point outside the root (user-owned directory, documented).
@@ -38,3 +38,39 @@ The S3 protocol surface implemented by the backend over s3s (routing, XML, error
 - **Addressing style**: path-style addressing is the supported/tested mode (s3s serves `/<bucket>/<key>`); virtual-hosted addressing is not configured in v1. Interop tests verify aws cli v2 and rclone work against `127.0.0.1` endpoints without client-side addressing overrides.
 - **Listing pollution**: reserved `.tinio/` never appears in `ListBuckets`; root-level files are not buckets (only directories). `.tinio` is a reserved path segment at ANY depth (FR-020): keys containing it are rejected on write (`AccessDenied`), return `NoSuchKey` on read, and are skipped in listings — a nested root's state is never served by an outer server.
 - **Out-of-band changes** (FR-013, SC-006): files placed/modified on disk are served immediately; Last-Modified always from FS mtime.
+
+## Automated coverage (2026-09-01)
+
+The cucumber suite (`crates/tinio-e2e/tests/features/`) is the executable form of this contract; the `traceability` test target (`cargo test -p tinio-e2e --test traceability`) cross-checks spec IDs and feature tags bidirectionally. Every ID in the tag column appears as a feature tag, and every traceability tag in the features has a spec ID here or in `tasks.md`.
+
+| Operation | Feature | Tag |
+|---|---|---|
+| `CreateBucket` / `DeleteBucket` (empty-only) / `HeadBucket` / `ListBuckets` / `GetBucketLocation` | `buckets.feature` | `@SC-001 @FR-002` |
+| A directory placed directly in the served root is a bucket (US1-AS1, out-of-band mirror); deleted bucket name reusable immediately (F07) | `buckets.feature` | `@fs @SC-001 @FR-002` |
+| `ListBuckets` pagination caps (`max-buckets` page cap) | `interop/journey.feature` | `@FR-021 @max-buckets-3` |
+| Bucket-name rules (validation matrix) | `error_codes.feature` | `@FR-012` |
+| `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` (round-trip, zero-byte, nested keys, Content-Type, overwrite) | `objects.feature` | `@T025 @FR-003` |
+| ETag = content MD5, meta-store validation (FR-022) | `objects.feature` | `@FR-022` |
+| Range (`206`/`Content-Range`, `416` `InvalidRange`) | `objects.feature` | `@T025` |
+| Conditional requests (304/412, weak/wildcard, date-based) | `conditions.feature` | `@FR-003` |
+| Folder markers (`dir/` never an object) | `objects.feature` | `@T025` |
+| Concurrent writes last-write-wins; interrupted upload leaves no partial object | `objects.feature` | `@FR-011` |
+| Out-of-band changes served immediately | `objects.feature` | `@FR-013 @SC-006` |
+| `DeleteObjects` (batch, quiet mode), `GetObjectTagging` | `tagging.feature` | `@FR-003` |
+| `CopyObject` — same/cross-bucket, overwrite, missing source (`NoSuchKey`), source/destination conditionals → 412 | `objects.feature`, `conditions.feature` | `@FR-015 @FR-003` |
+| `ListObjects` (V1) / `ListObjectsV2` (V2) — prefix, delimiter grouping, pagination | `listing.feature` | `@SC-001 @FR-004` |
+| `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` (composed ETag) / `AbortMultipartUpload` / `ListParts` / `ListMultipartUploads` — no 5 MB minimum, part-number validation, `NoSuchUpload` identity | `multipart.feature` | `@FR-014` |
+| `UploadPartCopy` (ranges, source conditionals, `InvalidPart`) | `conditions.feature` | `@FR-014` |
+| Multipart checksum validation behind `[s3] checksum = true` (per-part BadDigest, create-algorithm consistency, pre-commit Complete validation) — FR-026; see the [design doc](../../../docs/superpowers/specs/2026-08-31-multipart-checksum-validation-design.md) | `error_codes.feature`, `multipart.feature`, `interop/journey.feature` | `@checksum-on` scenarios |
+| Error-code set (FR-005), traversal/absolute-path rejection before FS access, capability toggles → `NotImplemented` | `error_codes.feature` | `@SC-004 @FR-005 @FR-006 @FR-021` |
+| `.tinio` reservation at any depth; nested-root isolation | `reserved_paths.feature` | `@FR-020` |
+| Symlink policy: access through a link refused (`AccessDenied`), link entries excluded from listings (default `follow_symlinks = false`) | `reserved_paths.feature` | `@fs @FR-020` |
+| `GET /metrics` (Prometheus text format; the three-layer set — HTTP, S3 ops, storage streaming counters) | `metrics.feature` | `@T075 @SC-008` |
+| SigV4 authentication: signed requests succeed; invalid credentials rejected with `InvalidAccessKeyId` and no operation performed (US3-AS1/AS2) | `interop/journey.feature` | `@FR-008 @SC-001 @T032 @FR-025 @SC-002` |
+| Interop: mandated clients (aws cli v2, rclone) core journey + ephemeral port (T032); client tiering (FR-025) | `interop/journey.feature` | `@SC-001 @T032 @FR-025` |
+| Interop: SC-002 no-client-side-overrides | `interop/journey.feature` | `@SC-002` |
+| Interop: boto3 basic journey (best-effort, T034) | `interop/journey.feature` | `@T034` |
+| Interop: multipart > 8 MiB composed ETag, server-side copy (FR-015), cold listing with/without scanner (FR-024), edge keys | `interop/advanced.feature` | `@T033 @FR-015 @FR-024` |
+| Interop: mc basic journey (best-effort, T035) | `interop/advanced.feature` | `@T035` |
+
+**Not covered by cucumber** (verified by the unit/integration suites that stayed in Rust, the manual perf scripts, or not yet implemented; mirrored in the traceability test's allow-list): FR-001 (meta-requirement), FR-007 (CLI), FR-009 (anonymous-mode configuration semantics — the anonymous request path itself is what the in-process suite exercises), FR-010 (streaming memory property), FR-016 (config precedence), FR-017 (logging), FR-018 (management plane), FR-019 (metric-recording overhead; the storage full-scan gauges are the management plane's T075 work — the streaming byte counters are covered), FR-023 (read-only mode — US2, unimplemented), SC-003 (flat-memory script), SC-005/SC-007 (US2 timing criteria), T010/T018/T023 (foundation/config citations).

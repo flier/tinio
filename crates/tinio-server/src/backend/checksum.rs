@@ -12,7 +12,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -44,7 +44,8 @@ use crate::_core::{
 pub(crate) struct VerifyState {
     /// The digest slot the storage commits atomically with the part row
     /// (written exactly once at stream end — a write-once cell, no
-    /// lock). The backend may use it as the part ETag when `etag_md5`.
+    /// lock). The [`checksum::PartChecksum::etag`] cell supplies the
+    /// part ETag when the tee hashes MD5.
     slot: Arc<checksum::PartChecksum>,
     mismatched: AtomicBool,
 }
@@ -52,11 +53,11 @@ pub(crate) struct VerifyState {
 impl VerifyState {
     /// A fresh shared outcome; `etag_md5` when the tee computes MD5 over
     /// the body (a part's ETag IS its content MD5 — the backend skips
-    /// its own hash).
+    /// its own hash). The raw digest lands in the cell at stream end.
     pub(crate) fn new(etag_md5: bool) -> Self {
         Self {
             slot: Arc::new(checksum::PartChecksum {
-                etag_md5,
+                etag: etag_md5.then(OnceLock::new),
                 ..Default::default()
             }),
             mismatched: AtomicBool::new(false),
@@ -473,6 +474,17 @@ impl Stream for VerifyStream {
                         value: computed,
                     });
                 }
+                // The MD5 slot doubles as the part ETag (F05): fill the
+                // etag cell whenever the tee hashed MD5 — the Content-MD5
+                // check enables the slot even when the algorithm slot
+                // holds a different one, and that digest must not be
+                // thrown away (the backend would hash the body again).
+                if md5_ok
+                    && let Some(raw) = md5.and_then(|m| checksum::Value(m.to_string()).md5_raw())
+                    && let Some(cell) = self.state.slot.etag.as_ref()
+                {
+                    let _ = cell.set(raw);
+                }
                 if algo_ok && md5_ok {
                     Poll::Ready(None)
                 } else {
@@ -618,10 +630,7 @@ fn crc_combine(
     len_b: u64,
     cache: &mut CombineCache,
 ) -> u64 {
-    if cache
-        .as_ref()
-        .map_or(true, |(key, _)| *key != (algo, len_b))
-    {
+    if cache.as_ref().is_none_or(|(key, _)| *key != (algo, len_b)) {
         *cache = Some(((algo, len_b), combine_matrices(algo, len_b)));
     }
     let mats = &cache.as_ref().expect("just set").1;
@@ -671,6 +680,8 @@ fn crc_params(algo: checksum::Algorithm) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+    use futures::stream;
+
     use super::*;
 
     /// The wire base64 of a raw digest.
@@ -887,5 +898,89 @@ mod tests {
         );
         let err = Spec::from_upload_part(&UploadPartInput::default(), &headers).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequest");
+    }
+
+    /// The raw 16-byte MD5 of `data` (the s3s hasher — the same digest
+    /// the tee computes).
+    fn md5_raw(data: &[u8]) -> [u8; 16] {
+        let mut h = ChecksumHasher {
+            md5: Some(Md5::new()),
+            ..Default::default()
+        };
+        h.update(data);
+        checksum::Value(h.finalize().checksum_md5.unwrap())
+            .md5_raw()
+            .expect("the s3s md5 is valid and 16 bytes")
+    }
+
+    /// Drain one wrapped stream to its end (the finalize happens at the
+    /// final `None`).
+    async fn drain(body: BodyStream) {
+        let mut body = body;
+        while let Some(chunk) = body.next().await {
+            chunk.unwrap();
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn tee_fills_the_etag_cell_whenever_it_hashes_md5() {
+        // F05: the tee hashes MD5 for a Content-MD5 check even when the
+        // algorithm slot holds a different one — the raw digest must
+        // land in the etag cell (the backend reuses it as the part ETag
+        // instead of hashing the body a second time), while the digest
+        // slot keeps the algorithm's value.
+        let state = Arc::new(VerifyState::new(true));
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha256),
+            expected: None,
+            trailer_algo: None,
+            content_md5: Some(checksum::Value(b64(&md5_raw(b"hello world")))),
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(
+                b"hello world",
+            ))])),
+            &spec,
+            None,
+            &state,
+        );
+        drain(body).await;
+        let slot = state.slot();
+        assert_eq!(
+            slot.etag.as_ref().and_then(|c| c.get()),
+            Some(&md5_raw(b"hello world")),
+            "the Content-MD5 digest must be exposed as the part ETag"
+        );
+        assert_eq!(
+            slot.digest.get().map(|p| p.algorithm),
+            Some(Algorithm::Sha256),
+            "the digest slot keeps the algorithm's value"
+        );
+
+        // No Content-MD5 and no MD5 algorithm → no etag promise at all
+        // (the backend hashes for the ETag itself).
+        let state = Arc::new(VerifyState::new(false));
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha256),
+            expected: None,
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(
+                b"hello world",
+            ))])),
+            &spec,
+            None,
+            &state,
+        );
+        drain(body).await;
+        let slot = state.slot();
+        assert!(slot.etag.is_none(), "no MD5 hashed → no etag cell");
+        assert_eq!(
+            slot.digest.get().map(|p| p.algorithm),
+            Some(Algorithm::Sha256)
+        );
     }
 }

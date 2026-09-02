@@ -1,0 +1,40 @@
+[package]
+name = "tinio-e2e"
+version.workspace = true
+edition.workspace = true
+description = "BDD acceptance suite: cucumber scenarios over the in-process tinio server"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "net",
+    "io-util",
+    "sync",
+] }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+cucumber = { workspace = true, features = ["output-json", "tracing"] }
+futures = { workspace = true }
+http = { workspace = true }
+md-5 = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+tinio-core = { path = "../tinio-core" }
+tinio-fs = { path = "../tinio-fs" }
+tinio-mem = { path = "../tinio-mem" }
+tinio-server = { path = "../tinio-server" }
+tinio-util = { path = "../tinio-util", features = ["testing"] }
+
+[[test]]
+name = "cucumber"
+harness = false
+
+# Spec↔tag traceability cross-check: a plain default-harness test target
+# (no cucumber involvement), so `cargo test` runs it normally.
+[[test]]
+name = "traceability"

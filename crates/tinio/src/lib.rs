@@ -46,3 +46,33 @@ pub use crate::{
         PartInfo, Storage, bucket, cleanup, etag, object, storage,
     },
 };
+
+#[cfg(test)]
+mod tests {
+    //! The facade is the only public API surface — these tests pin the
+    //! re-export seams so a refactor cannot silently drop them.
+    use super::*;
+
+    #[test]
+    fn config_re_export_parses() {
+        let config = Config::parse("version = 1").unwrap();
+        assert_eq!(config.server.port, 9000);
+    }
+
+    #[test]
+    fn storage_contract_types_are_re_exported() {
+        // The checked constructors must stay reachable through the
+        // facade, alongside the contract types.
+        let name = bucket::name("data").unwrap();
+        assert_eq!(name.to_string(), "data");
+        let key = object::key("dir/file.txt").unwrap();
+        assert_eq!(key.to_string(), "dir/file.txt");
+        // The range and etag types are reachable and functional.
+        assert_eq!(ByteRange::Inclusive(2, 5).resolve(10).unwrap(), (2, 5));
+        // MD5("hello") = 5d41402abc4b2a76b9719d911017c592.
+        assert_eq!(
+            ETag::from_content(b"hello").as_str(),
+            "5d41402abc4b2a76b9719d911017c592"
+        );
+    }
+}

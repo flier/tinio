@@ -26,7 +26,7 @@ use crate::storage::{self, invalid_checksum};
 /// assert_eq!("SHA512".parse(), Ok(checksum::Algorithm::Sha512));
 /// assert_eq!("XXHASH64".parse(), Ok(checksum::Algorithm::XxHash64));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, FromStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromStr)]
 #[display(style = "UPPERCASE")]
 pub enum Algorithm {
     /// CRC-32 (ISO-HDLC), `x-amz-checksum-crc32`.
@@ -67,7 +67,9 @@ impl Algorithm {
     ];
 
     /// The `&'static str` wire name (`"CRC32"` … `"XXHASH128"`) — the
-    /// allocation-free form for the backends' persisted rows.
+    /// allocation-free form for the backends' persisted rows, and the
+    /// ONE home for the spelling (F13): [`Display`] delegates here, so
+    /// the derived `FromStr` and the persisted rows can never diverge.
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::Crc32 => "CRC32",
@@ -81,6 +83,15 @@ impl Algorithm {
             Self::XxHash3 => "XXHASH3",
             Self::XxHash128 => "XXHASH128",
         }
+    }
+}
+
+/// The wire name — one spelling home: [`Algorithm::wire_name`] is the
+/// single source (the backends persist it; `FromStr` parses it back), so
+/// the two can never diverge (F13).
+impl std::fmt::Display for Algorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
     }
 }
 
@@ -158,7 +169,7 @@ impl Value {
 
     /// The raw 16-byte MD5 digest — `None` when the value is not a
     /// valid MD5 wire form (the tee's MD5 slot doubles as a part ETag,
-    /// and both backends decode it the same way).
+    /// and every consumer decodes it the same way).
     pub fn md5_raw(&self) -> Option<[u8; 16]> {
         self.raw()?.try_into().ok()
     }
@@ -176,17 +187,30 @@ pub struct Part {
 /// The server-computed digest of a part body: the verify tee fills
 /// [`Self::digest`] at stream end, and the backend reads it at commit
 /// time so the part row and its checksum row commit in ONE transaction
-/// (the two-phase `set_part_checksum` CAS is gone). `etag_md5` tells
-/// the backend the tee computed MD5 over the body — a part's ETag IS
-/// its content MD5, so the backend uses the slot value as the ETag
-/// instead of hashing the bytes a second time.
+/// (the two-phase `set_part_checksum` CAS is gone). A part's ETag IS
+/// its content MD5: [`Self::etag`] carries the tee's raw MD5 digest
+/// (filled at stream end, whenever the tee hashed MD5 — the algorithm
+/// slot, or the `Content-MD5` check — F05), so the backend skips its
+/// own hash.
 #[derive(Debug, Default)]
 pub struct PartChecksum {
     /// The digest (set once at stream end; empty when the part carried
     /// no checksum algorithm).
     pub digest: OnceLock<Part>,
-    /// The tee computed MD5 — the digest may serve as the part ETag.
-    pub etag_md5: bool,
+    /// The tee's MD5 promise and value: `Some` when the tee WILL hash
+    /// MD5 over the body (the promise is known before the body streams
+    /// — the fs writer decides its inline hasher from it); the cell is
+    /// filled with the raw 16-byte digest at stream end.
+    pub etag: Option<OnceLock<[u8; 16]>>,
+}
+
+impl PartChecksum {
+    /// The tee's raw MD5 digest, once the stream ended — `None` while
+    /// streaming, or when the tee never hashed MD5. One home for the
+    /// cell unwrap (the backends read it as the part ETag).
+    pub fn etag_digest(&self) -> Option<[u8; 16]> {
+        self.etag.as_ref().and_then(|cell| cell.get()).copied()
+    }
 }
 
 impl Part {
@@ -197,6 +221,13 @@ impl Part {
             algorithm: algorithm(algo)?,
             value: Value(value),
         })
+    }
+
+    /// The row-decode form of a read path (F07): a domain-invalid row
+    /// self-heals (`None` — the part is served without a checksum, like
+    /// the invalid ETag rows) instead of failing the listing.
+    pub fn from_wire_opt(algo: &str, value: String) -> Option<Self> {
+        Self::from_wire(algo, value).ok()
     }
 }
 
@@ -228,6 +259,13 @@ impl Upload {
             r#type: stored_type(ty)?,
         })
     }
+
+    /// The row-decode form of a read path (F07): a domain-invalid row
+    /// self-heals (`None` — the upload is served without a spec, like
+    /// the fs backend's `walk_uploads`) instead of failing the read.
+    pub fn from_wire_opt(algo: &str, ty: &str) -> Option<Self> {
+        Self::from_wire(algo, ty).ok()
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +278,8 @@ mod tests {
     fn algorithm_wire_names_round_trip() {
         for algo in Algorithm::ALL {
             assert_eq!(algo.to_string().parse(), Ok(algo));
+            // F13: Display and the persisted wire name are ONE spelling.
+            assert_eq!(algo.to_string(), algo.wire_name());
         }
         assert!(Algorithm::from_str("BLAKE3").is_err());
         assert!(Algorithm::from_str("crc32").is_err()); // case-sensitive

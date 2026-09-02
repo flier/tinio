@@ -68,4 +68,4 @@ unsafe_code = "forbid"
 ```
 
 - `tinio-cli` defaults `mem` so `tinio server` without a directory uses the in-memory backend.
-- Enable `testing` in `[dev-dependencies]` for the conformance harness.
+- Conformance `testing` feature, cucumber deps/targets/run: `docs/tests.md`.

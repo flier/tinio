@@ -354,8 +354,8 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            BodyStream, BucketOps, ByteRange, ETag, ListObjectsParams, ObjectListing, ObjectOps,
-            bucket, object, storage::Error::*,
+            BodyStream, BucketOps, ListObjectsParams, ObjectListing, ObjectOps, bucket, object,
+            storage::Error::*,
         },
         _util::testing::{body, read_body},
         MemoryOptions,
@@ -534,24 +534,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_overwrites_existing_object() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("a.txt").unwrap();
-        storage
-            .put_object(&bucket, &key, body(b"old".to_vec()))
-            .await
-            .unwrap();
-        let put = storage
-            .put_object(&bucket, &key, body(b"new-bytes".to_vec()))
-            .await
-            .unwrap();
-        assert_eq!(put.etag, ETag::from_content(b"new-bytes"));
-        let got = storage.get_object(&bucket, &key, None).await.unwrap();
-        assert_eq!(read_body(got.body).await.unwrap(), b"new-bytes");
-        assert_eq!(got.info.size, 9);
-    }
-
-    #[tokio::test]
     async fn put_concatenates_body_chunks() {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("chunked").unwrap();
@@ -564,136 +546,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_empty_object_returns_empty_body() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("empty").unwrap();
-        storage
-            .put_object(&bucket, &key, body(b"".to_vec()))
-            .await
-            .unwrap();
-        let got = storage.get_object(&bucket, &key, None).await.unwrap();
-        assert!(got.served_range.is_none());
-        assert_eq!(got.info.size, 0);
-        assert!(read_body(got.body).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_missing_key_is_no_such_key() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("missing").unwrap();
-        assert!(matches!(
-            storage.get_object(&bucket, &key, None).await.unwrap_err(),
-            Error::Storage(NoSuchKey(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_clamps_inclusive_range_to_object_size() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("digits").unwrap();
-        storage
-            .put_object(&bucket, &key, body(b"0123456789".to_vec()))
-            .await
-            .unwrap();
-        let got = storage
-            .get_object(&bucket, &key, Some(ByteRange::Inclusive(8, 99)))
-            .await
-            .unwrap();
-        assert_eq!(got.served_range, Some((8, 9)));
-        assert_eq!(read_body(got.body).await.unwrap(), b"89");
-    }
-
-    #[tokio::test]
-    async fn get_suffix_larger_than_object_returns_all() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("digits").unwrap();
-        storage
-            .put_object(&bucket, &key, body(b"0123456789".to_vec()))
-            .await
-            .unwrap();
-        let got = storage
-            .get_object(&bucket, &key, Some(ByteRange::Suffix(100)))
-            .await
-            .unwrap();
-        assert_eq!(got.served_range, Some((0, 9)));
-        assert_eq!(read_body(got.body).await.unwrap(), b"0123456789");
-    }
-
-    #[tokio::test]
-    async fn unsatisfiable_ranges_are_invalid_range() {
-        let (storage, bucket) = with_bucket().await;
-        let key = object::key("digits").unwrap();
-        storage
-            .put_object(&bucket, &key, body(b"0123456789".to_vec()))
-            .await
-            .unwrap();
-        for range in [
-            ByteRange::From(10),
-            ByteRange::Inclusive(10, 20),
-            ByteRange::Suffix(0),
-        ] {
-            assert!(
-                matches!(
-                    storage
-                        .get_object(&bucket, &key, Some(range))
-                        .await
-                        .unwrap_err(),
-                    Error::Storage(InvalidRange { .. })
-                ),
-                "{range:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn head_folder_marker_and_reserved_are_no_such_key() {
-        let (storage, bucket) = with_bucket().await;
-        let marker = object::key("dir/").unwrap();
-        storage
-            .put_object(&bucket, &marker, body(b"".to_vec()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            storage.head_object(&bucket, &marker).await.unwrap_err(),
-            Error::Storage(NoSuchKey(_))
-        ));
-        let reserved = object::key("a/.tinio/b").unwrap();
-        assert!(matches!(
-            storage.head_object(&bucket, &reserved).await.unwrap_err(),
-            Error::Storage(NoSuchKey(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn list_objects_skips_folder_markers() {
-        let (storage, bucket) = with_bucket().await;
-        storage
-            .put_object(&bucket, &object::key("dir/").unwrap(), body(b"".to_vec()))
-            .await
-            .unwrap();
-        storage
-            .put_object(
-                &bucket,
-                &object::key("dir/a.txt").unwrap(),
-                body(b"a".to_vec()),
-            )
-            .await
-            .unwrap();
-        let page = storage
-            .list_objects(crate::_core::ListObjectsParams {
-                bucket: bucket.clone(),
-                prefix: String::new(),
-                delimiter: None,
-                start_after: None,
-                max_keys: 1000,
-            })
-            .await
-            .unwrap();
-        let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_ref()).collect();
-        assert_eq!(keys, ["dir/a.txt"]);
-    }
-
-    #[tokio::test]
     async fn list_objects_empty_bucket_is_not_truncated() {
         let (storage, bucket) = with_bucket().await;
         let page = storage
@@ -702,27 +554,6 @@ mod tests {
             .unwrap();
         assert!(page.objects.is_empty());
         assert!(page.common_prefixes.is_empty());
-        assert!(!page.truncated);
-        assert_eq!(page.next_start_after, None);
-    }
-
-    #[tokio::test]
-    async fn list_objects_paginates_without_delimiter() {
-        let (storage, bucket) = with_bucket().await;
-        put_keys(&storage, &bucket, &["a.txt", "b.txt", "c.txt", "d.txt"]).await;
-        let page = storage
-            .list_objects(params(&bucket, "", None, None, 2))
-            .await
-            .unwrap();
-        assert_eq!(object_keys(&page), ["a.txt", "b.txt"]);
-        assert!(page.truncated);
-        assert_eq!(page.next_start_after.as_deref(), Some("b.txt"));
-
-        let page = storage
-            .list_objects(params(&bucket, "", None, Some("b.txt"), 2))
-            .await
-            .unwrap();
-        assert_eq!(object_keys(&page), ["c.txt", "d.txt"]);
         assert!(!page.truncated);
         assert_eq!(page.next_start_after, None);
     }
@@ -768,58 +599,6 @@ mod tests {
         assert_eq!(object_keys(&page), ["dir/a.txt", "dir/b.txt"]);
         assert!(page.common_prefixes.is_empty());
         assert!(!page.truncated);
-    }
-
-    #[tokio::test]
-    async fn list_objects_prefix_does_not_include_siblings() {
-        let (storage, bucket) = with_bucket().await;
-        put_keys(&storage, &bucket, &["a.txt", "dir/a.txt", "z.txt"]).await;
-        let page = storage
-            .list_objects(params(&bucket, "dir/", None, None, 1000))
-            .await
-            .unwrap();
-        assert_eq!(object_keys(&page), ["dir/a.txt"]);
-    }
-
-    #[tokio::test]
-    async fn list_objects_delimiter_groups_and_resumes_after_common_prefix() {
-        let (storage, bucket) = with_bucket().await;
-        put_keys(
-            &storage,
-            &bucket,
-            &["a.txt", "b.txt", "dir/c.txt", "dir/e.txt", "z.txt"],
-        )
-        .await;
-        let page = storage
-            .list_objects(params(&bucket, "", Some("/"), None, 2))
-            .await
-            .unwrap();
-        assert_eq!(object_keys(&page), ["a.txt", "b.txt"]);
-        assert!(page.common_prefixes.is_empty());
-        assert!(page.truncated);
-        assert_eq!(page.next_start_after.as_deref(), Some("b.txt"));
-
-        let page = storage
-            .list_objects(params(&bucket, "", Some("/"), Some("b.txt"), 1))
-            .await
-            .unwrap();
-        assert!(page.objects.is_empty());
-        assert_eq!(page.common_prefixes, ["dir/"]);
-        assert!(page.truncated);
-        assert_eq!(page.next_start_after.as_deref(), Some("dir/"));
-
-        let page = storage
-            .list_objects(params(&bucket, "", Some("/"), Some("dir/"), 1000))
-            .await
-            .unwrap();
-        assert_eq!(object_keys(&page), ["z.txt"]);
-        assert!(
-            page.common_prefixes.is_empty(),
-            "resuming after dir/ must not re-emit it: {:?}",
-            page.common_prefixes
-        );
-        assert!(!page.truncated);
-        assert_eq!(page.next_start_after, None);
     }
 
     #[tokio::test]
@@ -871,18 +650,6 @@ mod tests {
         // first object of the next page forever.
         assert!(!page.truncated);
         assert_eq!(page.next_start_after, None);
-    }
-
-    #[tokio::test]
-    async fn list_objects_skips_folder_markers_with_delimiter() {
-        let (storage, bucket) = with_bucket().await;
-        put_keys(&storage, &bucket, &["dir/", "dir/a.txt"]).await;
-        let page = storage
-            .list_objects(params(&bucket, "", Some("/"), None, 1000))
-            .await
-            .unwrap();
-        assert!(page.objects.is_empty());
-        assert_eq!(page.common_prefixes, ["dir/"]);
     }
 
     #[tokio::test]

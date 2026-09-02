@@ -302,8 +302,9 @@ impl AtomicWriter {
     /// temp path and content MD5. The caller controls when the temp
     /// becomes visible (rename under its own lock); on failure the temp is
     /// removed best-effort. `checksum` is the server's tee slot: with
-    /// `etag_md5` the slot already holds the content MD5 (a part's ETag
-    /// IS its content MD5), so the write is not hashed a second time.
+    /// the `etag` cell the slot already holds the content MD5 (a part's
+    /// ETag IS its content MD5), so the write is not hashed a second
+    /// time.
     pub(crate) async fn stage(
         &self,
         body: BodyStream,
@@ -322,8 +323,8 @@ impl AtomicWriter {
     }
 
     /// The stream+hash core: drain `body` into `temp` with bounded
-    /// buffers, returning the content MD5 (from the tee slot when
-    /// `etag_md5` — the write skips its own hash).
+    /// buffers, returning the content MD5 (from the tee's `etag` cell
+    /// when promised — the write skips its own hash).
     async fn write_temp(
         &self,
         temp: &Path,
@@ -331,7 +332,7 @@ impl AtomicWriter {
         checksum: Option<&checksum::PartChecksum>,
     ) -> Result<ETag, Error> {
         let mut file = File::create(temp).await?;
-        let mut hasher = (!checksum.is_some_and(|c| c.etag_md5)).then(Md5::new);
+        let mut hasher = (!checksum.is_some_and(|c| c.etag.is_some())).then(Md5::new);
         let mut stream = pin!(body);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -358,17 +359,12 @@ impl AtomicWriter {
         match hasher {
             // The write was hashed inline.
             Some(hasher) => Ok(ETag::Single(hasher.finalize().into())),
-            // The tee's MD5 (etag_md5): decode the wire base64 into the
-            // raw digest — the tee fills the slot before the stream's
-            // final `None`, so the value is there.
+            // The tee's MD5: the raw digest lands in the etag cell before
+            // the stream's final `None`, so the value is there.
             None => {
-                let slot = checksum
-                    .and_then(|c| c.digest.get())
-                    .expect("the etag_md5 tee fills the slot at stream end");
-                let digest = slot
-                    .value
-                    .md5_raw()
-                    .expect("the tee's md5 is valid and 16 bytes");
+                let digest = checksum
+                    .and_then(|c| c.etag_digest())
+                    .expect("the etag tee fills the cell at stream end");
                 Ok(ETag::Single(digest))
             }
         }
