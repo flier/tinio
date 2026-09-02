@@ -35,8 +35,9 @@ fn subst(world: &super::World, text: &str) -> String {
 
 /// The with-headers steps' shared preamble: the data-table rows, each
 /// value with the world's captured substitutions applied, as the header
-/// slice the raw client takes.
-fn table_headers(world: &super::World, step: &Step) -> Vec<(String, String)> {
+/// slice the raw client takes. `pub(super)`: the multipart steps reuse it
+/// for the conditional-complete tables (conditions.feature FR-028).
+pub(super) fn table_headers(world: &super::World, step: &Step) -> Vec<(String, String)> {
     let table = step.table().expect("the with-headers step carries a table");
     table
         .rows

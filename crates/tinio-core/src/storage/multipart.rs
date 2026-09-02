@@ -229,6 +229,11 @@ pub trait MultipartOps: Send + Sync + 'static {
     /// ascending numbers, each ETag matching the stored part. Extra stored
     /// parts that are not listed are discarded. Empty `parts` is [`Error::NoParts`].
     /// A missing / mismatched / out-of-order part is [`Error::InvalidPart`].
+    /// A non-final listed part below [`crate::multipart::MIN_PART_BYTES`] is
+    /// [`Error::PartTooSmall`] — the S3 5 MiB rule, enforced authoritatively
+    /// here against the part state the commit consumes (a concurrent part
+    /// overwrite between the S3 layer's listing and this call is caught
+    /// here, not by the pre-check).
     /// Returns the composed object metadata (ETag `MD5-of-MD5s-N`, FR-022).
     async fn complete_multipart_upload(
         &self,

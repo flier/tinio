@@ -4,4 +4,6 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 3259bc4f136b5e0f4c8897a2cb7aff3d7df469b73b24b34a4015e77d7585df86 # shrinks to part_sizes = [0]
+# (The previous seed — a single 0-byte part — belonged to the pre-2026-09-02
+# strategy of unbounded small part sizes; the non-final 5 MiB minimum
+# reworked the generator, so the old seed no longer maps.)

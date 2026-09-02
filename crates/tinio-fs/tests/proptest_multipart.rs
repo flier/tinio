@@ -12,7 +12,7 @@ use prop::collection;
 use proptest::prelude::*;
 use tinio_core::{
     ETag, bucket,
-    multipart::{CompletedPart, PartInfo, PartNumber},
+    multipart::{CompletedPart, MIN_PART_BYTES, PartInfo, PartNumber},
     object,
     storage::Error::NoSuchUpload,
 };
@@ -32,12 +32,20 @@ fn reference_composed(parts: &[PartInfo]) -> String {
 }
 
 proptest! {
-    /// Random part counts (1..=24) and sizes (0..=4 KiB) assemble
-    /// byte-exact, with the reference composed ETag.
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    /// Random part counts (1..=3) and sizes assemble byte-exact, with
+    /// the reference composed ETag. Non-final parts must clear the 5 MiB
+    /// minimum the store enforces at complete — they vary just above it;
+    /// the final part is 0..=4 KiB. Each case assembles up to ~10 MiB,
+    /// hence the bounded case count.
     #[test]
     fn assembly_is_exact_concatenation(
-        part_sizes in collection::vec(0usize..4096, 1..24),
+        non_final in collection::vec((MIN_PART_BYTES as usize)..(MIN_PART_BYTES as usize + 1024), 0..=2),
+        final_size in 0usize..4096,
     ) {
+        let mut part_sizes = non_final;
+        part_sizes.push(final_size);
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
             let state = tempfile::tempdir().unwrap();

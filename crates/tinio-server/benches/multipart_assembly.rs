@@ -9,7 +9,7 @@ use std::hint::black_box;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{
     bucket,
-    multipart::CompletedPart,
+    multipart::{CompletedPart, MIN_PART_BYTES},
     object,
     storage::{BucketOps, MultipartOps, ObjectOps},
 };
@@ -17,15 +17,16 @@ use tinio_fs::{FsStorage, testing::fs_options};
 use tinio_util::testing::body;
 use tokio::runtime::Runtime;
 
-/// Part count of the assembly benchmark (each part 256 KiB → 64 MiB
-/// composed object).
-const PARTS: usize = 256;
-const PART_SIZE: usize = 256 * 1024;
+/// Part count of the assembly benchmark: 12 parts at exactly the 5 MiB
+/// non-final minimum (the store now enforces it at complete) → a 60 MiB
+/// composed object.
+const PARTS: usize = 12;
+const PART_SIZE: usize = MIN_PART_BYTES as usize;
 
 fn multipart_assembly(c: &mut Criterion) {
     let mut group = c.benchmark_group("multipart_assembly");
     group.throughput(Throughput::Bytes((PARTS * PART_SIZE) as u64));
-    group.bench_function("complete_64MiB_256_parts", |b| {
+    group.bench_function("complete_60MiB_12_parts", |b| {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let rt = Runtime::new().unwrap();

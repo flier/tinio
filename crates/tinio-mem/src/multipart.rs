@@ -14,8 +14,8 @@ use crate::{
     _core::{
         CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
         PartInfo, PartNumber, PartsListing, UploadsListing, bucket, checksum, collect_body,
-        from_nanos, group_and_paginate_ordered, key_marker_order, now_nanos, object,
-        split_uploads_order, uploads_order,
+        from_nanos, group_and_paginate_ordered, key_marker_order, multipart::check_part_minimum,
+        now_nanos, object, split_uploads_order, uploads_order,
     },
     Error,
     error::{
@@ -343,7 +343,7 @@ impl MultipartOps for MemoryStorage {
             {
                 let stored_parts = txn.open_table(PARTS)?;
                 let stored_meta = txn.open_table(PART_META)?;
-                for part in parts {
+                for (index, part) in parts.iter().enumerate() {
                     let n = u32::from(part.part_number);
                     if n <= prev {
                         return Err(invalid_part(n));
@@ -357,6 +357,14 @@ impl MultipartOps for MemoryStorage {
                         .get(pk.as_str())?
                         .ok_or_else(|| invalid_part(n))?;
                     let (etag_str, size, mtime) = meta_guard.value();
+                    // The S3 non-final minimum (shared
+                    // `check_part_minimum`), enforced authoritatively IN
+                    // this transaction — the size and the bytes it
+                    // describes come from the same snapshot the commit
+                    // composes (the S3 layer additionally pre-checks its
+                    // own listing snapshot; a concurrent upload_part
+                    // cannot interleave with a write txn).
+                    check_part_minimum(n, size, index + 1 == parts.len())?;
                     let stored_etag: ETag = etag_str.parse().map_err(invalid_etag)?;
                     if stored_etag != part.etag {
                         return Err(invalid_part(n));
@@ -618,7 +626,9 @@ mod tests {
     use crate::{
         _core::{
             BucketOps, CompletedPart, ListUploadsParams, MultipartOps, ObjectOps, PartInfo, bucket,
-            multipart::part_number, object, storage::Error::*,
+            multipart::{MIN_PART_BYTES, part_number},
+            object,
+            storage::Error::*,
         },
         _util::testing::{body, read_body},
         MemoryOptions,
@@ -855,18 +865,20 @@ mod tests {
             .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
+        // The listed non-final parts must be >= the 5 MiB minimum (the
+        // authoritative in-txn check); the unlisted part may be small.
+        let min = MIN_PART_BYTES as usize;
+        let data1 = vec![b'a'; min];
+        let data2 = vec![b'b'; min];
         let mut uploaded = Vec::new();
-        for (n, data) in [(1u32, b"aaa" as &[u8]), (2, b"bbb"), (3, b"ccc")] {
+        for (n, data) in [
+            (1u32, data1.clone()),
+            (2, data2.clone()),
+            (3, b"ccc".to_vec()),
+        ] {
             uploaded.push(
                 storage
-                    .upload_part(
-                        &bucket,
-                        &key,
-                        &upload.upload_id,
-                        n.into(),
-                        body(data.to_vec()),
-                        None,
-                    )
+                    .upload_part(&bucket, &key, &upload.upload_id, n.into(), body(data), None)
                     .await
                     .unwrap(),
             );
@@ -880,10 +892,66 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.size, 6);
+        let expect = [data1, data2].concat();
+        assert_eq!(completed.size, expect.len() as u64);
         let got = storage.get_object(&bucket, &key, None).await.unwrap();
-        assert_eq!(read_body(got.body).await.unwrap(), b"aaabbb");
+        assert_eq!(read_body(got.body).await.unwrap(), expect);
         assert!(completed.etag.as_str().ends_with("-2"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_complete_survives_in_txn() {
+        // The authoritative in-txn size check fails the complete — and
+        // the write transaction rolls back, leaving the upload alive for
+        // a corrected retry (S3). The failure shape itself (one byte
+        // under the minimum → PartTooSmall) is the shared conformance
+        // leg.
+        let (storage, bucket) = with_bucket().await;
+        let key = object::key("a.bin").unwrap();
+        let min = MIN_PART_BYTES as usize;
+        let upload = storage
+            .create_multipart_upload(&bucket, &key, None)
+            .await
+            .unwrap();
+        let under = storage
+            .upload_part(
+                &bucket,
+                &key,
+                &upload.upload_id,
+                1.into(),
+                body(vec![b'b'; min - 1]),
+                None,
+            )
+            .await
+            .unwrap();
+        let small = storage
+            .upload_part(
+                &bucket,
+                &key,
+                &upload.upload_id,
+                2.into(),
+                body(b"x".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = storage
+            .complete_multipart_upload(
+                &bucket,
+                &key,
+                &upload.upload_id,
+                &[completed(&under), completed(&small)],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(PartTooSmall { .. })), "{err}");
+        assert!(
+            storage
+                .get_multipart_upload(&bucket, &key, &upload.upload_id)
+                .await
+                .is_ok(),
+            "the failed complete must leave the upload alive"
+        );
     }
 
     #[tokio::test]

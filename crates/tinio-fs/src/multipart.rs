@@ -11,8 +11,9 @@
 //! onto the object path; the composed ETag `MD5-of-MD5s-N` matches the AWS
 //! reference composition. Parts survive restarts, so cross-restart
 //! completion/abort is legal (quickstart §7). The S3 5 MiB minimum for
-//! non-final parts is enforced at the S3 mapping layer (EntityTooSmall);
-//! the store itself accepts any part size so the contract stays uniform.
+//! non-final parts is enforced authoritatively in [`Store::complete`]'s
+//! verify loop (EntityTooSmall) — part uploads themselves accept any
+//! size.
 //! The number of concurrently in-progress uploads is capped by
 //! `max_concurrent_uploads` (default `DEFAULT_MAX_CONCURRENT_UPLOADS`,
 //! `[s3] max_concurrent_uploads`).
@@ -45,7 +46,7 @@ use uuid::Uuid;
 use crate::{
     _core::{
         BodyStream, ETag, bucket, checksum, from_nanos,
-        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
+        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber, check_part_minimum},
         object::{self},
         storage::{
             self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload,
@@ -703,6 +704,11 @@ impl Store {
     ///
     /// - empty `parts` → `Error::NoParts`;
     /// - missing / mismatched / out-of-order part → `InvalidPart`;
+    /// - a non-final listed part below
+    ///   [`tinio_core::multipart::MIN_PART_BYTES`] → `PartTooSmall`
+    ///   (the authoritative S3 5 MiB rule — the S3 layer pre-checks its
+    ///   own listing snapshot, but a part overwritten between that listing
+    ///   and this verify loop is caught here);
     /// - a part file vanishing mid-verify/assembly when the upload was
     ///   consumed (a concurrent abort/sweep) → `NoSuchUpload` (§5.6);
     /// - the upload's recorded key differs from `key` → `NoSuchUpload`.
@@ -750,7 +756,7 @@ impl Store {
         // missing — the crash-window fallback, §5.6).
         let mut infos = Vec::with_capacity(parts.len());
         let mut last = 0u32;
-        for part in parts {
+        for (index, part) in parts.iter().enumerate() {
             let n = u32::from(part.part_number);
             if n <= last {
                 return Err(storage::invalid_part(n).into());
@@ -767,6 +773,14 @@ impl Store {
                 }
                 Ok(_) | Err(_) => return Err(storage::invalid_part(n).into()),
             };
+            // The S3 non-final minimum (shared `check_part_minimum`),
+            // enforced authoritatively against the file the assembly
+            // below will compose (a part overwritten since the S3
+            // layer's listing snapshot is caught here, not by the
+            // pre-check). A part shrunk between this metadata read and
+            // the assembly copy fails the assembly's re-hash →
+            // InvalidPart — never an undersized commit.
+            check_part_minimum(n, metadata.len(), index + 1 == parts.len())?;
             let stored = match records.get(&n).and_then(|hex| ETag::new(hex).ok()) {
                 // A domain-invalid record (or no record — the crash-window
                 // fallback): recompute from the file, §5.6.
@@ -1262,6 +1276,7 @@ mod tests {
         _core::{
             ETag,
             checksum::Algorithm,
+            multipart::MIN_PART_BYTES,
             storage::{Error as StorageError, group_and_paginate_ordered},
         },
         _util::testing::body,
@@ -1620,7 +1635,15 @@ mod tests {
         let upload = store.create(&b, &k, None).await.unwrap();
         let mut completed = Vec::new();
         for i in 1..=4u32 {
-            let data = vec![i as u8; 32 * 1024];
+            // Non-final listed parts must be >= the 5 MiB minimum (the
+            // authoritative verify-loop check); the final part may stay
+            // small.
+            let size = if i == 4 {
+                32 * 1024
+            } else {
+                MIN_PART_BYTES as usize
+            };
+            let data = vec![i as u8; size];
             let part = store
                 .put_part(&b, &k, &upload.upload_id, i.into(), body(data), None)
                 .await
@@ -1848,10 +1871,7 @@ mod tests {
         );
         a.unwrap();
         b2.unwrap();
-        let (parts, _, _) = store
-            .list_parts(&b, &k, &id, None, 10)
-            .await
-            .unwrap();
+        let (parts, _, _) = store.list_parts(&b, &k, &id, None, 10).await.unwrap();
         assert_eq!(parts.len(), 1);
         // The record's etag must be the hash of the file's content.
         let dir = state.path().join("multipart/data").join(&id);
@@ -1895,7 +1915,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store.create(&b, &k, None).await.unwrap();
-        let parts_data: [&[u8]; 3] = [b"part-1", b"part-2", b"part-3-original"];
+        // Non-final listed parts must be >= the 5 MiB minimum (the
+        // authoritative verify-loop check); the final (part 3) stays small
+        // — the racer overwrites it, so it must be cheap to re-upload.
+        let parts_data: [Vec<u8>; 3] = [
+            vec![b'1'; MIN_PART_BYTES as usize],
+            vec![b'2'; MIN_PART_BYTES as usize],
+            b"part-3-original".to_vec(),
+        ];
         for (i, data) in parts_data.iter().enumerate() {
             store
                 .put_part(
@@ -1903,7 +1930,7 @@ mod tests {
                     &k,
                     &upload.upload_id,
                     ((i + 1) as u32).into(),
-                    body(data.to_vec()),
+                    body(data.clone()),
                     None,
                 )
                 .await
@@ -1954,10 +1981,8 @@ mod tests {
                 // exactly the original parts and the ETag matches.
                 let target = state.path().join("out.bin");
                 fs::rename(&temp, &target).await.unwrap();
-                assert_eq!(
-                    fs::read(&target).await.unwrap(),
-                    b"part-1part-2part-3-original"
-                );
+                let expect = parts_data.concat();
+                assert_eq!(fs::read(&target).await.unwrap(), expect);
                 assert_eq!(etag, ETag::composed_from_parts(&real).unwrap());
             }
             Err(err) => {
@@ -1990,18 +2015,29 @@ mod tests {
         let mut saw_no_such_upload = false;
         // Enough parts that the assembly window (per-part opens)
         // reliably intersects the abort; retry on the off chance the
-        // completion wins the race outright.
-        for _ in 0..8 {
+        // completion wins the race outright. The non-final 5 MiB minimum
+        // keeps each round's assembly long (see below) — four rounds
+        // suffice where the small-part original needed eight.
+        for _ in 0..4 {
             let upload = store.create(&b, &k, None).await.unwrap();
             let mut completed = Vec::new();
             for n in 1..=8u32 {
+                // Non-final listed parts must be >= the 5 MiB minimum —
+                // only the final part may stay small. The assembly is
+                // therefore long, which widens the race window the test
+                // needs (the abort commits while parts are streaming).
+                let size = if n == 8 {
+                    256 * 1024
+                } else {
+                    MIN_PART_BYTES as usize
+                };
                 let part = store
                     .put_part(
                         &b,
                         &k,
                         &upload.upload_id,
                         n.into(),
-                        body(vec![n as u8; 256 * 1024]),
+                        body(vec![n as u8; size]),
                         None,
                     )
                     .await
@@ -2138,18 +2174,22 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store.create(&b, &k, None).await.unwrap();
-        store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+        // The first part is non-final in the two-part list — it must be
+        // >= the 5 MiB minimum the verify loop enforces.
+        let big = vec![b'a'; MIN_PART_BYTES as usize];
+        let p1 = store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(big.clone()), None)
             .await
             .unwrap();
-        // An out-of-band part file with no record.
+        // An out-of-band part file with no record (the final part may be
+        // small).
         let dir = state.path().join("multipart/data").join(&upload.upload_id);
         fs::write(dir.join("part-2"), b"bbb").await.unwrap();
         let recomputed = ETag::from_content(b"bbb");
         let completed = [
             CompletedPart {
                 part_number: 1.into(),
-                etag: ETag::from_content(b"aaa"),
+                etag: p1.etag,
             },
             CompletedPart {
                 part_number: 2.into(),
@@ -2160,10 +2200,76 @@ mod tests {
             .complete(&b, &k, &upload.upload_id, &completed)
             .await
             .unwrap();
+        let expect = [big, b"bbb".to_vec()].concat();
         assert_eq!(
             fs::read(&temp).await.unwrap(),
-            b"aaabbb",
+            expect,
             "the recomputed part joins the assembly"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_prefers_the_size_error_over_an_etag_mismatch() {
+        // The verify loop checks the 5 MiB minimum BEFORE the per-part
+        // ETag compare within one iteration: an undersized part whose
+        // list etag is deliberately wrong answers PartTooSmall, never
+        // InvalidPart. (The rule's pass and plain-failure shapes are the
+        // shared conformance leg.)
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let min = MIN_PART_BYTES as usize;
+        let upload = store.create(&b, &k, None).await.unwrap();
+        let under = store
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                1.into(),
+                body(vec![b'b'; min - 1]),
+                None,
+            )
+            .await
+            .unwrap();
+        let small = store
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                2.into(),
+                body(b"x".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = store
+            .complete(
+                &b,
+                &k,
+                &upload.upload_id,
+                &[
+                    CompletedPart {
+                        part_number: under.part_number,
+                        etag: ETag::from_content(b"zzz"),
+                    },
+                    CompletedPart {
+                        part_number: small.part_number,
+                        etag: small.etag,
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Storage(StorageError::PartTooSmall {
+                    part_number: 1,
+                    min_bytes: MIN_PART_BYTES,
+                    actual,
+                }) if actual == min as u64 - 1
+            ),
+            "{err:?}"
         );
     }
 

@@ -19,6 +19,23 @@ const MAX_PART: u32 = 10_000;
 /// `EntityTooSmall` on completion). The final part has no minimum.
 pub const MIN_PART_BYTES: u64 = 5 * 1024 * 1024;
 
+/// The S3 non-final-part minimum rule at complete: every part except the
+/// client list's last entry — the final part — must be at least
+/// [`MIN_PART_BYTES`]. One home for the rule, enforced authoritatively by
+/// the storage backends against the state their commit composes and
+/// pre-checked by the S3 layer over its listing snapshot.
+#[inline]
+pub fn check_part_minimum(
+    part_number: u32,
+    size: u64,
+    is_final: bool,
+) -> Result<(), storage::Error> {
+    if !is_final && size < MIN_PART_BYTES {
+        return Err(storage::part_too_small(part_number, MIN_PART_BYTES, size));
+    }
+    Ok(())
+}
+
 /// A validated multipart part number (`1..=10000`).
 ///
 /// Untrusted input goes through [`part_number`]. [`From<u32>`] is for
@@ -187,5 +204,24 @@ mod tests {
     #[should_panic]
     fn part_number_from_invalid_panics() {
         let _: PartNumber = 0.into();
+    }
+
+    #[test]
+    fn check_part_minimum_enforces_the_rule() {
+        let min = MIN_PART_BYTES;
+        // A non-final part at or above the minimum passes.
+        assert!(check_part_minimum(1, min, false).is_ok());
+        assert!(check_part_minimum(1, min + 1, false).is_ok());
+        // One byte under → PartTooSmall with the exact fields.
+        assert!(matches!(
+            check_part_minimum(2, min - 1, false),
+            Err(PartTooSmall {
+                part_number: 2,
+                min_bytes,
+                actual,
+            }) if min_bytes == min && actual == min - 1
+        ));
+        // The final part has no minimum.
+        assert!(check_part_minimum(1, 0, true).is_ok());
     }
 }

@@ -8,7 +8,7 @@ use std::{
     time::SystemTime,
 };
 
-use cucumber::{given, then, when};
+use cucumber::{gherkin::Step, given, then, when};
 
 use crate::_core::{etag::ETag, multipart::PartInfo};
 
@@ -220,6 +220,24 @@ async fn do_list_parts(world: &mut super::World, marker: Option<i64>, max: Optio
 async fn complete_upload(world: &mut super::World) {
     let parts = world.mp.parts.clone();
     complete_with(world, &parts, &[("Content-Type", "application/xml")]).await;
+}
+
+/// Complete the scenario's upload with the recorded parts plus the
+/// conditional-write headers of a data table (the conditions.feature
+/// FR-028 legs: If-Match / If-None-Match ride on the completion POST —
+/// errors.rs's table handling applies the `{etag}` substitution).
+#[given(regex = r#"I complete the multipart upload with headers$"#)]
+#[when(regex = r#"I complete the multipart upload with headers$"#)]
+#[then(regex = r#"I complete the multipart upload with headers$"#)]
+async fn complete_with_conditional_headers(world: &mut super::World, step: &Step) {
+    let mut headers = super::errors::table_headers(world, step);
+    headers.insert(0, ("Content-Type".into(), "application/xml".into()));
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let parts = world.mp.parts.clone();
+    complete_with(world, &parts, &refs).await;
 }
 
 /// Complete with the last `n` recorded parts (a subset completion): the

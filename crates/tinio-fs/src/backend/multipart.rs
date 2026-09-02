@@ -397,7 +397,10 @@ mod tests {
         let k = object::key("big.bin").unwrap();
         let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
         let mut parts = Vec::new();
-        let parts_data: [&[u8]; 3] = [b"abc", b"defgh", b"ij"];
+        // Non-final parts must be >= the 5 MiB minimum the backend
+        // enforces at complete; the final part may be small.
+        let min = crate::_core::multipart::MIN_PART_BYTES as usize;
+        let parts_data: [Vec<u8>; 3] = [vec![b'a'; min], vec![b'b'; min], b"ij".to_vec()];
         for (i, data) in parts_data.iter().enumerate() {
             let part = storage
                 .upload_part(
@@ -405,7 +408,7 @@ mod tests {
                     &k,
                     &upload.upload_id,
                     ((i + 1) as u32).into(),
-                    body(data.to_vec()),
+                    body(data.clone()),
                     None,
                 )
                 .await
@@ -437,9 +440,10 @@ mod tests {
             .complete_multipart_upload(&b, &k, &upload.upload_id, &completed)
             .await
             .unwrap();
-        assert_eq!(info.size, 10);
+        let expected = parts_data.concat();
+        assert_eq!(info.size, expected.len() as u64);
         // MD5-of-MD5s-3 reference (computed from raw part digests).
-        assert_eq!(info.etag.as_str(), "3bad9a9cef9eca7c4de3f13d00832b7e-3");
+        assert_eq!(info.etag.as_str(), "bee3dfeaffb829f8b15e911120368526-3");
 
         // The completed upload's part directory is removed — the
         // records AND the part files are gone, no leak for the sweep
@@ -456,8 +460,8 @@ mod tests {
         );
 
         let get = storage.get_object(&b, &k, None).await.unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"abcdefghij");
-        assert_eq!(get.info.etag.as_str(), "3bad9a9cef9eca7c4de3f13d00832b7e-3");
+        assert_eq!(read_body(get.body).await.unwrap(), expected);
+        assert_eq!(get.info.etag.as_str(), "bee3dfeaffb829f8b15e911120368526-3");
 
         storage.delete_object(&b, &k).await.unwrap();
         storage.delete_bucket(&b).await.unwrap();

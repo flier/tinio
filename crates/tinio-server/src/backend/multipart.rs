@@ -23,16 +23,18 @@ use crate::{
     _core::{
         ETag,
         checksum::{Algorithm, Part, Type, Upload, Value},
-        multipart::{CompletedPart, MIN_PART_BYTES, PartNumber, part_number as parse_part_number},
+        multipart::{
+            CompletedPart, PartNumber, check_part_minimum, part_number as parse_part_number,
+        },
         storage::{ByteRange, Error as StorageError, ListPartsParams, ListUploadsParams, Storage},
     },
     backend::{
-        ConditionalHeaders, S3Backend, byte_range,
+        ConditionalHeaders, S3Backend, byte_range, check_complete_conditions, check_write_shape,
         checksum::{
             self, HasFields, VerifyState, VerifyStream, compose_composite, linearize_full_object,
             single_checksum_value,
         },
-        map_backend_error, normalize_delimiter, normalize_page_size,
+        map_backend_error, normalize_delimiter, normalize_page_size, same_whole_second,
     },
 };
 
@@ -274,7 +276,10 @@ impl<S: Storage> S3Backend<S> {
         // same way), so an unseeded entry would leak for the upload's
         // lifetime.
         if self.caps.checksum {
-            self.put_checksum_spec(upload.upload_id.clone(), upload.checksum.clone().map(Arc::new));
+            self.put_checksum_spec(
+                upload.upload_id.clone(),
+                upload.checksum.clone().map(Arc::new),
+            );
         }
         Ok(S3Response::new(dto::CreateMultipartUploadOutput {
             bucket: Some(String::from(bucket)),
@@ -422,18 +427,15 @@ impl<S: Storage> S3Backend<S> {
         // them concurrently (the spec comes from the read-through cache,
         // F04: a 10k-part copy flow pays the same zero storage reads as
         // UploadPart).
-        let (head, algo) = tokio::join!(
-            self.storage.head_object(&src_bucket, &src_key),
-            async {
-                if self.caps.checksum {
-                    self.upload_checksum_spec(&bucket, &key, &upload_id)
-                        .await
-                        .map(|spec| spec.map(|c| c.algorithm))
-                } else {
-                    Ok(None)
-                }
-            },
-        );
+        let (head, algo) = tokio::join!(self.storage.head_object(&src_bucket, &src_key), async {
+            if self.caps.checksum {
+                self.upload_checksum_spec(&bucket, &key, &upload_id)
+                    .await
+                    .map(|spec| spec.map(|c| c.algorithm))
+            } else {
+                Ok(None)
+            }
+        },);
         let info = head.map_err(map_backend_error)?;
         let algo = algo?;
         ConditionalHeaders::new(
@@ -515,6 +517,15 @@ impl<S: Storage> S3Backend<S> {
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
         let upload_id = req.input.upload_id.clone();
+        // The request-shape rejections go up front (before the parts
+        // parse and the lock — a rejected request must not pay for
+        // them): `If-Match` + `If-None-Match` together → 400
+        // `InvalidRequest`, a specific `If-None-Match` → 501
+        // `NotImplemented`.
+        check_write_shape(
+            req.input.if_match.as_ref(),
+            req.input.if_none_match.as_ref(),
+        )?;
         let input = &req.input;
         let mut parts = Vec::new();
         // The client's per-part checksum entries, parallel to `parts`
@@ -555,16 +566,56 @@ impl<S: Storage> S3Backend<S> {
             parts.push(CompletedPart { part_number, etag });
         }
         // Serialize the whole complete with the per-object write lock
-        // (spec R8): paging, the 5 MiB rule, the pre-commit checksum
-        // validation, and the commit all run under the lock, so
-        // validation always reads the snapshot the commit consumes.
+        // (spec R8): paging, the 5 MiB pre-check, and the pre-commit
+        // checksum validation all read one listing snapshot under the
+        // lock. The AUTHORITATIVE part checks (the per-part ETag and the
+        // 5 MiB rule) run inside the storage commit, which re-reads the
+        // current part state — a concurrent UploadPart overwriting a
+        // part after this snapshot is caught there (InvalidPart /
+        // PartTooSmall), not here.
         let _guard = self.lock_object(&bucket, &key).await;
-        // The persisted upload state and the request's full-object
-        // value, fetched before the scan: they decide whether the
-        // snapshot is needed at all (Eff #1 — with the toggle on, a
-        // single-part complete with no checksums anywhere skips the
-        // full paging loop).
-        let upload = if self.caps.checksum {
+        // Destination conditionals (AWS conditional writes): the checks
+        // run under the write lock, atomic with the complete. The
+        // upload's own existence is validated FIRST — a conditional
+        // retry of a completed or aborted upload answers NoSuchUpload
+        // (the same ordering as the abort op and the unconditional
+        // complete). The destination conditions then evaluate against
+        // the object currently at the key (the one being replaced):
+        // If-Match mismatch → 412, missing destination → 404
+        // NoSuchKey, If-None-Match: * against an existing object → 412.
+        // The destination-condition presence predicate — a complete
+        // carries only the two etag headers (never dates), so presence
+        // is the plain OR over the request fields; the conditions
+        // themselves evaluate in `check_complete_conditions` below.
+        let has_dest_conditions = req.input.if_match.is_some() || req.input.if_none_match.is_some();
+        // The persisted upload state, fetched under the lock before the
+        // destination checks: it validates the upload still exists
+        // (above) and, when the checksum toggle is on, decides with the
+        // full-object value whether the part snapshot below is needed at
+        // all (Eff #1 — with the toggle on, a single-part complete with
+        // no checksums anywhere skips the full paging loop). One fetch
+        // serves both consumers; a conditional complete with the toggle
+        // off still pays the existence read only.
+        let upload = if has_dest_conditions {
+            // The upload-existence fetch and the destination head are
+            // independent reads — run them concurrently (the pattern
+            // of op_upload_part_copy) so the lock is held for their
+            // max, not their sum. The RESULT checks keep the order
+            // below: NoSuchUpload before the destination conditions;
+            // on that error path the already-started head read is
+            // simply discarded.
+            let (upload, current) = tokio::join!(
+                self.storage.get_multipart_upload(&bucket, &key, &upload_id),
+                self.head_optional(&bucket, &key),
+            );
+            let upload = Some(upload.map_err(map_backend_error)?);
+            check_complete_conditions(
+                req.input.if_match.as_ref(),
+                req.input.if_none_match.as_ref(),
+                current?.as_ref(),
+            )?;
+            upload
+        } else if self.caps.checksum {
             Some(
                 self.storage
                     .get_multipart_upload(&bucket, &key, &upload_id)
@@ -587,7 +638,7 @@ impl<S: Storage> S3Backend<S> {
         // point read per part).
         let mut stored: HashMap<u32, (u64, Option<Part>)> = HashMap::new();
         if parts.len() > 1
-            || upload.as_ref().is_some_and(|u| u.checksum.is_some())
+            || (self.caps.checksum && upload.as_ref().is_some_and(|u| u.checksum.is_some()))
             || full.is_some()
             || client_part_checksums.iter().any(Option::is_some)
         {
@@ -614,7 +665,15 @@ impl<S: Storage> S3Backend<S> {
             }
         }
         // S3 requires every non-final part to be at least 5 MiB
-        // (EntityTooSmall); the final part has no minimum.
+        // (EntityTooSmall; the shared `check_part_minimum`, whose
+        // PartTooSmall maps to the same wire error). This is the EARLY
+        // check on the lock-held listing snapshot (a fast, state-shaped
+        // error); the storage commit re-reads the parts and enforces the
+        // rule authoritatively (see the storage contract), closing the
+        // window where a concurrent UploadPart overwrites a part after
+        // this snapshot. Only multi-part lists run it: a single-part
+        // complete has no non-final part — and, with the checksum
+        // toggle off, may not have paid for the stored snapshot at all.
         if parts.len() > 1 {
             for (index, part) in parts.iter().enumerate() {
                 if index + 1 == parts.len() {
@@ -625,12 +684,7 @@ impl<S: Storage> S3Backend<S> {
                     .get(&n)
                     .map(|(size, _)| *size)
                     .ok_or_else(|| s3_error!(InvalidPart, "part {n} was not uploaded"))?;
-                if size < MIN_PART_BYTES {
-                    return Err(s3_error!(
-                        EntityTooSmall,
-                        "part {n} is {size} bytes, below the {MIN_PART_BYTES}-byte minimum for non-final parts"
-                    ));
-                }
+                check_part_minimum(n, size, false).map_err(map_backend_error)?;
             }
         }
         // Checksum validation (pre-commit, under the per-object write
@@ -638,7 +692,9 @@ impl<S: Storage> S3Backend<S> {
         // so the upload (and any pre-existing object of the same key)
         // is left untouched — matching S3, with no rollback machinery.
         let mut echo_checksum: Option<(Algorithm, Value)> = None;
-        if let Some(upload) = upload {
+        if self.caps.checksum
+            && let Some(upload) = upload.as_ref()
+        {
             // 1. CompletedPart cross-check: the client's checksum
             // entries must match the stored values whenever both exist.
             // Only the algorithm-consistency rule is gated on the
@@ -653,7 +709,7 @@ impl<S: Storage> S3Backend<S> {
                 let Some(entry) = entry else {
                     continue;
                 };
-                if let Some(upload_algo) = upload_algo(&upload)
+                if let Some(upload_algo) = upload_algo(upload)
                     && entry.algorithm != upload_algo
                 {
                     return Err(s3_error!(
@@ -677,7 +733,7 @@ impl<S: Storage> S3Backend<S> {
                 }
             }
             // 2. The full-object value (hoisted above).
-            match upload_algo(&upload) {
+            match upload_algo(upload) {
                 None => {
                     // No create-time algorithm: a value is accepted but not
                     // validated (documented AWS behavior for CRC32/CRC32C/
@@ -765,6 +821,33 @@ impl<S: Storage> S3Backend<S> {
         self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        // If-Match-Initiated-Time: the upload must still be the one the
+        // client started (whole-second precision, matching the echoed
+        // Initiated timestamp). A missing upload answers NoSuchUpload
+        // regardless of the condition. Conditional and unconditional
+        // aborts take no lock: the state an abort touches is
+        // (bucket, upload_id)-scoped — no object row — and the
+        // destructive drain is serialized by the storage row (both
+        // backends commit it in one transaction with an in-txn
+        // existence + key match), exactly as the unconditional abort
+        // always has been. A complete or abort of the same upload
+        // landing between the fetch and the drain surfaces as
+        // NoSuchUpload — AWS-consistent and identical to the
+        // unconditional abort's exposure (the per-key lock the complete
+        // takes guards its destination conditions, not the abort).
+        if let Some(t) = req.input.if_match_initiated_time {
+            let upload = self
+                .storage
+                .get_multipart_upload(&bucket, &key, &req.input.upload_id)
+                .await
+                .map_err(map_backend_error)?;
+            if !same_whole_second(upload.initiated_at, &t) {
+                return Err(s3_error!(
+                    PreconditionFailed,
+                    "If-Match-Initiated-Time failed"
+                ));
+            }
+        }
         self.storage
             .abort_multipart_upload(&bucket, &key, &req.input.upload_id)
             .await
@@ -956,13 +1039,16 @@ mod tests {
         crypto::{Checksum as _, Sha256},
         dto::{CopySource, StreamingBlob, UploadPartCopyInput},
     };
+    use time::OffsetDateTime;
 
     use super::*;
     #[cfg(feature = "copy")]
     use crate::_util::testing::body;
     use crate::{
         _core::{
-            bucket, object,
+            bucket,
+            multipart::MIN_PART_BYTES,
+            object,
             storage::{BucketOps, MultipartOps, ObjectOps},
         },
         _mem::MemoryStorage,
@@ -1821,5 +1907,233 @@ mod tests {
         let upload = &listed.output.uploads.as_ref().unwrap()[0];
         assert!(upload.checksum_algorithm.is_none());
         assert!(upload.checksum_type.is_none());
+    }
+
+    /// The body currently at the test object key (the failed-condition
+    /// assertions: a rejected conditional complete must leave the
+    /// destination untouched).
+    async fn object_body(backend: &S3Backend<MemoryStorage>, b: &str) -> Vec<u8> {
+        crate::_util::testing::read_body(
+            backend
+                .storage()
+                .get_object(
+                    &bucket::name(b).unwrap(),
+                    &object::key("big.bin").unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .body,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Upload one part of `data` and return its wire ETag.
+    async fn upload_one_part(
+        backend: &S3Backend<MemoryStorage>,
+        b: &str,
+        upload_id: &str,
+        data: &[u8],
+    ) -> dto::ETag {
+        backend
+            .upload_part(s3_request(dto::UploadPartInput {
+                bucket: b.to_string(),
+                key: "big.bin".into(),
+                upload_id: upload_id.to_string(),
+                part_number: 1,
+                body: part_body(data),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap()
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn complete_multipart_upload_honors_destination_conditions() {
+        // AWS conditional writes on the complete: the checks evaluate
+        // against the object CURRENTLY at the key (the one being
+        // replaced), not the composing upload's ETag.
+        let (backend, b) = setup().await;
+
+        // If-None-Match: * succeeds on a fresh key.
+        let upload_id = create_upload(&backend, &b, None, None).await;
+        let etag = upload_one_part(&backend, &b, &upload_id, b"hello").await;
+        let mut input = complete_input(&upload_id, &[etag]);
+        input.if_none_match = Some("*".parse().unwrap());
+        backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap();
+
+        // A second complete of the same key with If-None-Match: * → 412
+        // (the object now exists) — and the destination is untouched.
+        let upload_id = create_upload(&backend, &b, None, None).await;
+        let etag = upload_one_part(&backend, &b, &upload_id, b"world").await;
+        let mut input = complete_input(&upload_id, &[etag]);
+        input.if_none_match = Some("*".parse().unwrap());
+        let err = backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+        assert_eq!(object_body(&backend, &b).await, b"hello");
+
+        // Both headers → 400 (the exact InvalidRequest code) — the
+        // destination and the upload are both untouched.
+        let mut input = complete_input(&upload_id, &[]);
+        input.if_match = Some("*".parse().unwrap());
+        input.if_none_match = Some("*".parse().unwrap());
+        let err = backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequest");
+        assert_eq!(object_body(&backend, &b).await, b"hello");
+
+        // A specific If-None-Match → 501 NotImplemented.
+        let mut input = complete_input(&upload_id, &[]);
+        input.if_none_match = Some(r#""abc""#.parse().unwrap());
+        let err = backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
+        assert_eq!(object_body(&backend, &b).await, b"hello");
+
+        // If-Match: `*` matches an existing object and the complete
+        // proceeds; a mismatching value → 412 (the missing-destination
+        // 404 NoSuchKey arm is unit-tested in `conditions.rs`).
+        let upload_id = create_upload(&backend, &b, None, None).await;
+        let etag = upload_one_part(&backend, &b, &upload_id, b"again").await;
+        let mut input = complete_input(&upload_id, &[etag.clone()]);
+        input.if_match = Some("*".parse().unwrap());
+        backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap();
+        let upload_id = create_upload(&backend, &b, None, None).await;
+        let etag = upload_one_part(&backend, &b, &upload_id, b"again").await;
+        let mut input = complete_input(&upload_id, &[etag]);
+        input.if_match = Some(r#""deadbeefdeadbeefdeadbeefdeadbeef""#.parse().unwrap());
+        let err = backend
+            .complete_multipart_upload(s3_request(input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+        assert_eq!(
+            object_body(&backend, &b).await,
+            b"again",
+            "a failed conditional complete must leave the destination untouched"
+        );
+    }
+
+    #[cfg(feature = "multipart")]
+    #[tokio::test]
+    async fn abort_multipart_upload_honors_if_match_initiated_time() {
+        let (backend, b) = setup().await;
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.clone(),
+                key: "abort.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload_id = create.output.upload_id.unwrap();
+        // s3s 0.15's CreateMultipartUploadOutput has NO `initiated` field —
+        // the storage read is the source of the wire timestamp.
+        let initiated = dto::Timestamp::from(
+            backend
+                .storage()
+                .get_multipart_upload(
+                    &bucket::name(&b).unwrap(),
+                    &object::key("abort.bin").unwrap(),
+                    &upload_id,
+                )
+                .await
+                .unwrap()
+                .initiated_at,
+        );
+
+        // A matching initiated time aborts (204) — and the upload is
+        // really gone.
+        backend
+            .abort_multipart_upload(s3_request(dto::AbortMultipartUploadInput {
+                bucket: b.clone(),
+                key: "abort.bin".into(),
+                upload_id: upload_id.clone(),
+                if_match_initiated_time: Some(initiated),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .storage()
+                .get_multipart_upload(
+                    &bucket::name(&b).unwrap(),
+                    &object::key("abort.bin").unwrap(),
+                    &upload_id,
+                )
+                .await
+                .is_err(),
+            "the matching abort must remove the upload"
+        );
+
+        // A stale time → 412; the upload still exists.
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.clone(),
+                key: "abort.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload_id = create.output.upload_id.unwrap();
+        let err = backend
+            .abort_multipart_upload(s3_request(dto::AbortMultipartUploadInput {
+                bucket: b.clone(),
+                key: "abort.bin".into(),
+                upload_id: upload_id.clone(),
+                if_match_initiated_time: Some(dto::Timestamp::from(
+                    OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+        assert!(
+            backend
+                .storage()
+                .get_multipart_upload(
+                    &bucket::name(&b).unwrap(),
+                    &object::key("abort.bin").unwrap(),
+                    &upload_id,
+                )
+                .await
+                .is_ok(),
+            "the failed condition must leave the upload alive"
+        );
+
+        // A missing upload answers NoSuchUpload regardless of the condition.
+        let err = backend
+            .abort_multipart_upload(s3_request(dto::AbortMultipartUploadInput {
+                bucket: b.clone(),
+                key: "abort.bin".into(),
+                upload_id: "missing".into(),
+                if_match_initiated_time: Some(dto::Timestamp::from(
+                    OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchUpload");
     }
 }

@@ -377,13 +377,16 @@ mod tests {
             .create_multipart_upload(&bucket, &key, None)
             .await
             .unwrap();
+        // The first part is non-final in the two-part list — it must be
+        // >= the 5 MiB minimum the complete enforces in-txn.
+        let min = crate::_core::multipart::MIN_PART_BYTES as usize;
         let p1 = storage
             .upload_part(
                 &bucket,
                 &key,
                 &upload.upload_id,
                 1.into(),
-                body(b"abc".to_vec()),
+                body(vec![b'a'; min]),
                 None,
             )
             .await

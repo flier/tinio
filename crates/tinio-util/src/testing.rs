@@ -82,10 +82,11 @@ pub fn etag(hex: &str) -> ETag {
     ETag::new(hex).expect("valid etag")
 }
 
-/// Reference multipart ETag for the conformance parts
-/// (`part-one-`, `part-two-`, `part-three`) under the AWS composition:
+/// Reference multipart ETag for the conformance parts (5 MiB of `a`,
+/// 5 MiB of `b`, `part-three` — non-final parts must clear the 5 MiB
+/// minimum the backends enforce at complete) under the AWS composition:
 /// MD5(raw(part1) || raw(part2) || raw(part3))-3, computed externally.
-const EXPECTED_COMPOSED_ETAG: &str = "aed23cbfc502f1e851e828efe2ca50d0-3";
+const EXPECTED_COMPOSED_ETAG: &str = "a123aabc080721b488eb77490b99befe-3";
 
 fn check(cond: bool, msg: &str) {
     assert!(cond, "conformance violation: {msg}");
@@ -708,7 +709,10 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         .unwrap();
     check(!upload.upload_id.is_empty(), "upload id must be non-empty");
 
-    let parts_data: [&[u8]; 3] = [b"part-one-", b"part-two-", b"part-three"];
+    // Non-final parts must be >= the 5 MiB minimum the backends enforce
+    // at complete (the authoritative rule); the final part may be small.
+    let min = multipart::MIN_PART_BYTES as usize;
+    let parts_data: [Vec<u8>; 3] = [vec![b'a'; min], vec![b'b'; min], b"part-three".to_vec()];
     let mut parts = Vec::new();
     for (i, data) in parts_data.iter().enumerate() {
         let part = storage
@@ -717,13 +721,13 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                 &big,
                 &upload.upload_id,
                 ((i + 1) as u32).into(),
-                body(data.to_vec()),
+                body(data.clone()),
                 None,
             )
             .await
             .unwrap();
         check(
-            part.etag == ETag::from_content(data),
+            part.etag == ETag::from_content(data.as_slice()),
             "part ETag must be the part's content MD5",
         );
         parts.push(part);
@@ -763,7 +767,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         .complete_multipart_upload(b, &big, &upload.upload_id, &completed_parts)
         .await
         .unwrap();
-    let expected = b"part-one-part-two-part-three";
+    let expected = parts_data.concat();
     check(
         completed.size == expected.len() as u64,
         "assembled object size",
@@ -784,6 +788,104 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         read_body(get.body).await.unwrap() == expected,
         "assembled object must be byte-exact",
     );
+
+    // The non-final minimum is the S3 rule the backends enforce
+    // authoritatively at complete — its failure shape (one byte under →
+    // PartTooSmall) is asserted here once, against both backends; the
+    // backends' own suites keep only their mechanism-specific angles.
+    let min_key = object::key("min.bin").unwrap();
+    let failing = storage
+        .create_multipart_upload(b, &min_key, None)
+        .await
+        .unwrap();
+    let under = storage
+        .upload_part(
+            b,
+            &min_key,
+            &failing.upload_id,
+            1.into(),
+            body(vec![b'u'; min - 1]),
+            None,
+        )
+        .await
+        .unwrap();
+    let small = storage
+        .upload_part(
+            b,
+            &min_key,
+            &failing.upload_id,
+            2.into(),
+            body(b"x".to_vec()),
+            None,
+        )
+        .await
+        .unwrap();
+    let err = into_core_error(
+        storage
+            .complete_multipart_upload(
+                b,
+                &min_key,
+                &failing.upload_id,
+                &[
+                    CompletedPart {
+                        part_number: under.part_number,
+                        etag: under.etag,
+                    },
+                    CompletedPart {
+                        part_number: small.part_number,
+                        etag: small.etag,
+                    },
+                ],
+            )
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(
+            err,
+            PartTooSmall {
+                part_number: 1,
+                min_bytes,
+                actual,
+            } if min_bytes == multipart::MIN_PART_BYTES && actual == min as u64 - 1
+        ),
+        "a non-final part one byte under the minimum must fail the complete",
+    );
+    storage
+        .abort_multipart_upload(b, &min_key, &failing.upload_id)
+        .await
+        .unwrap();
+    // The client list's last entry is the final part — it has no
+    // minimum: a single small part still completes.
+    let single_key = object::key("single.bin").unwrap();
+    let single_upload = storage
+        .create_multipart_upload(b, &single_key, None)
+        .await
+        .unwrap();
+    let only = storage
+        .upload_part(
+            b,
+            &single_key,
+            &single_upload.upload_id,
+            1.into(),
+            body(b"tiny".to_vec()),
+            None,
+        )
+        .await
+        .unwrap();
+    storage
+        .complete_multipart_upload(
+            b,
+            &single_key,
+            &single_upload.upload_id,
+            &[CompletedPart {
+                part_number: only.part_number,
+                etag: only.etag,
+            }],
+        )
+        .await
+        .unwrap();
+    storage.delete_object(b, &single_key).await.unwrap();
 
     // Missing uploads.
     let err = into_core_error(

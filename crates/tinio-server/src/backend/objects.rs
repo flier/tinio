@@ -8,12 +8,11 @@
 //! `x-amz-checksum-*` are accepted and dropped. CopyObject is gated by the
 //! `copy` cargo feature and the runtime `copy_object` toggle (FR-021).
 
-use std::{str::FromStr, time::SystemTime};
+use std::time::SystemTime;
 
 use s3s::{
     S3Error, S3Request, S3Response, S3Result,
-    dto::{self, DeleteObjectOutput, ETagCondition},
-    s3_error,
+    dto::{self, DeleteObjectOutput},
 };
 
 use crate::{
@@ -22,36 +21,43 @@ use crate::{
         storage::{Error as StorageError, GetObjectResult, Storage},
     },
     backend::{
-        ConditionFailure, ConditionalHeaders, S3Backend, byte_range, condition_error,
-        map_backend_error,
+        ConditionalHeaders, DeleteConditions, S3Backend, byte_range, check_write_shape,
+        checked_if_match_size, decide_fetch, decide_range_error, generation_changed,
+        map_backend_error, parse_etag_condition_header, parse_if_range,
     },
 };
-
-/// Parse an ETag-condition header (`x-amz-if-match`, `x-amz-if-none-match`)
-/// into the DTO type when present. CopyObject's destination conditionals
-/// are not part of the s3s DTO, so they are read from the headers here.
-fn parse_etag_condition_header(
-    headers: &http::HeaderMap,
-    name: &'static str,
-) -> Result<Option<dto::ETagCondition>, S3Error> {
-    let Some(value) = headers.get(name) else {
-        return Ok(None);
-    };
-    let text = value
-        .to_str()
-        .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))?;
-    ETagCondition::from_str(text)
-        .map(Some)
-        .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))
-}
 
 /// The destination-conditional protocol (`x-amz-if-match` /
 /// `x-amz-if-none-match`): evaluate against the CURRENT object at
 /// (bucket, key), 412 on failure. Shared by the conditional put and the
 /// conditional copy — a missing object is the "no current version" case
 /// (If-None-Match: *); any real failure must not look like an absent
-/// object, or the precondition would pass and overwrite.
+/// object, or the precondition would pass and overwrite. The both-present
+/// 400 is NOT here — the callers run `check_write_shape` up front
+/// (request-shape error, before the body is staged); this checker keeps
+/// only the state-dependent part.
 impl<S: Storage> S3Backend<S> {
+    /// Head the object at `(bucket, key)`, mapping a missing object to
+    /// `None` — the conditional paths' "no current state" case. One home
+    /// for the preamble the destination, delete, and complete checks
+    /// share.
+    pub(crate) async fn head_optional(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> S3Result<Option<object::Info>> {
+        match self.storage.head_object(bucket, key).await {
+            Ok(info) => Ok(Some(info)),
+            Err(err) => {
+                let err: StorageError = err.into();
+                match err {
+                    StorageError::NoSuchKey(_) => Ok(None),
+                    err => Err(map_backend_error(err)),
+                }
+            }
+        }
+    }
+
     async fn check_destination_conditions(
         &self,
         bucket: &bucket::Name,
@@ -59,28 +65,18 @@ impl<S: Storage> S3Backend<S> {
         if_match: Option<&dto::ETagCondition>,
         if_none_match: Option<&dto::ETagCondition>,
     ) -> S3Result<()> {
-        if if_match.is_none() && if_none_match.is_none() {
+        // The destination set is etag-only (AWS conditional writes
+        // carry no date headers).
+        let conditions = ConditionalHeaders::etag_only(if_match, if_none_match);
+        // No conditions ⇒ the fast path (skip the head) — `absent()`
+        // folds the old early return into the evaluator.
+        if conditions.absent() {
             return Ok(());
         }
-        let current = match self.storage.head_object(bucket, key).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                let err: StorageError = err.into();
-                match err {
-                    StorageError::NoSuchKey(_) => None,
-                    err => return Err(map_backend_error(err)),
-                }
-            }
-        };
-        if let Some(info) = current {
-            ConditionalHeaders::new(if_match, if_none_match, None, None).check(
-                &info.etag,
-                info.last_modified,
-                true,
-            )?;
-        } else if if_match.is_some() {
-            // No current version can match an If-Match (412).
-            return Err(condition_error(ConditionFailure::Match, true));
+        if let Some(info) = self.head_optional(bucket, key).await? {
+            conditions.check(&info.etag, info.last_modified, true)?;
+        } else {
+            conditions.check_missing()?;
         }
         Ok(())
     }
@@ -104,6 +100,17 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::PutObjectOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+
+        // The write-path shape gate (AWS conditional writes): If-Match +
+        // If-None-Match together → 400, and If-None-Match accepts `*`
+        // only (a specific value → 501 — shared with the copy
+        // destination and the complete via [`check_write_shape`]),
+        // rejected up front — before the body is staged (a rejected
+        // request must not pay the body stream).
+        check_write_shape(
+            req.input.if_match.as_ref(),
+            req.input.if_none_match.as_ref(),
+        )?;
 
         // Stage the body first, outside the write lock: streaming a slow
         // client must not stall other writers. The conditional check and
@@ -144,24 +151,159 @@ impl<S: Storage> S3Backend<S> {
         let key = self.key(req.input.key)?;
 
         let range = req.input.range.map(byte_range);
-        // One resolution: the conditionals evaluate against the object's
-        // own info (the body is dropped when a precondition fails).
-        let GetObjectResult {
-            info,
-            body,
-            served_range,
-        } = self
-            .storage
-            .get_object(&bucket, &key, range)
-            .await
-            .map_err(map_backend_error)?;
-        ConditionalHeaders::new(
+        let conditions = ConditionalHeaders::new(
             req.input.if_match.as_ref(),
             req.input.if_none_match.as_ref(),
             req.input.if_modified_since,
             req.input.if_unmodified_since,
-        )
-        .check(&info.etag, info.last_modified, false)?;
+        );
+        // If-Range gates the Range header only (RFC 9110 §13.1.5); a
+        // parse failure or a wildcard drops the header. Read-path
+        // snapshot policy: ONLY a Range request carrying RFC 7232
+        // conditions reads a head first — a precondition 304/412 must
+        // answer BEFORE a 416. Everything else — a no-Range conditional
+        // GET and a pure If-Range request included — is a single body
+        // fetch whose snapshot the conditions / the If-Range validator
+        // evaluate against: race-free by construction, and one storage
+        // read where the old head-first code took two. A pure If-Range
+        // request whose validator turns out stale against the fetched
+        // snapshot discards the served range and refetches the full
+        // object (below) — a stale validator pays a wasted range read,
+        // no more.
+        let if_range = parse_if_range(&req.headers);
+        let needs_head = range.is_some() && !conditions.absent();
+        let head = if needs_head {
+            Some(
+                self.storage
+                    .head_object(&bucket, &key)
+                    .await
+                    .map_err(map_backend_error)?,
+            )
+        } else {
+            None
+        };
+        // The RFC 7232 conditions evaluate against the head snapshot —
+        // a failed precondition answers 304/412 without the body fetch
+        // (a matching If-None-Match answers 304 even over an
+        // unsatisfiable Range — the precondition beats the 416). The set
+        // re-evaluates against the fetched snapshot when a write raced
+        // between the two reads (below). The Range honored by the body
+        // fetch: an If-Range mismatch drops it (the full 200 is served).
+        let range = if let Some(info) = head.as_ref() {
+            conditions.check(&info.etag, info.last_modified, false)?;
+            match (&range, &if_range) {
+                (Some(_), Some(ir)) if !ir.matches(&info.etag, info.last_modified) => None,
+                _ => range,
+            }
+        } else {
+            range
+        };
+        // The body fetch — the snapshot every answer is evaluated and
+        // described against (a single storage read is generation-
+        // consistent on both backends). A ranged fetch can fail
+        // InvalidRange when the object shrank between the head and the
+        // fetch: with an honored If-Range that means the validator went
+        // stale mid-flight (RFC 9110 §13.1.5 — the Range must be
+        // dropped, the full object served); the 416-vs-full
+        // classification needs the CURRENT validator — the head-first
+        // flow holds it, and a head-less pure If-Range request takes
+        // one lazily, on the error path only.
+        let fetched = match self.storage.get_object(&bucket, &key, range).await {
+            Ok(result) => result,
+            Err(err) => {
+                let err: StorageError = err.into();
+                // The 416-vs-full decision needs the CURRENT validator:
+                // the head-first flow holds the validator the Range was
+                // honored under; a head-less pure If-Range request (no
+                // RFC 7232 conditions) takes one lazily — on the error
+                // path only.
+                let lazy_head = if matches!(err, StorageError::InvalidRange { .. })
+                    && head.is_none()
+                    && if_range.is_some()
+                {
+                    Some(
+                        self.storage
+                            .head_object(&bucket, &key)
+                            .await
+                            .map_err(map_backend_error)?,
+                    )
+                } else {
+                    None
+                };
+                let head = head.as_ref().or(lazy_head.as_ref());
+                match err {
+                    StorageError::InvalidRange { size, .. }
+                        if decide_range_error(if_range.as_ref(), head, size) =>
+                    {
+                        self.storage
+                            .get_object(&bucket, &key, None)
+                            .await
+                            .map_err(map_backend_error)?
+                    }
+                    err => return Err(map_backend_error(err)),
+                }
+            }
+        };
+        // No head (a no-Range conditional GET, an unconditional one, or
+        // a pure If-Range request): the conditions evaluate against the
+        // single fetched snapshot — the 304/412 carries that snapshot's
+        // own validators.
+        if head.is_none() {
+            conditions.check(&fetched.info.etag, fetched.info.last_modified, false)?;
+        }
+        // The head and the body fetch are two independent reads — no
+        // lock serializes them (unlike the conditional put, whose check
+        // and commit share the per-key write lock) — so a same-key
+        // overwrite between the calls would otherwise wrap the new
+        // object's bytes in the old snapshot's metadata. When the
+        // fetched snapshot differs from the head's (ETag OR mtime — a
+        // byte-identical rewrite changes only the mtime), the gates
+        // re-evaluate against the fetched one — the snapshot the bytes
+        // actually came from — so a response always describes one
+        // object. A failed re-check answers 304/412 (the fs body was
+        // never polled; the mem copy is paid only in this rare race). A
+        // full object is refetched only when the fetch actually served a
+        // range and the If-Range no longer matches the fetched snapshot
+        // (`decide_fetch`); the refetched snapshot is itself re-evaluated
+        // before serving — bounded, never a loop.
+        let fetched = if let Some(head) = head.as_ref()
+            && generation_changed(head, &fetched.info)
+        {
+            conditions.check(&fetched.info.etag, fetched.info.last_modified, false)?;
+            if decide_fetch(head, &fetched.info, if_range.as_ref(), fetched.served_range) {
+                let result = self
+                    .storage
+                    .get_object(&bucket, &key, None)
+                    .await
+                    .map_err(map_backend_error)?;
+                conditions.check(&result.info.etag, result.info.last_modified, false)?;
+                result
+            } else {
+                fetched
+            }
+        } else if head.is_none()
+            && let Some(ir) = if_range.as_ref()
+            && fetched.served_range.is_some()
+            && !ir.matches(&fetched.info.etag, fetched.info.last_modified)
+        {
+            // A head-less pure If-Range request (no RFC 7232
+            // conditions): the Range was fetched blind — a validator
+            // that fails the fetched snapshot is stale, so the Range is
+            // ignored and the full object served (RFC 9110 §13.1.5).
+            // Nothing to re-evaluate: this request carries no
+            // conditions.
+            self.storage
+                .get_object(&bucket, &key, None)
+                .await
+                .map_err(map_backend_error)?
+        } else {
+            fetched
+        };
+        let GetObjectResult {
+            body,
+            served_range,
+            info,
+        } = fetched;
 
         let (content_length, content_range) = match served_range {
             Some((start, end)) => (
@@ -220,11 +362,35 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::DeleteObjectOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        // The malformed-size rejection is request-shape (a negative
+        // value can never match any object) — validated up front,
+        // state-independently, like the both-present 400. The validated
+        // size then compares in the unsigned domain.
+        let conditions = DeleteConditions::new(
+            req.input.if_match.as_ref(),
+            req.input.if_match_last_modified_time,
+            req.input
+                .if_match_size
+                .map(checked_if_match_size)
+                .transpose()?,
+        );
         // Serialize with the write lock: a delete landing between a
         // conditional put's check and commit must not erase the state
         // the precondition was evaluated against.
         let _guard = self.lock_object(&bucket, &key).await;
-        // Idempotent per S3 (missing objects still answer 204).
+        // Conditional delete: ETag / last-modified-time / size — every
+        // provided header must match the object AT the key, else 412.
+        // The head-check + delete run in the per-key critical section
+        // above. A missing object answers 204 under every conditional
+        // header (AWS model text: "if the ETag matches or if the object
+        // doesn't exist, the operation will return a 204") — delete is
+        // idempotent and the conditions gate an existing object only
+        // (the module doc in conditions.rs states the policy centrally).
+        if !conditions.absent()
+            && let Some(info) = self.head_optional(&bucket, &key).await?
+        {
+            conditions.check(&info)?;
+        }
         self.storage
             .delete_object(&bucket, &key)
             .await
@@ -309,6 +475,18 @@ impl<S: Storage> S3Backend<S> {
         let dst_bucket = self.bucket(req.input.bucket)?;
         let dst_key = self.key(req.input.key)?;
 
+        // The destination conditionals (`x-amz-if-match` /
+        // `x-amz-if-none-match`) are parsed FIRST — a pure header parse,
+        // no I/O — so the destination write-shape gate (both headers →
+        // 400, a specific `If-None-Match` → 501; AWS conditional writes)
+        // is rejected before the source head and the destination lock.
+        // The copy-source family (`copy_source_if_*`) is NOT subject to
+        // the gate — it keeps the RFC 9110 §13.2.2 evaluation order
+        // below.
+        let dest_if_match = parse_etag_condition_header(&req.headers, "x-amz-if-match")?;
+        let dest_if_none_match = parse_etag_condition_header(&req.headers, "x-amz-if-none-match")?;
+        check_write_shape(dest_if_match.as_ref(), dest_if_none_match.as_ref())?;
+
         // Server-side copy: the contract's copy primitive moves the
         // source bytes into the destination (no client passthrough,
         // FR-015 — a backend may copy them kernel-side). The head's info
@@ -334,8 +512,6 @@ impl<S: Storage> S3Backend<S> {
         // evaluate against the CURRENT destination (412 on failure): a
         // conditional copy must not silently overwrite — the shared
         // destination protocol.
-        let dest_if_match = parse_etag_condition_header(&req.headers, "x-amz-if-match")?;
-        let dest_if_none_match = parse_etag_condition_header(&req.headers, "x-amz-if-none-match")?;
         self.check_destination_conditions(
             &dst_bucket,
             &dst_key,
@@ -602,11 +778,13 @@ mod tests {
             .await
             .unwrap();
 
-        // If-None-Match matching → 412 (never 304 on the write path).
+        // A specific If-None-Match value is not implemented on the write
+        // path (AWS) → 501, never a live evaluation — the shared
+        // destination shape gate, same as the complete.
         let err = put(None, Some(format!("\"{etag}\"").parse().unwrap()))
             .await
             .unwrap_err();
-        assert_eq!(err.code().as_str(), "PreconditionFailed");
+        assert_eq!(err.code().as_str(), "NotImplemented");
 
         // If-None-Match: * against an existing object → 412.
         let err = put(None, Some("*".parse().unwrap())).await.unwrap_err();
@@ -625,6 +803,253 @@ mod tests {
         put(Some(format!("\"{etag}\"").parse().unwrap()), None)
             .await
             .unwrap();
+
+        // If-Match on a MISSING key → 412 (create-if-absent cannot
+        // pass an If-Match — the destination 412 that differs from the
+        // complete's 404 NoSuchKey and the delete's 204).
+        let err = backend
+            .put_object(s3_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "absent.txt".into(),
+                body: Some(StreamingBlob::wrap(stream::once(async {
+                    Ok::<_, io::Error>(Bytes::from_static(b"hello"))
+                }))),
+                if_match: Some("*".parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+
+        // The shape gate fires on a MISSING key too — before the body is
+        // staged: a specific If-None-Match answers 501, never a state
+        // check.
+        let err = backend
+            .put_object(s3_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "absent.txt".into(),
+                body: Some(StreamingBlob::wrap(stream::once(async {
+                    Ok::<_, io::Error>(Bytes::from_static(b"hello"))
+                }))),
+                if_none_match: Some("\"abc\"".parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
+    }
+
+    #[tokio::test]
+    async fn destination_conditions_with_both_etag_headers_is_400() {
+        let (backend, b) = setup_name().await;
+        backend
+            .storage()
+            .put_object(&b, &"hello.txt".into(), body(b"hello"))
+            .await
+            .unwrap();
+        // AWS conditional writes reject If-Match + If-None-Match together.
+        let err = backend
+            .put_object(s3_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                body: Some(StreamingBlob::wrap(stream::once(async {
+                    Ok::<_, io::Error>(Bytes::from_static(b"hello"))
+                }))),
+                if_match: Some("*".parse().unwrap()),
+                if_none_match: Some("*".parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequest");
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_enforces_the_trio() {
+        let (backend, b) = setup_name().await;
+        let etag = "5d41402abc4b2a76b9719d911017c592";
+        backend
+            .storage()
+            .put_object(&b, &"hello.txt".into(), body(b"hello"))
+            .await
+            .unwrap();
+
+        // Matching conditions delete (204).
+        backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match: Some(format!("\"{etag}\"").parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        // The object is gone: the conditional delete of a missing key
+        // answers 204 under EVERY conditional header (AWS model text:
+        // "if the ETag matches or if the object doesn't exist, the
+        // operation will return a 204") — including If-Match and the
+        // date/size conditions alike.
+        backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match: Some(format!("\"{etag}\"").parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match_last_modified_time: Some(Timestamp::from(
+                    OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                )),
+                if_match_size: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        // A negative size is malformed, not a precondition failure — and
+        // the rejection is request-shape, so it answers 400 on a MISSING
+        // key too (never a state-dependent 204).
+        let err = backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match_size: Some(-1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+
+        // A mismatching size on an existing object → 412.
+        backend
+            .storage()
+            .put_object(&b, &"hello.txt".into(), body(b"hello"))
+            .await
+            .unwrap();
+        let err = backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match_size: Some(999),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+
+        // A mismatching last-modified-time on an existing object → 412.
+        let err = backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match_last_modified_time: Some(Timestamp::from(
+                    OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "PreconditionFailed");
+    }
+
+    #[tokio::test]
+    async fn get_object_if_range_gates_the_range() {
+        let (backend, b) = setup_name().await;
+        let etag = "5d41402abc4b2a76b9719d911017c592";
+        backend
+            .storage()
+            .put_object(&b, &"hello.txt".into(), body(b"hello"))
+            .await
+            .unwrap();
+        // Matching validator → the Range is honored (206).
+        let mut req = s3_request(dto::GetObjectInput {
+            bucket: b.to_string(),
+            key: "hello.txt".into(),
+            range: Some(Range::Int {
+                first: 1,
+                last: Some(3),
+            }),
+            ..Default::default()
+        });
+        req.headers.insert(
+            "if-range",
+            HeaderValue::from_str(&format!("\"{etag}\"")).unwrap(),
+        );
+        let got = backend.get_object(req).await.unwrap();
+        assert_eq!(got.output.content_range.as_deref(), Some("bytes 1-3/5"));
+        let mut body = got.output.body.unwrap();
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(buf, b"ell");
+        // Stale validator → the Range is ignored (full 200).
+        let mut req = s3_request(dto::GetObjectInput {
+            bucket: b.to_string(),
+            key: "hello.txt".into(),
+            range: Some(Range::Int {
+                first: 1,
+                last: Some(3),
+            }),
+            ..Default::default()
+        });
+        req.headers.insert(
+            "if-range",
+            HeaderValue::from_str("\"deadbeefdeadbeefdeadbeefdeadbeef\"").unwrap(),
+        );
+        let got = backend.get_object(req).await.unwrap();
+        assert_eq!(got.output.content_range, None);
+        let mut body = got.output.body.unwrap();
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(buf, b"hello");
+    }
+
+    #[tokio::test]
+    async fn get_object_conditional_ordering_keeps_outcomes() {
+        let (backend, b) = setup_name().await;
+        let etag = "5d41402abc4b2a76b9719d911017c592";
+        backend
+            .storage()
+            .put_object(&b, &"hello.txt".into(), body(b"hello"))
+            .await
+            .unwrap();
+        // A failing If-None-Match still answers 304 (no body)…
+        let err = backend
+            .get_object(s3_request(dto::GetObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_none_match: Some(format!("\"{etag}\"").parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotModified");
+        // …and a passing no-Range conditional one (a single fetch + post
+        // check, 2026-09-02 #2) still answers 200 with the full body…
+        let got = backend
+            .get_object(s3_request(dto::GetObjectInput {
+                bucket: b.to_string(),
+                key: "hello.txt".into(),
+                if_match: Some(format!("\"{etag}\"").parse().unwrap()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let mut body = got.output.body.unwrap();
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(buf, b"hello");
     }
 
     #[tokio::test]
@@ -792,7 +1217,8 @@ mod tests {
             .etag
             .as_str();
 
-        // x-amz-if-none-match matching the destination → 412, no write.
+        // x-amz-if-none-match: * against an existing destination → 412,
+        // no write.
         let mut req = s3_request(
             CopyObjectInput::builder()
                 .bucket(b.to_string())
@@ -801,10 +1227,8 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        req.headers.insert(
-            "x-amz-if-none-match",
-            HeaderValue::from_str(&format!("\"{dst_etag}\"")).unwrap(),
-        );
+        req.headers
+            .insert("x-amz-if-none-match", HeaderValue::from_static("*"));
         let err = backend.copy_object(req).await.unwrap_err();
         assert_eq!(err.code().as_str(), "PreconditionFailed");
         let got = read_body(
@@ -836,6 +1260,26 @@ mod tests {
         );
         let err = backend.copy_object(req).await.unwrap_err();
         assert_eq!(err.code().as_str(), "PreconditionFailed");
+
+        // A specific x-amz-if-none-match value is not implemented on the
+        // destination write path (501 — the shared destination shape
+        // gate; AWS does not evaluate specific If-None-Match values on
+        // writes, and a non-matching value must never fall through to a
+        // silent overwrite).
+        let mut req = s3_request(
+            CopyObjectInput::builder()
+                .bucket(b.to_string())
+                .key("dst.txt".to_string())
+                .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .build()
+                .unwrap(),
+        );
+        req.headers.insert(
+            "x-amz-if-none-match",
+            HeaderValue::from_str("\"deadbeefdeadbeefdeadbeefdeadbeef\"").unwrap(),
+        );
+        let err = backend.copy_object(req).await.unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
 
         // x-amz-if-match matching the destination → the copy proceeds.
         let mut req = s3_request(

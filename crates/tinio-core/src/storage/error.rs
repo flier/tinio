@@ -70,7 +70,9 @@ pub enum Error {
     #[error("no parts uploaded")]
     NoParts,
     /// A non-final multipart part is below the S3 5 MiB minimum
-    /// (EntityTooSmall — enforced at the S3 mapping layer).
+    /// (EntityTooSmall — enforced authoritatively by the storage
+    /// backends at complete, against the part state the commit reads;
+    /// the S3 layer additionally pre-checks its own listing snapshot).
     #[error(
         "multipart part {part_number} is {actual} bytes, below the {min_bytes}-byte minimum for non-final parts"
     )]
