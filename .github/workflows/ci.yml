@@ -374,9 +374,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # aws cli v2 ships on all three hosted-runner images (install-action
+      # has no aws-cli manifest — the old key failed the first real run).
+      # rclone is the only tool to fetch.
       - uses: taiki-e/install-action@v2
         with:
-          tool: aws-cli, rclone
+          tool: rclone
+
+      # The @external presence checks want both clients; print the
+      # versions for the log.
+      - name: client versions (interop harness)
+        run: aws --version && rclone version
 
       # The @external cucumber steps spawn the serve example binary
       # (serve_bin() resolves it in the workspace target dir).
