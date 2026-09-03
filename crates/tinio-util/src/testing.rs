@@ -1841,16 +1841,29 @@ mod tests {
     }
 }
 
-/// Poll `cond` until true or a 30 s deadline passes (the test runners'
-/// workers are asynchronous, so assertions must wait; 30 s keeps the
-/// fs-drain waits (tombstone reclaim under CI load / Defender scans)
-/// from starving on slow runners — the poll only costs on failure).
-/// The shared home of the helper formerly duplicated across tinio-fs
-/// testutil and the tinio-server pipeline tests (F30).
+/// The wait timeout in seconds — `TINIO_TEST_WAIT_TIMEOUT_SECS` overrides the
+/// 60 s default (read once per call; unset or unparsable → default).
+/// A knob for slow runners: fs-drain waits (tombstone reclaim under CI
+/// load / Defender scans / contended machines) starve without it.
+fn wait_timeout_secs() -> u64 {
+    std::env::var("TINIO_TEST_WAIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+}
+
+/// Poll `cond` until true or the deadline passes (the test runners'
+/// workers are asynchronous, so assertions must wait; the poll only
+/// costs on failure). The shared home of the helper formerly duplicated
+/// across tinio-fs testutil and the tinio-server pipeline tests (F30).
 pub async fn wait_for(mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let secs = wait_timeout_secs();
+    let deadline = Instant::now() + Duration::from_secs(secs);
     while !cond() {
-        assert!(Instant::now() < deadline, "condition not met within 30 s");
+        assert!(
+            Instant::now() < deadline,
+            "condition not met within {secs} s"
+        );
         sleep(Duration::from_millis(2)).await;
     }
 }

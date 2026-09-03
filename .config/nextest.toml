@@ -1,0 +1,7 @@
+# CI test-leg runner profile — selected by .github/actions/run-test-leg
+# via `--profile ci`. A nextest runner profile is independent of the
+# Cargo build profile (--cargo-profile ci): retries/fail-fast live here
+# so the test commands stay one line per mode.
+[profile.ci]
+fail-fast = false
+retries = 2

@@ -1,0 +1,16 @@
+# actionlint configuration.
+#
+# The two matrix.* error classes below are false positives caused by the
+# file's design: steps shared across jobs are defined once as YAML anchors
+# at their first real use (`- &name`) and aliased (`- *name`) by later
+# jobs, but actionlint validates an anchored step's expressions at every
+# expansion site — including jobs whose matrix lacks `os`/`target` (or
+# has no matrix at all). GitHub's runtime evaluates a missing matrix
+# property as empty, and artifact names stay unique via github.job.
+# Keep the ignores narrow so real matrix typos in job bodies are still
+# reported.
+paths:
+  .github/workflows/ci.yml:
+    ignore:
+      - 'property "os" is not defined in object type'
+      - 'property "target" is not defined in object type'

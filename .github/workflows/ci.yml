@@ -17,6 +17,43 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
+  # Diagnostic only: sccache dumps its per-job error log here (the ghac
+  # backend logged ~245 cache_write_errors on the 2026-09-03 run while
+  # 20 parallel jobs hammered one Actions-cache store). The inline upload
+  # step reads this same value for its artifact path. Non-fatal if the
+  # path is not writable on a runner; drop this env and the
+  # SCCACHE_ERROR_LOG_UPLOAD flag together once write errors are
+  # root-caused. The path must be writable on every OS: github.workspace
+  # resolves to a native path on windows/macos runners (/tmp is
+  # POSIX-only; native sccache.exe cannot write it).
+  SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache-err.log
+  # ARMED (diagnostic run for the ghac cache_write_errors of run
+  # 33769082799): "true" makes every compile job upload its sccache error
+  # log as an artifact, kept even when the job failed. Flip back to
+  # "false" once the write errors are fixed.
+  SCCACHE_ERROR_LOG_UPLOAD: "true"
+
+permissions:
+  # Job default for every job (unlisted scopes = none): checkout needs
+  # contents: read, or cloning this private repo 404s ("not found"). A
+  # job-level permissions block REPLACES this default, so the two jobs
+  # that need more (e2e, interop — PR report comment) re-list
+  # contents: read in their own blocks.
+  contents: read
+
+# ---------------------------------------------------------------------------
+# Shared steps. A step shared across jobs is defined ONCE as a YAML anchor
+# at its first real use (`- &name`, in the earliest job below that runs it
+# — GitHub's workflow schema rejects unknown top-level keys, so a synthetic
+# anchor-holder block like `x-steps` is not an option) and aliased
+# (`- *name`) by every later job; the rationale for each shared step lives
+# at its definition site instead of being copied around. Aliases expand
+# textually, so each job keeps full native context (runner.os, matrix,
+# github.* expressions). GitHub does NOT support YAML merge keys (`<<:`) —
+# an aliased step cannot be overridden per job; a step that needs per-job
+# variation stays inline (or becomes a composite action, like
+# run-test-leg).
+# ---------------------------------------------------------------------------
 
 jobs:
   # Lint and tests are separate jobs so a clippy failure never blocks the
@@ -32,86 +69,170 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - &checkout
+        uses: actions/checkout@v7
 
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
+      # Linux links through clang + lld (.cargo/config.toml); the hosted
+      # ubuntu image ships clang but not lld.
+      - &lld
+        name: install lld (linux linker)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y lld
 
-      # Nightly rustfmt for rustfmt.toml unstable_features; last toolchain
-      # installed is default, so stable follows for clippy.
+      # Nightly rustfmt for rustfmt.toml unstable_features. fmt output is
+      # platform-neutral, so only the ubuntu leg installs nightly and runs
+      # fmt --check; the win/mac legs skip it (stable then stays the only —
+      # hence default — toolchain for clippy).
       - uses: dtolnay/rust-toolchain@nightly
+        if: runner.os == 'Linux'
         with:
           components: rustfmt
 
+      # Lint installs stable with the clippy component; the plain stable
+      # toolchain step (*toolchain) is defined in the test job below.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # rust-cache here caches only the cargo registry (cache-targets off):
+      # per-job target/ dirs never serve the cross-job chain (sccache
+      # carries that) and were the biggest cache-store pressure. Only test
+      # (the ubuntu chain head) keeps its target dir.
+      - &rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
 
       # Object-level compile cache (sccache) — shares hits across the
       # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - &sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Quality gates (constitution "Rust Tooling & Quality Gates").
       - name: fmt --check
+        if: runner.os == 'Linux'
         run: cargo +nightly fmt --all -- --check
 
       - name: clippy (-D warnings)
         run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
 
+      # Diagnostic upload (env-gated, see SCCACHE_ERROR_LOG_UPLOAD above):
+      # per-job sccache error log kept even when the job failed. The log
+      # path is read from env.SCCACHE_ERROR_LOG so this step and the env
+      # value cannot drift apart.
+      - &upload-err
+        name: upload sccache error log
+        if: always() && env.SCCACHE_ERROR_LOG_UPLOAD == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-err-log-${{ github.job }}-${{ matrix.os }}-${{ matrix.target }}
+          path: ${{ env.SCCACHE_ERROR_LOG }}
+          if-no-files-found: ignore
+
   test:
-    name: Test (unit/doc/features)
+    name: Test (unit/features, default)
+    # Ubuntu default-features leg ONLY: it owns the fast gates and its
+    # profile-ci artifacts (workspace libs + dev-deps incl. criterion) warm
+    # the sccache/rust-cache stores the chain reuses — e2e/bench-smoke chain
+    # behind THIS job, so they never wait on the no-default/doc legs
+    # (test-extra) or the windows/macos legs (test-port), which compile
+    # different graphs and warm nothing downstream.
     needs: check
-    permissions:
-      # Job-level permissions revoke everything not listed: checkout needs
-      # contents: read, or cloning this private repo 404s ("not found").
-      contents: read
     strategy:
       fail-fast: false
-      # The unit/doc runs as separate matrix legs: the three commands used
-      # to serialize inside one job per OS; each leg now compiles its own
-      # target in parallel (sccache/rust-cache dedupe the shared deps).
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        target: [default, no-default, doc]
-    runs-on: ${{ matrix.os }}
+        target: [default]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - *checkout
+      - *lld
 
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
+      # Plain stable toolchain, shared by every job except lint (which
+      # adds the clippy component — see the lint job above).
+      - &toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - uses: dtolnay/rust-toolchain@stable
-
+      # Chain head: test keeps its full target dir (the e2e/interop/
+      # bench-smoke chain rides these artifacts); every other job runs
+      # rust-cache registry-only (*rust-cache). Single leg, so it is also
+      # the single writer — no save-if needed.
       - uses: Swatinem/rust-cache@v2
 
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - *sccache
 
-      # The cucumber e2e suite (crates/tinio-e2e, harness = false) runs in
-      # its own e2e job with report output — exclude it here so it does
-      # not run twice (and does not accidentally run @external scenarios).
-      - name: test (default features)
-        if: matrix.target == 'default'
-        run: cargo test --profile ci --workspace --exclude tinio-e2e
+      # One matrix leg per call: the action switches on the leg's mode
+      # (default / no-default / doc) — single source of truth shared by
+      # all three test jobs.
+      - uses: ./.github/actions/run-test-leg
+        with:
+          mode: ${{ matrix.target }}
 
-      - name: test (--no-default-features)
-        if: matrix.target == 'no-default'
-        run: cargo test --profile ci --workspace --no-default-features --exclude tinio-e2e
+      - *upload-err
 
-      - name: doc (no warnings)
-        if: matrix.target == 'doc'
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --profile ci --workspace --no-deps
+  # The no-default-features and rustdoc legs: different compile graphs that
+  # warm nothing downstream, so they run as a leaf job instead of holding
+  # up the ubuntu chain (previously e2e/bench-smoke waited on them).
+  test-extra:
+    name: Test (no-default features / doc)
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [no-default, doc]
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+
+      # Registry-only rust-cache; the no-default leg saves for both legs
+      # (single writer per job — parallel legs race one cache key).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+          save-if: ${{ matrix.target == 'no-default' }}
+
+      - *sccache
+
+      - uses: ./.github/actions/run-test-leg
+        with:
+          mode: ${{ matrix.target }}
+
+      - *upload-err
+
+  # Windows/macOS unit legs: identical commands to the ubuntu test jobs,
+  # run on the portable OSes for platform coverage. They run in parallel
+  # with them — same graph, different target platform, so neither warms
+  # the other. The doc leg stays on ubuntu (test-extra): rustdoc warnings
+  # are platform-neutral.
+  test-port:
+    name: Test (portable OS, unit/features)
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        target: [default, no-default]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+
+      # Registry-only rust-cache; per-OS single writer is the default leg
+      # (parallel legs race one cache key).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+          save-if: ${{ matrix.target == 'default' }}
+
+      - *sccache
+
+      - uses: ./.github/actions/run-test-leg
+        with:
+          mode: ${{ matrix.target }}
+
+      - *upload-err
 
   features:
     name: Feature matrix (tinio facade)
@@ -126,21 +247,11 @@ jobs:
     # matrix.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
 
       - uses: taiki-e/install-action@v2
         with:
@@ -149,61 +260,47 @@ jobs:
       - name: feature-matrix check (tinio)
         run: cargo hack check --package tinio --each-feature --no-dev-deps --profile ci
 
+      - *upload-err
+
   e2e:
     name: E2E (cucumber fs/mem + traceability)
-    needs: check
-    # PR test reports (BDD cucumber migration): the e2e runs below write
-    # JSON reports; every leg uploads them as artifacts, the ubuntu legs
-    # publish a pass/fail summary comment to the PR.
+    # Ubuntu cucumber legs chain behind the ubuntu test job: they compile
+    # the same profile-ci default-features dep graph (tinio-e2e's workspace
+    # deps), so cargo test warms them first. Windows/macos legs live in
+    # e2e-port (parallel — different target platform, no sharing back);
+    # this ubuntu job owns the PR test report comment.
+    needs: test
     permissions:
-      # Job-level permissions revoke everything not listed: checkout needs
-      # contents: read, or cloning this private repo 404s ("not found").
       contents: read
       checks: write
       pull-requests: write
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
 
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
-
-      # Cucumber e2e suite: in-process scenarios; the default @external
-      # exclusion is built into the runner, no --tags needed on the fs pass.
-      # The mem pass skips @fs-only scenarios (traversal, nested-root,
-      # out-of-band); backend-neutral scenarios run on mem via
-      # TINIO_E2E_BACKEND, @mem-only ones by their tag. --test cucumber
-      # keeps the args from reaching the plain-harness traceability target
-      # (which runs in its own step below), and the explicit --tags must
-      # repeat the @external exclusion (it replaces the runner's default
-      # filter). --retry 1 on both passes mitigates the ConnectionAborted
-      # flake.
-      - name: e2e cucumber (fs backend)
-        # --retry 2: the reserved-paths scenario burned both retry-1
-        # attempts on the ConnectionAborted flake of a loaded windows leg
-        # (run 33764783657).
+      # --- cucumber e2e suite (e2e and e2e-port) --------------------------
+      # In-process scenarios; the runner's built-in default filter excludes
+      # the external-client tags (@interop/@boto3/@mc), so the fs pass needs
+      # no --tags. The mem pass skips @fs-only scenarios (traversal,
+      # nested-root, out-of-band); backend-neutral scenarios run on mem via
+      # TINIO_E2E_BACKEND. --test cucumber keeps the args from reaching the
+      # plain-harness traceability target (its own step below), and an
+      # explicit --tags REPLACES the runner's default filter, so the mem
+      # pass must repeat the external-tag exclusions itself. --retry 2 on
+      # both passes: ConnectionAborted flakes on loaded legs burned both
+      # retry-1 attempts in earlier runs (33764783657 fs, 33750043137 mem).
+      - &e2e-fs
+        name: e2e cucumber (fs backend)
         run: cargo test --profile ci -p tinio-e2e --test cucumber -- --retry 2
         env:
           TINIO_E2E_REPORT: cucumber-report-fs.json
 
-      - name: e2e cucumber (mem backend)
-        # --retry 2: the ConnectionAborted flake hit both retry-1 attempts
-        # on a loaded windows leg (run 33750043137).
+      - &e2e-mem
+        name: e2e cucumber (mem backend)
         run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
@@ -211,12 +308,17 @@ jobs:
 
       # The spec↔tag cross-check: a plain-harness libtest target, no
       # cucumber argv, so it cannot share the scoped runs above.
-      - name: e2e traceability
+      - &e2e-trace
+        name: e2e traceability
         run: cargo test --profile ci -p tinio-e2e --test traceability
 
-      # PR test reports. The reports land in crates/tinio-e2e/ (cargo runs
-      # the test binary with the package root as cwd), hence the ** glob.
-      - name: upload cucumber report
+      - *upload-err
+
+      # PR test reports (BDD cucumber migration): the e2e/interop jobs write
+      # JSON reports. Reports land in crates/tinio-e2e/ (cargo runs the test
+      # binary with the package root as cwd), hence the ** glob.
+      - &upload-report
+        name: upload cucumber report
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -225,125 +327,45 @@ jobs:
 
       # dorny/test-reporter has no cucumber reporter (its README documents
       # 13 reporter identifiers, none of them cucumber — verified
-      # 2026-09-01), so the tier-3 fallback publishes the report: a step
+      # 2026-09-01), so this tier-3 fallback publishes the report: a step
       # summary plus a PR comment with pass/fail counts and the failed
       # scenario names. Never fails the job (fail-on-error: 'false' analog).
-      - name: publish test report to PR
-        if: always() && matrix.os == 'ubuntu-latest'
+      # Included only by the two ubuntu jobs (e2e, interop) — the jobs that
+      # hold the PR-comment permissions — so nothing gates on runner here.
+      - &publish-report
+        name: publish test report to PR
+        if: always()
         uses: actions/github-script@v9
         with:
           script: |
-            const fs = require('fs');
-            const path = require('path');
+            const publish = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/publish-cucumber-report.js`);
+            await publish({ github, context, core });
 
-            // Find the cucumber JSON reports (same files the artifact
-            // step uploads: *-report*.json anywhere in the workspace).
-            function findReports(dir, acc) {
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                if (entry.name === '.git' || entry.name === 'target') continue;
-                const p = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                  findReports(p, acc);
-                } else if (/^.*-report.*\.json$/.test(entry.name)) {
-                  acc.push(p);
-                }
-              }
-              return acc;
-            }
-
-            const reports = findReports(process.env.GITHUB_WORKSPACE, []).sort();
-            const rows = [];
-            const failures = [];
-
-            for (const file of reports) {
-              let data;
-              try {
-                data = JSON.parse(fs.readFileSync(file, 'utf8'));
-              } catch (err) {
-                core.warning(`could not parse report ${file}: ${err.message}`);
-                continue;
-              }
-              const row = { file: path.basename(file), scenarios: 0, passed: 0, failed: 0, skipped: 0 };
-              for (const feature of data) {
-                for (const el of feature.elements || []) {
-                  if (el.type !== 'scenario') continue;
-                  row.scenarios += 1;
-                  // cucumber-rs 0.23's JSON writer accumulates events across
-                  // retry attempts on the same element (steps are never
-                  // cleared between attempts; element identity is
-                  // name+line+type), so a flake recovered by --retry 1
-                  // carries failed attempt-1 statuses AND passed attempt-2
-                  // statuses for the same step lines. Keep only the LAST
-                  // status per step line (the gherkin position line is
-                  // stable across attempts); hooks have no stable key in
-                  // the JSON, so keep the last status per hook kind.
-                  const statuses = new Set();
-                  const lastByLine = new Map();
-                  for (const step of el.steps || []) {
-                    const status = step.result && step.result.status;
-                    if (typeof step.line === 'number') {
-                      lastByLine.set(step.line, status);
-                    } else {
-                      statuses.add(status);
-                    }
-                  }
-                  for (const status of lastByLine.values()) {
-                    statuses.add(status);
-                  }
-                  const lastHookByKind = new Map();
-                  for (const kind of ['before', 'after']) {
-                    for (const hook of el[kind] || []) {
-                      lastHookByKind.set(kind, hook.result && hook.result.status);
-                    }
-                  }
-                  for (const status of lastHookByKind.values()) {
-                    statuses.add(status);
-                  }
-                  if (statuses.has('failed') || statuses.has('undefined') || statuses.has('ambiguous')) {
-                    row.failed += 1;
-                    failures.push(`- \`${feature.uri}\` — ${el.name}`);
-                  } else if (statuses.size === 0 || (statuses.size === 1 && statuses.has('passed'))) {
-                    row.passed += 1;
-                  } else {
-                    row.skipped += 1;
-                  }
-                }
-              }
-              rows.push(row);
-            }
-
-            const table = rows.length > 0
-              ? ['| report | scenarios | passed | failed | skipped |', '|---|---|---|---|---|']
-                  .concat(rows.map((r) => `| ${r.file} | ${r.scenarios} | ${r.passed} | ${r.failed} | ${r.skipped} |`))
-                  .join('\n')
-              : 'No cucumber report found — the e2e run did not produce a JSON report.';
-
-            const body = [
-              `## e2e cucumber report (\`${process.env.GITHUB_JOB}\`)`,
-              '',
-              table,
-              failures.length > 0
-                ? `\n**${failures.length} failed scenario(s):**\n${failures.join('\n')}`
-                : rows.length > 0 ? '\nAll scenarios passed.' : '',
-            ].join('\n');
-
-            // Step summary: visible on every run, including fork PRs
-            // without comment permissions.
-            await core.summary.addRaw(body).write();
-
-            // PR comment (pull_request runs only — context.issue.number is
-            // unset on push). A permission failure must not fail the job.
-            if (context.issue.number) {
-              try {
-                await github.rest.issues.createComment({
-                  ...context.repo,
-                  issue_number: context.issue.number,
-                  body,
-                });
-              } catch (err) {
-                core.warning(`could not post PR comment: ${err.message}`);
-              }
-            }
+  # Windows/macOS cucumber legs (parallel to the ubuntu e2e job): they
+  # compile tinio-e2e for a different target platform, so they neither
+  # warm nor are warmed by the ubuntu chain (test -> e2e -> interop).
+  # They upload their reports as artifacts; the ubuntu e2e job owns the
+  # PR comment. Gated on check only, so portable e2e coverage survives a
+  # ubuntu unit-test failure.
+  e2e-port:
+    name: E2E (portable OS, cucumber fs/mem + traceability)
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+      - *e2e-fs
+      - *e2e-mem
+      - *e2e-trace
+      - *upload-err
+      - *upload-report
 
   check:
     name: Check (workspace compile)
@@ -353,45 +375,32 @@ jobs:
     # stays the quality gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
 
       - name: check (all targets)
         run: cargo check --profile ci --workspace --all-targets
 
+      - *upload-err
+
   bench-smoke:
     name: Benchmark smoke (criterion --test)
+    # Chains behind the ubuntu test job (same platform, same profile-ci
+    # default-features graph): cargo test has already compiled the
+    # workspace libs and the criterion dev-deps, so this leg only builds
+    # its bench targets — was 0% sccache hits and ~8 min cold while
+    # running in parallel with the tests.
     runs-on: ubuntu-latest
-    needs: check
+    needs: test
     steps:
-      - uses: actions/checkout@v7
-
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
 
       # T030/T031: one-iteration criterion runs keep the fs-backend and
       # S3-mapping benches compilable and runnable. Baselines and
@@ -399,25 +408,17 @@ jobs:
       - name: bench smoke
         run: cargo bench --profile ci -p tinio-fs -p tinio-server -- --test
 
+      - *upload-err
+
   semver:
     name: Semver checks (tinio facade)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
 
       - uses: taiki-e/install-action@v2
         with:
@@ -439,6 +440,8 @@ jobs:
             echo "tinio@${ver} is not on crates.io yet — semver-checks baseline starts with the first release"
           fi
 
+      - *upload-err
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -447,17 +450,12 @@ jobs:
     # only at release time; the maintainer reviews the report.
     if: github.ref_name == 'main' || github.ref_name == 'dev'
     steps:
-      - uses: actions/checkout@v7
+      - *checkout
+      - *toolchain
 
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      # No compile here at all (cargo audit parses Cargo.lock), so no
+      # sccache-action, no rust-cache, no lld — their saves would churn
+      # the Actions-cache store the sccache diagnostic is watching.
 
       - uses: taiki-e/install-action@v2
         with:
@@ -468,186 +466,86 @@ jobs:
 
   interop:
     name: Interop (aws cli v2 + rclone)
-    # cucumber @interop harness (crates/tinio-e2e) is committed, job always
-    # runs — gated on the lightweight compile check above, not the test
-    # matrix (the windows leg alone outlasts the rest of the run): it
-    # starts in parallel with lint/test/e2e once the tree compiles.
-    # PR test reports: same artifact + ubuntu-only comment scheme as test.
-    needs: check
+    # Ubuntu leg chains behind the ubuntu e2e job: both compile the same
+    # tinio-e2e cucumber profile-ci test binary (e2e without @interop,
+    # this leg with), so e2e warms this leg's compile. The serve example
+    # builds under --profile ci so it shares the chain's artifacts
+    # instead of the dev profile (which nothing else builds — cold every
+    # run). Windows/macos legs live in interop-port; this ubuntu job owns
+    # the PR test report comment.
+    needs: e2e
     permissions:
-      # Job-level permissions revoke everything not listed: checkout needs
-      # contents: read, or cloning this private repo 404s ("not found").
       contents: read
       checks: write
       pull-requests: write
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
 
-      # Linux links through clang + lld (.cargo/config.toml); the
-      # hosted ubuntu image ships clang but not lld.
-      - name: install lld (linux linker)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Object-level compile cache (sccache) — shares hits across the
-      # same-OS jobs via the Actions cache service.
-      - uses: mozilla-actions/sccache-action@v0.0.11
-
+      # --- interop harness (interop and interop-port) ---------------------
       # aws cli v2 ships on all three hosted-runner images (install-action
-      # has no aws-cli manifest — the old key failed the first real run).
+      # has no aws-cli manifest — the old key failed the first real run);
       # rclone is the only tool to fetch.
-      - uses: taiki-e/install-action@v2
+      - &install-rclone
+        uses: taiki-e/install-action@v2
         with:
           tool: rclone
 
-      # The @external presence checks want both clients; print the
+      # The external-client presence checks want both clients; print the
       # versions for the log.
-      - name: client versions (interop harness)
+      - &interop-client
+        name: client versions (interop harness)
         run: aws --version && rclone version
 
-      # The @external cucumber steps spawn the serve example binary
-      # (serve_bin() resolves it in the workspace target dir).
-      - name: build serve example (interop harness)
-        run: cargo build -p tinio-server --example serve
+      # The external-client cucumber steps spawn the serve example binary;
+      # serve_bin() resolves it in the running test binary's own profile
+      # dir (<target>/<profile>/examples), so the build profile here must
+      # match the test profile — both use --profile ci. The dev profile
+      # shared nothing else and recompiled cold every run.
+      - &interop-example
+        name: build serve example (interop harness)
+        run: cargo build --profile ci -p tinio-server --example serve
 
       # FR-025: aws cli v2 + rclone are the CI-gated clients. The cucumber
       # @interop run replaces the deleted bash scripts (e2e/interop/*.sh).
       # --test cucumber keeps the tags from reaching the plain-harness
       # traceability target; --retry 1 mitigates external-client flakes.
-      - name: interop cucumber (@interop)
+      - &interop-cucumber
+        name: interop cucumber (@interop)
         run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
         env:
           TINIO_E2E_REPORT: interop-report.json
 
-      - name: upload cucumber report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ github.job }}-${{ matrix.os }}-cucumber-report
-          path: '**/*-report*.json'
+      - *upload-err
+      - *upload-report
+      - *publish-report
 
-      - name: publish test report to PR
-        if: always() && matrix.os == 'ubuntu-latest'
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-
-            // Find the cucumber JSON reports (same files the artifact
-            // step uploads: *-report*.json anywhere in the workspace).
-            function findReports(dir, acc) {
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                if (entry.name === '.git' || entry.name === 'target') continue;
-                const p = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                  findReports(p, acc);
-                } else if (/^.*-report.*\.json$/.test(entry.name)) {
-                  acc.push(p);
-                }
-              }
-              return acc;
-            }
-
-            const reports = findReports(process.env.GITHUB_WORKSPACE, []).sort();
-            const rows = [];
-            const failures = [];
-
-            for (const file of reports) {
-              let data;
-              try {
-                data = JSON.parse(fs.readFileSync(file, 'utf8'));
-              } catch (err) {
-                core.warning(`could not parse report ${file}: ${err.message}`);
-                continue;
-              }
-              const row = { file: path.basename(file), scenarios: 0, passed: 0, failed: 0, skipped: 0 };
-              for (const feature of data) {
-                for (const el of feature.elements || []) {
-                  if (el.type !== 'scenario') continue;
-                  row.scenarios += 1;
-                  // cucumber-rs 0.23's JSON writer accumulates events across
-                  // retry attempts on the same element (steps are never
-                  // cleared between attempts; element identity is
-                  // name+line+type), so a flake recovered by --retry 1
-                  // carries failed attempt-1 statuses AND passed attempt-2
-                  // statuses for the same step lines. Keep only the LAST
-                  // status per step line (the gherkin position line is
-                  // stable across attempts); hooks have no stable key in
-                  // the JSON, so keep the last status per hook kind.
-                  const statuses = new Set();
-                  const lastByLine = new Map();
-                  for (const step of el.steps || []) {
-                    const status = step.result && step.result.status;
-                    if (typeof step.line === 'number') {
-                      lastByLine.set(step.line, status);
-                    } else {
-                      statuses.add(status);
-                    }
-                  }
-                  for (const status of lastByLine.values()) {
-                    statuses.add(status);
-                  }
-                  const lastHookByKind = new Map();
-                  for (const kind of ['before', 'after']) {
-                    for (const hook of el[kind] || []) {
-                      lastHookByKind.set(kind, hook.result && hook.result.status);
-                    }
-                  }
-                  for (const status of lastHookByKind.values()) {
-                    statuses.add(status);
-                  }
-                  if (statuses.has('failed') || statuses.has('undefined') || statuses.has('ambiguous')) {
-                    row.failed += 1;
-                    failures.push(`- \`${feature.uri}\` — ${el.name}`);
-                  } else if (statuses.size === 0 || (statuses.size === 1 && statuses.has('passed'))) {
-                    row.passed += 1;
-                  } else {
-                    row.skipped += 1;
-                  }
-                }
-              }
-              rows.push(row);
-            }
-
-            const table = rows.length > 0
-              ? ['| report | scenarios | passed | failed | skipped |', '|---|---|---|---|---|']
-                  .concat(rows.map((r) => `| ${r.file} | ${r.scenarios} | ${r.passed} | ${r.failed} | ${r.skipped} |`))
-                  .join('\n')
-              : 'No cucumber report found — the e2e run did not produce a JSON report.';
-
-            const body = [
-              `## e2e cucumber report (\`${process.env.GITHUB_JOB}\`)`,
-              '',
-              table,
-              failures.length > 0
-                ? `\n**${failures.length} failed scenario(s):**\n${failures.join('\n')}`
-                : rows.length > 0 ? '\nAll scenarios passed.' : '',
-            ].join('\n');
-
-            // Step summary: visible on every run, including fork PRs
-            // without comment permissions.
-            await core.summary.addRaw(body).write();
-
-            // PR comment (pull_request runs only — context.issue.number is
-            // unset on push). A permission failure must not fail the job.
-            if (context.issue.number) {
-              try {
-                await github.rest.issues.createComment({
-                  ...context.repo,
-                  issue_number: context.issue.number,
-                  body,
-                });
-              } catch (err) {
-                core.warning(`could not post PR comment: ${err.message}`);
-              }
-            }
+  # Windows/macOS interop legs (parallel to the ubuntu interop job):
+  # same external-client cucumber suite on the portable OSes, gated on
+  # check only so interop coverage survives an ubuntu test/e2e failure.
+  # Uploads reports as artifacts; the ubuntu interop job owns the PR
+  # comment.
+  interop-port:
+    name: Interop (portable OS, aws cli v2 + rclone)
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+      - *install-rclone
+      - *interop-client
+      - *interop-example
+      - *interop-cucumber
+      - *upload-err
+      - *upload-report

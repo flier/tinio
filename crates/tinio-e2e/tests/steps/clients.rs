@@ -53,13 +53,24 @@ fn target_dir() -> PathBuf {
 }
 
 /// The serve example binary. Cargo sets `CARGO_BIN_EXE_*` for bins only —
-/// not examples — so resolve it relative to the workspace target dir.
+/// not examples — so resolve it relative to this test binary's own
+/// location: `<target>/<profile>/deps/cucumber-<hash>` means the example
+/// sits in the sibling `examples/` dir of the same profile dir. The
+/// example must be built with the SAME profile as the test run (CI builds
+/// both with `--profile ci`): a profile mismatch looks in the wrong dir —
+/// or worse, finds a stale binary restored from a cache.
 fn serve_bin() -> PathBuf {
     let name = format!("serve{}", if cfg!(windows) { ".exe" } else { "" });
-    let p = target_dir().join("debug/examples").join(name);
+    let exe = env::current_exe().expect("current exe path");
+    let profile_dir = exe
+        .parent() // .../deps
+        .and_then(Path::parent) // .../<profile>
+        .expect("test binary lives in <target>/<profile>/deps");
+    let p = profile_dir.join("examples").join(name);
     assert!(
         p.exists(),
-        "serve example binary not found at {} — run `cargo build -p tinio-server --example serve`",
+        "serve example binary not found at {} — build it with the same profile as the tests \
+         (`cargo build -p tinio-server --example serve`; CI adds `--profile ci`)",
         p.display()
     );
     p

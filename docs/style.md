@@ -36,5 +36,6 @@
 
 - English bullets. Scripts → `/tmp`.
 - Compress hard: no articles/filler/hedging; fragments; `condition (ex): action — scope`. 1 ex/pattern (extra = distinct branch). Merge overlap; positive > ban. Cut till drop changes behavior. Inline code/paths/commands exact.
+- Documents (plans/specs/design): NO hard line wraps — paragraphs, list items, and blockquotes stay single-line; only structural breaks remain (blank lines, table rows, code fences, headings).
 - CLAUDE.md = always-loaded pointer (name branches, then the doc); each `docs/*.md` = source of truth for its branch. No restating a rule in both.
 - Gherkin / cucumber e2e: `docs/tests.md`.

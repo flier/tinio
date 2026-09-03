@@ -5,6 +5,11 @@
 - Async: `#[tokio::test]` / `async fn` — no `Runtime::block_on` / `rt(...)`. Sync: `#[test]`. Exception: deliberate runtime shape under test.
 - Conformance: enable `tinio-util` `testing` in `[dev-dependencies]`. Cucumber never repeats its assertions.
 
+## CI legs
+
+- `.github/actions/run-test-leg` — its `run:` lines are the exact unit/doc commands (modes default / no-default / doc): nextest `--cargo-profile ci --profile ci` (`.config/nextest.toml` = runner profile: fail-fast false, retries 2), doctests via `cargo test --doc --profile ci` (nextest can't run them), rustdoc `-D warnings`.
+- Local equivalents keep `cargo test` (canonical above; cucumber sections) — the CI nextest profile is for the runners.
+
 ## Cucumber (tinio-e2e)
 
 Layout: `tests/features/`, `tests/steps/`. Tag taxonomy / FR-025 / WSL2: `crates/tinio-e2e/README.md`.
@@ -47,5 +52,6 @@ cargo test -p tinio-e2e --test traceability
   `/mnt/e/GitHub/tinio`, ext4 `CARGO_TARGET_DIR` — crates/tinio-e2e/README.md "WSL2"):
   `cargo clippy --workspace --all-targets -- -D warnings`
 - Timing-sensitive unit tests (bucket delete/create/put hammer polls
-  `wait_for`, tinio-util — 10 s deadline) can starve on loaded CI runners;
-  reproduce under WSL2 before classifying flaky vs real.
+  `wait_for`, tinio-util — 60 s default timeout, `TINIO_TEST_WAIT_TIMEOUT_SECS`
+  overrides) can starve on loaded CI runners; reproduce under WSL2
+  before classifying flaky vs real.

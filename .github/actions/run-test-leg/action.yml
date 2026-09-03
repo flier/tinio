@@ -1,0 +1,62 @@
+name: Run workspace test matrix leg
+description: >-
+  Run one workspace unit/doc leg selected by `mode` (default /
+  no-default / doc) — the exact commands the test matrix executes, shared
+  as a single source of truth between the ubuntu test job and the
+  portable-OS (windows/macos) test job so the two can never drift.
+  Unit/integration tests run under cargo-nextest (per-test processes;
+  the runner profile's retry/fail-fast absorb their flakes);
+  doctests are NOT supported by nextest and run separately with
+  `cargo test --doc`. The cucumber e2e
+  suite (crates/tinio-e2e, harness = false) runs in its own e2e job with
+  report output — excluded here so it does not run twice (and does not
+  accidentally run @external scenarios).
+inputs:
+  mode:
+    description: >-
+      Which leg to run: 'default' (workspace tests), 'no-default'
+      (workspace tests with --no-default-features), or 'doc' (rustdoc
+      with -D warnings, no deps).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: install nextest
+      if: inputs.mode != 'doc'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+
+    # --cargo-profile ci = the Cargo compile profile ([profile.ci] in the
+    # root Cargo.toml). --profile ci = the nextest runner profile
+    # (.config/nextest.toml): fail-fast off keeps CI parity with cargo
+    # test (report every failure), retries 2 absorbs per-process flakes
+    # (each test runs in its own process under nextest, surfacing timing
+    # races one shared process hid). Runner and Cargo profiles are
+    # independent.
+    - name: test (default features)
+      if: inputs.mode == 'default'
+      shell: bash
+      run: cargo nextest run --cargo-profile ci --profile ci --workspace --exclude tinio-e2e
+
+    - name: doctests (default features)
+      if: inputs.mode == 'default'
+      shell: bash
+      run: cargo test --doc --profile ci --workspace --exclude tinio-e2e
+
+    - name: test (--no-default-features)
+      if: inputs.mode == 'no-default'
+      shell: bash
+      run: cargo nextest run --cargo-profile ci --profile ci --workspace --no-default-features --exclude tinio-e2e
+
+    - name: doctests (--no-default-features)
+      if: inputs.mode == 'no-default'
+      shell: bash
+      run: cargo test --doc --profile ci --workspace --no-default-features --exclude tinio-e2e
+
+    - name: doc (no warnings)
+      if: inputs.mode == 'doc'
+      shell: bash
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: cargo doc --profile ci --workspace --no-deps
