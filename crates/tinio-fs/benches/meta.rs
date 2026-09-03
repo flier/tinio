@@ -46,6 +46,8 @@ fn populated_store() -> (tempfile::TempDir, meta::Store) {
                                 u64::from(i),
                                 u64::from(i),
                                 0,
+                                "",
+                                "",
                             ),
                         )
                         .unwrap();

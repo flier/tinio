@@ -22,7 +22,11 @@
 //! round-trips (byte-identical, ETag = content MD5), key validation and
 //! `.tinio` reservation (FR-006/FR-020), folder markers, idempotent deletes,
 //! listing with prefix/delimiter/pagination, byte ranges, and the full
-//! multipart lifecycle with composed-ETag verification (FR-014/FR-022).
+//! multipart lifecycle with composed-ETag verification (FR-014/FR-022);
+//! the tagging contract — object and bucket tag sets, the tagged write
+//! paths (commit/copy/multipart completion) and recorded checksums;
+//! rename_object; and the completed-object part listing with its
+//! OBJECT_PARTS lifecycle (spec 2026-08-31).
 //! [`tinio_mem::MemoryStorage`] — the in-memory reference backend —
 //! backs conformance tests in the `tinio-mem` crate.
 //!
@@ -45,7 +49,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
-    ListPartsParams, ListUploadsParams, Storage, bucket,
+    ListPartsParams, ListUploadsParams, MultipartOps, Storage, bucket,
     checksum::{self, Algorithm, Type},
     multipart, object, storage,
     storage::Error::*,
@@ -82,6 +86,18 @@ pub fn etag(hex: &str) -> ETag {
     ETag::new(hex).expect("valid etag")
 }
 
+/// The server's checksum tee slot with `algorithm`/`value` pre-loaded —
+/// the digest the write paths record atomically with the row (the
+/// harness sets the slot itself: the backends never hash).
+fn checksum_tee(algorithm: checksum::Algorithm, value: &str) -> Arc<checksum::PartChecksum> {
+    let slot = Arc::new(checksum::PartChecksum::default());
+    let _ = slot.digest.set(checksum::Part {
+        algorithm,
+        value: checksum::Value(value.into()),
+    });
+    slot
+}
+
 /// Reference multipart ETag for the conformance parts (5 MiB of `a`,
 /// 5 MiB of `b`, `part-three` — non-final parts must clear the 5 MiB
 /// minimum the backends enforce at complete) under the AWS composition:
@@ -94,6 +110,7 @@ fn check(cond: bool, msg: &str) {
 
 /// Run the full conformance suite against a backend. Panics on the first
 /// violation (test-harness semantics).
+
 pub async fn assert_conformance<S: Storage>(storage: &S) {
     let b = bucket::name(unique_bucket("conform")).unwrap();
     conformance_buckets(storage, &b).await;
@@ -101,6 +118,38 @@ pub async fn assert_conformance<S: Storage>(storage: &S) {
     conformance_copy(storage, &b).await;
     conformance_listing(storage, &b).await;
     conformance_multipart(storage, &b).await;
+}
+
+/// Drive one create → upload-part → complete round trip of `key` — the
+/// shared scaffold of the fs/mem suites' object-attributes tests. The
+/// upload carries no tags or checksum spec; one part of body `b"mp"` is
+/// uploaded and completed (a composed single-part object whose retained
+/// part list has one row).
+pub async fn complete_single_part<S>(storage: &S, b: &bucket::Name, key: &object::Key)
+where
+    S: Storage + MultipartOps,
+{
+    let upload = storage
+        .create_multipart_upload(b, key, None, object::Tags::empty())
+        .await
+        .unwrap();
+    let part = storage
+        .upload_part(b, key, &upload.upload_id, 1.into(), body(b"mp"), None)
+        .await
+        .unwrap();
+    storage
+        .complete_multipart_upload(
+            b,
+            key,
+            &upload.upload_id,
+            &[CompletedPart {
+                part_number: part.part_number,
+                etag: part.etag,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
 }
 
 async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
@@ -116,7 +165,10 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
         .put_object(b, &src, body(data.to_vec()))
         .await
         .unwrap();
-    let put = storage.copy_object(b, &src, b, &dst).await.unwrap();
+    let put = storage
+        .copy_object(b, &src, b, &dst, object::Tags::empty(), None)
+        .await
+        .unwrap();
     check(
         put.etag == ETag::from_content(data),
         "copy ETag must be the content MD5",
@@ -130,16 +182,92 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // Copy of a missing source is NoSuchKey.
     let missing = object::key("ghost.bin").unwrap();
-    let err = into_core_error(storage.copy_object(b, &missing, b, &dst).await.unwrap_err());
+    let err = into_core_error(
+        storage
+            .copy_object(b, &missing, b, &dst, object::Tags::empty(), None)
+            .await
+            .unwrap_err(),
+    );
     check(
         matches!(err, NoSuchKey(_)),
         "copy of a missing source must be NoSuchKey",
     );
 
+    // The copy's metadata is the caller's, never the source's: the
+    // `tags` parameter records on the destination, and a tagged source
+    // copied without them arrives untagged (the interface sends the
+    // source's set only under the COPY directive).
+    let tagged_src = object::key("copy-tagged-src.bin").unwrap();
+    let src_tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    let copy_tags = object::Tags::from_pairs([("tier".into(), "gold".into())]).unwrap();
+    let src_checksum = checksum::Recorded {
+        part: checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value("y/Q5Jg==".into()),
+        },
+        kind: Type::FullObject,
+    };
+    let staged = storage
+        .stage_body(
+            b,
+            &tagged_src,
+            body(data.to_vec()),
+            Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+        )
+        .await
+        .unwrap();
+    storage
+        .commit_object(b, &tagged_src, staged, src_tags)
+        .await
+        .unwrap();
+    let bare_dst = object::key("copy-bare-dst.bin").unwrap();
+    let bare = storage
+        .copy_object(b, &tagged_src, b, &bare_dst, object::Tags::empty(), None)
+        .await
+        .unwrap();
+    check(
+        bare.tags.is_empty(),
+        "a copy without tags must not inherit the source's",
+    );
+    let head = storage.head_object(b, &bare_dst).await.unwrap();
+    check(
+        head.tags.is_empty() && head.checksum.is_none(),
+        "an untagged copy must record none of the source's metadata",
+    );
+    let carried_dst = object::key("copy-carried-dst.bin").unwrap();
+    let carried = storage
+        .copy_object(
+            b,
+            &tagged_src,
+            b,
+            &carried_dst,
+            copy_tags.clone(),
+            Some(src_checksum.clone()),
+        )
+        .await
+        .unwrap();
+    check(
+        carried.tags == copy_tags,
+        "the copy's tags must record on the destination",
+    );
+    let head = storage.head_object(b, &carried_dst).await.unwrap();
+    check(head.tags == copy_tags, "head must serve the copied tags");
+    check(
+        head.checksum == Some(src_checksum.clone()),
+        "the carried checksum — value and kind — must record on the destination",
+    );
+    check(
+        head.etag == ETag::from_content(data),
+        "the copy ETag must be the content MD5",
+    );
+
     // Copy into a folder-marker destination creates the marker (the
     // destination is a directory, never an object).
     let marker = object::key("copied-dir/").unwrap();
-    storage.copy_object(b, &src, b, &marker).await.unwrap();
+    storage
+        .copy_object(b, &src, b, &marker, object::Tags::empty(), None)
+        .await
+        .unwrap();
     let err = into_core_error(storage.get_object(b, &marker, None).await.unwrap_err());
     check(
         matches!(err, NoSuchKey(_)),
@@ -150,7 +278,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     // UploadPartCopy: the part holds the source's bytes (optionally a
     // byte range); the part ETag is the content MD5 of the part bytes.
     let upload = storage
-        .create_multipart_upload(b, &src, None)
+        .create_multipart_upload(b, &src, None, object::Tags::empty())
         .await
         .unwrap();
     let part = storage
@@ -205,6 +333,9 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     // Cleanup.
     storage.delete_object(b, &src).await.unwrap();
     storage.delete_object(b, &dst).await.unwrap();
+    storage.delete_object(b, &tagged_src).await.unwrap();
+    storage.delete_object(b, &bare_dst).await.unwrap();
+    storage.delete_object(b, &carried_dst).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
 }
 
@@ -398,6 +529,61 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
         "deleting a missing bucket must be NoSuchBucket",
     );
 
+    // Bucket tags: put/get round-trip, replace-all, delete — and the
+    // missing-bucket semantics (get/put NoSuchBucket, delete succeeds;
+    // an untagged bucket reads back as the empty set).
+    let tags = object::Tags::from_pairs([
+        ("owner".into(), "team-x".into()),
+        ("env".into(), "prod".into()),
+    ])
+    .unwrap();
+    let replaced = object::Tags::from_pairs([("tier".into(), "gold".into())]).unwrap();
+    storage.put_bucket_tags(b, &tags).await.unwrap();
+    let got = storage.get_bucket_tags(b).await.unwrap();
+    check(got == tags, "bucket tags must round-trip");
+    storage.put_bucket_tags(b, &replaced).await.unwrap();
+    let got = storage.get_bucket_tags(b).await.unwrap();
+    check(got == replaced, "put_bucket_tags must replace, not merge");
+    storage.delete_bucket_tags(b).await.unwrap();
+    let got = storage.get_bucket_tags(b).await.unwrap();
+    check(got.is_empty(), "delete_bucket_tags must clear the set");
+    storage.delete_bucket_tags(b).await.unwrap(); // idempotent
+
+    // The bucket cap is 50 tags — a set past the object-tag cap of 10
+    // (built with the bucket constructor) round-trips, so the read-side
+    // parse honors the bucket cap, not the object cap.
+    let wide: Vec<(String, String)> = (0..12)
+        .map(|i| (format!("k{i}"), format!("v{i}")))
+        .collect();
+    let wide = object::Tags::from_pairs_limited(wide, 50).unwrap();
+    storage.put_bucket_tags(b, &wide).await.unwrap();
+    let got = storage.get_bucket_tags(b).await.unwrap();
+    check(
+        got == wide,
+        "a bucket tag set past 10 tags must read back intact",
+    );
+    let full: Vec<(String, String)> = (0..50)
+        .map(|i| (format!("k{i}"), format!("v{i}")))
+        .collect();
+    let full = object::Tags::from_pairs_limited(full, 50).unwrap();
+    storage.put_bucket_tags(b, &full).await.unwrap();
+    let got = storage.get_bucket_tags(b).await.unwrap();
+    check(got == full, "a 50-tag bucket set must round-trip");
+    storage.delete_bucket_tags(b).await.unwrap();
+
+    // Missing bucket.
+    let err = into_core_error(storage.get_bucket_tags(&missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "get_bucket_tags on a missing bucket must be NoSuchBucket",
+    );
+    let err = into_core_error(storage.put_bucket_tags(&missing, &tags).await.unwrap_err());
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "put_bucket_tags on a missing bucket must be NoSuchBucket",
+    );
+    storage.delete_bucket_tags(&missing).await.unwrap(); // idempotent
+
     // Delete non-empty (a folder marker counts as content).
     let marker = object::key("dir/").unwrap();
     storage.put_object(b, &marker, body("")).await.unwrap();
@@ -468,10 +654,13 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // The two-phase write (stage + commit) equals a direct put.
     let staged = storage
-        .stage_body(b, &hello, body(data.to_vec()))
+        .stage_body(b, &hello, body(data.to_vec()), None)
         .await
         .unwrap();
-    let put = storage.commit_object(b, &hello, staged).await.unwrap();
+    let put = storage
+        .commit_object(b, &hello, staged, object::Tags::empty())
+        .await
+        .unwrap();
     check(
         put.etag == ETag::from_content(data),
         "staged commit ETag must be the content MD5",
@@ -488,6 +677,228 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     check(
         matches!(err, NoSuchKey(_)),
         "missing object must be NoSuchKey",
+    );
+
+    // Object tags: put/get round-trip, replace-all, and delete — with
+    // the missing-object semantics (get/put NoSuchKey, delete succeeds;
+    // an untagged object reads back as the empty set).
+    let tags = object::Tags::from_pairs([
+        ("env".into(), "prod".into()),
+        ("team".into(), "core".into()),
+        ("owner".into(), "harness".into()),
+    ])
+    .unwrap();
+    let replaced = object::Tags::from_pairs([("tier".into(), "gold".into())]).unwrap();
+    storage.put_object_tags(b, &hello, &tags).await.unwrap();
+    let got = storage.get_object_tags(b, &hello).await.unwrap();
+    check(got == tags, "object tags must round-trip");
+    let head = storage.head_object(b, &hello).await.unwrap();
+    check(head.tags == tags, "head must serve a tag-only write");
+    storage.put_object_tags(b, &hello, &replaced).await.unwrap();
+    let got = storage.get_object_tags(b, &hello).await.unwrap();
+    check(got == replaced, "put_object_tags must replace, not merge");
+    storage.delete_object_tags(b, &hello).await.unwrap();
+    let got = storage.get_object_tags(b, &hello).await.unwrap();
+    check(got.is_empty(), "delete_object_tags must clear the set");
+    storage.delete_object_tags(b, &hello).await.unwrap(); // idempotent
+    let err = into_core_error(storage.get_object_tags(b, &missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "the tags of a missing object must be NoSuchKey",
+    );
+    let err = into_core_error(
+        storage
+            .put_object_tags(b, &missing, &tags)
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(err, NoSuchKey(_)),
+        "tagging a missing object must be NoSuchKey",
+    );
+    storage.delete_object_tags(b, &missing).await.unwrap(); // idempotent
+
+    // The tagged write path: a staged commit records its tags with the
+    // object — head and get serve the same set.
+    let tagged = object::key("tagged.bin").unwrap();
+    let write_tags = object::Tags::from_pairs([
+        ("env".into(), "prod".into()),
+        ("owner".into(), "harness".into()),
+    ])
+    .unwrap();
+    let staged = storage
+        .stage_body(b, &tagged, body(data.to_vec()), None)
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(b, &tagged, staged, write_tags.clone())
+        .await
+        .unwrap();
+    check(
+        committed.tags == write_tags,
+        "a commit must record its tags",
+    );
+    let head = storage.head_object(b, &tagged).await.unwrap();
+    check(
+        head.tags == write_tags,
+        "head must serve the committed tags",
+    );
+    let get = storage.get_object(b, &tagged, None).await.unwrap();
+    check(
+        get.info.tags == write_tags,
+        "get must serve the committed tags",
+    );
+
+    // Recorded checksums: a plain PUT staged with the server's tee slot
+    // records the validated digest as FULL_OBJECT — the kind is fixed by
+    // the write path — and head/get echo the record. A commit staged
+    // without a tee records none.
+    let recorded = object::key("recorded.bin").unwrap();
+    let expected = checksum::Recorded {
+        part: checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value("y/Q5Jg==".into()),
+        },
+        kind: Type::FullObject,
+    };
+    let staged = storage
+        .stage_body(
+            b,
+            &recorded,
+            body(b"abc"),
+            Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+        )
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(b, &recorded, staged, object::Tags::empty())
+        .await
+        .unwrap();
+    check(
+        committed.checksum == Some(expected.clone()),
+        "a tee-staged commit must record its digest as FULL_OBJECT",
+    );
+    let head = storage.head_object(b, &recorded).await.unwrap();
+    check(
+        head.checksum == Some(expected.clone()),
+        "head must echo the recorded checksum",
+    );
+    let get = storage.get_object(b, &recorded, None).await.unwrap();
+    check(
+        get.info.checksum == Some(expected),
+        "get must echo the recorded checksum",
+    );
+    let staged = storage
+        .stage_body(b, &recorded, body(b"abc"), None)
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(b, &recorded, staged, object::Tags::empty())
+        .await
+        .unwrap();
+    check(
+        committed.checksum.is_none(),
+        "a commit staged without a tee must record no checksum",
+    );
+
+    // Completed-object parts: a plain put has none, and the listing of a
+    // missing object is NoSuchKey (T2-B — the listing mirrors head's
+    // existence gate).
+    let listed = storage.list_object_parts(b, &hello).await.unwrap();
+    check(listed.is_empty(), "a plain put must have no parts");
+    let err = into_core_error(storage.list_object_parts(b, &missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "the parts of a missing object must be NoSuchKey",
+    );
+
+    // rename_object: an atomic move — the source is gone, and the
+    // destination holds the bytes and the object's metadata (tags,
+    // recorded checksum, ETag — a rename is not a fresh object). An
+    // existing destination is overwritten.
+    let mv_src = object::key("mv-src.bin").unwrap();
+    let mv_dst = object::key("mv-dst.bin").unwrap();
+    let mv_data = b"rename me, metadata included";
+    let mv_tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    let mv_checksum = checksum::Recorded {
+        part: checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value("y/Q5Jg==".into()),
+        },
+        kind: Type::FullObject,
+    };
+    let staged = storage
+        .stage_body(
+            b,
+            &mv_src,
+            body(mv_data.to_vec()),
+            Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+        )
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(b, &mv_src, staged, mv_tags.clone())
+        .await
+        .unwrap();
+    let renamed = storage.rename_object(b, &mv_src, &mv_dst).await.unwrap();
+    check(
+        renamed.key == mv_dst,
+        "rename must return the destination info",
+    );
+    check(
+        renamed.tags == mv_tags && renamed.checksum == Some(mv_checksum.clone()),
+        "rename must move the tags and the recorded checksum",
+    );
+    check(renamed.etag == committed.etag, "rename must move the ETag");
+    let head = storage.head_object(b, &mv_dst).await.unwrap();
+    check(
+        head.size == mv_data.len() as u64
+            && head.tags == mv_tags
+            && head.checksum == Some(mv_checksum.clone()),
+        "the destination must hold the moved metadata",
+    );
+    let get = storage.get_object(b, &mv_dst, None).await.unwrap();
+    check(
+        read_body(get.body).await.unwrap() == mv_data,
+        "the destination must hold the bytes",
+    );
+    let err = into_core_error(storage.head_object(b, &mv_src).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "the rename source must be gone",
+    );
+    // An overwriting rename carries the source's bytes and metadata.
+    let mv_over = object::key("mv-over.bin").unwrap();
+    storage
+        .put_object(b, &mv_over, body(b"old content"))
+        .await
+        .unwrap();
+    let renamed = storage.rename_object(b, &mv_dst, &mv_over).await.unwrap();
+    check(
+        renamed.tags == mv_tags && renamed.checksum == Some(mv_checksum.clone()),
+        "an overwriting rename must carry the source metadata",
+    );
+    let get = storage.get_object(b, &mv_over, None).await.unwrap();
+    check(
+        read_body(get.body).await.unwrap() == mv_data,
+        "an overwriting rename must replace the destination bytes",
+    );
+    let head = storage.head_object(b, &mv_over).await.unwrap();
+    check(
+        head.etag == committed.etag,
+        "the overwritten object keeps the moved ETag",
+    );
+    // Missing source.
+    let nowhere = object::key("mv-nowhere.bin").unwrap();
+    let err = into_core_error(
+        storage
+            .rename_object(b, &missing, &nowhere)
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(err, NoSuchKey(_)),
+        "renaming a missing source must be NoSuchKey",
     );
 
     // Invalid keys are rejected at the checked constructor (FR-006) — before
@@ -575,6 +986,9 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.delete_object(b, &empty).await.unwrap();
     storage.delete_object(b, &hello).await.unwrap();
     storage.delete_object(b, &digits).await.unwrap();
+    storage.delete_object(b, &tagged).await.unwrap();
+    storage.delete_object(b, &recorded).await.unwrap();
+    storage.delete_object(b, &mv_over).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
 }
 
@@ -692,7 +1106,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     let reserved = object::key("a/.tinio/b").unwrap();
     let err = into_core_error(
         storage
-            .create_multipart_upload(b, &reserved, None)
+            .create_multipart_upload(b, &reserved, None, object::Tags::empty())
             .await
             .unwrap_err(),
     );
@@ -704,7 +1118,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Full lifecycle: create → upload 3 parts → list → complete.
     let big = object::key("big.bin").unwrap();
     let upload = storage
-        .create_multipart_upload(b, &big, None)
+        .create_multipart_upload(b, &big, None, object::Tags::empty())
         .await
         .unwrap();
     check(!upload.upload_id.is_empty(), "upload id must be non-empty");
@@ -764,7 +1178,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         })
         .collect();
     let completed = storage
-        .complete_multipart_upload(b, &big, &upload.upload_id, &completed_parts)
+        .complete_multipart_upload(b, &big, &upload.upload_id, &completed_parts, None)
         .await
         .unwrap();
     let expected = parts_data.concat();
@@ -795,7 +1209,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // backends' own suites keep only their mechanism-specific angles.
     let min_key = object::key("min.bin").unwrap();
     let failing = storage
-        .create_multipart_upload(b, &min_key, None)
+        .create_multipart_upload(b, &min_key, None, object::Tags::empty())
         .await
         .unwrap();
     let under = storage
@@ -836,6 +1250,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                         etag: small.etag,
                     },
                 ],
+                None,
             )
             .await
             .unwrap_err(),
@@ -859,7 +1274,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // minimum: a single small part still completes.
     let single_key = object::key("single.bin").unwrap();
     let single_upload = storage
-        .create_multipart_upload(b, &single_key, None)
+        .create_multipart_upload(b, &single_key, None, object::Tags::empty())
         .await
         .unwrap();
     let only = storage
@@ -882,6 +1297,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                 part_number: only.part_number,
                 etag: only.etag,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -902,12 +1318,12 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Complete with no parts is an error.
     let empty_mp = object::key("empty-mp.bin").unwrap();
     let u = storage
-        .create_multipart_upload(b, &empty_mp, None)
+        .create_multipart_upload(b, &empty_mp, None, object::Tags::empty())
         .await
         .unwrap();
     let err = into_core_error(
         storage
-            .complete_multipart_upload(b, &empty_mp, &u.upload_id, &[])
+            .complete_multipart_upload(b, &empty_mp, &u.upload_id, &[], None)
             .await
             .unwrap_err(),
     );
@@ -923,7 +1339,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // A bucket with in-progress uploads is not empty.
     let busy = object::key("busy.bin").unwrap();
     let busy_upload = storage
-        .create_multipart_upload(b, &busy, None)
+        .create_multipart_upload(b, &busy, None, object::Tags::empty())
         .await
         .unwrap();
     let err = into_core_error(storage.delete_bucket(b).await.unwrap_err());
@@ -939,7 +1355,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Abort removes parts and leaves no object.
     let abort_bin = object::key("abort.bin").unwrap();
     let upload2 = storage
-        .create_multipart_upload(b, &abort_bin, None)
+        .create_multipart_upload(b, &abort_bin, None, object::Tags::empty())
         .await
         .unwrap();
     storage
@@ -966,7 +1382,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // List uploads.
     let pending = object::key("pending.bin").unwrap();
     let upload3 = storage
-        .create_multipart_upload(b, &pending, None)
+        .create_multipart_upload(b, &pending, None, object::Tags::empty())
         .await
         .unwrap();
     let listing = storage
@@ -1000,7 +1416,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         r#type: Some(Type::FullObject),
     };
     let cs_upload = storage
-        .create_multipart_upload(b, &cs_big, Some(cs_spec.clone()))
+        .create_multipart_upload(b, &cs_big, Some(cs_spec.clone()), object::Tags::empty())
         .await
         .unwrap();
     check(
@@ -1018,11 +1434,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // The tee slot (what the server hands the backend): the digest
     // commits atomically with the part row.
     let value = checksum::Value("y/Q5Jg==".into());
-    let slot = Arc::new(checksum::PartChecksum::default());
-    let _ = slot.digest.set(checksum::Part {
-        algorithm: Algorithm::Crc32,
-        value: value.clone(),
-    });
+    let slot = checksum_tee(Algorithm::Crc32, "y/Q5Jg==");
     let cs_part = storage
         .upload_part(
             b,
@@ -1089,11 +1501,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     );
     // A re-upload with a NEW slot overwrites the row — the two rows
     // commit in one transaction, so no CAS can ever go stale.
-    let new_slot = Arc::new(checksum::PartChecksum::default());
-    let _ = new_slot.digest.set(checksum::Part {
-        algorithm: Algorithm::Crc32,
-        value: checksum::Value("AAAAAAAAAAAAAAAAAAAAAA==".into()),
-    });
+    let new_slot = checksum_tee(Algorithm::Crc32, "AAAAAAAAAAAAAAAAAAAAAA==");
     storage
         .upload_part(
             b,
@@ -1137,6 +1545,276 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     check(
         matches!(err, NoSuchUpload(_)),
         "abort must drain the checksum rows",
+    );
+    // The completed object's retained parts (GetObjectAttributes
+    // ObjectParts): big.bin's composition rows are served in part-number
+    // order with the uploaded sizes — no per-part checksums (its parts
+    // were uploaded without the tee).
+    let rows = storage.list_object_parts(b, &big).await.unwrap();
+    check(
+        rows.iter()
+            .map(|p| u32::from(p.part_number))
+            .collect::<Vec<_>>()
+            == [1, 2, 3],
+        "the retained parts must be the completion's, in number order",
+    );
+    check(
+        rows.iter().map(|p| p.size).collect::<Vec<_>>() == [min as u64, min as u64, 10],
+        "the retained part sizes must match the uploaded parts",
+    );
+    check(
+        rows.iter().all(|p| p.checksum.is_none()),
+        "parts uploaded without the tee must carry no checksum",
+    );
+
+    // Multipart write path: the create-time tags — persisted in the
+    // upload state, passed back through the completion — land on the
+    // object, and the composite the interface computed records with it
+    // (kind COMPOSITE), echoed by head and get.
+    let attrs = object::key("attrs.bin").unwrap();
+    let create_tags = object::Tags::from_pairs([
+        ("env".into(), "prod".into()),
+        ("owner".into(), "harness".into()),
+    ])
+    .unwrap();
+    let upload = storage
+        .create_multipart_upload(b, &attrs, None, create_tags.clone())
+        .await
+        .unwrap();
+    check(
+        upload.tags == create_tags,
+        "the upload state must persist the create-time tags",
+    );
+    let first = storage
+        .upload_part(
+            b,
+            &attrs,
+            &upload.upload_id,
+            1.into(),
+            body(vec![b'q'; min]),
+            Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+        )
+        .await
+        .unwrap();
+    let second = storage
+        .upload_part(
+            b,
+            &attrs,
+            &upload.upload_id,
+            2.into(),
+            body(b"tail"),
+            Some(checksum_tee(Algorithm::Crc32, "NhCmhg==")),
+        )
+        .await
+        .unwrap();
+    let composite = checksum::Recorded {
+        part: checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+        },
+        kind: Type::Composite,
+    };
+    let completed = storage
+        .complete_multipart_upload(
+            b,
+            &attrs,
+            &upload.upload_id,
+            &[
+                CompletedPart {
+                    part_number: first.part_number,
+                    etag: first.etag.clone(),
+                },
+                CompletedPart {
+                    part_number: second.part_number,
+                    etag: second.etag.clone(),
+                },
+            ],
+            Some(composite.clone()),
+        )
+        .await
+        .unwrap();
+    check(
+        completed.tags == create_tags,
+        "the completion must apply the create-time tags",
+    );
+    check(
+        completed.checksum == Some(composite.clone()),
+        "the completion must record the interface's composite",
+    );
+    let head = storage.head_object(b, &attrs).await.unwrap();
+    check(
+        head.tags == create_tags,
+        "head must serve the completed tags",
+    );
+    check(
+        head.checksum == Some(composite.clone()),
+        "head must echo the recorded composite",
+    );
+    let get = storage.get_object(b, &attrs, None).await.unwrap();
+    check(
+        get.info.checksum == Some(composite.clone()),
+        "get must echo the recorded composite",
+    );
+    // The retained rows carry each part's tee checksum and uploaded size.
+    let rows = storage.list_object_parts(b, &attrs).await.unwrap();
+    check(
+        rows.iter().map(|p| p.size).collect::<Vec<_>>() == [min as u64, 4],
+        "the retained part sizes must match the uploaded parts",
+    );
+    check(
+        rows[0].checksum
+            == Some(checksum::Part {
+                algorithm: Algorithm::Crc32,
+                value: checksum::Value("y/Q5Jg==".into()),
+            })
+            && rows[1].checksum
+                == Some(checksum::Part {
+                    algorithm: Algorithm::Crc32,
+                    value: checksum::Value("NhCmhg==".into()),
+                }),
+        "the retained rows must carry the per-part tee checksums",
+    );
+
+    // OBJECT_PARTS lifecycle: the retained list is always exactly the
+    // last write's — a copy never inherits the source's rows (nor keeps
+    // the overwritten destination's), a re-completion replaces them, and
+    // commit and delete leave none behind.
+    let overwrite = object::key("overwrite.bin").unwrap();
+    let upload = storage
+        .create_multipart_upload(b, &overwrite, None, object::Tags::empty())
+        .await
+        .unwrap();
+    let part = storage
+        .upload_part(
+            b,
+            &overwrite,
+            &upload.upload_id,
+            1.into(),
+            body(b"tiny"),
+            None,
+        )
+        .await
+        .unwrap();
+    storage
+        .complete_multipart_upload(
+            b,
+            &overwrite,
+            &upload.upload_id,
+            &[CompletedPart {
+                part_number: part.part_number,
+                etag: part.etag,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = storage.list_object_parts(b, &overwrite).await.unwrap();
+    check(
+        rows.len() == 1 && u32::from(rows[0].part_number) == 1,
+        "a completion must retain its own parts",
+    );
+    storage
+        .copy_object(b, &attrs, b, &overwrite, object::Tags::empty(), None)
+        .await
+        .unwrap();
+    let rows = storage.list_object_parts(b, &overwrite).await.unwrap();
+    check(
+        rows.is_empty(),
+        "a copy must not inherit the source's parts — nor keep the destination's",
+    );
+    storage.delete_object(b, &overwrite).await.unwrap();
+
+    // A rename moves the rows with the record — the moved object keeps
+    // its tags, its recorded composite, and its retained parts.
+    let moved = object::key("moved.bin").unwrap();
+    let renamed = storage.rename_object(b, &attrs, &moved).await.unwrap();
+    check(
+        renamed.tags == create_tags && renamed.checksum == Some(composite.clone()),
+        "rename must move the completed object's metadata",
+    );
+    let rows = storage.list_object_parts(b, &moved).await.unwrap();
+    check(
+        rows.len() == 2 && rows[0].checksum.is_some() && rows[1].checksum.is_some(),
+        "the retained parts must migrate with the record",
+    );
+    let err = into_core_error(storage.head_object(b, &attrs).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "the rename source must be gone",
+    );
+    let err = into_core_error(storage.list_object_parts(b, &attrs).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "a renamed-away object's parts must answer NoSuchKey",
+    );
+
+    // A re-completion over the moved object replaces its rows (no
+    // accumulation) and its metadata (the completion's own tags and
+    // checksum, not the moved ones).
+    let upload = storage
+        .create_multipart_upload(b, &moved, None, object::Tags::empty())
+        .await
+        .unwrap();
+    let part = storage
+        .upload_part(b, &moved, &upload.upload_id, 1.into(), body(b"again"), None)
+        .await
+        .unwrap();
+    storage
+        .complete_multipart_upload(
+            b,
+            &moved,
+            &upload.upload_id,
+            &[CompletedPart {
+                part_number: part.part_number,
+                etag: part.etag,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = storage.list_object_parts(b, &moved).await.unwrap();
+    check(
+        rows.len() == 1 && u32::from(rows[0].part_number) == 1,
+        "a re-completion must replace the retained rows",
+    );
+    let head = storage.head_object(b, &moved).await.unwrap();
+    check(
+        head.tags.is_empty() && head.checksum.is_none(),
+        "a re-completion must replace the moved metadata",
+    );
+
+    // A plain commit over the multipart object replaces the rest of the
+    // multipart state — tags, recorded checksum, retained parts.
+    let commit_tags = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
+    let staged = storage
+        .stage_body(b, &moved, body(b"flat"), None)
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(b, &moved, staged, commit_tags.clone())
+        .await
+        .unwrap();
+    check(
+        committed.tags == commit_tags,
+        "a commit over a multipart object must record its own tags",
+    );
+    let head = storage.head_object(b, &moved).await.unwrap();
+    check(
+        head.tags == commit_tags && head.checksum.is_none(),
+        "a commit over a multipart object must replace tags and checksum",
+    );
+    let rows = storage.list_object_parts(b, &moved).await.unwrap();
+    check(
+        rows.is_empty(),
+        "a commit over a completed multipart object must clear its parts",
+    );
+
+    // Delete drains the rows with the object.
+    storage.delete_object(b, &moved).await.unwrap();
+    let err = into_core_error(storage.list_object_parts(b, &moved).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "the parts of a deleted object must be gone with it",
     );
 
     storage.delete_object(b, &big).await.unwrap();

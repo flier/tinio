@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 
 use super::Storage;
-use crate::bucket::{self, Bucket};
+use crate::{
+    bucket::{self, Bucket},
+    object,
+};
 
 /// Parameters of a [`BucketOps::list_buckets`] call — the S3 listing
 /// semantics (prefix filtering, pagination).
@@ -106,6 +109,31 @@ pub trait BucketOps: Send + Sync + 'static {
         &self,
         params: ListBucketsParams,
     ) -> Result<BucketsListing, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// The bucket's tag set (S3 GetBucketTagging). `NoSuchBucket` when
+    /// the bucket is missing.
+    async fn get_bucket_tags(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<object::Tags, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the bucket's tag set (S3 PutBucketTagging — replace-all,
+    /// no merge). `NoSuchBucket` when the bucket is missing.
+    async fn put_bucket_tags(
+        &self,
+        name: &bucket::Name,
+        tags: &object::Tags,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Remove the bucket's tag set (S3 DeleteBucketTagging). S3
+    /// semantics: idempotent — a missing bucket is Ok.
+    async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
 }

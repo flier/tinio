@@ -194,10 +194,101 @@ lazy_static! {
     };
 }
 
+/// The metric statics are process-global (the prometheus default
+/// registry): a test binary runs hundreds of tests in parallel threads,
+/// every one of which records into the same statics through the data
+/// plane, so an exact-value/family assertion races the other tests'
+/// writes (observed flakes: the write-lock snapshot, the family set,
+/// `STORAGE_DOWNLOAD_BYTES`, `HTTP_IN_FLIGHT`). The serialization is a
+/// cfg(test)-only writer lock: every metric WRITE takes it, and the
+/// exact-assert tests take it for their whole assert window. Production
+/// call sites compile the lock away. Reentrant: an exact test holds the
+/// window and does its setup THROUGH the public record/refresh fns, so a
+/// writer on the same thread (one test = one thread) must not deadlock
+/// on its own lock — the window marks the thread and writers skip
+/// acquisition while it is held.
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use std::{
+        cell::Cell,
+        sync::{Mutex, MutexGuard},
+    };
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static HELD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Writer-side guard: `Some` blocks while an exact-assert test on
+    /// another thread holds the window; `None` on the window's own
+    /// thread (reentrant setup).
+    pub(crate) fn writer() -> Option<MutexGuard<'static, ()>> {
+        if HELD.with(Cell::get) {
+            None
+        } else {
+            Some(LOCK.lock().unwrap())
+        }
+    }
+
+    /// The exact-assert window: exclusive against every other-thread
+    /// writer; reentrant on this thread. The thread mark is cleared on
+    /// drop — the harness reuses test threads, so a stale mark would
+    /// silently disable the lock for a later test.
+    pub(crate) struct Window {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Window {
+        fn drop(&mut self) {
+            HELD.with(|held| held.set(false));
+        }
+    }
+
+    /// Open the window (the assert-exclusive region of an exact test).
+    pub(crate) fn window() -> Window {
+        HELD.with(|held| held.set(true));
+        Window {
+            _lock: LOCK.lock().unwrap(),
+        }
+    }
+}
+
+/// Take the in-flight gauge for a request (the data plane's per-request
+/// inc/dec pair).
+pub(crate) fn http_in_flight_inc() {
+    #[cfg(test)]
+    let _g = test_lock::writer();
+    HTTP_IN_FLIGHT.inc();
+}
+
+/// Release the in-flight gauge (request completion or cancellation).
+pub(crate) fn http_in_flight_dec() {
+    #[cfg(test)]
+    let _g = test_lock::writer();
+    HTTP_IN_FLIGHT.dec();
+}
+
+/// Record the uploaded bytes of a completed request.
+pub(crate) fn record_upload_bytes(n: u64) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
+    STORAGE_UPLOAD_BYTES.inc_by(n);
+}
+
+/// Record the downloaded bytes of a completed response body.
+pub(crate) fn record_download_bytes(n: u64) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
+    STORAGE_DOWNLOAD_BYTES.inc_by(n);
+}
+
 /// Decrement the in-progress-multipart gauge, saturating at zero: after a
 /// restart the persisted uploads are not counted, so completing or
 /// aborting one must not drive the gauge negative.
 pub(crate) fn multipart_in_progress_dec() {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     if STORAGE_MULTIPART_IN_PROGRESS.get() > 0 {
         STORAGE_MULTIPART_IN_PROGRESS.dec();
     }
@@ -219,6 +310,8 @@ fn record(
 
 /// Record a completed HTTP request (management plane).
 pub fn record_http_request(method: &str, status: u16, duration: Duration) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     record(
         &HTTP_REQUESTS,
         &[method, &status.to_string()],
@@ -230,6 +323,8 @@ pub fn record_http_request(method: &str, status: u16, duration: Duration) {
 
 /// Record a completed S3 data-plane operation.
 pub fn record_s3_operation(op: &str, status: u16, duration: Duration) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     record(
         &S3_OPERATIONS,
         &[op, &status.to_string()],
@@ -249,6 +344,8 @@ pub fn record_s3_operation(op: &str, status: u16, duration: Duration) {
 /// (F10 — the server's `/metrics` endpoint calls this on every scrape,
 /// so a running server's registry always contains them).
 pub fn refresh(io: Stats, db: Stats, write_lock: WriteLockStats) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     for (label, stats) in [("io", io), ("db", db)] {
         PIPELINE_QUEUE_DEPTH
             .with_label_values(&[label])
@@ -413,6 +510,7 @@ mod tests {
 
     #[test]
     fn registers_all_families() {
+        let _window = test_lock::window();
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         // gather() only emits families with samples — record one of each
         // label-bearing family first.
@@ -427,6 +525,14 @@ mod tests {
         STORAGE_OBJECTS_UPLOADED.with_label_values(&["put"]).inc();
         STORAGE_OBJECTS_DELETED.inc_by(0);
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
+        // The write-lock histograms are always emitted (zero counts
+        // before any write transaction); the refresh is also the
+        // registration path (the server's `/metrics` endpoint calls it on
+        // every scrape, F10). The refresh happens under the snapshot
+        // guard — it writes the shared snapshot, so it must not race the
+        // other snapshot test's refresh+encode (a clobbered snapshot
+        // fails its exact-value asserts and poisons the guard).
+        let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
         // The pipeline gauges (io/db labels) sample the inline runners —
         // stats are all zeros, the family set is what matters here.
         refresh(
@@ -434,11 +540,6 @@ mod tests {
             Stats::default(),
             WriteLockStats::default(),
         );
-        // The write-lock histograms are always emitted (zero counts
-        // before any write transaction); the refresh is also the
-        // registration path (the server's `/metrics` endpoint calls it on
-        // every scrape, F10).
-        let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
         let names: Vec<String> = default_registry()
             .gather()
             .iter()
@@ -479,6 +580,7 @@ mod tests {
 
     #[test]
     fn write_lock_histograms_reflect_the_snapshot() {
+        let _window = test_lock::window();
         // The conversion is positional: snapshot bucket i maps to the
         // i-th cumulative `le=` bound (µs → seconds), `_sum`/`_count`
         // carry the snapshot's count/sum, and the text encoder appends
@@ -559,6 +661,7 @@ mod tests {
 
     #[test]
     fn recording_increments_counters() {
+        let _window = test_lock::window();
         record_http_request("INC", 200, Duration::from_millis(2));
         record_http_request("INC", 200, Duration::from_millis(1));
         record_s3_operation("IncGetObject", 200, Duration::from_millis(3));
@@ -583,6 +686,7 @@ mod tests {
 
     #[test]
     fn multipart_in_progress_dec_saturates_at_zero() {
+        let _window = test_lock::window();
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         // After a restart the persisted uploads are not counted — a dec
         // on an empty gauge must not drive it negative.
@@ -667,6 +771,7 @@ mod tests {
 
     #[test]
     fn metric_s3_records_status_classes() {
+        let _window = test_lock::window();
         // Ok → 200; a generic client error → 400; InternalError → 500;
         // the trait default (NotImplemented) → 501.
         for (mode, _status) in [
@@ -688,6 +793,7 @@ mod tests {
     #[test]
     #[cfg(feature = "multipart")]
     fn metric_s3_maintains_multipart_gauge() {
+        let _window = test_lock::window();
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
         let backend = MetricS3::new(FakeS3 { mode: FakeMode::Ok });
@@ -710,6 +816,7 @@ mod tests {
 
     #[test]
     fn metric_s3_records_every_delegated_operation() {
+        let _window = test_lock::window();
         // Every thin wrapper must route through `record` — the fake
         // answers the trait default (NotImplemented → 501) for every op
         // it does not override, so each delegation line is exercised.
@@ -726,11 +833,27 @@ mod tests {
         call!(head_bucket, dto::HeadBucketInput);
         call!(list_buckets, dto::ListBucketsInput);
         call!(get_bucket_location, dto::GetBucketLocationInput);
+        call!(get_bucket_tagging, dto::GetBucketTaggingInput);
+        call!(delete_bucket_tagging, dto::DeleteBucketTaggingInput);
+        // `PutBucketTaggingInput` has a required `tagging` field — no
+        // Default derive — built explicitly like the delete_objects
+        // input above.
+        let _ = rt.block_on(
+            backend.put_bucket_tagging(request(dto::PutBucketTaggingInput {
+                bucket: "b".into(),
+                tagging: dto::Tagging { tag_set: vec![] },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+            })),
+        );
         call!(put_object, dto::PutObjectInput);
         call!(get_object, dto::GetObjectInput);
         call!(head_object, dto::HeadObjectInput);
+        call!(get_object_attributes, dto::GetObjectAttributesInput);
         call!(delete_object, dto::DeleteObjectInput);
         call!(get_object_tagging, dto::GetObjectTaggingInput);
+        call!(delete_object_tagging, dto::DeleteObjectTaggingInput);
         #[cfg(feature = "multipart")]
         call!(upload_part, dto::UploadPartInput);
         #[cfg(feature = "list-v1")]
@@ -810,6 +933,10 @@ mod tests {
                 sse_customer_key: None,
                 sse_customer_key_md5: None,
             })));
+            // `RenameObjectInput` derives Default — the plain `call!`
+            // form (the fake answers NotImplemented on every op it does
+            // not override).
+            call!(rename_object, dto::RenameObjectInput);
         }
         let _ = rt.block_on(backend.delete_objects(request(dto::DeleteObjectsInput {
             bucket: "b".into(),
@@ -820,17 +947,38 @@ mod tests {
             mfa: None,
             request_payer: None,
         })));
+        // `PutObjectTaggingInput` has a required `tagging` field — no
+        // Default derive — built explicitly like the delete_objects
+        // input above.
+        let _ = rt.block_on(
+            backend.put_object_tagging(request(dto::PutObjectTaggingInput {
+                bucket: "b".into(),
+                key: "k".into(),
+                tagging: dto::Tagging { tag_set: vec![] },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+                request_payer: None,
+                version_id: None,
+            })),
+        );
         let mut expected: Vec<&str> = vec![
             "DeleteBucket",
             "HeadBucket",
             "ListBuckets",
             "GetBucketLocation",
+            "GetBucketTagging",
+            "PutBucketTagging",
+            "DeleteBucketTagging",
             "PutObject",
             "GetObject",
             "HeadObject",
+            "GetObjectAttributes",
             "DeleteObject",
             "DeleteObjects",
             "GetObjectTagging",
+            "PutObjectTagging",
+            "DeleteObjectTagging",
         ];
         #[cfg(feature = "multipart")]
         expected.extend(["UploadPart", "ListParts", "ListMultipartUploads"]);
@@ -847,6 +995,7 @@ mod tests {
         {
             assert_eq!(s3_counter("CopyObject", 501), 1);
             assert_eq!(s3_counter("UploadPartCopy", 501), 1);
+            assert_eq!(s3_counter("RenameObject", 501), 1);
         }
         #[cfg(feature = "list-v1")]
         assert_eq!(s3_counter("ListObjects", 501), 1);
@@ -972,6 +1121,30 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
             .await
     }
 
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<dto::GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::GetBucketTaggingOutput>> {
+        self.record("GetBucketTagging", self.inner.get_bucket_tagging(req))
+            .await
+    }
+
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<dto::PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::PutBucketTaggingOutput>> {
+        self.record("PutBucketTagging", self.inner.put_bucket_tagging(req))
+            .await
+    }
+
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<dto::DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketTaggingOutput>> {
+        self.record("DeleteBucketTagging", self.inner.delete_bucket_tagging(req))
+            .await
+    }
+
     // --- objects ---
     async fn put_object(
         &self,
@@ -992,6 +1165,14 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         req: S3Request<dto::HeadObjectInput>,
     ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
         self.record("HeadObject", self.inner.head_object(req)).await
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<dto::GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<dto::GetObjectAttributesOutput>> {
+        self.record("GetObjectAttributes", self.inner.get_object_attributes(req))
+            .await
     }
 
     async fn delete_object(
@@ -1018,12 +1199,37 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
             .await
     }
 
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<dto::PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::PutObjectTaggingOutput>> {
+        self.record("PutObjectTagging", self.inner.put_object_tagging(req))
+            .await
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<dto::DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectTaggingOutput>> {
+        self.record("DeleteObjectTagging", self.inner.delete_object_tagging(req))
+            .await
+    }
+
     #[cfg(feature = "copy")]
     async fn copy_object(
         &self,
         req: S3Request<dto::CopyObjectInput>,
     ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
         self.record("CopyObject", self.inner.copy_object(req)).await
+    }
+
+    #[cfg(feature = "copy")]
+    async fn rename_object(
+        &self,
+        req: S3Request<dto::RenameObjectInput>,
+    ) -> S3Result<S3Response<dto::RenameObjectOutput>> {
+        self.record("RenameObject", self.inner.rename_object(req))
+            .await
     }
 
     // --- listing ---

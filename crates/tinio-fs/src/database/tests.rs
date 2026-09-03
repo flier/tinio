@@ -19,10 +19,13 @@ use super::{
     handle,
     handle::Handle,
     open::{Integrity, check_integrity, open},
-    tables::{BucketsTable, ObjectMetaTable, PartsTable, StateTable, UploadsTable},
+    tables::{
+        BucketsTable, ObjectMetaTable, ObjectPartsTable, PartChecksumsTable, PartsTable,
+        StateTable, UploadChecksumsTable, UploadsTable,
+    },
 };
 use crate::{
-    _core::{bucket, object},
+    _core::{bucket, object, to_nanos},
     _util::testing::{assert_send_sync, etag},
 };
 
@@ -61,16 +64,20 @@ async fn open_creates_database_and_all_tables() {
     BucketsTable::open_readonly(&txn).unwrap();
     UploadsTable::open_readonly(&txn).unwrap();
     PartsTable::open_readonly(&txn).unwrap();
+    UploadChecksumsTable::open_readonly(&txn).unwrap();
+    PartChecksumsTable::open_readonly(&txn).unwrap();
+    ObjectPartsTable::open_readonly(&txn).unwrap();
     StateTable::open_readonly(&txn).unwrap();
 }
 
 #[tokio::test]
-async fn v1_databases_are_refused() {
-    // F06 (user decision): ONE current version, no migration — a
-    // pre-checksum v1 database is refused like any other mismatch (the
-    // state is derivable; the operator deletes and rebuilds). The
-    // checksum tables landed without a version bump, so v1 cannot be
-    // told apart from a newer format and must not open silently.
+async fn stored_v1_databases_open() {
+    // F06 + user ruling 2026-09-02: the version stays 1 — additive
+    // schema changes (the checksum tables, the tagging rows /
+    // `OBJECT_PARTS`) do NOT bump it, and a stored 1 opens (dev-local
+    // databases are disposable: a stale same-version database written in
+    // an older row format may fail at row decode — the operator deletes
+    // it; that is not the version gate's job).
     let (state, db, _) = open_db();
     {
         let mut txn = db.begin_write().unwrap();
@@ -81,18 +88,8 @@ async fn v1_databases_are_refused() {
         txn.commit().unwrap();
     }
     drop(db);
-    let err = open(state.path()).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::UnsupportedVersion {
-                found: 1,
-                expected: 2,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
+    let opened = open(state.path()).unwrap();
+    assert!(opened.db.begin_read().is_ok());
     drop(state);
 }
 
@@ -106,7 +103,7 @@ async fn open_twice_is_idempotent() {
         .unwrap()
         .ensure_version(state.path())
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 1);
 }
 
 #[tokio::test]
@@ -128,7 +125,7 @@ async fn version_mismatch_is_unsupported_version() {
             err,
             Error::UnsupportedVersion {
                 found: 9,
-                expected: 2,
+                expected: 1,
                 ..
             }
         ),
@@ -216,7 +213,7 @@ async fn compact_if_needed_shrinks_and_clears_marker() {
                 table
                     .insert(
                         ("data", key.as_str()),
-                        (key.as_str(), u64::from(i), u64::from(i), 0),
+                        (key.as_str(), u64::from(i), u64::from(i), 0, "", ""),
                     )
                     .unwrap();
             }
@@ -632,6 +629,35 @@ async fn bucket_get_or_insert_returns_the_stored_creation_time() {
 }
 
 #[tokio::test]
+async fn bucket_get_or_insert_preserves_the_stored_tags() {
+    let (state, db, _) = open_db();
+    let handle = Handle::new(db);
+    let name = bucket::name("data").unwrap();
+    let write_name = name.clone();
+    let now = UNIX_EPOCH + Duration::from_nanos(42);
+    handle
+        .write(move |txn| {
+            let mut table = BucketsTable::open(txn)?;
+            // The tagging write's row upsert (`put_full` — `set_tags` on
+            // a row-less bucket), then the racing first-sight upsert
+            // (`get_or_insert` — the head/list record): the re-insert
+            // must keep the stored tags element, never clear it.
+            table.put_full(&write_name, now, "env=prod")?;
+            let recorded = table.get_or_insert(&write_name, now + Duration::from_secs(1))?;
+            assert_eq!(recorded, now);
+            let (created, tags) = table
+                .row(&write_name)?
+                .expect("the put_full row must be present");
+            assert_eq!(created, now);
+            assert_eq!(tags, "env=prod");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(state);
+}
+
+#[tokio::test]
 async fn object_meta_put_round_trips() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
@@ -644,7 +670,18 @@ async fn object_meta_put_round_trips() {
     handle
         .write(move |txn| {
             let mut table = ObjectMetaTable::open(txn)?;
-            table.put(&write_name, &write_key, &write_etag, 2, UNIX_EPOCH, 7)
+            table.put(
+                &write_name,
+                &write_key,
+                &super::tables::StoredMeta {
+                    etag: write_etag.clone(),
+                    size: 2,
+                    mtime: to_nanos(UNIX_EPOCH),
+                    file_identity: 7,
+                    tags: object::Tags::empty(),
+                    checksum: None,
+                },
+            )
         })
         .await
         .unwrap();
@@ -672,8 +709,8 @@ async fn upload_and_part_rows_round_trip_and_list_from_stops_at_the_next_upload(
         .write(move |txn| {
             {
                 let mut uploads = UploadsTable::open(txn)?;
-                uploads.put(&write_name, "aaa", &write_key, UNIX_EPOCH)?;
-                uploads.put(&write_name, "bbb", &write_key, UNIX_EPOCH)?;
+                uploads.put(&write_name, "aaa", &write_key, UNIX_EPOCH, "")?;
+                uploads.put(&write_name, "bbb", &write_key, UNIX_EPOCH, "")?;
             }
             let mut parts = PartsTable::open(txn)?;
             parts.put(&write_name, "aaa", 1, &write_etag)?;

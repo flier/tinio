@@ -12,6 +12,7 @@
 //!   header — delete is idempotent, the conditions gate an existing
 //!   object only, and [`DeleteConditions::absent`] decides whether a
 //!   delete is conditional at all.
+//!
 //! `If-None-Match` passes on an absent object on every destination path.
 
 use std::{cmp::Ordering, str::FromStr, time::SystemTime};
@@ -205,9 +206,28 @@ fn strong_matches(cond: &ETagCondition, etag: &ETag) -> bool {
             .is_some_and(|e| e.as_strong().is_some_and(|v| v == etag.as_str()))
 }
 
+/// Parse an ETag-condition VALUE (`x-amz-if-match` / `x-amz-if-none-match`
+/// wire strings, and the String-typed RenameObject source fields) into
+/// the DTO type when present — the sites not part of the s3s DTO, so they
+/// are read from the headers / String fields here. A malformed value is a
+/// request-shape error, 400 `InvalidArgument` "invalid {name} header".
+pub(crate) fn parse_etag_condition_value(
+    value: Option<&str>,
+    name: &'static str,
+) -> S3Result<Option<ETagCondition>> {
+    value
+        .map(|v| {
+            ETagCondition::from_str(v)
+                .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))
+        })
+        .transpose()
+}
+
 /// Parse an ETag-condition header (`x-amz-if-match`, `x-amz-if-none-match`)
-/// into the DTO type when present. CopyObject's destination conditionals
-/// are not part of the s3s DTO, so they are read from the headers here.
+/// into the DTO type when present — the [`parse_etag_condition_value`]
+/// rule over the request's `HeaderMap`. CopyObject's destination
+/// conditionals are not part of the s3s DTO, so they are read from the
+/// headers here.
 pub(crate) fn parse_etag_condition_header(
     headers: &http::HeaderMap,
     name: &'static str,
@@ -218,9 +238,7 @@ pub(crate) fn parse_etag_condition_header(
     let text = value
         .to_str()
         .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))?;
-    ETagCondition::from_str(text)
-        .map(Some)
-        .map_err(|_| s3_error!(InvalidArgument, "invalid {name} header"))
+    parse_etag_condition_value(Some(text), name)
 }
 
 /// The `If-Range` value (RFC 9110 §13.1.5): an entity-tag or an
@@ -503,7 +521,10 @@ mod tests {
     use s3s::S3ErrorCode;
 
     use super::*;
-    use crate::_core::{ETag, object};
+    use crate::_core::{
+        ETag,
+        object::{self, Tags},
+    };
 
     fn etag(value: &str) -> ETag {
         value.parse().unwrap()
@@ -732,6 +753,8 @@ mod tests {
             size,
             last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_secs),
             etag: etag(etag_hex),
+            tags: Tags::empty(),
+            checksum: None,
         }
     }
 

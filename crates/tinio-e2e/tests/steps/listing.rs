@@ -62,7 +62,12 @@ async fn do_list(world: &mut super::World, key: &str, delimiter: Option<String>,
 /// The ListObjectsV2 request path of `bucket`/`prefix` with an optional
 /// `delimiter` and `max-keys` — one builder for every list step (the
 /// plain lists, the pagination walk, and its full re-list).
-fn list_v2_path(bucket: &str, prefix: &str, delimiter: Option<&str>, max_keys: Option<u64>) -> String {
+fn list_v2_path(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: Option<u64>,
+) -> String {
     let mut path = format!("/{bucket}?list-type=2&prefix={}", url_encode(prefix));
     if let Some(d) = delimiter {
         path += &format!("&delimiter={}", url_encode(d));
@@ -172,7 +177,12 @@ async fn listing_prefixes(world: &mut super::World, p1: String, p2: String) {
 #[then("a truncated listing resumes with the next page")]
 async fn truncated_resumes(world: &mut super::World) {
     let st = &world.last_listing;
-    let base = list_v2_path(&st.bucket, &st.prefix, st.delimiter.as_deref(), Some(st.max_keys));
+    let base = list_v2_path(
+        &st.bucket,
+        &st.prefix,
+        st.delimiter.as_deref(),
+        Some(st.max_keys),
+    );
     let mut pages = vec![String::from_utf8_lossy(&world.last.body).into_owned()];
     assert!(
         pages[0].contains("<IsTruncated>true</IsTruncated>"),
@@ -184,7 +194,8 @@ async fn truncated_resumes(world: &mut super::World) {
         if !text.contains("<IsTruncated>true</IsTruncated>") {
             break;
         }
-        let token = super::common::extract(text, "<NextContinuationToken>", "</NextContinuationToken>");
+        let token =
+            super::common::extract(text, "<NextContinuationToken>", "</NextContinuationToken>");
         assert!(
             !token.is_empty(),
             "truncated page without a continuation token"

@@ -1,10 +1,12 @@
 //! Object read/write types and the [`ObjectOps`] contract category.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use derive_more::Debug;
 
 use super::{Storage, body::BodyStream, range::ByteRange};
-use crate::{bucket, etag::ETag, object};
+use crate::{bucket, checksum, etag::ETag, multipart::ObjectPart, object};
 
 /// Result of a successful object write.
 ///
@@ -44,6 +46,8 @@ pub struct PutObjectResult {
 ///         size: 5,
 ///         last_modified: SystemTime::UNIX_EPOCH,
 ///         etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+///         tags: object::Tags::empty(),
+///         checksum: None,
 ///     },
 ///     body: Box::pin(stream::empty()),
 ///     served_range: Some((0, 4)),
@@ -150,7 +154,8 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// Stream an object body into storage (atomic on the backend side —
     /// last completed write wins, never a torn object, FR-011). The
     /// default implementation is [`ObjectOps::stage_body`] followed by
-    /// [`ObjectOps::commit_object`].
+    /// [`ObjectOps::commit_object`] with empty tags (the tagged write
+    /// paths call the pair directly); it returns the committed ETag.
     async fn put_object(
         &self,
         bucket: &bucket::Name,
@@ -160,8 +165,11 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage,
     {
-        let staged = self.stage_body(bucket, key, body).await?;
-        self.commit_object(bucket, key, staged).await
+        let staged = self.stage_body(bucket, key, body, None).await?;
+        let info = self
+            .commit_object(bucket, key, staged, object::Tags::empty())
+            .await?;
+        Ok(PutObjectResult { etag: info.etag })
     }
 
     /// The streaming phase of a write: buffer `body` outside the
@@ -169,11 +177,20 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// writers. The stage is cheap to discard — the body is published
     /// only by the later [`ObjectOps::commit_object`]. Validation that can
     /// fail before any body is read (bucket, key) still rejects here.
+    /// `checksum` is the server's tee slot (the
+    /// [`crate::storage::MultipartOps::upload_part`] pattern): the
+    /// interface wraps the body when the client sent a single
+    /// `x-amz-checksum-*` header under the `checksum` toggle, the digest
+    /// is computed while the body streams, a mismatch fails the staging
+    /// (the multipart path's checksum-mismatch error), and the validated
+    /// digest rides into the later [`ObjectOps::commit_object`]; absent,
+    /// no digest is computed.
     async fn stage_body(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         body: BodyStream,
+        checksum: Option<Arc<checksum::PartChecksum>>,
     ) -> Result<Self::StagedBody, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -182,13 +199,17 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// onto `key` (atomic on the backend side — last completed write
     /// wins, never a torn object, FR-011). Re-checks everything the
     /// stage checked, under the backend's mutation lock, so the commit
-    /// is safe against concurrent bucket deletion.
+    /// is safe against concurrent bucket deletion. `tags` — validated by
+    /// the interface — and the stage's tee digest (when the stage
+    /// carried one) are recorded atomically with the write, with no
+    /// post-commit tag window. Returns the committed object metadata.
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         staged: Self::StagedBody,
-    ) -> Result<PutObjectResult, <Self as Storage>::Error>
+        tags: object::Tags,
+    ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -203,29 +224,51 @@ pub trait ObjectOps: Send + Sync + 'static {
         Self: Storage;
 
     /// Server-side copy of `src` into `dst` (S3 CopyObject): the source
-    /// content is stored under `dst` atomically (FR-011), and the
-    /// source's metadata is NOT carried over — a copy is a fresh object
-    /// (its mtime is the copy time; its ETag is the content's). The
-    /// default implementation streams the source through the body
-    /// contract (get → put); a backend may override with a
-    /// filesystem-level copy (same filesystem, zero userspace
-    /// buffering) and may reuse the source's ETag for a full copy of a
-    /// single-form source (the content MD5 is unchanged by a copy).
-    /// `NoSuchKey` when the source does not exist; `NoSuchBucket` when
-    /// either bucket does not.
+    /// content is stored under `dst` atomically (FR-011), and the copy
+    /// is a fresh object — its mtime is the copy time and its ETag is
+    /// the content's; its metadata is what the caller passes, not what
+    /// the source holds. `tags` is the new object's tag set and
+    /// `checksum` the recorded checksum carried into its record (the
+    /// interface passes the source's recorded value — a full copy's
+    /// bytes are the source's — or the directive's replacement; `None`
+    /// stores none); a copy never inherits the source's retained parts.
+    /// The default implementation streams the source through the body
+    /// contract (get → stage → commit, carrying `tags`); a backend may
+    /// override with a filesystem-level copy (same filesystem, zero
+    /// userspace buffering), carrying `checksum` too and reusing the
+    /// source's ETag for a single-form source (the content MD5 is
+    /// unchanged by a copy). `NoSuchKey` when the source does not
+    /// exist; `NoSuchBucket` when either bucket does not.
     async fn copy_object(
         &self,
         src_bucket: &bucket::Name,
         src_key: &object::Key,
         dst_bucket: &bucket::Name,
         dst_key: &object::Key,
-    ) -> Result<PutObjectResult, <Self as Storage>::Error>
+        tags: object::Tags,
+        _checksum: Option<checksum::Recorded>,
+    ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         let get = self.get_object(src_bucket, src_key, None).await?;
-        self.put_object(dst_bucket, dst_key, get.body).await
+        let staged = self.stage_body(dst_bucket, dst_key, get.body, None).await?;
+        self.commit_object(dst_bucket, dst_key, staged, tags).await
     }
+
+    /// Atomically move `src` to `dst` (S3 RenameObject): the object's
+    /// metadata — mtime, tags, recorded checksum, retained parts —
+    /// moves with it; a rename is not a fresh object. An existing `dst`
+    /// is overwritten. `NoSuchKey` when `src` is missing; `NoSuchBucket`
+    /// when the bucket does not.
+    async fn rename_object(
+        &self,
+        bucket: &bucket::Name,
+        src: &object::Key,
+        dst: &object::Key,
+    ) -> Result<object::Info, <Self as Storage>::Error>
+    where
+        Self: Storage;
 
     /// Object metadata; `NoSuchKey` when missing.
     async fn head_object(
@@ -245,12 +288,57 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage;
 
+    /// The object's tag set (S3 GetObjectTagging). `NoSuchKey` when the
+    /// object is missing.
+    async fn get_object_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<object::Tags, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the object's tag set (S3 PutObjectTagging — replace-all,
+    /// no merge). `NoSuchKey` when the object is missing.
+    async fn put_object_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        tags: &object::Tags,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Remove the object's tag set (S3 DeleteObjectTagging). S3
+    /// semantics: idempotent — a missing object is Ok.
+    async fn delete_object_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
     /// List objects with prefix filtering, delimiter grouping, and
     /// pagination (S3 semantics).
     async fn list_objects(
         &self,
         params: ListObjectsParams,
     ) -> Result<ObjectListing, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// The retained part rows of a completed multipart object (S3
+    /// GetObjectAttributes `ObjectParts`): the parts the object was
+    /// composed of at its last multipart completion, in part-number
+    /// order, with the stored per-part checksums. Empty for an object
+    /// that was not multipart-completed (a plain put or copy has no
+    /// parts).
+    async fn list_object_parts(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Vec<ObjectPart>, <Self as Storage>::Error>
     where
         Self: Storage;
 }
@@ -270,6 +358,8 @@ mod tests {
             size: 1,
             last_modified: SystemTime::UNIX_EPOCH,
             etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         let listing = ObjectListing {
             objects: vec![info],
@@ -296,6 +386,8 @@ mod tests {
                 size: 0,
                 last_modified: SystemTime::UNIX_EPOCH,
                 etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+                tags: object::Tags::empty(),
+                checksum: None,
             },
             body: Box::pin(stream::empty()),
             served_range: Some((0, 0)),
@@ -310,6 +402,8 @@ mod tests {
             size: 1,
             last_modified: SystemTime::UNIX_EPOCH,
             etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         let result = GetObjectResult {
             info,

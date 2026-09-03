@@ -127,6 +127,25 @@ mod tests {
                 StorageError::Io(IoError::other("boom")),
                 S3ErrorCode::InternalError,
             ),
+            (
+                StorageError::PartTooSmall {
+                    part_number: 1,
+                    min_bytes: 5 * 1024 * 1024,
+                    actual: 42,
+                },
+                S3ErrorCode::EntityTooSmall,
+            ),
+            (
+                StorageError::TooManyMultipartUploads { limit: 7 },
+                S3ErrorCode::SlowDown,
+            ),
+            (
+                StorageError::EntityTooLarge {
+                    size: 1024,
+                    limit: 100,
+                },
+                S3ErrorCode::EntityTooLarge,
+            ),
         ];
         for (storage_err, expected) in cases {
             assert_eq!(s3_code(storage_err), expected);

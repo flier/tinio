@@ -222,7 +222,7 @@ struct InFlightGauge;
 
 impl Drop for InFlightGauge {
     fn drop(&mut self) {
-        metrics::HTTP_IN_FLIGHT.dec();
+        metrics::http_in_flight_dec();
     }
 }
 
@@ -236,7 +236,7 @@ impl DataPlaneService {
 
     fn call_with_peer(&self, req: Request<Incoming>, peer: SocketAddr) -> ServiceFuture {
         let start = Instant::now();
-        metrics::HTTP_IN_FLIGHT.inc();
+        metrics::http_in_flight_inc();
         // Decrements when the future completes AND when hyper drops it
         // (client disconnect mid-request) — a cancelled future must not
         // leak the gauge. Moved into the future below.
@@ -285,7 +285,7 @@ impl DataPlaneService {
                 .map_err(|e| IoError::other(format!("{e:?}")).into());
             let elapsed = start.elapsed();
             let upload_bytes = upload_counter.load(Ordering::Relaxed);
-            metrics::STORAGE_UPLOAD_BYTES.inc_by(upload_bytes);
+            metrics::record_upload_bytes(upload_bytes);
             // The gauge is released here (normal completion) or with the
             // future itself (cancellation).
             drop(inflight);
@@ -372,7 +372,7 @@ impl<B> CountingBody<B> {
         if self.kind == CountingKind::Download && !self.recorded {
             self.recorded = true;
             let n = self.counter.load(Ordering::Relaxed);
-            metrics::STORAGE_DOWNLOAD_BYTES.inc_by(n);
+            metrics::record_download_bytes(n);
         }
     }
 }
@@ -641,8 +641,10 @@ mod tests {
     #[test]
     fn counting_body_records_download_bytes_exactly_once() {
         // Scenarios are serialized inside one test — the gauge is global,
-        // and parallel tests would clobber each other's deltas.
-
+        // and parallel tests would clobber each other's deltas. The
+        // process-wide metric window (metrics::test_lock) additionally
+        // excludes the OTHER tests' data-plane writes for the window.
+        let _window = metrics::test_lock::window();
         // (1) A fully-drained download records its total once.
         let before = metrics::STORAGE_DOWNLOAD_BYTES.get();
         let counter = Arc::new(AtomicU64::new(0));
@@ -685,6 +687,7 @@ mod tests {
 
     #[test]
     fn inflight_gauge_decrements_on_drop() {
+        let _window = metrics::test_lock::window();
         metrics::HTTP_IN_FLIGHT.set(5);
         {
             let _gauge = InFlightGauge;

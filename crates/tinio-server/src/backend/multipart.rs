@@ -22,19 +22,21 @@ use tracing::warn;
 use crate::{
     _core::{
         ETag,
-        checksum::{Algorithm, Part, Type, Upload, Value},
+        checksum::{Algorithm, Part, Recorded, Type, Upload, Value},
         multipart::{
             CompletedPart, PartNumber, check_part_minimum, part_number as parse_part_number,
         },
-        storage::{ByteRange, Error as StorageError, ListPartsParams, ListUploadsParams, Storage},
+        object,
+        storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
     },
     backend::{
         ConditionalHeaders, S3Backend, byte_range, check_complete_conditions, check_write_shape,
         checksum::{
-            self, HasFields, VerifyState, VerifyStream, compose_composite, linearize_full_object,
-            single_checksum_value,
+            self, HasFields, VerifyState, VerifyStream, compose_composite, echo_validated,
+            linearize_full_object, map_part_error, single_checksum_value,
         },
         map_backend_error, normalize_delimiter, normalize_page_size, same_whole_second,
+        tags::parse_tagging_header,
     },
 };
 
@@ -56,17 +58,6 @@ fn copy_source_range(raw: &str) -> Result<ByteRange, S3Error> {
     match range {
         ByteRange::Inclusive(_, _) => Ok(range),
         _ => Err(invalid()),
-    }
-}
-
-/// The `upload_part` error mapping of the tee paths: a stream that
-/// ended in a checksum mismatch surfaces as `BadDigest` (the part was
-/// never committed), anything else as the backend error.
-fn map_part_error<E: Into<StorageError>>(state: Option<&VerifyState>, err: E) -> S3Error {
-    if state.is_some_and(|state| state.mismatched()) {
-        s3_error!(BadDigest, "checksum mismatch")
-    } else {
-        map_backend_error(err)
     }
 }
 
@@ -265,9 +256,18 @@ impl<S: Storage> S3Backend<S> {
         } else {
             None
         };
+        // The create-time object tags (spec 2026-08-31): parsed under
+        // the tagging toggle only — off keeps the established
+        // accept-and-drop — and persisted with the upload state for the
+        // completion to apply to the object.
+        let tags = if self.caps.tagging {
+            parse_tagging_header(req.input.tagging.as_ref())?.unwrap_or_default()
+        } else {
+            object::Tags::empty()
+        };
         let upload = self
             .storage
-            .create_multipart_upload(&bucket, &key, checksum)
+            .create_multipart_upload(&bucket, &key, checksum, tags)
             .await
             .map_err(map_backend_error)?;
         // Seed the spec cache (F04): the spec is immutable after create
@@ -382,17 +382,7 @@ impl<S: Storage> S3Backend<S> {
             e_tag: Some(Self::etag_wire(&part.etag)),
             ..Default::default()
         };
-        // Response echo only when the request carried a value — a header
-        // field or a declared trailer (S3 API docs: "only be present if
-        // the checksum was provided in the request"). The validated
-        // computed value equals the provided one.
-        if let Some((state, spec)) = &tee
-            && let Some(algo) = spec.algorithm
-            && (spec.expected.is_some() || spec.trailer_algo.is_some())
-            && let Some(computed) = state.computed()
-        {
-            output.set_checksum(algo, computed.as_str());
-        }
+        echo_validated(&mut output, tee.as_ref());
         Ok(S3Response::new(output))
     }
 
@@ -590,12 +580,14 @@ impl<S: Storage> S3Backend<S> {
         let has_dest_conditions = req.input.if_match.is_some() || req.input.if_none_match.is_some();
         // The persisted upload state, fetched under the lock before the
         // destination checks: it validates the upload still exists
-        // (above) and, when the checksum toggle is on, decides with the
-        // full-object value whether the part snapshot below is needed at
-        // all (Eff #1 — with the toggle on, a single-part complete with
-        // no checksums anywhere skips the full paging loop). One fetch
-        // serves both consumers; a conditional complete with the toggle
-        // off still pays the existence read only.
+        // (above) and, with the checksum toggle on, supplies the spec
+        // that decides with the full-object value whether the part
+        // snapshot below is needed at all (Eff #1 — with the toggle on,
+        // a single-part complete with no checksums anywhere skips the
+        // full paging loop). The create-time tags are NOT fetched: the
+        // completion applies them from the upload state it consumes
+        // (spec 2026-08-31). A conditional complete with the checksum
+        // toggle off still pays the existence read only.
         let upload = if has_dest_conditions {
             // The upload-existence fetch and the destination head are
             // independent reads — run them concurrently (the pattern
@@ -691,7 +683,11 @@ impl<S: Storage> S3Backend<S> {
         // lock — spec R8): a failed validation returns before any write,
         // so the upload (and any pre-existing object of the same key)
         // is left untouched — matching S3, with no rollback machinery.
-        let mut echo_checksum: Option<(Algorithm, Value)> = None;
+        // The echoed full-object value carries the derivation kind that
+        // produced it: the same value records into the completed
+        // object's checksum record (the GET/HEAD echo of spec
+        // 2026-08-31) with its `checksum_type`.
+        let mut echo_checksum: Option<(Algorithm, Value, Type)> = None;
         if self.caps.checksum
             && let Some(upload) = upload.as_ref()
         {
@@ -777,13 +773,13 @@ impl<S: Storage> S3Backend<S> {
                     )?;
                     match (full, derived) {
                         (Some((_, value)), Some(computed)) if computed.as_str() == value => {
-                            echo_checksum = Some((upload_algo, computed));
+                            echo_checksum = Some((upload_algo, computed, checksum_type));
                         }
                         (Some(_), Some(_)) => {
                             return Err(s3_error!(BadDigest, "checksum mismatch"));
                         }
                         (None, Some(computed)) => {
-                            echo_checksum = Some((upload_algo, computed));
+                            echo_checksum = Some((upload_algo, computed, checksum_type));
                         }
                         // Skipped (D2) — accepted, not validated.
                         (_, None) => {}
@@ -793,7 +789,23 @@ impl<S: Storage> S3Backend<S> {
         }
         let info = self
             .storage
-            .complete_multipart_upload(&bucket, &key, &upload_id, &parts)
+            .complete_multipart_upload(
+                &bucket,
+                &key,
+                &upload_id,
+                &parts,
+                // The echoed composite records into the object (the
+                // GET/HEAD echo of spec 2026-08-31) with its derivation
+                // kind; absent when the toggle is off or the derivation
+                // was skipped (D2).
+                echo_checksum.as_ref().map(|(algo, value, kind)| Recorded {
+                    part: Part {
+                        algorithm: *algo,
+                        value: value.clone(),
+                    },
+                    kind: *kind,
+                }),
+            )
             .await
             .map_err(map_backend_error)?;
         // The upload is finished — its spec entry would otherwise stay
@@ -807,7 +819,7 @@ impl<S: Storage> S3Backend<S> {
             location,
             ..Default::default()
         };
-        if let Some((algo, value)) = echo_checksum {
+        if let Some((algo, value, _)) = echo_checksum {
             output.set_checksum(algo, value.as_str());
         }
         Ok(S3Response::new(output))
@@ -1894,6 +1906,7 @@ mod tests {
                     algorithm: Algorithm::Crc32,
                     r#type: None,
                 }),
+                object::Tags::empty(),
             )
             .await
             .unwrap();
@@ -1927,6 +1940,119 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn complete_applies_the_create_time_tags() {
+        let (backend, b) = setup().await;
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                tagging: Some("env=prod&z=1".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload_id = create.output.upload_id.unwrap();
+        let etag = upload_one_part(&backend, &b, &upload_id, b"hello").await;
+        backend
+            .complete_multipart_upload(s3_request(complete_input(&upload_id, &[etag])))
+            .await
+            .unwrap();
+        let head = backend
+            .storage()
+            .head_object(&bucket::name(&b).unwrap(), &object::key("big.bin").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(head.tags.to_wire(), "env=prod&z=1");
+    }
+
+    #[tokio::test]
+    async fn complete_tags_toggle_off_accepts_and_drops() {
+        // The write header is accept-and-drop under the toggle off —
+        // even a malformed value passes — and the completed object
+        // records nothing.
+        let (backend, b) = setup_with_caps(Capabilities {
+            tagging: false,
+            ..Default::default()
+        })
+        .await;
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                tagging: Some("no-equals-sign".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload_id = create.output.upload_id.unwrap();
+        let etag = upload_one_part(&backend, &b, &upload_id, b"hello").await;
+        backend
+            .complete_multipart_upload(s3_request(complete_input(&upload_id, &[etag])))
+            .await
+            .unwrap();
+        let head = backend
+            .storage()
+            .head_object(&bucket::name(&b).unwrap(), &object::key("big.bin").unwrap())
+            .await
+            .unwrap();
+        assert!(head.tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_objects_record_the_composite_and_echo_it_on_reads() {
+        // Spec 2026-08-31: the completion records the derived composite
+        // (the response-echo value) with its COMPOSITE kind; GET/HEAD
+        // then echo the recorded value + `x-amz-checksum-type`.
+        let (backend, b) = setup_checksum().await;
+        let upload_id = create_upload(&backend, &b, Some("SHA256"), None).await;
+        let etag = upload_one_part(&backend, &b, &upload_id, b"hello").await;
+        let complete = backend
+            .complete_multipart_upload(s3_request(complete_input(&upload_id, &[etag])))
+            .await
+            .unwrap();
+        let echoed = complete.output.checksum_sha256.as_ref().unwrap().clone();
+        let head = backend
+            .storage()
+            .head_object(&bucket::name(&b).unwrap(), &object::key("big.bin").unwrap())
+            .await
+            .unwrap();
+        let recorded = head.checksum.unwrap();
+        assert_eq!(recorded.part.algorithm, Algorithm::Sha256);
+        assert_eq!(recorded.part.value.as_str(), echoed.as_str());
+        assert_eq!(recorded.kind, Type::Composite);
+        // GET and HEAD echo the recorded value with the recorded kind.
+        let got = backend
+            .get_object(s3_request(dto::GetObjectInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(got.output.checksum_sha256.as_deref(), Some(echoed.as_str()));
+        assert_eq!(
+            got.output.checksum_type.as_ref().map(|t| t.as_str()),
+            Some("COMPOSITE")
+        );
+        let head = backend
+            .head_object(s3_request(dto::HeadObjectInput {
+                bucket: b.clone(),
+                key: "big.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            head.output.checksum_sha256.as_deref(),
+            Some(echoed.as_str())
+        );
+        assert_eq!(
+            head.output.checksum_type.as_ref().map(|t| t.as_str()),
+            Some("COMPOSITE")
+        );
     }
 
     /// Upload one part of `data` and return its wire ETag.
@@ -2010,7 +2136,7 @@ mod tests {
         // 404 NoSuchKey arm is unit-tested in `conditions.rs`).
         let upload_id = create_upload(&backend, &b, None, None).await;
         let etag = upload_one_part(&backend, &b, &upload_id, b"again").await;
-        let mut input = complete_input(&upload_id, &[etag.clone()]);
+        let mut input = complete_input(&upload_id, &[etag]);
         input.if_match = Some("*".parse().unwrap());
         backend
             .complete_multipart_upload(s3_request(input))

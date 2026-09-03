@@ -147,12 +147,15 @@ pub struct UploadsListing {
 pub trait MultipartOps: Send + Sync + 'static {
     /// Start a multipart upload; returns the upload state with a fresh
     /// upload id. `checksum` is the create-time checksum spec
-    /// (persisted; echoed by `get_multipart_upload`/`list_multipart_uploads`).
+    /// (persisted; echoed by `get_multipart_upload`/`list_multipart_uploads`),
+    /// `tags` the object's create-time tag set (persisted in the upload
+    /// state; applied to the completed object).
     async fn create_multipart_upload(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         checksum: Option<checksum::Upload>,
+        tags: object::Tags,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -223,7 +226,12 @@ pub trait MultipartOps: Send + Sync + 'static {
     where
         Self: Storage;
 
-    /// Assemble the listed parts into the final object (streaming, atomic).
+    /// Assemble the listed parts into the final object (streaming,
+    /// atomic), recording the upload's create-time tags — read from the
+    /// upload state the completion consumes, never re-ferried through
+    /// the interface — and `checksum` (the composite full-object digest
+    /// the interface computed for the response echo; the backends never
+    /// hash) with the object in the same transaction.
     ///
     /// `parts` is the client's `CompleteMultipartUpload` list: strictly
     /// ascending numbers, each ETag matching the stored part. Extra stored
@@ -241,6 +249,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         key: &object::Key,
         upload_id: &str,
         parts: &[CompletedPart],
+        checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage;

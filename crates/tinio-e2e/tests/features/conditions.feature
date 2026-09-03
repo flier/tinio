@@ -414,3 +414,106 @@ Feature: Request conditions
       | x-amz-if-none-match | "deadbeefdeadbeefdeadbeefdeadbeef" |
     Then the response status is 501
     And the error code is "NotImplemented"
+
+  # Task 11 (2026-08-31 s3-tagging-ops): RenameObject — the AWS
+  # directory-bucket move, honored on the general-purpose model. Wire
+  # shape (s3s 0.15): PUT /{bucket}/{destination}?renameObject — NOT a
+  # query-disambiguated POST — with the source in `x-amz-rename-source`
+  # (a key of the request's own bucket, optionally with the leading
+  # slash of the documented form). The source conditions ride the
+  # x-amz-rename-source-if-* headers, the destination conditions the
+  # plain If-* headers. The response echoes the moved object's ETag as a
+  # response header (the s3s output model is empty).
+  # Task 12 (2026-09-03): the rename scenarios below carry @FR-031
+  # (contracts/s3-surface.md §RenameObject) — per-scenario tags, because
+  # the feature-level tags above describe the pre-existing scenarios.
+
+  @FR-031
+  Scenario: RenameObject moves the object under a matching source condition
+    Given I create bucket "data"
+    And I upload "data/a.txt" with body "hello"
+    Then the response header "ETag" is stored
+    When I send a "PUT" request to "/data/b.txt?renameObject" with headers
+      | x-amz-rename-source          | a.txt |
+      | x-amz-rename-source-if-match | {etag} |
+    Then the response status is 200
+    And the response header "ETag" is stored
+    # The move preserved the object: the same validator answers at the
+    # destination…
+    When I get object "data/b.txt"
+    Then the response status is 200
+    And the object body is "hello"
+    And the object ETag is the MD5 of "hello"
+    # …and the source is gone.
+    When I get object "data/a.txt"
+    Then the response status is 404
+    And the error code is "NoSuchKey"
+
+  @FR-031
+  Scenario: RenameObject source condition mismatch answers 412
+    Given I create bucket "data"
+    And I upload "data/a.txt" with body "hello"
+    When I send a "PUT" request to "/data/b.txt?renameObject" with headers
+      | x-amz-rename-source          | a.txt |
+      | x-amz-rename-source-if-match | "deadbeefdeadbeefdeadbeefdeadbeef" |
+    Then the response status is 412
+    And the error code is "PreconditionFailed"
+    # The failed rename moved nothing…
+    When I get object "data/a.txt"
+    Then the response status is 200
+    # …and a missing source answers NoSuchKey under any condition
+    # (tinio's choice — the AWS docs are silent on the failure mode).
+    When I send a "PUT" request to "/data/b.txt?renameObject" with headers
+      | x-amz-rename-source | missing.txt |
+    Then the response status is 404
+    And the error code is "NoSuchKey"
+
+  @FR-031
+  Scenario: RenameObject overwrites an existing destination
+    Given I create bucket "data"
+    And I upload "data/a.txt" with body "hello"
+    And I upload "data/b.txt" with body "old"
+    # The destination conditions ride the plain If-* headers: an
+    # If-None-Match: * guards the existing object…
+    When I send a "PUT" request to "/data/b.txt?renameObject" with headers
+      | x-amz-rename-source | a.txt |
+      | If-None-Match       | *     |
+    Then the response status is 412
+    And the error code is "PreconditionFailed"
+    When I get object "data/b.txt"
+    Then the response status is 200
+    And the object body is "old"
+    # …and an unconditional rename replaces it.
+    When I send a "PUT" request to "/data/b.txt?renameObject" with headers
+      | x-amz-rename-source | a.txt |
+    Then the response status is 200
+    When I get object "data/b.txt"
+    Then the response status is 200
+    And the object body is "hello"
+    When I get object "data/a.txt"
+    Then the response status is 404
+    And the error code is "NoSuchKey"
+
+  @FR-031
+  Scenario: RenameObject onto itself answers 412
+    Given I create bucket "data"
+    And I upload "data/a.txt" with body "hello"
+    # The leading-slash source form is accepted (stripped before the
+    # degenerate-key comparison, which fires before any head).
+    When I send a "PUT" request to "/data/a.txt?renameObject" with headers
+      | x-amz-rename-source | /a.txt |
+    Then the response status is 412
+    And the error code is "PreconditionFailed"
+    When I get object "data/a.txt"
+    Then the response status is 200
+    And the object body is "hello"
+
+  @minimal-caps
+  @FR-031
+  Scenario: RenameObject answers NotImplemented when copy is disabled
+    Given I create bucket "data"
+    And I upload "data/a.txt" with body "hello"
+    When I send a "PUT" request to "/data/b.txt?renameObject" with headers
+      | x-amz-rename-source | a.txt |
+    Then the response status is 501
+    And the error code is "NotImplemented"

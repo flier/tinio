@@ -71,7 +71,7 @@ Pain points of the file approach:
 
 ```
 <state-dir>/
-├── meta.redb                # all derived metadata (5 tables, see 5.2); redb 4.2 has no separate lock file (verified)
+├── meta.redb                # all derived metadata (8 tables, see 5.2); redb 4.2 has no separate lock file (verified)
 ├── tmp/                     # unchanged: staging area for object writes and multipart assembly (transient data files)
 └── multipart/<bucket>/<upload_id>/part-<n>   # part content files only; no upload.json, no sidecars
 ```
@@ -82,13 +82,16 @@ Pain points of the file approach:
 
 | Table | key | value | Notes |
 |---|---|---|---|
-| `OBJECT_META` | `(bucket: &str, key: &str)` | `(etag_hex: &str, size: u64, mtime_nanos: u64, file_identity: u64)` | composite key makes per-bucket range scans free (walk, remove_bucket); identity is used for composed-ETag touch/replace discrimination (§5.5.7) |
-| `BUCKETS` | `name: &str` | `created_at_nanos: u64` | aligns with the existing buckets.json semantics |
-| `UPLOADS` | `(bucket: &str, upload_id: &str)` | `(key: &str, initiated_at_nanos: u64)` | upload existence = record existence (replaces upload.json) |
+| `OBJECT_META` | `(bucket: &str, key: &str)` | `(etag_hex: &str, size: u64, mtime_nanos: u64, file_identity: u64, tags_wire: &str, checksum_wire: &str)` | composite key makes per-bucket range scans free (walk, remove_bucket); identity is used for composed-ETag touch/replace discrimination (§5.5.7). The tags and checksum elements are **empty strings when the object has none** (spec 2026-08-31); the checksum wire is `<algorithm wire>:<base64 value>:<kind>` — e.g. `CRC32:NhCmhg==:FULL_OBJECT` — with the kind (`FULL_OBJECT`/`COMPOSITE`) recorded at write time so read paths never derive it; garbage elements self-heal to empty/`None` on read (like the etag) |
+| `BUCKETS` | `name: &str` | `(created_at_nanos: u64, tags_wire: &str)` | aligns with the existing buckets.json semantics; the tags element is empty when the bucket has none |
+| `UPLOADS` | `(bucket: &str, upload_id: &str)` | `(key: &str, initiated_at_nanos: u64, tags_wire: &str)` | upload existence = record existence (replaces upload.json); the tags element is the create-time object tag set, applied to the object at completion |
 | `PARTS` | `(bucket: &str, upload_id: &str, part_number: u32)` | `etag_hex: &str` | replaces the sidecars; size/mtime come from the part-file stat (real file state) |
-| `STATE` | `"version"` | `1` | validated at open: absent → write it (new DB); present but mismatched → error (mirrors buckets.json's version behavior); also holds the `compact_needed` marker row (see §5.8) |
+| `UPLOAD_CHECKSUMS` | `(bucket: &str, upload_id: &str)` | `(algorithm_wire: &str, checksum_type_wire: &str)` | the upload's create-time checksum spec; `""` for a checksum type that was never fixed |
+| `PART_CHECKSUMS` | `(bucket: &str, upload_id: &str, part_number: u32)` | `(algorithm_wire: &str, base64_value: &str)` | one uploaded part's computed checksum |
+| `OBJECT_PARTS` | `(bucket: &str, key: &str, part_number: u32)` | `(size: u64, algorithm_wire: &str, base64_value: &str)` | the completed object's retained part list (GetObjectAttributes ObjectParts): the parts composed at the object's last multipart completion, in part order, with their stored checksums (`""` = part stored without one). Key shape mirrors `PARTS`. Drained on overwrite/delete/bucket removal, migrated on rename, never inherited by copy |
+| `STATE` | `"version"` | `1` | validated at open: absent → write it (new DB); present but mismatched → error (mirrors buckets.json's version behavior); also holds the `compact_needed` marker row (see §5.8). **Version stays 1 across additive schema changes** — `UPLOAD_CHECKSUMS`/`PART_CHECKSUMS` and the tags/checksum elements + `OBJECT_PARTS` carried no bump (user ruling 2026-09-02: additive changes carry no version; a same-version DB from an older format may fail at row decode — delete and rebuild by hand) |
 
-Encoding conventions: etags are stored as `ETag::as_str()` hex strings, validated into the domain type via `ETag::new` on read — consistent with the existing "storage layer uses plain strings, validation on read" convention; `mtime_nanos` reuses the existing `mtime_nanos()` helper.
+Encoding conventions: etags are stored as `ETag::as_str()` hex strings, validated into the domain type via `ETag::new` on read — consistent with the existing "storage layer uses plain strings, validation on read" convention; `mtime_nanos` reuses the existing `mtime_nanos()` helper. Tags persist as the canonical wire string (sorted `k=v&k2=v2`, RFC-3986 percent-encoded, shared with the `x-amz-tagging` header codec); read paths parse with the tolerant `tags_from_wire` mirror — the 10-cap core `parse_wire` cannot serve the 50-tag bucket cap.
 
 **Range-scan boundary construction**: tuple comparison is per-element by byte order, the first element dominates; one bucket's entries are contiguous from the lower bound `(bucket, "")`. **No exclusive upper bound** — `(bucket + '\u{10FFFF}', "")` does not hold under byte order (`"data-x"`'s first element < `"data\u{10FFFF}"` because `'x'` (0x2D) < 0xF4, so bucket names with longer prefixes leak into the range; verified empirically). Correct approach: scan from `(bucket, "")` and stop when the first element stops matching (`drain_pair`/`collect_pairs` predicate boundary, O(range) + 1 lookahead). No assumptions about the key charset.
 

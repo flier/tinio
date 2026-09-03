@@ -242,7 +242,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            bucket,
+            bucket, object,
             storage::{BucketOps, MultipartOps},
         },
         _util::testing::body,
@@ -301,7 +301,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         storage
-            .create_multipart_upload(&b, &"big.bin".into(), None)
+            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty())
             .await
             .unwrap();
         let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
@@ -343,7 +343,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into(), None)
+            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty())
             .await
             .unwrap();
         storage

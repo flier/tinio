@@ -81,6 +81,7 @@ impl MultipartOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
         checksum: Option<checksum::Upload>,
+        tags: object::Tags,
     ) -> Result<MultipartUpload, Error> {
         self.ensure_bucket(bucket).await?;
         // The multipart path must not be a backdoor for `.tinio` (FR-020).
@@ -92,7 +93,9 @@ impl MultipartOps for FsStorage {
         if key.is_folder_marker() {
             return Err(invalid_key(key.to_string()).into());
         }
-        self.multipart_store.create(bucket, key, checksum).await
+        self.multipart_store
+            .create(bucket, key, checksum, tags)
+            .await
     }
 
     async fn get_multipart_upload(
@@ -195,6 +198,7 @@ impl MultipartOps for FsStorage {
         key: &object::Key,
         upload_id: &str,
         parts: &[CompletedPart],
+        checksum: Option<checksum::Recorded>,
     ) -> Result<Info, Error> {
         let bucket_dir = self.ensure_bucket(bucket).await?;
         if key.is_reserved() {
@@ -214,8 +218,10 @@ impl MultipartOps for FsStorage {
         // Phase 1 (the store's own lock): verify + assemble into a temp
         // file. The upload is NOT consumed here — its records must
         // outlive the rename so a crash in between leaves the upload
-        // listed and a client retry completes idempotently (§5.6).
-        let (temp, etag) = self
+        // listed and a client retry completes idempotently (§5.6). The
+        // assembly also returns each part's `(number, size, checksum
+        // row)` — the retained `OBJECT_PARTS` list.
+        let (temp, etag, part_rows) = self
             .multipart_store
             .complete(bucket, key, upload_id, parts)
             .await?;
@@ -251,7 +257,21 @@ impl MultipartOps for FsStorage {
         let metadata = fs::metadata(&target).await?;
         let size = metadata.len();
         let mtime = metadata.modified()?;
-        self.complete_object_state(bucket, key, upload_id, &etag, &target, &metadata)
+        // The single state transaction: consume the upload records,
+        // persist the object row (tags + the interface-computed composite
+        // checksum — the backend never hashes), and retain the assembled
+        // parts in `OBJECT_PARTS`.
+        let tags = self
+            .complete_object_state(
+                bucket,
+                key,
+                upload_id,
+                &etag,
+                &target,
+                &metadata,
+                checksum.clone(),
+                part_rows,
+            )
             .await?;
         // The part files are dead weight after the consume — remove them
         // best-effort. A failure must NOT fail the completion (the object
@@ -270,6 +290,8 @@ impl MultipartOps for FsStorage {
             size,
             last_modified: mtime,
             etag,
+            tags,
+            checksum,
         })
     }
 
@@ -342,7 +364,7 @@ mod tests {
             storage::{BucketOps, ObjectOps},
         },
         _util::testing::{body, read_body},
-        testutil::{fs_options, storage},
+        testutil::{checksum_tee, fs_options, md5_wire, storage},
     };
 
     #[tokio::test]
@@ -353,7 +375,10 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let err = storage
             .upload_part(
                 &b,
@@ -395,7 +420,10 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let mut parts = Vec::new();
         // Non-final parts must be >= the 5 MiB minimum the backend
         // enforces at complete; the final part may be small.
@@ -437,7 +465,7 @@ mod tests {
             })
             .collect();
         let info = storage
-            .complete_multipart_upload(&b, &k, &upload.upload_id, &completed)
+            .complete_multipart_upload(&b, &k, &upload.upload_id, &completed, None)
             .await
             .unwrap();
         let expected = parts_data.concat();
@@ -473,7 +501,10 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         for i in 1..=5u32 {
             storage
                 .upload_part(&b, &k, &upload.upload_id, i.into(), body(b"x"), None)
@@ -524,11 +555,21 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         storage
-            .create_multipart_upload(&b, &object::key("a.bin").unwrap(), None)
+            .create_multipart_upload(
+                &b,
+                &object::key("a.bin").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&b, &object::key("b.bin").unwrap(), None)
+            .create_multipart_upload(
+                &b,
+                &object::key("b.bin").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         let page = storage
@@ -557,7 +598,12 @@ mod tests {
         storage.create_bucket(&b).await.unwrap();
         for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
             storage
-                .create_multipart_upload(&b, &object::key(key).unwrap(), None)
+                .create_multipart_upload(
+                    &b,
+                    &object::key(key).unwrap(),
+                    None,
+                    object::Tags::empty(),
+                )
                 .await
                 .unwrap();
         }
@@ -605,8 +651,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("same.bin").unwrap();
-        let u1 = storage.create_multipart_upload(&b, &k, None).await.unwrap();
-        storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        let u1 = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
+        storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let page = storage
             .list_multipart_uploads(ListUploadsParams {
                 bucket: b.clone(),
@@ -628,8 +680,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let k = object::key("same.bin").unwrap();
-        storage.create_multipart_upload(&b, &k, None).await.unwrap();
-        storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
+        storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let page1 = storage
             .list_multipart_uploads(ListUploadsParams {
                 bucket: b.clone(),
@@ -683,7 +741,10 @@ mod tests {
         .unwrap();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = storage.create_multipart_upload(&b, &k, None).await.unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let part = storage
             .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"hello"), None)
             .await
@@ -704,7 +765,7 @@ mod tests {
             wait_for_tmp(&storage),
             move || async move {
                 storage2
-                    .complete_multipart_upload(&b2, &k2, &upload_id, &completed)
+                    .complete_multipart_upload(&b2, &k2, &upload_id, &completed, None)
                     .await
                     .unwrap()
             },
@@ -720,5 +781,119 @@ mod tests {
         );
         let get = storage.get_object(&b, &k, None).await.unwrap();
         assert_eq!(read_body(get.body).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn fs_complete_retains_object_parts() {
+        // spec 2026-08-31: completion persists the assembled parts into
+        // OBJECT_PARTS — list_object_parts serves them in part order with
+        // sizes and the per-part checksums, and the object row carries
+        // the completion's tags and the interface-computed composite
+        // checksum (the backend never hashes).
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        let k = object::key("big.bin").unwrap();
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &k, None, tags.clone())
+            .await
+            .unwrap();
+        // Two parts: the non-final first must meet the 5 MiB S3 minimum;
+        // both upload with a tee so the retained rows carry per-part
+        // checksums (the digest values are the parts' real content MD5s).
+        let min = crate::_core::multipart::MIN_PART_BYTES as usize;
+        let first = vec![b'a'; min];
+        let p1 = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                1.into(),
+                body(first.clone()),
+                Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(&first))),
+            )
+            .await
+            .unwrap();
+        let p2 = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                2.into(),
+                body(b"world"),
+                Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(b"world"))),
+            )
+            .await
+            .unwrap();
+        let composite = checksum::Recorded {
+            part: checksum::Part {
+                algorithm: checksum::Algorithm::Md5,
+                value: checksum::Value("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+            },
+            kind: checksum::Type::Composite,
+        };
+        let completed = [
+            crate::_core::CompletedPart {
+                part_number: p1.part_number,
+                etag: p1.etag,
+            },
+            crate::_core::CompletedPart {
+                part_number: p2.part_number,
+                etag: p2.etag,
+            },
+        ];
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload.upload_id,
+                &completed,
+                Some(composite.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.tags, tags, "completion applies the create-time tags");
+        assert_eq!(info.checksum.as_ref(), Some(&composite));
+
+        // The retained part rows: order, sizes, per-part checksums.
+        let parts = storage.list_object_parts(&b, &k).await.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(u32::from(parts[0].part_number), 1);
+        assert_eq!(parts[0].size, min as u64);
+        let checksum = parts[0].checksum.as_ref().expect("part 1's checksum");
+        assert_eq!(checksum.algorithm, checksum::Algorithm::Md5);
+        assert_eq!(checksum.value.0, md5_wire(&first));
+        assert_eq!(u32::from(parts[1].part_number), 2);
+        assert_eq!(parts[1].size, 5);
+        let checksum = parts[1].checksum.as_ref().expect("part 2's checksum");
+        assert_eq!(checksum.value.0, md5_wire(b"world"));
+
+        // A second completion over the same key replaces the rows (the
+        // old completion's parts must not accumulate).
+        let upload2 = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
+        let p = storage
+            .upload_part(&b, &k, &upload2.upload_id, 3.into(), body(b"tail"), None)
+            .await
+            .unwrap();
+        storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload2.upload_id,
+                &[crate::_core::CompletedPart {
+                    part_number: p.part_number,
+                    etag: p.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let parts = storage.list_object_parts(&b, &k).await.unwrap();
+        assert_eq!(parts.len(), 1, "re-completion replaces the retained rows");
+        assert_eq!(u32::from(parts[0].part_number), 3);
     }
 }

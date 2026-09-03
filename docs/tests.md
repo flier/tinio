@@ -28,9 +28,9 @@ cargo test -p tinio-e2e --test traceability
 
 - English; features = executable `specs/001-s3-local-server/contracts/s3-surface.md`.
 - Steps: `Given`/`When` = actions, `Then` = assertions; first-person verbs; `And` chains; unanchored regex; `{int}`/`{string}`/`{word}`.
-- One module per S3 family (`buckets`, `objects`, `multipart`, `listing`, `errors`, `conditions`, `reserved_paths`, `metrics`, `tagging`, `clients`); register in `tests/steps/mod.rs`; shared `World`.
+- One module per S3 family (`buckets`, `clients`, `common`, `conditions`, `errors`, `listing`, `multipart`, `objects`, `reserved_paths` — declared in `tests/steps/mod.rs`; the `metrics`/`tagging` scenarios ride the generic `common` request steps, no dedicated module); shared `World`.
 - Data-driven: `Examples` tables; one behavior per scenario.
-- Tags: feature `@FR-xxx`/`@SC-xxx`/`@Txxx` (filter-inherited, hook-invisible); scenario config (`@fs`/`@mem`/`@nested-root`/`@checksum-on`/`@minimal-caps`/`@cold-listing`/`@max-buckets-3`) + external (`@interop`/`@aws`/`@rclone`/`@boto3`/`@mc`). One mapping: `config_from_tags`.
+- Tags: feature `@FR-xxx`/`@SC-xxx`/`@Txxx` (filter-inherited, hook-invisible); scenario config (`@fs`/`@mem`/`@nested-root`/`@checksum-on`/`@minimal-caps`/`@cold-listing`/`@max-buckets-3`/`@tagging-off`) + external (`@interop`/`@aws`/`@rclone`/`@boto3`/`@mc`). One mapping: `config_from_tags`.
 - Spec IDs: `cargo test -p tinio-e2e --test traceability`.
 
 ### Migration

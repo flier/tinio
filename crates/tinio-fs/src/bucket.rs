@@ -1,10 +1,12 @@
-//! Bucket creation times (task T040, migrated to redb per meta-redb-spec).
+//! Bucket creation times and tags (task T040, migrated to redb per
+//! meta-redb-spec; the tags element per spec 2026-08-31).
 //!
-//! `BUCKETS` table of `<state-dir>/meta.redb`: `name` → created-at unix
-//! nanos. Pre-existing directories get their creation time lazily recorded
-//! on first sight; orphaned entries are pruned on bucket delete and at
-//! startup repair (through [`crate::FsCleanup`]). Redb transactions replace
-//! the old load-modify-save of `buckets.json` under an in-process lock — a
+//! `BUCKETS` table of `<state-dir>/meta.redb`: `name` →
+//! `(created-at unix nanos, tags wire)`. Pre-existing directories get
+//! their creation time lazily recorded on first sight; orphaned entries
+//! are pruned on bucket delete and at startup repair (through
+//! [`crate::FsCleanup`]). Redb transactions replace the old
+//! load-modify-save of `buckets.json` under an in-process lock — a
 //! first-sight record is one atomic upsert, so concurrent first-sights
 //! cannot lose each other's entry.
 
@@ -13,9 +15,9 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 pub use bucket::{Name, name};
 
 use crate::{
-    _core::bucket,
+    _core::{bucket, object},
     Error,
-    database::{self, BucketsTable, Handle},
+    database::{self, BUCKET_TAGS_MAX, BucketsTable, Handle},
 };
 
 /// Bucket-name → creation-time store (`BUCKETS` table).
@@ -55,6 +57,74 @@ impl Store {
     pub async fn created_at(&self, name: &bucket::Name) -> Result<Option<SystemTime>, Error> {
         self.handle
             .read(|txn| BucketsTable::open_readonly(txn)?.get(name))
+            .map_err(Into::into)
+    }
+
+    /// The recorded tag set of a bucket — empty when the row is absent
+    /// (a pre-existing bucket never tagged through the API) or its wire
+    /// is domain-invalid (self-healing, like the object rows).
+    pub async fn tags(&self, name: &bucket::Name) -> Result<object::Tags, Error> {
+        let name = name.clone();
+        self.handle
+            .read(move |txn| {
+                let table = BucketsTable::open_readonly(txn)?;
+                let row = table.row(&name)?;
+                Ok(row.map_or_else(object::Tags::empty, |(_, wire)| {
+                    object::Tags::parse_wire_limited(&wire, BUCKET_TAGS_MAX).unwrap_or_default()
+                }))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Replace the bucket's tag set, preserving the creation time — one
+    /// read-modify-write transaction (the row's created-at is kept; a
+    /// missing row is lazily recorded with `now`, the first-sight policy
+    /// of [`Self::get_or_record`]). The caller answers `NoSuchBucket`
+    /// for a missing bucket directory before calling.
+    pub async fn set_tags(&self, name: &bucket::Name, tags: &object::Tags) -> Result<(), Error> {
+        let name = name.clone();
+        let tags = tags.clone();
+        let tags_wire = tags.to_wire();
+        self.handle
+            .write_if(move |txn| {
+                let mut table = BucketsTable::open(txn)?;
+                let Some((created, wire)) = table.row(&name)? else {
+                    // No row yet — the lazy first-sight record (a real
+                    // change: it creates the entry).
+                    table.put_full(&name, SystemTime::now(), &tags_wire)?;
+                    return Ok(Some(()));
+                };
+                if wire == tags_wire {
+                    return Ok(None);
+                }
+                table.put_full(&name, created, &tags_wire)?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Clear the bucket's tag set, preserving the creation time
+    /// (idempotent — a missing row is a no-op; the caller answers
+    /// `NoSuchBucket` for a missing bucket directory before calling).
+    pub async fn clear_tags(&self, name: &bucket::Name) -> Result<(), Error> {
+        let name = name.clone();
+        self.handle
+            .write_if(move |txn| {
+                let mut table = BucketsTable::open(txn)?;
+                let Some((created, wire)) = table.row(&name)? else {
+                    // Nothing to change — no commit (no fsync).
+                    return Ok(None);
+                };
+                if wire.is_empty() {
+                    return Ok(None);
+                }
+                table.put_full(&name, created, "")?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|_| ())
             .map_err(Into::into)
     }
 
@@ -254,7 +324,7 @@ mod tests {
                 Error::Database(UnsupportedVersion {
                     path: _,
                     found: 9,
-                    expected: 2
+                    expected: 1
                 })
             ),
             "{err:?}"

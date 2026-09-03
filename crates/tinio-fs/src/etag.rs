@@ -423,6 +423,8 @@ mod tests {
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: 0,
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         let handle = File::options().write(true).open(&file).unwrap();
         handle
@@ -456,6 +458,8 @@ mod tests {
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: fsutil::file_identity(&file, &metadata),
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         let handle = File::options().write(true).open(&file).unwrap();
         handle
@@ -485,6 +489,8 @@ mod tests {
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: fsutil::file_identity(&file, &metadata),
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         // Overwrite in place with different same-size content. The sleep
         // lands the rewrite in a later Windows FILETIME tick (~16 ms
@@ -522,6 +528,8 @@ mod tests {
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: fsutil::file_identity(&file, &metadata),
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         let replacement = state.path().join("replacement.bin");
         std_fs::write(&replacement, b"hello").unwrap();
@@ -554,6 +562,8 @@ mod tests {
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: fsutil::file_identity(&file, &metadata),
+            tags: object::Tags::empty(),
+            checksum: None,
         };
         let replacement = state.path().join("replacement.bin");
         std_fs::write(&replacement, b"hello").unwrap();

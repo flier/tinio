@@ -43,7 +43,7 @@ fn multipart_assembly(c: &mut Criterion) {
                 // Re-create the upload each iteration (a completed upload is
                 // consumed).
                 let upload = storage
-                    .create_multipart_upload(&bname, &key, None)
+                    .create_multipart_upload(&bname, &key, None, object::Tags::empty())
                     .await
                     .unwrap();
                 let part_data: Vec<u8> = vec![b'p'; PART_SIZE];
@@ -66,7 +66,7 @@ fn multipart_assembly(c: &mut Criterion) {
                     });
                 }
                 let info = storage
-                    .complete_multipart_upload(&bname, &key, &upload.upload_id, &completed)
+                    .complete_multipart_upload(&bname, &key, &upload.upload_id, &completed, None)
                     .await
                     .unwrap();
                 black_box(info.size);

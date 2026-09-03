@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::header::HeaderName;
 use s3s::{
-    S3Result, TrailingHeaders,
+    S3Error, S3Result, TrailingHeaders,
     checksum::ChecksumHasher,
     crypto::{
         Checksum as _, Crc32, Crc32c, Crc64Nvme, Md5, Sha1, Sha256, Sha512, XxHash3, XxHash64,
@@ -32,10 +32,27 @@ use s3s::{
     dto, s3_error,
 };
 
+use super::map_backend_error;
 use crate::_core::{
     BodyStream,
     checksum::{self, Algorithm},
+    storage::Error as StorageError,
 };
+
+/// The tee error mapping of the staging paths (a part upload or a plain
+/// PUT): a stream that ended in a checksum mismatch surfaces as
+/// `BadDigest` (the write was never committed — the storage error alone
+/// would answer `InternalError`), anything else as the backend error.
+pub(crate) fn map_part_error<E: Into<StorageError>>(
+    state: Option<&VerifyState>,
+    err: E,
+) -> S3Error {
+    if state.is_some_and(|state| state.mismatched()) {
+        s3_error!(BadDigest, "checksum mismatch")
+    } else {
+        map_backend_error(err)
+    }
+}
 
 /// The shared outcome of a [`VerifyStream`]: the computed digest (in
 /// the storage-commit slot) and whether an expected value failed to
@@ -133,6 +150,24 @@ impl Spec {
         )
     }
 
+    /// Parse the checksum sources of a `PutObject` request — the PUT
+    /// mirror of [`Spec::from_upload_part`] (the plain-put recording of
+    /// spec 2026-08-31): the single `checksum_<algo>` DTO field, the
+    /// declared aws-chunked trailer, or nothing, with `Content-MD5` as
+    /// the same independent legacy check. The only difference: a plain
+    /// PUT has no persisted create algorithm to reconcile with.
+    pub(crate) fn from_put_object(
+        input: &dto::PutObjectInput,
+        headers: &http::HeaderMap,
+    ) -> S3Result<Option<Spec>> {
+        Self::parse(
+            single_checksum_value(input)?,
+            input.content_md5.as_deref(),
+            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
+            declared_trailer(headers)?,
+        )
+    }
+
     /// The checksum-value sources of one request: the value fields
     /// (`single_checksum_value` already rejected a second), `Content-MD5`,
     /// the `x-amz-checksum-algorithm` header, and the declared
@@ -213,13 +248,16 @@ fn declared_trailer(headers: &http::HeaderMap) -> S3Result<Option<checksum::Algo
 /// The one-method trait that lets an output set its algorithm's value
 /// field across the DTO shapes that carry the checksum value headers
 /// (`UploadPartOutput`, `CompleteMultipartUploadOutput`, `dto::Part`,
-/// `dto::CopyPartResult`).
+/// `dto::CopyPartResult`, the Put/Get/Head object outputs — the
+/// recorded-checksum echo of the write and read paths — and the
+/// GetObjectAttributes containers `dto::Checksum` / `dto::ObjectPart`
+/// of the attribute echo).
 pub(crate) trait HasFields {
     fn set_checksum(&mut self, algo: checksum::Algorithm, value: &str);
 }
 
 /// The `checksum_<algo>` value fields are identical across the
-/// output shapes — one macro, four impls.
+/// output shapes — one macro, seven impls.
 macro_rules! impl_checksum_fields {
     ($ty:ty) => {
         impl HasFields for $ty {
@@ -248,6 +286,38 @@ impl_checksum_fields!(dto::CopyPartResult);
 // The request DTO carries the same ten value fields — the test helper
 // sets the part's field with the same mapping.
 impl_checksum_fields!(dto::UploadPartInput);
+// The write/read object outputs of the recorded-checksum echo
+// (spec 2026-08-31): a PUT echoes the validated request value,
+// GET/HEAD echo the recorded one.
+impl_checksum_fields!(dto::PutObjectOutput);
+impl_checksum_fields!(dto::GetObjectOutput);
+impl_checksum_fields!(dto::HeadObjectOutput);
+// The GetObjectAttributes containers (the attribute echo of the
+// recorded object checksum and the retained part checksums).
+impl_checksum_fields!(dto::Checksum);
+impl_checksum_fields!(dto::ObjectPart);
+
+/// The output shapes whose recorded-checksum echo also carries the
+/// `checksum_type` dto field (the GET/HEAD object outputs and the
+/// GetObjectAttributes `dto::Checksum` container — the s3s fields the
+/// [`HasFields`] macro cannot reach).
+pub(crate) trait ChecksumTypeField {
+    fn set_checksum_type(&mut self, ty: dto::ChecksumType);
+}
+
+macro_rules! impl_checksum_type_field {
+    ($ty:ty) => {
+        impl ChecksumTypeField for $ty {
+            fn set_checksum_type(&mut self, ty: dto::ChecksumType) {
+                self.checksum_type = Some(ty);
+            }
+        }
+    };
+}
+
+impl_checksum_type_field!(dto::GetObjectOutput);
+impl_checksum_type_field!(dto::HeadObjectOutput);
+impl_checksum_type_field!(dto::Checksum);
 
 /// The s3s wire algorithm of a [`checksum::Algorithm`].
 pub(crate) fn wire_algo(algo: checksum::Algorithm) -> dto::ChecksumAlgorithm {
@@ -271,6 +341,35 @@ pub(crate) fn wire_type(ty: checksum::Type) -> dto::ChecksumType {
         checksum::Type::Composite => dto::ChecksumType::COMPOSITE,
         checksum::Type::FullObject => dto::ChecksumType::FULL_OBJECT,
     })
+}
+
+/// The response echo of a validated request checksum — the plain-PUT
+/// and upload-part rule (S3 API docs: "only be present if the checksum
+/// was provided in the request"): the echo fires when the request
+/// carried a header field or a declared trailer, once the computed
+/// digest is known; the validated computed value equals the provided
+/// one.
+pub(crate) fn echo_validated(out: &mut impl HasFields, tee: Option<&(Arc<VerifyState>, Spec)>) {
+    if let Some((state, spec)) = tee
+        && let Some(algo) = spec.algorithm
+        && (spec.expected.is_some() || spec.trailer_algo.is_some())
+        && let Some(computed) = state.computed()
+    {
+        out.set_checksum(algo, computed.as_str());
+    }
+}
+
+/// The recorded-checksum echo rule (spec 2026-08-31 — grilling Q7):
+/// the matching per-algorithm field plus `checksum_type` from the
+/// recorded kind — one rule for the GET/HEAD echoes and the
+/// GetObjectAttributes attribute container; unconditional (nothing is
+/// recorded while the `checksum` toggle is off).
+pub(crate) fn echo_recorded(
+    out: &mut (impl HasFields + ChecksumTypeField),
+    recorded: &checksum::Recorded,
+) {
+    out.set_checksum(recorded.part.algorithm, recorded.part.value.as_str());
+    out.set_checksum_type(wire_type(recorded.kind));
 }
 
 /// The `x-amz-checksum-<algo>` header name of an algorithm.
@@ -297,7 +396,8 @@ pub(crate) trait ValueFields {
 }
 
 /// The value fields are identical across the request/part shapes —
-/// one macro, three impls.
+/// one macro, five impls (the PUT input joins the multipart family for
+/// its single-value scan).
 macro_rules! impl_checksum_value_fields {
     ($ty:ty) => {
         impl ValueFields for $ty {
@@ -320,6 +420,7 @@ macro_rules! impl_checksum_value_fields {
 }
 
 impl_checksum_value_fields!(dto::UploadPartInput);
+impl_checksum_value_fields!(dto::PutObjectInput);
 impl_checksum_value_fields!(dto::CompletedPart);
 impl_checksum_value_fields!(dto::CompleteMultipartUploadInput);
 impl_checksum_value_fields!(dto::Checksum);
@@ -683,6 +784,7 @@ mod tests {
     use futures::stream;
 
     use super::*;
+    use crate::_core::object;
 
     /// The wire base64 of a raw digest.
     fn b64(bytes: &[u8]) -> String {
@@ -982,5 +1084,480 @@ mod tests {
             slot.digest.get().map(|p| p.algorithm),
             Some(Algorithm::Sha256)
         );
+    }
+
+    // --- the mapping layer across ALL algorithms (coverage round): the
+    // request/response DTO value fields, the wire names, and the hasher
+    // slots are identical per algorithm — a swapped slot or a missing
+    // arm only shows when every algorithm is driven, not just the CRC32/
+    // SHA256/MD5 set the HTTP suite exercises.
+
+    /// The s3s digest value of `data` under one algorithm — the
+    /// reference against the per-algorithm echo below (hasher built
+    /// manually, slot by slot, NOT through [`enable_algo`]: a swapped
+    /// slot in the production mapping fails the equality).
+    fn reference_digest(algo: checksum::Algorithm, data: &[u8]) -> String {
+        let mut h = ChecksumHasher::default();
+        match algo {
+            Algorithm::Crc32 => h.crc32 = Some(Crc32::new()),
+            Algorithm::Crc32C => h.crc32c = Some(Crc32c::new()),
+            Algorithm::Crc64Nvme => h.crc64nvme = Some(Crc64Nvme::new()),
+            Algorithm::Sha1 => h.sha1 = Some(Sha1::new()),
+            Algorithm::Sha256 => h.sha256 = Some(Sha256::new()),
+            Algorithm::Sha512 => h.sha512 = Some(Sha512::new()),
+            Algorithm::Md5 => h.md5 = Some(Md5::new()),
+            Algorithm::XxHash64 => h.xxhash64 = Some(XxHash64::new()),
+            Algorithm::XxHash3 => h.xxhash3 = Some(XxHash3::new()),
+            Algorithm::XxHash128 => h.xxhash128 = Some(XxHash128::new()),
+        }
+        h.update(data);
+        checksum_value_of(&h.finalize(), algo).unwrap().to_string()
+    }
+
+    #[test]
+    fn enable_algo_matches_the_manual_slot_for_every_algorithm() {
+        for algo in Algorithm::ALL {
+            let mut mapped = ChecksumHasher::default();
+            enable_algo(&mut mapped, algo);
+            mapped.update(b"hello");
+            let value = checksum_value_of(&mapped.finalize(), algo)
+                .unwrap()
+                .to_string();
+            assert_eq!(value, reference_digest(algo, b"hello"), "algorithm {algo}");
+        }
+    }
+
+    #[test]
+    fn header_name_is_the_lowercased_wire_name_for_every_algorithm() {
+        for algo in Algorithm::ALL {
+            let expected = format!("x-amz-checksum-{}", algo.wire_name().to_ascii_lowercase());
+            assert_eq!(checksum_header_name(algo), expected, "algorithm {algo}");
+        }
+    }
+
+    #[test]
+    fn set_checksum_targets_exactly_the_algorithms_field() {
+        // One DTO shape carries both the writer and the reader of the
+        // value fields (the upload-part input) — set via [`HasFields`],
+        // read back via [`ValueFields`]: each arm must touch only its
+        // own field.
+        for algo in Algorithm::ALL {
+            let mut input = dto::UploadPartInput::default();
+            HasFields::set_checksum(&mut input, algo, "AAAA");
+            for probe in Algorithm::ALL {
+                let value = input.checksum_value(probe);
+                if probe == algo {
+                    assert_eq!(value, Some("AAAA"), "algo {algo} must store its field");
+                } else {
+                    assert!(value.is_none(), "algo {algo} must not touch {probe}");
+                }
+            }
+        }
+    }
+
+    /// A stream that reports `Pending` once, then yields one chunk, then
+    /// ends — the shape a stalled body takes (the tee must forward the
+    /// `Pending` unchanged; a stall is not an error).
+    #[derive(Default)]
+    struct PendingFirst {
+        polled: bool,
+        chunked: bool,
+    }
+
+    impl Stream for PendingFirst {
+        type Item = io::Result<Bytes>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if !self.polled {
+                self.polled = true;
+                return Poll::Pending;
+            }
+            if !self.chunked {
+                self.chunked = true;
+                return Poll::Ready(Some(Ok(Bytes::from_static(b"hi"))));
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_stream_propagates_pending_and_finishes_once() {
+        use std::task::Poll;
+
+        let state = Arc::new(VerifyState::new(false));
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha256),
+            expected: None,
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let mut body = Box::pin(VerifyStream::wrap(
+            Box::pin(PendingFirst::default()),
+            &spec,
+            None,
+            &state,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        // Drive manually so the intermediate `Pending` is observable.
+        let mut saw_pending = false;
+        loop {
+            match Stream::poll_next(body.as_mut(), &mut cx) {
+                Poll::Pending => saw_pending = true,
+                Poll::Ready(Some(Ok(_))) => {}
+                Poll::Ready(Some(Err(err))) => panic!("unexpected stream error: {err}"),
+                Poll::Ready(None) => break,
+            }
+        }
+        assert!(saw_pending, "the tee must forward the inner Pending");
+        assert!(!state.mismatched());
+        // The wrapper is finished: a further poll answers Ready(None)
+        // without touching the wrapped stream again.
+        assert!(matches!(
+            Stream::poll_next(body.as_mut(), &mut cx),
+            Poll::Ready(None)
+        ));
+        // The stream end finalized the digest into the slot.
+        let slot = state.slot();
+        assert_eq!(
+            slot.digest.get().map(|p| p.algorithm),
+            Some(Algorithm::Sha256)
+        );
+    }
+
+    #[test]
+    fn known_vectors_pin_the_wire_encoding() {
+        // The digest values the cucumber features carry over the wire:
+        // a change in the s3s hash encodings (or the slot mapping) fails
+        // here before it can silently break the HTTP scenarios. The
+        // sha1/sha512/md5 values are the standard digests of b"hello"
+        // (raw bytes, base64); the CRC/xxhash values pin the s3s wire
+        // encodings (big-endian register / the crate's own byte order).
+        let cases = [
+            (Algorithm::Crc32C, b"hello", "mnG7TA=="),
+            (Algorithm::Crc64Nvme, b"hello", "M3eFcAZSQlc="),
+            (Algorithm::Sha1, b"hello", "qvTGHdzF6KLavt4PO0gs2a6pQ00="),
+            (
+                Algorithm::Sha512,
+                b"hello",
+                "m3HSJL1i83hdltRq0+o9czGb+8KJDKra4t/3JRlnPKcjI8PZm6XBHXx6zG4UuMXaDEZjR1wuXDre9G9zvN7AQw==",
+            ),
+            (Algorithm::XxHash64, b"hello", "JseCfYifbaM="),
+            (Algorithm::XxHash3, b"hello", "lVXoVVxi3P0="),
+            (Algorithm::XxHash128, b"hello", "tenBrQcbPn/Hec+qXlI4GA=="),
+        ];
+        for (algo, data, expected) in cases {
+            assert_eq!(
+                reference_digest(algo, data),
+                expected,
+                "algorithm {algo} over {data:?}"
+            );
+        }
+    }
+
+    // --- the parse/verify edges the HTTP suite cannot drive (a value
+    // field AND a declared trailer in one request, a trailer list with
+    // foreign names, a stream that ends mismatched).
+
+    #[test]
+    fn spec_rejects_a_value_field_plus_a_declared_trailer() {
+        let err = Spec::parse(
+            Some((Algorithm::Crc32, "y/Q5Jg==")),
+            None,
+            None,
+            Some(Algorithm::Crc32),
+        )
+        .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequest");
+    }
+
+    #[test]
+    fn declared_trailer_skips_foreign_names() {
+        use http::HeaderMap;
+        use s3s::dto::UploadPartInput;
+
+        // Only a signature trailer declared → no checksum spec at all.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-trailer", "x-amz-chunk-signature".parse().unwrap());
+        assert!(
+            Spec::from_upload_part(&UploadPartInput::default(), &headers)
+                .unwrap()
+                .is_none()
+        );
+        // A foreign name before the checksum name is skipped, not fatal.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-trailer",
+            "x-amz-chunk-signature, x-amz-checksum-crc32"
+                .parse()
+                .unwrap(),
+        );
+        let spec = Spec::from_upload_part(&UploadPartInput::default(), &headers)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.trailer_algo, Some(Algorithm::Crc32));
+        // A non-UTF8 trailer declaration is skipped, not fatal.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-trailer",
+            http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        );
+        assert!(
+            Spec::from_upload_part(&UploadPartInput::default(), &headers)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Drain a wrapped stream, returning the first error (a clean end
+    /// fails the test) — the mismatch paths surface as a stream error.
+    async fn drain_first_err(body: BodyStream) {
+        let mut body = body;
+        while let Some(chunk) = body.next().await {
+            if chunk.is_err() {
+                return;
+            }
+        }
+        panic!("expected the checksum mismatch to fail the stream");
+    }
+
+    #[tokio::test]
+    async fn mismatched_algorithm_value_fails_and_records_nothing() {
+        let state = Arc::new(VerifyState::new(true));
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha512),
+            expected: Some(checksum::Value("AAAAAAAAAAAAAAAAAAAAAAAAAAA=".into())),
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(
+                b"hello",
+            ))])),
+            &spec,
+            None,
+            &state,
+        );
+        drain_first_err(body).await;
+        assert!(state.mismatched());
+        let slot = state.slot();
+        assert!(
+            slot.digest.get().is_none(),
+            "a mismatch must not fill the slot"
+        );
+        assert!(slot.etag.as_ref().and_then(|c| c.get()).is_none());
+    }
+
+    #[tokio::test]
+    async fn mismatched_content_md5_fails_even_when_the_algorithm_matches() {
+        let state = Arc::new(VerifyState::new(true));
+        // A correct sha512 value, a wrong Content-MD5: the independent
+        // legacy check must fail the stream on its own.
+        let sha512 = reference_digest(Algorithm::Sha512, b"hello");
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha512),
+            expected: Some(checksum::Value(sha512)),
+            trailer_algo: None,
+            content_md5: Some(checksum::Value(b64(&md5_raw(b"goodbye")))),
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(
+                b"hello",
+            ))])),
+            &spec,
+            None,
+            &state,
+        );
+        drain_first_err(body).await;
+        assert!(state.mismatched());
+        assert!(state.slot().digest.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_declared_trailer_that_never_arrives_is_a_mismatch() {
+        let state = Arc::new(VerifyState::new(false));
+        // A trailer declared by the request, but the trailing-headers
+        // handle stays empty: the value never arrived → mismatch, not a
+        // silent skip.
+        let spec = Spec {
+            algorithm: Some(Algorithm::Crc32),
+            expected: None,
+            trailer_algo: Some(Algorithm::Crc32),
+            content_md5: None,
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(
+                b"hello",
+            ))])),
+            &spec,
+            None,
+            &state,
+        );
+        drain_first_err(body).await;
+        assert!(state.mismatched());
+        assert!(state.slot().digest.get().is_none());
+    }
+
+    #[test]
+    fn compose_composite_skips_on_invalid_base64() {
+        let parts = [checksum::Part {
+            algorithm: Algorithm::Sha256,
+            value: checksum::Value("!!!not-base64!!!".into()),
+        }];
+        let parts: Vec<_> = parts.iter().collect();
+        assert!(compose_composite(Algorithm::Sha256, &parts).is_none());
+    }
+
+    #[test]
+    fn linearize_rejects_non_crc_algorithms_and_bad_widths() {
+        // FULL_OBJECT linearization is CRC-only (S3): a SHA family
+        // algorithm has no matrices → None.
+        let part = checksum::Part {
+            algorithm: Algorithm::Sha256,
+            value: checksum::Value(b64(&[0u8; 32])),
+        };
+        assert!(linearize_full_object(Algorithm::Sha256, &[&part], &[1]).is_none());
+        // A CRC part whose stored value is not the register width is
+        // domain-invalid → None (the caller skips validation).
+        let part = checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value(b64(&[0u8; 8])),
+        };
+        assert!(linearize_full_object(Algorithm::Crc32, &[&part], &[1]).is_none());
+        // One valid part linearizes to itself, whatever its length.
+        let crc = checksum::Value(b64(&crc_raw(Algorithm::Crc32, b"hello")));
+        let part = checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: crc.clone(),
+        };
+        let linearized = linearize_full_object(Algorithm::Crc32, &[&part], &[5]).unwrap();
+        assert_eq!(linearized, crc);
+    }
+
+    #[tokio::test]
+    async fn map_part_error_selects_bad_digest_only_on_mismatch() {
+        let key = object::key("k.bin").unwrap();
+        // No mismatch: the backend error maps through unchanged.
+        let state = Arc::new(VerifyState::new(false));
+        let mapped = map_part_error(Some(&state), StorageError::NoSuchKey(key.clone()));
+        assert_eq!(mapped.code().as_str(), "NoSuchKey");
+        // A mismatched tee maps the SAME backend error to BadDigest.
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha256),
+            expected: Some(checksum::Value(b64(&[0u8; 32]))),
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(
+                b"hello",
+            ))])),
+            &spec,
+            None,
+            &state,
+        );
+        drain_first_err(body).await;
+        assert!(state.mismatched());
+        let mapped = map_part_error(Some(&state), StorageError::NoSuchKey(key));
+        assert_eq!(mapped.code().as_str(), "BadDigest");
+    }
+
+    #[test]
+    fn echo_validated_and_recorded_cover_the_remaining_algorithms() {
+        // echo_validated: fires only when the request carried an
+        // expected value (or a declared trailer) AND the stream computed
+        // one — with an echo for a non-CRC algorithm too.
+        let state = Arc::new(VerifyState::new(false));
+        let _ = state.slot().digest.set(checksum::Part {
+            algorithm: Algorithm::Sha1,
+            value: checksum::Value("abc".into()),
+        });
+        // Compute-only spec: nothing expected → no echo.
+        let compute_only = Spec {
+            algorithm: Some(Algorithm::Sha1),
+            expected: None,
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let mut out = dto::UploadPartOutput::default();
+        echo_validated(&mut out, Some(&(state.clone(), compute_only)));
+        assert!(out.checksum_sha1.is_none(), "compute-only must not echo");
+        // An expected value → the validated value echoes back.
+        let expected = Spec {
+            algorithm: Some(Algorithm::Sha1),
+            expected: Some(checksum::Value("abc".into())),
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let mut out = dto::UploadPartOutput::default();
+        echo_validated(&mut out, Some(&(state, expected)));
+        assert_eq!(out.checksum_sha1.as_deref(), Some("abc"));
+
+        // echo_recorded: the algorithm's field plus the recorded kind.
+        let mut head = dto::HeadObjectOutput::default();
+        echo_recorded(
+            &mut head,
+            &checksum::Recorded {
+                part: checksum::Part {
+                    algorithm: Algorithm::XxHash64,
+                    value: checksum::Value("xyz".into()),
+                },
+                kind: checksum::Type::Composite,
+            },
+        );
+        assert_eq!(head.checksum_xxhash64.as_deref(), Some("xyz"));
+        assert_eq!(
+            head.checksum_type.as_ref().map(|t| t.as_str()),
+            Some(dto::ChecksumType::COMPOSITE)
+        );
+    }
+
+    #[test]
+    fn wire_algo_matches_the_core_wire_name_for_every_algorithm() {
+        // The s3s DTO wire name and the core persisted name are ONE
+        // spelling (F13) — a divergence would break create/complete
+        // echoes for the algorithms the HTTP suite drives.
+        for algo in Algorithm::ALL {
+            assert_eq!(
+                wire_algo(algo).as_str(),
+                algo.wire_name(),
+                "algorithm {algo}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_stream_forwards_inner_errors_and_stays_finished() {
+        // A body stream that fails mid-flight: the tee must forward the
+        // error unchanged and report the stream as finished (no second
+        // poll of the wrapped stream after the error). The tee still
+        // finalizes the partial body it saw and fills the digest slot —
+        // the consuming backend aborts the write on the stream error, so
+        // the slot never reaches a commit.
+        let state = Arc::new(VerifyState::new(true));
+        let spec = Spec {
+            algorithm: Some(Algorithm::Sha256),
+            expected: None,
+            trailer_algo: None,
+            content_md5: None,
+        };
+        let body = VerifyStream::wrap(
+            Box::pin(stream::iter(vec![
+                Ok::<_, io::Error>(Bytes::from_static(b"hello")),
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom")),
+            ])),
+            &spec,
+            None,
+            &state,
+        );
+        let mut body = body;
+        let mut seen_error = false;
+        while let Some(chunk) = body.next().await {
+            if let Err(err) = chunk {
+                seen_error = err.kind() == io::ErrorKind::BrokenPipe;
+            }
+        }
+        assert!(seen_error, "the inner stream error must reach the consumer");
+        assert!(!state.mismatched(), "a transport error is not a mismatch");
     }
 }

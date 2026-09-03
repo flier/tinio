@@ -268,7 +268,7 @@ impl AtomicWriter {
 
     /// Sync `dir` (D1); a failure is warned, never fatal (F06 — see
     /// [`Self::commit`]).
-    async fn sync_dir_warned(dir: &Path) {
+    pub(crate) async fn sync_dir_warned(dir: &Path) {
         if let Err(err) = sync_parent_dir(dir).await {
             tracing::warn!(path = %dir.display(), error = %err, "directory sync failed after a committed rename");
         }
@@ -278,8 +278,9 @@ impl AtomicWriter {
     /// (F03 — the first commit into a new prefix created the chain). Each
     /// sync failure is warned and the chain walk continues (the closest
     /// surviving entry is the strongest durability the filesystem allows
-    /// at that point; F06).
-    async fn sync_ancestor_chain(leaf: &Path, sync_root: Option<&Path>) {
+    /// at that point; F06). Shared with `rename_object`'s file move (the
+    /// same first-into-a-new-prefix durability).
+    pub(crate) async fn sync_ancestor_chain(leaf: &Path, sync_root: Option<&Path>) {
         let mut dir = Some(leaf);
         while let Some(d) = dir {
             Self::sync_dir_warned(d).await;

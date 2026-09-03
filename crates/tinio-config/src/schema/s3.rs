@@ -79,6 +79,11 @@ pub struct Capabilities {
     #[serde(default)]
     #[default = false]
     pub checksum: bool,
+
+    /// Object and bucket tagging (Get/Put/Delete*Tagging). Default on.
+    #[serde(default = "tagging")]
+    #[default = true]
+    pub tagging: bool,
 }
 
 /// S3 section (`[s3]`; runtime level, FR-021). Disabled capability groups
@@ -149,6 +154,10 @@ fn max_buckets() -> u32 {
 
 fn max_keys() -> u32 {
     Capabilities::default().max_keys
+}
+
+fn tagging() -> bool {
+    Capabilities::default().tagging
 }
 
 impl From<&Config> for Capabilities {
@@ -276,6 +285,17 @@ mod tests {
         // The knob flows through the capability pipeline.
         let caps = Capabilities::from(config.s3.as_ref().unwrap());
         assert!(caps.checksum);
+    }
+
+    #[test]
+    fn tagging_defaults_on_and_can_be_disabled() {
+        // The default config has tagging enabled.
+        let caps = Capabilities::default();
+        assert!(caps.tagging);
+        // A config with tagging: false round-trips.
+        let toml = "tagging = false";
+        let caps: Capabilities = toml::from_str(toml).unwrap();
+        assert!(!caps.tagging);
     }
 
     #[test]

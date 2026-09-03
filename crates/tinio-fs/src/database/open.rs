@@ -15,8 +15,8 @@ use super::{
     compact::{Stats, snapshot},
     error::Error,
     tables::{
-        BucketsTable, ObjectMetaTable, PartChecksumsTable, PartsTable, StateTable,
-        UploadChecksumsTable, UploadsTable,
+        BucketsTable, ObjectMetaTable, ObjectPartsTable, PartChecksumsTable, PartsTable,
+        StateTable, UploadChecksumsTable, UploadsTable,
     },
 };
 
@@ -87,6 +87,7 @@ pub fn open(state_dir: &Path) -> Result<Open, Error> {
         PartsTable::ensure(&mut txn)?;
         UploadChecksumsTable::ensure(&mut txn)?;
         PartChecksumsTable::ensure(&mut txn)?;
+        ObjectPartsTable::ensure(&mut txn)?;
         let stats = snapshot(&txn.stats()?);
         txn.commit()?;
         (compact_needed, stats)

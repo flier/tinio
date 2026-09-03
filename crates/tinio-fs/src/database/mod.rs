@@ -1,9 +1,9 @@
 //! The redb state database — `<state-dir>/meta.redb` (meta-redb-spec §5).
 //!
-//! All derived metadata lives in one file across seven tables (`OBJECT_META`,
-//! `BUCKETS`, `UPLOADS`, `PARTS`, `UPLOAD_CHECKSUMS`, `PART_CHECKSUMS`,
-//! `STATE`); the file system keeps only the multipart part contents and the
-//! `tmp/` staging directory.
+//! All derived metadata lives in one file across eight tables
+//! (`OBJECT_META`, `BUCKETS`, `UPLOADS`, `PARTS`, `UPLOAD_CHECKSUMS`,
+//! `PART_CHECKSUMS`, `OBJECT_PARTS`, `STATE`); the file system keeps only
+//! the multipart part contents and the `tmp/` staging directory.
 //!
 //! [`open`] opens-or-creates the database and its tables in one write
 //! transaction (read transactions refuse to open a table that does not
@@ -42,6 +42,9 @@ pub use open::{Integrity, Open, check_integrity, open};
 #[cfg(test)]
 pub(crate) use tables::StateTable;
 pub(crate) use tables::{
-    BucketsTable, PartChecksumsTable, PartsTable, UploadChecksumsTable, UploadsTable,
+    BucketsTable, ObjectPartsTable, PartChecksumsTable, PartsTable, UploadChecksumsTable,
+    UploadsTable,
 };
 pub use tables::{ObjectMetaTable, StoredMeta};
+
+pub(crate) use crate::_core::object::{BUCKET_TAGS_MAX, OBJECT_TAGS_MAX};

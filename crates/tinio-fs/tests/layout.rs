@@ -12,6 +12,7 @@ use std::{fs::read_dir, path::Path};
 use tinio_core::{
     bucket,
     multipart::part_number,
+    object,
     storage::{BucketOps, ListPartsParams, MultipartOps, ObjectOps},
 };
 use tinio_fs::{FsOptions, FsStorage, testing};
@@ -53,7 +54,7 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
     // Multipart lifecycle leaves part files only.
     let key = "big.bin".into();
     let upload = storage
-        .create_multipart_upload(&b, &key, None)
+        .create_multipart_upload(&b, &key, None, object::Tags::empty())
         .await
         .unwrap();
     storage

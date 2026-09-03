@@ -97,10 +97,14 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         Backend::Fs
     };
 
-    // Capability toggles (spec §Tagging, grilling Q4).
+    // Capability toggles (specs/001-s3-local-server/contracts/s3-surface.md
+    // §Object tagging — the tagging capability toggle of FR-030; grilling Q4).
     let mut caps = Capabilities::default();
     if tagged("checksum-on") {
         caps.checksum = true;
+    }
+    if tagged("tagging-off") {
+        caps.tagging = false;
     }
     if tagged("minimal-caps") {
         caps.multipart = false;
@@ -108,6 +112,7 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         caps.list_objects_v1 = false;
         caps.list_objects_v2 = false;
         caps.delete_objects = false;
+        caps.tagging = false;
     }
     if tagged("max-buckets-3") {
         // The ListBuckets-pagination scenarios need a page cap below the
@@ -141,7 +146,9 @@ fn before_hook<'a>(
 ) -> LocalBoxFuture<'a, ()> {
     Box::pin(async move {
         let (backend, caps, fs_kind) = config_from_tags(&scenario.tags);
-        let external = ["interop", "boto3", "mc"].iter().any(|t| has_tag(&scenario.tags, t));
+        let external = ["interop", "boto3", "mc"]
+            .iter()
+            .any(|t| has_tag(&scenario.tags, t));
         if external {
             clients::check_presence(&scenario.tags);
             world.ext = Some(clients::External::start(&caps, fs_kind));

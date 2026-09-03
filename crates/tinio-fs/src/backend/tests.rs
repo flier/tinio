@@ -182,12 +182,12 @@ async fn set_max_concurrent_uploads_is_enforced() {
     storage.set_max_concurrent_uploads(1);
     storage
         .multipart_store()
-        .create(&b, &k, None)
+        .create(&b, &k, None, object::Tags::empty())
         .await
         .unwrap();
     let err = storage
         .multipart_store()
-        .create(&b, &k, None)
+        .create(&b, &k, None, object::Tags::empty())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("uploads"), "{err}");

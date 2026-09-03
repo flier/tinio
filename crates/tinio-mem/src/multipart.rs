@@ -23,9 +23,10 @@ use crate::{
         no_such_bucket, no_such_upload,
     },
     storage::{
-        BUCKETS, MemoryStorage, OBJECT_META, OBJECTS, PART_CHECKSUMS, PART_META, PARTS,
-        UPLOAD_CHECKSUMS, UPLOADS, band_start, check_bucket, check_upload, collect_part_keys,
-        object_key, parse_part_number, part_key, remove_all_parts, upload_key,
+        BUCKETS, MemoryStorage, OBJECT_META, OBJECT_PARTS, OBJECTS, PART_CHECKSUMS, PART_META,
+        PARTS, UPLOAD_CHECKSUMS, UPLOADS, band_start, check_bucket, check_upload,
+        collect_part_keys, object_key, object_part_key, parse_part_number, part_key,
+        remove_all_parts, remove_object_parts, upload_key,
     },
 };
 
@@ -36,6 +37,7 @@ struct UploadRow {
     key: object::Key,
     upload_id: String,
     initiated_at: u64,
+    tags: object::Tags,
     checksum: Option<checksum::Upload>,
 }
 
@@ -46,6 +48,7 @@ impl MultipartOps for MemoryStorage {
         bucket: &bucket::Name,
         key: &object::Key,
         checksum: Option<checksum::Upload>,
+        tags: object::Tags,
     ) -> Result<MultipartUpload, Error> {
         // Bucket existence first, like the fs backend and every S3 op: a
         // reserved/marker key on a missing bucket answers NoSuchBucket,
@@ -68,6 +71,7 @@ impl MultipartOps for MemoryStorage {
             key: key.clone(),
             initiated_at: SystemTime::now(),
             checksum: checksum.clone(),
+            tags: tags.clone(),
         };
         let txn = self.db.begin_write()?;
         {
@@ -75,30 +79,22 @@ impl MultipartOps for MemoryStorage {
             if buckets.get(bucket.as_ref().as_str())?.is_none() {
                 return Err(no_such_bucket(bucket));
             }
+            let ukey = upload_key(
+                upload.bucket.as_ref().as_str(),
+                upload.key.as_ref().as_str(),
+                &upload.upload_id,
+            );
+            // The create-time tags wire rides in the UPLOADS row (spec
+            // 2026-08-31 — applied to the completed object).
+            let tags_wire = tags.to_wire();
             let mut uploads = txn.open_table(UPLOADS)?;
-            uploads.insert(
-                upload_key(
-                    upload.bucket.as_ref().as_str(),
-                    upload.key.as_ref().as_str(),
-                    &upload.upload_id,
-                )
-                .as_str(),
-                now_nanos(),
-            )?;
+            uploads.insert(ukey.as_str(), (now_nanos(), tags_wire.as_str()))?;
             // The create-time checksum spec, persisted alongside the
             // UPLOADS row (spec 2026-08-31).
             if let Some(c) = checksum {
                 let mut cs = txn.open_table(UPLOAD_CHECKSUMS)?;
                 let (algo, ty) = c.to_wire();
-                cs.insert(
-                    upload_key(
-                        upload.bucket.as_ref().as_str(),
-                        upload.key.as_ref().as_str(),
-                        &upload.upload_id,
-                    )
-                    .as_str(),
-                    (algo.as_str(), ty.as_str()),
-                )?;
+                cs.insert(ukey.as_str(), (algo.as_str(), ty.as_str()))?;
             }
         }
         txn.commit()?;
@@ -119,13 +115,22 @@ impl MultipartOps for MemoryStorage {
         }
         let ukey = upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id);
         let txn = self.db.begin_read()?;
-        // One `UPLOADS` row fetch serves both the existence check and
-        // `initiated_at` (the compound key already encodes the identity).
-        let uploads = txn.open_table(UPLOADS)?;
-        let initiated = uploads
-            .get(ukey.as_str())?
-            .ok_or_else(|| no_such_upload(upload_id))?
-            .value();
+        // One `UPLOADS` row fetch serves the existence check,
+        // `initiated_at`, and the create-time tags (the compound key
+        // already encodes the identity). The tags element self-heals on a
+        // domain-invalid wire (empty — like the checksum spec below).
+        let (initiated, tags) = {
+            let uploads = txn.open_table(UPLOADS)?;
+            let guard = uploads
+                .get(ukey.as_str())?
+                .ok_or_else(|| no_such_upload(upload_id))?;
+            let (initiated, tags_wire) = guard.value();
+            (
+                initiated,
+                object::Tags::parse_wire_limited(tags_wire, object::OBJECT_TAGS_MAX)
+                    .unwrap_or_default(),
+            )
+        };
         let checksums = txn.open_table(UPLOAD_CHECKSUMS)?;
         let checksum_row = checksums.get(ukey.as_str())?.map(|v| {
             let (a, t) = v.value();
@@ -140,6 +145,7 @@ impl MultipartOps for MemoryStorage {
             // served without a spec (F07 — the fs backend skips the
             // same way).
             checksum: checksum_row.and_then(|(a, t)| checksum::Upload::from_wire_opt(&a, &t)),
+            tags,
         })
     }
 
@@ -322,6 +328,7 @@ impl MultipartOps for MemoryStorage {
         key: &object::Key,
         upload_id: &str,
         parts: &[CompletedPart],
+        checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
         let txn = self.db.begin_write()?;
         {
@@ -332,17 +339,35 @@ impl MultipartOps for MemoryStorage {
         if parts.is_empty() {
             return Err(no_parts());
         }
+        // The create-time tags applied at completion come from the
+        // UPLOADS row this transaction consumes (spec 2026-08-31) — read
+        // here, never re-ferried through the interface. A garbage wire
+        // self-heals to the empty set (the read-path discipline).
+        let tags = {
+            let uploads = txn.open_table(UPLOADS)?;
+            check_upload(&uploads, upload_id, bucket, key)?;
+            let ukey = upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id);
+            let guard = uploads
+                .get(ukey.as_str())?
+                .ok_or_else(|| no_such_upload(upload_id))?;
+            let tags_wire = guard.value().1.to_string();
+            object::Tags::parse_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
+                .unwrap_or_default()
+        };
         let (data, etag, now) = {
-            {
-                let uploads = txn.open_table(UPLOADS)?;
-                check_upload(&uploads, upload_id, bucket, key)?;
-            }
             let mut prev = 0u32;
             let mut data = Vec::new();
             let mut infos: Vec<PartInfo> = Vec::new();
+            // The retained OBJECT_PARTS rows: each listed part's size and
+            // its stored checksum row (written by upload_part in the same
+            // transaction as the part row), in part order — joined in
+            // this transaction, before the part records are consumed
+            // (spec 2026-08-31).
+            let mut retained: Vec<(u32, u64, Option<(String, String)>)> = Vec::new();
             {
                 let stored_parts = txn.open_table(PARTS)?;
                 let stored_meta = txn.open_table(PART_META)?;
+                let stored_checksums = txn.open_table(PART_CHECKSUMS)?;
                 for (index, part) in parts.iter().enumerate() {
                     let n = u32::from(part.part_number);
                     if n <= prev {
@@ -377,17 +402,39 @@ impl MultipartOps for MemoryStorage {
                         checksum: None,
                     });
                     data.extend_from_slice(body.value());
+                    retained.push((
+                        n,
+                        size,
+                        stored_checksums.get(pk.as_str())?.map(|v| {
+                            let (a, value) = v.value();
+                            (a.to_string(), value.to_string())
+                        }),
+                    ));
                 }
             }
             let etag = ETag::composed_from_parts(&infos).expect("parts checked non-empty above");
             let etag_str = etag.as_str();
             let now = now_nanos();
             let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
+            // The object row: the completion's tags and the
+            // interface-computed composite checksum ride in the same
+            // transaction as the object bytes (the backend never hashes).
+            let tags_wire = tags.to_wire();
+            let checksum_wire = checksum.as_ref().map(|c| c.to_wire()).unwrap_or_default();
             {
                 let mut objects = txn.open_table(OBJECTS)?;
                 let mut obj_meta = txn.open_table(OBJECT_META)?;
                 objects.insert(ok.as_str(), data.as_slice())?;
-                obj_meta.insert(ok.as_str(), (etag_str.as_str(), data.len() as u64, now))?;
+                obj_meta.insert(
+                    ok.as_str(),
+                    (
+                        etag_str.as_str(),
+                        data.len() as u64,
+                        now,
+                        tags_wire.as_str(),
+                        checksum_wire.as_str(),
+                    ),
+                )?;
             }
             {
                 let mut uploads = txn.open_table(UPLOADS)?;
@@ -407,6 +454,23 @@ impl MultipartOps for MemoryStorage {
                     &prefix,
                 )?;
             }
+            {
+                // The retained part list: replace any stale rows of the
+                // key, then insert this completion's parts (a re-completed
+                // key must not accumulate rows).
+                let mut parts_table = txn.open_table(OBJECT_PARTS)?;
+                remove_object_parts(&mut parts_table, &ok)?;
+                for (n, part_size, checksum_row) in retained {
+                    let pk = object_part_key(&ok, n);
+                    let (algorithm, value) = match checksum_row {
+                        Some((algorithm, value)) => (algorithm, value),
+                        // `""` marks a part stored without a checksum.
+                        None => (String::new(), String::new()),
+                    };
+                    parts_table
+                        .insert(pk.as_str(), (part_size, algorithm.as_str(), value.as_str()))?;
+                }
+            }
             (data, etag, now)
         };
         // The assembled object replaces the parts byte-for-byte (the
@@ -419,6 +483,8 @@ impl MultipartOps for MemoryStorage {
             size: data.len() as u64,
             last_modified: from_nanos(now),
             etag,
+            tags,
+            checksum,
         })
     }
 
@@ -558,13 +624,18 @@ impl MultipartOps for MemoryStorage {
                     // A domain-invalid checksum row self-heals: the
                     // upload is listed without a spec (F07 — the fs
                     // backend skips the same way; a hard error here
-                    // would fail the whole listing for one bad row).
+                    // would fail the whole listing for one bad row). The
+                    // create-time tags element self-heals the same way
+                    // (empty — the wire is API-written).
                     let checksum =
                         checksum_row.and_then(|(a, t)| checksum::Upload::from_wire_opt(&a, &t));
+                    let (initiated_at, tags_wire) = v.value();
                     Some(UploadRow {
                         key,
                         upload_id: upload_id.to_string(),
-                        initiated_at: v.value(),
+                        initiated_at,
+                        tags: object::Tags::parse_wire_limited(tags_wire, object::OBJECT_TAGS_MAX)
+                            .unwrap_or_default(),
                         checksum,
                     })
                 }
@@ -601,6 +672,7 @@ impl MultipartOps for MemoryStorage {
                 key: u.key,
                 initiated_at: from_nanos(u.initiated_at),
                 checksum: u.checksum,
+                tags: u.tags,
             })
             .collect();
         let (next_key, next_upload_id) = match next {
@@ -632,6 +704,7 @@ mod tests {
         },
         _util::testing::{body, read_body},
         MemoryOptions,
+        testutil::checksum_tee,
     };
 
     fn completed(part: &PartInfo) -> CompletedPart {
@@ -656,7 +729,7 @@ mod tests {
         let (storage, name) = with_bucket().await;
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None)
+            .create_multipart_upload(&name, &key, None, object::Tags::empty())
             .await
             .unwrap();
         storage
@@ -731,7 +804,7 @@ mod tests {
         storage.create_bucket(&name).await.unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None)
+            .create_multipart_upload(&name, &key, None, object::Tags::empty())
             .await
             .unwrap();
 
@@ -774,7 +847,7 @@ mod tests {
         storage.create_bucket(&name).await.unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None)
+            .create_multipart_upload(&name, &key, None, object::Tags::empty())
             .await
             .unwrap();
 
@@ -825,7 +898,7 @@ mod tests {
 
         // The freed capacity is reusable by a new upload.
         let u2 = storage
-            .create_multipart_upload(&name, &key, None)
+            .create_multipart_upload(&name, &key, None, object::Tags::empty())
             .await
             .unwrap();
         storage
@@ -846,11 +919,11 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let a = storage
-            .create_multipart_upload(&bucket, &key, None)
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
             .await
             .unwrap();
         let b = storage
-            .create_multipart_upload(&bucket, &key, None)
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
             .await
             .unwrap();
         assert_ne!(a.upload_id, b.upload_id);
@@ -862,7 +935,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
             .await
             .unwrap();
         // The listed non-final parts must be >= the 5 MiB minimum (the
@@ -889,6 +962,7 @@ mod tests {
                 &key,
                 &upload.upload_id,
                 &[completed(&uploaded[0]), completed(&uploaded[1])],
+                None,
             )
             .await
             .unwrap();
@@ -910,7 +984,7 @@ mod tests {
         let key = object::key("a.bin").unwrap();
         let min = MIN_PART_BYTES as usize;
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
             .await
             .unwrap();
         let under = storage
@@ -941,6 +1015,7 @@ mod tests {
                 &key,
                 &upload.upload_id,
                 &[completed(&under), completed(&small)],
+                None,
             )
             .await
             .unwrap_err();
@@ -972,5 +1047,141 @@ mod tests {
                 .unwrap_err(),
             Error::Storage(NoSuchBucket(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn mem_complete_retains_object_parts() {
+        // spec 2026-08-31: completion persists the assembled parts into
+        // OBJECT_PARTS — list_object_parts serves them in part order with
+        // sizes and the per-part checksums, and the object row carries
+        // the completion's tags and the interface-computed composite
+        // checksum (the backend never hashes).
+        let (storage, b) = with_bucket().await;
+        let k = object::key("big.bin").unwrap();
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        let upload = storage
+            .create_multipart_upload(&b, &k, None, tags.clone())
+            .await
+            .unwrap();
+        assert_eq!(upload.tags, tags, "the create-time tags ride on the upload");
+        assert_eq!(
+            storage
+                .get_multipart_upload(&b, &k, &upload.upload_id)
+                .await
+                .unwrap()
+                .tags,
+            tags,
+            "the stored upload row echoes the create-time tags"
+        );
+        // Two parts: the non-final first must meet the 5 MiB S3 minimum;
+        // both upload with a preset tee so the retained rows carry
+        // per-part checksums (the digest values are the tee's — the
+        // backend never validates them against the bytes).
+        let min = MIN_PART_BYTES as usize;
+        let first = vec![b'a'; min];
+        let p1 = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                1.into(),
+                body(first.clone()),
+                Some(checksum_tee(checksum::Algorithm::Crc32, "NhCmhg==")),
+            )
+            .await
+            .unwrap();
+        let p2 = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                2.into(),
+                body(b"world".to_vec()),
+                Some(checksum_tee(
+                    checksum::Algorithm::Md5,
+                    "N7SrFkGmSbsK8h0dJ9nK1Q==",
+                )),
+            )
+            .await
+            .unwrap();
+        let composite = checksum::Recorded {
+            part: checksum::Part {
+                algorithm: checksum::Algorithm::Md5,
+                value: checksum::Value("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+            },
+            kind: checksum::Type::Composite,
+        };
+        let completed = [
+            CompletedPart {
+                part_number: p1.part_number,
+                etag: p1.etag,
+            },
+            CompletedPart {
+                part_number: p2.part_number,
+                etag: p2.etag,
+            },
+        ];
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload.upload_id,
+                &completed,
+                Some(composite.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.tags, tags, "completion applies the create-time tags");
+        assert_eq!(info.checksum.as_ref(), Some(&composite));
+        assert_eq!(
+            storage.head_object(&b, &k).await.unwrap().checksum,
+            Some(composite),
+            "the object row carries the composite"
+        );
+
+        // The retained part rows: order, sizes, per-part checksums.
+        let parts = storage.list_object_parts(&b, &k).await.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(u32::from(parts[0].part_number), 1);
+        assert_eq!(parts[0].size, min as u64);
+        let checksum = parts[0].checksum.as_ref().expect("part 1's checksum");
+        assert_eq!(checksum.algorithm, checksum::Algorithm::Crc32);
+        assert_eq!(checksum.value.0, "NhCmhg==");
+        assert_eq!(u32::from(parts[1].part_number), 2);
+        assert_eq!(parts[1].size, 5);
+        let checksum = parts[1].checksum.as_ref().expect("part 2's checksum");
+        assert_eq!(checksum.algorithm, checksum::Algorithm::Md5);
+        assert_eq!(checksum.value.0, "N7SrFkGmSbsK8h0dJ9nK1Q==");
+
+        // A second completion over the same key replaces the rows (the
+        // old completion's parts must not accumulate).
+        let upload2 = storage
+            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
+        let p = storage
+            .upload_part(&b, &k, &upload2.upload_id, 3.into(), body(b"tail"), None)
+            .await
+            .unwrap();
+        storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload2.upload_id,
+                &[CompletedPart {
+                    part_number: p.part_number,
+                    etag: p.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let parts = storage.list_object_parts(&b, &k).await.unwrap();
+        assert_eq!(parts.len(), 1, "re-completion replaces the retained rows");
+        assert_eq!(u32::from(parts[0].part_number), 3);
+        assert!(
+            parts[0].checksum.is_none(),
+            "a part uploaded without a tee retains no checksum"
+        );
     }
 }

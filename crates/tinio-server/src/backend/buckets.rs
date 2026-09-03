@@ -5,22 +5,35 @@
 //! (`buckets.json`); GetBucketLocation always answers `us-east-1`
 //! (s3-surface.md). Storage errors map to S3 codes via
 //! [`map_backend_error`](crate::backend::map_backend_error).
+//!
+//! The bucket-tagging trio (Get|Put|DeleteBucketTagging, spec 2026-08-31)
+//! lives here too, gated on `caps.tagging` — the toggle off answers
+//! `NotImplemented` (FR-021), the write validates through the core tag
+//! type at the 50-tag bucket cap.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use s3s::{
     S3Request, S3Response, S3Result,
     dto::{
         Bucket, BucketLocationConstraint, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
-        DeleteBucketOutput, GetBucketLocationInput, GetBucketLocationOutput, HeadBucketInput,
-        HeadBucketOutput, ListBucketsInput, ListBucketsOutput,
+        DeleteBucketOutput, DeleteBucketTaggingInput, DeleteBucketTaggingOutput,
+        GetBucketLocationInput, GetBucketLocationOutput, GetBucketTaggingInput,
+        GetBucketTaggingOutput, HeadBucketInput, HeadBucketOutput, ListBucketsInput,
+        ListBucketsOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     },
     s3_error,
 };
 
 use crate::{
     _config::s3::MAX_BUCKETS,
-    _core::storage::{ListBucketsParams, Storage},
-    backend::{S3Backend, clamp_page_size, map_backend_error},
+    _core::{
+        object,
+        storage::{ListBucketsParams, Storage},
+    },
+    backend::{
+        S3Backend, clamp_page_size, map_backend_error,
+        tags::{tag_set_from_tags, tags_from_tag_set},
+    },
 };
 
 /// The ListBuckets default page size when `max-buckets` is absent — the
@@ -164,12 +177,68 @@ impl<S: Storage> S3Backend<S> {
             location_constraint: Some(BucketLocationConstraint::from("us-east-1".to_string())),
         }))
     }
+
+    /// GetBucketTagging — the bucket's real tag set (spec 2026-08-31).
+    /// A missing bucket answers 404 `NoSuchBucket` (AWS: only the delete
+    /// is idempotent on the bucket's existence); a tag-less bucket
+    /// answers the empty set.
+    pub(crate) async fn op_get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        Self::require_cap(self.caps.tagging, "GetBucketTagging")?;
+        let bucket = self.bucket(req.input.bucket)?;
+        let tags = self
+            .storage
+            .get_bucket_tags(&bucket)
+            .await
+            .map_err(map_backend_error)?;
+        Ok(S3Response::new(GetBucketTaggingOutput {
+            tag_set: tag_set_from_tags(&tags),
+        }))
+    }
+
+    /// PutBucketTagging — replace the bucket's tag set (replace-all, no
+    /// merge). The dto `TagSet` is validated through the core type
+    /// (duplicate keys, the ≤50 bucket cap → `InvalidTag` 400) before
+    /// the contract call; a missing bucket answers 404 `NoSuchBucket`.
+    /// No per-bucket lock (spec decision — AWS gives no atomicity
+    /// guarantee between tag and data writes; last-writer-wins is
+    /// accepted, as on the object surface).
+    pub(crate) async fn op_put_bucket_tagging(
+        &self,
+        req: S3Request<PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        Self::require_cap(self.caps.tagging, "PutBucketTagging")?;
+        let bucket = self.bucket(req.input.bucket)?;
+        let tags = tags_from_tag_set(&req.input.tagging.tag_set, object::BUCKET_TAGS_MAX)?;
+        self.storage
+            .put_bucket_tags(&bucket, &tags)
+            .await
+            .map_err(map_backend_error)?;
+        Ok(S3Response::new(PutBucketTaggingOutput::default()))
+    }
+
+    /// DeleteBucketTagging — remove the bucket's tag set. Idempotent:
+    /// a missing bucket — and a bucket with no tag set — answers 204.
+    pub(crate) async fn op_delete_bucket_tagging(
+        &self,
+        req: S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        Self::require_cap(self.caps.tagging, "DeleteBucketTagging")?;
+        let bucket = self.bucket(req.input.bucket)?;
+        self.storage
+            .delete_bucket_tags(&bucket)
+            .await
+            .map_err(map_backend_error)?;
+        Ok(S3Response::new(DeleteBucketTaggingOutput::default()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use s3s::S3;
+    use s3s::{S3, dto};
     use tokio::runtime::Runtime;
 
     use super::{
@@ -183,7 +252,10 @@ mod tests {
         },
         _mem::MemoryStorage,
         _util::testing::{assert_conformance, body},
-        backend::{Capabilities, testutil::s3_request},
+        backend::{
+            Capabilities,
+            testutil::{s3_request, setup},
+        },
     };
 
     fn backend() -> S3Backend<MemoryStorage> {
@@ -192,6 +264,13 @@ mod tests {
 
     fn backend_with(caps: Capabilities) -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), caps)
+    }
+
+    /// A fresh backend with a `data` bucket created; returns its
+    /// validated name.
+    async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
+        let (backend, b) = setup().await;
+        (backend, bucket::name(b.as_str()).unwrap())
     }
 
     /// The URL-safe no-pad base64 of a bucket name — the continuation
@@ -716,5 +795,164 @@ mod tests {
             .filter_map(|b| b.name)
             .collect();
         assert_eq!(names, ["beta"]);
+    }
+
+    #[tokio::test]
+    async fn bucket_tagging_ops_round_trip() {
+        let (backend, b) = setup_name().await;
+        let tags = vec![dto::Tag {
+            key: Some("team".into()),
+            value: Some("core".into()),
+        }];
+        backend
+            .put_bucket_tagging(s3_request(dto::PutBucketTaggingInput {
+                bucket: b.to_string(),
+                tagging: dto::Tagging {
+                    tag_set: tags.clone(),
+                },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+            }))
+            .await
+            .unwrap();
+        let got = backend
+            .get_bucket_tagging(s3_request(dto::GetBucketTaggingInput {
+                bucket: b.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(got.output.tag_set, tags);
+        backend
+            .delete_bucket_tagging(s3_request(dto::DeleteBucketTaggingInput {
+                bucket: b.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let got = backend
+            .get_bucket_tagging(s3_request(dto::GetBucketTaggingInput {
+                bucket: b.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(got.output.tag_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bucket_tagging_ops_missing_bucket_semantics() {
+        // get/put on a missing bucket answer NoSuchBucket (AWS); delete
+        // is idempotent — a missing bucket answers success.
+        let backend = backend();
+        let err = backend
+            .get_bucket_tagging(s3_request(dto::GetBucketTaggingInput {
+                bucket: "ghost".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchBucket");
+        let err = backend
+            .put_bucket_tagging(s3_request(dto::PutBucketTaggingInput {
+                bucket: "ghost".into(),
+                tagging: dto::Tagging { tag_set: vec![] },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchBucket");
+        backend
+            .delete_bucket_tagging(s3_request(dto::DeleteBucketTaggingInput {
+                bucket: "ghost".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_bucket_tagging_validation_rejects_bad_sets() {
+        let (backend, b) = setup_name().await;
+        let put = |tag_set: Vec<dto::Tag>| {
+            backend.put_bucket_tagging(s3_request(dto::PutBucketTaggingInput {
+                bucket: b.to_string(),
+                tagging: dto::Tagging { tag_set },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+            }))
+        };
+        // Duplicate keys → InvalidTag.
+        let err = put(vec![
+            dto::Tag {
+                key: Some("k".into()),
+                value: Some("1".into()),
+            },
+            dto::Tag {
+                key: Some("k".into()),
+                value: Some("2".into()),
+            },
+        ])
+        .await
+        .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidTag");
+        // Past the 50-tag bucket cap → InvalidTag; the boundary itself
+        // (50) is accepted (AWS-verified per-surface limit).
+        let over: Vec<dto::Tag> = (0..51)
+            .map(|i| dto::Tag {
+                key: Some(format!("k-{i}")),
+                value: Some("v".into()),
+            })
+            .collect();
+        let err = put(over).await.unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidTag");
+        let at_cap: Vec<dto::Tag> = (0..50)
+            .map(|i| dto::Tag {
+                key: Some(format!("k-{i}")),
+                value: Some("v".into()),
+            })
+            .collect();
+        put(at_cap).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tagging_toggle_off_gates_the_bucket_tagging_ops() {
+        // The tagging toggle off answers NotImplemented (FR-021). The
+        // gate fires before the bucket check — no bucket is needed.
+        let backend = backend_with(Capabilities {
+            tagging: false,
+            ..Default::default()
+        });
+        let err = backend
+            .get_bucket_tagging(s3_request(dto::GetBucketTaggingInput {
+                bucket: "data".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
+        let err = backend
+            .put_bucket_tagging(s3_request(dto::PutBucketTaggingInput {
+                bucket: "data".into(),
+                tagging: dto::Tagging { tag_set: vec![] },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
+        let err = backend
+            .delete_bucket_tagging(s3_request(dto::DeleteBucketTaggingInput {
+                bucket: "data".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
     }
 }

@@ -48,8 +48,8 @@ use tokio::fs;
 
 use crate::{
     _core::{
-        ETag, bucket,
-        object::{self, Info},
+        ETag, bucket, checksum,
+        object::{self, Info, Tags},
         pipeline::{self, Completion},
         storage::{self, ListObjectsParams, ObjectListing, UnorderedPager},
     },
@@ -422,8 +422,17 @@ impl FsListing {
         // from the store and never enqueued (no worker, no IO task). The
         // gate consults the walked file identity (F01) — a same-size
         // mtime-preserving replacement is a gate miss, never a stale
-        // serve.
+        // serve. The page slots' tags/checksum come from the same gated
+        // rows (spec 2026-08-31 — `Info.tags`/`Info.checksum` are always
+        // populated from the stored row, empty when the row is absent):
+        // the producer rewrites preserve the replaced row's elements, so
+        // the served page matches what the row holds after the walk.
+        let mut row_meta: Vec<(Tags, Option<checksum::Recorded>)> = Vec::with_capacity(page.len());
         for (i, stored) in gated.into_iter().enumerate() {
+            row_meta.push(stored.as_ref().map_or_else(
+                || (Tags::empty(), None),
+                |stored| (stored.tags.clone(), stored.checksum.clone()),
+            ));
             let walked = &page[i];
             match &stored {
                 Some(stored)
@@ -486,13 +495,15 @@ impl FsListing {
         let mut objects: Vec<Info> = Vec::with_capacity(page.len());
         // The page is consumed here — the assembly is its last use, so
         // the walked keys and paths are moved, not cloned.
-        for (walked, result) in page.into_iter().zip(&results) {
+        for ((walked, result), (tags, checksum)) in page.into_iter().zip(&results).zip(&row_meta) {
             if let Some(etag) = result {
                 objects.push(Info {
                     key: walked.key,
                     size: walked.size,
                     last_modified: walked.mtime,
                     etag: etag.clone(),
+                    tags: tags.clone(),
+                    checksum: checksum.clone(),
                 });
             }
         }
@@ -1640,7 +1651,7 @@ mod tests {
             {
                 let mut table = ObjectMetaTable::open(&mut txn).unwrap();
                 table
-                    .insert(("data", "f00.txt"), ("not-an-etag", 1, 1, 0))
+                    .insert(("data", "f00.txt"), ("not-an-etag", 1, 1, 0, "", ""))
                     .unwrap();
             }
             txn.commit().unwrap();

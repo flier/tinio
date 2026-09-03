@@ -231,6 +231,20 @@ impl Part {
     }
 }
 
+/// An object's recorded checksum — the algorithm/digest it was stored
+/// with, plus the kind fixing how the digest relates to the content.
+/// The kind is the multipart derivation kind ([`Type`]): FULL_OBJECT
+/// for plain PUTs, COMPOSITE for multipart completions, the source's
+/// kind for copies. It is recorded at write time so read paths never
+/// derive it; the backends persist and return these values untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    /// The algorithm and its base64 digest value.
+    pub part: Part,
+    /// How the digest relates to the content.
+    pub kind: Type,
+}
+
 /// The upload-level checksum specification of
 /// `CreateMultipartUpload` (`x-amz-checksum-algorithm` +
 /// `x-amz-checksum-type`).
@@ -240,6 +254,36 @@ pub struct Upload {
     pub algorithm: Algorithm,
     /// The full-object derivation, when the client fixed one at create.
     pub r#type: Option<Type>,
+}
+
+impl Recorded {
+    /// The persisted row element: `<algorithm wire>:<base64 value>:<kind
+    /// wire>` — e.g. `CRC32:NhCmhg==:FULL_OBJECT` (the base64 `Value`
+    /// wire form; the kind is recorded at write time so read paths
+    /// never derive it). Empty string marks "no recorded checksum".
+    pub fn to_wire(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.part.algorithm, self.part.value.0, self.kind
+        )
+    }
+
+    /// Parse a stored checksum element; garbage → `None` (self-healing
+    /// like the etag). The base64 value passes through unvalidated —
+    /// matching the `PART_CHECKSUMS` read paths
+    /// ([`Part::from_wire_opt`]); the value's alphabet never contains
+    /// the `:` separator, so the split is unambiguous.
+    pub fn from_wire_opt(wire: &str) -> Option<Self> {
+        if wire.is_empty() {
+            return None;
+        }
+        let (algorithm, rest) = wire.split_once(':')?;
+        let (value, kind) = rest.split_once(':')?;
+        Some(Self {
+            part: Part::from_wire_opt(algorithm, value.to_string())?,
+            kind: kind.parse().ok()?,
+        })
+    }
 }
 
 impl Upload {
@@ -273,6 +317,23 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+
+    #[test]
+    fn recorded_wire_round_trips() {
+        let recorded = Recorded {
+            part: Part {
+                algorithm: Algorithm::Crc32,
+                value: Value("y/Q5Jg==".into()),
+            },
+            kind: Type::FullObject,
+        };
+        assert_eq!(recorded.to_wire(), "CRC32:y/Q5Jg==:FULL_OBJECT");
+        assert_eq!(Recorded::from_wire_opt(&recorded.to_wire()), Some(recorded));
+        // Garbage self-heals to `None` (the invalid-row discipline).
+        assert_eq!(Recorded::from_wire_opt(""), None);
+        assert_eq!(Recorded::from_wire_opt("garbage"), None);
+        assert_eq!(Recorded::from_wire_opt("CRC32:y/Q5Jg==:BOGUS"), None);
+    }
 
     #[test]
     fn algorithm_wire_names_round_trip() {

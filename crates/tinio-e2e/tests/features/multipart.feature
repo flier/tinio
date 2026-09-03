@@ -268,3 +268,37 @@ Feature: Multipart
     And the object body is "precious"
     When I complete the multipart upload with checksum-crc32 "nZC9/g=="
     Then the response status is 200
+
+  # CRC64NVMe — the aws-cli default when checksums are enabled — must
+  # drive the same full-object completion validation as CRC32: a wrong
+  # value fails pre-commit with BadDigest, the correct content digest
+  # (KxZnuc7pwS0= over the deterministic 5242881-byte body) commits, and
+  # the response echoes the algorithm's value.
+  @checksum-on
+  Scenario: CRC64NVMe completion checksum mismatch is BadDigest and preserves the old object
+    Given I create bucket "data"
+    And I upload "data/big.bin" with body "precious"
+    And I start a multipart upload for "data/big.bin" with checksum-algorithm CRC64NVME
+    And I upload part 1 with 5242881 bytes
+    When I complete the multipart upload with checksum-crc64nvme "M3eFcAZSQlc="
+    Then the response status is 400
+    And the error code is "BadDigest"
+    When I get object "data/big.bin"
+    Then the response status is 200
+    And the object body is "precious"
+    When I complete the multipart upload with checksum-crc64nvme "KxZnuc7pwS0="
+    Then the response status is 200
+
+  # A per-part crc64nvme value (the header an aws-cli `upload-part` with
+  # `--checksum-algorithm CRC64NVME` carries on the part) is validated
+  # against the part bytes and echoed, and the FULL_OBJECT linearization
+  # of the recorded part digest matches the whole-object value.
+  @checksum-on
+  Scenario: CRC64NVMe part checksum validates, echoes, and completes the linearized full object
+    Given I create bucket "data"
+    And I start a multipart upload for "data/big.bin" with checksum-algorithm CRC64NVME
+    And I upload part 1 with 5242881 bytes and checksum-crc64nvme "KxZnuc7pwS0="
+    Then the response status is 200
+    And the response header "x-amz-checksum-crc64nvme" is "KxZnuc7pwS0="
+    When I complete the multipart upload with checksum-crc64nvme "KxZnuc7pwS0="
+    Then the response status is 200

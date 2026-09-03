@@ -3,16 +3,12 @@
 //! marker validation, completion with the recorded parts). The full
 //! multipart feature suite grows this module in Task 8.
 
-use std::{
-    collections::HashMap,
-    time::SystemTime,
-};
+use std::{collections::HashMap, time::SystemTime};
 
 use cucumber::{gherkin::Step, given, then, when};
 
-use crate::_core::{etag::ETag, multipart::PartInfo};
-
 use super::common::{deterministic_bytes, md5_hex};
+use crate::_core::{etag::ETag, multipart::PartInfo};
 
 /// The scenario's multipart-upload state (world.mp): one rebuild per
 /// started upload ([`start_upload_with`]), so no upload-scoped field can
@@ -42,7 +38,7 @@ pub struct MultipartState {
 
 #[given(expr = "I start a multipart upload for {string}")]
 async fn start_upload(world: &mut super::World, key: String) {
-    start_upload_with(world, key, None).await;
+    start_upload_with(world, key, &[]).await;
 }
 
 /// A create with a `x-amz-checksum-algorithm` header (the checksum
@@ -50,17 +46,22 @@ async fn start_upload(world: &mut super::World, key: String) {
 /// completion checksum validations.
 #[given(expr = "I start a multipart upload for {string} with checksum-algorithm {word}")]
 async fn start_upload_algo(world: &mut super::World, key: String, algo: String) {
-    start_upload_with(world, key, Some(&algo)).await;
+    start_upload_with(world, key, &[("x-amz-checksum-algorithm", &algo)]).await;
 }
 
-/// One create: `POST /{key}?uploads`, optionally carrying the
-/// `x-amz-checksum-algorithm` header. Keep the UploadId and the key for
-/// the part-upload steps; a new upload rebuilds the whole upload state.
-async fn start_upload_with(world: &mut super::World, key: String, algo: Option<&str>) {
-    let headers: &[(&str, &str)] = match algo {
-        Some(algo) => &[("x-amz-checksum-algorithm", algo)],
-        None => &[],
-    };
+/// A create with one extra request header (the object-tagging scenarios
+/// of Task 11: `x-amz-tagging` on the create is recorded and carried
+/// onto the completed object). The generic (name, value) pair keeps the
+/// step useful for any single create header.
+#[given(expr = "I start a multipart upload for {string} with header {string} {string}")]
+async fn start_upload_header(world: &mut super::World, key: String, name: String, value: String) {
+    start_upload_with(world, key, &[(name.as_str(), value.as_str())]).await;
+}
+
+/// One create: `POST /{key}?uploads` with `headers`. Keep the UploadId
+/// and the key for the part-upload steps; a new upload rebuilds the
+/// whole upload state.
+async fn start_upload_with(world: &mut super::World, key: String, headers: &[(&str, &str)]) {
     world.last = world
         .client
         .request("POST", &format!("/{key}?uploads"), headers, &[])
@@ -80,7 +81,32 @@ async fn start_upload_with(world: &mut super::World, key: String, algo: Option<&
 #[when(regex = r#"I upload part (\d+) with body "([^"]*)" and checksum-crc32 "([^"]+)""#)]
 async fn upload_part_checksum(world: &mut super::World, part: u32, body: String, crc32: String) {
     let body = body.into_bytes();
-    upload_part(world, part, &[("x-amz-checksum-crc32", &crc32)], &body, true).await;
+    upload_part(
+        world,
+        part,
+        &[("x-amz-checksum-crc32", &crc32)],
+        &body,
+        true,
+    )
+    .await;
+}
+
+/// A part upload of `n` deterministic bytes carrying a crc64nvme value
+/// (the full-object checksum scenarios; the digest is computed over the
+/// same deterministic content the plain `{int} bytes` step writes).
+#[given(expr = "I upload part {int} with {int} bytes and checksum-crc64nvme {string}")]
+#[when(expr = "I upload part {int} with {int} bytes and checksum-crc64nvme {string}")]
+#[then(expr = "I upload part {int} with {int} bytes and checksum-crc64nvme {string}")]
+async fn upload_part_bytes_crc64nvme(world: &mut super::World, part: u32, n: u64, value: String) {
+    let body = deterministic_bytes(n);
+    upload_part(
+        world,
+        part,
+        &[("x-amz-checksum-crc64nvme", &value)],
+        &body,
+        true,
+    )
+    .await;
 }
 
 /// A part upload with a `Content-MD5` header (the checksum scenarios).
@@ -282,23 +308,16 @@ async fn complete_extra_part(world: &mut super::World, part: u32) {
 #[then(expr = "I complete the multipart upload for {string}")]
 async fn complete_for_key(world: &mut super::World, key: String) {
     let parts = world.mp.parts.clone();
-    complete_with_key(
-        world,
-        &key,
-        &parts,
-        &[("Content-Type", "application/xml")],
-    )
-    .await;
+    complete_with_key(world, &key, &parts, &[("Content-Type", "application/xml")]).await;
 }
 
 /// Complete with a client-side full-object checksum: the headers carry
-/// `x-amz-checksum-crc32`, `x-amz-checksum-type: FULL_OBJECT` and the
-/// `x-amz-mp-object-size` derived from the listed parts (a wrong value
-/// must fail pre-commit with BadDigest).
-#[given(expr = "I complete the multipart upload with checksum-crc32 {string}")]
-#[when(expr = "I complete the multipart upload with checksum-crc32 {string}")]
-#[then(expr = "I complete the multipart upload with checksum-crc32 {string}")]
-async fn complete_with_checksum(world: &mut super::World, crc32: String) {
+/// the algorithm's `x-amz-checksum-<algo>` value, `x-amz-checksum-type:
+/// FULL_OBJECT` and the `x-amz-mp-object-size` derived from the listed
+/// parts (a wrong value must fail pre-commit with BadDigest). One home
+/// for the completion-checksum block — the per-algorithm steps differ
+/// only in the header name.
+async fn complete_with_full_object_checksum(world: &mut super::World, header: &str, value: &str) {
     let size: u64 = world
         .mp
         .parts
@@ -309,11 +328,25 @@ async fn complete_with_checksum(world: &mut super::World, crc32: String) {
     let parts = world.mp.parts.clone();
     let headers = [
         ("Content-Type", "application/xml"),
-        ("x-amz-checksum-crc32", &crc32),
+        (header, value),
         ("x-amz-checksum-type", "FULL_OBJECT"),
         ("x-amz-mp-object-size", &size_text),
     ];
     complete_with(world, &parts, &headers).await;
+}
+
+#[given(expr = "I complete the multipart upload with checksum-crc32 {string}")]
+#[when(expr = "I complete the multipart upload with checksum-crc32 {string}")]
+#[then(expr = "I complete the multipart upload with checksum-crc32 {string}")]
+async fn complete_with_checksum(world: &mut super::World, crc32: String) {
+    complete_with_full_object_checksum(world, "x-amz-checksum-crc32", &crc32).await;
+}
+
+#[given(expr = "I complete the multipart upload with checksum-crc64nvme {string}")]
+#[when(expr = "I complete the multipart upload with checksum-crc64nvme {string}")]
+#[then(expr = "I complete the multipart upload with checksum-crc64nvme {string}")]
+async fn complete_with_checksum_crc64nvme(world: &mut super::World, crc64nvme: String) {
+    complete_with_full_object_checksum(world, "x-amz-checksum-crc64nvme", &crc64nvme).await;
 }
 
 /// Complete with TWO checksum fields on every part (F01): with the
@@ -332,13 +365,7 @@ async fn complete_with_two_checksums(world: &mut super::World) {
         &world.mp.parts,
     );
     let key = world.mp.upload_key.clone();
-    send_complete(
-        world,
-        &key,
-        &body,
-        &[("Content-Type", "application/xml")],
-    )
-    .await;
+    send_complete(world, &key, &body, &[("Content-Type", "application/xml")]).await;
 }
 
 /// Abort the scenario's multipart upload.
@@ -430,10 +457,7 @@ fn composed(parts: &[(u32, String)]) -> String {
 
 /// The `<CompleteMultipartUpload>` body whose `<Part>` elements come
 /// from `render` — one home for the completion body shape.
-fn completion_body(
-    render: impl Fn(&(u32, String)) -> String,
-    parts: &[(u32, String)],
-) -> String {
+fn completion_body(render: impl Fn(&(u32, String)) -> String, parts: &[(u32, String)]) -> String {
     let parts_xml: String = parts.iter().map(render).collect();
     format!("<CompleteMultipartUpload>{parts_xml}</CompleteMultipartUpload>")
 }
@@ -447,12 +471,7 @@ fn completion_xml(parts: &[(u32, String)]) -> String {
 }
 
 /// One completion request against `key`'s upload.
-async fn send_complete(
-    world: &mut super::World,
-    key: &str,
-    body: &str,
-    headers: &[(&str, &str)],
-) {
+async fn send_complete(world: &mut super::World, key: &str, body: &str, headers: &[(&str, &str)]) {
     world.last = world
         .client
         .request(

@@ -23,6 +23,7 @@ pub(crate) mod checksum;
 pub(crate) mod listing;
 pub(crate) mod multipart;
 pub(crate) mod objects;
+pub(crate) mod tags;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -115,7 +116,7 @@ const CHECKSUM_SPEC_CACHE_CAP: usize = 8192;
 pub(crate) use conditions::{
     ConditionalHeaders, DeleteConditions, check_complete_conditions, check_write_shape,
     checked_if_match_size, decide_fetch, decide_range_error, generation_changed,
-    parse_etag_condition_header, parse_if_range, same_whole_second,
+    parse_etag_condition_header, parse_etag_condition_value, parse_if_range, same_whole_second,
 };
 pub(crate) use errors::map_backend_error;
 use futures::{TryStreamExt, stream};

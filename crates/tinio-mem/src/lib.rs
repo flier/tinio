@@ -22,6 +22,8 @@ mod error;
 mod multipart;
 mod object;
 mod storage;
+#[cfg(test)]
+mod testutil;
 
 pub use self::{
     cleanup::MemoryCleanup,

@@ -15,6 +15,7 @@ use crate::{
     _core::{
         BucketsListing, ListBucketsParams,
         bucket::{self, Bucket},
+        object,
         storage::{BucketOps, UnorderedPager, already_exists, no_such_bucket, not_empty},
     },
     path::{STATE_DIR_NAME, bucket_path_lexical},
@@ -197,6 +198,27 @@ impl BucketOps for FsStorage {
             truncated,
             next_start_after: next,
         })
+    }
+
+    async fn get_bucket_tags(&self, name: &bucket::Name) -> Result<object::Tags, Error> {
+        // Existence is the bucket directory (`NoSuchBucket` when missing
+        // — mirroring head_bucket); the tags come from the `BUCKETS`
+        // row, empty when the bucket has no row yet (a pre-existing
+        // bucket has never been tagged through the API).
+        self.ensure_bucket(name).await?;
+        self.bucket_store.tags(name).await
+    }
+
+    async fn put_bucket_tags(&self, name: &bucket::Name, tags: &object::Tags) -> Result<(), Error> {
+        self.ensure_bucket(name).await?;
+        self.bucket_store.set_tags(name, tags).await
+    }
+
+    async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), Error> {
+        // S3 semantics: idempotent — a missing bucket is Ok (the
+        // contract's delete-object/bucket leniency). The row's creation
+        // time is preserved; a row-less bucket has nothing to clear.
+        self.bucket_store.clear_tags(name).await
     }
 }
 
@@ -561,7 +583,7 @@ mod tests {
         let b = bucket::name("my-bucket").unwrap();
         storage.create_bucket(&b).await.unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into(), None)
+            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty())
             .await
             .unwrap();
         let err: StorageError = storage.delete_bucket(&b).await.unwrap_err().into();
@@ -656,7 +678,7 @@ mod tests {
         // Upload + part rows.
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None)
+            .create(&b, &k, None, object::Tags::empty())
             .await
             .unwrap();
         storage
@@ -739,5 +761,49 @@ mod tests {
         assert!(listing.buckets.is_empty());
         assert!(!listing.truncated);
         assert_eq!(listing.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn fs_bucket_tags_round_trip_and_replace() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        assert!(
+            storage.get_bucket_tags(&b).await.unwrap().is_empty(),
+            "an untagged bucket answers the empty set"
+        );
+
+        // Put → Get round-trip (replace-all, no merge).
+        let tags = object::Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        storage.put_bucket_tags(&b, &tags).await.unwrap();
+        assert_eq!(storage.get_bucket_tags(&b).await.unwrap(), tags);
+        let replaced = object::Tags::from_pairs([("team".into(), "edge".into())]).unwrap();
+        storage.put_bucket_tags(&b, &replaced).await.unwrap();
+        assert_eq!(storage.get_bucket_tags(&b).await.unwrap(), replaced);
+
+        // head_bucket still reports the creation time (the row's other
+        // element survives the tag writes).
+        let head = storage.head_bucket(&b).await.unwrap();
+        assert!(
+            head.creation_time <= std::time::SystemTime::now(),
+            "the creation time must survive bucket tagging"
+        );
+
+        // Delete clears.
+        storage.delete_bucket_tags(&b).await.unwrap();
+        assert!(storage.get_bucket_tags(&b).await.unwrap().is_empty());
+
+        // Missing bucket: get/put → NoSuchBucket; delete succeeds
+        // (idempotent, like the object tagging delete).
+        let ghost = bucket::name("ghost").unwrap();
+        let err: StorageError = storage.get_bucket_tags(&ghost).await.unwrap_err().into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        let err: StorageError = storage
+            .put_bucket_tags(&ghost, &tags)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        storage.delete_bucket_tags(&ghost).await.unwrap();
     }
 }

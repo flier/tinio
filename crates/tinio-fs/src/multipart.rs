@@ -2,7 +2,8 @@
 //! meta-redb-spec).
 //!
 //! Upload records live in the `UPLOADS` table (`(bucket, upload_id)` →
-//! `(key, initiated_at)`) and part ETags in `PARTS` (`(bucket, upload_id,
+//! `(key, initiated_at, tags wire)` — the create-time object tags, spec
+//! 2026-08-31) and part ETags in `PARTS` (`(bucket, upload_id,
 //! part_number)` → etag hex) of `<state-dir>/meta.redb`. The file system
 //! keeps only the part contents at `<state-dir>/multipart/<bucket>/<upload_id>/part-<n>`
 //! (the upload directory is created by the first `put_part`, never by
@@ -55,7 +56,10 @@ use crate::{
     },
     _util::lockmap::{Guard, Map},
     Error,
-    database::{self, Handle, PartChecksumsTable, PartsTable, UploadChecksumsTable, UploadsTable},
+    database::{
+        self, Handle, OBJECT_TAGS_MAX, PartChecksumsTable, PartsTable, UploadChecksumsTable,
+        UploadsTable,
+    },
     fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
@@ -70,6 +74,13 @@ fn part_path(dir: &Path, n: u32) -> PathBuf {
 /// The per-upload part-write lock map: `(bucket, upload_id)` → the
 /// [`Store::part_lock`] mutex slot.
 type PartLocks = Map<(String, String)>;
+
+/// One assembled part of a completed upload, as [`Store::complete`]
+/// returns it: `(part number, size, checksum row)` — the checksum row is
+/// the part's stored `PART_CHECKSUMS` row (`None` when the part was
+/// uploaded without one). The caller persists these into `OBJECT_PARTS`
+/// (spec 2026-08-31).
+pub(crate) type CompletedPartRow = (u32, u64, Option<(String, String)>);
 
 /// Delete one upload's `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/
 /// `PART_CHECKSUMS` rows in the caller's write transaction (`complete`
@@ -146,12 +157,15 @@ fn sort_uploads(uploads: &mut [MultipartUpload]) {
 /// Build a `MultipartUpload` from a stored `UPLOADS` row plus the
 /// `UPLOAD_CHECKSUMS` row (`None` = no checksum spec). Domain-invalid
 /// rows are skipped (`None` — self-healing; `list_uploads`/`walk_uploads`
-/// share this conversion).
+/// share this conversion); a domain-invalid tags wire heals to the empty
+/// set (the row's tags were validated before writing — garbage is
+/// treated as missing, like the invalid etag rows).
 fn upload_from_row(
     bucket: &bucket::Name,
     upload_id: &str,
     key: &str,
     initiated_at: u64,
+    tags_wire: &str,
     checksum_row: Option<(String, String)>,
 ) -> Result<Option<MultipartUpload>, storage::Error> {
     let Ok(key) = object::key(key) else {
@@ -170,20 +184,37 @@ fn upload_from_row(
         // same way, and a hard error here would also kill the multipart
         // sweep (walk_uploads) forever.
         checksum: checksum_row.and_then(|(algo, ty)| checksum::Upload::from_wire_opt(&algo, &ty)),
+        tags: object::Tags::parse_wire_limited(tags_wire, OBJECT_TAGS_MAX).unwrap_or_default(),
     }))
 }
 
 /// One materialized upload row of the listings: `(bucket, upload_id,
-/// key, initiated_at, checksum_row)`.
-type UploadRow = (bucket::Name, String, String, u64, Option<(String, String)>);
+/// key, initiated_at, tags wire, checksum_row)`.
+type UploadRow = (
+    bucket::Name,
+    String,
+    String,
+    u64,
+    String,
+    Option<(String, String)>,
+);
 
 /// The rows→uploads conversion shared by the listings: domain-invalid
 /// rows are skipped (self-healing — the `None` of [`upload_from_row`]).
 fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, storage::Error> {
     rows.into_iter()
-        .map(|(bucket, upload_id, key, initiated_at, checksum_row)| {
-            upload_from_row(&bucket, &upload_id, &key, initiated_at, checksum_row)
-        })
+        .map(
+            |(bucket, upload_id, key, initiated_at, tags_wire, checksum_row)| {
+                upload_from_row(
+                    &bucket,
+                    &upload_id,
+                    &key,
+                    initiated_at,
+                    &tags_wire,
+                    checksum_row,
+                )
+            },
+        )
         .collect::<Result<Vec<_>, _>>()
         .map(|rows| rows.into_iter().flatten().collect())
 }
@@ -207,7 +238,10 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
 /// let bucket = bucket::name("data").unwrap();
 /// let key = object::key("big.bin").unwrap();
 /// Runtime::new().unwrap().block_on(async {
-///     let upload = store.create(&bucket, &key, None).await.unwrap();
+///     let upload = store
+///         .create(&bucket, &key, None, object::Tags::empty())
+///         .await
+///         .unwrap();
 ///     let part = store
 ///         .put_part(
 ///             &bucket,
@@ -225,7 +259,7 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
 ///         part_number: part.part_number,
 ///         etag: part.etag,
 ///     };
-///     let (temp, _etag) = store
+///     let (temp, _etag, _parts) = store
 ///         .complete(&bucket, &key, &upload.upload_id, &[completed])
 ///         .await
 ///         .unwrap();
@@ -294,6 +328,8 @@ impl Store {
     /// committed before the store answers — the upload directory is only
     /// created by the first `put_part`). `checksum` is the create-time
     /// checksum spec, persisted alongside the `UPLOADS` row (spec
+    /// 2026-08-31); `tags` is the create-time object tag set, persisted
+    /// in the `UPLOADS` row and applied to the completed object (spec
     /// 2026-08-31). The bucket must already exist — callers check
     /// `head_bucket` first.
     pub async fn create(
@@ -301,6 +337,7 @@ impl Store {
         bucket: &bucket::Name,
         key: &object::Key,
         checksum: Option<checksum::Upload>,
+        tags: object::Tags,
     ) -> Result<MultipartUpload, Error> {
         // Cap the number of in-progress uploads (CWE-770): without a cap an
         // authenticated client can accumulate an unbounded number of
@@ -320,6 +357,7 @@ impl Store {
             key: key.clone(),
             initiated_at: SystemTime::now(),
             checksum: checksum.clone(),
+            tags: tags.clone(),
         };
         // Clone into the write closure (runs on the blocking pool, G3
         // revision); `upload` stays owned for the return.
@@ -329,11 +367,18 @@ impl Store {
         let initiated_at = upload.initiated_at;
         // The wire names are owned into the closure (a `&'static str` row
         // needs owned strings); `""` marks a checksum type that was never
-        // fixed.
+        // fixed; the tags wire is the canonical `to_wire` form.
         let checksum_row = checksum.map(|c| c.to_wire());
+        let tags_wire = tags.to_wire();
         self.handle
             .write(move |txn| {
-                UploadsTable::open(txn)?.put(&bucket, &upload_id, &key, initiated_at)?;
+                UploadsTable::open(txn)?.put(
+                    &bucket,
+                    &upload_id,
+                    &key,
+                    initiated_at,
+                    &tags_wire,
+                )?;
                 if let Some((algo, ty)) = checksum_row {
                     UploadChecksumsTable::open(txn)?.put(&bucket, &upload_id, &algo, &ty)?;
                 }
@@ -360,20 +405,27 @@ impl Store {
             .read(move |txn| {
                 let uploads = UploadsTable::open_readonly(txn)?;
                 // One lookup: the row, present only when it records `key`.
-                let Some((stored_key, initiated_at)) =
+                let Some((stored_key, initiated_at, tags_wire)) =
                     uploads.get_matching(&bucket_txn, &key, &upload_id_owned)?
                 else {
                     return Ok(None);
                 };
                 let checksum_row = UploadChecksumsTable::open_readonly(txn)?
                     .get(bucket_txn.as_ref().as_str(), &upload_id_owned)?;
-                Ok(Some((stored_key, initiated_at, checksum_row)))
+                Ok(Some((stored_key, initiated_at, tags_wire, checksum_row)))
             })
             .map_err(Error::from)?;
-        let (stored_key, initiated_at, checksum_row) =
+        let (stored_key, initiated_at, tags_wire, checksum_row) =
             found.ok_or_else(|| storage::no_such_upload(upload_id))?;
-        upload_from_row(bucket, upload_id, &stored_key, initiated_at, checksum_row)?
-            .ok_or_else(|| storage::no_such_upload(upload_id).into())
+        upload_from_row(
+            bucket,
+            upload_id,
+            &stored_key,
+            initiated_at,
+            &tags_wire,
+            checksum_row,
+        )?
+        .ok_or_else(|| storage::no_such_upload(upload_id).into())
     }
 
     /// Stream one part (number `1..=10000`) into the upload. `checksum`
@@ -713,14 +765,19 @@ impl Store {
     ///   consumed (a concurrent abort/sweep) → `NoSuchUpload` (§5.6);
     /// - the upload's recorded key differs from `key` → `NoSuchUpload`.
     ///
-    /// Returns the temp path and the composed ETag (`MD5-of-MD5s-N`).
+    /// Returns the temp path, the composed ETag (`MD5-of-MD5s-N`), and
+    /// the assembled parts' rows — `CompletedPartRow`s in completion
+    /// order — for the caller to persist into `OBJECT_PARTS` (the
+    /// completed object's retained part list, spec 2026-08-31; the
+    /// checksum row is the stored `PART_CHECKSUMS` row of each part:
+    /// `None` when the part was uploaded without one).
     pub async fn complete(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         upload_id: &str,
         parts: &[CompletedPart],
-    ) -> Result<(PathBuf, ETag), Error> {
+    ) -> Result<(PathBuf, ETag, Vec<CompletedPartRow>), Error> {
         let dir = self.upload_dir(bucket, upload_id)?;
         if parts.is_empty() {
             self.require_upload(bucket, key, upload_id).await?;
@@ -729,7 +786,10 @@ impl Store {
         // One read transaction: the upload check AND the `PARTS` rows of
         // the requested parts only (point lookups — no full-upload scan;
         // the verify loop below looks each part up here instead of opening
-        // a transaction per part).
+        // a transaction per part). The `PART_CHECKSUMS` row of each part
+        // joins in the same transaction (spec 2026-08-31 — the rows
+        // commit atomically with the part rows, so the join is consistent
+        // with the verified ETag).
         let (found, records) = self
             .handle
             .read(|txn| {
@@ -738,11 +798,13 @@ impl Store {
                     return Ok((false, HashMap::new()));
                 }
                 let table = PartsTable::open_readonly(txn)?;
+                let checksums = PartChecksumsTable::open_readonly(txn)?;
                 let mut records = HashMap::with_capacity(parts.len());
                 for part in parts {
                     let n = u32::from(part.part_number);
                     if let Some(hex) = table.get_hex(bucket, upload_id, n)? {
-                        records.insert(n, hex);
+                        let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id, n)?;
+                        records.insert(n, (hex, checksum_row));
                     }
                 }
                 Ok((true, records))
@@ -755,6 +817,7 @@ impl Store {
         // ETag (the `PARTS` row, or the file recompute when the row is
         // missing — the crash-window fallback, §5.6).
         let mut infos = Vec::with_capacity(parts.len());
+        let mut part_rows = Vec::with_capacity(parts.len());
         let mut last = 0u32;
         for (index, part) in parts.iter().enumerate() {
             let n = u32::from(part.part_number);
@@ -781,7 +844,7 @@ impl Store {
             // the assembly copy fails the assembly's re-hash →
             // InvalidPart — never an undersized commit.
             check_part_minimum(n, metadata.len(), index + 1 == parts.len())?;
-            let stored = match records.get(&n).and_then(|hex| ETag::new(hex).ok()) {
+            let stored = match records.get(&n).and_then(|(hex, _)| ETag::new(hex).ok()) {
                 // A domain-invalid record (or no record — the crash-window
                 // fallback): recompute from the file, §5.6.
                 None => match md5_of_file(&path).await {
@@ -803,6 +866,15 @@ impl Store {
                 last_modified: metadata.modified()?,
                 checksum: None,
             });
+            // The assembled part's OBJECT_PARTS row: the verified size
+            // and the joined checksum row (the upload's drain removes the
+            // `PART_CHECKSUMS` rows at completion — the retained list
+            // must be captured before that).
+            part_rows.push((
+                n,
+                metadata.len(),
+                records.get(&n).and_then(|(_, c)| c.clone()),
+            ));
         }
         // Assemble before consuming the upload (part files stay readable
         // until the delete). The bytes copied are hashed in the same
@@ -871,7 +943,7 @@ impl Store {
         // consumes (§5.3).
         let etag =
             ETag::composed_from_parts(&infos).ok_or_else(|| Error::from(storage::no_parts()))?;
-        Ok((temp, etag))
+        Ok((temp, etag, part_rows))
     }
 
     /// Delete an upload's `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/
@@ -970,13 +1042,14 @@ impl Store {
                 let table = UploadsTable::open_readonly(txn)?;
                 let checksums = UploadChecksumsTable::open_readonly(txn)?;
                 let mut rows = Vec::new();
-                table.for_bucket(bucket, |upload_id, (key, initiated_at)| {
+                table.for_bucket(bucket, |upload_id, (key, initiated_at, tags_wire)| {
                     let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id)?;
                     rows.push((
                         bucket.clone(),
                         upload_id.to_string(),
                         key.to_string(),
                         initiated_at,
+                        tags_wire.to_string(),
                         checksum_row,
                     ));
                     Ok(())
@@ -1044,13 +1117,14 @@ impl Store {
                 let table = UploadsTable::open_readonly(txn)?;
                 let checksums = UploadChecksumsTable::open_readonly(txn)?;
                 let mut rows = Vec::new();
-                table.for_bucket(&bucket_txn, |upload_id, (key, initiated_at)| {
+                table.for_bucket(&bucket_txn, |upload_id, (key, initiated_at, tags_wire)| {
                     let checksum_row = checksums.get(bucket_txn.as_ref().as_str(), upload_id)?;
                     rows.push((
                         bucket_txn.clone(),
                         upload_id.to_string(),
                         key.to_string(),
                         initiated_at,
+                        tags_wire.to_string(),
                         checksum_row,
                     ));
                     Ok(())
@@ -1128,7 +1202,7 @@ impl Store {
                 let table = UploadsTable::open_readonly(txn)?;
                 let checksums = UploadChecksumsTable::open_readonly(txn)?;
                 let mut rows = Vec::new();
-                table.for_each(|b, upload_id, key, initiated_at| {
+                table.for_each(|b, upload_id, key, initiated_at, tags_wire| {
                     let Ok(bucket) = bucket::name(b) else {
                         return Ok(());
                     };
@@ -1138,6 +1212,7 @@ impl Store {
                         upload_id.to_string(),
                         key.to_string(),
                         initiated_at,
+                        tags_wire.to_string(),
                         checksum_row,
                     ));
                     Ok(())
@@ -1161,7 +1236,7 @@ impl Store {
             .read(|txn| {
                 let table = UploadsTable::open_readonly(txn)?;
                 let mut ids = HashSet::new();
-                table.for_each(|bucket, upload_id, _, _| {
+                table.for_each(|bucket, upload_id, _, _, _| {
                     ids.insert((bucket.to_string(), upload_id.to_string()));
                     Ok(())
                 })?;
@@ -1186,7 +1261,7 @@ impl Store {
         self.handle
             .write(move |txn| {
                 UploadsTable::open(txn)?
-                    .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0))?;
+                    .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0, ""))?;
                 Ok(())
             })
             .await
@@ -1294,9 +1369,15 @@ mod tests {
         store.set_max_concurrent_uploads(1);
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        store.create(&b, &k, None).await.unwrap();
+        store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
 
-        let err = store.create(&b, &k, None).await.unwrap_err();
+        let err = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1320,7 +1401,7 @@ mod tests {
             for _ in 0..(i % 3 + 1) {
                 uploads.push(
                     store
-                        .create(&b, &object::key(*key).unwrap(), None)
+                        .create(&b, &object::key(*key).unwrap(), None, object::Tags::empty())
                         .await
                         .unwrap(),
                 );
@@ -1401,15 +1482,30 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         store
-            .create(&b, &object::key("dir/a.txt").unwrap(), None)
+            .create(
+                &b,
+                &object::key("dir/a.txt").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         store
-            .create(&b, &object::key("dir/c.txt").unwrap(), None)
+            .create(
+                &b,
+                &object::key("dir/c.txt").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         store
-            .create(&b, &object::key("z.txt").unwrap(), None)
+            .create(
+                &b,
+                &object::key("z.txt").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         let marker = uploads_order("dir/a.txt", "\u{10FFFF}");
@@ -1429,7 +1525,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         assert!(!upload.upload_id.is_empty());
         // The record is DB-driven; the directory appears only with the
         // first part (the orphan-cleanup TOCTOU order depends on it).
@@ -1461,6 +1560,7 @@ mod tests {
                     algorithm: Algorithm::Crc32,
                     r#type: None,
                 }),
+                object::Tags::empty(),
             )
             .await
             .unwrap();
@@ -1499,7 +1599,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let b2 = b.clone();
         let id = upload.upload_id.clone();
         store
@@ -1527,7 +1630,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
@@ -1560,7 +1666,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let slot = Arc::new(checksum::PartChecksum::default());
         let _ = slot.digest.set(checksum::Part {
             algorithm: Algorithm::Crc32,
@@ -1586,7 +1695,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let part = store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
@@ -1598,14 +1710,14 @@ mod tests {
         let target = state.path().join("out.bin");
         // First attempt: the rename lands, the consume does not
         // (the crash). The upload is still listed.
-        let (temp, _) = store
+        let (temp, _, _) = store
             .complete(&b, &k, &upload.upload_id, &completed)
             .await
             .unwrap();
         fs::rename(&temp, &target).await.unwrap();
         assert!(store.has_uploads(&b).await.unwrap());
         // Retry: verify + assemble + rename + consume all succeed.
-        let (temp, _) = store
+        let (temp, _, _) = store
             .complete(&b, &k, &upload.upload_id, &completed)
             .await
             .unwrap();
@@ -1620,7 +1732,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         // No part dir was ever created; consuming twice is a no-op.
         store.consume(&b, &upload.upload_id).await.unwrap();
         store.consume(&b, &upload.upload_id).await.unwrap();
@@ -1632,7 +1747,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let mut completed = Vec::new();
         for i in 1..=4u32 {
             // Non-final listed parts must be >= the 5 MiB minimum (the
@@ -1659,7 +1777,7 @@ mod tests {
         );
         // If the assemble won, the caller renames and consumes; the
         // consume is a no-op if the abort already removed the records.
-        if let Ok((temp, _)) = complete {
+        if let Ok((temp, _, _)) = complete {
             let target = state.path().join("out.bin");
             fs::rename(&temp, &target).await.unwrap();
             store.consume(&b, &upload.upload_id).await.unwrap();
@@ -1681,7 +1799,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let p1 = store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
@@ -1709,7 +1830,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
@@ -1740,8 +1864,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k1 = object::key("a.bin").unwrap();
         let k2 = object::key("b.bin").unwrap();
-        let u1 = store.create(&b, &k1, None).await.unwrap();
-        let u2 = store.create(&b, &k2, None).await.unwrap();
+        let u1 = store
+            .create(&b, &k1, None, object::Tags::empty())
+            .await
+            .unwrap();
+        let u2 = store
+            .create(&b, &k2, None, object::Tags::empty())
+            .await
+            .unwrap();
         let uploads = store.list_uploads(&b).await.unwrap();
         assert_eq!(uploads.len(), 2);
         assert!(store.has_uploads(&b).await.unwrap());
@@ -1755,8 +1885,14 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("same.bin").unwrap();
-        store.create(&b, &k, None).await.unwrap();
-        store.create(&b, &k, None).await.unwrap();
+        store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
+        store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let uploads = store.list_uploads(&b).await.unwrap();
         assert_eq!(uploads.len(), 2);
         assert!(
@@ -1771,7 +1907,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("a.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store.remove_bucket(&b).await.unwrap();
         assert!(!store.has_uploads(&b).await.unwrap());
         let err = store.abort(&b, &k, &upload.upload_id).await.unwrap_err();
@@ -1784,11 +1923,21 @@ mod tests {
         let b1 = bucket::name("alpha").unwrap();
         let b2 = bucket::name("zeta").unwrap();
         store
-            .create(&b1, &object::key("a.bin").unwrap(), None)
+            .create(
+                &b1,
+                &object::key("a.bin").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         store
-            .create(&b2, &object::key("z.bin").unwrap(), None)
+            .create(
+                &b2,
+                &object::key("z.bin").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
         let uploads = store.walk_uploads().await.unwrap();
@@ -1805,7 +1954,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         for n in 1..=4u32 {
             store
                 .put_part(&b, &k, &upload.upload_id, n.into(), body(b"x"), None)
@@ -1842,7 +1994,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
@@ -1863,7 +2018,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let id = upload.upload_id.clone();
         let (a, b2) = tokio::join!(
             store.put_part(&b, &k, &id, 1.into(), body(b"AAAA"), None),
@@ -1887,7 +2045,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         // Write a part file out-of-band (no PARTS record).
         let dir = state.path().join("multipart/data").join(&upload.upload_id);
         fs::create_dir_all(&dir).await.unwrap();
@@ -1914,7 +2075,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         // Non-final listed parts must be >= the 5 MiB minimum (the
         // authoritative verify-loop check); the final (part 3) stays small
         // — the racer overwrites it, so it must be cheap to re-upload.
@@ -1975,7 +2139,7 @@ mod tests {
         let outcome = store.complete(&b, &k, &upload.upload_id, &completed).await;
         racer.await.unwrap();
         match outcome {
-            Ok((temp, etag)) => {
+            Ok((temp, etag, _)) => {
                 // Success means the re-verification passed: no part
                 // changed between verify and copy — the bytes are
                 // exactly the original parts and the ETag matches.
@@ -2019,7 +2183,10 @@ mod tests {
         // keeps each round's assembly long (see below) — four rounds
         // suffice where the small-part original needed eight.
         for _ in 0..4 {
-            let upload = store.create(&b, &k, None).await.unwrap();
+            let upload = store
+                .create(&b, &k, None, object::Tags::empty())
+                .await
+                .unwrap();
             let mut completed = Vec::new();
             for n in 1..=8u32 {
                 // Non-final listed parts must be >= the 5 MiB minimum —
@@ -2052,7 +2219,7 @@ mod tests {
                 store.abort(&b, &k, &upload.upload_id),
             );
             match complete {
-                Ok((temp, _)) => {
+                Ok((temp, _, _)) => {
                     // The completion won — finish the caller flow and
                     // retry the race with a fresh upload.
                     let target = state.path().join(format!("out-{}.bin", upload.upload_id));
@@ -2086,7 +2253,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         // A raw row at the boundary (no part file needed — pass 2
         // skips missing files; the marker logic sees the raw rows).
         let bucket = b.clone();
@@ -2128,7 +2298,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
             .await
@@ -2150,7 +2323,10 @@ mod tests {
         let (_, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store
             .overwrite_stored_key(&b, &upload.upload_id, "other.bin")
             .await
@@ -2173,7 +2349,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         // The first part is non-final in the two-part list — it must be
         // >= the 5 MiB minimum the verify loop enforces.
         let big = vec![b'a'; MIN_PART_BYTES as usize];
@@ -2196,7 +2375,7 @@ mod tests {
                 etag: recomputed,
             },
         ];
-        let (temp, _etag) = store
+        let (temp, _etag, _parts) = store
             .complete(&b, &k, &upload.upload_id, &completed)
             .await
             .unwrap();
@@ -2219,7 +2398,10 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let min = MIN_PART_BYTES as usize;
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let under = store
             .put_part(
                 &b,
@@ -2281,7 +2463,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let part = store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
             .await
@@ -2316,7 +2501,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         let part = store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
             .await
@@ -2349,7 +2537,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         fs::write(state.path().join("tmp"), b"blocked")
             .await
             .unwrap();
@@ -2374,7 +2565,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         fs::create_dir_all(state.path().join("multipart"))
             .await
             .unwrap();
@@ -2410,7 +2604,10 @@ mod tests {
         let (state, store) = fixture();
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
-        let upload = store.create(&b, &k, None).await.unwrap();
+        let upload = store
+            .create(&b, &k, None, object::Tags::empty())
+            .await
+            .unwrap();
         store
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
             .await

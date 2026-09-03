@@ -720,7 +720,12 @@ mod tests {
         storage.create_bucket(&live).await.unwrap();
         storage
             .multipart_store()
-            .create(&live, &object::key("k").unwrap(), None)
+            .create(
+                &live,
+                &object::key("k").unwrap(),
+                None,
+                object::Tags::empty(),
+            )
             .await
             .unwrap();
 
@@ -859,7 +864,7 @@ mod tests {
         let k = object::key("k").unwrap();
         storage
             .multipart_store()
-            .create(&gone, &k, None)
+            .create(&gone, &k, None, object::Tags::empty())
             .await
             .unwrap();
         assert!(storage.multipart_store().has_uploads(&gone).await.unwrap());
@@ -896,7 +901,7 @@ mod tests {
         let k = object::key("k").unwrap();
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None)
+            .create(&b, &k, None, object::Tags::empty())
             .await
             .unwrap();
         let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
@@ -953,7 +958,7 @@ mod tests {
         let k = object::key("k").unwrap();
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None)
+            .create(&b, &k, None, object::Tags::empty())
             .await
             .unwrap();
         storage
@@ -1031,7 +1036,7 @@ mod tests {
         // record survives.
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None)
+            .create(&b, &k, None, object::Tags::empty())
             .await
             .unwrap();
         let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;

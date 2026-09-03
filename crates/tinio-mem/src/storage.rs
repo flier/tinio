@@ -2,8 +2,8 @@
 //! [`MemoryStorage`] core.
 //!
 //! All state lives in a redb database over the [`redb::InMemoryBackend`],
-//! organized into eight tables (buckets, objects, object_meta, uploads,
-//! parts, part_meta, upload_checksums, part_checksums). Every check-and-write sequence (e.g. `put_object` checking the
+//! organized into nine tables (buckets, objects, object_meta, uploads,
+//! parts, part_meta, upload_checksums, part_checksums, object_parts). Every check-and-write sequence (e.g. `put_object` checking the
 //! bucket before inserting) runs inside one redb **write transaction**:
 //! transactions are atomic and serialized (redb is a single-writer
 //! database), so `delete_bucket`'s empty-check + removal and a concurrent
@@ -43,18 +43,26 @@ pub(crate) fn band_start<'a>(band: &'a str, marker: Option<&'a str>) -> Bound<&'
     }
 }
 
-/// `name` → creation time (unix nanoseconds).
-pub(crate) const BUCKETS: TableDefinition<&str, u64> = TableDefinition::new("buckets");
+/// `name` → `(creation time unix nanos, tags wire)` — the tags element is
+/// empty when the bucket has none (spec 2026-08-31).
+pub(crate) const BUCKETS: TableDefinition<&str, (u64, &str)> = TableDefinition::new("buckets");
 /// `bucket\0key` → object bytes.
 pub(crate) const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
-/// `bucket\0key` → `(etag wire form, size, last-modified unix nanos)`.
-pub(crate) const OBJECT_META: TableDefinition<&str, (&str, u64, u64)> =
+/// `bucket\0key` → `(etag wire form, size, last-modified unix nanos, tags
+/// wire, checksum wire)` — the tags element is the object's tag set, the
+/// checksum element `<algorithm wire>:<base64 value>:<kind>` its recorded
+/// checksum; both are empty strings when the object has none (spec
+/// 2026-08-31). The kind is recorded at write time so read paths never
+/// derive it.
+pub(crate) const OBJECT_META: TableDefinition<&str, (&str, u64, u64, &str, &str)> =
     TableDefinition::new("object_meta");
-/// `bucket\0key\0upload_id` → initiated unix nanos.
+/// `bucket\0key\0upload_id` → `(initiated unix nanos, tags wire)` — the
+/// tags element is the create-time object tag set, applied to the
+/// completed object.
 ///
 /// Scans under the `bucket\0` prefix bound a listing to one bucket, and the
 /// compound key makes the bucket/key identity check a single lookup.
-pub(crate) const UPLOADS: TableDefinition<&str, u64> = TableDefinition::new("uploads");
+pub(crate) const UPLOADS: TableDefinition<&str, (u64, &str)> = TableDefinition::new("uploads");
 /// `upload_id\0part_number` (zero-padded) → part bytes.
 pub(crate) const PARTS: TableDefinition<&str, &[u8]> = TableDefinition::new("parts");
 /// `upload_id\0part_number` → `(etag wire form, size, last-modified unix nanos)`.
@@ -70,6 +78,24 @@ pub(crate) const UPLOAD_CHECKSUMS: TableDefinition<&str, (&str, &str)> =
 /// `PARTS`/`PART_META`.
 pub(crate) const PART_CHECKSUMS: TableDefinition<&str, (&str, &str)> =
     TableDefinition::new("part_checksums");
+/// `bucket\0key\0part_number` (zero-padded) → `(size, algorithm wire
+/// name or "", base64 checksum value or "")` — the completed object's
+/// retained part list (spec 2026-08-31, GetObjectAttributes
+/// ObjectParts): the parts the object was composed of at its last
+/// multipart completion, in part order, with the stored per-part
+/// checksums. `""` marks a part stored without a checksum.
+pub(crate) const OBJECT_PARTS: TableDefinition<&str, (u64, &str, &str)> =
+    TableDefinition::new("object_parts");
+
+// --- the stored-element wire codecs (spec 2026-08-31) ---
+//
+// The mem rows hold the tags and recorded-checksum values as canonical
+// wire strings, like the fs backend's rows. Rows are written by the API
+// only; the read-side parses below self-heal a domain-invalid element
+// (tampering) instead of failing the row — the same tolerance as the fs
+// backend: tags decode via `object::Tags::parse_wire_limited` + the
+// empty-set fallback, checksum elements via
+// `checksum::Recorded::from_wire_opt`.
 
 /// A minimal in-memory backend over redb's in-memory backend.
 ///
@@ -155,6 +181,7 @@ impl MemoryStorage {
             txn.open_table(PART_META)?;
             txn.open_table(UPLOAD_CHECKSUMS)?;
             txn.open_table(PART_CHECKSUMS)?;
+            txn.open_table(OBJECT_PARTS)?;
             txn.commit()?;
         }
         Ok(Self {
@@ -188,7 +215,7 @@ impl MemoryStorage {
         // latter, and it is racy under concurrent deltas).
         let projected = Cell::new(0u64);
         self.total_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                 let new_total = total as i128 + delta as i128;
                 if new_total < 0 {
                     // Defensive: internal accounting must never go negative.
@@ -208,7 +235,7 @@ impl MemoryStorage {
     /// Roll back a [`Self::adjust_total`] delta after a failed commit.
     pub(crate) fn rollback_total(&self, delta: i64) {
         self.total_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                 Some(((total as i128 - delta as i128).max(0)) as u64)
             })
             .ok();
@@ -277,13 +304,79 @@ pub(crate) fn collect_part_keys(
     Ok(out)
 }
 
+/// `bucket\0key\0NNNNNNNNNN` — zero-padded so string order == part-number
+/// order (mirrors [`part_key`]); `ok` is the key's `object_key`.
+pub(crate) fn object_part_key(ok: &str, part_number: u32) -> String {
+    format!("{ok}\0{part_number:010}")
+}
+
+/// The `OBJECT_PARTS` rows of one object key (`ok` = the key's
+/// `object_key`), in part-number order — the shared scan of the part
+/// listing and the rename migration (rows are returned owned — the redb
+/// guards borrow the transaction).
+pub(crate) fn collect_part_rows<T>(
+    parts: &T,
+    ok: &str,
+) -> Result<Vec<(u32, u64, String, String)>, Error>
+where
+    T: redb::ReadableTable<&'static str, (u64, &'static str, &'static str)>,
+{
+    let prefix = format!("{ok} ");
+    let mut range = parts.range(prefix.as_str()..)?;
+    let mut rows = Vec::new();
+    loop {
+        match range.next() {
+            Some(Ok((k, v))) => {
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                let part_number = parse_part_number(&k.value()[prefix.len()..])?;
+                let (size, algorithm, value) = v.value();
+                rows.push((part_number, size, algorithm.to_string(), value.to_string()));
+            }
+            Some(Err(e)) => return Err(database_storage(e)),
+            None => break,
+        }
+    }
+    Ok(rows)
+}
+
+/// Remove every `OBJECT_PARTS` row of one object key (`ok` = the key's
+/// `object_key`) — an overwrite, completion, or delete must not leave a
+/// completed object's stale parts behind (the new object has none).
+/// Idempotent.
+pub(crate) fn remove_object_parts(
+    parts: &mut redb::Table<'_, &str, (u64, &str, &str)>,
+    ok: &str,
+) -> Result<(), Error> {
+    let prefix = format!("{ok}\0");
+    let mut keys = Vec::new();
+    let mut iter = parts.range(prefix.as_str()..)?;
+    loop {
+        match iter.next() {
+            Some(Ok((k, _))) => {
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                keys.push(k.value().to_string());
+            }
+            Some(Err(e)) => return Err(database_storage(e)),
+            None => break,
+        }
+    }
+    for key in keys {
+        parts.remove(key.as_str())?;
+    }
+    Ok(())
+}
+
 /// Check that `bucket` exists (`NoSuchBucket` otherwise). Multipart
 /// operations answer bucket existence first — the fs backend's
 /// `ensure_bucket` precedes everything else, and NoParts/NoSuchUpload
 /// must not mask a missing bucket.
 pub(crate) fn check_bucket<T>(buckets: &T, name: &bucket::Name) -> Result<(), Error>
 where
-    T: ReadableTable<&'static str, u64>,
+    T: ReadableTable<&'static str, (u64, &'static str)>,
 {
     if buckets.get(name.as_ref().as_str())?.is_none() {
         return Err(no_such_bucket(name));
@@ -303,7 +396,7 @@ pub(crate) fn check_upload<T>(
     key: &object::Key,
 ) -> Result<(), Error>
 where
-    T: ReadableTable<&'static str, u64>,
+    T: ReadableTable<&'static str, (u64, &'static str)>,
 {
     let ukey = upload_key(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id);
     if uploads.get(ukey.as_str())?.is_none() {
@@ -374,7 +467,7 @@ mod tests {
         storage.create_bucket(&bucket).await.unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None)
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
             .await
             .unwrap();
         // The first part is non-final in the two-part list — it must be
@@ -417,6 +510,7 @@ mod tests {
                         etag: p2.etag.clone(),
                     },
                 ],
+                None,
             )
             .await
             .unwrap();

@@ -104,7 +104,7 @@ pub struct CompletedPart {
 /// ```rust
 /// use std::time::SystemTime;
 ///
-/// use tinio_core::MultipartUpload;
+/// use tinio_core::{MultipartUpload, object};
 ///
 /// let upload = MultipartUpload {
 ///     upload_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
@@ -112,6 +112,7 @@ pub struct CompletedPart {
 ///     key: "big.bin".into(),
 ///     initiated_at: SystemTime::UNIX_EPOCH,
 ///     checksum: None,
+///     tags: object::Tags::empty(),
 /// };
 /// assert_eq!(upload.upload_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
 /// ```
@@ -127,6 +128,9 @@ pub struct MultipartUpload {
     pub initiated_at: SystemTime,
     /// The create-time checksum spec (`None` = no checksum upload).
     pub checksum: Option<checksum::Upload>,
+    /// The create-time object tags (empty when none; persisted in the
+    /// upload state and applied to the object at completion).
+    pub tags: object::Tags,
 }
 
 /// Metadata of a single uploaded multipart part.
@@ -161,6 +165,33 @@ pub struct PartInfo {
     pub checksum: Option<checksum::Part>,
 }
 
+/// One part of a completed multipart object — the retained composition
+/// row served by GetObjectAttributes (S3 `ObjectPart`: part number,
+/// size, per-part checksum). No ETag: the S3 dto has none. Not to be
+/// confused with the upload's [`PartInfo`].
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::multipart::ObjectPart;
+///
+/// let part = ObjectPart {
+///     part_number: 1.into(),
+///     size: 5_242_880,
+///     checksum: None,
+/// };
+/// assert_eq!(u32::from(part.part_number), 1);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPart {
+    /// Part number (`1..=10000`).
+    pub part_number: PartNumber,
+    /// Part size in bytes.
+    pub size: u64,
+    /// The stored per-part checksum (`None` = none was computed).
+    pub checksum: Option<checksum::Part>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,9 +218,34 @@ mod tests {
             key: "big.bin".into(),
             initiated_at: SystemTime::UNIX_EPOCH,
             checksum: None,
+            tags: object::Tags::empty(),
         };
         assert_eq!(m.upload_id, "uuid-v4");
         assert_eq!(m.key.as_ref(), "big.bin");
+        assert!(m.tags.is_empty());
+    }
+
+    #[test]
+    fn object_part_construct() {
+        // Mirrors `part_info_round_trip`: the completed-object part row
+        // is plain data (no ETag, no timestamp — the S3 `ObjectPart`).
+        let p = ObjectPart {
+            part_number: 7.into(),
+            size: 100,
+            checksum: Some(checksum::Part {
+                algorithm: checksum::Algorithm::Crc32,
+                value: checksum::Value("NhCmhg==".into()),
+            }),
+        };
+        assert_eq!(u32::from(p.part_number), 7);
+        assert_eq!(p.size, 100);
+        assert_eq!(
+            p.checksum,
+            Some(checksum::Part {
+                algorithm: checksum::Algorithm::Crc32,
+                value: checksum::Value("NhCmhg==".into()),
+            })
+        );
     }
 
     #[test]
@@ -198,6 +254,7 @@ mod tests {
         assert_send_sync::<MultipartUpload>();
         assert_send_sync::<PartNumber>();
         assert_send_sync::<CompletedPart>();
+        assert_send_sync::<ObjectPart>();
     }
 
     #[test]

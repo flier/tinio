@@ -221,3 +221,133 @@ Feature: Object data plane
     When I copy object "data/missing.txt" to "data/dst.txt"
     Then the response status is 404
     And the error code is "NoSuchKey"
+
+  # Task 11 (2026-08-31 s3-tagging-ops): GetObjectAttributes — the
+  # requested subset of ETag / ObjectSize / StorageClass / Checksum /
+  # ObjectParts of one object. Wire shape (s3s 0.15):
+  # GET /{key}?attributes with the x-amz-object-attributes /
+  # x-amz-max-parts / x-amz-part-number-marker headers; the response is
+  # the GetObjectAttributes XML (the retained part list's total rides
+  # the <PartsCount> member).
+  # Task 12 (2026-09-03): the attributes scenarios below carry @FR-032
+  # (contracts/s3-surface.md §GetObjectAttributes) — per-scenario tags,
+  # because the feature-level tags above describe the pre-existing
+  # scenarios.
+
+  @FR-032
+  Scenario: GetObjectAttributes answers the requested subset
+    Given I create bucket "data"
+    And I upload "data/plain.txt" with body "hello"
+    # The header value may join the attributes with commas (the SDK wire
+    # form) — each requested member is echoed…
+    When I send a "GET" request to "/data/plain.txt?attributes" with headers
+      | x-amz-object-attributes | ETag,ObjectSize |
+    Then the response status is 200
+    And the response body contains "<ETag>"
+    And the response body contains "<ObjectSize>5</ObjectSize>"
+    # …only the requested subset answers…
+    When I send a "GET" request to "/data/plain.txt?attributes" with headers
+      | x-amz-object-attributes | ObjectSize |
+    Then the response status is 200
+    And the response body contains "<ObjectSize>5</ObjectSize>"
+    And the response body does not contain "<ETag>"
+    # …a non-multipart object omits the ObjectParts container…
+    When I send a "GET" request to "/data/plain.txt?attributes" with headers
+      | x-amz-object-attributes | ETag,ObjectParts |
+    Then the response status is 200
+    And the response body contains "<ETag>"
+    And the response body does not contain "<ObjectParts>"
+    # …and a missing key answers NoSuchKey.
+    When I send a "GET" request to "/data/missing.txt?attributes" with headers
+      | x-amz-object-attributes | ETag |
+    Then the response status is 404
+    And the error code is "NoSuchKey"
+
+  @FR-032
+  Scenario: GetObjectAttributes paginates the retained part list
+    Given I create bucket "data"
+    And I start a multipart upload for "data/big.bin"
+    And I upload part 1 with 5242881 bytes
+    And I upload part 2 with 4096 bytes
+    When I complete the multipart upload
+    Then the response status is 200
+    # The client-side max-parts cap truncates the page — the container
+    # echoes the applied cap, the next marker, and the total count (a
+    # completed object retains its assembly parts for this op).
+    When I send a "GET" request to "/data/big.bin?attributes" with headers
+      | x-amz-object-attributes | ObjectParts |
+      | x-amz-max-parts         | 1           |
+    Then the response status is 200
+    And the response body contains "<PartNumber>1</PartNumber>"
+    And the response body contains "<IsTruncated>true</IsTruncated>"
+    And the response body contains "<NextPartNumberMarker>1</NextPartNumberMarker>"
+    And the response body contains "<PartsCount>2</PartsCount>"
+    # Resuming past the exclusive marker lists the rest, untruncated.
+    When I send a "GET" request to "/data/big.bin?attributes" with headers
+      | x-amz-object-attributes  | ObjectParts |
+      | x-amz-part-number-marker | 1           |
+    Then the response status is 200
+    And the response body contains "<PartNumber>2</PartNumber>"
+    And the response body contains "<IsTruncated>false</IsTruncated>"
+    And the response body does not contain "<NextPartNumberMarker>"
+
+  @checksum-on
+  @FR-032
+  Scenario: GetObjectAttributes echoes a recorded checksum
+    Given I create bucket "data"
+    # A checksummed plain put records the FULL_OBJECT kind (a multipart
+    # completion records COMPOSITE — pinned by the server unit suite).
+    When I send a "PUT" request to "/data/c.txt" with headers and body "hello"
+      | x-amz-checksum-crc32 | NhCmhg== |
+    Then the response status is 200
+    And the response header "x-amz-checksum-crc32" is "NhCmhg=="
+    When I send a "GET" request to "/data/c.txt"
+    Then the response status is 200
+    And the response header "x-amz-checksum-crc32" is "NhCmhg=="
+    And the response header "x-amz-checksum-type" is "FULL_OBJECT"
+    When I send a "GET" request to "/data/c.txt?attributes" with headers
+      | x-amz-object-attributes | Checksum |
+    Then the response status is 200
+    And the response body contains "<ChecksumCRC32>NhCmhg==</ChecksumCRC32>"
+    And the response body contains "<ChecksumType>FULL_OBJECT</ChecksumType>"
+
+  # The request-checksum echo and the recorded echo (PUT/GET) are NOT
+  # crc32-specific: every algorithm the API model carries must round-trip
+  # through the same value-field plumbing. The digests are the standard
+  # values of the body "hello" (pinned by the server unit suite's
+  # known_vectors test — a hash-encoding change fails there first).
+  @checksum-on
+  @FR-032
+  Scenario Outline: every checksum algorithm echoes on PUT and records on GET
+    Given I create bucket "data"
+    When I send a "PUT" request to "/data/<key>.txt" with headers and body "hello"
+      | x-amz-checksum-<algo> | <digest> |
+    Then the response status is 200
+    And the response header "x-amz-checksum-<algo>" is "<digest>"
+    When I send a "GET" request to "/data/<key>.txt"
+    Then the response status is 200
+    And the response header "x-amz-checksum-<algo>" is "<digest>"
+    And the response header "x-amz-checksum-type" is "FULL_OBJECT"
+
+    Examples:
+      | key  | algo      | digest                                                             |
+      | a    | crc32c    | mnG7TA==                                                          |
+      | b    | crc64nvme | M3eFcAZSQlc=                                                       |
+      | c    | sha1      | qvTGHdzF6KLavt4PO0gs2a6pQ00=                                      |
+      | d    | sha512    | m3HSJL1i83hdltRq0+o9czGb+8KJDKra4t/3JRlnPKcjI8PZm6XBHXx6zG4UuMXaDEZjR1wuXDre9G9zvN7AQw== |
+      | e    | xxhash64  | JseCfYifbaM=                                                       |
+      | f    | xxhash3   | lVXoVVxi3P0=                                                        |
+      | g    | xxhash128 | tenBrQcbPn/Hec+qXlI4GA==                                            |
+
+  # A mismatched full-object checksum on a plain PUT is BadDigest and the
+  # write is refused (the tee's mismatch surfaces through the commit).
+  @checksum-on
+  @FR-032
+  Scenario: a wrong sha512 checksum on PUT is BadDigest
+    Given I create bucket "data"
+    When I send a "PUT" request to "/data/bad.txt" with headers and body "hello"
+      | x-amz-checksum-sha512 | AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA== |
+    Then the response status is 400
+    And the error code is "BadDigest"
+    When I get object "data/bad.txt"
+    Then the response status is 404

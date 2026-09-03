@@ -12,7 +12,7 @@ dedicated test target cross-checks against the spec corpus (both directions).
 |---|---|
 | `tests/cucumber.rs` | The single cucumber test binary (`[[test]] cucumber`, `harness = false`): sets the default tag filter, picks the writers, `fail_on_skipped()`. |
 | `tests/features/` | The `.feature` files (specs, one per domain; `interop/` holds the external-client features). |
-| `tests/steps/` | The `World` + domain-organized step modules (`buckets`, `objects`, `multipart`, `listing`, `errors`, `conditions`, `reserved_paths`, `metrics`, `tagging`, `common`, `clients`) and the `#[before]`/`#[after]` hooks. |
+| `tests/steps/` | The `World` + domain-organized step modules (`buckets`, `clients`, `common`, `conditions`, `errors`, `listing`, `multipart`, `objects`, `reserved_paths`) and the `#[before]`/`#[after]` hooks (the `metrics`/`tagging` scenarios ride the generic `common` request steps). |
 | `tests/traceability.rs` | The spec↔tag cross-check — a plain-harness test target, no cucumber involvement. |
 | `scripts/wsl-interop.sh` | One-command `@interop` run inside WSL2 (Linux-side aws-cli/rclone). |
 
@@ -45,7 +45,8 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@mem` | scenario | Explicit mem backend (wins over `TINIO_E2E_BACKEND`); currently no feature carries it — the CI mem pass uses the env var. |
 | `@nested-root` | scenario | fs: served root = tempdir/`root` (traversal-proof scenarios). |
 | `@checksum-on` | scenario | `caps.checksum = true` (checksum-validation scenarios). |
-| `@minimal-caps` | scenario | Multipart / copy-object / list v1 / list v2 / delete-objects all off (unsupported-op error scenarios). |
+| `@minimal-caps` | scenario | Multipart / copy-object / list v1 / list v2 / delete-objects / tagging all off (unsupported-op error scenarios). |
+| `@tagging-off` | scenario | `caps.tagging = false` (the six `?tagging` ops answer `NotImplemented`). |
 | `@cold-listing` | scenario | fs scanner interval 100 ms (cold-listing scenarios). |
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
 

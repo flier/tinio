@@ -14,7 +14,7 @@ use super::{
     scan::{drain_pair, drain_triple, for_each_pair},
 };
 use crate::{
-    _core::{etag::ETag, from_nanos, object, to_nanos},
+    _core::{checksum, etag::ETag, from_nanos, object, to_nanos},
     bucket,
 };
 
@@ -90,21 +90,35 @@ macro_rules! table_impl {
 
 type BucketKey = &'static str;
 
-/// `name` → created-at unix nanos.
-const BUCKETS: TableDefinition<BucketKey, u64> = TableDefinition::new("buckets");
+/// `name` → `(created-at unix nanos, tags wire)` — the tags element is
+/// empty when the bucket has none (spec 2026-08-31).
+type BucketValue = (u64, &'static str);
+const BUCKETS: TableDefinition<BucketKey, BucketValue> = TableDefinition::new("buckets");
 
 /// Handle to the `BUCKETS` table (writable or read-only).
 pub struct BucketsTable<'txn, T>(T, PhantomData<&'txn ()>);
 
-table_impl!(BucketsTable, BUCKETS, BucketKey, u64);
+table_impl!(BucketsTable, BUCKETS, BucketKey, BucketValue);
 
 impl<'txn, T> BucketsTable<'txn, T>
 where
-    T: ReadableTable<BucketKey, u64>,
+    T: ReadableTable<BucketKey, BucketValue>,
 {
     /// Creation time of `name`, if recorded.
     pub fn get(&self, name: &bucket::Name) -> Result<Option<SystemTime>, Error> {
-        Ok(self.0.get(&**name)?.map(|guard| from_nanos(guard.value())))
+        Ok(self
+            .0
+            .get(&**name)?
+            .map(|guard| from_nanos(guard.value().0)))
+    }
+
+    /// The stored row of `name`: `(creation time, tags wire raw)` (owned —
+    /// the guard cannot outlive the closure).
+    pub fn row(&self, name: &bucket::Name) -> Result<Option<(SystemTime, String)>, Error> {
+        Ok(self
+            .0
+            .get(&**name)?
+            .map(|guard| (from_nanos(guard.value().0), guard.value().1.to_string())))
     }
 
     /// Visit every recorded bucket in name order.
@@ -114,30 +128,49 @@ where
     {
         for item in self.0.iter()? {
             let (k, v) = item?;
-            visit(k.value(), from_nanos(v.value()))?;
+            visit(k.value(), from_nanos(v.value().0))?;
         }
         Ok(())
     }
 }
 
-impl<'txn> BucketsTable<'txn, Table<'txn, BucketKey, u64>> {
-    /// Record (or overwrite) the creation time of `name`.
+impl<'txn> BucketsTable<'txn, Table<'txn, BucketKey, BucketValue>> {
+    /// Record (or overwrite) the creation time of `name` — the tags
+    /// element is cleared (a fresh row has no tags; the tagging ops use
+    /// [`Self::put_full`] to preserve the creation time).
     pub fn put(&mut self, name: &bucket::Name, created_at: SystemTime) -> Result<(), Error> {
-        self.0.insert(&**name, to_nanos(created_at))?;
+        self.0.insert(&**name, (to_nanos(created_at), ""))?;
         Ok(())
     }
 
-    /// Insert `now` when absent; return the stored creation time.
+    /// Record (or overwrite) the whole row: the creation time AND the
+    /// tags wire (`put_bucket_tags`'s row upsert — the creation time is
+    /// preserved from the stored row, first-sighted when absent).
+    pub fn put_full(
+        &mut self,
+        name: &bucket::Name,
+        created_at: SystemTime,
+        tags_wire: &str,
+    ) -> Result<(), Error> {
+        self.0.insert(&**name, (to_nanos(created_at), tags_wire))?;
+        Ok(())
+    }
+
+    /// Insert `now` when absent; return the stored creation time. The
+    /// stored row's tags element rides the re-insert (a first-sight
+    /// upsert must not clear the tag set the tagging write just recorded
+    /// — mirror the `put_full`-style callers, which keep
+    /// `(created_at, existing_tags)`).
     pub fn get_or_insert(
         &mut self,
         name: &bucket::Name,
         now: SystemTime,
     ) -> Result<SystemTime, Error> {
-        let created = match self.0.get(&**name)? {
-            Some(guard) => guard.value(),
-            None => to_nanos(now),
+        let (created, tags) = match self.0.get(&**name)? {
+            Some(guard) => (guard.value().0, guard.value().1.to_string()),
+            None => (to_nanos(now), String::new()),
         };
-        self.0.insert(&**name, created)?;
+        self.0.insert(&**name, (created, tags.as_str()))?;
         Ok(from_nanos(created))
     }
 
@@ -151,9 +184,14 @@ impl<'txn> BucketsTable<'txn, Table<'txn, BucketKey, u64>> {
 // --- OBJECT_META ---
 
 type MetaKey = (&'static str, &'static str);
-type MetaValue = (&'static str, u64, u64, u64);
 
-/// `(bucket, key)` → `(etag hex, size, mtime unix nanos, file identity)`.
+/// `(bucket, key)` → `(etag hex, size, mtime unix nanos, file identity,
+/// tags wire, checksum wire)` — the tags and checksum elements are empty
+/// strings when the object has none (spec 2026-08-31). The checksum wire
+/// is `<algorithm wire>:<base64 value>:<kind>` — e.g.
+/// `CRC32:NhCmhg==:FULL_OBJECT` — with the kind recorded at write time so
+/// read paths never derive it.
+type MetaValue = (&'static str, u64, u64, u64, &'static str, &'static str);
 const OBJECT_META: TableDefinition<MetaKey, MetaValue> = TableDefinition::new("object_meta");
 
 /// Handle to the `OBJECT_META` table (writable or read-only).
@@ -162,7 +200,8 @@ pub struct ObjectMetaTable<'txn, T>(T, PhantomData<&'txn ()>);
 table_impl!(ObjectMetaTable, OBJECT_META, MetaKey, MetaValue);
 
 /// One stored `OBJECT_META` entry, validated into domain types (the row
-/// shape is `(etag hex, size, mtime unix nanos, file identity)`).
+/// shape is `(etag hex, size, mtime unix nanos, file identity, tags wire,
+/// checksum wire)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMeta {
     /// ETag (single MD5 or composed `-N` form).
@@ -174,21 +213,32 @@ pub struct StoredMeta {
     /// File identity at record time (`0` marks an unavailable platform
     /// identity).
     pub file_identity: u64,
+    /// The object's tag set (empty when none, or when the stored wire is
+    /// domain-invalid — self-healing like the etag).
+    pub tags: object::Tags,
+    /// The recorded object checksum (`None` when none, or when the stored
+    /// element is domain-invalid — self-healing like the etag).
+    pub checksum: Option<checksum::Recorded>,
 }
 
 /// Validate one raw `OBJECT_META` row into [`StoredMeta`] — `None` on a
 /// domain-invalid etag (self-healing: the caller treats it as missing
-/// and recomputes). Shared by the point read [`ObjectMetaTable::get`]
-/// and the gating traversal [`ObjectMetaTable::for_bucket_gated`] — the
-/// single home of the rule.
+/// and recomputes). The tags and checksum elements self-heal to
+/// empty/`None` on a domain-invalid wire — the row itself is still
+/// served (its etag is valid), exactly like the read paths treat a
+/// garbage checksum spec. Shared by the point read
+/// [`ObjectMetaTable::get`] and the gating traversal
+/// [`ObjectMetaTable::for_bucket_gated`] — the single home of the rule.
 fn validate_stored(
-    (etag, size, mtime, file_identity): (&str, u64, u64, u64),
+    (etag, size, mtime, file_identity, tags, checksum): (&str, u64, u64, u64, &str, &str),
 ) -> Option<StoredMeta> {
     Some(StoredMeta {
         etag: ETag::new(etag).ok()?,
         size,
         mtime,
         file_identity,
+        tags: object::Tags::parse_wire_limited(tags, object::OBJECT_TAGS_MAX).unwrap_or_default(),
+        checksum: checksum::Recorded::from_wire_opt(checksum),
     })
 }
 
@@ -221,7 +271,7 @@ where
             &self.0,
             (bucket, ""),
             |b, _| b == bucket,
-            |_, raw_key, (etag, size, mtime, _)| {
+            |_, raw_key, (etag, size, mtime, _, _, _)| {
                 let key = object::key(raw_key).map_err(|err| corrupt_meta(raw_key, err))?;
                 let etag = ETag::new(etag).map_err(|err| corrupt_meta(raw_key, err))?;
                 visit(key, etag, size, mtime)
@@ -244,13 +294,13 @@ where
             &self.0,
             (bucket, ""),
             |b, _| b == bucket,
-            |_, raw_key, (etag, size, mtime, file_identity)| {
+            |_, raw_key, (etag, size, mtime, file_identity, tags, checksum)| {
                 let Ok(key) = object::key(raw_key) else {
                     return Ok(()); // invalid key domain → skip the row
                 };
                 // Same row validation as the point read and the gate
                 // (invalid etag → None — self-healing).
-                let stored = validate_stored((etag, size, mtime, file_identity));
+                let stored = validate_stored((etag, size, mtime, file_identity, tags, checksum));
                 visit(key, stored)
             },
         )
@@ -258,20 +308,40 @@ where
 }
 
 impl<'txn> ObjectMetaTable<'txn, Table<'txn, MetaKey, MetaValue>> {
-    /// Upsert the meta entry for `key`.
+    /// Upsert the meta entry for `key` — the tags and the recorded
+    /// checksum ride in the same row (write-path atomicity: the
+    /// interface-validated `tags` and the recorded checksum are persisted
+    /// with the etag, never a post-commit tag window). `checksum` is
+    /// stored with its recorded kind (`FULL_OBJECT` for plain PUTs,
+    /// `COMPOSITE` for multipart completions, the source's kind for
+    /// copies) — read paths never derive it.
+    #[allow(clippy::too_many_arguments)]
+    /// Upsert one row — the key plus the [`StoredMeta`] payload (one
+    /// struct per row; the wire elements are encoded here, the one
+    /// encode home).
     pub fn put(
         &mut self,
         bucket: &bucket::Name,
         key: &object::Key,
-        etag: &ETag,
-        size: u64,
-        mtime: SystemTime,
-        identity: u64,
+        meta: &StoredMeta,
     ) -> Result<(), Error> {
-        let etag_hex = etag.as_str();
+        let etag_hex = meta.etag.as_str();
+        let tags_wire = meta.tags.to_wire();
+        let checksum_wire = meta
+            .checksum
+            .as_ref()
+            .map(|c| c.to_wire())
+            .unwrap_or_default();
         self.0.insert(
             (&**bucket, &**key),
-            (etag_hex.as_str(), size, to_nanos(mtime), identity),
+            (
+                etag_hex.as_str(),
+                meta.size,
+                meta.mtime,
+                meta.file_identity,
+                tags_wire.as_str(),
+                checksum_wire.as_str(),
+            ),
         )?;
         Ok(())
     }
@@ -293,9 +363,11 @@ impl<'txn> ObjectMetaTable<'txn, Table<'txn, MetaKey, MetaValue>> {
 // --- UPLOADS ---
 
 type UploadKey = (&'static str, &'static str);
-type UploadValue = (&'static str, u64);
 
-/// `(bucket, upload_id)` → `(key, initiated-at unix nanos)`.
+/// `(bucket, upload_id)` → `(key, initiated-at unix nanos, tags wire)` —
+/// the tags element is the create-time object tag set (spec 2026-08-31,
+/// applied to the completed object; empty when none).
+type UploadValue = (&'static str, u64, &'static str);
 const UPLOADS: TableDefinition<UploadKey, UploadValue> = TableDefinition::new("uploads");
 
 /// Handle to the `UPLOADS` table (writable or read-only).
@@ -340,24 +412,32 @@ where
 
     /// The stored row, present only when the upload exists AND records
     /// `key` (S3 identity is `(bucket, key, uploadId)`) — the
-    /// `key_matches` + `get` pair of `get_upload` in one lookup.
+    /// `key_matches` + `get` pair of `get_upload` in one lookup. Returns
+    /// `(key, initiated-at, tags wire)` (owned — the guard cannot outlive
+    /// the closure).
     pub fn get_matching(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         upload_id: &str,
-    ) -> Result<Option<(String, u64)>, Error> {
+    ) -> Result<Option<(String, u64, String)>, Error> {
         Ok(self
             .0
             .get((&**bucket, upload_id))?
-            .map(|guard| (guard.value().0.to_string(), guard.value().1))
-            .filter(|(stored_key, _)| stored_key == &**key))
+            .map(|guard| {
+                (
+                    guard.value().0.to_string(),
+                    guard.value().1,
+                    guard.value().2.to_string(),
+                )
+            })
+            .filter(|(stored_key, _, _)| stored_key == &**key))
     }
 
     /// Visit every upload row of `bucket` (contiguous from `(bucket, "")`).
     pub fn for_bucket<F>(&self, bucket: &bucket::Name, mut visit: F) -> Result<(), Error>
     where
-        F: FnMut(&str, (&str, u64)) -> Result<(), Error>,
+        F: FnMut(&str, (&str, u64, &str)) -> Result<(), Error>,
     {
         let bucket = &**bucket;
         for_each_pair(
@@ -371,31 +451,33 @@ where
     /// Visit every upload row across all buckets.
     pub fn for_each<F>(&self, mut visit: F) -> Result<(), Error>
     where
-        F: FnMut(&str, &str, &str, u64) -> Result<(), Error>,
+        F: FnMut(&str, &str, &str, u64, &str) -> Result<(), Error>,
     {
         for item in self.0.iter()? {
             let (k, v) = item?;
             let (b, upload_id) = k.value();
-            let (key, initiated_at) = v.value();
-            visit(b, upload_id, key, initiated_at)?;
+            let (key, initiated_at, tags_wire) = v.value();
+            visit(b, upload_id, key, initiated_at, tags_wire)?;
         }
         Ok(())
     }
 }
 
 impl<'txn> UploadsTable<'txn, Table<'txn, UploadKey, UploadValue>> {
-    /// Upsert one upload row.
+    /// Upsert one upload row — the create-time tags wire rides in the
+    /// row (spec 2026-08-31).
     pub fn put(
         &mut self,
         bucket: &bucket::Name,
         upload_id: &str,
         key: &object::Key,
         initiated_at: SystemTime,
+        tags_wire: &str,
     ) -> Result<(), Error> {
         let key_str = key.to_string();
         self.0.insert(
             (&**bucket, upload_id),
-            (key_str.as_str(), to_nanos(initiated_at)),
+            (key_str.as_str(), to_nanos(initiated_at), tags_wire),
         )?;
         Ok(())
     }
@@ -635,18 +717,108 @@ impl<'txn> PartChecksumsTable<'txn, Table<'txn, PartKey, PartChecksumValue>> {
     }
 }
 
+// --- OBJECT_PARTS ---
+
+type ObjectPartKey = (&'static str, &'static str, u32);
+
+/// `(bucket, key, part_number)` → `(size, algorithm wire name or "",
+/// base64 checksum value or "")` — the completed object's retained part
+/// list (spec 2026-08-31, GetObjectAttributes ObjectParts): the parts
+/// the object was composed of at its last multipart completion, in part
+/// order, with the stored per-part checksums. `""` marks a part stored
+/// without a checksum. The key shape mirrors `PARTS` (same `(bucket,
+/// upload-id/object-key, part_number)` ordering).
+type ObjectPartValue = (u64, &'static str, &'static str);
+const OBJECT_PARTS: TableDefinition<ObjectPartKey, ObjectPartValue> =
+    TableDefinition::new("object_parts");
+
+/// Handle to the `OBJECT_PARTS` table (writable or read-only).
+pub struct ObjectPartsTable<'txn, T>(T, PhantomData<&'txn ()>);
+
+table_impl!(
+    ObjectPartsTable,
+    OBJECT_PARTS,
+    ObjectPartKey,
+    ObjectPartValue
+);
+
+impl<'txn, T> ObjectPartsTable<'txn, T>
+where
+    T: ReadableTable<ObjectPartKey, ObjectPartValue>,
+{
+    /// The key's rows in part-number order: `(part number, size,
+    /// algorithm wire name, base64 checksum value)` (owned — the guard
+    /// cannot outlive the closure).
+    pub fn list(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Vec<(u32, u64, String, String)>, Error> {
+        let bucket = &**bucket;
+        let key = &**key;
+        let mut out = Vec::new();
+        for item in self.0.range((bucket, key, 0)..)? {
+            let (k, v) = item?;
+            let (b, stored_key, n) = k.value();
+            if b != bucket || stored_key != key {
+                break;
+            }
+            let (size, algorithm, value) = v.value();
+            out.push((n, size, algorithm.to_string(), value.to_string()));
+        }
+        Ok(out)
+    }
+}
+
+impl<'txn> ObjectPartsTable<'txn, Table<'txn, ObjectPartKey, ObjectPartValue>> {
+    /// Upsert one part row.
+    pub fn put(
+        &mut self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        part_number: u32,
+        size: u64,
+        algorithm: &str,
+        value: &str,
+    ) -> Result<(), Error> {
+        self.0
+            .insert((&**bucket, &**key, part_number), (size, algorithm, value))?;
+        Ok(())
+    }
+
+    /// Delete every row of `key` — an overwrite/copy/delete must not
+    /// leave a completed object's stale parts behind (the new object has
+    /// none). Idempotent.
+    pub fn remove_key(&mut self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
+        let bucket = &**bucket;
+        let key = &**key;
+        drain_triple(&mut self.0, (bucket, key, 0), |b, k, _| {
+            b == bucket && k == key
+        })
+    }
+
+    /// Delete every row of `bucket` (bucket teardown).
+    pub fn drain_bucket(&mut self, bucket: &bucket::Name) -> Result<(), Error> {
+        let bucket = &**bucket;
+        drain_triple(&mut self.0, (bucket, "", 0), |b, _, _| b == bucket)
+    }
+}
+
 // --- STATE ---
 
 type StateKey = &'static str;
 
 /// The `STATE` table's format version — ONE current version, no
 /// migration (F06, user decision): any stored version that is not this
-/// one is refused, old and new alike. The version history is additive
-/// (`UPLOAD_CHECKSUMS` + `PART_CHECKSUMS` landed in 2, spec 2026-08-31),
-/// but a pre-checksum v1 database cannot be told apart from a future
-/// format, so it must not open silently — the state is derivable, and
-/// `UnsupportedVersion` tells the operator to delete and rebuild.
-const STATE_VERSION: u64 = 2;
+/// one is refused on open. The version stays `1` — additive schema
+/// changes (the multipart-checksum tables, and the tagging rows /
+/// `OBJECT_PARTS` of this change) do NOT bump it (user ruling
+/// 2026-09-02: dev-local databases are disposable, no compatibility
+/// machinery); any stored version other than `1` is still refused by the
+/// gate — a stale v2 database errors with `UnsupportedVersion` and the
+/// operator deletes it, and a stale same-version database written in an
+/// older row format may error at row decode — the same remedy.
+const STATE_VERSION: u64 = 1;
 /// The `STATE` version key.
 const STATE_VERSION_KEY: &str = "version";
 /// The `STATE` compact-needed marker key (0 = clean, 1 = needs compact).

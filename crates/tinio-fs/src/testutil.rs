@@ -12,7 +12,7 @@ use std::{
     io::{Error as IoError, ErrorKind},
     path::Path,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -27,12 +27,40 @@ use tokio::{
 
 use crate::{
     _core::{
-        bucket,
+        bucket, checksum,
         pipeline::{self, Completion, Error::ShutDown, Reply, Runner, Stats, Task},
     },
     _util::testing::wait_for as util_wait_for,
     Error, FsOptions, FsStorage, etag, testing,
 };
+
+/// A preset server tee slot (spec 2026-08-31): the digest cell already
+/// holds `algorithm`/`base64_value`, so a staged body commits it as the
+/// object's recorded checksum. The server's tee would fill the cell while
+/// the body streamed; tests preset it — the backends never validate the
+/// value against the bytes.
+pub(crate) fn checksum_tee(
+    algorithm: checksum::Algorithm,
+    base64_value: &str,
+) -> Arc<checksum::PartChecksum> {
+    let tee = Arc::new(checksum::PartChecksum {
+        digest: OnceLock::new(),
+        etag: None,
+    });
+    let _ = tee.digest.set(checksum::Part {
+        algorithm,
+        value: checksum::Value(base64_value.into()),
+    });
+    tee
+}
+
+/// The base64 wire value of `data`'s content MD5 — the honest digest of
+/// a test body (the fs crate's only hash primitive is MD5).
+pub(crate) fn md5_wire(data: &[u8]) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use md5::{Digest, Md5};
+    STANDARD.encode(Md5::digest(data))
+}
 
 /// Poll `cond` until true or a 10 s deadline passes (the test runners'
 /// workers are asynchronous, so assertions must wait). The shared

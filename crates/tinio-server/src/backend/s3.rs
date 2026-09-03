@@ -42,6 +42,28 @@ impl<S: Storage> S3 for S3Backend<S> {
         self.op_get_bucket_location(req).await
     }
 
+    // --- bucket tagging (spec 2026-08-31) ---
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<dto::GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::GetBucketTaggingOutput>> {
+        self.op_get_bucket_tagging(req).await
+    }
+
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<dto::PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::PutBucketTaggingOutput>> {
+        self.op_put_bucket_tagging(req).await
+    }
+
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<dto::DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketTaggingOutput>> {
+        self.op_delete_bucket_tagging(req).await
+    }
+
     // --- objects + copy (T048) ---
     async fn put_object(
         &self,
@@ -62,6 +84,13 @@ impl<S: Storage> S3 for S3Backend<S> {
         req: S3Request<dto::HeadObjectInput>,
     ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
         self.op_head_object(req).await
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<dto::GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<dto::GetObjectAttributesOutput>> {
+        self.op_get_object_attributes(req).await
     }
 
     async fn delete_object(
@@ -85,12 +114,34 @@ impl<S: Storage> S3 for S3Backend<S> {
         self.op_get_object_tagging(req).await
     }
 
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<dto::PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::PutObjectTaggingOutput>> {
+        self.op_put_object_tagging(req).await
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<dto::DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectTaggingOutput>> {
+        self.op_delete_object_tagging(req).await
+    }
+
     #[cfg(feature = "copy")]
     async fn copy_object(
         &self,
         req: S3Request<dto::CopyObjectInput>,
     ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
         self.op_copy_object(req).await
+    }
+
+    #[cfg(feature = "copy")]
+    async fn rename_object(
+        &self,
+        req: S3Request<dto::RenameObjectInput>,
+    ) -> S3Result<S3Response<dto::RenameObjectOutput>> {
+        self.op_rename_object(req).await
     }
 
     // --- listing (T049) ---

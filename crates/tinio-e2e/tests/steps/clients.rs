@@ -32,9 +32,8 @@ use std::{
 use assert_cmd::Command as AssertCmd;
 use cucumber::{given, then, when};
 
+use super::{FsKind, World, common::deterministic_bytes, has_tag};
 use crate::_server::_config::{Config, s3};
-
-use super::{common::deterministic_bytes, has_tag, FsKind, World};
 
 /// The fixed MinIO-convention credential pair the serve example accepts.
 pub const ACCESS_KEY: &str = "minioadmin";

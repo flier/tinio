@@ -214,6 +214,35 @@ impl Handle {
         .await
     }
 
+    /// The no-op-aware sibling of [`Self::write`]: the closure reports
+    /// whether it changed the database (`None` = nothing to commit), and
+    /// a clean no-op drops the write transaction without the commit
+    /// fsync — the idempotent tag clears and the row-missing probes of
+    /// the tag ops cost nothing. The `Err` arm aborts like `write`.
+    pub(crate) async fn write_if<T>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&mut WriteTransaction) -> Result<Option<T>, Error> + Send + 'static,
+    ) -> Result<Option<T>, Error>
+    where
+        T: Send + 'static,
+    {
+        self.timed_write(move |mut txn| {
+            let result = f(&mut txn);
+            match result {
+                Ok(Some(value)) => txn.commit().map(|()| Some(value)).map_err(Into::into),
+                Ok(None) => {
+                    let _ = txn.abort();
+                    Ok(None)
+                }
+                Err(err) => {
+                    let _ = txn.abort();
+                    Err(err)
+                }
+            }
+        })
+        .await
+    }
+
     /// The timing write-transaction wrapper (pipeline-spec.md §4, P5):
     /// the entry-to-`begin_write` return ≈ the lock wait, the
     /// entry-to-return = the total duration (incl. fsync) — both recorded

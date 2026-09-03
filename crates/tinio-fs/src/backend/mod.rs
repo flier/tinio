@@ -33,20 +33,24 @@ pub use crate::error::Error;
 pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
 use crate::{
     _core::{
-        ETag, object, pipeline,
+        ETag, checksum, object, pipeline,
         storage::{
             COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
             DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
             META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
         },
+        to_nanos,
     },
     _util::lockmap,
     bucket,
-    database::{self, BucketsTable, Handle, ObjectMetaTable, compact_if_needed},
+    database::{
+        self, BucketsTable, Handle, ObjectMetaTable, ObjectPartsTable, UploadsTable,
+        compact_if_needed,
+    },
     etag, fsutil,
     listing::FsListing,
     meta,
-    multipart::{Store as MultipartStore, drain_bucket_uploads, drain_upload},
+    multipart::{CompletedPartRow, Store as MultipartStore, drain_bucket_uploads, drain_upload},
     path::{
         BoundaryCache, map_bucket_path, map_key_path, map_key_path_lexical, prove_key_contained,
         state_dir,
@@ -584,12 +588,12 @@ impl FsStorage {
     }
 
     /// Delete the whole derived state of a bucket — the `BUCKETS` row and
-    /// the `OBJECT_META` / `UPLOADS` / `PARTS` ranges — in one write
-    /// transaction (meta-redb-spec G2: a bucket's state dies atomically).
-    /// The bucket directory itself is removed by the caller under the
-    /// mutation lock; errors propagate — a swallowed failure would leak
-    /// `OBJECT_META` rows that no cleanup stage can see (the repair walk
-    /// only visits live buckets).
+    /// the `OBJECT_META` / `OBJECT_PARTS` / `UPLOADS` / `PARTS` ranges —
+    /// in one write transaction (meta-redb-spec G2: a bucket's state dies
+    /// atomically). The bucket directory itself is removed by the caller
+    /// under the mutation lock; errors propagate — a swallowed failure
+    /// would leak `OBJECT_META` rows that no cleanup stage can see (the
+    /// repair walk only visits live buckets).
     pub(crate) async fn remove_bucket_state(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let bucket = bucket.clone();
         self.handle
@@ -602,6 +606,10 @@ impl FsStorage {
                     let mut meta = ObjectMetaTable::open(txn)?;
                     meta.drain_bucket(&bucket)?;
                 }
+                {
+                    let mut parts = ObjectPartsTable::open(txn)?;
+                    parts.drain_bucket(&bucket)?;
+                }
                 drain_bucket_uploads(txn, &bucket)?;
                 Ok(())
             })
@@ -610,14 +618,23 @@ impl FsStorage {
     }
 
     /// The post-rename state of a completed multipart upload: delete its
-    /// `UPLOADS` + `PARTS` records and persist the object's `OBJECT_META`
-    /// entry in ONE write transaction (meta-redb-spec §5.3 — rename,
-    /// then a single all-or-nothing state transaction). Idempotent: on a
-    /// retry after a crash before this call the records are still there
-    /// and get deleted; a concurrent abort that already removed them is
-    /// a no-op. Errors propagate — the transaction rolls back as a unit,
-    /// so a failed call leaves the upload records intact and a client
-    /// retry re-runs the whole completion safely.
+    /// `UPLOADS` + `PARTS` records, persist the object's `OBJECT_META`
+    /// entry (with the completion's `tags` and the interface-computed
+    /// composite `checksum` — the backends never hash, spec 2026-08-31),
+    /// and persist the assembled parts into `OBJECT_PARTS` — the
+    /// completed object's retained part list, each row `(part number,
+    /// size, algorithm wire, base64 checksum value)`; `parts` is
+    /// `Store::complete`'s assembled rows (in part-number order), and
+    /// any stale rows of the key are replaced (an overwriting completion
+    /// leaves only its own parts). ONE write transaction
+    /// (meta-redb-spec §5.3 — rename, then a single all-or-nothing state
+    /// transaction). Idempotent: on a retry after a crash before this
+    /// call the records are still there and get deleted; a concurrent
+    /// abort that already removed them is a no-op. Errors propagate —
+    /// the transaction rolls back as a unit, so a failed call leaves the
+    /// upload records intact and a client retry re-runs the whole
+    /// completion safely.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_object_state(
         &self,
         bucket: &bucket::Name,
@@ -626,7 +643,9 @@ impl FsStorage {
         etag: &ETag,
         path: &Path,
         metadata: &Metadata,
-    ) -> Result<(), Error> {
+        checksum: Option<checksum::Recorded>,
+        parts: Vec<CompletedPartRow>,
+    ) -> Result<object::Tags, Error> {
         let size = metadata.len();
         let mtime = metadata.modified()?;
         let identity = fsutil::file_identity(path, metadata);
@@ -634,10 +653,53 @@ impl FsStorage {
         let key = key.clone();
         let upload_id = upload_id.to_string();
         let etag = etag.clone();
+        let checksum = checksum.clone();
+        let parts = parts.clone();
         self.handle
             .write(move |txn| {
+                // The create-time tags ride in the upload row this
+                // transaction consumes (spec 2026-08-31) — read before
+                // the drain, never re-ferried through the interface. A
+                // garbage wire self-heals to the empty set.
+                let tags = {
+                    let uploads = UploadsTable::open(txn)?;
+                    let tags_wire = uploads
+                        .get_matching(&bucket, &key, &upload_id)?
+                        .map_or_else(String::new, |(_, _, wire)| wire);
+                    object::Tags::parse_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
+                        .unwrap_or_default()
+                };
                 drain_upload(txn, &bucket, &upload_id)?;
-                ObjectMetaTable::open(txn)?.put(&bucket, &key, &etag, size, mtime, identity)
+                {
+                    let mut meta = ObjectMetaTable::open(txn)?;
+                    meta.put(
+                        &bucket,
+                        &key,
+                        &database::StoredMeta {
+                            etag: etag.clone(),
+                            size,
+                            mtime: to_nanos(mtime),
+                            file_identity: identity,
+                            tags: tags.clone(),
+                            checksum: checksum.clone(),
+                        },
+                    )?;
+                }
+                {
+                    // The retained part list: replace any stale rows of
+                    // the key, then insert this completion's parts (a
+                    // re-completed key must not accumulate rows).
+                    let mut parts_table = ObjectPartsTable::open(txn)?;
+                    parts_table.remove_key(&bucket, &key)?;
+                    for (n, part_size, checksum_row) in &parts {
+                        let (algorithm, value) = match checksum_row {
+                            Some((algorithm, value)) => (algorithm.as_str(), value.as_str()),
+                            None => ("", ""),
+                        };
+                        parts_table.put(&bucket, &key, *n, *part_size, algorithm, value)?;
+                    }
+                }
+                Ok(tags)
             })
             .await
             .map_err(Into::into)

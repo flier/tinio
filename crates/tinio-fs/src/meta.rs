@@ -1,22 +1,30 @@
 //! The ETag metadata store (task T039, migrated to redb per meta-redb-spec).
 //!
 //! Entries live in the `OBJECT_META` table of `<state-dir>/meta.redb`:
-//! key `(bucket, key)`, value `(etag hex, size, mtime unix nanos)`. The
+//! key `(bucket, key)`, value `(etag hex, size, mtime unix nanos, file
+//! identity, tags wire, checksum wire)` (spec 2026-08-31 — the object row
+//! also records the API-written tag set and the write-time checksum). The
 //! composite key keeps one bucket's entries contiguous, so `walk` and
 //! `remove_bucket` are cheap prefix range scans.
 //!
 //! Entries are served only when size + mtime match the object file
 //! (FR-022); otherwise the ETag is recomputed streaming and the entry
-//! rewritten. Redb transactions replace the old temp+rename writes under an
-//! in-process lock: single-entry operations are one short transaction, and
-//! a bucket removal is one atomic range deletion.
+//! rewritten. The tags/checksum elements are NOT recomputable from the
+//! object file: a content-derived rewrite (an ETag recompute) carries the
+//! replaced row's elements over — they describe the object as last
+//! written through the API, and only an API write (PUT/copy/complete/
+//! delete/tag op) clears them. Redb transactions replace the old
+//! temp+rename writes under an in-process lock: single-entry operations
+//! are one short transaction, and a bucket removal is one atomic range
+//! deletion.
 //!
 //! `tinio-core` domain types stay serde-free (constitution I); the stored
 //! value uses plain strings and is validated into the domain types on read.
 //! A domain-invalid stored value is reported as missing (the caller
 //! recomputes from the object file and rewrites — self-healing, FR-022);
-//! under redb's table-level consistency a single bad entry no longer
-//! exists on its own.
+//! a domain-invalid tags/checksum element heals to empty/`None` on the
+//! same read (the row's etag is still served); under redb's table-level
+//! consistency a single bad entry no longer exists on its own.
 //!
 //! The pipeline stage adds three primitives over this store (pipeline-spec.md
 //! §3.2): [`Store::set_batch`] / [`Store::set_batch_owned`] (one write
@@ -38,9 +46,9 @@ pub use object::{Key, key};
 
 pub use crate::bucket::{Name, name};
 use crate::{
-    _core::{etag::ETag, from_nanos, object, to_nanos},
+    _core::{checksum, etag::ETag, from_nanos, object, to_nanos},
     Error, bucket,
-    database::{self, Handle, ObjectMetaTable},
+    database::{self, Handle, ObjectMetaTable, ObjectPartsTable},
     etag::{self, HashBuffer},
 };
 
@@ -323,17 +331,10 @@ impl Store {
         }
     }
 
-    /// The ETag of an object file at `path`, ensuring a matching entry:
-    /// the stored entry when it still matches (`size` + `mtime` +
-    /// `identity` — F01), else the content MD5 recomputed streaming and
-    /// the entry rewritten (FR-022). Returns the ETag and whether it was
-    /// (re)computed — one read drives the decision, so a stale entry
-    /// costs one read, not two. `identity` is the file identity of the
-    /// same handle the caller's `size`/`mtime` came from (`0` when
-    /// unavailable) — the gate never opens the path itself. The re-hash
-    /// opens the file under the `follow_symlinks` policy (nofollow when
-    /// disabled — a swap to a symlink between the metadata check and the
-    /// hash is rejected, R3) and persists the hash-time metadata (F19).
+    /// The ETag of an object file at `path`, ensuring a matching entry —
+    /// the `ensure_row` row's etag: the stored entry when it
+    /// still matches, else the content MD5 recomputed streaming. Returns
+    /// the ETag and whether it was (re)computed.
     #[allow(clippy::too_many_arguments)]
     pub async fn ensure_etag(
         &self,
@@ -345,6 +346,39 @@ impl Store {
         identity: u64,
         follow_symlinks: bool,
     ) -> Result<(ETag, bool), Error> {
+        let (row, recomputed) = self
+            .ensure_row(bucket, key, path, size, mtime, identity, follow_symlinks)
+            .await?;
+        Ok((row.etag, recomputed))
+    }
+
+    /// The full ensured row of an object file at `path`: the stored entry
+    /// when it still matches (`size` + `mtime` + `identity` — F01), else
+    /// the entry the rewrite left — the content MD5 recomputed streaming
+    /// with the replaced row's tags/checksum elements carried over
+    /// (FR-022 + spec 2026-08-31: the elements are NOT recomputable from
+    /// content, so a content-derived rewrite preserves them — they
+    /// describe the object as last written through the API; only an API
+    /// write clears them). Returns the validated row (the etag, tags and
+    /// checksum the read paths serve) and whether it was (re)written —
+    /// one read drives the decision, so a stale entry costs one read,
+    /// not two. `identity` is the file identity of the same handle the
+    /// caller's `size`/`mtime` came from (`0` when unavailable) — the
+    /// gate never opens the path itself. The re-hash opens the file under
+    /// the `follow_symlinks` policy (nofollow when disabled — a swap to a
+    /// symlink between the metadata check and the hash is rejected, R3)
+    /// and persists the hash-time metadata (F19).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn ensure_row(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        path: &Path,
+        size: u64,
+        mtime: SystemTime,
+        identity: u64,
+        follow_symlinks: bool,
+    ) -> Result<(database::StoredMeta, bool), Error> {
         if let Some(stored) = self.stored_entry(bucket, key).await? {
             if entry_matches(
                 stored.size,
@@ -354,7 +388,7 @@ impl Store {
                 mtime,
                 identity,
             ) {
-                return Ok((stored.etag, false));
+                return Ok((stored, false));
             }
             // The composed-ETag keep decision (P1, [`composed_keep`] —
             // one home for the rule, F27): on platforms with a file
@@ -370,9 +404,20 @@ impl Store {
             if composed_gate(&stored.etag, stored.size, size)
                 && composed_keep(stored.file_identity, stored.mtime, identity, mtime)
             {
-                self.set(bucket, key, &stored.etag, size, mtime, identity)
+                let (tags, checksum) = self
+                    .rewrite_preserving(bucket, key, &stored.etag, size, mtime, identity)
                     .await?;
-                return Ok((stored.etag, false));
+                return Ok((
+                    database::StoredMeta {
+                        etag: stored.etag,
+                        size,
+                        mtime: to_nanos(mtime),
+                        file_identity: identity,
+                        tags,
+                        checksum,
+                    },
+                    false,
+                ));
             }
         }
         // One recompute-and-rewrite tail for both the stale-entry and
@@ -380,8 +425,20 @@ impl Store {
         // return above) — the rewrite rule has ONE home (F19).
         let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
         let etag = ETag::Single(digest);
-        self.set(bucket, key, &etag, size, mtime, identity).await?;
-        Ok((etag, true))
+        let (tags, checksum) = self
+            .rewrite_preserving(bucket, key, &etag, size, mtime, identity)
+            .await?;
+        Ok((
+            database::StoredMeta {
+                etag,
+                size,
+                mtime: to_nanos(mtime),
+                file_identity: identity,
+                tags,
+                checksum,
+            },
+            true,
+        ))
     }
 
     /// The ETag of an object file at `path`: the stored entry when it still
@@ -404,10 +461,13 @@ impl Store {
             .0)
     }
 
-    /// Store (or overwrite) the entry for `key` — one write transaction.
-    /// `identity` is the file identity at record time (see
-    /// `fsutil::file_identity`); `0` marks an unavailable
-    /// platform identity.
+    /// Store (or overwrite) the entry for `key` — one write transaction,
+    /// the content-derived rewrite form (`rewrite_preserving`):
+    /// the etag/size/mtime/identity columns are replaced and the replaced
+    /// row's tags/checksum elements are carried over (empty when the row
+    /// is absent). `identity` is the file identity at record time (see
+    /// `fsutil::file_identity`); `0` marks an unavailable platform
+    /// identity.
     pub async fn set(
         &self,
         bucket: &bucket::Name,
@@ -417,6 +477,29 @@ impl Store {
         mtime: SystemTime,
         identity: u64,
     ) -> Result<(), Error> {
+        self.rewrite_preserving(bucket, key, etag, size, mtime, identity)
+            .await
+            .map(|_| ())
+    }
+
+    /// One write transaction: read the row being replaced, then
+    /// re-insert it with `etag`/`size`/`mtime`/`identity` refreshed and
+    /// the row's tags + checksum elements carried over (empty/`None`
+    /// when the row is absent) — the content-derived rewrite semantics
+    /// (see the module doc). Returns the elements written, so the
+    /// caller's response metadata matches the row exactly (the
+    /// read-modify-write runs inside the single write transaction —
+    /// redb's serialized writers make the carried-over elements the
+    /// latest committed at rewrite time).
+    async fn rewrite_preserving(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        etag: &ETag,
+        size: u64,
+        mtime: SystemTime,
+        identity: u64,
+    ) -> Result<(object::Tags, Option<checksum::Recorded>), Error> {
         // The closure runs on the blocking pool (`Handle::write` is
         // async, G3 revision) — clone the borrowed captures into it.
         let bucket = bucket.clone();
@@ -424,9 +507,162 @@ impl Store {
         let etag = etag.clone();
         self.handle
             .write(move |txn| {
-                ObjectMetaTable::open(txn)?.put(&bucket, &key, &etag, size, mtime, identity)
+                let mut table = ObjectMetaTable::open(txn)?;
+                let row = table.get(&bucket, &key)?;
+                let tags = row
+                    .as_ref()
+                    .map_or_else(object::Tags::empty, |row| row.tags.clone());
+                let checksum = row.as_ref().and_then(|row| row.checksum.clone());
+                table.put(
+                    &bucket,
+                    &key,
+                    &database::StoredMeta {
+                        etag: etag.clone(),
+                        size,
+                        mtime: to_nanos(mtime),
+                        file_identity: identity,
+                        tags: tags.clone(),
+                        checksum: checksum.clone(),
+                    },
+                )?;
+                Ok((tags, checksum))
             })
             .await
+            .map_err(Into::into)
+    }
+
+    /// The stored tag set of `key` — empty when the row is absent (a
+    /// hand-dropped object has never been tagged through the API) or its
+    /// wire is domain-invalid (self-healing).
+    pub async fn tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<object::Tags, Error> {
+        Ok(self
+            .stored_entry(bucket, key)
+            .await?
+            .map_or_else(object::Tags::empty, |row| row.tags))
+    }
+
+    /// Replace the stored tag set of `key`, preserving the row's other
+    /// elements — one read-modify-write transaction (last-writer-wins
+    /// against concurrent writes, like every tagging op — spec
+    /// 2026-08-31: tagging ops take no per-key lock). Returns whether a
+    /// row was updated: a missing row is not created here — the object
+    /// file exists but its row is absent (a hand-dropped object), and
+    /// the caller heals the row first (the etag is not derivable without
+    /// a content hash).
+    pub async fn set_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        tags: &object::Tags,
+    ) -> Result<bool, Error> {
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let tags = tags.clone();
+        self.handle
+            .write_if(move |txn| {
+                let mut table = ObjectMetaTable::open(txn)?;
+                let Some(row) = table.get(&bucket, &key)? else {
+                    // Nothing to change — no commit (no fsync).
+                    return Ok(None);
+                };
+                table.put(
+                    &bucket,
+                    &key,
+                    &database::StoredMeta {
+                        tags: tags.clone(),
+                        ..row
+                    },
+                )?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|wrote| wrote.is_some())
+            .map_err(Into::into)
+    }
+
+    /// `set_tags` of an object file whose row may be missing (a
+    /// hand-dropped object): the plain tag update when the row exists,
+    /// else the content-hash heal + tag insert in ONE write
+    /// transaction — the first tagging of a hand-dropped object costs
+    /// one fsync, not three. The hash-time metadata rules the inserted
+    /// row (F19, like `ensure_row`); a row that appears between the
+    /// probe and the write is tag-updated, never clobbered. A file that
+    /// vanishes before the hash surfaces as the hash's `NotFound`
+    /// (the caller maps it to `NoSuchKey`).
+    pub(crate) async fn ensure_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        path: &Path,
+        follow_symlinks: bool,
+        tags: &object::Tags,
+    ) -> Result<(), Error> {
+        if self.set_tags(bucket, key, tags).await? {
+            return Ok(());
+        }
+        let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
+        let etag = ETag::Single(digest);
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let tags = tags.clone();
+        self.handle
+            .write(move |txn| {
+                let mut table = ObjectMetaTable::open(txn)?;
+                // A row that appeared during the hash keeps its checksum
+                // (the etag/size/mtime/identity are the hash-time ones —
+                // the row describes the same file read at hash time).
+                let checksum = table
+                    .get(&bucket, &key)?
+                    .and_then(|row| row.checksum.clone());
+                table.put(
+                    &bucket,
+                    &key,
+                    &database::StoredMeta {
+                        etag: etag.clone(),
+                        size,
+                        mtime: to_nanos(mtime),
+                        file_identity: identity,
+                        tags: tags.clone(),
+                        checksum,
+                    },
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Clear the stored tag set of `key`, preserving the row's other
+    /// elements (idempotent — a missing row is a no-op).
+    pub async fn clear_tags(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
+        let bucket = bucket.clone();
+        let key = key.clone();
+        self.handle
+            .write_if(move |txn| {
+                let mut table = ObjectMetaTable::open(txn)?;
+                let Some(row) = table.get(&bucket, &key)? else {
+                    // Nothing to change — no commit (no fsync).
+                    return Ok(None);
+                };
+                if row.tags.is_empty() {
+                    return Ok(None);
+                }
+                table.put(
+                    &bucket,
+                    &key,
+                    &database::StoredMeta {
+                        tags: object::Tags::empty(),
+                        ..row
+                    },
+                )?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|_| ())
             .map_err(Into::into)
     }
 
@@ -460,6 +696,11 @@ impl Store {
     /// must be `'static` for `spawn_blocking`, G3 revision — the
     /// DB-pipeline worker is a blocking-model worker dedicated to DB
     /// writes, so the `spawn_blocking` hop there is acceptable, P1).
+    ///
+    /// Each entry is a content-derived rewrite (`rewrite_preserving`):
+    /// the replaced row's tags/checksum elements are carried over, so a
+    /// producer recompute (a stale ETag refreshed by the list/scanner
+    /// walk) never clears the API-written metadata.
     pub async fn set_batch_owned(
         &self,
         bucket: &bucket::Name,
@@ -473,13 +714,22 @@ impl Store {
             .write(move |txn| {
                 let mut table = ObjectMetaTable::open(txn)?;
                 for entry in &entries {
+                    let row = table.get(&bucket, &entry.key)?;
+                    let tags = row
+                        .as_ref()
+                        .map_or_else(object::Tags::empty, |row| row.tags.clone());
+                    let checksum = row.as_ref().and_then(|row| row.checksum.clone());
                     table.put(
                         &bucket,
                         &entry.key,
-                        &entry.etag,
-                        entry.size,
-                        entry.mtime,
-                        entry.identity,
+                        &database::StoredMeta {
+                            etag: entry.etag.clone(),
+                            size: entry.size,
+                            mtime: to_nanos(entry.mtime),
+                            file_identity: entry.identity,
+                            tags: tags.clone(),
+                            checksum: checksum.clone(),
+                        },
                     )?;
                 }
                 Ok(())
@@ -488,26 +738,34 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Remove the entry for `key` (idempotent — a missing entry is Ok).
+    /// Remove the entry for `key` and its retained `OBJECT_PARTS` rows
+    /// (idempotent — a missing entry is Ok; the parts rows die with the
+    /// record, so a delete never leaves a completed object's part list
+    /// behind).
     pub async fn remove(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
         let bucket = bucket.clone();
         let key = key.clone();
         self.handle
-            .write(move |txn| ObjectMetaTable::open(txn)?.remove(&bucket, &key))
+            .write(move |txn| {
+                ObjectMetaTable::open(txn)?.remove(&bucket, &key)?;
+                ObjectPartsTable::open(txn)?.remove_key(&bucket, &key)?;
+                Ok(())
+            })
             .await
             .map_err(Into::into)
     }
 
-    /// Remove every entry of `keys` in ONE write transaction (idempotent
-    /// per key — a missing entry is Ok), the remove-side counterpart of
-    /// the upsert batch [`Self::set_batch_owned`]: the scanner's orphan
-    /// pass removes its confirmed orphans with one redb write-lock
-    /// acquisition instead of one transaction per key (P04 — a mass
-    /// out-of-band `rm` no longer serializes M write locks against live
-    /// PUTs). The keys are **moved** into the write closure — the caller
-    /// owns the `Vec` (data-path review 2026-08-29, finding 2 — no
-    /// re-copy on the reclamation path). An empty `keys` is a no-op: no
-    /// write transaction is opened.
+    /// Remove every entry of `keys` — and each key's retained
+    /// `OBJECT_PARTS` rows — in ONE write transaction (idempotent per
+    /// key — a missing entry is Ok), the remove-side counterpart of the
+    /// upsert batch [`Self::set_batch_owned`]: the scanner's orphan pass
+    /// removes its confirmed orphans with one redb write-lock acquisition
+    /// instead of one transaction per key (P04 — a mass out-of-band `rm`
+    /// no longer serializes M write locks against live PUTs). The keys
+    /// are **moved** into the write closure — the caller owns the `Vec`
+    /// (data-path review 2026-08-29, finding 2 — no re-copy on the
+    /// reclamation path). An empty `keys` is a no-op: no write
+    /// transaction is opened.
     pub async fn remove_many(
         &self,
         bucket: &bucket::Name,
@@ -519,9 +777,20 @@ impl Store {
         let bucket = bucket.clone();
         self.handle
             .write(move |txn| {
-                let mut table = ObjectMetaTable::open(txn)?;
-                for key in &keys {
-                    table.remove(&bucket, key)?;
+                // One handle per table (redb refuses a second open of one
+                // table in a transaction); the two tables are drained in
+                // separate passes — the handle borrows cannot overlap.
+                {
+                    let mut table = ObjectMetaTable::open(txn)?;
+                    for key in &keys {
+                        table.remove(&bucket, key)?;
+                    }
+                }
+                {
+                    let mut parts = ObjectPartsTable::open(txn)?;
+                    for key in &keys {
+                        parts.remove_key(&bucket, key)?;
+                    }
                 }
                 Ok(())
             })
@@ -677,7 +946,7 @@ mod tests {
         {
             let mut table = ObjectMetaTable::open(&mut txn).unwrap();
             table
-                .insert((bucket, key), ("not-an-etag", 1, 1, 0))
+                .insert((bucket, key), ("not-an-etag", 1, 1, 0, "", ""))
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -692,7 +961,10 @@ mod tests {
         {
             let mut table = ObjectMetaTable::open(&mut txn).unwrap();
             table
-                .insert((bucket, key), ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 0))
+                .insert(
+                    (bucket, key),
+                    ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 0, "", ""),
+                )
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -1052,7 +1324,7 @@ mod tests {
                 table
                     .insert(
                         ("data", "a.txt"),
-                        ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9),
+                        ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9, "", ""),
                     )
                     .unwrap();
             }

@@ -52,7 +52,7 @@ proptest! {
             let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &key, None).await.unwrap();
+            let upload = store.create(&b, &key, None, object::Tags::empty()).await.unwrap();
 
             let mut parts = Vec::new();
             let mut expected = Vec::new();
@@ -76,7 +76,7 @@ proptest! {
                 })
                 .collect();
             let target = state.path().join("assembled.bin");
-            let (temp, etag) = store
+            let (temp, etag, _parts) = store
                 .complete(&b, &key, &upload.upload_id, &completed)
                 .await
                 .unwrap();
@@ -106,7 +106,7 @@ proptest! {
             let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &key, None).await.unwrap();
+            let upload = store.create(&b, &key, None, object::Tags::empty()).await.unwrap();
             let first_data: Vec<u8> = (0..first).map(|i| i as u8).collect();
             let second_data: Vec<u8> = (0..second).map(|i| (i as u8).wrapping_mul(7)).collect();
             let p1 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(first_data.clone()), None).await.unwrap();
@@ -123,7 +123,7 @@ proptest! {
                 etag: p2.etag.clone(),
             }];
             let target = state.path().join("out.bin");
-            let (temp, _etag) = store
+            let (temp, _etag, _parts) = store
                 .complete(&b, &key, &upload.upload_id, &completed)
                 .await
                 .unwrap();
@@ -146,7 +146,7 @@ proptest! {
             let store = multipart::store(state.path()).unwrap();
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
-            let upload = store.create(&b, &key, None).await.unwrap();
+            let upload = store.create(&b, &key, None, object::Tags::empty()).await.unwrap();
             let pn: PartNumber = n.into();
             prop_assert!(u32::from(pn) == n);
             let part = store.put_part(&b, &key, &upload.upload_id, pn, body(b"x"), None).await.unwrap();
