@@ -19,6 +19,9 @@ jobs:
     # JSON reports; every leg uploads them as artifacts, the ubuntu legs
     # publish a pass/fail summary comment to the PR.
     permissions:
+      # Job-level permissions revoke everything not listed: checkout needs
+      # contents: read, or cloning this private repo 404s ("not found").
+      contents: read
       checks: write
       pull-requests: write
     strategy:
@@ -27,7 +30,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Nightly rustfmt for rustfmt.toml unstable_features; last toolchain
       # installed is default, so stable follows for clippy/test/doc.
@@ -103,7 +106,7 @@ jobs:
       # the test binary with the package root as cwd), hence the ** glob.
       - name: upload cucumber report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ github.job }}-${{ matrix.os }}-cucumber-report
           path: '**/*-report*.json'
@@ -115,7 +118,7 @@ jobs:
       # scenario names. Never fails the job (fail-on-error: 'false' analog).
       - name: publish test report to PR
         if: always() && matrix.os == 'ubuntu-latest'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -235,7 +238,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: quality
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -251,7 +254,7 @@ jobs:
     name: Semver checks (tinio facade)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -284,7 +287,7 @@ jobs:
     # reviews its report before every release.
     if: github.ref_name == 'main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -303,6 +306,9 @@ jobs:
     needs: quality
     # PR test reports: same artifact + ubuntu-only comment scheme as quality.
     permissions:
+      # Job-level permissions revoke everything not listed: checkout needs
+      # contents: read, or cloning this private repo 404s ("not found").
+      contents: read
       checks: write
       pull-requests: write
     strategy:
@@ -311,7 +317,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -337,14 +343,14 @@ jobs:
 
       - name: upload cucumber report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ github.job }}-${{ matrix.os }}-cucumber-report
           path: '**/*-report*.json'
 
       - name: publish test report to PR
         if: always() && matrix.os == 'ubuntu-latest'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
