@@ -1841,14 +1841,16 @@ mod tests {
     }
 }
 
-/// Poll `cond` until true or a 10 s deadline passes (the test runners'
-/// workers are asynchronous, so assertions must wait). The shared home of
-/// the helper formerly duplicated across tinio-fs testutil and the
-/// tinio-server pipeline tests (F30).
+/// Poll `cond` until true or a 30 s deadline passes (the test runners'
+/// workers are asynchronous, so assertions must wait; 30 s keeps the
+/// fs-drain waits (tombstone reclaim under CI load / Defender scans)
+/// from starving on slow runners — the poll only costs on failure).
+/// The shared home of the helper formerly duplicated across tinio-fs
+/// testutil and the tinio-server pipeline tests (F30).
 pub async fn wait_for(mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !cond() {
-        assert!(Instant::now() < deadline, "condition not met within 10 s");
+        assert!(Instant::now() < deadline, "condition not met within 30 s");
         sleep(Duration::from_millis(2)).await;
     }
 }

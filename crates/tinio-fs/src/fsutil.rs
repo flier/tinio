@@ -12,7 +12,7 @@ use std::{
 };
 
 use md5::Md5;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use rustix::fs as rustix_fs;
 #[cfg(unix)]
 use rustix::io::Errno;
@@ -443,25 +443,38 @@ pub(crate) fn copy_file_range(src: &File, offset: u64, len: u64, dst: &File) -> 
         }
     }
     #[cfg(not(target_os = "linux"))]
-    {
-        use std::io::{Read, Seek, SeekFrom, Write};
+    copy_file_range_fallback(src, offset, len, dst)?;
+    Ok(())
+}
 
-        use crate::write::CHUNK_SIZE;
-        src.seek(SeekFrom::Start(offset))?;
-        let mut remaining = len;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
-            let n = src.read(&mut buf[..want])?;
-            if n == 0 {
-                return Err(IoError::new(
-                    ErrorKind::UnexpectedEof,
-                    "copy made no progress",
-                ));
-            }
-            dst.write_all(&buf[..n])?;
-            remaining -= n as u64;
+/// The non-Linux unix fallback of `copy_file_range` — a separate
+/// cfg-gated function (not an inline branch) so the `&File` seek/read/
+/// write bindings of the buffered loop can be `mut` target-locally,
+/// without an `unused_mut` on the Linux branch.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn copy_file_range_fallback(
+    mut src: &File,
+    offset: u64,
+    len: u64,
+    mut dst: &File,
+) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use crate::write::CHUNK_SIZE;
+    src.seek(SeekFrom::Start(offset))?;
+    let mut remaining = len;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = src.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "copy made no progress",
+            ));
         }
+        dst.write_all(&buf[..n])?;
+        remaining -= n as u64;
     }
     Ok(())
 }

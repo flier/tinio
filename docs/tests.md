@@ -36,3 +36,16 @@ cargo test -p tinio-e2e --test traceability
 ### Migration
 
 - Migrate iff SC/FR/T spec semantic **and** S3-API observable. Unit tests without spec ID stay Rust; leave `tinio-util` harness untouched.
+
+## Platform-gated verification (WSL2)
+
+- `#[cfg(unix)]` tests (fs copy fast-path, multipart-ETag sources) are
+  **invisible to the Windows toolchain** — an import Windows clippy reports
+  as unused can still be load-bearing on the CI ubuntu/macos legs (E0599
+  class: trait methods unresolved). Verify gate runs in WSL2 before the
+  next push when a Windows-clean run goes red only upstream (repo at
+  `/mnt/e/GitHub/tinio`, ext4 `CARGO_TARGET_DIR` — crates/tinio-e2e/README.md "WSL2"):
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- Timing-sensitive unit tests (bucket delete/create/put hammer polls
+  `wait_for`, tinio-util — 10 s deadline) can starve on loaded CI runners;
+  reproduce under WSL2 before classifying flaky vs real.
