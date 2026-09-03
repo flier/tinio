@@ -45,7 +45,64 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: Test (unit/e2e/doc/features)
+    name: Test (unit/doc/features)
+    permissions:
+      # Job-level permissions revoke everything not listed: checkout needs
+      # contents: read, or cloning this private repo 404s ("not found").
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The cucumber e2e suite (crates/tinio-e2e, harness = false) runs in
+      # its own e2e job with report output — exclude it here so it does
+      # not run twice (and does not accidentally run @external scenarios).
+      - name: test (default features)
+        run: cargo test --workspace --exclude tinio-e2e
+
+      - name: test (--no-default-features)
+        run: cargo test --workspace --no-default-features --exclude tinio-e2e
+
+      - name: doc (no warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  features:
+    name: Feature matrix (tinio facade)
+    # Feature-gate compile checks: every feature of the facade (and,
+    # through its passthroughs, of tinio-server/tinio-cli/tinio-api)
+    # must compile — catches feature-gate breakage early. cargo check
+    # level, no dev-deps. --each-feature isolates every flag (plus the
+    # no-default/default/all-features runs, ~12 checks); the powerset's
+    # 2^9 combinations re-type-check the server crate hundreds of times
+    # for little extra signal. Platform-neutral: one ubuntu leg, no
+    # matrix.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: feature-matrix check (tinio)
+        run: cargo hack check --package tinio --each-feature --no-dev-deps
+
+  e2e:
+    name: E2E (cucumber fs/mem + traceability)
     # PR test reports (BDD cucumber migration): the e2e runs below write
     # JSON reports; every leg uploads them as artifacts, the ubuntu legs
     # publish a pass/fail summary comment to the PR.
@@ -66,15 +123,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      # The cucumber e2e suite (crates/tinio-e2e, harness = false) runs in
-      # its own steps below with report output — exclude it here so it does
-      # not run twice (and does not accidentally run @external scenarios).
-      - name: test (default features)
-        run: cargo test --workspace --exclude tinio-e2e
-
-      - name: test (--no-default-features)
-        run: cargo test --workspace --no-default-features --exclude tinio-e2e
 
       # Cucumber e2e suite: in-process scenarios; the default @external
       # exclusion is built into the runner, no --tags needed on the fs pass.
@@ -101,22 +149,6 @@ jobs:
       # cucumber argv, so it cannot share the scoped runs above.
       - name: e2e traceability
         run: cargo test -p tinio-e2e --test traceability
-
-      - name: doc (no warnings)
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
-
-      # Feature-matrix compile checks: every feature combination of the
-      # facade (and, through its passthroughs, of tinio-server/tinio-cli/
-      # tinio-api) must compile — catches feature-gate breakage early.
-      # cargo check level, no dev-deps.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack
-
-      - name: feature-matrix check (tinio)
-        run: cargo hack check --package tinio --feature-powerset --no-dev-deps
 
       # PR test reports. The reports land in crates/tinio-e2e/ (cargo runs
       # the test binary with the package root as cwd), hence the ** glob.
@@ -299,9 +331,10 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
-    # constitution VI: cargo audit runs on the release branch; the maintainer
-    # reviews its report before every release.
-    if: github.ref_name == 'main'
+    # constitution VI: cargo audit runs on the release branch (main) and
+    # the dev branch — vulnerability updates land during development, not
+    # only at release time; the maintainer reviews the report.
+    if: github.ref_name == 'main' || github.ref_name == 'dev'
     steps:
       - uses: actions/checkout@v7
 

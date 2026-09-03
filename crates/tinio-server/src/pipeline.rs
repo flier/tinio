@@ -932,6 +932,10 @@ mod tests {
         let (ran, _dropped, task) = FlagTask::new();
         pipelines.io().enqueue(Box::new(task)).await.unwrap();
         wait_for(|| ran.load(Ordering::Relaxed)).await;
+        // The worker's stats drain after the task body set `ran` — wait
+        // for the pipeline to return to idle before asserting (slow
+        // runners lag the flag past the old immediate assert).
+        wait_for(|| pipelines.io().stats() == Stats::default()).await;
         assert_eq!(pipelines.io().stats(), Stats::default());
     }
 

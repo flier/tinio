@@ -317,7 +317,9 @@ async fn bucket_dir_resolves_dangling_and_looping_links() {
     assert!(matches!(err, Error::Io(_)), "link loop: {err:?}");
 }
 
-#[cfg(unix)]
+// macOS/APFS rejects non-UTF-8 names at creation (EILSEQ) — the
+// scenario is unrepresentable there; Linux/BSD keep the coverage.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn bucket_names_skips_non_utf8_directory_names() {
     // A top-level directory whose name is not valid UTF-8 cannot be a

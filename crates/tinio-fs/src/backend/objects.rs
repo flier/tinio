@@ -1047,6 +1047,11 @@ mod tests {
     use tokio::{fs, time::timeout};
 
     use super::*;
+    // MultipartOps' direct callers here are the #[cfg(unix)] fast-path
+    // tests — cfg-gated like the import above, or windows clippy reports
+    // it unused while the unix build cannot resolve the trait methods.
+    #[cfg(unix)]
+    use crate::_core::storage::MultipartOps;
     use crate::{
         _core::{
             object,
@@ -1055,11 +1060,6 @@ mod tests {
         _util::testing::{assert_conformance, body, complete_single_part, etag, read_body},
         testutil::{checksum_tee, fs_options, md5_wire, storage},
     };
-    // MultipartOps' direct callers here are the #[cfg(unix)] fast-path
-    // tests — cfg-gated like the import above, or windows clippy reports
-    // it unused while the unix build cannot resolve the trait methods.
-    #[cfg(unix)]
-    use crate::_core::storage::MultipartOps;
 
     #[tokio::test]
     async fn conformance_green() {

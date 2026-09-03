@@ -688,7 +688,9 @@ mod tests {
         assert!(latest_part_mtime(empty.path()).await.unwrap().is_none());
     }
 
-    #[cfg(unix)]
+    // macOS/APFS rejects non-UTF-8 names at creation (EILSEQ) — the
+    // scenario is unrepresentable there; Linux/BSD keep the coverage.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[tokio::test]
     async fn latest_part_mtime_skips_non_utf8_names() {
         use std::os::unix::ffi::OsStringExt;
