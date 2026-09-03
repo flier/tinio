@@ -22,7 +22,14 @@ smart-default.workspace = true
 strict-path = { workspace = true, features = ["junctions"] }
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
@@ -33,7 +40,11 @@ tinio-util.workspace = true
 winapi-util.workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true, features = ["async_tokio"] }
+criterion = { workspace = true, features = [
+    "async_tokio",
+    "rayon",
+    "cargo_bench_support",
+] }
 dhat.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
@@ -51,6 +62,10 @@ harness = false
 [[bench]]
 name = "set_batch"
 harness = false
+
+[package.metadata.cargo-machete]
+# false positive: package md-5 has lib name md5, used in write.rs/multipart.rs
+ignored = ["md-5"]
 
 [lints.rust]
 unsafe_code = "forbid"

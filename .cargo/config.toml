@@ -1,0 +1,6 @@
+# Linux builds link through clang + lld (CI ubuntu and WSL2): much faster
+# linking than the default ld. Needs lld installed (CI installs it;
+# WSL2: apt install lld).
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

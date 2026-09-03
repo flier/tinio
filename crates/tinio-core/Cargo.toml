@@ -30,5 +30,9 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 
+[package.metadata.cargo-machete]
+# false positive: package md-5 has lib name md5, used in etag.rs
+ignored = ["md-5"]
+
 [lints.rust]
 unsafe_code = "forbid"

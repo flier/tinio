@@ -40,7 +40,6 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
@@ -59,7 +58,11 @@ tinio-util.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 bytes.workspace = true
-criterion = { workspace = true, features = ["async_tokio"] }
+criterion = { workspace = true, features = [
+    "async_tokio",
+    "rayon",
+    "cargo_bench_support",
+] }
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true

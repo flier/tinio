@@ -34,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       # Nightly rustfmt for rustfmt.toml unstable_features; last toolchain
       # installed is default, so stable follows for clippy.
       - uses: dtolnay/rust-toolchain@nightly
@@ -55,7 +61,7 @@ jobs:
         run: cargo +nightly fmt --all -- --check
 
       - name: clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
 
   test:
     name: Test (unit/doc/features)
@@ -76,6 +82,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -89,17 +101,17 @@ jobs:
       # not run twice (and does not accidentally run @external scenarios).
       - name: test (default features)
         if: matrix.target == 'default'
-        run: cargo test --workspace --exclude tinio-e2e
+        run: cargo test --profile ci --workspace --exclude tinio-e2e
 
       - name: test (--no-default-features)
         if: matrix.target == 'no-default'
-        run: cargo test --workspace --no-default-features --exclude tinio-e2e
+        run: cargo test --profile ci --workspace --no-default-features --exclude tinio-e2e
 
       - name: doc (no warnings)
         if: matrix.target == 'doc'
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --profile ci --workspace --no-deps
 
   features:
     name: Feature matrix (tinio facade)
@@ -116,6 +128,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -129,7 +147,7 @@ jobs:
           tool: cargo-hack
 
       - name: feature-matrix check (tinio)
-        run: cargo hack check --package tinio --each-feature --no-dev-deps
+        run: cargo hack check --package tinio --each-feature --no-dev-deps --profile ci
 
   e2e:
     name: E2E (cucumber fs/mem + traceability)
@@ -150,6 +168,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -173,14 +197,14 @@ jobs:
         # --retry 2: the reserved-paths scenario burned both retry-1
         # attempts on the ConnectionAborted flake of a loaded windows leg
         # (run 33764783657).
-        run: cargo test -p tinio-e2e --test cucumber -- --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --retry 2
         env:
           TINIO_E2E_REPORT: cucumber-report-fs.json
 
       - name: e2e cucumber (mem backend)
         # --retry 2: the ConnectionAborted flake hit both retry-1 attempts
         # on a loaded windows leg (run 33750043137).
-        run: cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json
@@ -188,7 +212,7 @@ jobs:
       # The spec↔tag cross-check: a plain-harness libtest target, no
       # cucumber argv, so it cannot share the scoped runs above.
       - name: e2e traceability
-        run: cargo test -p tinio-e2e --test traceability
+        run: cargo test --profile ci -p tinio-e2e --test traceability
 
       # PR test reports. The reports land in crates/tinio-e2e/ (cargo runs
       # the test binary with the package root as cwd), hence the ** glob.
@@ -331,6 +355,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -340,7 +370,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: check (all targets)
-        run: cargo check --workspace --all-targets
+        run: cargo check --profile ci --workspace --all-targets
 
   bench-smoke:
     name: Benchmark smoke (criterion --test)
@@ -348,6 +378,12 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v7
+
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -361,13 +397,19 @@ jobs:
       # S3-mapping benches compilable and runnable. Baselines and
       # regression gating are Phase 6 (T088).
       - name: bench smoke
-        run: cargo bench -p tinio-fs -p tinio-server -- --test
+        run: cargo bench --profile ci -p tinio-fs -p tinio-server -- --test
 
   semver:
     name: Semver checks (tinio facade)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -407,6 +449,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -440,6 +488,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Linux links through clang + lld (.cargo/config.toml); the
+      # hosted ubuntu image ships clang but not lld.
+      - name: install lld (linux linker)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lld
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -470,7 +524,7 @@ jobs:
       # --test cucumber keeps the tags from reaching the plain-harness
       # traceability target; --retry 1 mitigates external-client flakes.
       - name: interop cucumber (@interop)
-        run: cargo test -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
         env:
           TINIO_E2E_REPORT: interop-report.json
 

@@ -7,18 +7,17 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
-base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 redb.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["v4"] }
 
 tinio-core.workspace = true
 
 [dev-dependencies]
 tinio-util = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

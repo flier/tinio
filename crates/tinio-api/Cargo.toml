@@ -6,24 +6,14 @@ description = "Management plane for tinio: axum router, control-channel transpor
 publish = false
 
 [dependencies]
-axum.workspace = true
-prometheus.workspace = true
-rustls-pemfile = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio-rustls = { workspace = true, optional = true }
-utoipa = { workspace = true, optional = true, features = ["axum_extras"] }
 
 tinio-core.workspace = true
 
 [dev-dependencies]
 tinio-util = { workspace = true, features = ["testing"] }
-
-[features]
-default = []
-openapi = ["dep:utoipa"]
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 
 [lints.rust]
 unsafe_code = "forbid"

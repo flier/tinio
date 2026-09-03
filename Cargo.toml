@@ -9,15 +9,12 @@ edition = "2024"
 [workspace.dependencies]
 assert_cmd = "2"
 async-trait = "0.1"
-axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
-clap = "4"
-criterion = "0.8"
+criterion = { version = "0.8", default-features = false }
 cucumber = "0.23"
 derive_more = "2"
 dhat = "0.3"
-dirs = "6.0"
 dotenvy = "0.15"
 futures = "0.3"
 garde = "0.23"
@@ -43,13 +40,11 @@ prometheus = "0.14"
 proptest = "1.11"
 redb = "4.2"
 rustix = "1.1"
-rustls-pemfile = "2.2"
 s3s = "0.15"
 secrecy = "0.10"
 serde = "1"
 serde_ignored = "0.1"
 serde_json = "1.0"
-sha1 = "0.11"
 smart-default = "0.7"
 strict-path = "0.2"
 tempfile = "3.27"
@@ -57,16 +52,12 @@ thiserror = "2.0"
 thread-priority = "3.1"
 time = "0.3"
 tokio = "1"
-tokio-rustls = "0.26"
-tokio-util = "0.7"
 tower = "0.5"
 toml = "1.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = "0.3"
 unicode-properties = { version = "0.1", default-features = false }
-url = "2"
-utoipa = "5.5"
 uuid = "1"
 winapi-util = "0.1"
 windows-sys = "0.61"
@@ -80,3 +71,25 @@ tinio-fs = { path = "crates/tinio-fs" }
 tinio-mem = { path = "crates/tinio-mem" }
 tinio-server = { path = "crates/tinio-server", default-features = false }
 tinio-util = { path = "crates/tinio-util" }
+
+# CI compile profile: no debug info, wide codegen parallelism, no
+# incremental — the CI cargo runs below pass --profile ci. Local dev
+# keeps the dev profile (trimmed debug below) and `--profile debugging`
+# for full debug info when needed.
+[profile.ci]
+inherits = "dev"
+debug = false
+codegen-units = 16
+incremental = false
+
+[profile.dev]
+# Panic backtraces stay readable for workspace crates only.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies compile without debug info.
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true

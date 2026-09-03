@@ -6,7 +6,6 @@ description = "Command-line interface for tinio: server/start, status, stop, doc
 publish = false
 
 [dependencies]
-clap = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 
 tinio-api = { workspace = true, optional = true }
