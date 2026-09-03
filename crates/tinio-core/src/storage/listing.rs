@@ -304,7 +304,7 @@ pub fn group_and_paginate_unordered<T>(
 }
 
 /// The stateful, incremental form of [`group_and_paginate_unordered`]:
-/// [`offer`](UnorderedPager::offer) accepts one item of the stream at a
+/// [`Self::offer`](UnorderedPager::offer) accepts one item of the stream at a
 /// time, [`finish`](UnorderedPager::finish) yields the page — the fs
 /// backend feeds its async dirent walks through it item by item instead
 /// of materializing and sorting the whole set. Semantics are exactly the
@@ -331,7 +331,7 @@ where
 {
     /// Start a page with the same parameters as
     /// [`group_and_paginate_unordered`]. The composite order of a plain
-    /// row is supplied per [`offer`] call — the pager holds only the
+    /// row is supplied per [`Self::offer`] call — the pager holds only the
     /// borrowed-key `key_of` (an `order_of` held in the constructor
     /// would be dead weight for every `offer_keyed`-only caller).
     pub fn new(
@@ -413,14 +413,14 @@ where
     }
 
     /// Offer one item whose order IS its key — the keyed fast path of
-    /// [`offer`] for key-ordered listings (the fs object page): the
+    /// [`Self::offer`] for key-ordered listings (the fs object page): the
     /// marker skip, the dedup set, and the bounded-k admission compare
     /// the **borrowed** key/prefix, and the order String is materialized
     /// only for entries that actually enter the heap — a `max_keys`
     /// page of a huge bucket allocates O(page) order strings, not
     /// O(entries), and a rolled-up group's rows pay no allocation at
     /// all on the rejection paths (marker skip, already rolled up, heap
-    /// full — E1). Semantics are identical to [`offer`] with
+    /// full — E1). Semantics are identical to [`Self::offer`] with
     /// `order_of = |item| key_of(item).to_string()`.
     pub fn offer_keyed(&mut self, item: T) {
         if self.max == 0 {

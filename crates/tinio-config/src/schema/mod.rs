@@ -3,7 +3,7 @@
 //! Pure data types with serde attributes (TOML shape), `SmartDefault` field
 //! defaults, and garde validation attributes. Unknown keys are not rejected
 //! by serde — the internal `parse_at` collects them via `serde_ignored` and
-//! reports [`Error::UnknownKey`] (FR-016, fail-fast).
+//! reports [`crate::Error::UnknownKey`] (FR-016, fail-fast).
 //! Sections are presence-gated: absent optional sections
 //! parse as `None` and are skipped when the config is re-serialized.
 //!

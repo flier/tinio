@@ -365,7 +365,7 @@ pub fn refresh(io: Stats, db: Stats, write_lock: WriteLockStats) {
 /// and `total` distributions of every write transaction — filled from
 /// the latest [`WriteLockStats`] on gather. Prometheus histograms
 /// cannot be set from external counts, so the families are a small
-/// custom [`Collector`] over the [`proto`] message types: the shared
+/// custom [`Collector`] over the [`prometheus::proto`] message types: the shared
 /// tinio-core bucket bounds become cumulative `le=` buckets (µs →
 /// seconds), with `_sum`/`_count` from the snapshot's count/sum (the
 /// text encoder appends the `le="+Inf"` bucket from `_count`).

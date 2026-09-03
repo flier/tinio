@@ -126,13 +126,13 @@ pub struct ObjectListing {
 /// Object operations of the storage contract.
 ///
 /// Implementations MUST reject invalid keys with
-/// [`Error::InvalidKey`] **before any filesystem access** (FR-006 —
+/// [`super::Error::InvalidKey`] **before any filesystem access** (FR-006 —
 /// keys are pre-validated by [`object::key`]; the check is a defensive
 /// backstop), refuse writes whose key is reserved (`.tinio` segment,
-/// FR-020) with [`Error::AccessDenied`], and implement folder-marker
+/// FR-020) with [`super::Error::AccessDenied`], and implement folder-marker
 /// semantics: a key ending in `/` is never an object (put creates a
 /// directory, get/head report `NoSuchKey`). A missing bucket is
-/// [`Error::NoSuchBucket`], a missing object [`Error::NoSuchKey`].
+/// [`super::Error::NoSuchBucket`], a missing object [`super::Error::NoSuchKey`].
 ///
 /// # Examples
 ///

@@ -110,7 +110,6 @@ fn check(cond: bool, msg: &str) {
 
 /// Run the full conformance suite against a backend. Panics on the first
 /// violation (test-harness semantics).
-
 pub async fn assert_conformance<S: Storage>(storage: &S) {
     let b = bucket::name(unique_bucket("conform")).unwrap();
     conformance_buckets(storage, &b).await;

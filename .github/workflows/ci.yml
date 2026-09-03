@@ -13,8 +13,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  quality:
-    name: Quality (fmt/clippy/test/doc/features)
+  # Lint and tests are separate jobs so a clippy failure never blocks the
+  # test legs — both matrices run in parallel and report independently.
+  lint:
+    name: Lint (fmt/clippy)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Nightly rustfmt for rustfmt.toml unstable_features; last toolchain
+      # installed is default, so stable follows for clippy.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Quality gates (constitution "Rust Tooling & Quality Gates").
+      - name: fmt --check
+        run: cargo +nightly fmt --all -- --check
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (unit/e2e/doc/features)
     # PR test reports (BDD cucumber migration): the e2e runs below write
     # JSON reports; every leg uploads them as artifacts, the ubuntu legs
     # publish a pass/fail summary comment to the PR.
@@ -32,24 +63,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Nightly rustfmt for rustfmt.toml unstable_features; last toolchain
-      # installed is default, so stable follows for clippy/test/doc.
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      # Quality gates (constitution "Rust Tooling & Quality Gates").
-      - name: fmt --check
-        run: cargo +nightly fmt --all -- --check
-
-      - name: clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # The cucumber e2e suite (crates/tinio-e2e, harness = false) runs in
       # its own steps below with report output — exclude it here so it does
@@ -236,7 +252,7 @@ jobs:
   bench-smoke:
     name: Benchmark smoke (criterion --test)
     runs-on: ubuntu-latest
-    needs: quality
+    needs: test
     steps:
       - uses: actions/checkout@v7
 
@@ -303,8 +319,8 @@ jobs:
   interop:
     name: Interop (aws cli v2 + rclone)
     # cucumber @interop harness (crates/tinio-e2e) is committed, job always runs
-    needs: quality
-    # PR test reports: same artifact + ubuntu-only comment scheme as quality.
+    needs: test
+    # PR test reports: same artifact + ubuntu-only comment scheme as test.
     permissions:
       # Job-level permissions revoke everything not listed: checkout needs
       # contents: read, or cloning this private repo 404s ("not found").

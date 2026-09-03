@@ -1050,7 +1050,7 @@ mod tests {
     use crate::{
         _core::{
             object,
-            storage::{BucketOps, Error as StorageError, MultipartOps},
+            storage::{BucketOps, Error as StorageError},
         },
         _util::testing::{assert_conformance, body, complete_single_part, etag, read_body},
         testutil::{checksum_tee, fs_options, md5_wire, storage},

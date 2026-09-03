@@ -157,7 +157,7 @@ struct AlignedCounter(AtomicU64);
 /// wiring (pipeline-spec.md §3.3, R5).
 ///
 /// Parameterized by each pipeline's [`Task::Output`]: `FsOptions` types
-/// the IO pipeline to [`tinio_fs::etag::Result`], the removal pipeline to
+/// the IO pipeline to `tinio_fs::etag::Result`, the removal pipeline to
 /// `Result<(), tinio_fs::Error>` (D-A — physically isolated from ETag
 /// compute), and the DB pipeline to `Result<(), tinio_fs::Error>`
 /// (P4/P7). The three type parameters are independent so the lanes can

@@ -65,10 +65,10 @@ pub struct BucketsListing {
 /// Bucket operations of the storage contract.
 ///
 /// Implementations MUST reject invalid bucket names with
-/// [`Error::InvalidBucketName`] **before any filesystem access**
+/// [`super::Error::InvalidBucketName`] **before any filesystem access**
 /// (FR-012 — names are pre-validated by [`bucket::name`]; the check is a
 /// defensive backstop), and report a missing bucket as
-/// [`Error::NoSuchBucket`] — the S3 mapping layer relies on it.
+/// [`super::Error::NoSuchBucket`] — the S3 mapping layer relies on it.
 ///
 /// # Examples
 ///

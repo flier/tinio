@@ -189,7 +189,7 @@ impl MemoryStorage {
 #[async_trait]
 impl ObjectOps for MemoryStorage {
     /// A staged body: the buffered payload (the commit inserts it) plus
-    /// the stage's tee digest (see [`StagedBody`]).
+    /// the stage's tee digest (see `StagedBody`).
     type StagedBody = StagedBody;
 
     async fn stage_body(
@@ -770,8 +770,8 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            BodyStream, BucketOps, CompletedPart, ListObjectsParams, MultipartOps, ObjectListing,
-            ObjectOps, bucket, checksum, object, storage::Error::*,
+            BodyStream, BucketOps, ListObjectsParams, ObjectListing, ObjectOps, bucket, checksum,
+            object, storage::Error::*,
         },
         _util::testing::{body, complete_single_part, read_body},
         MemoryOptions,
