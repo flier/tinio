@@ -12,13 +12,19 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(feature = "copy")]
+use s3s::{S3Error, dto::Range};
 use s3s::{
-    S3Error, S3Request, S3Response, S3Result,
-    dto::{self, AbortMultipartUploadOutput, Range},
+    S3Request, S3Response, S3Result,
+    dto::{self, AbortMultipartUploadOutput},
     s3_error,
 };
 use tracing::warn;
 
+#[cfg(feature = "copy")]
+use crate::_core::storage::ByteRange;
+#[cfg(feature = "copy")]
+use crate::backend::{ConditionalHeaders, byte_range};
 use crate::{
     _core::{
         ETag,
@@ -27,10 +33,10 @@ use crate::{
             CompletedPart, PartNumber, check_part_minimum, part_number as parse_part_number,
         },
         object,
-        storage::{ByteRange, ListPartsParams, ListUploadsParams, Storage},
+        storage::{ListPartsParams, ListUploadsParams, Storage},
     },
     backend::{
-        ConditionalHeaders, S3Backend, byte_range, check_complete_conditions, check_write_shape,
+        S3Backend, check_complete_conditions, check_write_shape,
         checksum::{
             self, HasFields, VerifyState, VerifyStream, compose_composite, echo_validated,
             linearize_full_object, map_part_error, single_checksum_value,
@@ -1045,17 +1051,17 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use futures::stream;
+    #[cfg(feature = "copy")]
+    use s3s::dto::{CopySource, UploadPartCopyInput};
     use s3s::{
         S3,
         checksum::ChecksumHasher,
         crypto::{Checksum as _, Sha256},
-        dto::{CopySource, StreamingBlob, UploadPartCopyInput},
+        dto::StreamingBlob,
     };
     use time::OffsetDateTime;
 
     use super::*;
-    #[cfg(feature = "copy")]
-    use crate::_util::testing::body;
     use crate::{
         _core::{
             bucket,
@@ -1064,6 +1070,7 @@ mod tests {
             storage::{BucketOps, MultipartOps, ObjectOps},
         },
         _mem::MemoryStorage,
+        _util::testing::body,
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},

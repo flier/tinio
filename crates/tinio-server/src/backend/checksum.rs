@@ -18,6 +18,7 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(any(feature = "multipart", test))]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -121,6 +122,7 @@ impl Spec {
     /// A compute-only spec: hash with `algo`, validate nothing, echo
     /// nothing — the server-side computation of a create-algorithm
     /// upload (a header-less part, a copy part; spec D5).
+    #[cfg(feature = "multipart")]
     pub(crate) fn compute_only(algo: checksum::Algorithm) -> Spec {
         Spec {
             algorithm: Some(algo),
@@ -138,6 +140,7 @@ impl Spec {
     /// coexist. More than one algorithm value source → `InvalidRequest`;
     /// an `x-amz-checksum-algorithm` header with no value source at all
     /// → `InvalidRequest` (S3: 400).
+    #[cfg(feature = "multipart")]
     pub(crate) fn from_upload_part(
         input: &dto::UploadPartInput,
         headers: &http::HeaderMap,
@@ -320,6 +323,7 @@ impl_checksum_type_field!(dto::HeadObjectOutput);
 impl_checksum_type_field!(dto::Checksum);
 
 /// The s3s wire algorithm of a [`checksum::Algorithm`].
+#[cfg(feature = "multipart")]
 pub(crate) fn wire_algo(algo: checksum::Algorithm) -> dto::ChecksumAlgorithm {
     dto::ChecksumAlgorithm::from_static(match algo {
         Algorithm::Crc32 => dto::ChecksumAlgorithm::CRC32,
@@ -614,6 +618,7 @@ pub(crate) fn checksum_value_of(
 /// digest bytes (the documented S3 construction; the AWS Java example
 /// applies it to SHA-256). `None` when any part value is not valid
 /// base64 — the caller skips validation (deviation D2).
+#[cfg(feature = "multipart")]
 pub(crate) fn compose_composite(
     algo: checksum::Algorithm,
     parts: &[&checksum::Part],
@@ -642,6 +647,7 @@ pub(crate) fn compose_composite(
 /// big-endian register value). The self-validating test
 /// (`linearize_matches_the_direct_crc_of_concatenated_content`) is the
 /// oracle — a wrong constant or endianness fails it.
+#[cfg(feature = "multipart")]
 pub(crate) fn linearize_full_object(
     algo: checksum::Algorithm,
     parts: &[&checksum::Part],
@@ -682,9 +688,11 @@ pub(crate) fn linearize_full_object(
 /// `M_k = square^k(advance-by-one-bit)`, LSB first (the two pre-squares
 /// make the first entry the advance-by-one-byte operator, zlib's
 /// `crc32_combine` construction).
+#[cfg(feature = "multipart")]
 type CombineCache = Option<((checksum::Algorithm, u64), Vec<[u64; 64]>)>;
 
 /// The matrix chain of `crc_combine` for one `(algo, len)`.
+#[cfg(feature = "multipart")]
 fn combine_matrices(algo: checksum::Algorithm, len: u64) -> Vec<[u64; 64]> {
     let (poly, _) = crc_params(algo);
     // The "advance by one bit" operator of the reflected register
@@ -724,6 +732,7 @@ fn combine_matrices(algo: checksum::Algorithm, len: u64) -> Vec<[u64; 64]> {
 /// xor `crc_b` (the all-ones init/xorout convention makes the xor the
 /// complete combination). The matrix chain comes from `cache` (the
 /// caller's single-slot memoization of [`combine_matrices`]).
+#[cfg(feature = "multipart")]
 fn crc_combine(
     algo: checksum::Algorithm,
     crc_a: u64,
@@ -749,6 +758,7 @@ fn crc_combine(
 
 /// Multiply a register value by a gf2 matrix (bits of `vec` select the
 /// rows).
+#[cfg(feature = "multipart")]
 fn gf2_matrix_times(mat: &[u64; 64], mut vec: u64) -> u64 {
     let mut sum = 0u64;
     let mut i = 0;
@@ -763,6 +773,7 @@ fn gf2_matrix_times(mat: &[u64; 64], mut vec: u64) -> u64 {
 }
 
 /// Square a gf2 matrix (the doubled advance).
+#[cfg(feature = "multipart")]
 fn gf2_matrix_square(square: &mut [u64; 64], mat: &[u64; 64]) {
     for (n, s) in square.iter_mut().enumerate() {
         *s = gf2_matrix_times(mat, mat[n]);
@@ -770,6 +781,7 @@ fn gf2_matrix_square(square: &mut [u64; 64], mat: &[u64; 64]) {
 }
 
 /// The reflected polynomial and register-width mask of a CRC algorithm.
+#[cfg(feature = "multipart")]
 fn crc_params(algo: checksum::Algorithm) -> (u64, u64) {
     match algo {
         Algorithm::Crc32 => (0xEDB88320, u64::MAX >> 32),
@@ -793,6 +805,7 @@ mod tests {
 
     /// The raw digest of one CRC algorithm over `data` — the s3s
     /// hasher, independent of the linearization code under test.
+    #[cfg(feature = "multipart")]
     fn crc_raw(algo: checksum::Algorithm, data: &[u8]) -> Vec<u8> {
         let mut h = ChecksumHasher::default();
         enable_algo(&mut h, algo);
@@ -803,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn linearize_matches_the_direct_crc_of_concatenated_content() {
         // The self-validating oracle: split random content into random
         // parts, CRC each part, linearize, and compare with the direct
@@ -853,6 +867,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn compose_composite_is_the_algorithm_over_concatenated_digests() {
         let mut h = ChecksumHasher {
             sha256: Some(Sha256::new()),
@@ -892,6 +907,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn parse_rejects_two_value_fields_and_bare_algorithm() {
         use http::HeaderMap;
         use s3s::dto::UploadPartInput;
@@ -965,6 +981,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn declared_trailers_are_case_insensitive_and_may_repeat() {
         // F7/F8: trailer names are HTTP field names (case-insensitive)
         // and the header may repeat — a mixed-case or second-line
@@ -1017,6 +1034,9 @@ mod tests {
 
     /// Drain one wrapped stream to its end (the finalize happens at the
     /// final `None`).
+    /// Drain a request body stream (the tee/verify tests' common
+    /// sink).
+    #[cfg(feature = "multipart")]
     async fn drain(body: BodyStream) {
         let mut body = body;
         while let Some(chunk) = body.next().await {
@@ -1272,6 +1292,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn declared_trailer_skips_foreign_names() {
         use http::HeaderMap;
         use s3s::dto::UploadPartInput;
@@ -1399,6 +1420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn compose_composite_skips_on_invalid_base64() {
         let parts = [checksum::Part {
             algorithm: Algorithm::Sha256,
@@ -1409,6 +1431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn linearize_rejects_non_crc_algorithms_and_bad_widths() {
         // FULL_OBJECT linearization is CRC-only (S3): a SHA family
         // algorithm has no matrices → None.
@@ -1513,6 +1536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn wire_algo_matches_the_core_wire_name_for_every_algorithm() {
         // The s3s DTO wire name and the core persisted name are ONE
         // spelling (F13) — a divergence would break create/complete

@@ -15,7 +15,10 @@
 //!
 //! `If-None-Match` passes on an absent object on every destination path.
 
-use std::{cmp::Ordering, str::FromStr, time::SystemTime};
+/// The copy-only conditionals parse an ETag-condition wire value.
+#[cfg(feature = "copy")]
+use std::str::FromStr;
+use std::{cmp::Ordering, time::SystemTime};
 
 use derive_more::Display;
 use s3s::{
@@ -211,6 +214,7 @@ fn strong_matches(cond: &ETagCondition, etag: &ETag) -> bool {
 /// the DTO type when present — the sites not part of the s3s DTO, so they
 /// are read from the headers / String fields here. A malformed value is a
 /// request-shape error, 400 `InvalidArgument` "invalid {name} header".
+#[cfg(feature = "copy")]
 pub(crate) fn parse_etag_condition_value(
     value: Option<&str>,
     name: &'static str,
@@ -228,6 +232,7 @@ pub(crate) fn parse_etag_condition_value(
 /// rule over the request's `HeaderMap`. CopyObject's destination
 /// conditionals are not part of the s3s DTO, so they are read from the
 /// headers here.
+#[cfg(feature = "copy")]
 pub(crate) fn parse_etag_condition_header(
     headers: &http::HeaderMap,
     name: &'static str,
@@ -460,6 +465,7 @@ pub(crate) fn check_write_shape(
 /// 501) live in [`check_write_shape`], the shared destination-write
 /// gate (put and copy call it too), which the ops call before the
 /// lock.
+#[cfg(feature = "multipart")]
 pub(crate) fn check_complete_conditions(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,
@@ -927,6 +933,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn complete_conditions_follow_aws_conditional_writes() {
         let e0 = "5d41402abc4b2a76b9719d911017c592";
         let current = Some(info(e0, LM, 100));

@@ -22,6 +22,9 @@ struct ListPage {
     bucket: String,
     prefix: Option<String>,
     delimiter: Option<String>,
+    /// The request's start-after, echoed back only by the V1 surface
+    /// (`Marker`); V2 carries its own continuation token.
+    #[cfg(feature = "list-v1")]
     start_after: Option<String>,
     max_keys: i32,
     contents: Vec<dto::Object>,
@@ -75,6 +78,7 @@ impl<S: Storage> S3Backend<S> {
             bucket: String::from(bucket),
             prefix,
             delimiter,
+            #[cfg(feature = "list-v1")]
             start_after,
             max_keys: max_keys as i32,
             contents: page

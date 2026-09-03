@@ -11,12 +11,21 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache: object-level compile cache shared across same-OS jobs via the
+  # Actions cache service (SCCACHE_GHA_ENABLED); CARGO_INCREMENTAL=0 for
+  # wrapper hits (the action installs sccache and exports it on PATH).
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # Lint and tests are separate jobs so a clippy failure never blocks the
   # test legs — both matrices run in parallel and report independently.
   lint:
     name: Lint (fmt/clippy)
+    # All gates run behind the lightweight compile check: a tree that
+    # does not build skips the 3-OS matrices instead of burning them.
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +46,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
       # Quality gates (constitution "Rust Tooling & Quality Gates").
       - name: fmt --check
         run: cargo +nightly fmt --all -- --check
@@ -46,14 +59,19 @@ jobs:
 
   test:
     name: Test (unit/doc/features)
+    needs: check
     permissions:
       # Job-level permissions revoke everything not listed: checkout needs
       # contents: read, or cloning this private repo 404s ("not found").
       contents: read
     strategy:
       fail-fast: false
+      # The unit/doc runs as separate matrix legs: the three commands used
+      # to serialize inside one job per OS; each leg now compiles its own
+      # target in parallel (sccache/rust-cache dedupe the shared deps).
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        target: [default, no-default, doc]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -62,22 +80,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
       # The cucumber e2e suite (crates/tinio-e2e, harness = false) runs in
       # its own e2e job with report output — exclude it here so it does
       # not run twice (and does not accidentally run @external scenarios).
       - name: test (default features)
+        if: matrix.target == 'default'
         run: cargo test --workspace --exclude tinio-e2e
 
       - name: test (--no-default-features)
+        if: matrix.target == 'no-default'
         run: cargo test --workspace --no-default-features --exclude tinio-e2e
 
       - name: doc (no warnings)
+        if: matrix.target == 'doc'
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps
 
   features:
     name: Feature matrix (tinio facade)
+    needs: check
     # Feature-gate compile checks: every feature of the facade (and,
     # through its passthroughs, of tinio-server/tinio-cli/tinio-api)
     # must compile — catches feature-gate breakage early. cargo check
@@ -94,6 +120,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
@@ -103,6 +133,7 @@ jobs:
 
   e2e:
     name: E2E (cucumber fs/mem + traceability)
+    needs: check
     # PR test reports (BDD cucumber migration): the e2e runs below write
     # JSON reports; every leg uploads them as artifacts, the ubuntu legs
     # publish a pass/fail summary comment to the PR.
@@ -124,6 +155,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
       # Cucumber e2e suite: in-process scenarios; the default @external
       # exclusion is built into the runner, no --tags needed on the fs pass.
       # The mem pass skips @fs-only scenarios (traversal, nested-root,
@@ -135,7 +170,10 @@ jobs:
       # filter). --retry 1 on both passes mitigates the ConnectionAborted
       # flake.
       - name: e2e cucumber (fs backend)
-        run: cargo test -p tinio-e2e --test cucumber -- --retry 1
+        # --retry 2: the reserved-paths scenario burned both retry-1
+        # attempts on the ConnectionAborted flake of a loaded windows leg
+        # (run 33764783657).
+        run: cargo test -p tinio-e2e --test cucumber -- --retry 2
         env:
           TINIO_E2E_REPORT: cucumber-report-fs.json
 
@@ -285,9 +323,10 @@ jobs:
 
   check:
     name: Check (workspace compile)
-    # Lightweight prerequisite for interop: one ubuntu leg proves the
-    # tree compiles before the external-client scenarios spend three
-    # runners; the full clippy matrix in lint stays the quality gate.
+    # The single prerequisite of every gate: one ubuntu leg proves the
+    # tree compiles before the 3-OS matrices and external-client
+    # scenarios spend their runners; the full clippy matrix in lint
+    # stays the quality gate.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -295,6 +334,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: check (all targets)
         run: cargo check --workspace --all-targets
@@ -302,13 +345,17 @@ jobs:
   bench-smoke:
     name: Benchmark smoke (criterion --test)
     runs-on: ubuntu-latest
-    needs: test
+    needs: check
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       # T030/T031: one-iteration criterion runs keep the fs-backend and
       # S3-mapping benches compilable and runnable. Baselines and
@@ -325,6 +372,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: taiki-e/install-action@v2
         with:
@@ -392,6 +443,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Object-level compile cache (sccache) — shares hits across the
+      # same-OS jobs via the Actions cache service.
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       # aws cli v2 ships on all three hosted-runner images (install-action
       # has no aws-cli manifest — the old key failed the first real run).

@@ -99,38 +99,44 @@ mod tests {
     }
 }
 
-use std::{
-    collections::HashMap,
-    io::Error as IoError,
-    sync::{Arc, Mutex},
-    time::SystemTime,
-};
+use std::{io::Error as IoError, sync::Arc, time::SystemTime};
 
 /// The checksum-spec cache's hard bound — see
 /// [`S3Backend::put_checksum_spec`]. Roughly 200-400 bytes per entry
 /// (a UUID key + the spec), so this is a few MB worst case; the API
 /// abort/complete eviction covers the live-upload paths, this covers
 /// the uploads the store-level sweep aborts out from under the backend.
+#[cfg(feature = "multipart")]
 const CHECKSUM_SPEC_CACHE_CAP: usize = 8192;
 
+#[cfg(feature = "multipart")]
+use std::{collections::HashMap, sync::Mutex};
+
 pub(crate) use conditions::{
-    ConditionalHeaders, DeleteConditions, check_complete_conditions, check_write_shape,
-    checked_if_match_size, decide_fetch, decide_range_error, generation_changed,
-    parse_etag_condition_header, parse_etag_condition_value, parse_if_range, same_whole_second,
+    ConditionalHeaders, DeleteConditions, check_write_shape, checked_if_match_size, decide_fetch,
+    decide_range_error, generation_changed, parse_if_range,
 };
+#[cfg(feature = "multipart")]
+pub(crate) use conditions::{check_complete_conditions, same_whole_second};
+#[cfg(feature = "copy")]
+pub(crate) use conditions::{parse_etag_condition_header, parse_etag_condition_value};
 pub(crate) use errors::map_backend_error;
 use futures::{TryStreamExt, stream};
 use mime_guess;
+#[cfg(feature = "copy")]
+use s3s::dto::CopySource;
 use s3s::{
     S3Error, S3Result,
-    dto::{self, CopySource, ETag as WireETag, LastModified, Range, StreamingBlob},
+    dto::{self, ETag as WireETag, LastModified, Range, StreamingBlob},
     s3_error,
 };
 
 pub use crate::_config::s3::Capabilities;
+#[cfg(feature = "multipart")]
+use crate::_core::checksum as core_checksum;
 use crate::{
     _core::{
-        BodyStream, ETag, bucket, checksum as core_checksum, object,
+        BodyStream, ETag, bucket, object,
         storage::{ByteRange, Error as StorageError, Storage},
     },
     _util::lockmap::{self, Map},
@@ -206,6 +212,7 @@ pub struct S3Backend<S: Storage> {
     /// [`CHECKSUM_SPEC_CACHE_CAP`] — the store-level sweep can abort an
     /// upload without the backend hearing, so that stale entry would
     /// otherwise live forever.
+    #[cfg(feature = "multipart")]
     pub(crate) checksum_specs: Arc<Mutex<HashMap<String, Option<Arc<core_checksum::Upload>>>>>,
 }
 
@@ -216,6 +223,7 @@ impl<S: Storage> S3Backend<S> {
             storage: Arc::new(storage),
             caps,
             conditional_put_locks: Map::new(),
+            #[cfg(feature = "multipart")]
             checksum_specs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -268,6 +276,7 @@ impl<S: Storage> S3Backend<S> {
     /// current; the storage layer still enforces existence at write
     /// time, so a stale entry of an aborted upload can never resurrect
     /// a part (the write answers `NoSuchUpload` itself).
+    #[cfg(feature = "multipart")]
     pub(crate) async fn upload_checksum_spec(
         &self,
         bucket: &bucket::Name,
@@ -303,6 +312,7 @@ impl<S: Storage> S3Backend<S> {
     /// evicted per insert. Eviction is always safe — the cache is
     /// read-through, so a miss (even of a live upload) just re-reads the
     /// storage row, which still enforces existence.
+    #[cfg(feature = "multipart")]
     pub(crate) fn put_checksum_spec(
         &self,
         upload_id: String,
@@ -323,6 +333,7 @@ impl<S: Storage> S3Backend<S> {
     /// Forget the cached spec of a finished upload (abort/complete): the
     /// entry would otherwise outlive the upload it describes — the cache
     /// would grow with every upload ever created, not the live ones.
+    #[cfg(feature = "multipart")]
     pub(crate) fn evict_checksum_spec(&self, upload_id: &str) {
         self.checksum_specs
             .lock()
@@ -391,6 +402,7 @@ pub(crate) fn byte_range(r: dto::Range) -> ByteRange {
 /// roll every key up into an empty common prefix and empty the page.
 /// One home for the boundary rule, shared by the object and upload
 /// listings.
+#[cfg(any(feature = "multipart", feature = "list-v1", feature = "list-v2"))]
 pub(crate) fn normalize_delimiter(delimiter: Option<String>) -> Option<String> {
     delimiter.filter(|d| !d.is_empty())
 }

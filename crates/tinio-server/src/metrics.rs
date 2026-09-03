@@ -286,6 +286,7 @@ pub(crate) fn record_download_bytes(n: u64) {
 /// Decrement the in-progress-multipart gauge, saturating at zero: after a
 /// restart the persisted uploads are not counted, so completing or
 /// aborting one must not drive the gauge negative.
+#[cfg(feature = "multipart")]
 pub(crate) fn multipart_in_progress_dec() {
     #[cfg(test)]
     let _g = test_lock::writer();
@@ -685,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multipart")]
     fn multipart_in_progress_dec_saturates_at_zero() {
         let _window = test_lock::window();
         let _guard = MULTIPART_GAUGE.lock().unwrap();
@@ -962,26 +964,30 @@ mod tests {
                 version_id: None,
             })),
         );
-        let mut expected: Vec<&str> = vec![
-            "DeleteBucket",
-            "HeadBucket",
-            "ListBuckets",
-            "GetBucketLocation",
-            "GetBucketTagging",
-            "PutBucketTagging",
-            "DeleteBucketTagging",
-            "PutObject",
-            "GetObject",
-            "HeadObject",
-            "GetObjectAttributes",
-            "DeleteObject",
-            "DeleteObjects",
-            "GetObjectTagging",
-            "PutObjectTagging",
-            "DeleteObjectTagging",
-        ];
-        #[cfg(feature = "multipart")]
-        expected.extend(["UploadPart", "ListParts", "ListMultipartUploads"]);
+        let expected: Vec<&str> = {
+            let base = [
+                "DeleteBucket",
+                "HeadBucket",
+                "ListBuckets",
+                "GetBucketLocation",
+                "GetBucketTagging",
+                "PutBucketTagging",
+                "DeleteBucketTagging",
+                "PutObject",
+                "GetObject",
+                "HeadObject",
+                "GetObjectAttributes",
+                "DeleteObject",
+                "DeleteObjects",
+                "GetObjectTagging",
+                "PutObjectTagging",
+                "DeleteObjectTagging",
+            ]
+            .into_iter();
+            #[cfg(feature = "multipart")]
+            let base = base.chain(["UploadPart", "ListParts", "ListMultipartUploads"]);
+            base.collect()
+        };
         let recorded: Vec<&str> = expected
             .iter()
             .copied()

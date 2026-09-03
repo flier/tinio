@@ -16,7 +16,14 @@
 //! RenameObject are gated by the `copy` cargo feature and the runtime
 //! `copy_object` toggle (FR-021); the tagging ops gate on `caps.tagging`.
 
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
+/// The copy-only conditionals of [`op_copy_object`]/[`op_rename_object`]
+/// (`x-amz-if-match`/`x-amz-if-none-match`, the `x-amz-rename-source-if-*`
+/// String fields, and the shared 412 constructor): the destination-put
+/// conditional writes read the same header family through the s3s DTO
+/// instead.
+#[cfg(feature = "copy")]
+use std::time::SystemTime;
 
 use http::HeaderValue;
 use s3s::{
@@ -25,6 +32,11 @@ use s3s::{
     s3_error,
 };
 
+#[cfg(feature = "copy")]
+use crate::backend::{
+    conditions::{ConditionFailure, condition_error},
+    parse_etag_condition_header, parse_etag_condition_value,
+};
 use crate::{
     _core::{
         bucket,
@@ -39,10 +51,8 @@ use crate::{
             HasFields, Spec, VerifyState, VerifyStream, echo_recorded, echo_validated,
             map_part_error,
         },
-        conditions::{ConditionFailure, condition_error},
         decide_fetch, decide_range_error, generation_changed, map_backend_error,
-        normalize_page_size, parse_etag_condition_header, parse_etag_condition_value,
-        parse_if_range,
+        normalize_page_size, parse_if_range,
         tags::{parse_tagging_header, tag_set_from_tags, tags_from_tag_set},
     },
 };
@@ -399,10 +409,10 @@ impl<S: Storage> S3Backend<S> {
         // response carries no checksum headers: the value is the WHOLE
         // object's, and clients (aws cli crc64nvme) verify each ranged
         // part against it and fail the download (interop 33756495359).
-        if output.content_range.is_none() {
-            if let Some(recorded) = &info.checksum {
-                echo_recorded(&mut output, recorded);
-            }
+        if output.content_range.is_none()
+            && let Some(recorded) = &info.checksum
+        {
+            echo_recorded(&mut output, recorded);
         }
         // `x-amz-tagging-count` (dto field; AWS): present only when the
         // object carries tags, and only while the tagging toggle is on
@@ -1004,10 +1014,16 @@ mod tests {
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use http::HeaderValue;
+    #[cfg(feature = "multipart")]
+    use s3s::checksum::ChecksumHasher;
     use s3s::{
-        S3, S3ErrorCode,
-        checksum::ChecksumHasher,
-        dto::{CopyObjectInput, CopySource, Range, StreamingBlob, Timestamp},
+        S3,
+        dto::{Range, StreamingBlob, Timestamp},
+    };
+    #[cfg(feature = "copy")]
+    use s3s::{
+        S3ErrorCode,
+        dto::{CopyObjectInput, CopySource},
     };
     use time::OffsetDateTime;
 
