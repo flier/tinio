@@ -140,7 +140,9 @@ jobs:
           TINIO_E2E_REPORT: cucumber-report-fs.json
 
       - name: e2e cucumber (mem backend)
-        run: cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 1
+        # --retry 2: the ConnectionAborted flake hit both retry-1 attempts
+        # on a loaded windows leg (run 33750043137).
+        run: cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json

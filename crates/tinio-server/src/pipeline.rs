@@ -1310,12 +1310,17 @@ mod tests {
         let (panicked, task) = PanicTask::new();
         pipelines.db().enqueue(Box::new(task)).await.unwrap();
         wait_for(|| panicked.load(Ordering::Relaxed)).await;
-        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            text.matches("likely systemic").count(),
-            1,
-            "the panic must be the 10th consecutive failure: {text}"
-        );
+        // The `panicked` flag is set at the panic start; the escalation
+        // warn ("likely systemic") lands after the worker's catch handles
+        // the failure — wait for it in the log buffer, not an immediate
+        // assert (slow runners lag the warn past the flag).
+        let escalated = || {
+            String::from_utf8(buf.lock().unwrap().clone())
+                .unwrap()
+                .matches("likely systemic")
+                .count()
+        };
+        wait_for(|| escalated() == 1).await;
     }
 
     #[tokio::test]
