@@ -517,9 +517,13 @@ async fn run_aws(world: &mut World, command: String) {
 
 /// A run that must fail (the error-path legs): the client's stderr lands
 /// in `world.ext_error` for `the external client error contains …`.
-#[given(regex = r"I try aws (.*)")]
-#[when(regex = r"I try aws (.*)")]
-#[then(regex = r"I try aws (.*)")]
+/// Constrained to `s3…` subcommands so the wrong-credentials variant
+/// below stays unambiguous (cucumber-rs panics on overlapping matches;
+/// the regex crate has no lookahead). Extend the class for a future
+/// non-s3 command instead of widening to `.*`.
+#[given(regex = r"I try aws (s3[a-z]*(?: .*)?)")]
+#[when(regex = r"I try aws (s3[a-z]*(?: .*)?)")]
+#[then(regex = r"I try aws (s3[a-z]*(?: .*)?)")]
 async fn try_aws(world: &mut World, command: String) {
     let mut cmd = aws_cmd(world, &command);
     run_external(world, &mut cmd, false);

@@ -395,9 +395,14 @@ impl<S: Storage> S3Backend<S> {
         // The recorded checksum echo (spec 2026-08-31 — grilling Q7),
         // whenever a checksum is recorded — unconditional, no
         // `x-amz-checksum-mode` gating (nothing is recorded while the
-        // `checksum` toggle is off).
-        if let Some(recorded) = &info.checksum {
-            echo_recorded(&mut output, recorded);
+        // `checksum` toggle is off). A partial (206, `content_range`)
+        // response carries no checksum headers: the value is the WHOLE
+        // object's, and clients (aws cli crc64nvme) verify each ranged
+        // part against it and fail the download (interop 33756495359).
+        if output.content_range.is_none() {
+            if let Some(recorded) = &info.checksum {
+                echo_recorded(&mut output, recorded);
+            }
         }
         // `x-amz-tagging-count` (dto field; AWS): present only when the
         // object carries tags, and only while the tagging toggle is on

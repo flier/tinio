@@ -40,7 +40,8 @@ use io::Error as IoError;
 use prometheus::{Encoder, TextEncoder, default_registry};
 use s3s::{
     Body as S3Body,
-    auth::SimpleAuth,
+    auth::{S3Auth, SecretKey},
+    s3_error,
     service::{S3Service, S3ServiceBuilder},
 };
 use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
@@ -64,6 +65,29 @@ pub type MetricsRefresh = Arc<dyn Fn() + Send + Sync>;
 
 /// The reserved `/metrics` endpoint path on the data-plane listener.
 pub const METRICS_PATH: &str = "/metrics";
+
+/// The single static SigV4 credential pair as an s3s auth provider.
+/// Unlike `SimpleAuth` (which answers `NotSignedUp`), an unknown access
+/// key answers AWS's `InvalidAccessKeyId` — the code aws cli and the
+/// FR-008 interop scenario expect for a wrong key.
+struct StaticAuth {
+    access_key: String,
+    secret_key: SecretKey,
+}
+
+#[async_trait::async_trait]
+impl S3Auth for StaticAuth {
+    async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
+        if access_key == self.access_key {
+            Ok(self.secret_key.clone())
+        } else {
+            Err(s3_error!(
+                InvalidAccessKeyId,
+                "The AWS Access Key Id you provided does not exist in our records."
+            ))
+        }
+    }
+}
 
 /// The data plane: the s3s service behind the metrics/access middleware.
 pub struct DataPlane {
@@ -93,7 +117,10 @@ impl DataPlane {
     ) -> Self {
         let backend = MetricS3::new(S3Backend::new(storage, caps));
         let mut builder = S3ServiceBuilder::new(backend);
-        builder.set_auth(SimpleAuth::from_single(access_key, secret_key));
+        builder.set_auth(StaticAuth {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.into(),
+        });
         Self::from_service(builder.build())
     }
 

@@ -283,6 +283,22 @@ jobs:
               }
             }
 
+  check:
+    name: Check (workspace compile)
+    # Lightweight prerequisite for interop: one ubuntu leg proves the
+    # tree compiles before the external-client scenarios spend three
+    # runners; the full clippy matrix in lint stays the quality gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check (all targets)
+        run: cargo check --workspace --all-targets
+
   bench-smoke:
     name: Benchmark smoke (criterion --test)
     runs-on: ubuntu-latest
@@ -353,9 +369,12 @@ jobs:
 
   interop:
     name: Interop (aws cli v2 + rclone)
-    # cucumber @interop harness (crates/tinio-e2e) is committed, job always runs
-    needs: test
+    # cucumber @interop harness (crates/tinio-e2e) is committed, job always
+    # runs — gated on the lightweight compile check above, not the test
+    # matrix (the windows leg alone outlasts the rest of the run): it
+    # starts in parallel with lint/test/e2e once the tree compiles.
     # PR test reports: same artifact + ubuntu-only comment scheme as test.
+    needs: check
     permissions:
       # Job-level permissions revoke everything not listed: checkout needs
       # contents: read, or cloning this private repo 404s ("not found").
