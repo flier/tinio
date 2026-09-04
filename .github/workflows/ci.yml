@@ -17,21 +17,6 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
-  # Diagnostic only: sccache dumps its per-job error log here (the ghac
-  # backend logged ~245 cache_write_errors on the 2026-09-03 run while
-  # 20 parallel jobs hammered one Actions-cache store). The inline upload
-  # step reads this same value for its artifact path. Non-fatal if the
-  # path is not writable on a runner; drop this env and the
-  # SCCACHE_ERROR_LOG_UPLOAD flag together once write errors are
-  # root-caused. The path must be writable on every OS: github.workspace
-  # resolves to a native path on windows/macos runners (/tmp is
-  # POSIX-only; native sccache.exe cannot write it).
-  SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache-err.log
-  # ARMED (diagnostic run for the ghac cache_write_errors of run
-  # 33769082799): "true" makes every compile job upload its sccache error
-  # log as an artifact, kept even when the job failed. Flip back to
-  # "false" once the write errors are fixed.
-  SCCACHE_ERROR_LOG_UPLOAD: "true"
 
 permissions:
   # Job default for every job (unlisted scopes = none): checkout needs
@@ -116,19 +101,6 @@ jobs:
       - name: clippy (-D warnings)
         run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
 
-      # Diagnostic upload (env-gated, see SCCACHE_ERROR_LOG_UPLOAD above):
-      # per-job sccache error log kept even when the job failed. The log
-      # path is read from env.SCCACHE_ERROR_LOG so this step and the env
-      # value cannot drift apart.
-      - &upload-err
-        name: upload sccache error log
-        if: always() && env.SCCACHE_ERROR_LOG_UPLOAD == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: sccache-err-log-${{ github.job }}-${{ matrix.os }}-${{ matrix.target }}
-          path: ${{ env.SCCACHE_ERROR_LOG }}
-          if-no-files-found: ignore
-
   test:
     name: Test (unit/features, default)
     # Ubuntu default-features leg ONLY: it owns the fast gates and its
@@ -167,8 +139,6 @@ jobs:
         with:
           mode: ${{ matrix.target }}
 
-      - *upload-err
-
   # The no-default-features and rustdoc legs: different compile graphs that
   # warm nothing downstream, so they run as a leaf job instead of holding
   # up the ubuntu chain (previously e2e/bench-smoke waited on them).
@@ -197,8 +167,6 @@ jobs:
       - uses: ./.github/actions/run-test-leg
         with:
           mode: ${{ matrix.target }}
-
-      - *upload-err
 
   # Windows/macOS unit legs: identical commands to the ubuntu test jobs,
   # run on the portable OSes for platform coverage. They run in parallel
@@ -232,8 +200,6 @@ jobs:
         with:
           mode: ${{ matrix.target }}
 
-      - *upload-err
-
   features:
     name: Feature matrix (tinio facade)
     needs: check
@@ -259,8 +225,6 @@ jobs:
 
       - name: feature-matrix check (tinio)
         run: cargo hack check --package tinio --each-feature --no-dev-deps --profile ci
-
-      - *upload-err
 
   e2e:
     name: E2E (cucumber fs/mem + traceability)
@@ -312,8 +276,6 @@ jobs:
         name: e2e traceability
         run: cargo test --profile ci -p tinio-e2e --test traceability
 
-      - *upload-err
-
       # PR test reports (BDD cucumber migration): the e2e/interop jobs write
       # JSON reports. Reports land in crates/tinio-e2e/ (cargo runs the test
       # binary with the package root as cwd), hence the ** glob.
@@ -322,7 +284,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ github.job }}-${{ matrix.os }}-cucumber-report
+          name: ${{ github.job }}${{ matrix.os && format('-{0}', matrix.os) }}-cucumber-report
           path: '**/*-report*.json'
 
       # dorny/test-reporter has no cucumber reporter (its README documents
@@ -338,7 +300,129 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            const publish = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/publish-cucumber-report.js`);
+            const publish = async ({ github, context, core }) => {
+            const fs = require('fs');
+            const path = require('path');
+
+            // Find the cucumber JSON reports (same files the artifact
+            // step uploads: *-report*.json anywhere in the workspace).
+            function findReports(dir, acc) {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (entry.name === '.git' || entry.name === 'target') continue;
+                const p = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  findReports(p, acc);
+                } else if (/^.*-report.*\.json$/.test(entry.name)) {
+                  acc.push(p);
+                }
+              }
+              return acc;
+            }
+
+            const reports = findReports(process.env.GITHUB_WORKSPACE, []).sort();
+            const rows = [];
+            const failures = [];
+
+            for (const file of reports) {
+              let data;
+              try {
+                data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              } catch (err) {
+                core.warning(`could not parse report ${file}: ${err.message}`);
+                continue;
+              }
+              // A matched file that is valid JSON but not a cucumber report array
+              // must skip with a warning, not throw — this step never fails the job.
+              if (!Array.isArray(data)) {
+                core.warning(`skipping ${file}: not a cucumber JSON array`);
+                continue;
+              }
+              const row = { file: path.basename(file), scenarios: 0, passed: 0, failed: 0, skipped: 0 };
+              for (const feature of data) {
+                for (const el of feature.elements || []) {
+                  if (el.type !== 'scenario') continue;
+                  row.scenarios += 1;
+                  // cucumber-rs 0.23's JSON writer accumulates events across
+                  // retry attempts on the same element (steps are never
+                  // cleared between attempts; element identity is
+                  // name+line+type), so a flake recovered by --retry 2
+                  // carries failed attempt-N statuses AND passed attempt-N+1
+                  // statuses for the same step lines. Keep only the LAST
+                  // status per step line (the gherkin position line is
+                  // stable across attempts); hooks have no stable key in
+                  // the JSON, so keep the last status per hook kind.
+                  const statuses = new Set();
+                  const lastByLine = new Map();
+                  for (const step of el.steps || []) {
+                    const status = step.result && step.result.status;
+                    if (typeof step.line === 'number') {
+                      lastByLine.set(step.line, status);
+                    } else {
+                      statuses.add(status);
+                    }
+                  }
+                  for (const status of lastByLine.values()) {
+                    statuses.add(status);
+                  }
+                  const lastHookByKind = new Map();
+                  for (const kind of ['before', 'after']) {
+                    for (const hook of el[kind] || []) {
+                      lastHookByKind.set(kind, hook.result && hook.result.status);
+                    }
+                  }
+                  for (const status of lastHookByKind.values()) {
+                    statuses.add(status);
+                  }
+                  if (statuses.has('failed') || statuses.has('undefined') || statuses.has('ambiguous')) {
+                    row.failed += 1;
+                    failures.push(`- \`${feature.uri}\` — ${el.name}`);
+                  } else if (statuses.size === 0 || (statuses.size === 1 && statuses.has('passed'))) {
+                    row.passed += 1;
+                  } else {
+                    row.skipped += 1;
+                  }
+                }
+              }
+              rows.push(row);
+            }
+
+            const table = rows.length > 0
+              ? ['| report | scenarios | passed | failed | skipped |', '|---|---|---|---|---|']
+                .concat(rows.map((r) => `| ${r.file} | ${r.scenarios} | ${r.passed} | ${r.failed} | ${r.skipped} |`))
+                .join('\n')
+              : 'No cucumber report found — the e2e run did not produce a JSON report.';
+
+            let note = '';
+            if (failures.length > 0) {
+              note = `\n**${failures.length} failed scenario(s):**\n${failures.join('\n')}`;
+            } else if (rows.length > 0) {
+              note = '\nAll scenarios passed.';
+            }
+            const body = [
+              `## cucumber report (\`${process.env.GITHUB_JOB}\`)`,
+              '',
+              table,
+              note,
+            ].join('\n');
+
+            // Step summary: visible on every run, including fork PRs
+            // without comment permissions.
+            await core.summary.addRaw(body).write();
+
+            // PR comment (pull_request runs only — context.issue.number is
+            // unset on push). A permission failure must not fail the job.
+            if (context.issue.number) {
+              try {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              } catch (err) {
+                core.warning(`could not post PR comment: ${err.message}`);
+              }
+            }
+            };
             await publish({ github, context, core });
 
   # Windows/macOS cucumber legs (parallel to the ubuntu e2e job): they
@@ -364,7 +448,6 @@ jobs:
       - *e2e-fs
       - *e2e-mem
       - *e2e-trace
-      - *upload-err
       - *upload-report
 
   check:
@@ -383,8 +466,6 @@ jobs:
 
       - name: check (all targets)
         run: cargo check --profile ci --workspace --all-targets
-
-      - *upload-err
 
   bench-smoke:
     name: Benchmark smoke (criterion --test)
@@ -407,8 +488,6 @@ jobs:
       # regression gating are Phase 6 (T088).
       - name: bench smoke
         run: cargo bench --profile ci -p tinio-fs -p tinio-server -- --test
-
-      - *upload-err
 
   semver:
     name: Semver checks (tinio facade)
@@ -439,8 +518,6 @@ jobs:
           else
             echo "tinio@${ver} is not on crates.io yet — semver-checks baseline starts with the first release"
           fi
-
-      - *upload-err
 
   audit:
     name: Dependency audit
@@ -520,7 +597,6 @@ jobs:
         env:
           TINIO_E2E_REPORT: interop-report.json
 
-      - *upload-err
       - *upload-report
       - *publish-report
 
@@ -547,5 +623,4 @@ jobs:
       - *interop-client
       - *interop-example
       - *interop-cucumber
-      - *upload-err
       - *upload-report

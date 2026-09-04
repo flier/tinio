@@ -2,15 +2,15 @@ name: Run workspace test matrix leg
 description: >-
   Run one workspace unit/doc leg selected by `mode` (default /
   no-default / doc) — the exact commands the test matrix executes, shared
-  as a single source of truth between the ubuntu test job and the
-  portable-OS (windows/macos) test job so the two can never drift.
+  as a single source of truth between the three test jobs (test,
+  test-extra, test-port) so they can never drift.
   Unit/integration tests run under cargo-nextest (per-test processes;
   the runner profile's retry/fail-fast absorb their flakes);
   doctests are NOT supported by nextest and run separately with
   `cargo test --doc`. The cucumber e2e
   suite (crates/tinio-e2e, harness = false) runs in its own e2e job with
   report output — excluded here so it does not run twice (and does not
-  accidentally run @external scenarios).
+  accidentally run external-client scenarios).
 inputs:
   mode:
     description: >-
