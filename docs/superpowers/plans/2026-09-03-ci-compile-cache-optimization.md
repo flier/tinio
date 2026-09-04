@@ -1,6 +1,6 @@
 # CI compile-time & cache-hit-rate improvement plan (2026-09-03)
 
-Status: Phase 0 done · Phase 1 landed (commit d7a3fe0, pushed) · Phase 2 root-caused on 2026-09-04 — quota eviction, not rate-limiting (store was at 10.05 GB of the 10 GB cap, all 2575 entries under dev); store cleared, ARMED diagnostics removed, review fixes in tree · post-fix run pending the user's commit + push.
+Status: Phase 0 done · Phase 1 landed (d7a3fe0) · Phase 2 root-caused 2026-09-04 (quota eviction), store cleared, diagnostics removed · post-fix run (33838749905, cfbc1e6): wall 9:51 ✓, Rust hit rate 22.5 % ✗ (below armed run 55.9 % and acceptance), write errors 2797 ≈ 49 % of misses ✗ — root cause corrected to the cache API write rate limit (~200 uploads/min), not quota · next run on this commit is the payoff measurement.
 
 ## Goal
 
@@ -66,6 +66,15 @@ Write-error root cause (2026-09-04): **quota eviction, not rate-limiting** — `
 - Pending: user commits the tree and pushes; the post-fix run answers — write errors ≈ 0 expected, Rust rate ≥ 60 % ubuntu / ≥ 40 % windows-macOS (windows lint stays cold by design: clippy-driver objects never warm from the rustc chains), wall toward 15–18 min.
 - Acceptance revised: `write errors < 5 % of misses` only holds against a low-water store; at quota steady state (free-plan 10 GB, high-frequency dev pushes) write refusals are structural, so judge long-run health by hit rate, not write errors.
 - Re-evaluate later from post-fix data: windows larger runners, per-OS `e2e-port`/`interop-port` chaining, nextest partition sharding; revisit the cache quota (paid plan) only if steady-state hit rate proves too low to ship.
+
+## Phase 2 — post-fix run (33838749905, dev cfbc1e6, 2026-09-04)
+
+- Green in **9:51** (baseline 23:59, armed 16:25) — the 15–18 min wall target is met; run wall improved on both prior runs and the chain tail no longer dominates.
+- Rust hit rate **22.5 %** (1650/7325) vs baseline 14.0 % and armed 55.9 % — acceptance (≥60 % ubuntu / ≥40 % windows-macOS) not met; a regression vs the armed run. Legs that ran while write slots were open did well (lint ubuntu 55.4 %, feature matrix 52.0 %, interop ubuntu 49.3 %, doc 62.8 %); late/cold legs collapsed (check 0 %, Test default 6.9 %, lint windows 1.1 %, Test port windows default 0.0 %).
+- cache_write_errors **2797** (≈49 % of misses) vs baseline 4632, armed 541 — the low-water prediction (≈0) failed.
+- The store clear itself worked: the run ended at 1.2 GB / 1099 entries (all written by this run), ~1/8 of the 10 GB cap — quota was not the constraint on this run.
+- Root cause corrected: with the store far below the cap, the refusals are the **Actions cache API per-repo write rate limit (~200 uploads/min, HTTP 429, documented at `docs.github.com/en/actions/reference/limits`)**, not quota. Evidence: late legs show `cache_writes: 0` / `cache_write_duration: 0 s` (instant refusal) while early legs persisted ≈ the ~1000 objects a ~5 min window allows; baseline (47.8 %) and post-fix (49.3 %) share the same miss→error ratio, both being high-miss-volume runs.
+- Forward: the store now holds this commit's objects, and reads are unaffected by the write throttle — the next run on the same commit should show a much higher hit rate. If it still undershoots, the lever is reducing write volume (fewer misses, directory-level rust-cache, fewer parallel writers) or a paid plan; clearing the store is not a fix for the write limit.
 
 ## Verification
 
