@@ -220,6 +220,9 @@ fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, SelectError> {
         Expr::CompoundFieldAccess { .. } | Expr::JsonAccess { .. } => {
             column_field(ctx, &expr.to_string(), false)
         }
+        // `(x) IS NULL` ≡ `x IS NULL`: parenthesized columns stay MISSING
+        // rather than collapsing through `eval` into a present NULL.
+        Expr::Nested(e) => eval_field(e, ctx),
         other => Ok(Field::Present(eval(other, ctx)?)),
     }
 }
@@ -834,6 +837,23 @@ mod tests {
         // A present NULL is IS NULL true.
         let rec = Record::Csv(vec![Field::Present(Value::Null)], vec!["a".into()]);
         let rows = run("SELECT * FROM S3Object s WHERE s.a IS NULL", vec![rec]);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn parens_do_not_hide_missing() {
+        // `(x) IS NULL` ≡ `x IS NULL`: a parenthesized missing column stays
+        // MISSING, so IS NULL must not claim it.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE (s._5) IS NULL",
+            vec![csv(&["1", "2"], &["_1", "_2"])],
+        );
+        assert_eq!(rows.len(), 0);
+        // The MISSING sentinel sees through parentheses too.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE (s._5) IS MISSING",
+            vec![csv(&["1", "2"], &["_1", "_2"])],
+        );
         assert_eq!(rows.len(), 1);
     }
 
