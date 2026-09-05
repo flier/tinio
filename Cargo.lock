@@ -3638,6 +3638,7 @@ dependencies = [
  "parse-display",
  "percent-encoding",
  "proptest",
+ "sha2",
  "thiserror 2.0.20",
  "tinio-util",
  "tokio",
