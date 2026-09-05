@@ -1,14 +1,19 @@
-//! CSV record reader: the `RecordReader` interface plus the CSV input path.
+//! Record readers: the `RecordReader` interface, the CSV input path, and the
+//! stream stages that surround one — input `Compression` handling
+//! (`decompressed`) and the `RangeFilter` scan window.
 //!
 //! `RecordReader` is the engine's synchronous pull contract: `next` until
-//! `Ok(None)` at EOF. Input is the *uncompressed* stream (decompression
-//! happens outside, in the pipeline); record offsets reported by
-//! `last_record_start` are thus uncompressed stream bytes.
+//! `Ok(None)` at EOF. The reader sees the *uncompressed* stream (the
+//! pipeline feeds it through `decompressed` first); record offsets reported
+//! by `last_record_start` are therefore uncompressed stream bytes — the
+//! basis of ScanRange (`RangeFilter`).
 
 use std::collections::HashMap;
 use std::io::Read;
 
+use bzip2::read::MultiBzDecoder;
 use csv::{ReaderBuilder, StringRecord};
+use flate2::read::MultiGzDecoder;
 
 use crate::row::{Field, Record, Value};
 use crate::SelectError;
@@ -26,6 +31,26 @@ pub trait RecordReader {
     /// when its first byte falls in `[start, end]`.
     fn last_record_start(&self) -> u64 {
         0
+    }
+}
+
+/// Input compression (S3 Select `CompressionType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    None_,
+    Gzip,
+    Bzip2,
+}
+
+/// Wrap the input stream in the decoder for `compression`. Multi-member
+/// decoders read concatenated member streams to EOF exactly as AWS reads
+/// them (review 2026-09-05b) — `gzip`/`bzip2` CLI output is multi-member;
+/// a single-member decoder would silently stop at the first stream.
+pub fn decompressed(compression: Compression, r: Box<dyn Read + Send>) -> Box<dyn Read + Send> {
+    match compression {
+        Compression::None_ => r,
+        Compression::Gzip => Box::new(MultiGzDecoder::new(r)),
+        Compression::Bzip2 => Box::new(MultiBzDecoder::new(r)),
     }
 }
 
@@ -187,9 +212,76 @@ impl<R: Read> RecordReader for CsvReader<R> {
     }
 }
 
+/// ScanRange window over a record reader.
+///
+/// Offsets are *uncompressed* bytes — the filter wraps the format reader,
+/// not the raw stream, so a record counts when its first byte falls in
+/// `[start, end]` with `end = None` meaning "no upper bound" (the stream's
+/// own EOF). Pre-range records are consumed and dropped; the first record
+/// whose start passes `end` stops the stream (`Ok(None)`), and nothing past
+/// it is ever read. JSON DOCUMENT's whole object is one byte-0 record, so
+/// `start > 0` yields nothing — correct, not a bug (spec §Background).
+pub struct RangeFilter<R: RecordReader> {
+    inner: R,
+    start: u64,
+    end: Option<u64>,
+    /// A record whose start passed `end` stopped the stream.
+    stopped: bool,
+}
+
+impl<R: RecordReader> RangeFilter<R> {
+    /// The (start, end) pair is the *resolved* window — the adapter computes
+    /// it (Task 12): both bounds pass through; end-only resolves `start =
+    /// size - end`. The server validates the window (Task 13), so nothing
+    /// checks bounds here.
+    pub fn new(inner: R, start: u64, end: Option<u64>) -> Self {
+        Self {
+            inner,
+            start,
+            end,
+            stopped: false,
+        }
+    }
+}
+
+impl<R: RecordReader> RecordReader for RangeFilter<R> {
+    fn next(&mut self) -> Result<Option<Record>, SelectError> {
+        if self.stopped {
+            return Ok(None);
+        }
+        loop {
+            let record = match self.inner.next()? {
+                None => return Ok(None),
+                Some(record) => record,
+            };
+            let at = self.inner.last_record_start();
+            if at < self.start {
+                continue;
+            }
+            if let Some(end) = self.end
+                && at > end
+            {
+                self.stopped = true;
+                return Ok(None);
+            }
+            return Ok(Some(record));
+        }
+    }
+
+    fn last_record_start(&self) -> u64 {
+        self.inner.last_record_start()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
+
+    use bzip2::write::BzEncoder;
+    use flate2::write::GzEncoder;
+
+    use crate::json::{JsonReader, JsonType};
+    use crate::sql::parse;
 
     use super::*;
 
@@ -375,5 +467,185 @@ mod tests {
         assert_eq!(idx.get(&"NAME".to_lowercase()), Some(&2)); // duplicates: later wins
         assert_eq!(idx.get("iD"), None); // keys are lowercased
         assert_eq!(name_index(&[]).len(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Decompression + scan range (Task 10).
+    // ------------------------------------------------------------------
+
+    /// Four records, starts at 0, 13, 16, 19; 22 bytes total. A window
+    /// opening at byte 10 lands inside record 1's span (bytes 0..13) — its
+    /// partial remainder must not be yielded: a record counts by its first
+    /// byte, never by overlap.
+    const FOUR: &[u8] = b"0123456789ab\nr1\nr2\nr3\n";
+
+    fn csv_reader(bytes: &[u8]) -> CsvReader<Cursor<&[u8]>> {
+        CsvReader::new(Cursor::new(bytes), params(CsvHeader::None_))
+    }
+
+    /// One `next` call observable through `RangeFilter`: counts inner reads.
+    struct Counting<R: RecordReader>(R, usize);
+
+    impl<R: RecordReader> RecordReader for Counting<R> {
+        fn next(&mut self) -> Result<Option<Record>, SelectError> {
+            self.1 += 1;
+            self.0.next()
+        }
+
+        fn last_record_start(&self) -> u64 {
+            self.0.last_record_start()
+        }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn bzip2(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn range_start_inside_span_drops_partial_record() {
+        // start 10 falls inside record 1's span (0..13): record 1 drops
+        // (start 0 < 10 — consumed, not emitted), the rest are in range.
+        let mut r = RangeFilter::new(csv_reader(FOUR), 10, None);
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r1"], &["_1"]));
+        assert_eq!(r.last_record_start(), 13);
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r2"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r3"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn range_both_bounds_inclusive() {
+        let mut r = RangeFilter::new(csv_reader(FOUR), 13, Some(16));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r1"], &["_1"])); // 13
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r2"], &["_1"])); // 16 == end
+        assert_eq!(r.next().unwrap(), None); // 19 > 16 stops the stream
+    }
+
+    #[test]
+    fn range_stop_not_consuming_past_end() {
+        // A record whose start passes `end` stops the stream: 4 inner reads
+        // (1 dropped + 2 yielded + 1 stop) and none past the stop on a
+        // further pull.
+        let mut r = RangeFilter::new(Counting(csv_reader(FOUR), 0), 13, Some(16));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r1"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r2"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+        assert_eq!(r.inner.1, 4);
+        assert!(r.next().unwrap().is_none());
+        assert_eq!(r.inner.1, 4);
+    }
+
+    #[test]
+    fn range_empty_window_stops_immediately() {
+        // No record starts at 6: record 1 drops (start 0 < 6), record 2's
+        // start 13 > end 6 stops — `Ok(None)` after only two inner reads.
+        let mut r = RangeFilter::new(Counting(csv_reader(FOUR), 0), 6, Some(6));
+        assert_eq!(r.next().unwrap(), None);
+        assert_eq!(r.inner.1, 2);
+    }
+
+    #[test]
+    fn range_beyond_eof_drains_and_returns_none() {
+        // Window past the last record: all four are pre-range, consumed and
+        // dropped; the fifth inner read is the EOF probe that answers `None`.
+        let mut r = RangeFilter::new(Counting(csv_reader(FOUR), 0), 30, None);
+        assert_eq!(r.next().unwrap(), None);
+        assert_eq!(r.inner.1, 5);
+    }
+
+    #[test]
+    fn range_end_only_resolved_via_size() {
+        // End-only means "last N bytes" → start = size - N (the server
+        // resolves it, T13); the window tops at the object's last byte, so
+        // the upper bound is the stream's own EOF. Last 9 of 22 bytes.
+        let size: u64 = 22;
+        let start = size - 9;
+        assert_eq!(start, 13);
+        let mut r = RangeFilter::new(csv_reader(FOUR), start, None);
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r1"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r2"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["r3"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn document_start_above_zero_yields_nothing() {
+        // DOCUMENT: the whole object is one byte-0 record, so start > 0
+        // yields zero records — documented semantics, not a bug (spec).
+        let plan = parse("SELECT * FROM S3Object").unwrap();
+        let reader = JsonReader::new(
+            Cursor::new(b"{\"a\": 1}\n".to_vec()),
+            JsonType::Document,
+            &plan.from,
+        );
+        let mut r = RangeFilter::new(reader, 1, None);
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn none_compression_passes_through() {
+        let reader = decompressed(Compression::None_, Box::new(Cursor::new(b"a\nb\n")));
+        let mut r = CsvReader::new(reader, params(CsvHeader::None_));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["a"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["b"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn gzip_round_trip() {
+        let reader =
+            decompressed(Compression::Gzip, Box::new(Cursor::new(gzip(b"aaa\nbb\nc\n"))));
+        let mut r = CsvReader::new(reader, params(CsvHeader::None_));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["aaa"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["bb"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["c"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn gzip_multi_member_reads_all_streams() {
+        // Concatenated members — exactly what the gzip CLI emits; the
+        // single-member decoder would stop after the first stream.
+        let mut both = gzip(b"aaa\n");
+        both.extend(gzip(b"bb\nc\n"));
+        let reader = decompressed(Compression::Gzip, Box::new(Cursor::new(both)));
+        let mut r = CsvReader::new(reader, params(CsvHeader::None_));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["aaa"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["bb"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["c"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn bzip2_round_trip() {
+        let reader =
+            decompressed(Compression::Bzip2, Box::new(Cursor::new(bzip2(b"aaa\nbb\nc\n"))));
+        let mut r = CsvReader::new(reader, params(CsvHeader::None_));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["aaa"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["bb"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["c"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn bzip2_multi_member_reads_all_streams() {
+        // Two encoder streams concatenated — the multi-member decoder (R1:
+        // spec wins over the brief's single-stream reader) must read both.
+        let mut both = bzip2(b"aaa\n");
+        both.extend(bzip2(b"bb\nc\n"));
+        let reader = decompressed(Compression::Bzip2, Box::new(Cursor::new(both)));
+        let mut r = CsvReader::new(reader, params(CsvHeader::None_));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["aaa"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["bb"], &["_1"]));
+        assert_eq!(r.next().unwrap().unwrap(), csv(&["c"], &["_1"]));
+        assert_eq!(r.next().unwrap(), None);
     }
 }
