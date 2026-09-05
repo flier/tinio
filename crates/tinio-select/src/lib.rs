@@ -10,6 +10,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod output;
 pub mod record;
 pub mod row;
 pub mod sql;
