@@ -70,6 +70,7 @@ tinio-core = { path = "crates/tinio-core" }
 tinio-fs = { path = "crates/tinio-fs" }
 tinio-mem = { path = "crates/tinio-mem" }
 tinio-server = { path = "crates/tinio-server", default-features = false }
+tinio-store = { path = "crates/tinio-store" }
 tinio-util = { path = "crates/tinio-util" }
 
 # CI compile profile: no debug info, wide codegen parallelism, no

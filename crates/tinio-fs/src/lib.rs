@@ -17,6 +17,8 @@
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
+pub extern crate tinio_store as _store;
+#[doc(hidden)]
 pub extern crate tinio_util as _util;
 
 mod backend;

@@ -7,27 +7,22 @@
 //! the transaction ends (streams are `'static` and cannot borrow the
 //! transaction guard).
 
-use std::{iter::from_fn, ops::Bound, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::iter;
-use redb::{ReadableDatabase, ReadableTable};
 
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
-        bucket, checksum, collect_body, from_nanos, group_and_paginate,
-        multipart::ObjectPart,
-        now_nanos, object,
-        storage::{RollupMirror, common_prefix},
+        bucket::Name, checksum, collect_body, from_nanos, group_and_paginate,
+        multipart::ObjectPart, now_nanos, object,
     },
+    _store::{bucket, meta, object_part, objects, scan::for_each_pair},
     Error,
-    error::{access_denied, database_storage, invalid_key, no_such_bucket, no_such_key},
-    storage::{
-        BUCKETS, MemoryStorage, OBJECT_META, OBJECT_PARTS, OBJECTS, band_start, collect_part_rows,
-        object_key, remove_object_parts,
-    },
+    error::{access_denied, invalid_key, no_such_bucket, no_such_key},
+    storage::{MemoryStorage, check_bucket},
 };
 
 /// A staged object body: the buffered payload (the commit inserts it)
@@ -51,35 +46,26 @@ impl MemoryStorage {
     /// nothing — nothing changed).
     async fn rewrite_tags_element(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         tags_wire: &str,
     ) -> Result<bool, Error> {
-        let txn = self.db.begin_write()?;
-        let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-        let existed = {
-            let mut meta = txn.open_table(OBJECT_META)?;
-            // Owned copies — the redb guards cannot outlive the txn.
-            let Some((etag, size, mtime, checksum_wire)) = meta.get(ok.as_str())?.map(|guard| {
-                let (etag, size, mtime, _tags, checksum_wire) = guard.value();
-                (etag.to_string(), size, mtime, checksum_wire.to_string())
-            }) else {
+        self.db.write(|txn| -> Result<bool, Error> {
+            let mut meta = meta::Table::open(txn)?;
+            let Some(stored) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
                 return Ok(false);
             };
-            meta.insert(
-                ok.as_str(),
-                (
-                    etag.as_str(),
-                    size,
-                    mtime,
-                    tags_wire,
-                    checksum_wire.as_str(),
-                ),
-            )?;
-            true
-        };
-        txn.commit()?;
-        Ok(existed)
+            // The row's other elements (etag, size, mtime, file identity,
+            // recorded checksum) survive the tag write verbatim; only the
+            // tags element is replaced. The row re-encodes canonically
+            // via the shared `meta::Stored` codecs — the caller's tags wire
+            // is interface-written (canonical), and a domain-invalid wire
+            // self-heals to empty, like every read path.
+            let mut stored = stored;
+            stored.tags = object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX);
+            meta.put(bucket.as_ref().as_str(), key.as_ref().as_str(), &stored)?;
+            Ok(true)
+        })
     }
 
     /// The shared commit tail of the object write paths
@@ -97,11 +83,11 @@ impl MemoryStorage {
     /// commit behaves the same way). Returns the committed metadata.
     async fn write_object(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         mut data: Vec<u8>,
-        tags: object::Tags,
-        checksum: Option<checksum::Recorded>,
+        mut tags: object::Tags,
+        mut checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
         // Defensive: the staged-body path already rejects reserved keys —
         // a direct stage/commit must not create an invisible, undeletable
@@ -118,7 +104,11 @@ impl MemoryStorage {
         // backend's commit creates a directory and drops the temp).
         let marker = key.is_folder_marker();
         if marker {
+            // A marker records no body, tags, or checksum (accepted and
+            // dropped) — the fs backend's marker commit behaves the same.
             data = Vec::new();
+            tags = object::Tags::empty();
+            checksum = None;
         }
         let size = data.len() as u64;
         // Enforce the per-object size limit before opening the write
@@ -129,59 +119,67 @@ impl MemoryStorage {
         } else {
             ETag::from_content(&data)
         };
-        let txn = self.db.begin_write()?;
-        let (delta, now) = {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+        let (_, now) = self
+            .db
+            .write(|txn| -> Result<(i64, u64), Error> {
+            {
+                check_bucket(&bucket::Table::open(txn)?, bucket)?;
             }
-            let etag_str = etag.as_str();
-            let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-            let mut objects = txn.open_table(OBJECTS)?;
-            let mut meta = txn.open_table(OBJECT_META)?;
-            let mut parts = txn.open_table(OBJECT_PARTS)?;
-            let old_len = objects
-                .get(ok.as_str())?
-                .map(|v| v.value().len() as u64)
-                .unwrap_or(0);
+            let b = bucket.as_ref().as_str();
+            let k = key.as_ref().as_str();
+            // The shared handles borrow the write transaction exclusively,
+            // so each table is a separate pass (the fs pattern).
+            let old_len = {
+                let objects = objects::Table::open(txn)?;
+                objects
+                    .get(b, k)?
+                    .map(|guard| guard.value().len() as u64)
+                    .unwrap_or(0)
+            };
             let delta = data.len() as i64 - old_len as i64;
             self.adjust_total(delta)?;
-            objects.insert(ok.as_str(), data.as_slice())?;
+            {
+                let mut objects = objects::Table::open(txn)?;
+                objects.put(b, k, &data)?;
+            }
             let now = now_nanos();
-            let tags_wire = if marker {
-                String::new()
-            } else {
-                tags.to_wire()
-            };
-            let checksum_wire = if marker {
-                String::new()
-            } else {
-                checksum.as_ref().map(|c| c.to_wire()).unwrap_or_default()
-            };
-            meta.insert(
-                ok.as_str(),
-                (
-                    etag_str.as_str(),
-                    size,
-                    now,
-                    tags_wire.as_str(),
-                    checksum_wire.as_str(),
-                ),
-            )?;
-            remove_object_parts(&mut parts, &ok)?;
-            (delta, now)
-        };
-        if let Err(err) = txn.commit() {
-            self.rollback_total(delta);
-            return Err(err.into());
-        }
+            // The 6-tuple row (etag, size, mtime, file identity 0, tags
+            // wire, checksum wire) via the shared `meta::Stored` — the
+            // write-path encode home. A folder marker records no tags /
+            // checksum (accepted and dropped), like the fs backend's
+            // marker commit.
+            {
+                let mut table = meta::Table::open(txn)?;
+                table.put(
+                    b,
+                    k,
+                    &meta::Stored {
+                        etag: etag.clone(),
+                        size,
+                        mtime: now,
+                        file_identity: 0,
+                        tags: tags.clone(),
+                        checksum: checksum.clone(),
+                    },
+                )?;
+            }
+            {
+                let mut parts = object_part::Table::open(txn)?;
+                parts.remove_key(b, k)?;
+            }
+            Ok((delta, now))
+        })
+        // The in-memory backend's commit cannot fail (no disk path — an
+        // abort-only transaction is the only failure mode), so no
+        // rollback_total compensation is needed here.
+        ?;
         Ok(object::Info {
             key: key.clone(),
             size,
             last_modified: from_nanos(now),
             etag,
-            tags: if marker { object::Tags::empty() } else { tags },
-            checksum: if marker { None } else { checksum },
+            tags,
+            checksum,
         })
     }
 }
@@ -194,7 +192,7 @@ impl ObjectOps for MemoryStorage {
 
     async fn stage_body(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         body: BodyStream,
         checksum: Option<Arc<checksum::PartChecksum>>,
@@ -236,7 +234,7 @@ impl ObjectOps for MemoryStorage {
 
     async fn commit_object(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         staged: StagedBody,
         tags: object::Tags,
@@ -254,9 +252,9 @@ impl ObjectOps for MemoryStorage {
 
     async fn copy_object(
         &self,
-        src_bucket: &bucket::Name,
+        src_bucket: &Name,
         src_key: &object::Key,
-        dst_bucket: &bucket::Name,
+        dst_bucket: &Name,
         dst_key: &object::Key,
         tags: object::Tags,
         checksum: Option<checksum::Recorded>,
@@ -276,116 +274,110 @@ impl ObjectOps for MemoryStorage {
 
     async fn get_object(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
-        let txn = self.db.begin_read()?;
-        {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+        self.db.read(|txn| {
+            {
+                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
             }
-        }
-        if key.is_reserved() || key.is_folder_marker() {
-            return Err(no_such_key(key));
-        }
-        let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-        let objects = txn.open_table(OBJECTS)?;
-        let meta = txn.open_table(OBJECT_META)?;
-        let meta_guard = meta.get(ok.as_str())?.ok_or_else(|| no_such_key(key))?;
-        let (etag_str, size, mtime, tags_wire, checksum_wire) = meta_guard.value();
-        let etag: ETag = etag_str.parse()?;
-        // The tags/checksum elements self-heal on a domain-invalid wire
-        // (empty / `None`) — rows are API-written, so garbage is treated
-        // as missing, exactly like the invalid-etag rows.
-        let tags = object::Tags::parse_wire_limited(tags_wire, object::OBJECT_TAGS_MAX)
-            .unwrap_or_default();
-        let checksum = checksum::Recorded::from_wire_opt(checksum_wire);
-        let served_range = match range {
-            None => None,
-            Some(r) => Some(r.resolve(size)?),
-        };
-        // The served slice is copied straight out of the zero-copy redb
-        // guard — a range request never copies the full object.
-        let data_guard = objects.get(ok.as_str())?.ok_or_else(|| no_such_key(key))?;
-        let served = match served_range {
-            Some((start, end)) => data_guard.value()[start as usize..=end as usize].to_vec(),
-            None => data_guard.value().to_vec(),
-        };
-        let body: BodyStream = Box::pin(iter(vec![Ok(Bytes::from(served))]));
-        Ok(GetObjectResult {
-            info: object::Info {
+            if key.is_reserved() || key.is_folder_marker() {
+                return Err(no_such_key(key));
+            }
+            let objects = objects::Table::open_readonly(txn)?;
+            let meta = meta::Table::open_readonly(txn)?;
+            // The meta row is the existence gate; the shared validation decodes
+            // the 6-tuple (etag, size, mtime, file identity 0, tags wire,
+            // checksum wire) and self-heals a garbage tags/checksum element to
+            // empty/`None` (a garbage etag row reads as missing — the caller
+            // recomputes, the mem self-heal of a domain-invalid row).
+            let stored = meta
+                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                .ok_or_else(|| no_such_key(key))?;
+            let size = stored.size;
+            let served_range = match range {
+                None => None,
+                Some(r) => Some(r.resolve(size)?),
+            };
+            // The served slice is copied straight out of the zero-copy redb
+            // guard — a range request never copies the full object.
+            let data_guard = objects
+                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                .ok_or_else(|| no_such_key(key))?;
+            let served = match served_range {
+                Some((start, end)) => data_guard.value()[start as usize..=end as usize].to_vec(),
+                None => data_guard.value().to_vec(),
+            };
+            let body: BodyStream = Box::pin(iter(vec![Ok(Bytes::from(served))]));
+            Ok(GetObjectResult {
+                info: object::Info {
+                    key: key.clone(),
+                    size,
+                    last_modified: from_nanos(stored.mtime),
+                    etag: stored.etag,
+                    tags: stored.tags,
+                    checksum: stored.checksum,
+                },
+                body,
+                served_range,
+            })
+        })
+    }
+
+    async fn head_object(&self, bucket: &Name, key: &object::Key) -> Result<object::Info, Error> {
+        self.db.read(|txn| {
+            {
+                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
+            }
+            if key.is_folder_marker() || key.is_reserved() {
+                return Err(no_such_key(key));
+            }
+            let meta = meta::Table::open_readonly(txn)?;
+            let stored = meta
+                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                .ok_or_else(|| no_such_key(key))?;
+            Ok(object::Info {
                 key: key.clone(),
-                size,
-                last_modified: from_nanos(mtime),
-                etag,
-                tags,
-                checksum,
-            },
-            body,
-            served_range,
+                size: stored.size,
+                last_modified: from_nanos(stored.mtime),
+                etag: stored.etag,
+                tags: stored.tags,
+                checksum: stored.checksum,
+            })
         })
     }
 
-    async fn head_object(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-    ) -> Result<object::Info, Error> {
-        let txn = self.db.begin_read()?;
-        {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+    async fn delete_object(&self, bucket: &Name, key: &object::Key) -> Result<(), Error> {
+        let old_len = self.db.write(|txn| -> Result<u64, Error> {
+            {
+                check_bucket(&bucket::Table::open(txn)?, bucket)?;
             }
-        }
-        if key.is_folder_marker() || key.is_reserved() {
-            return Err(no_such_key(key));
-        }
-        let meta = txn.open_table(OBJECT_META)?;
-        let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-        let meta_guard = meta.get(ok.as_str())?.ok_or_else(|| no_such_key(key))?;
-        let (etag_str, size, mtime, tags_wire, checksum_wire) = meta_guard.value();
-        let etag: ETag = etag_str.parse()?;
-        Ok(object::Info {
-            key: key.clone(),
-            size,
-            last_modified: from_nanos(mtime),
-            etag,
-            // The tags/checksum elements self-heal on a domain-invalid
-            // wire (empty / `None`).
-            tags: object::Tags::parse_wire_limited(tags_wire, object::OBJECT_TAGS_MAX)
-                .unwrap_or_default(),
-            checksum: checksum::Recorded::from_wire_opt(checksum_wire),
-        })
-    }
-
-    async fn delete_object(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
-        let txn = self.db.begin_write()?;
-        let old_len = {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+            let b = bucket.as_ref().as_str();
+            let k = key.as_ref().as_str();
+            let old_len = {
+                let objects = objects::Table::open(txn)?;
+                objects
+                    .get(b, k)?
+                    .map(|guard| guard.value().len() as u64)
+                    .unwrap_or(0)
+            };
+            {
+                let mut objects = objects::Table::open(txn)?;
+                objects.remove(b, k)?;
             }
-            let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-            let mut objects = txn.open_table(OBJECTS)?;
-            let mut meta = txn.open_table(OBJECT_META)?;
-            let mut parts = txn.open_table(OBJECT_PARTS)?;
-            let old_len = objects
-                .get(ok.as_str())?
-                .map(|v| v.value().len() as u64)
-                .unwrap_or(0);
-            objects.remove(ok.as_str())?;
-            meta.remove(ok.as_str())?;
+            {
+                let mut meta = meta::Table::open(txn)?;
+                meta.remove(b, k)?;
+            }
             // The retained part list dies with the object (one
             // transaction — a delete must not orphan the rows).
-            remove_object_parts(&mut parts, &ok)?;
-            old_len
-        };
-        if let Err(err) = txn.commit() {
-            return Err(err.into());
-        }
+            {
+                let mut parts = object_part::Table::open(txn)?;
+                parts.remove_key(b, k)?;
+            }
+            Ok(old_len)
+        })?;
         // A delete only shrinks the total; it cannot exceed a limit.
         let _ = self.adjust_total(-(old_len as i64));
         Ok(())
@@ -393,7 +385,7 @@ impl ObjectOps for MemoryStorage {
 
     async fn rename_object(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         src: &object::Key,
         dst: &object::Key,
     ) -> Result<object::Info, Error> {
@@ -421,100 +413,74 @@ impl ObjectOps for MemoryStorage {
         if src.is_reserved() || src.is_folder_marker() {
             return Err(no_such_key(src));
         }
-        let txn = self.db.begin_write()?;
-        {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+        self.db.write(|txn| -> Result<object::Info, Error> {
+            {
+                check_bucket(&bucket::Table::open(txn)?, bucket)?;
             }
-        }
-        let ok_src = object_key(bucket.as_ref().as_str(), src.as_ref().as_str());
-        let ok_dst = object_key(bucket.as_ref().as_str(), dst.as_ref().as_str());
-        // The source's rows are copied to owned values first (the redb
-        // guards borrow the transaction), then re-keyed under `dst`.
-        let data = {
-            let objects = txn.open_table(OBJECTS)?;
-            match objects.get(ok_src.as_str())? {
-                Some(guard) => guard.value().to_vec(),
-                None => return Err(no_such_key(src)),
-            }
-        };
-        let row = {
-            let meta = txn.open_table(OBJECT_META)?;
-            match meta.get(ok_src.as_str())? {
-                Some(guard) => {
-                    let (etag, size, mtime, tags_wire, checksum_wire) = guard.value();
-                    (
-                        etag.to_string(),
-                        size,
-                        mtime,
-                        tags_wire.to_string(),
-                        checksum_wire.to_string(),
-                    )
+            let b = bucket.as_ref().as_str();
+            let src_key = src.as_ref().as_str();
+            let dst_key = dst.as_ref().as_str();
+            // The source's rows are copied to owned values first (the redb
+            // guards borrow the transaction), then re-keyed under `dst`. The
+            // shared handles borrow the write transaction exclusively, so
+            // each table is a separate pass.
+            let data = {
+                let objects = objects::Table::open(txn)?;
+                match objects.get(b, src_key)? {
+                    Some(guard) => guard.value().to_vec(),
+                    None => return Err(no_such_key(src)),
                 }
-                None => return Err(no_such_key(src)),
+            };
+            // The meta row moves via the shared `meta::Stored` — a rename is
+            // not a fresh object: nothing is recomputed, the six elements
+            // (file identity included) ride verbatim (re-encoded canonically
+            // from the validated row; rows are API-written).
+            let stored = {
+                let meta = meta::Table::open(txn)?;
+                meta.get(b, src_key)?.ok_or_else(|| no_such_key(src))?
+            };
+            {
+                let mut objects = objects::Table::open(txn)?;
+                objects.put(b, dst_key, &data)?;
+                objects.remove(b, src_key)?;
             }
-        };
-        let (etag_wire, size, mtime, tags_wire, checksum_wire) = row;
-        // A garbage-etag row errors like every mem read of one (rows are
-        // API-written; tampering is the only source).
-        let etag: ETag = etag_wire.parse()?;
-        {
-            let mut objects = txn.open_table(OBJECTS)?;
-            objects.insert(ok_dst.as_str(), data.as_slice())?;
-            objects.remove(ok_src.as_str())?;
-        }
-        {
-            let mut meta = txn.open_table(OBJECT_META)?;
-            meta.insert(
-                ok_dst.as_str(),
-                (
-                    etag_wire.as_str(),
-                    size,
-                    mtime,
-                    tags_wire.as_str(),
-                    checksum_wire.as_str(),
-                ),
-            )?;
-            meta.remove(ok_src.as_str())?;
-        }
-        // The retained part rows migrate with the record: list the src's
-        // rows, clear the dst's stale rows (an overwritten destination's
-        // part list dies), re-key under dst, drop the src's (one table
-        // handle serves the scan and the writes).
-        let rows = {
-            let parts = txn.open_table(OBJECT_PARTS)?;
-            collect_part_rows(&parts, &ok_src)?
-        };
-        {
-            let mut parts = txn.open_table(OBJECT_PARTS)?;
-            // Both range deletes precede the inserts — a redb 4.2.0
-            // debug build asserts when an insert precedes another key's
-            // range delete in one transaction.
-            remove_object_parts(&mut parts, &ok_dst)?;
-            remove_object_parts(&mut parts, &ok_src)?;
-            for (n, part_size, algorithm, value) in rows {
-                let pk = crate::storage::object_part_key(&ok_dst, n);
-                parts.insert(pk.as_str(), (part_size, algorithm.as_str(), value.as_str()))?;
+            {
+                let mut meta = meta::Table::open(txn)?;
+                meta.put(b, dst_key, &stored)?;
+                meta.remove(b, src_key)?;
             }
-        }
-        txn.commit()?;
-        Ok(object::Info {
-            key: dst.clone(),
-            size,
-            last_modified: from_nanos(mtime),
-            etag,
-            // The moved elements parse on the way out (garbage wires
-            // self-heal to empty/`None`, like every read path).
-            tags: object::Tags::parse_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
-                .unwrap_or_default(),
-            checksum: checksum::Recorded::from_wire_opt(&checksum_wire),
+            // The retained part rows migrate with the record: list the src's
+            // rows, clear the dst's stale rows (an overwritten destination's
+            // part list dies), re-key under dst, drop the src's.
+            let rows = {
+                let parts = object_part::Table::open(txn)?;
+                parts.list(b, src_key)?
+            };
+            {
+                let mut parts = object_part::Table::open(txn)?;
+                // Both range deletes precede the inserts — a redb 4.2.0
+                // debug build asserts when an insert precedes another key's
+                // range delete in one transaction.
+                parts.remove_key(b, dst_key)?;
+                parts.remove_key(b, src_key)?;
+                for (n, part_size, algorithm, value) in rows {
+                    parts.put(b, dst_key, n, part_size, &algorithm, &value)?;
+                }
+            }
+            Ok(object::Info {
+                key: dst.clone(),
+                size: stored.size,
+                last_modified: from_nanos(stored.mtime),
+                etag: stored.etag,
+                tags: stored.tags,
+                checksum: stored.checksum,
+            })
         })
     }
 
     async fn get_object_tags(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
     ) -> Result<object::Tags, Error> {
         // Object existence is the `OBJECT_META` row — head_object's gate
@@ -523,31 +489,24 @@ impl ObjectOps for MemoryStorage {
         // never objects — `NoSuchKey`, mirroring head). The tags come
         // from the row's tags element, empty when the wire is
         // domain-invalid (self-healing).
-        let txn = self.db.begin_read()?;
-        {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+        self.db.read(|txn| {
+            {
+                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
             }
-        }
-        if key.is_reserved() || key.is_folder_marker() {
-            return Err(no_such_key(key));
-        }
-        let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-        let meta = txn.open_table(OBJECT_META)?;
-        let Some(guard) = meta.get(ok.as_str())? else {
-            return Err(no_such_key(key));
-        };
-        let (_, _, _, tags_wire, _) = guard.value();
-        Ok(
-            object::Tags::parse_wire_limited(tags_wire, object::OBJECT_TAGS_MAX)
-                .unwrap_or_default(),
-        )
+            if key.is_reserved() || key.is_folder_marker() {
+                return Err(no_such_key(key));
+            }
+            let meta = meta::Table::open_readonly(txn)?;
+            let Some(stored) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
+                return Err(no_such_key(key));
+            };
+            Ok(stored.tags)
+        })
     }
 
     async fn put_object_tags(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         tags: &object::Tags,
     ) -> Result<(), Error> {
@@ -571,11 +530,7 @@ impl ObjectOps for MemoryStorage {
         Ok(())
     }
 
-    async fn delete_object_tags(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-    ) -> Result<(), Error> {
+    async fn delete_object_tags(&self, bucket: &Name, key: &object::Key) -> Result<(), Error> {
         // Idempotent like `delete_object`: only the bucket must exist
         // (`NoSuchBucket` when missing); a missing object — key, marker,
         // or row — is a no-op.
@@ -588,7 +543,7 @@ impl ObjectOps for MemoryStorage {
 
     async fn list_object_parts(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
     ) -> Result<Vec<ObjectPart>, Error> {
         // Existence is the `OBJECT_META` row (T2-B ruling: a missing
@@ -596,168 +551,98 @@ impl ObjectOps for MemoryStorage {
         // retained rows of a multipart-completed object are served in
         // part-number order — empty for an object that was never
         // multipart-completed (a plain put or copy has no parts).
-        let txn = self.db.begin_read()?;
-        {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(bucket));
+        self.db.read(|txn| {
+            {
+                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
             }
-        }
-        if key.is_reserved() || key.is_folder_marker() {
-            return Err(no_such_key(key));
-        }
-        let ok = object_key(bucket.as_ref().as_str(), key.as_ref().as_str());
-        let meta = txn.open_table(OBJECT_META)?;
-        if meta.get(ok.as_str())?.is_none() {
-            return Err(no_such_key(key));
-        }
-        let parts = txn.open_table(OBJECT_PARTS)?;
-        let out = collect_part_rows(&parts, &ok)?
-            .into_iter()
-            .map(|(part_number, size, algorithm, value)| ObjectPart {
-                part_number: part_number.into(),
-                size,
-                // A domain-invalid checksum row self-heals: the part is
-                // served without a checksum (the `""` algorithm of a
-                // checksum-less part parses to `None` the same way).
-                checksum: checksum::Part::from_wire_opt(&algorithm, value),
-            })
-            .collect();
-        Ok(out)
+            if key.is_reserved() || key.is_folder_marker() {
+                return Err(no_such_key(key));
+            }
+            let meta = meta::Table::open_readonly(txn)?;
+            if meta
+                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                .is_none()
+            {
+                return Err(no_such_key(key));
+            }
+            let parts = object_part::Table::open_readonly(txn)?;
+            let out = parts
+                .list(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                .into_iter()
+                .map(|(part_number, size, algorithm, value)| ObjectPart {
+                    part_number: part_number.into(),
+                    size,
+                    // A domain-invalid checksum row self-heals: the part is
+                    // served without a checksum (the `""` algorithm of a
+                    // checksum-less part parses to `None` the same way).
+                    checksum: checksum::Part::from_wire_opt(&algorithm, value),
+                })
+                .collect();
+            Ok(out)
+        })
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
-        let txn = self.db.begin_read()?;
-        {
-            let buckets = txn.open_table(BUCKETS)?;
-            if buckets.get(params.bucket.as_ref().as_str())?.is_none() {
-                return Err(no_such_bucket(&params.bucket));
+        self.db.read(|txn| {
+            {
+                check_bucket(&bucket::Table::open_readonly(txn)?, &params.bucket)?;
             }
-        }
-        let meta = txn.open_table(OBJECT_META)?;
-        let scan_prefix = object_key(params.bucket.as_ref().as_str(), &params.prefix);
-        let bucket_prefix = format!("{}\0", params.bucket.as_ref().as_str());
-        // Exclusive `start_after` when it sits inside the prefix; otherwise
-        // the prefix itself is the lower bound. Grouping still applies the
-        // marker: a continuation token may be a common prefix (`dir/`),
-        // which is not the same as skipping raw keys `<= start_after`.
-        let after_key = params
-            .start_after
-            .as_deref()
-            .map(|after| object_key(params.bucket.as_ref().as_str(), after));
-        let start = band_start(&scan_prefix, after_key.as_deref());
-        let mut range = meta.range::<&str>((start, Bound::Unbounded))?;
-        let mut scan_error = None;
-        // `bucket\0key` order is already lexicographic. Folder markers and
-        // reserved keys are skipped; `group_and_paginate` stops after one
-        // probe entry past `max_keys`, so the range is not drained. The
-        // sync scan runs inline on the async executor by design (mem is
-        // the reference backend, rows are owned copies, and the redb read
-        // txn is MVCC — no lock is held).
-        // The rollup mirror (`last_cp`) drops rows a delimiter group
-        // absorbs before they pay for the key copy, validation, or the
-        // ETag parse (only emitted objects carry an etag). The skips are
-        // state-free and the group updates mirror the engine's — an
-        // object row resets the group, a rollup row is its group's first
-        // — so the pre-filter cannot change the engine's output (it
-        // re-checks every surviving row). The mirror is the shared
-        // [`RollupMirror`] (A4 — one home with the engines); its
-        // two-phase shape matches the engine's ordering: the dedup check
-        // runs before this row's validation, the record after it, so a
-        // discarded row never advances the group.
-        let mut rollup = RollupMirror::new();
-        let objects = from_fn(|| {
-            loop {
-                let (k, v) = match range.next() {
-                    None => return None,
-                    Some(Err(e)) => {
-                        scan_error = Some(database_storage(e));
-                        return None;
+            let meta = meta::Table::open_readonly(txn)?;
+            let bucket_str = params.bucket.as_ref().as_str();
+            // The shared per-bucket walk starts at the prefix lower bound
+            // (rows below it cannot affect the rollups or the marker — the
+            // prefix-filter equivalence), with the keep boundary on the
+            // first element. Rows are validated after the marker/prefix
+            // skips (a domain-invalid key is skipped, a garbage etag reports
+            // `None` — a mem listing treats it as missing); the row key is
+            // the raw key (no bucket-prefix slicing). The sync scan runs
+            // inline on the async executor by design (mem is the reference
+            // backend, rows are owned copies, and the redb read txn is MVCC
+            // — no lock is held). The page's rows are materialized eagerly
+            // and handed to the pagination engine (the engine protocol).
+            let mut rows: Vec<object::Info> = Vec::new();
+            for_each_pair(
+                meta.deref(),
+                (bucket_str, params.prefix.as_str()),
+                |b, _| b == bucket_str,
+                |_, raw_key, value| -> Result<(), Error> {
+                    let Ok(key) = object::key(raw_key) else {
+                        return Ok(()); // invalid key domain → skip the row
+                    };
+                    if key.is_folder_marker() || key.is_reserved() {
+                        return Ok(());
                     }
-                    Some(Ok(entry)) => entry,
-                };
-                if !k.value().starts_with(&scan_prefix) {
-                    return None;
-                }
-                let raw_key = &k.value()[bucket_prefix.len()..];
-                let cp = params
-                    .delimiter
-                    .as_deref()
-                    .and_then(|delim| common_prefix(raw_key, &params.prefix, delim));
-                if let Some(cp) = cp
-                    && rollup.is_rolled(cp)
-                {
-                    continue; // the group already rolled up — skip the row
-                }
-                // A tampered row (a key/etag that cannot be domain-valid)
-                // is skipped, never a panic — same tolerance as the fs
-                // walk's unrepresentable entries. Rows were validated at
-                // insert; read-side checks are defense-in-depth.
-                let Ok(key) = object::key(raw_key) else {
-                    continue;
-                };
-                if key.is_folder_marker() || key.is_reserved() {
-                    continue;
-                }
-                let (etag, size, mtime, tags_wire, checksum_wire) = v.value();
-                let Ok(etag) = etag.parse() else {
-                    continue;
-                };
-                // The engine's rollup state, mirrored (kept through the
-                // marker skip, like the engine's `last_prefix`); the
-                // marker skip lands here too, so a row the engine would
-                // discard never builds an `Info`.
-                match cp {
-                    Some(cp) => {
-                        rollup.record_rollup(cp);
-                        if params
-                            .start_after
-                            .as_deref()
-                            .is_some_and(|after| cp <= after)
-                        {
-                            continue;
-                        }
+                    if !key.as_ref().starts_with(&params.prefix) {
+                        return Ok(());
                     }
-                    None => {
-                        rollup.reset();
-                        if params
-                            .start_after
-                            .as_deref()
-                            .is_some_and(|after| raw_key <= after)
-                        {
-                            continue;
-                        }
-                    }
-                }
-                return Some(object::Info {
-                    key,
-                    size,
-                    last_modified: from_nanos(mtime),
-                    etag,
-                    // The tags/checksum elements self-heal on a
-                    // domain-invalid wire (empty / `None`).
-                    tags: object::Tags::parse_wire_limited(tags_wire, object::OBJECT_TAGS_MAX)
-                        .unwrap_or_default(),
-                    checksum: checksum::Recorded::from_wire_opt(checksum_wire),
-                });
-            }
-        });
-        let (keys, common_prefixes, truncated, next_start_after) = group_and_paginate(
-            objects,
-            &params.prefix,
-            params.delimiter.as_deref(),
-            params.start_after.as_deref(),
-            params.max_keys,
-            |o| o.key.as_ref(),
-        );
-        if let Some(e) = scan_error {
-            return Err(e);
-        }
-        Ok(ObjectListing {
-            objects: keys,
-            common_prefixes,
-            truncated,
-            next_start_after,
+                    let Some(stored) = meta::validate(value) else {
+                        return Ok(()); // a garbage-etag row is treated as missing
+                    };
+                    rows.push(object::Info {
+                        key,
+                        size: stored.size,
+                        last_modified: from_nanos(stored.mtime),
+                        etag: stored.etag,
+                        tags: stored.tags,
+                        checksum: stored.checksum,
+                    });
+                    Ok(())
+                },
+            )?;
+            let (keys, common_prefixes, truncated, next_start_after) = group_and_paginate(
+                rows,
+                &params.prefix,
+                params.delimiter.as_deref(),
+                params.start_after.as_deref(),
+                params.max_keys,
+                |o| o.key.as_ref(),
+            );
+            Ok(ObjectListing {
+                objects: keys,
+                common_prefixes,
+                truncated,
+                next_start_after,
+            })
         })
     }
 }
@@ -766,6 +651,7 @@ impl ObjectOps for MemoryStorage {
 mod tests {
     use bytes::Bytes;
     use futures::stream::iter;
+    use redb::ReadableDatabase;
 
     use super::*;
     use crate::{
@@ -778,7 +664,7 @@ mod tests {
         testutil::checksum_tee,
     };
 
-    async fn with_bucket() -> (MemoryStorage, bucket::Name) {
+    async fn with_bucket() -> (MemoryStorage, Name) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
@@ -883,7 +769,7 @@ mod tests {
     }
 
     fn params(
-        bucket: &bucket::Name,
+        bucket: &Name,
         prefix: &str,
         delimiter: Option<&str>,
         start_after: Option<&str>,
@@ -898,7 +784,7 @@ mod tests {
         }
     }
 
-    async fn put_keys(storage: &MemoryStorage, bucket: &bucket::Name, keys: &[&str]) {
+    async fn put_keys(storage: &MemoryStorage, bucket: &Name, keys: &[&str]) {
         for key in keys {
             storage
                 .put_object(
@@ -1215,26 +1101,42 @@ mod tests {
         let (storage, b) = with_bucket().await;
         let k = object::key("g.txt").unwrap();
         {
-            let txn = storage.db.begin_write().unwrap();
-            let ok = crate::storage::object_key(b.as_ref().as_str(), k.as_ref().as_str());
+            let mut txn = storage.db.db().begin_write().unwrap();
+            let bucket_str = b.as_ref().as_str();
+            let key_str = k.as_ref().as_str();
             let etag = ETag::from_content(b"x");
             let etag_str = etag.as_str();
-            txn.open_table(crate::storage::OBJECT_META)
+            // The 6-tuple row decodes through the shared `meta::validate`
+            // with the self-heal semantics (garbage tags/checksum →
+            // empty/None; file identity carried as 0).
+            let decoded = meta::validate((
+                etag_str.as_str(),
+                1u64,
+                0u64,
+                0u64,
+                "env=%zz",
+                "CRC32:AA==:NOPE",
+            ))
+            .unwrap();
+            assert!(decoded.tags.is_empty());
+            assert!(decoded.checksum.is_none());
+            meta::Table::open(&mut txn)
                 .unwrap()
                 .insert(
-                    ok.as_str(),
+                    (bucket_str, key_str),
                     (
                         etag_str.as_str(),
                         1u64,
                         crate::_core::now_nanos(),
+                        0u64,
                         "env=%zz",
                         "CRC32:AA==:NOPE",
                     ),
                 )
                 .unwrap();
-            txn.open_table(crate::storage::OBJECTS)
+            objects::Table::open(&mut txn)
                 .unwrap()
-                .insert(ok.as_str(), b"x".as_slice())
+                .put(bucket_str, key_str, b"x")
                 .unwrap();
             txn.commit().unwrap();
         }
@@ -1310,19 +1212,18 @@ mod tests {
         storage.delete_object(&b, &dst).await.unwrap();
         let err: Error = storage.list_object_parts(&b, &dst).await.unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchKey(_))));
-        let txn = storage.db.begin_read().unwrap();
-        let parts = txn.open_table(crate::storage::OBJECT_PARTS).unwrap();
-        let bucket_prefix = format!("{}\0", b.as_ref().as_str());
-        let rows: Vec<String> = parts
-            .range(bucket_prefix.as_str()..)
-            .unwrap()
-            .take_while(|e| {
-                e.as_ref()
-                    .map(|(k, _)| k.value().starts_with(&bucket_prefix))
-                    .unwrap_or(false)
-            })
-            .map(|e| e.unwrap().0.value().to_string())
-            .collect();
+        let txn = storage.db.db().begin_read().unwrap();
+        let parts = object_part::Table::open_readonly(&txn).unwrap();
+        let bucket_str = b.as_ref().as_str();
+        let mut rows: Vec<String> = Vec::new();
+        for entry in parts.range((bucket_str, "", 0)..).unwrap() {
+            let (k, _) = entry.unwrap();
+            let (rb, rk, _) = k.value();
+            if rb != bucket_str {
+                break;
+            }
+            rows.push(rk.to_string());
+        }
         assert!(
             rows.is_empty(),
             "no OBJECT_PARTS rows may outlive their object: {rows:?}"

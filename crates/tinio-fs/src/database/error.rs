@@ -1,34 +1,26 @@
-//! redb error nesting (`#[from]` per kind) and the version-mismatch
-//! constructor.
+//! redb error nesting (the shared [`crate::_store::Error`] under
+//! `Redb`) and the version-mismatch constructor.
 
 use std::{io, path::PathBuf};
 
 use crate::_core::storage;
 
 /// A redb or state-database failure.
+///
+/// Conversions derive via thiserror: `#[from]` on `Io`, `Compaction`,
+/// and `Redb` emits `From<io::Error>`, `From<redb::CompactionError>`,
+/// and From<[`crate::_store::Error`]> — all three are hand-free, and
+/// no `From` impls are hand-written. The five raw redb errors are not
+/// forwarded (`From` is not transitive): they hop through the shared
+/// error first, wrapped explicitly at the fs sites (`Error::Redb(e.into())`).
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Database open/create failed.
-    #[error("database error: {0}")]
-    Open(#[from] redb::DatabaseError),
-    /// A transaction failed.
-    #[error("transaction error: {0}")]
-    Transaction(#[from] redb::TransactionError),
-    /// Opening a table failed.
-    #[error("table error: {0}")]
-    Table(#[from] redb::TableError),
-    /// A get/insert/range failed.
-    #[error("storage error: {0}")]
-    Storage(#[from] redb::StorageError),
-    /// A compaction failed.
-    #[error("compaction error: {0}")]
-    Compaction(#[from] redb::CompactionError),
-    /// Commit failed.
-    #[error("commit error: {0}")]
-    Commit(#[from] redb::CommitError),
     /// Filesystem I/O around the state database.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// A compaction failed.
+    #[error("compaction error: {0}")]
+    Compaction(#[from] redb::CompactionError),
     /// The `STATE` table version does not match.
     #[error(
         "unsupported {} version {found} (expected {expected})",
@@ -51,6 +43,10 @@ pub enum Error {
         #[source]
         source: storage::Error,
     },
+    /// A shared redb failure (the five mapping kinds of
+    /// [`crate::_store::Error`]).
+    #[error(transparent)]
+    Redb(#[from] crate::_store::Error),
 }
 
 /// The `STATE` table version does not match.

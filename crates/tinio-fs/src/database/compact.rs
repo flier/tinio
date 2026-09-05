@@ -2,7 +2,8 @@
 
 use redb::Database;
 
-use super::{error::Error, tables::StateTable};
+use super::error::Error;
+use crate::_store::state;
 
 /// Compact never triggers below this allocated size — a small database
 /// gains nothing from a rewrite (meta-redb-spec Q1).
@@ -66,9 +67,9 @@ pub fn compact_if_needed(
     // (`Ok(false)` = nothing to reclaim — the need was addressed either
     // way).
     {
-        let mut txn = db.begin_write()?;
-        StateTable::open(&mut txn)?.set_compact_marker_value(false)?;
-        txn.commit()?;
+        let mut txn = db.begin_write().map_err(|e| Error::Redb(e.into()))?;
+        state::Table::open(&mut txn)?.set_compact_marker(false)?;
+        txn.commit().map_err(|e| Error::Redb(e.into()))?;
     }
 
     Ok(if compacted {

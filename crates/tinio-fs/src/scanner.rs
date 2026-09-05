@@ -36,13 +36,14 @@ use tokio::{
 
 use crate::{
     _core::{bucket, cleanup::CleanupOptions, object, pipeline::Completion},
+    _store::meta,
     FsCleanup,
     backend::FsStorage,
-    database,
     error::Error,
     etag, fsutil,
     listing::MetaBatchAccumulator,
-    meta, pacing, tombstone,
+    meta::entry_matches,
+    pacing, tombstone,
 };
 
 /// Entries per batch: after each batch of **enqueued compute tasks** the
@@ -369,7 +370,7 @@ impl Scanner {
         // (F25): a panic is a bug, not a recoverable IO error; converting
         // it to `io::Error` would mask it as a self-healable recompute
         // (consistent with `database::Handle` and `meta::md5_of_file`).
-        let snapshot: HashMap<object::Key, Option<database::StoredMeta>> = {
+        let snapshot: HashMap<object::Key, Option<meta::Stored>> = {
             let meta = meta.clone();
             let name = name.clone();
             spawn_blocking(move || {
@@ -419,7 +420,7 @@ impl Scanner {
             let identity = file.identity();
             let stored = snapshot.get(&file.key).and_then(Option::as_ref);
             if let Some(stored) = stored
-                && meta::entry_matches(
+                && entry_matches(
                     stored.size,
                     stored.mtime,
                     stored.file_identity,

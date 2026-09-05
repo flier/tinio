@@ -54,12 +54,10 @@ use crate::{
             group_and_paginate_unordered, uploads_order,
         },
     },
+    _store::{part, part_checksum, table::TableDef, upload, upload_checksum},
     _util::lockmap::{Guard, Map},
     Error,
-    database::{
-        self, Handle, OBJECT_TAGS_MAX, PartChecksumsTable, PartsTable, UploadChecksumsTable,
-        UploadsTable,
-    },
+    database::{self, Handle, OBJECT_TAGS_MAX},
     fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
@@ -91,7 +89,7 @@ pub(crate) fn drain_upload(
     bucket: &bucket::Name,
     upload_id: &str,
 ) -> Result<(), database::Error> {
-    UploadsTable::open(txn)?.remove(bucket, upload_id)?;
+    upload::Table::open(txn)?.remove(bucket, upload_id)?;
     drain_upload_rest(txn, bucket, upload_id)
 }
 
@@ -105,7 +103,7 @@ pub(crate) fn drain_upload_checked(
     key: &object::Key,
     upload_id: &str,
 ) -> Result<bool, database::Error> {
-    let mut uploads = UploadsTable::open(txn)?;
+    let mut uploads = upload::Table::open(txn)?;
     if !uploads.key_matches(bucket, key, upload_id)? {
         return Ok(false);
     }
@@ -126,9 +124,9 @@ fn drain_upload_rest(
 ) -> Result<(), database::Error> {
     // The UPLOADS/checksum halves are one exact key each (idempotent
     // remove — no range scan); only the PARTS half needs the range.
-    UploadChecksumsTable::open(txn)?.remove(bucket, upload_id)?;
-    PartsTable::open(txn)?.drain_upload(bucket, upload_id)?;
-    PartChecksumsTable::open(txn)?.drain_upload(bucket, upload_id)?;
+    upload_checksum::Table::open(txn)?.remove(bucket, upload_id)?;
+    part::Table::open(txn)?.drain_upload(bucket, upload_id)?;
+    part_checksum::Table::open(txn)?.drain_upload(bucket, upload_id)?;
     Ok(())
 }
 
@@ -139,10 +137,10 @@ pub(crate) fn drain_bucket_uploads(
     txn: &mut redb::WriteTransaction,
     bucket: &bucket::Name,
 ) -> Result<(), database::Error> {
-    UploadsTable::open(txn)?.drain_bucket(bucket)?;
-    UploadChecksumsTable::open(txn)?.drain_bucket(bucket)?;
-    PartsTable::open(txn)?.drain_bucket(bucket)?;
-    PartChecksumsTable::open(txn)?.drain_bucket(bucket)?;
+    upload::Table::open(txn)?.drain_bucket(bucket)?;
+    upload_checksum::Table::open(txn)?.drain_bucket(bucket)?;
+    part::Table::open(txn)?.drain_bucket(bucket)?;
+    part_checksum::Table::open(txn)?.drain_bucket(bucket)?;
     Ok(())
 }
 
@@ -184,7 +182,7 @@ fn upload_from_row(
         // same way, and a hard error here would also kill the multipart
         // sweep (walk_uploads) forever.
         checksum: checksum_row.and_then(|(algo, ty)| checksum::Upload::from_wire_opt(&algo, &ty)),
-        tags: object::Tags::parse_wire_limited(tags_wire, OBJECT_TAGS_MAX).unwrap_or_default(),
+        tags: object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
     }))
 }
 
@@ -198,6 +196,43 @@ type UploadRow = (
     String,
     Option<(String, String)>,
 );
+
+/// The bucket's raw `UPLOADS` rows joined with each upload's checksum row
+/// (the F03 probe), in `(key, upload_id)` order — the composite order the
+/// pagination engine requires. Shared by the full-bucket listing and the
+/// paged one.
+fn materialize_upload_rows(
+    table: &upload::Table<
+        '_,
+        impl redb::ReadableTable<<upload::Def as TableDef>::Key, <upload::Def as TableDef>::Value>,
+    >,
+    checksums: &upload_checksum::Table<
+        '_,
+        impl redb::ReadableTable<
+            <upload_checksum::Def as TableDef>::Key,
+            <upload_checksum::Def as TableDef>::Value,
+        >,
+    >,
+    bucket: &bucket::Name,
+) -> Result<Vec<UploadRow>, database::Error> {
+    let mut rows = Vec::new();
+    table.for_bucket(
+        bucket.as_ref().as_str(),
+        |upload_id, (key, initiated_at, tags_wire)| {
+            let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id)?;
+            rows.push((
+                bucket.clone(),
+                upload_id.to_string(),
+                key.to_string(),
+                initiated_at,
+                tags_wire.to_string(),
+                checksum_row,
+            ));
+            Ok(())
+        },
+    )?;
+    Ok(rows)
+}
 
 /// The rows→uploads conversion shared by the listings: domain-invalid
 /// rows are skipped (self-healing — the `None` of [`upload_from_row`]).
@@ -372,7 +407,7 @@ impl Store {
         let tags_wire = tags.to_wire();
         self.handle
             .write(move |txn| {
-                UploadsTable::open(txn)?.put(
+                upload::Table::open(txn)?.put(
                     &bucket,
                     &upload_id,
                     &key,
@@ -380,7 +415,7 @@ impl Store {
                     &tags_wire,
                 )?;
                 if let Some((algo, ty)) = checksum_row {
-                    UploadChecksumsTable::open(txn)?.put(&bucket, &upload_id, &algo, &ty)?;
+                    upload_checksum::Table::open(txn)?.put(&bucket, &upload_id, &algo, &ty)?;
                 }
                 Ok(())
             })
@@ -403,14 +438,14 @@ impl Store {
         let found = self
             .handle
             .read(move |txn| {
-                let uploads = UploadsTable::open_readonly(txn)?;
+                let uploads = upload::Table::open_readonly(txn)?;
                 // One lookup: the row, present only when it records `key`.
                 let Some((stored_key, initiated_at, tags_wire)) =
                     uploads.get_matching(&bucket_txn, &key, &upload_id_owned)?
                 else {
                     return Ok(None);
                 };
-                let checksum_row = UploadChecksumsTable::open_readonly(txn)?
+                let checksum_row = upload_checksum::Table::open_readonly(txn)?
                     .get(bucket_txn.as_ref().as_str(), &upload_id_owned)?;
                 Ok(Some((stored_key, initiated_at, tags_wire, checksum_row)))
             })
@@ -543,17 +578,17 @@ impl Store {
         let recorded = match self
             .handle
             .write(move |txn| {
-                let uploads = UploadsTable::open(txn)?;
+                let uploads = upload::Table::open(txn)?;
                 if !uploads.key_matches(&bucket, &key, &upload_id_owned)? {
                     return Ok(false);
                 }
                 drop(uploads);
-                PartsTable::open(txn)?.put(&bucket, &upload_id_owned, n, &etag_owned)?;
+                part::Table::open(txn)?.put(&bucket, &upload_id_owned, n, &etag_owned)?;
                 // The checksum row commits atomically with the part row:
                 // write the tee's digest, or clear a stale row from a
                 // previous upload of this part number (it would corrupt
                 // the Complete composition).
-                let mut checksums = PartChecksumsTable::open(txn)?;
+                let mut checksums = part_checksum::Table::open(txn)?;
                 match checksum_txn.as_ref().and_then(|c| c.digest.get()) {
                     Some(part) => {
                         checksums.put(
@@ -635,7 +670,7 @@ impl Store {
         let (found, page, truncated) = self
             .handle
             .read(|txn| {
-                let uploads = UploadsTable::open_readonly(txn)?;
+                let uploads = upload::Table::open_readonly(txn)?;
                 if !uploads.key_matches(bucket, key, upload_id)? {
                     return Ok((false, Vec::new(), false));
                 }
@@ -649,7 +684,7 @@ impl Store {
                 let Some(start) = marker.map_or(Some(0), |m| m.checked_add(1)) else {
                     return Ok((true, Vec::new(), false));
                 };
-                let (recorded, truncated) = PartsTable::open_readonly(txn)?
+                let (recorded, truncated) = part::Table::open_readonly(txn)?
                     .list_from(bucket, upload_id, start, max_parts)?;
                 // Join the `PART_CHECKSUMS` row of each part (raw
                 // `(algorithm, value)` wire names; pass 2 parses them).
@@ -657,18 +692,14 @@ impl Store {
                 // at all (the checksum feature off ⇒ the table is
                 // guaranteed empty) skips the per-part point reads —
                 // one probe read instead of one per part (F03).
-                let checksums = PartChecksumsTable::open_readonly(txn)?;
-                let has_checksums = checksums
-                    .range((bucket.as_ref().as_str(), upload_id, 0)..)?
-                    .next()
-                    .transpose()?
-                    .is_some_and(|(k, _)| {
-                        let (b, id, _) = k.value();
-                        b == bucket.as_ref().as_str() && id == upload_id
-                    });
-                let checksums = has_checksums
-                    .then(|| PartChecksumsTable::open_readonly(txn))
-                    .transpose()?;
+                let checksums = part_checksum::Table::open_readonly(txn)?;
+                let checksums = part_checksum::Table::has_upload(
+                    &checksums,
+                    bucket.as_ref().as_str(),
+                    upload_id,
+                )?
+                .then(|| part_checksum::Table::open_readonly(txn))
+                .transpose()?;
                 let page = recorded
                     .into_iter()
                     .map(|(n, hex)| {
@@ -734,7 +765,11 @@ impl Store {
     ) -> Result<ETag, Error> {
         let stored = self
             .handle
-            .read(|txn| PartsTable::open_readonly(txn)?.get_hex(bucket, upload_id, n))
+            .read(|txn| {
+                part::Table::open_readonly(txn)?
+                    .get_hex(bucket, upload_id, n)
+                    .map_err(Into::into)
+            })
             .map_err(Error::from)?;
         if let Some(hex) = stored {
             // A domain-invalid record: fall through to the recompute.
@@ -793,12 +828,12 @@ impl Store {
         let (found, records) = self
             .handle
             .read(|txn| {
-                let uploads = UploadsTable::open_readonly(txn)?;
+                let uploads = upload::Table::open_readonly(txn)?;
                 if !uploads.key_matches(bucket, key, upload_id)? {
                     return Ok((false, HashMap::new()));
                 }
-                let table = PartsTable::open_readonly(txn)?;
-                let checksums = PartChecksumsTable::open_readonly(txn)?;
+                let table = part::Table::open_readonly(txn)?;
+                let checksums = part_checksum::Table::open_readonly(txn)?;
                 let mut records = HashMap::with_capacity(parts.len());
                 for part in parts {
                     let n = u32::from(part.part_number);
@@ -1039,22 +1074,9 @@ impl Store {
         let rows: Vec<UploadRow> = self
             .handle
             .read(|txn| {
-                let table = UploadsTable::open_readonly(txn)?;
-                let checksums = UploadChecksumsTable::open_readonly(txn)?;
-                let mut rows = Vec::new();
-                table.for_bucket(bucket, |upload_id, (key, initiated_at, tags_wire)| {
-                    let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id)?;
-                    rows.push((
-                        bucket.clone(),
-                        upload_id.to_string(),
-                        key.to_string(),
-                        initiated_at,
-                        tags_wire.to_string(),
-                        checksum_row,
-                    ));
-                    Ok(())
-                })?;
-                Ok(rows)
+                let table = upload::Table::open_readonly(txn)?;
+                let checksums = upload_checksum::Table::open_readonly(txn)?;
+                materialize_upload_rows(&table, &checksums, bucket)
             })
             .map_err(Error::from)?;
         let mut uploads = uploads_from_rows(rows)?;
@@ -1114,22 +1136,9 @@ impl Store {
         let rows: Vec<UploadRow> = self
             .handle
             .read_blocking(move |txn| {
-                let table = UploadsTable::open_readonly(txn)?;
-                let checksums = UploadChecksumsTable::open_readonly(txn)?;
-                let mut rows = Vec::new();
-                table.for_bucket(&bucket_txn, |upload_id, (key, initiated_at, tags_wire)| {
-                    let checksum_row = checksums.get(bucket_txn.as_ref().as_str(), upload_id)?;
-                    rows.push((
-                        bucket_txn.clone(),
-                        upload_id.to_string(),
-                        key.to_string(),
-                        initiated_at,
-                        tags_wire.to_string(),
-                        checksum_row,
-                    ));
-                    Ok(())
-                })?;
-                Ok(rows)
+                let table = upload::Table::open_readonly(txn)?;
+                let checksums = upload_checksum::Table::open_readonly(txn)?;
+                materialize_upload_rows(&table, &checksums, &bucket_txn)
             })
             .await
             .map_err(Error::from)?;
@@ -1172,7 +1181,11 @@ impl Store {
     /// in-progress uploads make the bucket non-empty).
     pub async fn has_uploads(&self, bucket: &bucket::Name) -> Result<bool, Error> {
         self.handle
-            .read(|txn| UploadsTable::open_readonly(txn)?.has_bucket(bucket))
+            .read(|txn| {
+                upload::Table::open_readonly(txn)?
+                    .has_bucket(bucket)
+                    .map_err(Into::into)
+            })
             .map_err(Error::from)
     }
 
@@ -1199,8 +1212,8 @@ impl Store {
         let rows: Vec<UploadRow> = self
             .handle
             .read(|txn| {
-                let table = UploadsTable::open_readonly(txn)?;
-                let checksums = UploadChecksumsTable::open_readonly(txn)?;
+                let table = upload::Table::open_readonly(txn)?;
+                let checksums = upload_checksum::Table::open_readonly(txn)?;
                 let mut rows = Vec::new();
                 table.for_each(|b, upload_id, key, initiated_at, tags_wire| {
                     let Ok(bucket) = bucket::name(b) else {
@@ -1234,7 +1247,7 @@ impl Store {
     pub(crate) async fn live_upload_ids(&self) -> Result<HashSet<(String, String)>, Error> {
         self.handle
             .read(|txn| {
-                let table = UploadsTable::open_readonly(txn)?;
+                let table = upload::Table::open_readonly(txn)?;
                 let mut ids = HashSet::new();
                 table.for_each(|bucket, upload_id, _, _, _| {
                     ids.insert((bucket.to_string(), upload_id.to_string()));
@@ -1260,8 +1273,9 @@ impl Store {
         let key = key.to_string();
         self.handle
             .write(move |txn| {
-                UploadsTable::open(txn)?
-                    .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0, ""))?;
+                upload::Table::open(txn)?
+                    .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0, ""))
+                    .map_err(|e| database::Error::Redb(e.into()))?;
                 Ok(())
             })
             .await
@@ -1281,8 +1295,10 @@ impl Store {
         let valid = self
             .handle
             .read(|txn| {
-                let table = UploadsTable::open_readonly(txn)?;
-                table.key_matches(bucket, key, upload_id)
+                let table = upload::Table::open_readonly(txn)?;
+                table
+                    .key_matches(bucket, key, upload_id)
+                    .map_err(Into::into)
             })
             .map_err(Error::from)?;
         if valid {
@@ -1579,9 +1595,10 @@ mod tests {
         let (upload_row, part_row) = store
             .handle
             .read(move |txn| {
-                let u = UploadChecksumsTable::open_readonly(txn)?.get(b2.as_ref().as_str(), &id)?;
+                let u =
+                    upload_checksum::Table::open_readonly(txn)?.get(b2.as_ref().as_str(), &id)?;
                 let p =
-                    PartChecksumsTable::open_readonly(txn)?.get(b2.as_ref().as_str(), &id, 1)?;
+                    part_checksum::Table::open_readonly(txn)?.get(b2.as_ref().as_str(), &id, 1)?;
                 Ok((u, p))
             })
             .unwrap();
@@ -1608,7 +1625,7 @@ mod tests {
         store
             .handle
             .write(move |txn| {
-                UploadChecksumsTable::open(txn)?.put(&b2, &id, "BLAKE3", "")?;
+                upload_checksum::Table::open(txn)?.put(&b2, &id, "BLAKE3", "")?;
                 Ok(())
             })
             .await
@@ -1643,7 +1660,7 @@ mod tests {
         store
             .handle
             .write(move |txn| {
-                PartChecksumsTable::open(txn)?.put(&b2, &id, 1, "BLAKE3", "AAAA")?;
+                part_checksum::Table::open(txn)?.put(&b2, &id, 1, "BLAKE3", "AAAA")?;
                 Ok(())
             })
             .await
@@ -1843,8 +1860,10 @@ mod tests {
         store
             .handle
             .write(move |txn| {
-                let mut parts = PartsTable::open(txn).unwrap();
-                parts.insert((&*bucket, upload_id.as_str(), 1u32), "not-an-etag")?;
+                let mut parts = part::Table::open(txn).unwrap();
+                parts
+                    .insert((&*bucket, upload_id.as_str(), 1u32), "not-an-etag")
+                    .map_err(|e| database::Error::Redb(e.into()))?;
                 Ok(())
             })
             .await
@@ -2264,10 +2283,13 @@ mod tests {
         store
             .handle
             .write(move |txn| {
-                PartsTable::open(txn).unwrap().insert(
-                    (&*bucket, upload_id.as_str(), u32::MAX),
-                    "9dd4e461268c8034f5c8564e155c67a6",
-                )?;
+                part::Table::open(txn)
+                    .unwrap()
+                    .insert(
+                        (&*bucket, upload_id.as_str(), u32::MAX),
+                        "9dd4e461268c8034f5c8564e155c67a6",
+                    )
+                    .map_err(|e| database::Error::Redb(e.into()))?;
                 Ok(())
             })
             .await

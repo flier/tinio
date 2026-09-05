@@ -41,7 +41,9 @@ use tokio::fs;
 
 use crate::{
     _core::{ETag, object, pipeline},
-    Error, database, fsutil, meta,
+    _store::meta,
+    Error, fsutil,
+    meta::{composed_gate, composed_keep},
     write::CHUNK_SIZE,
 };
 
@@ -133,7 +135,7 @@ pub(crate) struct ComputeTask {
     pub size: u64,
     /// The stored entry when the producer's gate found a stale one
     /// (P1 — the composed-ETag keep decision reads it).
-    pub stored: Option<database::StoredMeta>,
+    pub stored: Option<meta::Stored>,
     /// Whether the file may be opened through symlinks.
     pub follow_symlinks: bool,
 }
@@ -184,7 +186,7 @@ impl Drop for HashBuffer {
 impl ComputeTask {
     /// The compute core: open the file under the symlink policy (async,
     /// nofollow via the tokio blocking pool), then the shared
-    /// `ensure_etag` decision (P1, [`meta::composed_keep`] — one home
+    /// `ensure_etag` decision (P1, [`crate::meta::composed_keep`] — one home
     /// for the rule): composed + same size + same file with an unchanged
     /// mtime (the jitter window is the identity-less fallback) → keep the
     /// composed form; else stream re-hash (64 KiB bounded, incremental
@@ -202,14 +204,14 @@ impl ComputeTask {
         if let Some(stored) = &self.stored {
             // Timestamp jitter (antivirus, indexer) must not rewrite a
             // multipart `MD5-of-MD5s-N` ETag into a content MD5. The keep
-            // decision is [`meta::composed_keep`]: on platforms with a
+            // decision is [`crate::meta::composed_keep`]: on platforms with a
             // file identity the identity must match AND the mtime must be
             // unchanged — any drift re-hashes, because an in-place
             // same-size rewrite keeps the identity and is
             // indistinguishable from a touch without hashing (F04). Where
             // the platform exposes no identity (stored 0), the mtime
             // jitter window is the fallback.
-            if meta::composed_gate(&stored.etag, stored.size, self.size) {
+            if composed_gate(&stored.etag, stored.size, self.size) {
                 let mut file = open_policy(&self.path, self.follow_symlinks).await?;
                 // The path's ONE metadata fetch (data-path review
                 // 2026-08-29, finding 5): the probe's metadata doubles as
@@ -226,8 +228,8 @@ impl ComputeTask {
                 // stored one — a file that changed size between the walk
                 // and the open is a content change, never a touch (the
                 // shared shape+size gate, meta.rs).
-                if meta::composed_gate(&stored.etag, stored.size, before.len())
-                    && meta::composed_keep(stored.file_identity, stored.mtime, current, mtime)
+                if composed_gate(&stored.etag, stored.size, before.len())
+                    && composed_keep(stored.file_identity, stored.mtime, current, mtime)
                 {
                     return Ok(Outcome::keep(
                         &self.key,
@@ -362,7 +364,7 @@ mod tests {
         key: &str,
         path: PathBuf,
         size: u64,
-        stored: Option<database::StoredMeta>,
+        stored: Option<meta::Stored>,
         follow_symlinks: bool,
     ) -> ComputeTask {
         ComputeTask {
@@ -418,7 +420,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = database::StoredMeta {
+        let stored = meta::Stored {
             etag: composed.clone(),
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -453,7 +455,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = database::StoredMeta {
+        let stored = meta::Stored {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -484,7 +486,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = database::StoredMeta {
+        let stored = meta::Stored {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -523,7 +525,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = database::StoredMeta {
+        let stored = meta::Stored {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -557,7 +559,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = database::StoredMeta {
+        let stored = meta::Stored {
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),

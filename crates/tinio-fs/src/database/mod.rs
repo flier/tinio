@@ -29,7 +29,6 @@ mod compact;
 mod error;
 mod handle;
 mod open;
-mod scan;
 mod tables;
 
 #[cfg(test)]
@@ -39,12 +38,8 @@ pub use compact::{Compaction, Stats, compact_if_needed};
 pub use error::Error;
 pub use handle::{Handle, WriteLockSnapshot};
 pub use open::{Integrity, Open, check_integrity, open};
-#[cfg(test)]
-pub(crate) use tables::StateTable;
-pub(crate) use tables::{
-    BucketsTable, ObjectPartsTable, PartChecksumsTable, PartsTable, UploadChecksumsTable,
-    UploadsTable,
-};
-pub use tables::{ObjectMetaTable, StoredMeta};
+pub(crate) use tables::for_bucket_strict;
 
 pub(crate) use crate::_core::object::{BUCKET_TAGS_MAX, OBJECT_TAGS_MAX};
+#[cfg(test)]
+pub(crate) use crate::_store::state::Table as StateTable;

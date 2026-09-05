@@ -17,6 +17,7 @@ use crate::{
         storage::{BucketOps, Error as StorageError, ObjectOps},
     },
     _util::testing::body,
+    bucket::name,
     database::{self, StateTable},
     testutil::fs_options,
 };
@@ -54,7 +55,7 @@ async fn new_from_db_constructs_over_an_opened_database() {
     )
     .unwrap();
     assert_eq!(storage.state_dir(), state.path());
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
     assert!(storage.bucket_names("").await.unwrap() == vec![b]);
 }
@@ -72,7 +73,7 @@ async fn read_only_state_relocation_keeps_root_clean() {
         },
     )
     .unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
     storage
         .put_object(&b, &"a.txt".into(), body(b"hello"))
@@ -105,7 +106,7 @@ async fn new_consumes_the_compact_marker() {
         let mut txn = db.begin_write().unwrap();
         {
             let mut state = StateTable::open(&mut txn).unwrap();
-            state.set_compact_marker_value(true).unwrap();
+            state.set_compact_marker(true).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -154,7 +155,7 @@ async fn bucket_dir_of_a_missing_bucket_answers_no_such_bucket() {
         },
     )
     .unwrap();
-    let b = bucket::name("missing-bucket").unwrap();
+    let b = name("missing-bucket").unwrap();
     let err = storage.bucket_dir(&b).await.unwrap_err();
     assert!(
         matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
@@ -176,7 +177,7 @@ async fn write_lock_stats_reports_the_database_snapshot() {
 async fn set_max_concurrent_uploads_is_enforced() {
     let root = tempfile::tempdir().unwrap();
     let mut storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
     let k = object::key("k").unwrap();
     storage.set_max_concurrent_uploads(1);
@@ -197,7 +198,7 @@ async fn set_max_concurrent_uploads_is_enforced() {
 async fn bucket_names_skips_root_level_files() {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
     fs::write(root.path().join("notes.txt"), b"not a bucket")
         .await
@@ -210,11 +211,8 @@ async fn bucket_names_skips_root_level_files() {
 async fn bucket_names_filters_by_prefix() {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    for name in ["alpha-1", "alpha-2", "beta-1"] {
-        storage
-            .create_bucket(&bucket::name(name).unwrap())
-            .await
-            .unwrap();
+    for raw in ["alpha-1", "alpha-2", "beta-1"] {
+        storage.create_bucket(&name(raw).unwrap()).await.unwrap();
     }
     let names = storage
         .bucket_names("alpha")
@@ -244,7 +242,7 @@ async fn bucket_names_with_links(follow_symlinks: bool) -> Vec<String> {
         },
     )
     .unwrap();
-    let b = bucket::name("real-bucket").unwrap();
+    let b = name("real-bucket").unwrap();
     storage.create_bucket(&b).await.unwrap();
     #[cfg(unix)]
     symlink(target.path(), root.path().join("linked")).unwrap();
@@ -305,14 +303,14 @@ async fn bucket_dir_resolves_dangling_and_looping_links() {
     .unwrap();
     symlink(root.path().join("loop"), root.path().join("loop")).unwrap();
 
-    let dangle = bucket::name("dangle").unwrap();
+    let dangle = name("dangle").unwrap();
     let err = storage.bucket_dir(&dangle).await.unwrap_err();
     assert!(
         matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
         "dangling link: {err:?}"
     );
 
-    let looped = bucket::name("loop").unwrap();
+    let looped = name("loop").unwrap();
     let err = storage.bucket_dir(&looped).await.unwrap_err();
     assert!(matches!(err, Error::Io(_)), "link loop: {err:?}");
 }
@@ -327,7 +325,7 @@ async fn bucket_names_skips_non_utf8_directory_names() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
     let mut name = b"bad-".to_vec();
     name.push(0xff);
@@ -357,7 +355,7 @@ async fn bucket_dir_of_a_dangling_junction_is_no_such_bucket() {
         &root.path().join("no-such-target"),
         &root.path().join("data"),
     );
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     let err = storage.bucket_dir(&b).await.unwrap_err();
     assert!(
         matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
@@ -388,7 +386,7 @@ async fn lock_bucket_mutations_warns_after_the_threshold() {
     // failed.
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     let held = storage.lock_bucket_mutations(&b).await;
     let task = tokio::spawn({
         let storage = storage.clone();
@@ -409,7 +407,7 @@ async fn ensure_bucket_refuses_a_file_in_place_of_a_bucket() {
     // never an IO error).
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     fs::write(root.path().join("data"), b"not-a-dir")
         .await
         .unwrap();
@@ -429,7 +427,7 @@ async fn resolve_object_file_rejects_a_junction_leaf_when_following_is_disabled(
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     storage.create_bucket(&b).await.unwrap();
     fs::write(outside.path().join("x.txt"), b"s").await.unwrap();
     link_directory(outside.path(), &root.path().join("data/subdir"));

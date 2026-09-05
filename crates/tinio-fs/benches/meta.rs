@@ -12,10 +12,7 @@ use std::{
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{bucket, object};
-use tinio_fs::{
-    database::{self, ObjectMetaTable},
-    meta,
-};
+use tinio_fs::{_store::meta::Table, database, meta};
 use tokio::runtime::Runtime;
 
 /// Entries in the populated `OBJECT_META` table (inserted in one bulk
@@ -24,7 +21,7 @@ const ENTRIES: u32 = 100_000;
 
 /// A store over a freshly populated database of `ENTRIES` entries in one
 /// bucket (`data`). The table is opened through the crate's own
-/// `ObjectMetaTable` handle (the same `TableDefinition` the backend uses —
+/// `Table` handle (the same `TableDefinition` the backend uses —
 /// no bench-local schema that can drift); the populate handle is dropped
 /// before the store opens the file (redb's file lock is exclusive per
 /// handle).
@@ -35,7 +32,7 @@ fn populated_store() -> (tempfile::TempDir, meta::Store) {
         {
             let mut txn = db.begin_write().unwrap();
             {
-                let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+                let mut table = Table::open(&mut txn).unwrap();
                 for i in 0..ENTRIES {
                     let key = format!("dir/obj-{i:06}");
                     table

@@ -40,7 +40,7 @@ use crate::{
         },
         to_nanos,
     },
-    database::{self, ObjectMetaTable, ObjectPartsTable},
+    _store::{meta, object_part},
     fsutil,
     write::{AtomicWriter, CHUNK_SIZE},
 };
@@ -348,7 +348,7 @@ impl FsStorage {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<(fs::File, u64, SystemTime, database::StoredMeta), Error> {
+    ) -> Result<(fs::File, u64, SystemTime, meta::Stored), Error> {
         let (path, file, size, mtime, identity) = self.resolve_object_file(bucket, key).await?;
         let (row, _) = self
             .meta_store
@@ -581,10 +581,10 @@ impl FsStorage {
         if let Err(err) = self
             .handle
             .write(move |txn| {
-                ObjectMetaTable::open(txn)?.put(
+                meta::Table::open(txn)?.put(
                     &bucket,
                     &key,
-                    &database::StoredMeta {
+                    &meta::Stored {
                         etag: etag.clone(),
                         size,
                         mtime: to_nanos(mtime),
@@ -593,7 +593,7 @@ impl FsStorage {
                         checksum: checksum.clone(),
                     },
                 )?;
-                ObjectPartsTable::open(txn)?.remove_key(&bucket, &key)?;
+                object_part::Table::open(txn)?.remove_key(&bucket, &key)?;
                 Ok(())
             })
             .await
@@ -833,7 +833,7 @@ impl ObjectOps for FsStorage {
                     // one table in a transaction) — the two halves run in
                     // separate scopes.
                     let row = {
-                        let mut meta = ObjectMetaTable::open(txn)?;
+                        let mut meta = meta::Table::open(txn)?;
                         let Some(row) = meta.get(&bucket, &src)? else {
                             return Ok(None);
                         };
@@ -845,7 +845,7 @@ impl ObjectOps for FsStorage {
                     // src's rows, clear the dst's stale rows, re-key
                     // under dst, drop the src's (one table handle serves
                     // the read and the writes).
-                    let mut parts = ObjectPartsTable::open(txn)?;
+                    let mut parts = object_part::Table::open(txn)?;
                     let rows = parts.list(&bucket, &src)?;
                     // Both range deletes precede the inserts — a redb
                     // 4.2.0 debug build asserts when an insert precedes
@@ -1012,7 +1012,11 @@ impl ObjectOps for FsStorage {
         self.ensure_object_file(bucket, key).await?;
         let rows = self
             .handle
-            .read(|txn| ObjectPartsTable::open_readonly(txn)?.list(bucket, key))
+            .read(|txn| {
+                object_part::Table::open_readonly(txn)?
+                    .list(bucket, key)
+                    .map_err(Into::into)
+            })
             .map_err(Error::from)?;
         let parts = rows
             .into_iter()
@@ -1963,7 +1967,7 @@ mod tests {
             .unwrap()
             .db;
         let txn = redb::ReadableDatabase::begin_read(&db).unwrap();
-        let parts = crate::database::ObjectPartsTable::open_readonly(&txn).unwrap();
+        let parts = object_part::Table::open_readonly(&txn).unwrap();
         assert!(
             parts.list(&b, &dst).unwrap().is_empty(),
             "delete must drain the rows"

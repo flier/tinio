@@ -14,19 +14,17 @@ use redb::{
 use tokio::{runtime::Builder, sync::oneshot, time::timeout};
 
 use super::{
+    StateTable,
     compact::{Compaction, Stats, compact_if_needed, needs_compact},
     error::Error,
     handle,
     handle::Handle,
     open::{Integrity, check_integrity, open},
-    tables::{
-        BucketsTable, ObjectMetaTable, ObjectPartsTable, PartChecksumsTable, PartsTable,
-        StateTable, UploadChecksumsTable, UploadsTable,
-    },
 };
 use crate::{
-    _core::{bucket, object, to_nanos},
-    _util::testing::{assert_send_sync, etag},
+    _core::{bucket::name, object},
+    _store::{bucket, meta, object_part, part, part_checksum, upload, upload_checksum},
+    _util::testing::assert_send_sync,
 };
 
 fn open_db() -> (tempfile::TempDir, Database, Stats) {
@@ -37,12 +35,18 @@ fn open_db() -> (tempfile::TempDir, Database, Stats) {
 
 #[test]
 fn redb_errors_wrap_per_kind() {
-    let err = Error::from(TableDoesNotExist("t".into()));
-    assert!(matches!(err, Error::Table(TableDoesNotExist(_))), "{err:?}");
-    let err = Error::from(TxnStorage(ValueTooLarge(1)));
-    assert!(matches!(err, Error::Transaction(_)), "{err:?}");
+    let err = Error::Redb(TableDoesNotExist("t".into()).into());
     assert!(
-        Error::from(ValueTooLarge(1))
+        matches!(err, Error::Redb(crate::_store::Error::Table(_))),
+        "{err}"
+    );
+    let err = Error::Redb(TxnStorage(ValueTooLarge(1)).into());
+    assert!(
+        matches!(err, Error::Redb(crate::_store::Error::Transaction(_))),
+        "{err}"
+    );
+    assert!(
+        Error::Redb(ValueTooLarge(1).into())
             .to_string()
             .contains("storage error")
     );
@@ -60,13 +64,13 @@ async fn open_creates_database_and_all_tables() {
     // Every table is openable (read transactions refuse missing
     // tables — the open-time write transaction created them).
     let txn = db.begin_read().unwrap();
-    ObjectMetaTable::open_readonly(&txn).unwrap();
-    BucketsTable::open_readonly(&txn).unwrap();
-    UploadsTable::open_readonly(&txn).unwrap();
-    PartsTable::open_readonly(&txn).unwrap();
-    UploadChecksumsTable::open_readonly(&txn).unwrap();
-    PartChecksumsTable::open_readonly(&txn).unwrap();
-    ObjectPartsTable::open_readonly(&txn).unwrap();
+    meta::Table::open_readonly(&txn).unwrap();
+    bucket::Table::open_readonly(&txn).unwrap();
+    upload::Table::open_readonly(&txn).unwrap();
+    part::Table::open_readonly(&txn).unwrap();
+    upload_checksum::Table::open_readonly(&txn).unwrap();
+    part_checksum::Table::open_readonly(&txn).unwrap();
+    object_part::Table::open_readonly(&txn).unwrap();
     StateTable::open_readonly(&txn).unwrap();
 }
 
@@ -99,10 +103,8 @@ async fn open_twice_is_idempotent() {
     // A second open on the same file must succeed.
     let db = open(state.path()).unwrap().db;
     let mut txn = db.begin_write().unwrap();
-    let version = StateTable::open(&mut txn)
-        .unwrap()
-        .ensure_version(state.path())
-        .unwrap();
+    let mut st = StateTable::open(&mut txn).unwrap();
+    let version = super::tables::ensure_version(&mut st, state.path()).unwrap();
     assert_eq!(version, 1);
 }
 
@@ -147,7 +149,10 @@ async fn corrupt_file_is_an_error() {
     let (state, _, _) = open_db();
     fs::write(state.path().join("meta.redb"), b"not a redb file").unwrap();
     let err = open(state.path()).unwrap_err();
-    assert!(matches!(err, Error::Open(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::Redb(crate::_store::Error::Open(_))),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -207,7 +212,7 @@ async fn compact_if_needed_shrinks_and_clears_marker() {
     {
         let mut txn = db.begin_write().unwrap();
         {
-            let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+            let mut table = meta::Table::open(&mut txn).unwrap();
             for i in 0..50_000u32 {
                 let key = format!("key-{i}");
                 table
@@ -223,7 +228,7 @@ async fn compact_if_needed_shrinks_and_clears_marker() {
     {
         let mut txn = db.begin_write().unwrap();
         {
-            let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+            let mut table = meta::Table::open(&mut txn).unwrap();
             for i in 0..50_000u32 {
                 let key = format!("key-{i}");
                 // Raw remove: domain `remove` validates keys; this
@@ -241,7 +246,7 @@ async fn compact_if_needed_shrinks_and_clears_marker() {
         let mut txn = db.begin_write().unwrap();
         {
             let mut state_table = StateTable::open(&mut txn).unwrap();
-            state_table.set_compact_marker_value(true).unwrap();
+            state_table.set_compact_marker(true).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -290,18 +295,22 @@ async fn check_integrity_fails_on_garbage() {
 async fn handle_read_write_round_trip() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
-    let name = bucket::name("alpha").unwrap();
+    let name = name("alpha").unwrap();
     let created = UNIX_EPOCH + Duration::from_nanos(42);
     let write_name = name.clone();
     handle
         .write(move |txn| {
-            BucketsTable::open(txn)?.put(&write_name, created)?;
+            bucket::Table::open(txn)?.put(&write_name, created)?;
             Ok(())
         })
         .await
         .unwrap();
     let got = handle
-        .read(|txn| BucketsTable::open_readonly(txn)?.get(&name))
+        .read(|txn| {
+            bucket::Table::open_readonly(txn)?
+                .get(&name)
+                .map_err(Into::into)
+        })
         .unwrap();
     assert_eq!(got, Some(created));
     drop(state);
@@ -311,18 +320,18 @@ async fn handle_read_write_round_trip() {
 async fn write_closure_aborts_on_error() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
-    let name = bucket::name("beta").unwrap();
+    let name = name("beta").unwrap();
     let write_name = name.clone();
     let err = handle
         .write(move |txn| {
-            BucketsTable::open(txn)?.put(&write_name, UNIX_EPOCH)?;
+            bucket::Table::open(txn)?.put(&write_name, UNIX_EPOCH)?;
             Err::<(), _>(Error::Io(IoError::other("boom")))
         })
         .await;
     assert!(err.is_err());
     // The aborted transaction persisted nothing.
     let got = handle
-        .read(|txn| Ok(BucketsTable::open_readonly(txn)?.get(&name)?.is_some()))
+        .read(|txn| Ok(bucket::Table::open_readonly(txn)?.get(&name)?.is_some()))
         .unwrap();
     assert!(!got);
     drop(state);
@@ -385,10 +394,10 @@ async fn write_lock_stats_start_all_zero() {
 async fn write_transactions_are_timed() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
-    let name = bucket::name("alpha").unwrap();
+    let name = name("alpha").unwrap();
     handle
         .write(move |txn| {
-            BucketsTable::open(txn)?.put(&name, UNIX_EPOCH)?;
+            bucket::Table::open(txn)?.put(&name, UNIX_EPOCH)?;
             Ok(())
         })
         .await
@@ -417,10 +426,10 @@ async fn write_transactions_are_timed() {
 async fn slow_write_lands_in_the_last_bucket() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
-    let name = bucket::name("gamma").unwrap();
+    let name = name("gamma").unwrap();
     handle
         .write(move |txn| {
-            BucketsTable::open(txn)?.put(&name, UNIX_EPOCH)?;
+            bucket::Table::open(txn)?.put(&name, UNIX_EPOCH)?;
             thread::sleep(Duration::from_millis(150));
             Ok(())
         })
@@ -447,11 +456,11 @@ async fn slow_write_lands_in_the_last_bucket() {
 async fn aborted_write_is_recorded() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
-    let name = bucket::name("delta").unwrap();
+    let name = name("delta").unwrap();
     let write_name = name.clone();
     let err = handle
         .write(move |txn| {
-            BucketsTable::open(txn)?.put(&write_name, UNIX_EPOCH)?;
+            bucket::Table::open(txn)?.put(&write_name, UNIX_EPOCH)?;
             Err::<(), _>(Error::Io(IoError::other("boom")))
         })
         .await;
@@ -468,10 +477,14 @@ async fn aborted_write_is_recorded() {
 async fn reads_do_not_record() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
-    let b = bucket::name("data").unwrap();
+    let b = name("data").unwrap();
     let k = object::key("a.txt").unwrap();
     handle
-        .read(|txn| ObjectMetaTable::open_readonly(txn)?.get(&b, &k))
+        .read(|txn| {
+            meta::Table::open_readonly(txn)?
+                .get(&b, &k)
+                .map_err(Into::into)
+        })
         .unwrap();
     assert_eq!(handle.write_lock_stats().count, 0);
     drop(state);
@@ -505,10 +518,10 @@ async fn snapshots_accumulate_across_transactions() {
     let (state, db, _) = open_db();
     let handle = Handle::new(db);
     for i in 0..5u64 {
-        let name = bucket::name(format!("bucket{i}")).unwrap();
+        let name = name(format!("bucket{i}")).unwrap();
         handle
             .write(move |txn| {
-                BucketsTable::open(txn)?.put(&name, UNIX_EPOCH)?;
+                bucket::Table::open(txn)?.put(&name, UNIX_EPOCH)?;
                 Ok(())
             })
             .await
@@ -536,7 +549,7 @@ fn async_writes_run_on_the_blocking_pool() {
     runtime.block_on(async {
         let (state, db, _) = open_db();
         let handle = Handle::new(db);
-        let name = bucket::name("data").unwrap();
+        let name = name("data").unwrap();
         let (started_tx, started_rx) = oneshot::channel();
         let (gate_tx, gate_rx) = oneshot::channel::<()>();
         let writer = {
@@ -545,7 +558,7 @@ fn async_writes_run_on_the_blocking_pool() {
             tokio::spawn(async move {
                 handle
                     .write(move |txn| {
-                        BucketsTable::open(txn)?.put(&name, UNIX_EPOCH)?;
+                        bucket::Table::open(txn)?.put(&name, UNIX_EPOCH)?;
                         let _ = started_tx.send(());
                         // Park with the write transaction OPEN — the
                         // redb write lock is held from here on.
@@ -567,7 +580,11 @@ fn async_writes_run_on_the_blocking_pool() {
         // completes here while the write is still parked. The parked
         // write is uncommitted, so the row is invisible (redb MVCC)...
         let got = handle
-            .read(|txn| BucketsTable::open_readonly(txn)?.get(&name))
+            .read(|txn| {
+                bucket::Table::open_readonly(txn)?
+                    .get(&name)
+                    .map_err(Into::into)
+            })
             .unwrap();
         assert_eq!(got, None, "the parked write must not be committed yet");
         // ...and the parked write is still in flight (it holds the
@@ -581,7 +598,11 @@ fn async_writes_run_on_the_blocking_pool() {
         // The write committed when the closure returned: the row is
         // now visible.
         let got = handle
-            .read(|txn| BucketsTable::open_readonly(txn)?.get(&name))
+            .read(|txn| {
+                bucket::Table::open_readonly(txn)?
+                    .get(&name)
+                    .map_err(Into::into)
+            })
             .unwrap();
         assert_eq!(got, Some(UNIX_EPOCH));
         drop(state);
@@ -603,129 +624,6 @@ async fn a_panicking_write_closure_panics_the_caller() {
         .write(move |_txn| -> Result<(), Error> { panic!("boom") })
         .await
         .unwrap();
-    drop(state);
-}
-
-#[tokio::test]
-async fn bucket_get_or_insert_returns_the_stored_creation_time() {
-    let (state, db, _) = open_db();
-    let handle = Handle::new(db);
-    let name = bucket::name("data").unwrap();
-    let write_name = name.clone();
-    let now = UNIX_EPOCH + Duration::from_nanos(42);
-    handle
-        .write(move |txn| {
-            let mut table = BucketsTable::open(txn)?;
-            // Insert-absent path, then the stored-value path: a later
-            // call must return the first recorded time, not overwrite it.
-            let first = table.get_or_insert(&write_name, now)?;
-            let second = table.get_or_insert(&write_name, now + Duration::from_secs(1))?;
-            assert_eq!(first, second);
-            Ok(second)
-        })
-        .await
-        .unwrap();
-    drop(state);
-}
-
-#[tokio::test]
-async fn bucket_get_or_insert_preserves_the_stored_tags() {
-    let (state, db, _) = open_db();
-    let handle = Handle::new(db);
-    let name = bucket::name("data").unwrap();
-    let write_name = name.clone();
-    let now = UNIX_EPOCH + Duration::from_nanos(42);
-    handle
-        .write(move |txn| {
-            let mut table = BucketsTable::open(txn)?;
-            // The tagging write's row upsert (`put_full` — `set_tags` on
-            // a row-less bucket), then the racing first-sight upsert
-            // (`get_or_insert` — the head/list record): the re-insert
-            // must keep the stored tags element, never clear it.
-            table.put_full(&write_name, now, "env=prod")?;
-            let recorded = table.get_or_insert(&write_name, now + Duration::from_secs(1))?;
-            assert_eq!(recorded, now);
-            let (created, tags) = table
-                .row(&write_name)?
-                .expect("the put_full row must be present");
-            assert_eq!(created, now);
-            assert_eq!(tags, "env=prod");
-            Ok(())
-        })
-        .await
-        .unwrap();
-    drop(state);
-}
-
-#[tokio::test]
-async fn object_meta_put_round_trips() {
-    let (state, db, _) = open_db();
-    let handle = Handle::new(db);
-    let name = bucket::name("data").unwrap();
-    let write_name = name.clone();
-    let key = object::key("dir/a.txt").unwrap();
-    let write_key = key.clone();
-    let written = etag("5eb63bbbe01eeed093cb22bb8f5acdc3");
-    let write_etag = written.clone();
-    handle
-        .write(move |txn| {
-            let mut table = ObjectMetaTable::open(txn)?;
-            table.put(
-                &write_name,
-                &write_key,
-                &super::tables::StoredMeta {
-                    etag: write_etag.clone(),
-                    size: 2,
-                    mtime: to_nanos(UNIX_EPOCH),
-                    file_identity: 7,
-                    tags: object::Tags::empty(),
-                    checksum: None,
-                },
-            )
-        })
-        .await
-        .unwrap();
-    let got = handle
-        .read(|txn| ObjectMetaTable::open_readonly(txn)?.get(&name, &key))
-        .unwrap();
-    let row = got.expect("the put row must be readable");
-    assert_eq!(row.etag, written);
-    assert_eq!(row.size, 2);
-    assert_eq!(row.file_identity, 7);
-    drop(state);
-}
-
-#[tokio::test]
-async fn upload_and_part_rows_round_trip_and_list_from_stops_at_the_next_upload() {
-    let (state, db, _) = open_db();
-    let handle = Handle::new(db);
-    let name = bucket::name("data").unwrap();
-    let write_name = name.clone();
-    let key = object::key("big.bin").unwrap();
-    let write_key = key.clone();
-    let part_etag = etag("d41d8cd98f00b204e9800998ecf8427e");
-    let write_etag = part_etag.clone();
-    handle
-        .write(move |txn| {
-            {
-                let mut uploads = UploadsTable::open(txn)?;
-                uploads.put(&write_name, "aaa", &write_key, UNIX_EPOCH, "")?;
-                uploads.put(&write_name, "bbb", &write_key, UNIX_EPOCH, "")?;
-            }
-            let mut parts = PartsTable::open(txn)?;
-            parts.put(&write_name, "aaa", 1, &write_etag)?;
-            parts.put(&write_name, "bbb", 1, &write_etag)?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    // Paging past the last part of `aaa` must stop at the `bbb` row —
-    // the mismatch break, never a cross-upload bleed.
-    let (page, truncated) = handle
-        .read(|txn| PartsTable::open_readonly(txn)?.list_from(&name, "aaa", 0, 10))
-        .unwrap();
-    assert_eq!(page, vec![(1, part_etag.to_string())]);
-    assert!(!truncated);
     drop(state);
 }
 

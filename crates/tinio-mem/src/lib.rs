@@ -13,6 +13,8 @@
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
+#[doc(hidden)]
+pub extern crate tinio_store as _store;
 #[cfg(test)]
 extern crate tinio_util as _util;
 

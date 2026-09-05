@@ -12,12 +12,12 @@
 
 use std::{path::Path, sync::Arc, time::SystemTime};
 
-pub use bucket::{Name, name};
-
+pub use crate::_core::bucket::{Name, name};
 use crate::{
-    _core::{bucket, object},
+    _core::object,
+    _store::bucket,
     Error,
-    database::{self, BUCKET_TAGS_MAX, BucketsTable, Handle},
+    database::{self, BUCKET_TAGS_MAX, Handle},
 };
 
 /// Bucket-name → creation-time store (`BUCKETS` table).
@@ -54,23 +54,27 @@ impl Store {
     }
 
     /// The recorded creation time of a bucket, if any.
-    pub async fn created_at(&self, name: &bucket::Name) -> Result<Option<SystemTime>, Error> {
+    pub async fn created_at(&self, name: &Name) -> Result<Option<SystemTime>, Error> {
         self.handle
-            .read(|txn| BucketsTable::open_readonly(txn)?.get(name))
+            .read(|txn| {
+                bucket::Table::open_readonly(txn)?
+                    .get(name)
+                    .map_err(Into::into)
+            })
             .map_err(Into::into)
     }
 
     /// The recorded tag set of a bucket — empty when the row is absent
     /// (a pre-existing bucket never tagged through the API) or its wire
     /// is domain-invalid (self-healing, like the object rows).
-    pub async fn tags(&self, name: &bucket::Name) -> Result<object::Tags, Error> {
+    pub async fn tags(&self, name: &Name) -> Result<object::Tags, Error> {
         let name = name.clone();
         self.handle
             .read(move |txn| {
-                let table = BucketsTable::open_readonly(txn)?;
+                let table = bucket::Table::open_readonly(txn)?;
                 let row = table.row(&name)?;
                 Ok(row.map_or_else(object::Tags::empty, |(_, wire)| {
-                    object::Tags::parse_wire_limited(&wire, BUCKET_TAGS_MAX).unwrap_or_default()
+                    object::Tags::from_wire_limited(&wire, BUCKET_TAGS_MAX)
                 }))
             })
             .map_err(Into::into)
@@ -81,13 +85,13 @@ impl Store {
     /// missing row is lazily recorded with `now`, the first-sight policy
     /// of [`Self::get_or_record`]). The caller answers `NoSuchBucket`
     /// for a missing bucket directory before calling.
-    pub async fn set_tags(&self, name: &bucket::Name, tags: &object::Tags) -> Result<(), Error> {
+    pub async fn set_tags(&self, name: &Name, tags: &object::Tags) -> Result<(), Error> {
         let name = name.clone();
         let tags = tags.clone();
         let tags_wire = tags.to_wire();
         self.handle
             .write_if(move |txn| {
-                let mut table = BucketsTable::open(txn)?;
+                let mut table = bucket::Table::open(txn)?;
                 let Some((created, wire)) = table.row(&name)? else {
                     // No row yet — the lazy first-sight record (a real
                     // change: it creates the entry).
@@ -108,11 +112,11 @@ impl Store {
     /// Clear the bucket's tag set, preserving the creation time
     /// (idempotent — a missing row is a no-op; the caller answers
     /// `NoSuchBucket` for a missing bucket directory before calling).
-    pub async fn clear_tags(&self, name: &bucket::Name) -> Result<(), Error> {
+    pub async fn clear_tags(&self, name: &Name) -> Result<(), Error> {
         let name = name.clone();
         self.handle
             .write_if(move |txn| {
-                let mut table = BucketsTable::open(txn)?;
+                let mut table = bucket::Table::open(txn)?;
                 let Some((created, wire)) = table.row(&name)? else {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
@@ -134,17 +138,17 @@ impl Store {
     /// transaction (`HeadBucket` must not grab the exclusive write lock
     /// on every call); a missing row is an atomic upsert so concurrent
     /// first-sights converge.
-    pub async fn get_or_record(
-        &self,
-        name: &bucket::Name,
-        now: SystemTime,
-    ) -> Result<SystemTime, Error> {
+    pub async fn get_or_record(&self, name: &Name, now: SystemTime) -> Result<SystemTime, Error> {
         if let Some(created) = self.created_at(name).await? {
             return Ok(created);
         }
         let name = name.clone();
         self.handle
-            .write(move |txn| BucketsTable::open(txn)?.get_or_insert(&name, now))
+            .write(move |txn| {
+                bucket::Table::open(txn)?
+                    .get_or_insert(&name, now)
+                    .map_err(Into::into)
+            })
             .await
             .map_err(Into::into)
     }
@@ -157,14 +161,14 @@ impl Store {
     /// first-sights converge exactly like `get_or_record`'s write arm —
     /// the upsert reads the stored value inside the single-writer
     /// transaction.
-    pub async fn get_or_insert(
-        &self,
-        name: &bucket::Name,
-        now: SystemTime,
-    ) -> Result<SystemTime, Error> {
+    pub async fn get_or_insert(&self, name: &Name, now: SystemTime) -> Result<SystemTime, Error> {
         let name = name.clone();
         self.handle
-            .write(move |txn| BucketsTable::open(txn)?.get_or_insert(&name, now))
+            .write(move |txn| {
+                bucket::Table::open(txn)?
+                    .get_or_insert(&name, now)
+                    .map_err(Into::into)
+            })
             .await
             .map_err(Into::into)
     }
@@ -173,23 +177,28 @@ impl Store {
     /// transaction for the whole page (the ListBuckets analogue of
     /// `meta::Store::load_entries`; a missing entry is `None` — the
     /// caller lazily records first sight).
-    pub async fn load_many(
-        &self,
-        names: &[bucket::Name],
-    ) -> Result<Vec<Option<SystemTime>>, Error> {
+    pub async fn load_many(&self, names: &[Name]) -> Result<Vec<Option<SystemTime>>, Error> {
         self.handle
             .read(|txn| {
-                let table = BucketsTable::open_readonly(txn)?;
-                names.iter().map(|name| table.get(name)).collect()
+                let table = bucket::Table::open_readonly(txn)?;
+                names
+                    .iter()
+                    .map(|name| table.get(name))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
             })
             .map_err(Into::into)
     }
 
     /// Record (or overwrite) the creation time of a bucket.
-    pub async fn record(&self, name: &bucket::Name, created_at: SystemTime) -> Result<(), Error> {
+    pub async fn record(&self, name: &Name, created_at: SystemTime) -> Result<(), Error> {
         let name = name.clone();
         self.handle
-            .write(move |txn| BucketsTable::open(txn)?.put(&name, created_at))
+            .write(move |txn| {
+                bucket::Table::open(txn)?
+                    .put(&name, created_at)
+                    .map_err(Into::into)
+            })
             .await
             .map_err(Into::into)
     }
@@ -198,10 +207,10 @@ impl Store {
     /// production teardown removes the row inside
     /// [`FsStorage::remove_bucket_state`].
     #[cfg(test)]
-    pub async fn remove(&self, name: &bucket::Name) -> Result<(), Error> {
+    pub async fn remove(&self, name: &Name) -> Result<(), Error> {
         let name = name.clone();
         self.handle
-            .write(move |txn| BucketsTable::open(txn)?.remove(&name))
+            .write(move |txn| bucket::Table::open(txn)?.remove(&name).map_err(Into::into))
             .await
             .map_err(Into::into)
     }
@@ -211,7 +220,7 @@ impl Store {
     pub async fn load_all(&self) -> Result<Vec<(String, SystemTime)>, Error> {
         self.handle
             .read(|txn| {
-                let table = BucketsTable::open_readonly(txn)?;
+                let table = bucket::Table::open_readonly(txn)?;
                 let mut out = Vec::new();
                 table.for_each(|name, created_at| {
                     out.push((name.to_string(), created_at));

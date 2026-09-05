@@ -121,7 +121,7 @@ mod tests {
             storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
         },
         _util::testing::assert_send_sync,
-        database::Error::{Open, UnsupportedVersion},
+        database::Error::{Redb, UnsupportedVersion},
     };
 
     #[derive(Validate)]
@@ -187,7 +187,7 @@ mod tests {
 
         // redb failures project onto Io (never misclassified as a
         // contract-domain condition).
-        let db_err: Error = Open(DatabaseAlreadyOpen).into();
+        let db_err: Error = Redb(DatabaseAlreadyOpen.into()).into();
         let core: storage::Error = db_err.into();
         assert!(matches!(core, Io(_)));
 

@@ -10,16 +10,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
+use redb::{Database, ReadTransaction, WriteTransaction};
 use tokio::task::spawn_blocking;
 
 use super::{
     compact::{needs_compact, snapshot},
     error::Error,
     open::open,
-    tables::StateTable,
 };
-use crate::_core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS};
+use crate::{
+    _core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
+    _store::{state, store},
+};
 
 /// The histogram bucket of a duration in microseconds.
 pub(crate) fn write_lock_bucket(duration_us: u64) -> usize {
@@ -120,7 +122,8 @@ impl WriteHistogram {
 /// and self-healing, but this trade-off was deliberately not made).
 #[derive(Debug)]
 pub struct Handle {
-    db: Database,
+    /// The shared transaction core (the closure-passing read/write arms).
+    core: store::Handle,
     /// The write-lock histograms (pipeline-spec.md §4).
     hist: WriteHistogram,
 }
@@ -137,7 +140,7 @@ impl Handle {
     /// meta-redb-spec §5.9/G1).
     pub fn new(db: Database) -> Arc<Self> {
         Arc::new(Self {
-            db,
+            core: store::Handle::new(db),
             hist: WriteHistogram::default(),
         })
     }
@@ -150,8 +153,7 @@ impl Handle {
         &self,
         f: impl FnOnce(&ReadTransaction) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let txn = self.db.begin_read()?;
-        f(&txn)
+        self.core.read(f)
     }
 
     /// Run `f` against a read transaction on the tokio blocking pool —
@@ -174,12 +176,9 @@ impl Handle {
         T: Send + 'static,
     {
         let this = Arc::clone(self);
-        spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            f(&txn)
-        })
-        .await
-        .unwrap_or_else(|join| panic!("the read-transaction task panicked: {join}"))
+        spawn_blocking(move || this.core.read(f))
+            .await
+            .unwrap_or_else(|join| panic!("the read-transaction task panicked: {join}"))
     }
 
     /// Run `f` against a write transaction — committed on success, aborted
@@ -204,7 +203,10 @@ impl Handle {
         self.timed_write(move |mut txn| {
             let result = f(&mut txn);
             match result {
-                Ok(value) => txn.commit().map(|()| value).map_err(Into::into),
+                Ok(value) => txn
+                    .commit()
+                    .map(|()| value)
+                    .map_err(|e| Error::Redb(e.into())),
                 Err(err) => {
                     let _ = txn.abort();
                     Err(err)
@@ -229,7 +231,10 @@ impl Handle {
         self.timed_write(move |mut txn| {
             let result = f(&mut txn);
             match result {
-                Ok(Some(value)) => txn.commit().map(|()| Some(value)).map_err(Into::into),
+                Ok(Some(value)) => txn
+                    .commit()
+                    .map(|()| Some(value))
+                    .map_err(|e| Error::Redb(e.into())),
                 Ok(None) => {
                     let _ = txn.abort();
                     Ok(None)
@@ -289,7 +294,7 @@ impl Handle {
         start: Instant,
         f: impl FnOnce(WriteTransaction) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let txn = match self.db.begin_write() {
+        let txn = match self.core.db().begin_write() {
             Ok(txn) => txn,
             Err(err) => {
                 // No transaction opened: wait == total (no commit phase).
@@ -298,7 +303,7 @@ impl Handle {
                 // (Handle owns the Database).
                 let duration = start.elapsed();
                 self.hist.record(duration, duration);
-                return Err(err.into());
+                return Err(Error::Redb(err.into()));
             }
         };
         let waited = start.elapsed();
@@ -341,22 +346,22 @@ impl Handle {
         threshold_percent: u8,
     ) -> Result<bool, Error> {
         self.timed_write(move |mut txn| {
-            let stats = txn.stats()?;
+            let stats = txn.stats().map_err(|e| Error::Redb(e.into()))?;
             let needed = needs_compact(&snapshot(&stats), threshold_percent);
             let changed = {
-                let mut state = StateTable::open(&mut txn)?;
+                let mut state = state::Table::open(&mut txn)?;
                 let current = state.compact_marker()?;
                 if current == needed {
                     false
                 } else {
-                    state.set_compact_marker_value(needed)?;
+                    state.set_compact_marker(needed)?;
                     true
                 }
             };
             if changed {
-                txn.commit()?;
+                txn.commit().map_err(|e| Error::Redb(e.into()))?;
             } else {
-                txn.abort()?;
+                txn.abort().map_err(|e| Error::Redb(e.into()))?;
             }
             Ok(needed)
         })
@@ -368,7 +373,11 @@ impl Handle {
     /// doctor report it, the runtime evaluation path is
     /// `Self::evaluate_compact`).
     pub fn compact_needed(&self) -> Result<bool, Error> {
-        self.read(|txn| StateTable::open_readonly(txn)?.compact_marker())
+        self.read(|txn| {
+            state::Table::open_readonly(txn)?
+                .compact_marker()
+                .map_err(Error::Redb)
+        })
     }
 
     /// Set or clear the `compact_needed` marker — the marker protocol's
@@ -376,7 +385,10 @@ impl Handle {
     /// runtime path goes through `Self::evaluate_compact`). Async like
     /// every write transaction (G3 revision).
     pub async fn mark_compact_needed(self: &Arc<Self>, needed: bool) -> Result<(), Error> {
-        self.write(move |txn| StateTable::open(txn)?.set_compact_marker_value(needed))
-            .await
+        self.write(move |txn| -> Result<(), Error> {
+            let mut state = state::Table::open(txn)?;
+            state.set_compact_marker(needed).map_err(Error::Redb)
+        })
+        .await
     }
 }

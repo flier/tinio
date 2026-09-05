@@ -1,14 +1,12 @@
 //! In-memory backend errors.
 //!
 //! [`Error`] is a superset of [`storage::Error`]: contract failures wrap
-//! that type; redb failures wrap [`DatabaseError`]. `#[from]` converts
+//! that type; redb failures wrap [`DatabaseError`], the alias of the
+//! shared five-variant redb error core in tinio-store. `#[from]` converts
 //! [`storage::Error`] automatically. Projection onto the contract unwraps
 //! `Storage` and maps [`DatabaseError`] onto [`Error::Io`].
 
-use std::{
-    io::{self, Error as IoError},
-    num::ParseIntError,
-};
+use std::io::{self, Error as IoError};
 
 use crate::_core::{bucket, etag, object, storage, storage::Error::*};
 
@@ -36,36 +34,19 @@ pub enum Error {
     Database(#[from] DatabaseError),
 }
 
-/// A redb failure: open, transaction, table, storage, or commit.
+/// A redb failure: the shared five-variant mapping core
+/// ([`tinio_store::error::Error`]). The alias keeps the historical name.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use StorageError::ValueTooLarge;
-/// use redb::StorageError;
+/// use redb::StorageError::ValueTooLarge;
 /// use tinio_mem::{DatabaseError, Error};
 ///
-/// let err = Error::from(ValueTooLarge(1));
+/// let err = Error::Database(DatabaseError::from(ValueTooLarge(1)));
 /// assert!(matches!(err, Error::Database(DatabaseError::Storage(_))));
 /// ```
-#[derive(Debug, thiserror::Error)]
-pub enum DatabaseError {
-    /// Database open/create failed.
-    #[error("database error: {0}")]
-    Open(#[from] redb::DatabaseError),
-    /// A transaction failed.
-    #[error("transaction error: {0}")]
-    Transaction(#[from] redb::TransactionError),
-    /// Opening a table failed.
-    #[error("table error: {0}")]
-    Table(#[from] redb::TableError),
-    /// A get/insert/range failed.
-    #[error("storage error: {0}")]
-    Storage(#[from] redb::StorageError),
-    /// Commit failed.
-    #[error("commit error: {0}")]
-    Commit(#[from] redb::CommitError),
-}
+pub use crate::_store::Error as DatabaseError;
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
@@ -76,42 +57,6 @@ impl From<io::Error> for Error {
 impl From<etag::Error> for Error {
     fn from(err: etag::Error) -> Self {
         invalid_etag(err)
-    }
-}
-
-impl From<ParseIntError> for Error {
-    fn from(err: ParseIntError) -> Self {
-        invalid_part_key(err)
-    }
-}
-
-impl From<redb::DatabaseError> for Error {
-    fn from(err: redb::DatabaseError) -> Self {
-        database_open(err)
-    }
-}
-
-impl From<redb::TransactionError> for Error {
-    fn from(err: redb::TransactionError) -> Self {
-        database_transaction(err)
-    }
-}
-
-impl From<redb::TableError> for Error {
-    fn from(err: redb::TableError) -> Self {
-        database_table(err)
-    }
-}
-
-impl From<redb::StorageError> for Error {
-    fn from(err: redb::StorageError) -> Self {
-        database_storage(err)
-    }
-}
-
-impl From<redb::CommitError> for Error {
-    fn from(err: redb::CommitError) -> Self {
-        database_commit(err)
     }
 }
 
@@ -199,12 +144,6 @@ pub(crate) fn entity_too_large(size: u64, limit: u64) -> Error {
     Error::Storage(storage::entity_too_large(size, limit))
 }
 
-/// A multipart part-key suffix is not a `u32`.
-#[inline]
-pub(crate) fn invalid_part_key(err: ParseIntError) -> Error {
-    Error::Storage(storage::invalid_part_key(err))
-}
-
 /// The operation is refused (reserved `.tinio` segment or read-only mode).
 #[inline]
 pub(crate) fn access_denied(key: &object::Key) -> Error {
@@ -215,36 +154,6 @@ pub(crate) fn access_denied(key: &object::Key) -> Error {
 #[inline]
 pub(crate) fn io(err: io::Error) -> Error {
     Error::Storage(storage::io(err))
-}
-
-/// Database open/create failed.
-#[inline]
-pub(crate) fn database_open(err: redb::DatabaseError) -> Error {
-    Error::Database(DatabaseError::Open(err))
-}
-
-/// A transaction failed.
-#[inline]
-pub(crate) fn database_transaction(err: redb::TransactionError) -> Error {
-    Error::Database(DatabaseError::Transaction(err))
-}
-
-/// Opening a table failed.
-#[inline]
-pub(crate) fn database_table(err: redb::TableError) -> Error {
-    Error::Database(DatabaseError::Table(err))
-}
-
-/// A get/insert/range failed.
-#[inline]
-pub(crate) fn database_storage(err: redb::StorageError) -> Error {
-    Error::Database(DatabaseError::Storage(err))
-}
-
-/// Commit failed.
-#[inline]
-pub(crate) fn database_commit(err: redb::CommitError) -> Error {
-    Error::Database(DatabaseError::Commit(err))
 }
 
 #[cfg(test)]
@@ -300,26 +209,18 @@ mod tests {
 
     #[test]
     fn extras_project_onto_contract_io() {
-        let core: storage::Error = Error::from(ValueTooLarge(1)).into();
+        let core: storage::Error = Error::Database(DatabaseError::from(ValueTooLarge(1))).into();
         assert!(matches!(core, Io(_)));
     }
 
     #[test]
     fn redb_errors_wrap_as_database() {
-        let err = Error::from(ValueTooLarge(99));
+        let err = Error::Database(DatabaseError::from(ValueTooLarge(99)));
         assert!(
             matches!(err, Error::Database(DatabaseError::Storage(_))),
             "{err}"
         );
         assert!(err.to_string().starts_with("storage error:"));
-    }
-
-    #[test]
-    fn parse_int_error_funnels_through_storage() {
-        let src = "x".parse::<u32>().unwrap_err();
-        let err = Error::from(src.clone());
-        assert!(matches!(err, Error::Storage(InvalidPartKey(_))));
-        assert_eq!(err.to_string(), format!("invalid part key: {src}"));
     }
 
     #[test]
@@ -375,51 +276,30 @@ mod tests {
     #[test]
     fn every_database_variant_wraps_and_displays() {
         let cases: [(Error, &str); 5] = [
-            (Error::from(DatabaseAlreadyOpen), "database error:"),
             (
-                Error::from(TxnStorage(ValueTooLarge(1))),
+                Error::Database(DatabaseError::from(DatabaseAlreadyOpen)),
+                "database error:",
+            ),
+            (
+                Error::Database(DatabaseError::from(TxnStorage(ValueTooLarge(1)))),
                 "transaction error:",
             ),
-            (Error::from(TableDoesNotExist("x".into())), "table error:"),
-            (Error::from(Corrupted("boom".into())), "storage error:"),
-            (Error::from(TransactionPoisoned), "commit error:"),
+            (
+                Error::Database(DatabaseError::from(TableDoesNotExist("x".into()))),
+                "table error:",
+            ),
+            (
+                Error::Database(DatabaseError::from(Corrupted("boom".into()))),
+                "storage error:",
+            ),
+            (
+                Error::Database(DatabaseError::from(TransactionPoisoned)),
+                "commit error:",
+            ),
         ];
         for (err, prefix) in cases {
             assert!(matches!(err, Error::Database(_)), "{err}");
             assert!(err.to_string().starts_with(prefix), "{err}");
-        }
-    }
-
-    #[test]
-    fn database_constructors_cover_every_variant() {
-        let open = database_open(DatabaseAlreadyOpen);
-        assert!(matches!(open, Error::Database(DatabaseError::Open(_))));
-        let txn = database_transaction(TxnStorage(ValueTooLarge(1)));
-        assert!(matches!(
-            txn,
-            Error::Database(DatabaseError::Transaction(_))
-        ));
-        let table = database_table(TableDoesNotExist("x".into()));
-        assert!(matches!(table, Error::Database(DatabaseError::Table(_))));
-        let commit = database_commit(TransactionPoisoned);
-        assert!(matches!(commit, Error::Database(DatabaseError::Commit(_))));
-        assert!(matches!(
-            database_storage(Corrupted("boom".into())),
-            Error::Database(DatabaseError::Storage(_))
-        ));
-    }
-
-    #[test]
-    fn every_database_variant_projects_onto_contract_io() {
-        for err in [
-            database_open(DatabaseAlreadyOpen),
-            database_transaction(TxnStorage(ValueTooLarge(1))),
-            database_table(TableDoesNotExist("x".into())),
-            database_commit(TransactionPoisoned),
-            database_storage(Corrupted("boom".into())),
-        ] {
-            let core: storage::Error = err.into();
-            assert!(matches!(core, Io(_)), "{core}");
         }
     }
 }

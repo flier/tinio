@@ -1,0 +1,16 @@
+[package]
+name = "tinio-store"
+version.workspace = true
+edition.workspace = true
+description = "Shared redb table layer for the tinio storage backends"
+publish = false
+
+[dependencies]
+derive_more = { workspace = true, features = ["full"] }
+redb.workspace = true
+thiserror.workspace = true
+
+tinio-core.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

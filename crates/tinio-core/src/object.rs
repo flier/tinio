@@ -222,6 +222,13 @@ impl Tags {
     /// side maps errors to the empty set — rows are API-written, so a
     /// garbage wire self-heals to missing, exactly like the
     /// invalid-etag rows.
+    /// Parse the wire form with the read-path self-heal: a domain-invalid
+    /// wire becomes the empty set (the discipline every backend's read
+    /// path shares — the point is never a hard error on a stale row).
+    pub fn from_wire_limited(input: &str, limit: usize) -> Self {
+        Self::parse_wire_limited(input, limit).unwrap_or_default()
+    }
+
     pub fn parse_wire_limited(input: &str, limit: usize) -> Result<Self, TagError> {
         let mut pairs = Vec::new();
         for pair in input.split('&') {

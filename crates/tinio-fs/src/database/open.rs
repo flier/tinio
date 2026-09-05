@@ -14,11 +14,9 @@ use redb::Database;
 use super::{
     compact::{Stats, snapshot},
     error::Error,
-    tables::{
-        BucketsTable, ObjectMetaTable, ObjectPartsTable, PartChecksumsTable, PartsTable,
-        StateTable, UploadChecksumsTable, UploadsTable,
-    },
+    tables::ensure_version,
 };
+use crate::_store::{ensure_all, state};
 
 const META_DB_FILE: &str = "meta.redb";
 
@@ -63,33 +61,27 @@ pub struct Open {
 ///
 /// # Errors
 ///
-/// `Error::Open` when the file exists but is not a valid redb database
-/// (corrupted state — the metadata is derivable and the file can be deleted
-/// for a rebuild); `UnsupportedVersion` on a version mismatch.
+/// `Error::Redb(Open(..))` when the file exists but is not a valid redb
+/// database (corrupted state — the metadata is derivable and the file can
+/// be deleted for a rebuild); `UnsupportedVersion` on a version mismatch.
 pub fn open(state_dir: &Path) -> Result<Open, Error> {
     fs::create_dir_all(state_dir)?;
     #[cfg(unix)]
     fs::set_permissions(state_dir, Permissions::from_mode(STATE_DIR_MODE))?;
     let path = meta_db_path(state_dir);
-    let db = Database::create(&path)?;
+    let db = Database::create(&path).map_err(|e| Error::Redb(e.into()))?;
     #[cfg(unix)]
     fs::set_permissions(&path, Permissions::from_mode(META_DB_MODE))?;
     let (compact_needed, stats) = {
-        let mut txn = db.begin_write()?;
+        let mut txn = db.begin_write().map_err(|e| Error::Redb(e.into()))?;
         let compact_needed = {
-            let mut state = StateTable::open(&mut txn)?;
-            state.ensure_version(&path)?;
+            let mut state = state::Table::open(&mut txn)?;
+            ensure_version(&mut state, &path)?;
             state.compact_marker()?
         };
-        ObjectMetaTable::ensure(&mut txn)?;
-        BucketsTable::ensure(&mut txn)?;
-        UploadsTable::ensure(&mut txn)?;
-        PartsTable::ensure(&mut txn)?;
-        UploadChecksumsTable::ensure(&mut txn)?;
-        PartChecksumsTable::ensure(&mut txn)?;
-        ObjectPartsTable::ensure(&mut txn)?;
-        let stats = snapshot(&txn.stats()?);
-        txn.commit()?;
+        ensure_all(&mut txn)?;
+        let stats = snapshot(&txn.stats().map_err(|e| Error::Redb(e.into()))?);
+        txn.commit().map_err(|e| Error::Redb(e.into()))?;
         (compact_needed, stats)
     };
     Ok(Open {
@@ -179,11 +171,12 @@ pub enum Integrity {
 ///
 /// # Errors
 ///
-/// `Error::Open` when the file does not exist or cannot be opened (doctor
-/// reports it; `check_integrity` itself is redb's automatic repair path).
+/// `Error::Redb(Open(..))` when the file does not exist or cannot be
+/// opened (doctor reports it; `check_integrity` itself is redb's automatic
+/// repair path).
 pub fn check_integrity(state_dir: &Path) -> Result<Integrity, Error> {
     let path = meta_db_path(state_dir);
-    let mut db = Database::open(&path)?;
+    let mut db = Database::open(&path).map_err(|e| Error::Redb(e.into()))?;
     match db.check_integrity() {
         Ok(true) => Ok(Integrity::Healthy),
         Ok(false) => Ok(Integrity::Repaired),

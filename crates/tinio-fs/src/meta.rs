@@ -47,8 +47,9 @@ pub use object::{Key, key};
 pub use crate::bucket::{Name, name};
 use crate::{
     _core::{checksum, etag::ETag, from_nanos, object, to_nanos},
+    _store::{meta, object_part},
     Error, bucket,
-    database::{self, Handle, ObjectMetaTable, ObjectPartsTable},
+    database::{Handle, for_bucket_strict},
     etag::{self, HashBuffer},
 };
 
@@ -206,7 +207,7 @@ pub struct GatedMeta {
     /// The row's key.
     pub key: object::Key,
     /// The validated stored entry, when present and valid.
-    pub stored: Option<database::StoredMeta>,
+    pub stored: Option<meta::Stored>,
 }
 
 /// One entry of a [`Store::set_batch`] write batch (pipeline-spec.md
@@ -267,7 +268,7 @@ impl Store {
         Self { handle }
     }
 
-    /// The stored [`database::StoredMeta`] of `key` — the hot-path read, without
+    /// The stored [`meta::Stored`] of `key` — the hot-path read, without
     /// building a [`Record`] (no key clone).
     /// A domain-invalid stored value cannot be trusted: it is reported as
     /// missing so the caller recomputes the ETag from the object file and
@@ -277,9 +278,13 @@ impl Store {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<Option<database::StoredMeta>, Error> {
+    ) -> Result<Option<meta::Stored>, Error> {
         self.handle
-            .read(|txn| ObjectMetaTable::open_readonly(txn)?.get(bucket, key))
+            .read(|txn| {
+                meta::Table::open_readonly(txn)?
+                    .get(bucket, key)
+                    .map_err(Into::into)
+            })
             .map_err(Into::into)
     }
 
@@ -378,7 +383,7 @@ impl Store {
         mtime: SystemTime,
         identity: u64,
         follow_symlinks: bool,
-    ) -> Result<(database::StoredMeta, bool), Error> {
+    ) -> Result<(meta::Stored, bool), Error> {
         if let Some(stored) = self.stored_entry(bucket, key).await? {
             if entry_matches(
                 stored.size,
@@ -408,7 +413,7 @@ impl Store {
                     .rewrite_preserving(bucket, key, &stored.etag, size, mtime, identity)
                     .await?;
                 return Ok((
-                    database::StoredMeta {
+                    meta::Stored {
                         etag: stored.etag,
                         size,
                         mtime: to_nanos(mtime),
@@ -429,7 +434,7 @@ impl Store {
             .rewrite_preserving(bucket, key, &etag, size, mtime, identity)
             .await?;
         Ok((
-            database::StoredMeta {
+            meta::Stored {
                 etag,
                 size,
                 mtime: to_nanos(mtime),
@@ -507,7 +512,7 @@ impl Store {
         let etag = etag.clone();
         self.handle
             .write(move |txn| {
-                let mut table = ObjectMetaTable::open(txn)?;
+                let mut table = meta::Table::open(txn)?;
                 let row = table.get(&bucket, &key)?;
                 let tags = row
                     .as_ref()
@@ -516,7 +521,7 @@ impl Store {
                 table.put(
                     &bucket,
                     &key,
-                    &database::StoredMeta {
+                    &meta::Stored {
                         etag: etag.clone(),
                         size,
                         mtime: to_nanos(mtime),
@@ -564,7 +569,7 @@ impl Store {
         let tags = tags.clone();
         self.handle
             .write_if(move |txn| {
-                let mut table = ObjectMetaTable::open(txn)?;
+                let mut table = meta::Table::open(txn)?;
                 let Some(row) = table.get(&bucket, &key)? else {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
@@ -572,7 +577,7 @@ impl Store {
                 table.put(
                     &bucket,
                     &key,
-                    &database::StoredMeta {
+                    &meta::Stored {
                         tags: tags.clone(),
                         ..row
                     },
@@ -611,7 +616,7 @@ impl Store {
         let tags = tags.clone();
         self.handle
             .write(move |txn| {
-                let mut table = ObjectMetaTable::open(txn)?;
+                let mut table = meta::Table::open(txn)?;
                 // A row that appeared during the hash keeps its checksum
                 // (the etag/size/mtime/identity are the hash-time ones —
                 // the row describes the same file read at hash time).
@@ -621,7 +626,7 @@ impl Store {
                 table.put(
                     &bucket,
                     &key,
-                    &database::StoredMeta {
+                    &meta::Stored {
                         etag: etag.clone(),
                         size,
                         mtime: to_nanos(mtime),
@@ -643,7 +648,7 @@ impl Store {
         let key = key.clone();
         self.handle
             .write_if(move |txn| {
-                let mut table = ObjectMetaTable::open(txn)?;
+                let mut table = meta::Table::open(txn)?;
                 let Some(row) = table.get(&bucket, &key)? else {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
@@ -654,7 +659,7 @@ impl Store {
                 table.put(
                     &bucket,
                     &key,
-                    &database::StoredMeta {
+                    &meta::Stored {
                         tags: object::Tags::empty(),
                         ..row
                     },
@@ -712,7 +717,7 @@ impl Store {
         let bucket = bucket.clone();
         self.handle
             .write(move |txn| {
-                let mut table = ObjectMetaTable::open(txn)?;
+                let mut table = meta::Table::open(txn)?;
                 for entry in &entries {
                     let row = table.get(&bucket, &entry.key)?;
                     let tags = row
@@ -722,7 +727,7 @@ impl Store {
                     table.put(
                         &bucket,
                         &entry.key,
-                        &database::StoredMeta {
+                        &meta::Stored {
                             etag: entry.etag.clone(),
                             size: entry.size,
                             mtime: to_nanos(entry.mtime),
@@ -747,8 +752,8 @@ impl Store {
         let key = key.clone();
         self.handle
             .write(move |txn| {
-                ObjectMetaTable::open(txn)?.remove(&bucket, &key)?;
-                ObjectPartsTable::open(txn)?.remove_key(&bucket, &key)?;
+                meta::Table::open(txn)?.remove(&bucket, &key)?;
+                object_part::Table::open(txn)?.remove_key(&bucket, &key)?;
                 Ok(())
             })
             .await
@@ -781,13 +786,13 @@ impl Store {
                 // table in a transaction); the two tables are drained in
                 // separate passes — the handle borrows cannot overlap.
                 {
-                    let mut table = ObjectMetaTable::open(txn)?;
+                    let mut table = meta::Table::open(txn)?;
                     for key in &keys {
                         table.remove(&bucket, key)?;
                     }
                 }
                 {
-                    let mut parts = ObjectPartsTable::open(txn)?;
+                    let mut parts = object_part::Table::open(txn)?;
                     for key in &keys {
                         parts.remove_key(&bucket, key)?;
                     }
@@ -815,11 +820,14 @@ impl Store {
         &self,
         bucket: &bucket::Name,
         keys: impl IntoIterator<Item = &'a object::Key>,
-    ) -> Result<Vec<Option<database::StoredMeta>>, Error> {
+    ) -> Result<Vec<Option<meta::Stored>>, Error> {
         self.handle
             .read(|txn| {
-                let table = ObjectMetaTable::open_readonly(txn)?;
-                keys.into_iter().map(|key| table.get(bucket, key)).collect()
+                let table = meta::Table::open_readonly(txn)?;
+                keys.into_iter()
+                    .map(|key| table.get(bucket, key))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
             })
             .map_err(Into::into)
     }
@@ -846,7 +854,7 @@ impl Store {
     pub fn load_bucket(&self, bucket: &bucket::Name) -> Result<Vec<GatedMeta>, Error> {
         self.handle
             .read(|txn| {
-                let table = ObjectMetaTable::open_readonly(txn)?;
+                let table = meta::Table::open_readonly(txn)?;
                 let mut out = Vec::new();
                 table.for_bucket_gated(bucket, |key, stored| {
                     out.push(GatedMeta { key, stored });
@@ -872,9 +880,9 @@ impl Store {
         let bucket = bucket.clone();
         self.handle
             .read_blocking(move |txn| {
-                let table = ObjectMetaTable::open_readonly(txn)?;
+                let table = meta::Table::open_readonly(txn)?;
                 let mut out = Vec::new();
-                table.for_bucket(&bucket, |key, etag, size, mtime| {
+                for_bucket_strict(&table, &bucket, |key, etag, size, mtime| {
                     out.push(Record {
                         key,
                         etag,
@@ -896,7 +904,11 @@ impl Store {
     pub async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let bucket = bucket.clone();
         self.handle
-            .write(move |txn| ObjectMetaTable::open(txn)?.drain_bucket(&bucket))
+            .write(move |txn| {
+                meta::Table::open(txn)?
+                    .drain_bucket(&bucket)
+                    .map_err(Into::into)
+            })
             .await
             .map_err(Into::into)
     }
@@ -928,6 +940,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{bucket, object},
+        _store::meta::{Stored, Table},
         _util::testing::etag,
         database, fsutil, meta,
     };
@@ -944,7 +957,7 @@ mod tests {
         let db = database::open(state_dir).unwrap().db;
         let mut txn = db.begin_write().unwrap();
         {
-            let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+            let mut table = Table::open(&mut txn).unwrap();
             table
                 .insert((bucket, key), ("not-an-etag", 1, 1, 0, "", ""))
                 .unwrap();
@@ -959,7 +972,7 @@ mod tests {
         let db = database::open(state_dir).unwrap().db;
         let mut txn = db.begin_write().unwrap();
         {
-            let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+            let mut table = Table::open(&mut txn).unwrap();
             table
                 .insert(
                     (bucket, key),
@@ -1172,7 +1185,7 @@ mod tests {
         }
         // The traversal form sees the same stored rows (same
         // transaction semantics, both forms of the gating load — R1).
-        let walked: Vec<Option<database::StoredMeta>> = store
+        let walked: Vec<Option<Stored>> = store
             .load_bucket(&b)
             .unwrap()
             .into_iter()
@@ -1320,7 +1333,7 @@ mod tests {
             let db = database::open(state.path()).unwrap().db;
             let mut txn = db.begin_write().unwrap();
             {
-                let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+                let mut table = Table::open(&mut txn).unwrap();
                 table
                     .insert(
                         ("data", "a.txt"),

@@ -9,6 +9,7 @@
 
 use std::{fs::read_dir, path::Path};
 
+use redb::TableHandle;
 use tinio_core::{
     bucket,
     multipart::part_number,
@@ -128,6 +129,37 @@ async fn deleting_meta_redb_self_heals() {
     let content = storage.get_object(&b, &"a.txt".into(), None).await.unwrap();
     let body = read_body(content.body).await.unwrap();
     assert_eq!(body, b"hello");
+}
+
+/// The on-disk byte-format contract: a freshly opened `meta.redb` contains
+/// exactly the seven shared store tables plus the fs-local `state` table,
+/// and nothing else (shared-store-table-layer 2026-09-03 Goal 4 / spec §4
+/// byte-format guard — tinio-store's own `ensure_all` test pins the seven
+/// shared names; this pins the full fs schema).
+#[test]
+fn open_creates_exactly_the_schema_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let opened = tinio_fs::database::open(dir.path()).unwrap();
+    let txn = opened.db.begin_write().unwrap();
+    let mut names: Vec<String> = txn
+        .list_tables()
+        .unwrap()
+        .map(|h| h.name().to_string())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "buckets",
+            "object_meta",
+            "object_parts",
+            "part_checksums",
+            "parts",
+            "state",
+            "upload_checksums",
+            "uploads",
+        ]
+    );
 }
 
 fn bucket_name(name: &str) -> bucket::Name {

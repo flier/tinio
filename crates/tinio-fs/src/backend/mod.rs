@@ -20,12 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bucket::Store as BucketStore;
 use derive_more::Debug;
 use garde::Validate;
 use getset::{CopyGetters, Getters};
 use lockmap::Map;
-use meta::Store;
 pub use objects::StagedBody;
 use tokio::fs;
 
@@ -33,7 +31,9 @@ pub use crate::error::Error;
 pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
 use crate::{
     _core::{
-        ETag, checksum, object, pipeline,
+        ETag,
+        bucket::{Name, name},
+        checksum, object, pipeline,
         storage::{
             COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
             DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
@@ -41,15 +41,13 @@ use crate::{
         },
         to_nanos,
     },
+    _store::{bucket, meta, object_part, upload},
     _util::lockmap,
-    bucket,
-    database::{
-        self, BucketsTable, Handle, ObjectMetaTable, ObjectPartsTable, UploadsTable,
-        compact_if_needed,
-    },
+    bucket::Store as BucketStore,
+    database::{self, Handle, compact_if_needed},
     etag, fsutil,
     listing::FsListing,
-    meta,
+    meta::Store as MetaStore,
     multipart::{CompletedPartRow, Store as MultipartStore, drain_bucket_uploads, drain_upload},
     path::{
         BoundaryCache, map_bucket_path, map_key_path, map_key_path_lexical, prove_key_contained,
@@ -221,10 +219,10 @@ pub struct FsStorage {
     compact_threshold_percent: u8,
     /// Bucket creation times (`BUCKETS` table).
     #[getset(get = "pub(crate)")]
-    bucket_store: bucket::Store,
+    bucket_store: BucketStore,
     /// The ETag metadata store.
     #[getset(get = "pub(crate)")]
-    meta_store: meta::Store,
+    meta_store: MetaStore,
     /// Multipart parts storage.
     #[getset(get = "pub(crate)")]
     multipart_store: MultipartStore,
@@ -250,7 +248,7 @@ pub struct FsStorage {
     /// (emptiness check and unpublish are one critical section against
     /// writes into A); mutations of B do not wait.
     #[getset(skip)]
-    bucket_mutation_locks: lockmap::Map<bucket::Name>,
+    bucket_mutation_locks: lockmap::Map<Name>,
     /// Validated path boundaries (root + per-bucket), identity-checked
     /// and bounded — the containment proof of [`bucket_dir`](Self::bucket_dir)
     /// and [`key_path`](Self::key_path).
@@ -324,10 +322,7 @@ impl FsStorage {
     /// A wait past [`MUTATION_LOCK_WARN_THRESHOLD`] is warned (D-E): a
     /// delete/create/commit of the same name is holding the mutex — long
     /// enough to see in the logs, never silently absorbed.
-    pub(crate) async fn lock_bucket_mutations(
-        &self,
-        name: &bucket::Name,
-    ) -> lockmap::Guard<bucket::Name> {
+    pub(crate) async fn lock_bucket_mutations(&self, name: &Name) -> lockmap::Guard<Name> {
         let started = Instant::now();
         let guard = self.bucket_mutation_locks.lock(name.clone()).await;
         let waited = started.elapsed();
@@ -384,7 +379,7 @@ impl FsStorage {
             compact_threshold_percent,
             listing: FsListing::new(
                 &canonical,
-                Store::from_handle(handle.clone()),
+                MetaStore::from_handle(handle.clone()),
                 follow_symlinks,
                 io_pipeline,
                 db_pipeline,
@@ -393,7 +388,7 @@ impl FsStorage {
             ),
             remove_pipeline,
             bucket_store: BucketStore::from_handle(handle.clone()),
-            meta_store: Store::from_handle(handle.clone()),
+            meta_store: MetaStore::from_handle(handle.clone()),
             multipart_store: MultipartStore::from_handle(
                 handle.clone(),
                 &state_dir,
@@ -428,7 +423,7 @@ impl FsStorage {
     /// **Async (item 7a)**: the symlink probe and canonicalize run
     /// through `tokio::fs` — no sync syscalls on the request threads
     /// (the old per-object-op `std::fs` pair is gone).
-    pub(crate) async fn bucket_dir(&self, name: &bucket::Name) -> Result<PathBuf, Error> {
+    pub(crate) async fn bucket_dir(&self, name: &Name) -> Result<PathBuf, Error> {
         if self.follow_symlinks {
             let lexical = self.root().join(&**name);
             match fs::symlink_metadata(&lexical).await {
@@ -530,7 +525,7 @@ impl FsStorage {
     /// The collected form of the streaming [`Self::for_each_bucket_name`]
     /// — the scanner and cleanup need the full list; `list_buckets`
     /// feeds the stream into the bounded pagination engine instead.
-    pub(crate) async fn bucket_names(&self, prefix: &str) -> Result<Vec<bucket::Name>, Error> {
+    pub(crate) async fn bucket_names(&self, prefix: &str) -> Result<Vec<Name>, Error> {
         let mut out = Vec::new();
         self.for_each_bucket_name(prefix, |name| out.push(name))
             .await?;
@@ -547,20 +542,20 @@ impl FsStorage {
     async fn for_each_bucket_name(
         &self,
         prefix: &str,
-        mut visit: impl FnMut(bucket::Name),
+        mut visit: impl FnMut(Name),
     ) -> Result<(), Error> {
         let mut entries = fs::read_dir(self.root()).await?;
         while let Some(entry) = entries.next_entry().await? {
             let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
+            let Some(raw) = file_name.to_str() else {
                 continue; // non-UTF8 names cannot be bucket names
             };
             // No I/O and no allocation before this point: a non-matching
             // name is dropped on the borrowed `&str`.
-            if !name.starts_with(prefix) {
+            if !raw.starts_with(prefix) {
                 continue;
             }
-            let Ok(name) = bucket::name(name) else {
+            let Ok(name) = name(raw) else {
                 continue; // invalid names (incl. `.tinio`) are not buckets
             };
             if self.entry_is_bucket_dir(&entry).await {
@@ -594,20 +589,20 @@ impl FsStorage {
     /// under the mutation lock; errors propagate — a swallowed failure
     /// would leak `OBJECT_META` rows that no cleanup stage can see (the
     /// repair walk only visits live buckets).
-    pub(crate) async fn remove_bucket_state(&self, bucket: &bucket::Name) -> Result<(), Error> {
+    pub(crate) async fn remove_bucket_state(&self, bucket: &Name) -> Result<(), Error> {
         let bucket = bucket.clone();
         self.handle
             .write(move |txn| {
                 {
-                    let mut buckets = BucketsTable::open(txn)?;
+                    let mut buckets = bucket::Table::open(txn)?;
                     buckets.remove(&bucket)?;
                 }
                 {
-                    let mut meta = ObjectMetaTable::open(txn)?;
+                    let mut meta = meta::Table::open(txn)?;
                     meta.drain_bucket(&bucket)?;
                 }
                 {
-                    let mut parts = ObjectPartsTable::open(txn)?;
+                    let mut parts = object_part::Table::open(txn)?;
                     parts.drain_bucket(&bucket)?;
                 }
                 drain_bucket_uploads(txn, &bucket)?;
@@ -637,7 +632,7 @@ impl FsStorage {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_object_state(
         &self,
-        bucket: &bucket::Name,
+        bucket: &Name,
         key: &object::Key,
         upload_id: &str,
         etag: &ETag,
@@ -662,7 +657,7 @@ impl FsStorage {
                 // the drain, never re-ferried through the interface. A
                 // garbage wire self-heals to the empty set.
                 let tags = {
-                    let uploads = UploadsTable::open(txn)?;
+                    let uploads = upload::Table::open(txn)?;
                     let tags_wire = uploads
                         .get_matching(&bucket, &key, &upload_id)?
                         .map_or_else(String::new, |(_, _, wire)| wire);
@@ -671,11 +666,11 @@ impl FsStorage {
                 };
                 drain_upload(txn, &bucket, &upload_id)?;
                 {
-                    let mut meta = ObjectMetaTable::open(txn)?;
-                    meta.put(
+                    let mut table = meta::Table::open(txn)?;
+                    table.put(
                         &bucket,
                         &key,
-                        &database::StoredMeta {
+                        &meta::Stored {
                             etag: etag.clone(),
                             size,
                             mtime: to_nanos(mtime),
@@ -689,7 +684,7 @@ impl FsStorage {
                     // The retained part list: replace any stale rows of
                     // the key, then insert this completion's parts (a
                     // re-completed key must not accumulate rows).
-                    let mut parts_table = ObjectPartsTable::open(txn)?;
+                    let mut parts_table = object_part::Table::open(txn)?;
                     parts_table.remove_key(&bucket, &key)?;
                     for (n, part_size, checksum_row) in &parts {
                         let (algorithm, value) = match checksum_row {

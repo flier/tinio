@@ -863,9 +863,9 @@ mod tests {
                 ListObjectsParams,
             },
         },
+        _store::meta::Table,
         _util::testing,
         database,
-        database::ObjectMetaTable,
         testutil::{GatedRunner, LossyRunner, PacedRunner, files, link_directory, wait_for},
     };
 
@@ -1649,7 +1649,7 @@ mod tests {
             let db = database::open(state.path()).unwrap().db;
             let mut txn = db.begin_write().unwrap();
             {
-                let mut table = ObjectMetaTable::open(&mut txn).unwrap();
+                let mut table = Table::open(&mut txn).unwrap();
                 table
                     .insert(("data", "f00.txt"), ("not-an-etag", 1, 1, 0, "", ""))
                     .unwrap();

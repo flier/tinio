@@ -22,7 +22,7 @@
 
 ## Error
 
-- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `Database`; extras → `Io`. One `#[inline] pub(crate)` ctor/variant (`already_exists(name)`).
+- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `tinio_store::error::Error` (thiserror `#[from]`, display verbatim; fs `Redb`/mem `DatabaseError`; hop `Error::Redb(e.into())`); extras → `Io`. ctor `already_exists(name)`.
 
 ## Async traits
 
