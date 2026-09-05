@@ -564,6 +564,7 @@ fn like_tokens(pattern: &str, escape: Option<char>) -> Vec<LikeTok> {
         } else {
             match p[i] {
                 '%' if !matches!(toks.last(), Some(LikeTok::Star)) => toks.push(LikeTok::Star),
+                '%' => {}
                 '_' => toks.push(LikeTok::Single),
                 c => toks.push(LikeTok::Char(c)),
             }
@@ -1162,6 +1163,31 @@ mod tests {
             Err(SelectError::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
             other => panic!("expected one-char escape error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn like_consecutive_percent_runs_collapse() {
+        // A `%` run is one star — `%%` is not a literal-percent suffix.
+        let rows = |sql: &str| run(sql, vec![csv(&["x"], &["_1"])]).len();
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE 'hello' LIKE '%%'"), 1);
+        assert_eq!(
+            rows("SELECT * FROM S3Object s WHERE 'hello' LIKE '%%llo%%'"),
+            1
+        );
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE 'a' LIKE '%%%'"), 1);
+        assert_eq!(
+            rows("SELECT * FROM S3Object s WHERE 'a-b' LIKE '%%a%%b%%'"),
+            1
+        );
+        // A star before a subject's literal `%` consumes it, and a star
+        // also covers text with no literal `%` at all.
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE '50%' LIKE '50%%'"), 1);
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE '500' LIKE '50%%'"), 1);
+        // Escaped literal `%` followed by a star stays literal.
+        assert_eq!(
+            rows("SELECT * FROM S3Object s WHERE '50%' LIKE '50\\%%' ESCAPE '\\'"),
+            1
+        );
     }
 
     #[test]
