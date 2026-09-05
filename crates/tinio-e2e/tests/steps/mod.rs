@@ -113,6 +113,7 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         caps.list_objects_v2 = false;
         caps.delete_objects = false;
         caps.tagging = false;
+        caps.cors = false;
     }
     if tagged("max-buckets-3") {
         // The ListBuckets-pagination scenarios need a page cap below the

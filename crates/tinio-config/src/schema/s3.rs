@@ -84,6 +84,11 @@ pub struct Capabilities {
     #[serde(default = "tagging")]
     #[default = true]
     pub tagging: bool,
+
+    /// Bucket CORS (Get/Put/DeleteBucketCors). Default on.
+    #[serde(default = "cors")]
+    #[default = true]
+    pub cors: bool,
 }
 
 /// S3 section (`[s3]`; runtime level, FR-021). Disabled capability groups
@@ -158,6 +163,10 @@ fn max_keys() -> u32 {
 
 fn tagging() -> bool {
     Capabilities::default().tagging
+}
+
+fn cors() -> bool {
+    Capabilities::default().cors
 }
 
 impl From<&Config> for Capabilities {
@@ -296,6 +305,21 @@ mod tests {
         let toml = "tagging = false";
         let caps: Capabilities = toml::from_str(toml).unwrap();
         assert!(!caps.tagging);
+    }
+
+    #[test]
+    fn cors_defaults_on_and_can_be_disabled() {
+        // The default config has CORS enabled.
+        let caps = Capabilities::default();
+        assert!(caps.cors);
+        // A config with cors: false round-trips.
+        let toml = "cors = false";
+        let caps: Capabilities = toml::from_str(toml).unwrap();
+        assert!(!caps.cors);
+        // The knob flows through the capability pipeline.
+        let config = RootConfig::parse("version = 1\n[s3]\ncors = false").unwrap();
+        let caps = Capabilities::from(config.s3.as_ref().unwrap());
+        assert!(!caps.cors);
     }
 
     #[test]
