@@ -1,8 +1,10 @@
-//! Bucket creation times and tags (task T040, migrated to redb per
-//! meta-redb-spec; the tags element per spec 2026-08-31).
+//! Bucket creation times, tags, owner/ACL, and CORS (task T040, migrated
+//! to redb per meta-redb-spec; the elements per specs 2026-08-31 and
+//! 2026-09-05).
 //!
 //! `BUCKETS` table of `<state-dir>/meta.redb`: `name` →
-//! `(created-at unix nanos, tags wire)`. Pre-existing directories get
+//! `(created-at unix nanos, tags wire, owner wire, acl wire, cors wire)`
+//! — a wire element is `''` when unset. Pre-existing directories get
 //! their creation time lazily recorded on first sight; orphaned entries
 //! are pruned on bucket delete and at startup repair (through
 //! [`crate::FsCleanup`]). Redb transactions replace the old
@@ -14,7 +16,7 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 
 pub use crate::_core::bucket::{Name, name};
 use crate::{
-    _core::object,
+    _core::{cors, object, storage::no_such_bucket},
     _store::bucket,
     Error,
     database::{self, BUCKET_TAGS_MAX, Handle},
@@ -73,18 +75,19 @@ impl Store {
             .read(move |txn| {
                 let table = bucket::Table::open_readonly(txn)?;
                 let row = table.row(&name)?;
-                Ok(row.map_or_else(object::Tags::empty, |(_, wire)| {
+                Ok(row.map_or_else(object::Tags::empty, |(_, wire, _, _, _)| {
                     object::Tags::from_wire_limited(&wire, BUCKET_TAGS_MAX)
                 }))
             })
             .map_err(Into::into)
     }
 
-    /// Replace the bucket's tag set, preserving the creation time — one
-    /// read-modify-write transaction (the row's created-at is kept; a
-    /// missing row is lazily recorded with `now`, the first-sight policy
-    /// of [`Self::get_or_record`]). The caller answers `NoSuchBucket`
-    /// for a missing bucket directory before calling.
+    /// Replace the bucket's tag set, preserving the creation time and the
+    /// other wire elements — one read-modify-write transaction (the row's
+    /// created-at is kept; a missing row is lazily recorded with `now`,
+    /// the first-sight policy of [`Self::get_or_record`]). The caller
+    /// answers `NoSuchBucket` for a missing bucket directory before
+    /// calling.
     pub async fn set_tags(&self, name: &Name, tags: &object::Tags) -> Result<(), Error> {
         let name = name.clone();
         let tags = tags.clone();
@@ -92,16 +95,24 @@ impl Store {
         self.handle
             .write_if(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let Some((created, wire)) = table.row(&name)? else {
+                let Some((created, wire, owner_wire, acl_wire, cors_wire)) = table.row(&name)?
+                else {
                     // No row yet — the lazy first-sight record (a real
                     // change: it creates the entry).
-                    table.put_full(&name, SystemTime::now(), &tags_wire)?;
+                    table.put_full(&name, SystemTime::now(), &tags_wire, "", "", "")?;
                     return Ok(Some(()));
                 };
                 if wire == tags_wire {
                     return Ok(None);
                 }
-                table.put_full(&name, created, &tags_wire)?;
+                table.put_full(
+                    &name,
+                    created,
+                    &tags_wire,
+                    &owner_wire,
+                    &acl_wire,
+                    &cors_wire,
+                )?;
                 Ok(Some(()))
             })
             .await
@@ -109,27 +120,114 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Clear the bucket's tag set, preserving the creation time
-    /// (idempotent — a missing row is a no-op; the caller answers
-    /// `NoSuchBucket` for a missing bucket directory before calling).
+    /// Clear the bucket's tag set, preserving the creation time and the
+    /// other wire elements (idempotent — a missing row is a no-op; the
+    /// caller answers `NoSuchBucket` for a missing bucket directory
+    /// before calling).
     pub async fn clear_tags(&self, name: &Name) -> Result<(), Error> {
         let name = name.clone();
         self.handle
             .write_if(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let Some((created, wire)) = table.row(&name)? else {
+                let Some((created, wire, owner_wire, acl_wire, cors_wire)) = table.row(&name)?
+                else {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
                 };
                 if wire.is_empty() {
                     return Ok(None);
                 }
-                table.put_full(&name, created, "")?;
+                table.put_full(&name, created, "", &owner_wire, &acl_wire, &cors_wire)?;
                 Ok(Some(()))
             })
             .await
             .map(|_| ())
             .map_err(Into::into)
+    }
+
+    /// The bucket's CORS configuration, in stored order — `None` when
+    /// the bucket has no CORS configuration: no state record (a bucket
+    /// never seen through the API), the `''` wire (the cleared or
+    /// zero-rule state), or a corrupt wire (self-healing, like the store
+    /// [`bucket::decode_cors_wire`]).
+    pub async fn cors(&self, name: &Name) -> Result<Option<cors::CorsConfig>, Error> {
+        let name = name.clone();
+        self.handle
+            .read(move |txn| {
+                let table = bucket::Table::open_readonly(txn)?;
+                let row = table.row(&name)?;
+                Ok(row.and_then(|(_, _, _, _, cors_wire)| {
+                    let config = bucket::decode_cors_wire(&cors_wire);
+                    // op-review G2: the `''` wire — a zero-rule config,
+                    // the cleared state — is "no configuration".
+                    (!config.rules.is_empty()).then_some(config)
+                }))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Replace the bucket's CORS configuration, preserving the creation
+    /// time and the other wire elements (replace-all, no merge). A bucket
+    /// without a state record answers `NoSuchBucket`.
+    pub async fn set_cors(&self, name: &Name, config: &cors::CorsConfig) -> Result<(), Error> {
+        let name = name.clone();
+        let row_name = name.clone();
+        let config = config.clone();
+        let found = self
+            .handle
+            .write_if(move |txn| {
+                let mut table = bucket::Table::open(txn)?;
+                let Some((created, tags_wire, owner_wire, acl_wire, _)) = table.row(&row_name)?
+                else {
+                    return Ok(None);
+                };
+                // op-review G2: an empty rule set normalizes to the `''`
+                // wire — a zero-rule config is "no configuration", never
+                // a non-empty row.
+                let cors_wire = if config.rules.is_empty() {
+                    String::new()
+                } else {
+                    config.to_wire()
+                };
+                table.put_full(
+                    &row_name,
+                    created,
+                    &tags_wire,
+                    &owner_wire,
+                    &acl_wire,
+                    &cors_wire,
+                )?;
+                Ok(Some(()))
+            })
+            .await?;
+        match found {
+            Some(()) => Ok(()),
+            None => Err(no_such_bucket(&name).into()),
+        }
+    }
+
+    /// Remove the bucket's CORS configuration, preserving the creation
+    /// time and the other wire elements (`''` = "no configuration").
+    /// A bucket without a state record answers `NoSuchBucket`.
+    pub async fn clear_cors(&self, name: &Name) -> Result<(), Error> {
+        let name = name.clone();
+        let row_name = name.clone();
+        let found = self
+            .handle
+            .write_if(move |txn| {
+                let mut table = bucket::Table::open(txn)?;
+                let Some((created, tags_wire, owner_wire, acl_wire, _)) = table.row(&row_name)?
+                else {
+                    return Ok(None);
+                };
+                table.put_full(&row_name, created, &tags_wire, &owner_wire, &acl_wire, "")?;
+                Ok(Some(()))
+            })
+            .await?;
+        match found {
+            Some(()) => Ok(()),
+            None => Err(no_such_bucket(&name).into()),
+        }
     }
 
     /// The creation time of a bucket, lazily recorded on first sight:
@@ -255,6 +353,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        _core::storage::Error as StorageError,
         _util::testing::assert_send_sync,
         bucket,
         database::{self, Error::UnsupportedVersion, StateTable},
@@ -312,6 +411,96 @@ mod tests {
         let all = store.load_all().await.unwrap();
         let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn fs_store_cors_round_trip_preserves_order_and_optional_fields() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        store.record(&name, t(100)).await.unwrap();
+        assert_eq!(
+            store.cors(&name).await.unwrap(),
+            None,
+            "an unconfigured bucket answers None"
+        );
+        let cfg = cors::CorsConfig {
+            rules: vec![
+                cors::CorsRule {
+                    id: Some("one".into()),
+                    allowed_methods: vec!["GET".into()],
+                    allowed_origins: vec!["*".into()],
+                    allowed_headers: Some(vec!["x-amz-*".into()]),
+                    expose_headers: Some(vec!["ETag".into()]),
+                    max_age_seconds: Some(60),
+                },
+                cors::CorsRule {
+                    id: None,
+                    allowed_methods: vec!["PUT".into(), "DELETE".into()],
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_headers: None,
+                    expose_headers: None,
+                    max_age_seconds: None,
+                },
+            ],
+        };
+        store.set_cors(&name, &cfg).await.unwrap();
+        assert_eq!(store.cors(&name).await.unwrap(), Some(cfg.clone())); // order + fields preserved
+        // The row's other elements survive the CORS writes.
+        assert_eq!(store.created_at(&name).await.unwrap(), Some(t(100)));
+        store.clear_cors(&name).await.unwrap();
+        assert_eq!(store.cors(&name).await.unwrap(), None); // clear → "no config"
+    }
+
+    #[tokio::test]
+    async fn fs_store_cors_empty_config_normalizes_to_no_config() {
+        // op-review G2: a zero-rule config stored through the backend must
+        // be indistinguishable from "no configuration" ('' wire → get → None).
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        store.record(&name, t(100)).await.unwrap();
+        store
+            .set_cors(&name, &cors::CorsConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(store.cors(&name).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn fs_store_cors_missing_row_is_no_such_bucket_for_writes() {
+        // The write accessors answer NoSuchBucket when the state row is
+        // absent (a bucket that is not recorded cannot be configured); the
+        // missing-BUCKET probes (the real "missing bucket") are answered by
+        // the BucketOps impl through `ensure_bucket`.
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        store.record(&name, t(100)).await.unwrap();
+        store.remove(&name).await.unwrap();
+        let cfg = cors::CorsConfig {
+            rules: vec![cors::CorsRule {
+                id: None,
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["*".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        };
+        let err = store.set_cors(&name, &cfg).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
+            "{err:?}"
+        );
+        let err = store.clear_cors(&name).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::NoSuchBucket(_))),
+            "{err:?}"
+        );
+        // The read probe: no record = no configuration (a bucket without a
+        // state row has no CORS configuration, never an error).
+        assert_eq!(store.cors(&name).await.unwrap(), None);
     }
 
     #[tokio::test]

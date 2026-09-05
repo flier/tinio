@@ -15,7 +15,7 @@ use crate::{
     _core::{
         BucketsListing, ListBucketsParams,
         bucket::{self, Bucket},
-        object,
+        cors, object,
         storage::{BucketOps, UnorderedPager, already_exists, no_such_bucket, not_empty},
     },
     path::{STATE_DIR_NAME, bucket_path_lexical},
@@ -219,6 +219,37 @@ impl BucketOps for FsStorage {
         // contract's delete-object/bucket leniency). The row's creation
         // time is preserved; a row-less bucket has nothing to clear.
         self.bucket_store.clear_tags(name).await
+    }
+
+    async fn get_bucket_cors(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<cors::CorsConfig>, Error> {
+        // Existence is the bucket directory (`NoSuchBucket` when missing —
+        // mirroring `get_bucket_tags`); the configuration comes from the
+        // `BUCKETS` row, None when the bucket has no configuration (`''`
+        // wire — a bucket that was cleared or never configured).
+        self.ensure_bucket(name).await?;
+        self.bucket_store.cors(name).await
+    }
+
+    async fn put_bucket_cors(
+        &self,
+        name: &bucket::Name,
+        cors: &cors::CorsConfig,
+    ) -> Result<(), Error> {
+        self.ensure_bucket(name).await?;
+        self.bucket_store.set_cors(name, cors).await
+    }
+
+    async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), Error> {
+        // S3 semantics: `NoSuchBucket` when the bucket is missing — the
+        // delete-tagging idempotent leniency does NOT extend here (the
+        // CORS spec mandates `NoSuchBucket` for a missing bucket); a
+        // bucket that simply has no configuration clears to the same
+        // state (idempotent). The row's creation time is preserved.
+        self.ensure_bucket(name).await?;
+        self.bucket_store.clear_cors(name).await
     }
 }
 
@@ -805,5 +836,83 @@ mod tests {
             .into();
         assert!(matches!(err, NoSuchBucket(_)));
         storage.delete_bucket_tags(&ghost).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fs_bucket_cors_round_trip_and_replace() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        assert!(
+            storage.get_bucket_cors(&b).await.unwrap().is_none(),
+            "an unconfigured bucket answers None"
+        );
+
+        let config = cors::CorsConfig {
+            rules: vec![
+                cors::CorsRule {
+                    id: Some("one".into()),
+                    allowed_methods: vec!["GET".into()],
+                    allowed_origins: vec!["*".into()],
+                    allowed_headers: Some(vec!["x-amz-*".into()]),
+                    expose_headers: Some(vec!["ETag".into()]),
+                    max_age_seconds: Some(60),
+                },
+                cors::CorsRule {
+                    id: None,
+                    allowed_methods: vec!["PUT".into(), "DELETE".into()],
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_headers: None,
+                    expose_headers: None,
+                    max_age_seconds: None,
+                },
+            ],
+        };
+        // Put → Get round-trip (replace-all, no merge; order + fields kept).
+        storage.put_bucket_cors(&b, &config).await.unwrap();
+        assert_eq!(
+            storage.get_bucket_cors(&b).await.unwrap(),
+            Some(config.clone())
+        );
+
+        // op-review G2: a zero-rule config through the whole backend must
+        // be indistinguishable from "no configuration".
+        storage
+            .put_bucket_cors(&b, &cors::CorsConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);
+        storage.put_bucket_cors(&b, &config).await.unwrap();
+        assert_eq!(
+            storage.get_bucket_cors(&b).await.unwrap(),
+            Some(config.clone())
+        );
+
+        // head_bucket still reports the creation time (the row's other
+        // elements survive the CORS writes).
+        let head = storage.head_bucket(&b).await.unwrap();
+        assert!(
+            head.creation_time <= std::time::SystemTime::now(),
+            "the creation time must survive bucket CORS writes"
+        );
+
+        // Delete clears; the delete is idempotent on the stored config.
+        storage.delete_bucket_cors(&b).await.unwrap();
+        assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);
+        storage.delete_bucket_cors(&b).await.unwrap();
+
+        // Missing bucket: get/put/delete → NoSuchBucket (the CORS spec —
+        // unlike the delete-bucket-tags idempotent Ok).
+        let ghost = bucket::name("ghost").unwrap();
+        let err: StorageError = storage.get_bucket_cors(&ghost).await.unwrap_err().into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        let err: StorageError = storage
+            .put_bucket_cors(&ghost, &config)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        let err: StorageError = storage.delete_bucket_cors(&ghost).await.unwrap_err().into();
+        assert!(matches!(err, NoSuchBucket(_)));
     }
 }

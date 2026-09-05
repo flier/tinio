@@ -31,10 +31,10 @@ pub type Table<'txn, T = redb::Table<'txn, <Def as TableDef>::Key, <Def as Table
 /// Self-healing decode of the stored CORS wire: an empty or corrupt wire
 /// is an empty config (`''` = "no configuration" = 404 on get).
 ///
-/// Interim: dead until the CORS data plane lands (Task 5's fs/mem
-/// write/read paths consume it through the store, where it goes `pub`).
-#[allow(dead_code)]
-pub(crate) fn decode_cors_wire(wire: &str) -> CorsConfig {
+/// Consumed by the store CORS accessors (`tinio-fs`/`tinio-mem` read
+/// paths, through the `_store::bucket` alias) — the encode half is
+/// [`CorsConfig::to_wire`].
+pub fn decode_cors_wire(wire: &str) -> CorsConfig {
     if wire.is_empty() {
         CorsConfig::default()
     } else {
