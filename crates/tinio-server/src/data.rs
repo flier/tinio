@@ -24,6 +24,14 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "cors")]
+use http::{
+    HeaderValue,
+    header::{
+        ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_METHODS,
+        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ORIGIN, VARY,
+    },
+};
 use http::{
     Method, Request, Response,
     header::{CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT},
@@ -50,7 +58,7 @@ use tower::Service as TowerService;
 use tracing::Level;
 
 #[cfg(feature = "cors")]
-use crate::backend::cors::{CorsConfigs, CorsLookup, CorsPreflightRoute};
+use crate::backend::cors::{CorsConfigs, CorsLookup, CorsPreflightRoute, bucket_from_uri};
 use crate::{
     _core::storage::Storage,
     backend::{Capabilities, S3Backend},
@@ -290,10 +298,9 @@ pub struct DataPlaneService {
     /// [`DataPlane::with_metrics`] attaches the server's hook.
     metrics: MetricsRefresh,
     /// The CORS config lookup (feature + capability double-gated; `None`
-    /// when the preflight route is not armed) — the Task-10 decoration
-    /// reads it (not yet built; hence dead_code here).
+    /// when the preflight route is not armed) — read by the Task-10
+    /// decoration on every non-preflight response.
     #[cfg(feature = "cors")]
-    #[allow(dead_code)]
     cors: Option<Arc<dyn CorsLookup>>,
 }
 
@@ -357,6 +364,18 @@ impl DataPlaneService {
             (peer.ip().to_string(), request, referer, user_agent)
         });
 
+        // The Task-10 CORS decoration inputs, captured BEFORE the request
+        // is consumed: the Origin header and the URI (the decoration runs
+        // after the inner service answers, against the stored values).
+        #[cfg(feature = "cors")]
+        let origin = req
+            .headers()
+            .get(ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        #[cfg(feature = "cors")]
+        let uri = req.uri().clone();
+
         // Count upload bytes on the request body.
         let (parts, body) = req.into_parts();
         let upload_counter = Arc::new(AtomicU64::new(0));
@@ -368,6 +387,10 @@ impl DataPlaneService {
         // exact-body `Incoming`); clone per request — `S3Service` is an
         // `Arc` internally.
         let mut service = self.inner.clone();
+        // The decoration runs inside the 'static service future, which
+        // cannot borrow `&self` — the erased lookup is cloned (Arc).
+        #[cfg(feature = "cors")]
+        let cors = self.cors.clone();
         let future = TowerService::call(&mut service, req);
         Box::pin(async move {
             // s3s's `HttpError` is not a `std::error::Error` — box its
@@ -388,6 +411,67 @@ impl DataPlaneService {
             let (status, body_bytes, result) = match result {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    // Task-10 CORS decoration of the ACTUAL response (the
+                    // preflight route answers OPTIONS itself; this covers
+                    // every other operation): the Access-Control-* headers
+                    // of the rule that matches the request's Origin +
+                    // method — `rule_for` is first-origin-match with the
+                    // method validated WITHIN that rule (no fall-through).
+                    // s3s encodes op errors as Ok(Response) bodies, so 4xx
+                    // XML answers are decorated too — matches AWS. The
+                    // lookup is `None` unless feature + capability are on,
+                    // which short-circuits everything below. (The mut
+                    // shadow is cfg'd: feature-off builds leave the
+                    // binding plain.)
+                    #[cfg(feature = "cors")]
+                    let mut response = response;
+                    #[cfg(feature = "cors")]
+                    if let (Some(cors), Some(origin)) = (cors.as_deref(), origin.as_deref())
+                        && let Some(bucket) = bucket_from_uri(&uri)
+                        && let Some(config) = cors.get(&bucket).await
+                        && let Some(rule) = config.rule_for(origin, &method)
+                    {
+                        let headers = response.headers_mut();
+                        // grilling Q11: a rule whose allowed_origins
+                        // contains bare "*" answers ACAO "*" and OMITS
+                        // Allow-Credentials (the two are incompatible);
+                        // otherwise echo the origin + allow the credentials.
+                        // Fallible HeaderValue construction — every value
+                        // here is request or config data — SKIPS, never
+                        // unwraps (op-review S1).
+                        let star_rule = rule.allowed_origins.iter().any(|o| o == "*");
+                        if let Ok(v) = HeaderValue::from_str(if star_rule { "*" } else { origin }) {
+                            headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, v);
+                        }
+                        let methods = rule.allowed_methods.join(", ");
+                        if let Ok(v) = HeaderValue::from_str(&methods) {
+                            headers.insert(ACCESS_CONTROL_ALLOW_METHODS, v);
+                        }
+                        if let Some(expose) = &rule.expose_headers
+                            && !expose.is_empty()
+                            && let Ok(v) = HeaderValue::from_str(&expose.join(", "))
+                        {
+                            headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, v);
+                        }
+                        if !star_rule {
+                            // The literal is not request data — the safe
+                            // constant form (the preflight route's pattern).
+                            headers.insert(
+                                ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                                HeaderValue::from_static("true"),
+                            );
+                        }
+                        // grilling Q4 + op-review G3: APPEND (merge, never
+                        // replace) the Vary trio; the wire carries the
+                        // three as separate Vary lines.
+                        for v in [
+                            "Origin",
+                            "Access-Control-Request-Headers",
+                            "Access-Control-Request-Method",
+                        ] {
+                            headers.append(VARY, HeaderValue::from_static(v));
+                        }
+                    }
                     // Count download bytes on the response body (recorded
                     // when the stream ends); the access log uses the
                     // response Content-Length (known upfront).
@@ -585,10 +669,12 @@ mod tests {
         _core::{
             bucket,
             cors::{CorsConfig, CorsRule},
+            object,
             pipeline::Stats,
-            storage::BucketOps,
+            storage::{BucketOps, ObjectOps},
         },
         _mem::MemoryStorage,
+        _util::testing::body,
     };
 
     /// One captured event: the target and its key/value fields.
@@ -982,6 +1068,213 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert_eq!(status, 400, "{text}");
         assert!(text.contains("InvalidBucketName"), "{text}");
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A plane over a fresh MemoryStorage seeded with the bucket "data"
+    /// (plus the object "key" carrying "payload") and the CORS config,
+    /// served on an ephemeral port with the cors capability on.
+    async fn seeded_cors_plane(
+        config: CorsConfig,
+    ) -> (SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
+        let storage = MemoryStorage::new().unwrap();
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        storage
+            .put_object(&name, &object::key("key").unwrap(), body(b"payload"))
+            .await
+            .unwrap();
+        storage.put_bucket_cors(&name, &config).await.unwrap();
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, rx) = watch::channel(false);
+        let plane = DataPlane::new(storage, Capabilities::default());
+        let handle = tokio::spawn(async move {
+            plane.serve(listener, rx).await.unwrap();
+        });
+        (addr, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn get_with_matching_origin_is_decorated() {
+        // The first plane's config is ONE concrete rule (GET +
+        // https://example.com + expose ETag): a matching origin sees the
+        // full header set, a foreign origin and a no-Origin request see
+        // NONE, and a 404 (missing object) is still decorated (s3s encodes
+        // op errors as Ok(Response) bodies — matches AWS).
+        let (addr, shutdown, handle) = seeded_cors_plane(CorsConfig {
+            rules: vec![CorsRule {
+                id: Some("allow-example".into()),
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["https://example.com".into()],
+                allowed_headers: None,
+                expose_headers: Some(vec!["ETag".into()]),
+                max_age_seconds: None,
+            }],
+        })
+        .await;
+
+        // Matching origin → 200 + ACAO echo, the rule's methods, the
+        // rule's expose list, allow-credentials true, and the Vary trio.
+        let (status, body) = raw_request(
+            addr,
+            "GET /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 200, "{text}");
+        assert!(
+            text.contains("access-control-allow-origin: https://example.com"),
+            "{text}"
+        );
+        assert!(text.contains("access-control-allow-methods: get"), "{text}");
+        assert!(
+            text.contains("access-control-expose-headers: etag"),
+            "{text}"
+        );
+        assert!(
+            text.contains("access-control-allow-credentials: true"),
+            "{text}"
+        );
+        // grilling Q4: the Vary trio is APPENDed (the wire carries three
+        // Vary lines).
+        assert!(text.contains("vary: origin"), "{text}");
+        assert!(
+            text.contains("vary: access-control-request-headers"),
+            "{text}"
+        );
+        assert!(
+            text.contains("vary: access-control-request-method"),
+            "{text}"
+        );
+
+        // A foreign origin, and no Origin at all → NO access-control-*.
+        for origin in [Some("https://evil.com"), None] {
+            let request = match origin {
+                Some(origin) => format!(
+                    "GET /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
+                ),
+                None => "GET /data/key HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            };
+            let (status, body) = raw_request(addr, &request).await;
+            let text = String::from_utf8_lossy(&body).to_lowercase();
+            assert_eq!(status, 200, "{text}");
+            assert!(
+                !text.contains("access-control-"),
+                "no CORS headers for {origin:?}: {text}"
+            );
+        }
+
+        // A MISSING object → 404 + still decorated with the rule's ACAO.
+        let (status, body) = raw_request(
+            addr,
+            "GET /data/missing HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 404, "{text}");
+        assert!(
+            text.contains("access-control-allow-origin: https://example.com"),
+            "{text}"
+        );
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+
+        // Q11: a bare-"*"-origin rule decorates with ACAO "*" and OMITS
+        // Allow-Credentials.
+        let (addr, shutdown, handle) = seeded_cors_plane(CorsConfig {
+            rules: vec![CorsRule {
+                id: None,
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["*".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        })
+        .await;
+        let (status, body) = raw_request(
+            addr,
+            "GET /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://any.example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 200, "{text}");
+        assert!(text.contains("access-control-allow-origin: *"), "{text}");
+        assert!(!text.contains("access-control-allow-credentials"), "{text}");
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_with_origin_match_but_method_mismatch_is_not_decorated() {
+        // B5/S3 pin — first-origin-match applies to the DECORATION too:
+        // rule1 claims https://example.com (GET only); a PUT from that
+        // origin must NOT be decorated — rule1's origin matches, its
+        // method check fails, and the decorator never falls through to
+        // rule2 (which allows PUT for "*").
+        let (addr, shutdown, handle) = seeded_cors_plane(CorsConfig {
+            rules: vec![
+                CorsRule {
+                    id: Some("r1".into()),
+                    allowed_methods: vec!["GET".into()],
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_headers: None,
+                    expose_headers: None,
+                    max_age_seconds: None,
+                },
+                CorsRule {
+                    id: Some("r2".into()),
+                    allowed_methods: vec!["PUT".into()],
+                    allowed_origins: vec!["*".into()],
+                    allowed_headers: None,
+                    expose_headers: None,
+                    max_age_seconds: None,
+                },
+            ],
+        })
+        .await;
+
+        // Sanity: the same origin's GET IS decorated by rule1.
+        let (status, body) = raw_request(
+            addr,
+            "GET /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 200, "{text}");
+        assert!(
+            text.contains("access-control-allow-origin: https://example.com"),
+            "{text}"
+        );
+
+        // PUT from that origin → no access-control-* headers (rule1's
+        // origin matched, method PUT disallowed, no rule2 fall-through).
+        let (status, body) = raw_request(
+            addr,
+            "PUT /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains("access-control-"), "{text}");
+
+        // ... whereas a PUT from a DIFFERENT origin (no rule claims it)
+        // is decorated by rule2 — proof the pin is the first-origin rule,
+        // not method blocking overall.
+        let (status, body) = raw_request(
+            addr,
+            "PUT /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://any.example.com\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 200, "{text}");
+        assert!(text.contains("access-control-allow-origin: *"), "{text}");
+        assert!(text.contains("access-control-allow-methods: put"), "{text}");
         shutdown.send(true).unwrap();
         handle.await.unwrap();
     }

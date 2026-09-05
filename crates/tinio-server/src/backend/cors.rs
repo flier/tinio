@@ -85,11 +85,10 @@ impl<S: Storage> S3Backend<S> {
 /// decoration — the erased boundary over the shared storage handle.
 /// `#[async_trait]` REQUIRED: a native async-fn-in-trait is not
 /// dyn-compatible on stable Rust (E0038); the same pattern the storage
-/// traits use.
-/// (dead_code: the erased method's only call site is the Task-10
-/// decoration, not yet built — the route resolves it statically.)
+/// traits use. The erased method's call sites: the route resolves it
+/// statically (concrete `CorsConfigs`), the data-plane decoration
+/// dispatches through `dyn` (Task 10).
 #[async_trait::async_trait]
-#[allow(dead_code)]
 pub(crate) trait CorsLookup: Send + Sync {
     /// The bucket's CORS configuration — `None` on ANY resolution
     /// failure (missing bucket, invalid name, codec self-heal), which the
