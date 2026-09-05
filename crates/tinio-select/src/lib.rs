@@ -9,6 +9,7 @@
 //! `docs/superpowers/specs/2026-09-04-select-object-content-design.md`.
 
 pub mod error;
+pub mod record;
 pub mod row;
 pub mod sql;
 
