@@ -20,6 +20,7 @@ extern crate tinio_util as _util;
 pub mod bucket;
 pub mod checksum;
 pub mod cleanup;
+pub mod cors;
 pub mod etag;
 pub mod multipart;
 pub mod object;
