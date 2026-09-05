@@ -3841,6 +3841,7 @@ dependencies = [
  "tinio-core",
  "tinio-fs",
  "tinio-mem",
+ "tinio-select",
  "tinio-util",
  "tokio",
  "tower",

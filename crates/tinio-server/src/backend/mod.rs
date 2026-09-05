@@ -25,6 +25,7 @@ pub(crate) mod checksum;
 pub(crate) mod listing;
 pub(crate) mod multipart;
 pub(crate) mod objects;
+pub(crate) mod select;
 pub(crate) mod tags;
 #[cfg(test)]
 pub(crate) mod testutil;

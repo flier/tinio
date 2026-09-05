@@ -242,4 +242,13 @@ impl<S: Storage> S3 for S3Backend<S> {
     ) -> S3Result<S3Response<dto::ListMultipartUploadsOutput>> {
         self.op_list_multipart_uploads(req).await
     }
+
+    // --- select (spec 2026-09-04) ---
+    #[cfg(feature = "select")]
+    async fn select_object_content(
+        &self,
+        req: S3Request<dto::SelectObjectContentInput>,
+    ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
+        self.op_select_object_content(req).await
+    }
 }

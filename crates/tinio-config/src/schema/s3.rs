@@ -89,6 +89,11 @@ pub struct Capabilities {
     #[serde(default = "cors")]
     #[default = true]
     pub cors: bool,
+
+    /// S3 Select (`SelectObjectContent`). Default on.
+    #[serde(default = "select")]
+    #[default = true]
+    pub select: bool,
 }
 
 /// S3 section (`[s3]`; runtime level, FR-021). Disabled capability groups
@@ -167,6 +172,10 @@ fn tagging() -> bool {
 
 fn cors() -> bool {
     Capabilities::default().cors
+}
+
+fn select() -> bool {
+    Capabilities::default().select
 }
 
 impl From<&Config> for Capabilities {
@@ -320,6 +329,17 @@ mod tests {
         let config = RootConfig::parse("version = 1\n[s3]\ncors = false").unwrap();
         let caps = Capabilities::from(config.s3.as_ref().unwrap());
         assert!(!caps.cors);
+    }
+
+    #[test]
+    fn select_defaults_on_and_can_be_disabled() {
+        // The default config has select enabled (FR-021 parity).
+        let caps = Capabilities::default();
+        assert!(caps.select);
+        // A config with select: false round-trips.
+        let toml = "select = false";
+        let caps: Capabilities = toml::from_str(toml).unwrap();
+        assert!(!caps.select);
     }
 
     #[test]

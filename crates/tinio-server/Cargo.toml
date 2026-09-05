@@ -53,6 +53,7 @@ tracing-subscriber = { workspace = true, features = [
 tinio-api = { workspace = true, optional = true }
 tinio-config.workspace = true
 tinio-core.workspace = true
+tinio-select = { workspace = true, optional = true }
 tinio-util.workspace = true
 
 [dev-dependencies]
@@ -88,12 +89,14 @@ name = "pipeline"
 harness = false
 
 [features]
-default = ["multipart", "copy", "list-v1", "list-v2", "cors"]
+default = ["multipart", "copy", "list-v1", "list-v2", "cors", "select"]
 multipart = []
 copy = []
 list-v1 = []
 list-v2 = []
 cors = []
+select = ["dep:tinio-select"]
+select-parquet = ["select", "tinio-select/parquet"]
 api = ["dep:tinio-api"]
 otel = [
     "dep:opentelemetry",

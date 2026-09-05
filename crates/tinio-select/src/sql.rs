@@ -822,6 +822,24 @@ fn validate_aggregate_item(expr: &Expr) -> Result<(), SelectError> {
 
 /// Parquet projection set (Task 11): the column names referenced by SELECT
 /// items + WHERE — pruning input for the parquet reader's projection mask.
+/// Grilling Q6 — JSON output column naming: a projection names its JSON
+/// key from the alias, else (a plain field reference only) from the field
+/// name; any other expression without an alias (`s.x + 1`, `count(*)`)
+/// would need a guessed key, which the server rejects at request level
+/// (400 `InvalidRequestParameter`) for JSON output. CSV output is
+/// positional and never gated. The predicate pins the exemption — it
+/// mirrors `engine::plain_key`'s field-reference shapes.
+pub fn projection_needs_alias(item: &Projection) -> bool {
+    match item {
+        Projection::Wild => false,
+        Projection::Item { alias: Some(_), .. } => false,
+        Projection::Item { expr, alias: None } => !matches!(
+            expr,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::CompoundFieldAccess { .. }
+        ),
+    }
+}
+
 /// Flat-record semantics mirror `eval_field` (single identifier → its
 /// column; compound identifier → the last part, parts[0] is the FROM
 /// alias). A `Wild` projection reads everything — the empty set, which the
