@@ -1,0 +1,31 @@
+[package]
+name = "tinio-select"
+version.workspace = true
+edition.workspace = true
+description = "Streaming SQL SELECT engine for S3 objects (S3 Select)"
+publish = false
+
+[dependencies]
+bzip2.workspace = true
+csv.workspace = true
+flate2.workspace = true
+parquet = { workspace = true, optional = true } # review 2026-09-05b: declared optional here (not in workspace.dependencies, RFC 2906) so [features] parquet = ["dep:parquet"] resolves
+rust_decimal.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision", "preserve_order"] }
+sqlparser.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "select_scan"
+harness = false
+
+[features]
+default = []
+parquet = ["dep:parquet"]
+
+[lints.rust]
+unsafe_code = "forbid"
