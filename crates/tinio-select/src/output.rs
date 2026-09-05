@@ -77,6 +77,8 @@ pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, SelectE
 
 /// CSV row via the `csv` writer: values in key order under the params'
 /// quoting/escaping; `Json` values are rejected before anything is written.
+/// Double-quoting is off so the configured escape actually prefixes quote
+/// chars — with the default escape==quote the bytes equal doubling.
 fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, SelectError> {
     if row
         .vals
@@ -90,6 +92,7 @@ fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, Sele
         .terminator(Terminator::Any(params.record_delimiter))
         .quote(params.quote)
         .escape(params.escape)
+        .double_quote(false)
         .quote_style(match params.quote_fields {
             QuoteFields::AsNeeded => QuoteStyle::Necessary,
             QuoteFields::Always => QuoteStyle::Always,
@@ -251,6 +254,22 @@ mod tests {
             ],
         );
         assert_eq!(serialize_row(&mode, &row).unwrap(), &b"x|y;"[..]);
+    }
+
+    #[test]
+    fn csv_custom_escape_escapes_embedded_quote() {
+        // S3 QuoteEscapeCharacter other than `"` (review fix): the escape
+        // byte prefixes the quote char inside a quoted field — doubling is
+        // off, else the configured escape would be inert.
+        let mode = OutputMode::Csv(CsvOutputParams {
+            escape: b'\\',
+            ..Default::default()
+        });
+        let row = row(vec!["a"], vec![present(Value::String("a\"b".into()))]);
+        assert_eq!(
+            serialize_row(&mode, &row).unwrap(),
+            &b"\"a\\\"b\"\n"[..]
+        );
     }
 
     #[test]
