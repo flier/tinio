@@ -12,6 +12,8 @@ pub mod engine;
 pub mod error;
 pub mod json;
 pub mod output;
+#[cfg(feature = "parquet")]
+pub mod parquet;
 pub mod record;
 pub mod row;
 pub mod sql;

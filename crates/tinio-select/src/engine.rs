@@ -481,19 +481,19 @@ fn access_key(root: &Expr, chain: &[AccessExpr]) -> String {
 /// positionally; header names lookup case-insensitive unless `quoted`;
 /// duplicate names → `Ambiguous`; a USE-mode name that matches no header →
 /// `MissingHeader`, headerless modes fall through to MISSING. JSON: the
-/// attribute rules below. The parquet arm returns `Ok(None)` (treated as
-/// MISSING) until Task 11.
+/// attribute rules below. Parquet: the CSV spine minus MissingHeader (a
+/// name matching no projected column is MISSING — see `parquet_field`).
 fn column_value(
     rec: &Record,
     name: &str,
     alias: &Option<String>,
     quoted: bool,
 ) -> Result<Option<Field>, SelectError> {
-    let _ = alias; // needed by the parquet arm (Task 11)
+    let _ = alias; // unused by flat-record lookups (JSON paths use it)
     match rec {
         Record::Csv(fields, names) => Ok(csv_field(fields, names, name, quoted)?),
         Record::Json(v) => Ok(Some(json_column(v.as_ref(), name, quoted)?)),
-        Record::Parquet(_, _) => Ok(None),
+        Record::Parquet(fields, names) => parquet_field(fields, names, name, quoted),
     }
 }
 
@@ -735,6 +735,24 @@ fn csv_field(
             }
         }
         _ => Err(SelectError::Ambiguous(name.into())),
+    }
+}
+
+/// Parquet column resolution: the same spine as CSV (`_N` positional, CI
+/// name lookup unquoted / exact quoted, duplicates ambiguous) except a name
+/// matching no projected column is MISSING — never MissingHeader (that
+/// code is CSV-header-specific; with projection pruning an unselected
+/// schema column must look MISSING rather than error the stream).
+fn parquet_field(
+    fields: &[Field],
+    names: &[String],
+    name: &str,
+    quoted: bool,
+) -> Result<Option<Field>, SelectError> {
+    match csv_field(fields, names, name, quoted) {
+        Ok(field) => Ok(field),
+        Err(SelectError::MissingHeader(_)) => Ok(Some(Field::Missing)),
+        Err(e) => Err(e),
     }
 }
 
@@ -2237,5 +2255,75 @@ mod tests {
         assert!(engine.next(csv(&["1"], &["_1"])).unwrap().is_some());
         assert!(engine.next(csv(&["2"], &["_1"])).unwrap().is_none());
         assert!(engine.next(csv(&["3"], &["_1"])).unwrap().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Parquet column resolution (Task 11).
+    // ------------------------------------------------------------------
+
+    fn parquet(fields: Vec<Field>, names: &[&str]) -> Record {
+        Record::Parquet(fields, names.iter().map(|n| n.to_string()).collect())
+    }
+
+    #[test]
+    fn parquet_lookup_finds_projected_columns() {
+        let rec = parquet(
+            vec![
+                Field::Present(Value::Int(1)),
+                Field::Present(Value::Decimal(Decimal::new(1234, 2))),
+                Field::Missing,
+            ],
+            &["id", "price", "gone"],
+        );
+        // Unquoted names are case-insensitive per the identifier rules.
+        assert_eq!(
+            column_value(&rec, "ID", &None, false).unwrap(),
+            Some(Field::Present(Value::Int(1)))
+        );
+        assert_eq!(
+            column_value(&rec, "price", &None, false).unwrap(),
+            Some(Field::Present(Value::Decimal(Decimal::new(1234, 2))))
+        );
+        // `_N` positional spine works like CSV.
+        assert_eq!(
+            column_value(&rec, "_2", &None, false).unwrap(),
+            Some(Field::Present(Value::Decimal(Decimal::new(1234, 2))))
+        );
+    }
+
+    #[test]
+    fn parquet_lookup_pruned_or_unknown_is_missing() {
+        let rec = parquet(
+            vec![Field::Present(Value::Int(1))],
+            &["id"],
+        );
+        // A schema column dropped by projection pruning, and a name that
+        // never existed, both resolve MISSING — never MissingHeader (that
+        // code is CSV-header-specific; pruning must not error the stream).
+        assert_eq!(
+            column_value(&rec, "score", &None, false).unwrap(),
+            Some(Field::Missing)
+        );
+        assert_eq!(
+            column_value(&rec, "nope", &None, false).unwrap(),
+            Some(Field::Missing)
+        );
+    }
+
+    #[test]
+    fn parquet_lookup_duplicate_names_ambiguous() {
+        let rec = parquet(
+            vec![Field::Present(Value::Int(1)), Field::Present(Value::Int(2))],
+            &["a", "A"],
+        );
+        match column_value(&rec, "a", &None, false) {
+            Err(SelectError::Ambiguous(n)) => assert_eq!(n, "a"),
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+        // Quoted: exact case, no ambiguity.
+        assert_eq!(
+            column_value(&rec, "A", &None, true).unwrap(),
+            Some(Field::Present(Value::Int(2)))
+        );
     }
 }

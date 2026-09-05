@@ -3,11 +3,12 @@
 //! validator producing the engine's `QueryPlan`.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     AccessExpr, CaseWhen, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, LimitClause, SelectItem, SetExpr, Statement, Subscript,
-    TableFactor,
+    TableFactor, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -819,6 +820,58 @@ fn validate_aggregate_item(expr: &Expr) -> Result<(), SelectError> {
     }
 }
 
+/// Parquet projection set (Task 11): the column names referenced by SELECT
+/// items + WHERE — pruning input for the parquet reader's projection mask.
+/// Flat-record semantics mirror `eval_field` (single identifier → its
+/// column; compound identifier → the last part, parts[0] is the FROM
+/// alias). A `Wild` projection reads everything — the empty set, which the
+/// reader treats as "all columns". Names pass as written; the reader
+/// matches them against the schema case-insensitively (identifier rules).
+pub fn referenced_columns(plan: &QueryPlan) -> Vec<String> {
+    if plan.projections.iter().any(|p| matches!(p, Projection::Wild)) {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut collect = Columns(&mut names);
+    for item in &plan.projections {
+        let Projection::Item { expr, .. } = item else {
+            unreachable!("Wild rejected above");
+        };
+        let _ = expr.visit(&mut collect);
+    }
+    if let Some(expr) = &plan.where_expr {
+        let _ = expr.visit(&mut collect);
+    }
+    names.sort_by_key(|a| a.to_lowercase());
+    names.dedup();
+    names
+}
+
+/// Column-name collector: a plain identifier names its column; a compound
+/// identifier's last part names it. Access chains (`s.a.b`) are not column
+/// references on flat records (the engine resolves them as a literal name
+/// that matches none) — omitted rather than guessed.
+struct Columns<'a>(&'a mut Vec<String>);
+
+impl Visitor for Columns<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        match expr {
+            Expr::Identifier(id) => self.0.push(id.value.clone()),
+            Expr::CompoundIdentifier(parts) => self.0.push(
+                parts
+                    .last()
+                    .expect("compound identifier is non-empty")
+                    .value
+                    .clone(),
+            ),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// The expression arguments of a function call (aggregates never hide in
 /// `Wildcard`/`QualifiedWildcard` args).
 fn function_exprs(f: &Function) -> Vec<&Expr> {
@@ -1123,5 +1176,50 @@ mod tests {
             Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), "__s3_is_missing"),
             other => panic!("expected missing sentinel, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Parquet projection set (Task 11).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn referenced_columns_union_of_select_and_where() {
+        let q = ok("SELECT s.a, s.b2 FROM S3Object s WHERE s.c > 1");
+        assert_eq!(referenced_columns(&q), vec!["a", "b2", "c"]);
+        let q = ok("SELECT s.a FROM S3Object s WHERE s.c = s.d");
+        assert_eq!(referenced_columns(&q), vec!["a", "c", "d"]);
+    }
+
+    #[test]
+    fn referenced_columns_wild_means_all_columns() {
+        // SELECT * reads every schema column regardless of WHERE refs.
+        let q = ok("SELECT * FROM S3Object s WHERE s.a > 1");
+        assert_eq!(referenced_columns(&q), Vec::<String>::new());
+        let q = ok("SELECT * FROM S3Object");
+        assert_eq!(referenced_columns(&q), Vec::<String>::new());
+    }
+
+    #[test]
+    fn referenced_columns_walks_expression_children() {
+        // Aggregates, the MISSING sentinel, arithmetic, BETWEEN and LIKE:
+        // the walker descends into every child expression.
+        let q = ok("SELECT count(s._1), sum(s.x) FROM S3Object s WHERE s.y IS MISSING");
+        assert_eq!(referenced_columns(&q), vec!["_1", "x", "y"]);
+        let q = ok("SELECT s.a + 1 FROM S3Object s WHERE s.b BETWEEN 1 AND 2");
+        assert_eq!(referenced_columns(&q), vec!["a", "b"]);
+        let q = ok("SELECT s.a FROM S3Object s WHERE s.b LIKE 'x%'");
+        assert_eq!(referenced_columns(&q), vec!["a", "b"]);
+        let q = ok("SELECT s.a FROM S3Object s WHERE s.d IN (1, 2)");
+        assert_eq!(referenced_columns(&q), vec!["a", "d"]);
+    }
+
+    #[test]
+    fn referenced_columns_keeps_identifier_folding() {
+        // Names pass as written (the reader matches the schema
+        // case-insensitively); quoted identifiers keep their exact case.
+        let q = ok("SELECT s.ID FROM S3Object s");
+        assert_eq!(referenced_columns(&q), vec!["ID"]);
+        let q = ok("SELECT s.\"id\" FROM S3Object s WHERE s.NAME = 'x'");
+        assert_eq!(referenced_columns(&q), vec!["id", "NAME"]);
     }
 }
