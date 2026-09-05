@@ -17,11 +17,12 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::Value as AstValue;
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, ObjectName, ObjectNamePart, UnaryOperator,
+    AccessExpr, BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript, UnaryOperator,
 };
 
 use crate::SelectError;
+use crate::json::to_value;
 use crate::row::{Field, Record, Value, display, parse_number};
 use crate::sql::{Projection, QueryPlan, contains_aggregate};
 
@@ -197,7 +198,10 @@ impl Engine {
 
     /// One record's projection: `Wild` → the record's fields verbatim
     /// (its own names as keys); `Item` → the evaluated expression under the
-    /// alias, else the plain field name, else the expression text.
+    /// alias, else the plain field name, else the expression text. JSON
+    /// rows project the `Field` itself so a MISSING column serializes as
+    /// `{}` (AWS: MISSING → empty record) rather than a present NULL; CSV
+    /// keeps the eval-level collapse.
     fn project(&self, ctx: &RowCtx) -> Result<OutRow, SelectError> {
         let mut keys = Vec::new();
         let mut vals = Vec::new();
@@ -208,11 +212,22 @@ impl Engine {
                         keys.extend(names.iter().cloned());
                         vals.extend(fields.iter().cloned());
                     }
-                    // Task 9 gives JSON scalar-row semantics; empty until then.
+                    // JSON: the top-level keys in encounter order (objects);
+                    // a scalar/array/MISSING row has no columns.
+                    Record::Json(Some(serde_json::Value::Object(map))) => {
+                        for (key, value) in map {
+                            keys.push(key.clone());
+                            vals.push(Field::Present(to_value(value)));
+                        }
+                    }
                     Record::Json(_) => {}
                 },
                 Projection::Item { expr, alias } => {
-                    vals.push(Field::Present(eval(expr, ctx)?));
+                    let field = match ctx.record {
+                        Record::Json(_) => eval_field(expr, ctx)?,
+                        _ => Field::Present(eval(expr, ctx)?),
+                    };
+                    vals.push(field);
                     keys.push(match alias {
                         Some(a) => a.clone(),
                         None => plain_key(expr),
@@ -425,7 +440,9 @@ fn precision_overflow() -> SelectError {
     SelectError::Value("numeric value exceeds 28-digit precision".into())
 }
 
-/// The projection key of an expression without an alias.
+/// The projection key of an expression without an alias: a path access is
+/// named by its last named element (AWS: `s.projects[0].project_name` →
+/// `project_name`), else the last identifier, else its text.
 fn plain_key(expr: &Expr) -> String {
     match expr {
         Expr::Identifier(id) => id.value.clone(),
@@ -434,6 +451,28 @@ fn plain_key(expr: &Expr) -> String {
             .expect("compound identifier is non-empty")
             .value
             .clone(),
+        Expr::CompoundFieldAccess { root, access_chain } => access_key(root, access_chain),
+        other => other.to_string(),
+    }
+}
+
+/// The last named element of an access chain: walk backward for the last
+/// dot-identifier or string subscript (the output column name AWS uses);
+/// fall back to the root identifier, then to the expression text.
+fn access_key(root: &Expr, chain: &[AccessExpr]) -> String {
+    for step in chain.iter().rev() {
+        match step {
+            AccessExpr::Dot(Expr::Identifier(id)) => return id.value.clone(),
+            AccessExpr::Subscript(Subscript::Index { index }) => {
+                if let Some(SubKey::Key(k)) = subscript_key(index) {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+    }
+    match root {
+        Expr::Identifier(id) => id.value.clone(),
         other => other.to_string(),
     }
 }
@@ -441,20 +480,217 @@ fn plain_key(expr: &Expr) -> String {
 /// One column reference → the record's field at that name. CSV: `_N` maps
 /// positionally; header names lookup case-insensitive unless `quoted`;
 /// duplicate names → `Ambiguous`; a USE-mode name that matches no header →
-/// `MissingHeader`, headerless modes fall through to MISSING. JSON/parquet
-/// arms return `Ok(None)` (treated as MISSING) until Tasks 9/11.
+/// `MissingHeader`, headerless modes fall through to MISSING. JSON: the
+/// attribute rules below. The parquet arm returns `Ok(None)` (treated as
+/// MISSING) until Task 11.
 fn column_value(
     rec: &Record,
     name: &str,
     alias: &Option<String>,
     quoted: bool,
 ) -> Result<Option<Field>, SelectError> {
-    let _ = alias; // needed by the JSON/parquet arms (Tasks 9/11)
+    let _ = alias; // needed by the parquet arm (Task 11)
     match rec {
         Record::Csv(fields, names) => Ok(csv_field(fields, names, name, quoted)?),
-        Record::Json(_) => Ok(None),
+        Record::Json(v) => Ok(Some(json_column(v.as_ref(), name, quoted)?)),
         Record::Parquet(_, _) => Ok(None),
     }
+}
+
+/// JSON column resolution: a present non-object value resolves any unquoted
+/// name to itself (the scalar-row rule); an object looks the key up
+/// case-insensitively (`quoted` → exact; folded duplicates → `Ambiguous`);
+/// `_1` is the row itself unless the object carries a matching `_1` key
+/// (field wins); absent → MISSING.
+fn json_column(
+    value: Option<&serde_json::Value>,
+    name: &str,
+    quoted: bool,
+) -> Result<Field, SelectError> {
+    let Some(v) = value else { return Ok(Field::Missing) };
+    match v {
+        serde_json::Value::Object(map) => match json_lookup(map, name, quoted)? {
+            None if name == "_1" => Ok(Field::Present(to_value(v))),
+            Some(field) => Ok(Field::Present(to_value(field))),
+            None => Ok(Field::Missing),
+        },
+        _ => Ok(Field::Present(to_value(v))),
+    }
+}
+
+/// Object key lookup: case-insensitive when unquoted, exact when quoted;
+/// a case-folded duplicate is ambiguous (AWS: two attrs differing only in
+/// case → `AmbiguousFieldName`).
+fn json_lookup<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    quoted: bool,
+) -> Result<Option<&'a serde_json::Value>, SelectError> {
+    let mut found: Vec<&serde_json::Value> = Vec::new();
+    for (key, value) in map {
+        let matches = if quoted {
+            key == name
+        } else {
+            key.eq_ignore_ascii_case(name)
+        };
+        if matches {
+            found.push(value);
+        }
+    }
+    match found.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(*value)),
+        _ => Err(SelectError::Ambiguous(name.into())),
+    }
+}
+
+/// A JSON compound identifier path (`_1.dir_name`, `s.a.b`): the first part
+/// resolves on the record (`_1`/the FROM alias → the row; any other name →
+/// a field), the remaining parts walk object fields.
+fn json_path(
+    record: Option<&serde_json::Value>,
+    parts: &[Ident],
+    alias: &Option<String>,
+) -> Result<Field, SelectError> {
+    let (first, rest) = parts.split_first().expect("compound identifier is non-empty");
+    let mut field = match first.value.as_str() {
+        "_1" => json_row_ref(record, first.quote_style.is_some())?,
+        name if alias.as_deref() == Some(name) => json_row_value(record),
+        name => json_column(record, name, first.quote_style.is_some())?,
+    };
+    for part in rest {
+        field = json_dot_step(field, &part.value, part.quote_style.is_some())?;
+    }
+    Ok(field)
+}
+
+/// The row itself under `_1` — the whole record value unless the object
+/// carries a key matching `_1` (field wins).
+fn json_row_ref(record: Option<&serde_json::Value>, quoted: bool) -> Result<Field, SelectError> {
+    let Some(v) = record else { return Ok(Field::Missing) };
+    if let serde_json::Value::Object(map) = v
+        && let Some(field) = json_lookup(map, "_1", quoted)?
+    {
+        return Ok(Field::Present(to_value(field)));
+    }
+    Ok(Field::Present(to_value(v)))
+}
+
+/// The row itself under the FROM alias — always the whole record value.
+fn json_row_value(record: Option<&serde_json::Value>) -> Field {
+    match record {
+        None => Field::Missing,
+        Some(v) => Field::Present(to_value(v)),
+    }
+}
+
+/// One dot step: an object key lookup (CI/exact per the part's quote);
+/// anything else is MISSING.
+fn json_dot_step(field: Field, name: &str, quoted: bool) -> Result<Field, SelectError> {
+    match field {
+        Field::Missing => Ok(Field::Missing),
+        Field::Present(Value::Json(j)) => json_dot(j, name, quoted),
+        Field::Present(_) => Ok(Field::Missing),
+    }
+}
+
+/// One dot look up on a boxed JSON value.
+fn json_dot(j: Box<serde_json::Value>, name: &str, quoted: bool) -> Result<Field, SelectError> {
+    let serde_json::Value::Object(map) = j.as_ref() else {
+        return Ok(Field::Missing);
+    };
+    match json_lookup(map, name, quoted)? {
+        Some(v) => Ok(Field::Present(to_value(v))),
+        None => Ok(Field::Missing),
+    }
+}
+
+/// A JSON access chain (`s.projects[0].project_name`): the root expression
+/// resolves on the record (`_1`/the FROM alias → the row; any other name →
+/// a field), then each step is a dot or a bracket subscript; a MISSING
+/// base stays MISSING and a non-match step is MISSING.
+fn json_access(
+    record: Option<&serde_json::Value>,
+    root: &Expr,
+    chain: &[AccessExpr],
+    alias: &Option<String>,
+) -> Result<Field, SelectError> {
+    let mut field = match root {
+        Expr::Identifier(id) if id.value == "_1" => json_row_ref(record, id.quote_style.is_some())?,
+        Expr::Identifier(id) if alias.as_deref() == Some(id.value.as_str()) => {
+            json_row_value(record)
+        }
+        Expr::Identifier(id) => json_column(record, &id.value, id.quote_style.is_some())?,
+        // A non-identifier root has no path into the record.
+        _ => Field::Missing,
+    };
+    for step in chain {
+        field = json_step(field, step)?;
+    }
+    Ok(field)
+}
+
+/// One access-chain step.
+fn json_step(field: Field, step: &AccessExpr) -> Result<Field, SelectError> {
+    match (field, step) {
+        (Field::Missing, _) => Ok(Field::Missing),
+        (Field::Present(Value::Json(j)), AccessExpr::Dot(Expr::Identifier(id))) => {
+            json_dot(j, &id.value, id.quote_style.is_some())
+        }
+        (Field::Present(Value::Json(_)), AccessExpr::Dot(_)) => Ok(Field::Missing),
+        (Field::Present(Value::Json(j)), AccessExpr::Subscript(s)) => json_subscript(j, s),
+        (Field::Present(_), _) => Ok(Field::Missing),
+    }
+}
+
+/// One bracket subscript: a literal non-negative integer indexes an array
+/// (out-of-range / not-an-array → MISSING); a literal string names an
+/// object key exactly; anything else → MISSING.
+fn json_subscript(j: Box<serde_json::Value>, s: &Subscript) -> Result<Field, SelectError> {
+    let Subscript::Index { index } = s else {
+        return Ok(Field::Missing);
+    };
+    match subscript_key(index) {
+        Some(SubKey::Idx(i)) => match j.as_ref() {
+            serde_json::Value::Array(elems) => Ok(elems
+                .get(i)
+                .map_or(Field::Missing, |e| Field::Present(to_value(e)))),
+            _ => Ok(Field::Missing),
+        },
+        Some(SubKey::Key(k)) => match j.as_ref() {
+            serde_json::Value::Object(map) => Ok(map
+                .get(&k)
+                .map_or(Field::Missing, |e| Field::Present(to_value(e)))),
+            _ => Ok(Field::Missing),
+        },
+        None => Ok(Field::Missing),
+    }
+}
+
+/// One subscript literal: number index or string key; other expressions
+/// (negatives, column refs, arithmetic) are not a match.
+fn subscript_key(index: &Expr) -> Option<SubKey> {
+    match index {
+        Expr::Value(v) => match &v.value {
+            AstValue::Number(n, _) => n
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .map(|n| SubKey::Idx(n as usize)),
+            AstValue::SingleQuotedString(s) => Some(SubKey::Key(s.clone())),
+            _ => None,
+        },
+        // `s["k"]`: a double-quoted token parses as a quoted identifier —
+        // the key's name is the identifier's value.
+        Expr::Identifier(id) if id.quote_style.is_some() => Some(SubKey::Key(id.value.clone())),
+        _ => None,
+    }
+}
+
+/// The subscript literal's taxon: an array index or an object key name.
+enum SubKey {
+    Idx(usize),
+    Key(String),
 }
 
 /// CSV column resolution, per the interface above.
@@ -528,15 +764,20 @@ fn default_names(names: &[String]) -> bool {
 fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, SelectError> {
     match expr {
         Expr::Identifier(id) => column_field(ctx, &id.value, id.quote_style.is_some()),
-        Expr::CompoundIdentifier(parts) => {
-            let last = parts.last().expect("compound identifier is non-empty");
-            column_field(ctx, &last.value, last.quote_style.is_some())
-        }
-        // Path access is not meaningful on flat CSV; the full text never
-        // matches a header → MISSING (Tasks 9/11 replace this arm).
-        Expr::CompoundFieldAccess { .. } | Expr::JsonAccess { .. } => {
-            column_field(ctx, &expr.to_string(), false)
-        }
+        Expr::CompoundIdentifier(parts) => match ctx.record {
+            Record::Json(v) => json_path(v.as_ref(), parts, ctx.alias),
+            _ => {
+                let last = parts.last().expect("compound identifier is non-empty");
+                column_field(ctx, &last.value, last.quote_style.is_some())
+            }
+        },
+        // Path access on flat CSV is not meaningful — the full text never
+        // matches a header → MISSING; JSON resolves the real access chain.
+        Expr::CompoundFieldAccess { root, access_chain } => match ctx.record {
+            Record::Json(v) => json_access(v.as_ref(), root, access_chain, ctx.alias),
+            _ => column_field(ctx, &expr.to_string(), false),
+        },
+        Expr::JsonAccess { .. } => column_field(ctx, &expr.to_string(), false),
         // `(x) IS NULL` ≡ `x IS NULL`: parenthesized columns stay MISSING
         // rather than collapsing through `eval` into a present NULL.
         Expr::Nested(e) => eval_field(e, ctx),

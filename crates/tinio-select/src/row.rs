@@ -32,11 +32,13 @@ pub enum Field {
 }
 
 /// One input record: columns plus the name map (`_N`/headers for CSV,
-/// column names for parquet); JSON input carries the whole value.
+/// column names for parquet); JSON input carries the whole value — `None`
+/// is a path-traversal MISSING row (a wildcard/path step that matched
+/// nothing), distinct from a present `null` value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
     Csv(Vec<Field>, Vec<String>),
-    Json(serde_json::Value),
+    Json(Option<serde_json::Value>),
     Parquet(Vec<Field>, Vec<String>),
 }
 
