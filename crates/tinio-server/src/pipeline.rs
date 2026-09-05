@@ -1522,6 +1522,9 @@ mod tests {
                 io_pipeline: pipelines.io(),
                 remove_pipeline: pipelines.remove(),
                 db_pipeline: pipelines.db(),
+                // No owner-to-uid mapping — every object stays
+                // server-user-owned (the hardened default).
+                owner_uids: std::collections::HashMap::new(),
             },
         )
         .expect("FsStorage accepts the real pipeline runtimes");

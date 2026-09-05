@@ -39,7 +39,7 @@ use crate::backend::{
 };
 use crate::{
     _core::{
-        bucket,
+        acl, bucket,
         checksum::Algorithm,
         object,
         storage::{Error as StorageError, GetObjectResult, Storage},
@@ -208,7 +208,17 @@ impl<S: Storage> S3Backend<S> {
         .await?;
         let put = self
             .storage
-            .commit_object(&bucket, &key, staged, tags)
+            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
+            // path records an empty owner wire and the private default —
+            // Task 11 rewires this to `owner_for`/`expand_acl`.
+            .commit_object(
+                &bucket,
+                &key,
+                staged,
+                tags,
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .map_err(map_backend_error)?;
         let mut output = dto::PutObjectOutput {
@@ -850,7 +860,19 @@ impl<S: Storage> S3Backend<S> {
         .await?;
         let put = self
             .storage
-            .copy_object(&src_bucket, &src_key, &dst_bucket, &dst_key, tags, checksum)
+            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
+            // path records an empty owner wire and the private default —
+            // Task 11 rewires this to `owner_for`/`expand_acl`.
+            .copy_object(
+                &src_bucket,
+                &src_key,
+                &dst_bucket,
+                &dst_key,
+                tags,
+                None,
+                &acl::Acl::default_private(None),
+                checksum,
+            )
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(dto::CopyObjectOutput {

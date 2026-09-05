@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            bucket, object,
+            acl, bucket, object,
             storage::{BucketOps, ObjectOps},
         },
         _mem::MemoryStorage,
@@ -333,7 +333,10 @@ mod tests {
         );
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .put_object(&b, &object::key("a.txt").unwrap(), body("a"))
             .await
@@ -368,7 +371,10 @@ mod tests {
         );
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .put_object(&b, &object::key("a.txt").unwrap(), body("a"))
             .await
@@ -401,7 +407,10 @@ mod tests {
         );
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         for key in ["a.txt", "b.txt", "c.txt"] {
             storage
                 .put_object(&b, &object::key(key).unwrap(), body(key))
@@ -438,7 +447,10 @@ mod tests {
         );
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         for key in ["a.txt", "b.txt", "c.txt"] {
             storage
                 .put_object(&b, &object::key(key).unwrap(), body(key))

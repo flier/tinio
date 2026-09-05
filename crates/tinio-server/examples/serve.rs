@@ -145,6 +145,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             io_pipeline: pipelines.io(),
             remove_pipeline: pipelines.remove(),
             db_pipeline: pipelines.db(),
+            // No owner-to-uid mapping — every object stays
+            // server-user-owned (the hardened default).
+            owner_uids: std::collections::HashMap::new(),
         },
     )?;
     // `[s3] max_concurrent_uploads` caps in-progress multipart uploads

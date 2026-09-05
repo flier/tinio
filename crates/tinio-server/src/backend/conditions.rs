@@ -528,7 +528,7 @@ mod tests {
 
     use super::*;
     use crate::_core::{
-        ETag,
+        ETag, acl,
         object::{self, Tags},
     };
 
@@ -761,6 +761,8 @@ mod tests {
             etag: etag(etag_hex),
             tags: Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: acl::Acl::default_private(None),
         }
     }
 

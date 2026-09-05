@@ -13,13 +13,13 @@ use uuid::Uuid;
 use crate::{
     _core::{
         CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
-        PartInfo, PartNumber, PartsListing, UploadsListing, bucket::Name, checksum, collect_body,
-        from_nanos, group_and_paginate_unordered, key_marker_order, multipart::check_part_minimum,
-        now_nanos, object, split_uploads_order, uploads_order,
+        PartInfo, PartNumber, PartsListing, UploadsListing, acl, bucket::Name, checksum,
+        collect_body, from_nanos, group_and_paginate_unordered, key_marker_order,
+        multipart::check_part_minimum, now_nanos, object, split_uploads_order, uploads_order,
     },
     _store::{
-        bucket, meta, object_part, objects, part, part_checksum, part_data, part_meta, upload,
-        upload_checksum,
+        bucket, decode_acl_wire, decode_owner_wire, meta, object_part, objects, part,
+        part_checksum, part_data, part_meta, upload, upload_checksum,
     },
     Error,
     error::{
@@ -37,6 +37,8 @@ struct UploadRow {
     upload_id: String,
     initiated_at: u64,
     tags: object::Tags,
+    owner: Option<acl::OwnerId>,
+    acl: acl::Acl,
     checksum: Option<checksum::Upload>,
 }
 
@@ -48,6 +50,8 @@ impl MultipartOps for MemoryStorage {
         key: &object::Key,
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<MultipartUpload, Error> {
         // Bucket existence first, like the fs backend and every S3 op: a
         // reserved/marker key on a missing bucket answers NoSuchBucket,
@@ -72,6 +76,8 @@ impl MultipartOps for MemoryStorage {
             initiated_at,
             checksum: checksum.clone(),
             tags: tags.clone(),
+            owner: owner.cloned(),
+            acl: acl.clone(),
         };
         self.db.write(|txn| -> Result<MultipartUpload, Error> {
             {
@@ -84,7 +90,18 @@ impl MultipartOps for MemoryStorage {
             let k = upload.key.as_ref().as_str();
             {
                 let mut uploads = upload::Table::open(txn)?;
-                uploads.put(b, &upload.upload_id, k, initiated_at, &tags)?;
+                uploads.put(
+                    b,
+                    &upload.upload_id,
+                    k,
+                    initiated_at,
+                    &tags.to_wire(),
+                    &upload
+                        .owner
+                        .as_ref()
+                        .map_or_else(String::new, |o| o.as_str().to_string()),
+                    &upload.acl.to_grants_wire(),
+                )?;
             }
             // The create-time checksum spec, persisted alongside the
             // UPLOADS row (spec 2026-08-31).
@@ -115,7 +132,7 @@ impl MultipartOps for MemoryStorage {
             // element self-heals on a domain-invalid wire (empty — like the
             // checksum spec below).
             let uploads = upload::Table::open_readonly(txn)?;
-            let Some((_stored_key, initiated, tags)) =
+            let Some((_stored_key, initiated, tags_wire, owner_wire, acl_wire)) =
                 uploads.get_matching(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id)?
             else {
                 return Err(no_such_upload(upload_id));
@@ -128,7 +145,9 @@ impl MultipartOps for MemoryStorage {
                 key: key.clone(),
                 initiated_at: from_nanos(initiated),
                 checksum,
-                tags,
+                tags: object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX),
+                owner: decode_owner_wire(&owner_wire),
+                acl: decode_acl_wire(&acl_wire),
             })
         })
     }
@@ -350,12 +369,18 @@ impl MultipartOps for MemoryStorage {
             // table's read-path discipline).
             let b = bucket.as_ref().as_str();
             let k = key.as_ref().as_str();
-            let tags = {
+            let (tags, owner, acl) = {
                 let uploads = upload::Table::open(txn)?;
-                let Some(tags) = uploads.tags(b, k, upload_id)? else {
+                let Some((_, _, tags_wire, owner_wire, acl_wire)) =
+                    uploads.get_matching(b, k, upload_id)?
+                else {
                     return Err(no_such_upload(upload_id));
                 };
-                tags
+                (
+                    object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX),
+                    decode_owner_wire(&owner_wire),
+                    decode_acl_wire(&acl_wire),
+                )
             };
             let (data, etag, now) = {
                 // The retained OBJECT_PARTS rows: each listed part's size and
@@ -493,6 +518,8 @@ impl MultipartOps for MemoryStorage {
                             file_identity: 0,
                             tags: tags.clone(),
                             checksum: checksum.clone(),
+                            owner: owner.clone(),
+                            acl: acl.clone(),
                         },
                     )?;
                 }
@@ -546,6 +573,8 @@ impl MultipartOps for MemoryStorage {
                 etag,
                 tags,
                 checksum,
+                owner,
+                acl,
             })
         })
     }
@@ -633,7 +662,7 @@ impl MultipartOps for MemoryStorage {
             // are owned copies, and the redb read txn is MVCC — no lock is
             // held).
             let mut rows: Vec<UploadRow> = Vec::new();
-            uploads.for_bucket(b, |upload_id, (key, initiated_at, tags)| {
+            uploads.for_bucket(b, |upload_id, (key, initiated_at, tags_wire, owner_wire, acl_wire)| {
                 if !key.starts_with(&params.prefix) {
                     return Ok(());
                 }
@@ -645,7 +674,9 @@ impl MultipartOps for MemoryStorage {
                     key,
                     upload_id: upload_id.to_string(),
                     initiated_at,
-                    tags,
+                    tags: object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                    owner: decode_owner_wire(owner_wire),
+                    acl: decode_acl_wire(acl_wire),
                     checksum,
                 });
                 Ok(())
@@ -672,6 +703,8 @@ impl MultipartOps for MemoryStorage {
                     initiated_at: from_nanos(u.initiated_at),
                     checksum: u.checksum,
                     tags: u.tags,
+                    owner: u.owner,
+                    acl: u.acl,
                 })
                 .collect();
             let (next_key, next_upload_id) = match next {
@@ -717,7 +750,7 @@ mod tests {
     async fn with_bucket() -> (MemoryStorage, Name) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
         (storage, name)
     }
 
@@ -729,10 +762,10 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty())
+            .create_multipart_upload(&name, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
 
@@ -772,10 +805,10 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty())
+            .create_multipart_upload(&name, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
 
@@ -826,7 +859,7 @@ mod tests {
 
         // The freed capacity is reusable by a new upload.
         let u2 = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty())
+            .create_multipart_upload(&name, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -847,11 +880,11 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let a = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let b = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert_ne!(a.upload_id, b.upload_id);
@@ -863,7 +896,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         // The listed non-final parts must be >= the 5 MiB minimum (the
@@ -912,7 +945,7 @@ mod tests {
         let key = object::key("a.bin").unwrap();
         let min = MIN_PART_BYTES as usize;
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let under = storage
@@ -988,7 +1021,7 @@ mod tests {
         let k = object::key("big.bin").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, tags.clone())
+            .create_multipart_upload(&b, &k, None, tags.clone(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert_eq!(upload.tags, tags, "the create-time tags ride on the upload");
@@ -1084,7 +1117,7 @@ mod tests {
         // A second completion over the same key replaces the rows (the
         // old completion's parts must not accumulate).
         let upload2 = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let p = storage

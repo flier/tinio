@@ -92,7 +92,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{BucketOps, bucket};
+/// use tinio_core::{BucketOps, acl, bucket};
 /// use tinio_mem::{MemoryOptions, MemoryStorage};
 /// use tokio::runtime::Runtime;
 ///
@@ -100,7 +100,7 @@ where
 /// let bucket = bucket::name("data").unwrap();
 /// Runtime::new()
 ///     .unwrap()
-///     .block_on(storage.create_bucket(&bucket))
+///     .block_on(storage.create_bucket(&bucket, None, &acl::Acl::default_private(None)))
 ///     .unwrap();
 ///
 /// let limited = MemoryStorage::with_options(MemoryOptions {
@@ -250,7 +250,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, object},
+        _core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, acl, object},
         _util::testing::{assert_conformance, assert_send_sync, body},
     };
 
@@ -264,7 +264,10 @@ mod tests {
     async fn put_returns_rfc_md5_vector() {
         let storage = MemoryStorage::new().unwrap();
         let bucket = name("data").unwrap();
-        storage.create_bucket(&bucket).await.unwrap();
+        storage
+            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("abc").unwrap();
         let put = storage
             .put_object(&bucket, &key, body(b"abc".to_vec()))
@@ -283,10 +286,20 @@ mod tests {
     async fn multipart_etag_is_served_on_subsequent_reads() {
         let storage = MemoryStorage::new().unwrap();
         let bucket = name("data").unwrap();
-        storage.create_bucket(&bucket).await.unwrap();
+        storage
+            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty())
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // The first part is non-final in the two-part list — it must be
@@ -358,7 +371,10 @@ mod tests {
         // entry under the bucket prefix must have a live bucket.
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let bucket = name("race").unwrap();
-        storage.create_bucket(&bucket).await.unwrap();
+        storage
+            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("a.txt").unwrap();
 
         let mut handles = Vec::new();

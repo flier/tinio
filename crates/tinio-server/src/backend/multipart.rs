@@ -27,7 +27,7 @@ use crate::_core::storage::ByteRange;
 use crate::backend::{ConditionalHeaders, byte_range};
 use crate::{
     _core::{
-        ETag,
+        ETag, acl,
         checksum::{Algorithm, Part, Recorded, Type, Upload, Value},
         multipart::{
             CompletedPart, PartNumber, check_part_minimum, part_number as parse_part_number,
@@ -273,7 +273,17 @@ impl<S: Storage> S3Backend<S> {
         };
         let upload = self
             .storage
-            .create_multipart_upload(&bucket, &key, checksum, tags)
+            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
+            // path records an empty owner wire and the private default —
+            // Task 11 rewires this to `owner_for`/`expand_acl`.
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                checksum,
+                tags,
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .map_err(map_backend_error)?;
         // Seed the spec cache (F04): the spec is immutable after create
@@ -1064,7 +1074,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            bucket,
+            acl, bucket,
             multipart::MIN_PART_BYTES,
             object,
             storage::{BucketOps, MultipartOps, ObjectOps},
@@ -1342,7 +1352,11 @@ mod tests {
         let b = "data".to_string();
         backend
             .storage()
-            .create_bucket(&bucket::name(&b).unwrap())
+            .create_bucket(
+                &bucket::name(&b).unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         backend
@@ -1385,7 +1399,10 @@ mod tests {
         );
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let create = backend
             .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
                 bucket: "data".into(),
@@ -1424,7 +1441,11 @@ mod tests {
         );
         let storage = backend.storage();
         storage
-            .create_bucket(&bucket::name("data").unwrap())
+            .create_bucket(
+                &bucket::name("data").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let out = backend
@@ -1914,6 +1935,8 @@ mod tests {
                     r#type: None,
                 }),
                 object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();

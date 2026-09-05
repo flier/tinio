@@ -16,7 +16,7 @@ use futures::stream::iter;
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
-        bucket::Name, checksum, collect_body, from_nanos, group_and_paginate,
+        acl, bucket::Name, checksum, collect_body, from_nanos, group_and_paginate,
         multipart::ObjectPart, now_nanos, object,
     },
     _store::{bucket, meta, object_part, objects, scan::for_each_pair},
@@ -76,6 +76,8 @@ impl MemoryStorage {
         mut data: Vec<u8>,
         mut tags: object::Tags,
         mut checksum: Option<checksum::Recorded>,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<object::Info, Error> {
         // Defensive: the staged-body path already rejects reserved keys —
         // a direct stage/commit must not create an invisible, undeletable
@@ -148,6 +150,8 @@ impl MemoryStorage {
                         file_identity: 0,
                         tags: tags.clone(),
                         checksum: checksum.clone(),
+                        owner: owner.cloned(),
+                        acl: acl.clone(),
                     },
                 )?;
             }
@@ -168,6 +172,8 @@ impl MemoryStorage {
             etag,
             tags,
             checksum,
+            owner: owner.cloned(),
+            acl: acl.clone(),
         })
     }
 }
@@ -226,6 +232,8 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         staged: StagedBody,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<object::Info, Error> {
         // The stage's tee digest records as the object's FULL_OBJECT
         // checksum (the kind is fixed by the write path — a plain PUT's
@@ -234,7 +242,7 @@ impl ObjectOps for MemoryStorage {
             part,
             kind: checksum::Type::FullObject,
         });
-        self.write_object(bucket, key, staged.data, tags, checksum)
+        self.write_object(bucket, key, staged.data, tags, checksum, owner, acl)
             .await
     }
 
@@ -245,6 +253,8 @@ impl ObjectOps for MemoryStorage {
         dst_bucket: &Name,
         dst_key: &object::Key,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
         // The contract's stream default (get → stage → commit) cannot
@@ -256,7 +266,7 @@ impl ObjectOps for MemoryStorage {
         // destination key held.
         let get = self.get_object(src_bucket, src_key, None).await?;
         let data = collect_body(get.body).await?;
-        self.write_object(dst_bucket, dst_key, data, tags, checksum)
+        self.write_object(dst_bucket, dst_key, data, tags, checksum, owner, acl)
             .await
     }
 
@@ -306,6 +316,8 @@ impl ObjectOps for MemoryStorage {
                     etag: stored.etag,
                     tags: stored.tags,
                     checksum: stored.checksum,
+                    owner: stored.owner.clone(),
+                    acl: stored.acl.clone(),
                 },
                 body,
                 served_range,
@@ -332,6 +344,8 @@ impl ObjectOps for MemoryStorage {
                 etag: stored.etag,
                 tags: stored.tags,
                 checksum: stored.checksum,
+                owner: stored.owner.clone(),
+                acl: stored.acl.clone(),
             })
         })
     }
@@ -462,6 +476,8 @@ impl ObjectOps for MemoryStorage {
                 etag: stored.etag,
                 tags: stored.tags,
                 checksum: stored.checksum,
+                owner: stored.owner.clone(),
+                acl: stored.acl.clone(),
             })
         })
     }
@@ -525,6 +541,63 @@ impl ObjectOps for MemoryStorage {
         self.rewrite_tags_element(bucket, key, &object::Tags::empty())
             .await?;
         Ok(())
+    }
+
+    async fn get_object_acl(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+    ) -> Result<acl::Acl, Error> {
+        // Existence is the `OBJECT_META` row (`NoSuchKey` when missing);
+        // the ACL recombines the stored owner element with the stored
+        // grant set (the row form keeps them apart — the shared
+        // decode-home rule).
+        self.db.read(|txn| {
+            let meta = meta::Table::open_readonly(txn)?;
+            meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                .map(|stored| acl::Acl {
+                    owner: stored.owner.clone(),
+                    grants: stored.acl.grants.clone(),
+                })
+                .ok_or_else(|| no_such_key(key))
+        })
+    }
+
+    async fn put_object_acl(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        grants: &acl::AclGrants,
+    ) -> Result<(), Error> {
+        // Replace-all: the grant set replaces the row's ACL element; the
+        // owner element is preserved — a put never changes it (contract
+        // ruling). `NoSuchKey` when the object is missing.
+        let fresh = acl::Acl {
+            owner: None,
+            grants: grants.clone(),
+        };
+        self.db.write(|txn| -> Result<bool, Error> {
+            let mut meta = meta::Table::open(txn)?;
+            let Some(row) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
+                return Ok(false);
+            };
+            meta.put(
+                bucket.as_ref().as_str(),
+                key.as_ref().as_str(),
+                &meta::Stored {
+                    acl: fresh,
+                    ..row
+                },
+            )?;
+            Ok(true)
+        })
+        .map(|found| {
+            if found {
+                Ok(())
+            } else {
+                Err(no_such_key(key))
+            }
+        })?
     }
 
     async fn list_object_parts(
@@ -608,6 +681,8 @@ impl ObjectOps for MemoryStorage {
                         etag: stored.etag,
                         tags: stored.tags,
                         checksum: stored.checksum,
+                        owner: stored.owner.clone(),
+                        acl: stored.acl.clone(),
                     });
                     Ok(())
                 },
@@ -650,7 +725,7 @@ mod tests {
     async fn with_bucket() -> (MemoryStorage, Name) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
         (storage, name)
     }
 
@@ -666,7 +741,7 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
         let key = object::key("big.bin").unwrap();
 
         let err = storage
@@ -701,7 +776,7 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
         let k1 = object::key("a.bin").unwrap();
         let k2 = object::key("b.bin").unwrap();
 
@@ -946,7 +1021,7 @@ mod tests {
     async fn list_objects_does_not_cross_buckets() {
         let (storage, bucket) = with_bucket().await;
         let other = bucket::name("other").unwrap();
-        storage.create_bucket(&other).await.unwrap();
+        storage.create_bucket(&other, None, &acl::Acl::default_private(None)).await.unwrap();
         put_keys(&storage, &bucket, &["a.txt"]).await;
         put_keys(&storage, &other, &["b.txt"]).await;
         let page = storage
@@ -1018,7 +1093,7 @@ mod tests {
             .await
             .unwrap();
         let info = storage
-            .commit_object(&b, &a, staged, tags.clone())
+            .commit_object(&b, &a, staged, tags.clone(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert_eq!(info.etag, ETag::from_content(b"hi"));
@@ -1030,7 +1105,7 @@ mod tests {
         let dst = object::key("b.txt").unwrap();
         let copy_tags = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
         storage
-            .copy_object(&b, &a, &b, &dst, copy_tags.clone(), None)
+            .copy_object(&b, &a, &b, &dst, copy_tags.clone(), None, &acl::Acl::default_private(None),  None)
             .await
             .unwrap();
         assert_eq!(storage.get_object_tags(&b, &dst).await.unwrap(), copy_tags);
@@ -1054,7 +1129,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, object::Tags::empty())
+            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let head = storage.head_object(&b, &k).await.unwrap();
@@ -1091,7 +1166,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, object::Tags::empty())
+            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert!(
@@ -1119,7 +1194,7 @@ mod tests {
         // (d) copy_object never inherits the source's parts.
         let copy = object::key("copy.bin").unwrap();
         storage
-            .copy_object(&b, &dst, &b, &copy, object::Tags::empty(), None)
+            .copy_object(&b, &dst, &b, &copy, object::Tags::empty(), None, &acl::Acl::default_private(None),  None)
             .await
             .unwrap();
         assert!(

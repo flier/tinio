@@ -27,7 +27,7 @@ use s3s::{
 use crate::{
     _config::s3::MAX_BUCKETS,
     _core::{
-        object,
+        acl, object,
         storage::{ListBucketsParams, Storage},
     },
     backend::{
@@ -48,7 +48,10 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let name = self.bucket(req.input.bucket)?;
         self.storage
-            .create_bucket(&name)
+            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
+            // path records an empty owner wire and the private default —
+            // Task 11 rewires this to `owner_for`/`expand_acl`.
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(CreateBucketOutput {
@@ -133,11 +136,17 @@ impl<S: Storage> S3Backend<S> {
         let effective = clamp_page_size(requested, self.caps.max_buckets);
         let listing = self
             .storage
-            .list_buckets(ListBucketsParams {
-                prefix: prefix.clone().unwrap_or_default(),
-                start_after,
-                max_buckets: effective,
-            })
+            // Mechanical contract adaptation (Task 5 of the acl-owner plan): no owner
+            // filter yet — the legacy listing — Task 11 wires the
+            // auth layer's owner here.
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: prefix.clone().unwrap_or_default(),
+                    start_after,
+                    max_buckets: effective,
+                },
+                None,
+            )
             .await
             .map_err(map_backend_error)?;
         let buckets = listing
@@ -247,7 +256,7 @@ mod tests {
     };
     use crate::{
         _core::{
-            bucket,
+            acl, bucket,
             storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps},
         },
         _mem::MemoryStorage,
@@ -422,7 +431,11 @@ mod tests {
         let storage = backend.storage();
         for name in ["zeta", "alpha-1", "alpha-2", "mid", "beta-1", "beta-2"] {
             storage
-                .create_bucket(&bucket::name(name).unwrap())
+                .create_bucket(
+                    &bucket::name(name).unwrap(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         }
@@ -493,7 +506,11 @@ mod tests {
         let storage = backend.storage();
         for name in ["alpha-1", "alpha-2", "beta-1"] {
             storage
-                .create_bucket(&bucket::name(name).unwrap())
+                .create_bucket(
+                    &bucket::name(name).unwrap(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         }
@@ -526,7 +543,11 @@ mod tests {
         let backend = backend();
         let storage = backend.storage();
         storage
-            .create_bucket(&bucket::name("data").unwrap())
+            .create_bucket(
+                &bucket::name("data").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let out = backend
@@ -594,7 +615,11 @@ mod tests {
         let storage = backend.storage();
         for name in ["zeta", "alpha-1", "alpha-2", "mid", "beta-1", "beta-2"] {
             storage
-                .create_bucket(&bucket::name(name).unwrap())
+                .create_bucket(
+                    &bucket::name(name).unwrap(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         }
@@ -642,7 +667,11 @@ mod tests {
         // The ceiling itself is legal.
         let storage = backend.storage();
         storage
-            .create_bucket(&bucket::name("data").unwrap())
+            .create_bucket(
+                &bucket::name("data").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let out = backend
@@ -705,7 +734,11 @@ mod tests {
         let storage = backend.storage();
         for i in 0..10_001 {
             storage
-                .create_bucket(&bucket::name(format!("b-{i}")).unwrap())
+                .create_bucket(
+                    &bucket::name(format!("b-{i}")).unwrap(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         }
@@ -760,7 +793,11 @@ mod tests {
         let storage = backend.storage();
         for name in ["alpha", "beta"] {
             storage
-                .create_bucket(&bucket::name(name).unwrap())
+                .create_bucket(
+                    &bucket::name(name).unwrap(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         }

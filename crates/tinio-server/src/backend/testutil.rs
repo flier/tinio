@@ -5,7 +5,7 @@ use s3s::S3Request;
 
 use super::{Capabilities, S3Backend};
 use crate::{
-    _core::{bucket, storage::BucketOps},
+    _core::{acl, bucket, storage::BucketOps},
     _mem::MemoryStorage,
 };
 
@@ -37,7 +37,11 @@ pub(crate) async fn setup_with_caps(caps: Capabilities) -> (S3Backend<MemoryStor
     let storage = backend.storage();
     let b = "data".to_string();
     storage
-        .create_bucket(&bucket::name(&b).unwrap())
+        .create_bucket(
+            &bucket::name(&b).unwrap(),
+            None,
+            &acl::Acl::default_private(None),
+        )
         .await
         .unwrap();
     (backend, b)
