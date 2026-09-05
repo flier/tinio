@@ -6,8 +6,8 @@
 //! key order: MISSING omits its key, all-missing → `{}`, `Decimal` renders
 //! its normalized text (still a valid JSON number), `RawNumber` its token
 //! verbatim (arbitrary-precision passthrough), `String`/`Json` via serde_json.
-//! A JSON value under CSV output is the `NestedCsv` error — the only error
-//! either serializer raises (grilling Q10).
+//! A JSON value under CSV output is the SELECT * matrix cell: compact JSON
+//! text in that cell (`display`) — CSV quoting/escaping applies to the cell.
 
 use csv::{QuoteStyle, Terminator, WriterBuilder};
 
@@ -76,17 +76,13 @@ pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, SelectE
 }
 
 /// CSV row via the `csv` writer: values in key order under the params'
-/// quoting/escaping; `Json` values are rejected before anything is written.
+/// quoting/escaping; `Json` values render as compact JSON text in the cell
+/// (the SELECT * matrix: JSON→CSV nested values land in the cell as
+/// `to_string`, `{"a":1}` — CSV-side quoting/escaping applies, so the
+/// cell's own `"` are escaped per the params).
 /// Double-quoting is off so the configured escape actually prefixes quote
 /// chars — with the default escape==quote the bytes equal doubling.
 fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, SelectError> {
-    if row
-        .vals
-        .iter()
-        .any(|f| matches!(f, Field::Present(Value::Json(_))))
-    {
-        return Err(SelectError::NestedCsv);
-    }
     let mut b = WriterBuilder::new();
     b.delimiter(params.field_delimiter)
         .terminator(Terminator::Any(params.record_delimiter))
@@ -360,14 +356,18 @@ mod tests {
     }
 
     #[test]
-    fn json_value_under_csv_output_is_nested_error() {
+    fn json_value_under_csv_output_is_compact_cell() {
+        // SELECT * matrix: JSON→CSV nested values land in the cell as
+        // compact JSON text (`{"a":1}`, no spaces); the cell's own `"` are
+        // CSV-escaped per the params (default escape==quote: doubled), so
+        // the encoded cell is `"{""a"":1}"`.
         let row = row(
             vec!["k"],
             vec![present(Value::Json(Box::new(json!({"a": 1}))))],
         );
-        match serialize_row(&csv_mode(), &row) {
-            Err(SelectError::NestedCsv) => {}
-            other => panic!("expected NestedCsv error, got {other:?}"),
-        }
+        assert_eq!(
+            serialize_row(&csv_mode(), &row).unwrap(),
+            b"\"{\"\"a\"\":1}\"\n"
+        );
     }
 }
