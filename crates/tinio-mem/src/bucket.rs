@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::_core::bucket::name;
 use crate::{
     _core::{
-        Bucket, BucketOps, BucketsListing, ListBucketsParams, bucket::Name, object,
+        Bucket, BucketOps, BucketsListing, ListBucketsParams, bucket::Name, cors, object,
         paginate_ordered,
     },
     _store::{bucket, objects, upload},
@@ -123,7 +123,7 @@ impl BucketOps for MemoryStorage {
         // empty when the wire is domain-invalid (self-healing, cap 50).
         self.db.read(|txn| {
             let buckets = bucket::Table::open_readonly(txn)?;
-            let Some((_created, tags_wire)) = buckets.row(name.as_ref().as_str())? else {
+            let Some((_created, tags_wire, _, _, _)) = buckets.row(name.as_ref().as_str())? else {
                 return Err(no_such_bucket(name));
             };
             Ok(object::Tags::from_wire_limited(
@@ -153,6 +153,53 @@ impl BucketOps for MemoryStorage {
         self.rewrite_bucket_tags_element(name, "").await?;
         Ok(())
     }
+
+    async fn get_bucket_cors(&self, name: &Name) -> Result<Option<cors::CorsConfig>, Error> {
+        // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
+        // mirroring `head_bucket`). The configuration comes from the
+        // row's CORS element, None when it is the `''` wire (a bucket
+        // that was cleared or never configured) or domain-invalid
+        // (self-healing, the store's `decode_cors_wire`).
+        self.db.read(|txn| {
+            let buckets = bucket::Table::open_readonly(txn)?;
+            let Some((_created, _tags, _owner, _acl, cors_wire)) =
+                buckets.row(name.as_ref().as_str())?
+            else {
+                return Err(no_such_bucket(name));
+            };
+            let config = bucket::decode_cors_wire(&cors_wire);
+            // op-review G2: the `''` wire — a zero-rule config, the
+            // cleared state — is "no configuration".
+            Ok((!config.rules.is_empty()).then_some(config))
+        })
+    }
+
+    async fn put_bucket_cors(&self, name: &Name, config: &cors::CorsConfig) -> Result<(), Error> {
+        // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
+        // mirroring `head_bucket`). op-review G2: a zero-rule config
+        // normalizes to the `''` wire — "no configuration".
+        let wire = if config.rules.is_empty() {
+            String::new()
+        } else {
+            config.to_wire()
+        };
+        if !self.rewrite_bucket_cors_element(name, &wire).await? {
+            return Err(no_such_bucket(name));
+        }
+        Ok(())
+    }
+
+    async fn delete_bucket_cors(&self, name: &Name) -> Result<(), Error> {
+        // S3 semantics: `NoSuchBucket` when the bucket is missing — the
+        // delete-tagging idempotent leniency does NOT extend here (the
+        // CORS spec mandates `NoSuchBucket` for a missing bucket); a
+        // bucket that simply has no configuration clears to the same
+        // state (idempotent).
+        if !self.rewrite_bucket_cors_element(name, "").await? {
+            return Err(no_such_bucket(name));
+        }
+        Ok(())
+    }
 }
 
 impl MemoryStorage {
@@ -168,10 +215,50 @@ impl MemoryStorage {
     ) -> Result<bool, Error> {
         self.db.write(|txn| {
             let mut buckets = bucket::Table::open(txn)?;
-            let Some((created, _prev_tags)) = buckets.row(name.as_ref().as_str())? else {
+            let Some((created, _prev_tags, owner_wire, acl_wire, cors_wire)) =
+                buckets.row(name.as_ref().as_str())?
+            else {
                 return Ok(false);
             };
-            buckets.put_full(name.as_ref().as_str(), created, tags_wire)?;
+            buckets.put_full(
+                name.as_ref().as_str(),
+                created,
+                tags_wire,
+                &owner_wire,
+                &acl_wire,
+                &cors_wire,
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// The CORS write transaction of the bucket trio — the shared body
+    /// of `put_bucket_cors` and `delete_bucket_cors`: one
+    /// read-modify-write transaction replaces the row's CORS element
+    /// with `cors_wire`, keeping the creation time and the other wire
+    /// elements verbatim. Returns whether the row existed (the caller
+    /// maps both to `NoSuchBucket` — the CORS spec, unlike
+    /// delete-bucket-tagging's idempotent Ok-on-missing).
+    async fn rewrite_bucket_cors_element(
+        &self,
+        name: &Name,
+        cors_wire: &str,
+    ) -> Result<bool, Error> {
+        self.db.write(|txn| {
+            let mut buckets = bucket::Table::open(txn)?;
+            let Some((created, tags_wire, owner_wire, acl_wire, _prev_cors)) =
+                buckets.row(name.as_ref().as_str())?
+            else {
+                return Ok(false);
+            };
+            buckets.put_full(
+                name.as_ref().as_str(),
+                created,
+                &tags_wire,
+                &owner_wire,
+                &acl_wire,
+                cors_wire,
+            )?;
             Ok(true)
         })
     }
@@ -345,10 +432,114 @@ mod tests {
             let mut txn = storage.db.db().begin_write().unwrap();
             bucket::Table::open(&mut txn)
                 .unwrap()
-                .insert(b.as_ref().as_str(), (1u64, "team=%zz&"))
+                .insert(b.as_ref().as_str(), (1u64, "team=%zz&", "", "", ""))
                 .unwrap();
             txn.commit().unwrap();
         }
         assert!(storage.get_bucket_tags(&b).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mem_bucket_cors_round_trip_and_replace() {
+        let storage = MemoryStorage::new().unwrap();
+        let b = name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        assert!(
+            storage.get_bucket_cors(&b).await.unwrap().is_none(),
+            "an unconfigured bucket answers None"
+        );
+
+        let config = cors::CorsConfig {
+            rules: vec![
+                cors::CorsRule {
+                    id: Some("one".into()),
+                    allowed_methods: vec!["GET".into()],
+                    allowed_origins: vec!["*".into()],
+                    allowed_headers: Some(vec!["x-amz-*".into()]),
+                    expose_headers: Some(vec!["ETag".into()]),
+                    max_age_seconds: Some(60),
+                },
+                cors::CorsRule {
+                    id: None,
+                    allowed_methods: vec!["PUT".into(), "DELETE".into()],
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_headers: None,
+                    expose_headers: None,
+                    max_age_seconds: None,
+                },
+            ],
+        };
+        // The 5-tuple discipline, written first: the CORS writes must not
+        // clobber a stored tag set.
+        let tags = object::Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        storage.put_bucket_tags(&b, &tags).await.unwrap();
+
+        // Put → Get round-trip (replace-all, no merge; order + fields kept).
+        storage.put_bucket_cors(&b, &config).await.unwrap();
+        assert_eq!(
+            storage.get_bucket_cors(&b).await.unwrap(),
+            Some(config.clone())
+        );
+        assert_eq!(
+            storage.get_bucket_tags(&b).await.unwrap(),
+            tags,
+            "the CORS writes must preserve the tags element"
+        );
+
+        // op-review G2: a zero-rule config through the whole backend must
+        // be indistinguishable from "no configuration".
+        storage
+            .put_bucket_cors(&b, &cors::CorsConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);
+        storage.put_bucket_cors(&b, &config).await.unwrap();
+        assert_eq!(
+            storage.get_bucket_cors(&b).await.unwrap(),
+            Some(config.clone())
+        );
+
+        // head_bucket still reports the creation time (the row's other
+        // elements survive the CORS writes).
+        let head = storage.head_bucket(&b).await.unwrap();
+        assert!(
+            head.creation_time <= std::time::SystemTime::now(),
+            "the creation time must survive bucket CORS writes"
+        );
+
+        // Delete clears; the delete is idempotent on the stored config.
+        storage.delete_bucket_cors(&b).await.unwrap();
+        assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);
+        storage.delete_bucket_cors(&b).await.unwrap();
+
+        // Missing bucket: get/put/delete → NoSuchBucket (the CORS spec —
+        // unlike the delete-bucket-tags idempotent Ok).
+        let ghost = name("ghost").unwrap();
+        let err: Error = storage.get_bucket_cors(&ghost).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
+        let err: Error = storage.put_bucket_cors(&ghost, &config).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
+        let err: Error = storage.delete_bucket_cors(&ghost).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
+    }
+
+    #[tokio::test]
+    async fn mem_garbage_bucket_cors_self_heal() {
+        // The read-side tolerance ruling: a bucket row whose CORS element
+        // is domain-invalid serves "no configuration" (mirroring the fs
+        // store's self-healing decode). Rows are API-written; the garbage
+        // below is a direct database write (tampering).
+        let storage = MemoryStorage::new().unwrap();
+        let b = name("data").unwrap();
+        storage.create_bucket(&b).await.unwrap();
+        {
+            let mut txn = storage.db.db().begin_write().unwrap();
+            bucket::Table::open(&mut txn)
+                .unwrap()
+                .insert(b.as_ref().as_str(), (1u64, "", "", "", "a,b,c"))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert!(storage.get_bucket_cors(&b).await.unwrap().is_none());
     }
 }
