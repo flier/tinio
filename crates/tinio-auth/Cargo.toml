@@ -15,7 +15,11 @@ thiserror.workspace = true
 tinio-core.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+tinio-mem.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
