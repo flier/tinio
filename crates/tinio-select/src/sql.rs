@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    AccessExpr, CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, LimitClause, SelectItem, SetExpr, Statement, Subscript, TableFactor,
+    AccessExpr, CaseWhen, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, LimitClause, SelectItem, SetExpr, Statement, Subscript,
+    TableFactor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -158,6 +159,14 @@ pub fn parse(sql: &str) -> Result<QueryPlan, SelectError> {
     }
     if aggregates && projections.iter().any(|p| matches!(p, Projection::Wild)) {
         return Err(SelectError::Parse("aggregates require an explicit select list".into()));
+    }
+    if aggregates {
+        for item in &projections {
+            let Projection::Item { expr, .. } = item else {
+                unreachable!("aggregates+Wild rejected above");
+            };
+            validate_aggregate_item(expr)?;
+        }
     }
     Ok(QueryPlan {
         from,
@@ -760,6 +769,48 @@ fn is_aggregate_name(name: &sqlparser::ast::ObjectName) -> bool {
         .any(|k| part.value.eq_ignore_ascii_case(k))
 }
 
+/// In aggregate mode every projection item must be one bare aggregate call
+/// (Task 7): `count(*)`, `count(expr)`, `sum/avg/min/max(expr)` — no
+/// DISTINCT, no FILTER/OVER/clauses, no wrapping (`count(*) + 1`). A
+/// non-grouped column or an expression over an aggregate is invalid SQL
+/// without GROUP BY (AWS rejects both), so the whole query is a request-
+/// level parse error. `DISTINCT` gets its own message per the plan.
+fn validate_aggregate_item(expr: &Expr) -> Result<(), SelectError> {
+    let not_aggregate = || {
+        SelectError::Parse("non-aggregate expression in aggregate select list".into())
+    };
+    let Expr::Function(f) = expr else {
+        return Err(not_aggregate());
+    };
+    if !is_aggregate_name(&f.name)
+        || f.parameters != FunctionArguments::None
+        || f.filter.is_some()
+        || f.over.is_some()
+        || f.null_treatment.is_some()
+        || !f.within_group.is_empty()
+    {
+        return Err(not_aggregate());
+    }
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(not_aggregate());
+    };
+    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        return Err(SelectError::Parse("distinct not supported".into()));
+    }
+    if !list.clauses.is_empty() {
+        return Err(not_aggregate());
+    }
+    let [sqlparser::ast::ObjectNamePart::Identifier(part)] = f.name.0.as_slice() else {
+        return Err(not_aggregate());
+    };
+    let name = part.value.to_ascii_lowercase();
+    match (name.as_str(), list.args.as_slice()) {
+        ("count", [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok(()),
+        (_, [FunctionArg::Unnamed(FunctionArgExpr::Expr(_))]) => Ok(()),
+        _ => Err(not_aggregate()),
+    }
+}
+
 /// The expression arguments of a function call (aggregates never hide in
 /// `Wildcard`/`QualifiedWildcard` args).
 fn function_exprs(f: &Function) -> Vec<&Expr> {
@@ -949,6 +1000,44 @@ mod tests {
     #[test]
     fn reject_aggregates_plus_wild() {
         rej("SELECT *, count(*) FROM S3Object s", "aggregates require an explicit select list");
+    }
+
+    #[test]
+    fn reject_mixed_aggregate_list() {
+        // A non-grouped column next to an aggregate is invalid SQL — the
+        // list must be bare aggregate calls only (AWS rejects it too).
+        rej(
+            "SELECT s._1, count(*) FROM S3Object s",
+            "non-aggregate expression in aggregate select list",
+        );
+    }
+
+    #[test]
+    fn reject_wrapped_aggregate() {
+        // An expression over an aggregate (count(*) + 1) is not a bare
+        // aggregate call: rejected at parse like the mixed list.
+        rej(
+            "SELECT count(*) + 1 FROM S3Object s",
+            "non-aggregate expression in aggregate select list",
+        );
+    }
+
+    #[test]
+    fn reject_aggregate_distinct() {
+        rej(
+            "SELECT count(DISTINCT s._1) FROM S3Object s",
+            "distinct not supported",
+        );
+    }
+
+    #[test]
+    fn aggregate_bare_forms_parse() {
+        let q = ok(
+            "SELECT count(*), count(s._1) AS c, sum(s._2), avg(s._2), min(s._2), max(s._2) \
+             FROM S3Object s",
+        );
+        assert!(q.aggregates);
+        assert_eq!(q.projections.len(), 6);
     }
 
     #[test]

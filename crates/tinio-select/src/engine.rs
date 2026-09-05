@@ -17,8 +17,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::Value as AstValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
-    ObjectNamePart, UnaryOperator,
+    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, ObjectName, ObjectNamePart, UnaryOperator,
 };
 
 use crate::SelectError;
@@ -33,11 +33,58 @@ pub struct OutRow {
     pub vals: Vec<Field>,
 }
 
-/// Plan-driven evaluator: WHERE filter, projection, LIMIT.
+/// Plan-driven evaluator: WHERE filter, projection, LIMIT; aggregate mode
+/// (Task 7) accumulates instead, producing its row in `finish`.
 pub struct Engine {
     plan: QueryPlan,
     /// Rows emitted so far (the LIMIT counter).
     emitted: usize,
+    /// Aggregate accumulator: `None` for non-aggregate plans.
+    agg_state: Option<AggState>,
+    /// Per-projection kind, classified once on the first accumulated row —
+    /// the parse layer already guarantees the bare-call shape, so this
+    /// memo is also the engine's defense.
+    agg_kinds: Option<Vec<AggKind>>,
+}
+
+/// One projection item's aggregate form.
+#[derive(Debug, Clone, PartialEq)]
+enum AggKind {
+    CountStar,
+    Count(Expr),
+    Sum(Expr),
+    Avg(Expr),
+    Min(Expr),
+    Max(Expr),
+}
+
+/// The running aggregate accumulator: `count` = rows seen (COUNT(*)),
+/// `per_col[i]` = the i-th projection's column state.
+#[derive(Debug, Default)]
+struct AggState {
+    count: u64,
+    per_col: Vec<AggCol>,
+}
+
+/// One aggregate column's running state: contributing-value count, the
+/// running sum, and the MIN/MAX extrema — typed by the first contributing
+/// value.
+#[derive(Debug, Clone, Default)]
+struct AggCol {
+    count: u64,
+    sum: Option<Decimal>,
+    min: Option<Value>,
+    max: Option<Value>,
+    /// MIN/MAX comparison spine, fixed by the first contributor.
+    extrema: Option<ExtremaMode>,
+}
+
+/// The MIN/MAX spine: numeric when the first contributing value parses,
+/// strict-lexicographic string when it does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ExtremaMode {
+    Numeric,
+    String,
 }
 
 /// What an expression in flight sees: the record under test plus the FROM
@@ -49,11 +96,25 @@ struct RowCtx<'a> {
 
 impl Engine {
     pub fn new(plan: QueryPlan) -> Self {
-        Self { plan, emitted: 0 }
+        let agg_state = plan.aggregates.then(|| AggState {
+            count: 0,
+            per_col: vec![AggCol::default(); plan.projections.len()],
+        });
+        Self {
+            plan,
+            emitted: 0,
+            agg_state,
+            agg_kinds: None,
+        }
     }
 
-    /// One record through the plan. `Ok(None)` = filtered, or LIMIT reached.
+    /// One record through the plan. `Ok(None)` = filtered, or LIMIT reached;
+    /// in aggregate mode it always accumulates and returns `Ok(None)` (the
+    /// single row is live in `finish`).
     pub fn next(&mut self, rec: Record) -> Result<Option<OutRow>, SelectError> {
+        if self.agg_state.is_some() {
+            return self.aggregate_next(rec);
+        }
         if self.emitted >= self.plan.limit.unwrap_or(usize::MAX) {
             return Ok(None);
         }
@@ -73,10 +134,65 @@ impl Engine {
         Ok(Some(row))
     }
 
-    /// The aggregate row, live in Task 7; end-of-stream for this task's
-    /// non-aggregate plans.
+    /// Non-aggregate plans: end-of-stream, `Ok(None)` — matching `next`'s
+    /// row flow. Aggregate mode (Task 7): the caller loops `next` to EOF,
+    /// then `finish` produces the single aggregate row; a repeated call
+    /// returns `Ok(None)` (the state is consumed).
     pub fn finish(&mut self) -> Result<Option<OutRow>, SelectError> {
+        let Some(state) = self.agg_state.take() else {
+            return Ok(None);
+        };
+        self.classified()?;
+        let kinds = self.agg_kinds.as_deref().expect("classified above");
+        let mut keys = Vec::with_capacity(self.plan.projections.len());
+        let mut vals = Vec::with_capacity(self.plan.projections.len());
+        for (item, (kind, col)) in self
+            .plan
+            .projections
+            .iter()
+            .zip(kinds.iter().zip(state.per_col.iter()))
+        {
+            let Projection::Item { expr, alias } = item else {
+                unreachable!("aggregate plans never carry Wild (rejected at parse)");
+            };
+            keys.push(alias.clone().unwrap_or_else(|| plain_key(expr)));
+            vals.push(Field::Present(finish_value(kind, &state, col)?));
+        }
+        Ok(Some(OutRow { keys, vals }))
+    }
+
+    /// Aggregate mode: WHERE-filter, then accumulate for the row. A filtered
+    /// record contributes nothing; LIMIT applies to the single output row
+    /// (never a positive bound) and is not consulted here.
+    fn aggregate_next(&mut self, rec: Record) -> Result<Option<OutRow>, SelectError> {
+        self.classified()?;
+        let ctx = RowCtx {
+            record: &rec,
+            alias: &self.plan.from.alias,
+        };
+        let passes = match &self.plan.where_expr {
+            Some(expr) => eval(expr, &ctx)? == Value::Bool(true),
+            None => true,
+        };
+        if passes {
+            let kinds = self.agg_kinds.as_deref().expect("classified above");
+            let state = self.agg_state.as_mut().expect("aggregate mode");
+            accumulate(kinds, state, &ctx)?;
+        }
         Ok(None)
+    }
+
+    /// Classify the projection list once (defense: the parse layer already
+    /// guarantees every item is a bare aggregate call).
+    fn classified(&mut self) -> Result<(), SelectError> {
+        if self.agg_kinds.is_none() {
+            let mut kinds = Vec::with_capacity(self.plan.projections.len());
+            for item in &self.plan.projections {
+                kinds.push(aggregate_kind(item)?);
+            }
+            self.agg_kinds = Some(kinds);
+        }
+        Ok(())
     }
 
     /// One record's projection: `Wild` → the record's fields verbatim
@@ -106,6 +222,178 @@ impl Engine {
         }
         Ok(OutRow { keys, vals })
     }
+}
+
+/// One passing record through every aggregate in the projection list.
+fn accumulate(
+    kinds: &[AggKind],
+    state: &mut AggState,
+    ctx: &RowCtx,
+) -> Result<(), SelectError> {
+    state.count += 1;
+    for (kind, col) in kinds.iter().zip(state.per_col.iter_mut()) {
+        match kind {
+            AggKind::CountStar => {}
+            AggKind::Count(e) => {
+                if present_value(e, ctx)?.is_some() {
+                    col.count += 1;
+                }
+            }
+            AggKind::Sum(e) | AggKind::Avg(e) => {
+                if let Some(v) = present_value(e, ctx)? {
+                    let d = as_decimal(&v)?;
+                    col.count += 1;
+                    col.sum = Some(match col.sum {
+                        None => d,
+                        Some(s) => s.checked_add(d).ok_or_else(precision_overflow)?,
+                    });
+                }
+            }
+            AggKind::Min(e) => accumulate_extrema(e, true, col, ctx)?,
+            AggKind::Max(e) => accumulate_extrema(e, false, col, ctx)?,
+        }
+    }
+    Ok(())
+}
+
+/// The operand as a present non-NULL value (`eval_field` keeps MISSING);
+/// every aggregate skips Missing and Null alike.
+fn present_value(expr: &Expr, ctx: &RowCtx) -> Result<Option<Value>, SelectError> {
+    Ok(match eval_field(expr, ctx)? {
+        Field::Present(Value::Null) | Field::Missing => None,
+        Field::Present(v) => Some(v),
+    })
+}
+
+/// MIN/MAX accumulation, typed by the first contributing value (Task 7
+/// ruling): a value that parses numerically makes the column numeric — the
+/// extrema are parsed Decimals, so `min('10','2')` is 2, not "10", and a
+/// later unparseable contributor cast-fails with a value error. An
+/// unparseable first value (strings — the CSV case — reachable bool/JSON
+/// shapes via their canonical text) makes it a strict-lexicographic string
+/// column.
+fn accumulate_extrema(
+    expr: &Expr,
+    is_min: bool,
+    col: &mut AggCol,
+    ctx: &RowCtx,
+) -> Result<(), SelectError> {
+    let Some(v) = present_value(expr, ctx)? else {
+        return Ok(());
+    };
+    let current: &mut Option<Value> = if is_min { &mut col.min } else { &mut col.max };
+    match col.extrema {
+        Some(ExtremaMode::Numeric) => {
+            let d = as_decimal(&v)?;
+            let better = match current {
+                None => true,
+                Some(c) => {
+                    let other = as_decimal(c)?;
+                    if is_min { d < other } else { d > other }
+                }
+            };
+            if better {
+                *current = Some(Value::Decimal(d));
+            }
+        }
+        Some(ExtremaMode::String) => {
+            let text = display(&v);
+            let better = match current {
+                None => true,
+                Some(c) => {
+                    let current = display(c);
+                    if is_min { text < current } else { text > current }
+                }
+            };
+            if better {
+                *current = Some(Value::String(text));
+            }
+        }
+        None => match numeric(&v) {
+            Some(d) => {
+                col.extrema = Some(ExtremaMode::Numeric);
+                *current = Some(Value::Decimal(d));
+            }
+            None => {
+                col.extrema = Some(ExtremaMode::String);
+                *current = Some(Value::String(display(&v)));
+            }
+        },
+    }
+    Ok(())
+}
+
+/// One aggregate column's finished value: COUNT → Int; SUM/AVG/MIN/MAX with
+/// zero contributing values → Null; AVG → Decimal scale 10.
+fn finish_value(kind: &AggKind, state: &AggState, col: &AggCol) -> Result<Value, SelectError> {
+    Ok(match kind {
+        AggKind::CountStar => Value::Int(state.count as i64),
+        AggKind::Count(_) => Value::Int(col.count as i64),
+        AggKind::Sum(_) => match col.sum {
+            Some(sum) => Value::Decimal(sum),
+            None => Value::Null,
+        },
+        AggKind::Avg(_) => match (col.sum, col.count) {
+            (Some(sum), n) if n > 0 => {
+                let avg = sum
+                    .checked_div(Decimal::from(n))
+                    .ok_or_else(precision_overflow)?;
+                Value::Decimal(avg.round_dp(10))
+            }
+            _ => Value::Null,
+        },
+        AggKind::Min(_) => col.min.clone().unwrap_or(Value::Null),
+        AggKind::Max(_) => col.max.clone().unwrap_or(Value::Null),
+    })
+}
+
+/// Classify one projection item as the aggregate it must be — the shape the
+/// accumulation dispatches on; the parse layer rejects anything else, so
+/// the two error arms below are defense-in-depth.
+fn aggregate_kind(item: &Projection) -> Result<AggKind, SelectError> {
+    let not_aggregate = || {
+        SelectError::Parse("non-aggregate expression in aggregate select list".into())
+    };
+    let Projection::Item { expr, .. } = item else {
+        return Err(not_aggregate());
+    };
+    let Expr::Function(f) = expr else {
+        return Err(not_aggregate());
+    };
+    let Some(name) = single_part_name(&f.name) else {
+        return Err(not_aggregate());
+    };
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(not_aggregate());
+    };
+    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        return Err(SelectError::Parse("distinct not supported".into()));
+    }
+    match (name.as_str(), list.args.as_slice()) {
+        ("count", [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok(AggKind::CountStar),
+        ("count", [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => {
+            Ok(AggKind::Count(e.clone()))
+        }
+        ("sum", [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => Ok(AggKind::Sum(e.clone())),
+        ("avg", [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => Ok(AggKind::Avg(e.clone())),
+        ("min", [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => Ok(AggKind::Min(e.clone())),
+        ("max", [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => Ok(AggKind::Max(e.clone())),
+        _ => Err(not_aggregate()),
+    }
+}
+
+/// A function name as one lowercase part; a qualified name is never one of
+/// our aggregates.
+fn single_part_name(name: &ObjectName) -> Option<String> {
+    let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else {
+        return None;
+    };
+    Some(part.value.to_ascii_lowercase())
+}
+
+/// The shared 28-digit overflow error (same surface as arithmetic).
+fn precision_overflow() -> SelectError {
+    SelectError::Value("numeric value exceeds 28-digit precision".into())
 }
 
 /// The projection key of an expression without an alias.
@@ -750,6 +1038,19 @@ mod tests {
         rows
     }
 
+    /// Run `sql` over `records`, then `finish` — the aggregate row (Task 7).
+    #[track_caller]
+    fn run_agg(sql: &str, records: Vec<Record>) -> OutRow {
+        let mut engine = Engine::new(parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}")));
+        for rec in records {
+            engine.next(rec).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        engine
+            .finish()
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap_or_else(|| panic!("{sql}: expected an aggregate row"))
+    }
+
     #[test]
     fn where_limit_filters_then_caps() {
         let rows = run(
@@ -1286,12 +1587,262 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_function_arm_guards() {
-        let mut engine = Engine::new(parse("SELECT count(*) FROM S3Object s").unwrap());
+    fn unknown_function_arm_guards() {
+        // A non-aggregate plan never carries an aggregate call (sql.rs sets
+        // `aggregates` only for the five names); any other function is an
+        // unreachable shape — guard, not a real result.
+        let mut engine = Engine::new(parse("SELECT unknown_fn(s._1) FROM S3Object s").unwrap());
         match engine.next(csv(&["1"], &["_1"])) {
             Err(SelectError::Value(m)) => assert_eq!(m, "internal: unexpected aggregate call"),
             other => panic!("expected aggregate guard, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn count_star_counts_every_row() {
+        let row = run_agg(
+            "SELECT count(*) FROM S3Object s",
+            vec![
+                csv(&["1", "x"], &["_1", "_2"]),
+                csv(&["2", "y"], &["_1", "_2"]),
+            ],
+        );
+        assert_eq!(row.keys, vec!["count(*)"]);
+        assert_eq!(row.vals, vec![Field::Present(Value::Int(2))]);
+    }
+
+    #[test]
+    fn count_expr_missing_and_null_are_zero() {
+        // `_5` past the row width is MISSING for every row.
+        let row = run_agg(
+            "SELECT count(s._5) FROM S3Object s",
+            vec![
+                csv(&["1", "2", "3"], &["_1", "_2", "_3"]),
+                csv(&["1", "2", "3"], &["_1", "_2", "_3"]),
+            ],
+        );
+        assert_eq!(row.vals, vec![Field::Present(Value::Int(0))]);
+        // A present NULL does not count either.
+        let rec = Record::Csv(vec![Field::Present(Value::Null)], vec!["a".into()]);
+        let row = run_agg("SELECT count(s.a) FROM S3Object s", vec![rec]);
+        assert_eq!(row.vals, vec![Field::Present(Value::Int(0))]);
+    }
+
+    #[test]
+    fn sum_parses_numeric_strings() {
+        let row = run_agg(
+            "SELECT sum(s._3) FROM S3Object s",
+            vec![
+                csv(&["1", "x", "10"], &["_1", "_2", "_3"]),
+                csv(&["2", "y", "20"], &["_1", "_2", "_3"]),
+            ],
+        );
+        assert_eq!(
+            row.vals,
+            vec![Field::Present(Value::Decimal(Decimal::from(30)))]
+        );
+    }
+
+    #[test]
+    fn sum_non_numeric_value_errors() {
+        // AWS cast-fails: a non-numeric contributor in a SUM is a value
+        // error, never a silent skip (controller ruling, Task 7).
+        let mut engine = Engine::new(parse("SELECT sum(s._3) FROM S3Object s").unwrap());
+        assert_eq!(engine.next(csv(&["1", "x", "10"], &["_1", "_2", "_3"])).unwrap(), None);
+        match engine.next(csv(&["2", "y", "x"], &["_1", "_2", "_3"])) {
+            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
+            other => panic!("expected invalid numeric error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avg_is_decimal_scale_ten() {
+        // Exact average: 1.5.
+        let row = run_agg(
+            "SELECT avg(s._1) FROM S3Object s",
+            vec![
+                csv(&["1"], &["_1"]),
+                csv(&["2"], &["_1"]),
+            ],
+        );
+        assert_eq!(
+            row.vals,
+            vec![Field::Present(Value::Decimal(Decimal::new(15, 1)))]
+        );
+        // Non-terminating: 5/3 rounds to scale 10.
+        let row = run_agg(
+            "SELECT avg(s._1) FROM S3Object s",
+            vec![
+                csv(&["1"], &["_1"]),
+                csv(&["2"], &["_1"]),
+                csv(&["2"], &["_1"]),
+            ],
+        );
+        assert_eq!(
+            row.vals,
+            vec![Field::Present(Value::Decimal(Decimal::new(16666666667, 10)))]
+        );
+    }
+
+    #[test]
+    fn min_max_numeric_strings_are_decimals() {
+        // First contributor parses → the column is numeric: extrema are
+        // parsed Decimals, so ['10','2'] → min 2, max 10 (not "10").
+        let row = run_agg(
+            "SELECT min(s._1), max(s._1) FROM S3Object s",
+            vec![
+                csv(&["10"], &["_1"]),
+                csv(&["2"], &["_1"]),
+            ],
+        );
+        assert_eq!(
+            row.vals,
+            vec![
+                Field::Present(Value::Decimal(Decimal::from(2))),
+                Field::Present(Value::Decimal(Decimal::from(10))),
+            ]
+        );
+    }
+
+    #[test]
+    fn min_max_strings_lexicographic() {
+        // Non-numeric strings stay a string column: strict lexicographic.
+        let row = run_agg(
+            "SELECT min(s._2), max(s._2) FROM S3Object s",
+            vec![
+                csv(&["1", "alice"], &["_1", "_2"]),
+                csv(&["2", "carol"], &["_1", "_2"]),
+                csv(&["3", "bob"], &["_1", "_2"]),
+            ],
+        );
+        assert_eq!(row.keys, vec!["min(s._2)", "max(s._2)"]);
+        assert_eq!(row.vals, vec![s("alice"), s("carol")]);
+    }
+
+    #[test]
+    fn min_max_numeric_invalid_late_value_errors() {
+        // A numeric column hitting a non-parseable string cast-fails with a
+        // value error (the aggregate never returns a wrong extrema).
+        let mut engine = Engine::new(parse("SELECT min(s._1) FROM S3Object s").unwrap());
+        assert_eq!(engine.next(csv(&["10"], &["_1"])).unwrap(), None);
+        match engine.next(csv(&["x"], &["_1"])) {
+            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
+            other => panic!("expected invalid numeric error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_row_object_aggregates() {
+        // No records at all: COUNT(*) = 0, every other aggregate = NULL.
+        let row = run_agg(
+            "SELECT count(*), sum(s._1), avg(s._1), min(s._1), max(s._1) FROM S3Object s",
+            vec![],
+        );
+        assert_eq!(
+            row.vals,
+            vec![
+                Field::Present(Value::Int(0)),
+                Field::Present(Value::Null),
+                Field::Present(Value::Null),
+                Field::Present(Value::Null),
+                Field::Present(Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_null_row_aggregates() {
+        // One all-NULL row: COUNT(*) = 1 (a row), COUNT(expr) = 0, extrema
+        // and sums stay NULL.
+        let rec = Record::Csv(
+            vec![Field::Present(Value::Null), Field::Present(Value::Null)],
+            vec!["a".into(), "b".into()],
+        );
+        let row = run_agg(
+            "SELECT count(*), count(s.a), sum(s.b), avg(s.b), min(s.a), max(s.a) FROM S3Object s",
+            vec![rec],
+        );
+        assert_eq!(
+            row.vals,
+            vec![
+                Field::Present(Value::Int(1)),
+                Field::Present(Value::Int(0)),
+                Field::Present(Value::Null),
+                Field::Present(Value::Null),
+                Field::Present(Value::Null),
+                Field::Present(Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn sum_and_avg_over_all_missing_is_null() {
+        // `_5` past the row width: no contributors → NULL, not 0.
+        let row = run_agg(
+            "SELECT sum(s._5), avg(s._5) FROM S3Object s",
+            vec![csv(&["1", "2", "3"], &["_1", "_2", "_3"])],
+        );
+        assert_eq!(
+            row.vals,
+            vec![Field::Present(Value::Null), Field::Present(Value::Null)]
+        );
+    }
+
+    #[test]
+    fn aggregate_where_counts_only_passing_rows() {
+        let row = run_agg(
+            "SELECT count(*) FROM S3Object s WHERE s._1 = '1'",
+            vec![
+                csv(&["1", "x"], &["_1", "_2"]),
+                csv(&["2", "y"], &["_1", "_2"]),
+            ],
+        );
+        assert_eq!(row.vals, vec![Field::Present(Value::Int(1))]);
+    }
+
+    #[test]
+    fn aggregate_alias_is_the_key() {
+        let row = run_agg(
+            "SELECT count(*) AS n FROM S3Object s",
+            vec![csv(&["1"], &["_1"])],
+        );
+        assert_eq!(row.keys, vec!["n"]);
+        assert_eq!(row.vals, vec![Field::Present(Value::Int(1))]);
+    }
+
+    #[test]
+    fn aggregate_next_emits_no_rows() {
+        // Aggregate mode accumulates across every `next`; rows only exist at
+        // `finish` — filtered or not.
+        let mut engine = Engine::new(parse("SELECT count(*) FROM S3Object s").unwrap());
+        assert_eq!(engine.next(csv(&["1"], &["_1"])).unwrap(), None);
+        assert_eq!(engine.next(csv(&["2"], &["_1"])).unwrap(), None);
+    }
+
+    #[test]
+    fn multi_aggregate_row_shapes() {
+        // Bare forms compose into one row, in projection order.
+        let row = run_agg(
+            "SELECT count(*), count(s._1), sum(s._3), avg(s._3), min(s._2) FROM S3Object s",
+            vec![
+                csv(&["1", "x", "10"], &["_1", "_2", "_3"]),
+                csv(&["1", "y", "20"], &["_1", "_2", "_3"]),
+            ],
+        );
+        assert_eq!(
+            row.keys,
+            vec!["count(*)", "count(s._1)", "sum(s._3)", "avg(s._3)", "min(s._2)"]
+        );
+        assert_eq!(
+            row.vals,
+            vec![
+                Field::Present(Value::Int(2)),
+                Field::Present(Value::Int(2)),
+                Field::Present(Value::Decimal(Decimal::from(30))),
+                Field::Present(Value::Decimal(Decimal::from(15))),
+                s("x"),
+            ]
+        );
     }
 
     #[test]
