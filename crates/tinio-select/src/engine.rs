@@ -756,8 +756,10 @@ fn parquet_field(
     }
 }
 
-/// `_N` → zero-based index; `_0`/`_`/`_a` are not positional.
-fn positional(name: &str) -> Option<usize> {
+/// `_N` → zero-based index; `_0`/`_`/`_a` are not positional. Shared with
+/// the parquet projection mask: an `_N` reference reads the full record
+/// (the spine indexes the whole field list, never a pruned subset).
+pub(crate) fn positional(name: &str) -> Option<usize> {
     let digits = name.strip_prefix('_')?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;

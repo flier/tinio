@@ -39,6 +39,7 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::engine::positional;
 use crate::record::RecordReader;
 use crate::row::{Field, Record, Value, parse_number};
 use crate::SelectError;
@@ -87,6 +88,12 @@ fn projection_mask(
     projection: &[String],
 ) -> ProjectionMask {
     if projection.is_empty() {
+        return ProjectionMask::all();
+    }
+    // The engine's positional spine (`_N`) indexes the full record: a
+    // pruned record would index the projected subset — the wrong column
+    // or a starved MISSING — so any `_N` reference reads every column.
+    if projection.iter().any(|n| positional(n).is_some()) {
         return ProjectionMask::all();
     }
     let schema = builder.parquet_schema();
@@ -527,6 +534,21 @@ mod tests {
         };
         assert_eq!(names, vec!["id"]);
         assert_eq!(fields[0], Field::Present(Value::Int(42)));
+    }
+
+    #[test]
+    fn positional_projection_reads_all_columns() {
+        // `_N` references index the full record (the engine's positional
+        // spine) — a pruned record would index the projected subset, so
+        // `_2` would starve to MISSING. Fall back to every column.
+        let bytes = write_parquet(&fixture());
+        let mut r = ParquetReader::new(Cursor::new(bytes), vec!["_2".into()], MAX_BYTES).unwrap();
+        let Record::Parquet(fields, names) = record(&mut r) else {
+            panic!("expected parquet record")
+        };
+        assert_eq!(names.len(), 12);
+        assert_eq!(fields[0], Field::Present(Value::Int(42)));
+        assert_eq!(fields[1], Field::Present(Value::Int(-7)));
     }
 
     #[test]
