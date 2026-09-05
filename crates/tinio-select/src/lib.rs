@@ -10,5 +10,6 @@
 
 pub mod error;
 pub mod row;
+pub mod sql;
 
 pub use error::SelectError;
