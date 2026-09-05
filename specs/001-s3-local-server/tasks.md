@@ -249,6 +249,21 @@ Incremental surface work implemented on top of the original plan (FR-030/FR-031/
 - [X] T125 [US1] Cucumber scenarios: `tagging.feature` +7, `conditions.feature` RenameObject block +5, `objects.feature` GetObjectAttributes block +3 (167 scenarios total) — FR-030/FR-031/FR-032 (scenarios left untagged until T126 assigns the spec IDs)
 - [X] T126 [US1] Specs & docs: FR-030/FR-031/FR-032 written into `contracts/s3-surface.md`, task entries here, checklist items in `checklists/compatibility.md`, the feature scenarios tagged with the new IDs, the `steps/mod.rs` dangling "spec §Tagging" comment resolved — FR-030/FR-031/FR-032
 
+### Addendum 2026-09-05 — bucket CORS surface (design `docs/superpowers/specs/2026-09-05-s3-cors-design.md`, plan `docs/superpowers/plans/2026-09-05-s3-bucket-cors.md`)
+
+Incremental surface work closing gap-analysis Tier A#2 (FR-033, added to `contracts/s3-surface.md`; executed as the sdd plan's Tasks 1-11). `STATE_VERSION` stays 1 — the `cors_wire` BUCKETS element is additive (user ruling 2026-09-02). The cucumber scenarios carry `@FR-033` per-scenario tags (the features host no pre-existing keep-legs); the `@cors-off` scenario also pins FR-021.
+
+- [X] T127 [US1] CORS domain types + wire codec in `crates/tinio-core/src/cors.rs` (NEW): `CorsConfig`/`CorsRule` (order-preserving, first-match semantics), `preflight`/`rule_for` matching (single-`*` wildcard incl. apex exclusion, method/header validation within the winning rule — no fall-through), the canonical percent-encoded `cors_wire` string, validation constants (≤100 rules, 255-char ID, ≤1 `*`, five methods, 64-KB config cap) — FR-033 (unit tests written first)
+- [X] T128 [US1] Storage-contract additions in `crates/tinio-core/src/storage/`: `get_bucket_cors`/`put_bucket_cors`/`delete_bucket_cors`, BUCKETS row `cors_wire` element (additive; missing bucket → `NoSuchBucket`; `''` = no configuration; a zero-rule set is normalized to `''`) — FR-033
+- [X] T129 [US1] fs backend (`crates/tinio-fs`): the BUCKETS row extension + the trio over the shared-store layer — FR-033
+- [X] T130 [US1] mem backend (`crates/tinio-mem`): the trio mirroring the fs backend, conformance green — FR-033
+- [X] T131 [US1] Conformance harness additions in `crates/tinio-util/src/testing.rs`: the CORS trio (round trip, replace-all, delete, no-config, both backends) — FR-033
+- [X] T132 [US1] Double gate: `cors` cargo feature on tinio-server (default on, in `default`), `Capabilities.cors` + `[s3] cors` config key (default true), e2e `@cors-off` config tag, `@minimal-caps` clears `cors` too (seven caps) — FR-021/FR-033
+- [X] T133 [US1] Interface bucket CORS ops in `crates/tinio-server/src/backend/cors.rs`: the trio behind the double gate (`require_cap` → `NotImplemented "{name} is disabled"`), put-layer validations (≥1 rule, ≤100 rules, ID ≤255, ≥1 method+origin per rule, five methods, ≤1 `*`, no `,`/control bytes, non-negative max-age, 64-KB cap), Content-MD5 three-state (missing → `InvalidRequest` + verbatim AWS message, malformed → `InvalidDigest`) — FR-033
+- [X] T134 [US1] Preflight route in `crates/tinio-server/src/backend/cors.rs`: over s3s 0.15's `S3Route` seam (OPTIONS + `Origin` + `Access-Control-Request-Method`, anonymous `check_access`), the shared-handle `CorsConfigs` lookup, the AWS-verbatim 403 messages (no-config/existence-oracle-closed, evalution mismatch), the allow-list answer headers (`Access-Control-*`, `Vary` append, `Content-Length: 0`) — FR-033
+- [X] T135 [US1] Response decoration in `crates/tinio-server/src/data.rs`: first-origin-matching-rule decoration of `Ok` responses (4xx/5xx included), bare-`*` ACAO/credentials split, `Vary` append, fallible header construction — FR-033
+- [X] T136 [US1] Acceptance + docs: `cors.feature` (6 scenarios, `@FR-033`), e2e `@cors-off` step wiring, boto3-journey CORS legs (config trio + raw OPTIONS preflight + Origin-bearing SDK GET decoration), FR-033 written into `contracts/s3-surface.md`, `[s3] cors` into `contracts/config.md`, task entries here, gap-analysis Tier A#2 status note — FR-033
+
 ---
 
 ## Dependencies & Execution Order
