@@ -74,6 +74,7 @@ winapi-util = "0.1"
 windows-sys = "0.61"
 
 tinio-api = { path = "crates/tinio-api", default-features = false }
+tinio-auth = { path = "crates/tinio-auth", version = "0.1.0" }
 tinio-cli = { path = "crates/tinio-cli", default-features = false }
 tinio-config = { path = "crates/tinio-config" }
 tinio-core = { path = "crates/tinio-core" }

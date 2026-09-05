@@ -22,9 +22,15 @@ use sha2::{Digest, Sha256};
 
 use crate::percent;
 
+/// AWS's documented special-grantee canonical ID: the anonymous
+/// (unsigned) uploader. The only non-64-hex value [`OwnerId`] admits —
+/// the exception sits beside the type on purpose.
+pub const ANONYMOUS_CANONICAL_ID: &str = "65a011a29cdf8ec533ec3d1ccaae921c";
+
 /// A validated canonical user ID: the 64 lowercase-hex account
 /// identifier S3 uses for owners and grantees (AWS's own canonical IDs
-/// have the same shape).
+/// have the same shape), or AWS's anonymous special-grantee ID
+/// ([`ANONYMOUS_CANONICAL_ID`] — the one exception to the shape).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OwnerId(String);
 
@@ -32,12 +38,14 @@ const CANONICAL_ID_LEN: usize = 64;
 
 impl OwnerId {
     /// Validate and wrap a canonical ID from untrusted wire or config
-    /// input: exactly 64 lowercase hex digits.
+    /// input: exactly 64 lowercase hex digits, or exactly
+    /// [`ANONYMOUS_CANONICAL_ID`] (the anonymous special-grantee ID).
     pub fn new(s: impl Into<String>) -> Result<Self, AclError> {
         let s = s.into();
-        if s.len() == CANONICAL_ID_LEN
+        if (s.len() == CANONICAL_ID_LEN
             && s.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+            || s == ANONYMOUS_CANONICAL_ID
         {
             Ok(Self(s))
         } else {
@@ -315,6 +323,19 @@ mod tests {
             OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn anonymous_special_grantee_id_is_admitted() {
+        // AWS's anonymous uploader ID is 32-hex — the one non-64 exception.
+        assert_eq!(ANONYMOUS_CANONICAL_ID.len(), 32);
+        assert!(OwnerId::new(ANONYMOUS_CANONICAL_ID).is_ok());
+        assert_eq!(
+            OwnerId::new(ANONYMOUS_CANONICAL_ID).unwrap().as_str(),
+            ANONYMOUS_CANONICAL_ID
+        );
+        // A different 32-hex value is NOT admitted (exact-constant guard).
+        assert!(OwnerId::new("65a011a29cdf8ec533ec3d1ccaae921d").is_err());
     }
 
     #[test]

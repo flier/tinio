@@ -1,0 +1,21 @@
+[package]
+name = "tinio-auth"
+version.workspace = true
+edition.workspace = true
+description = "S3 authn/authz engine for tinio"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+s3s.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+tinio-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"

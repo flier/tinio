@@ -3591,6 +3591,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinio-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "s3s",
+ "sha2",
+ "thiserror 2.0.20",
+ "tinio-core",
+ "tokio",
+]
+
+[[package]]
 name = "tinio-cli"
 version = "0.1.0"
 dependencies = [
