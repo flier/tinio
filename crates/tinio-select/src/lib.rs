@@ -8,6 +8,7 @@
 //! `error::SelectError` and
 //! `docs/superpowers/specs/2026-09-04-select-object-content-design.md`.
 
+pub mod engine;
 pub mod error;
 pub mod record;
 pub mod row;
