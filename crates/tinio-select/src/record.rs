@@ -34,6 +34,18 @@ pub trait RecordReader {
     }
 }
 
+/// Boxing erasure: the events adapter composes per-format readers behind
+/// `Box<dyn RecordReader>`.
+impl RecordReader for Box<dyn RecordReader> {
+    fn next(&mut self) -> Result<Option<Record>, SelectError> {
+        (**self).next()
+    }
+
+    fn last_record_start(&self) -> u64 {
+        (**self).last_record_start()
+    }
+}
+
 /// Input compression (S3 Select `CompressionType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {

@@ -27,3 +27,24 @@ pub enum SelectError {
     #[error("S3 select: parquet object exceeds the memory bound")]
     ParquetTooLarge,
 }
+
+/// Manual `PartialEq` — `std::io::Error` is not comparable, so `Io` compares
+/// by `kind()`; the rest compare payloads. Purpose: whole-event-sequence
+/// assertions in the events adapter's tests.
+impl PartialEq for SelectError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Parse(a), Self::Parse(b)) => a == b,
+            (Self::Unsupported(a), Self::Unsupported(b)) => a == b,
+            (Self::Value(a), Self::Value(b)) => a == b,
+            (Self::Ambiguous(a), Self::Ambiguous(b)) => a == b,
+            (Self::MissingHeader(a), Self::MissingHeader(b)) => a == b,
+            (Self::Format(a), Self::Format(b)) => a == b,
+            (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
+            (Self::TooLarge, Self::TooLarge) => true,
+            (Self::NestedCsv, Self::NestedCsv) => true,
+            (Self::ParquetTooLarge, Self::ParquetTooLarge) => true,
+            _ => false,
+        }
+    }
+}
