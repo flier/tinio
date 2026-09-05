@@ -15,8 +15,9 @@ use tinio_core::{
     object::{self, Tags},
 };
 use tinio_store::{
-    bucket, ensure_all, meta, object_part, objects, part, part_checksum, part_data, part_meta,
-    state, store::Handle, upload, upload_checksum,
+    bucket::{self, BucketRow},
+    ensure_all, meta, object_part, objects, part, part_checksum, part_data, part_meta, state,
+    store::Handle, upload, upload_checksum,
 };
 
 /// A ready store handle over a fresh in-memory redb database — the
@@ -48,28 +49,37 @@ fn bucket_put_get_put_full_and_get_or_insert() {
         t.put("data", now)?;
         assert!(t.exists("data")?);
         assert_eq!(t.get("data")?, Some(now));
-        let (created, tags, owner, acl, cors) = t.row("data")?.expect("present");
-        assert_eq!((created, tags), (now, "".to_string()));
-        assert_eq!(
-            (owner, acl, cors),
-            ("".to_string(), "".to_string(), "".to_string())
-        );
+        let row = t.row("data")?.expect("present");
+        assert_eq!(row.created, now);
+        assert_eq!(row.tags, "");
+        assert_eq!(row.owner, "");
+        assert_eq!(row.acl, "");
+        assert_eq!(row.cors, "");
         // The tagging write upserts the whole row — every wire is
-        // preserved at its own position (the same-typed `&str` wires
-        // must not swap positions).
-        t.put_full("data", now, "env=prod", "owner:w", "acl:w", "cors:w")?;
-        let (_, tags, owner, acl, cors) = t.row("data")?.unwrap();
-        assert_eq!(tags, "env=prod");
-        assert_eq!(owner, "owner:w");
-        assert_eq!(acl, "acl:w");
-        assert_eq!(cors, "cors:w");
+        // preserved at its own slot (the same-typed `&str` wires must
+        // not swap elements).
+        t.put_full(
+            "data",
+            &BucketRow {
+                tags: "env=prod".into(),
+                owner: "owner:w".into(),
+                acl: "acl:w".into(),
+                cors: "cors:w".into(),
+                ..BucketRow::at(now)
+            },
+        )?;
+        let row = t.row("data")?.unwrap();
+        assert_eq!(row.tags, "env=prod");
+        assert_eq!(row.owner, "owner:w");
+        assert_eq!(row.acl, "acl:w");
+        assert_eq!(row.cors, "cors:w");
         // The list/head first-sight upsert must keep the first time AND
         // the stored wires (never clear them).
         let recorded = t.get_or_insert("data", now + Duration::from_secs(1))?;
         assert_eq!(recorded, now);
-        let (created, tags, owner, acl, cors) = t.row("data")?.unwrap();
+        let row = t.row("data")?.unwrap();
         assert_eq!(
-            (created, tags, owner, acl, cors),
+            (row.created, row.tags, row.owner, row.acl, row.cors),
             (
                 now,
                 "env=prod".to_string(),

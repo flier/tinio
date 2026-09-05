@@ -964,6 +964,26 @@ mod tests {
                 version_id: None,
             })),
         );
+        // The CORS trio: `PutBucketCorsInput` has a required config — no
+        // Default derive — built explicitly like the other tag inputs.
+        #[cfg(feature = "cors")]
+        {
+            let _ = rt.block_on(backend.get_bucket_cors(request(dto::GetBucketCorsInput {
+                bucket: "b".into(),
+                expected_bucket_owner: None,
+            })));
+            let _ = rt.block_on(backend.put_bucket_cors(request(dto::PutBucketCorsInput {
+                bucket: "b".into(),
+                cors_configuration: dto::CORSConfiguration { cors_rules: vec![] },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+            })));
+            let _ = rt.block_on(backend.delete_bucket_cors(request(dto::DeleteBucketCorsInput {
+                bucket: "b".into(),
+                expected_bucket_owner: None,
+            })));
+        }
         let expected: Vec<&str> = {
             let base = [
                 "DeleteBucket",
@@ -986,6 +1006,8 @@ mod tests {
             .into_iter();
             #[cfg(feature = "multipart")]
             let base = base.chain(["UploadPart", "ListParts", "ListMultipartUploads"]);
+            #[cfg(feature = "cors")]
+            let base = base.chain(["GetBucketCors", "PutBucketCors", "DeleteBucketCors"]);
             base.collect()
         };
         let recorded: Vec<&str> = expected

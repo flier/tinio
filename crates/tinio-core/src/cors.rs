@@ -44,18 +44,16 @@ impl CorsRule {
 
     /// Whether every requested header is allowed: any pattern match
     /// (`*`-wildcards; HTTP header names are case-insensitive) or, when
-    /// no `allowed_headers` is set, none.
+    /// no `allowed_headers` is set, none. No allocation — the comparison
+    /// is byte-wise case-insensitive.
     pub fn headers_allow(&self, requested: &[String]) -> bool {
         match &self.allowed_headers {
             None => requested.is_empty(),
-            Some(patterns) => {
-                let patterns: Vec<String> =
-                    patterns.iter().map(|p| p.to_ascii_lowercase()).collect();
-                requested.iter().all(|h| {
-                    let h = h.to_ascii_lowercase();
-                    patterns.iter().any(|p| pattern_matches(p, &h))
-                })
-            }
+            Some(patterns) => requested.iter().all(|h| {
+                patterns
+                    .iter()
+                    .any(|p| pattern_matches_ci(p.as_bytes(), h.as_bytes()))
+            }),
         }
     }
 }
@@ -87,10 +85,8 @@ impl CorsConfig {
         requested_headers: &[String],
     ) -> Option<PreflightMatch> {
         let rule = self
-            .rules
-            .iter()
-            .find(|r| r.origin_matches(origin))
-            .filter(|r| r.method_allows(method) && r.headers_allow(requested_headers))?;
+            .rule_for(origin, method)
+            .filter(|r| r.headers_allow(requested_headers))?;
         Some(PreflightMatch {
             rule: rule.clone(),
             origin: origin.to_string(),
@@ -195,12 +191,30 @@ fn pattern_matches(pattern: &str, value: &str) -> bool {
     }
 }
 
+/// The case-insensitive twin of [`pattern_matches`], byte-wise (HTTP
+/// header names; no allocation).
+fn pattern_matches_ci(pattern: &[u8], value: &[u8]) -> bool {
+    match pattern.iter().position(|b| *b == b'*') {
+        None => value.eq_ignore_ascii_case(pattern),
+        Some(0) if pattern.len() == 1 => true, // "*" alone
+        Some(pos) => {
+            let (prefix, rest) = pattern.split_at(pos);
+            let suffix = &rest[1..];
+            value.len() > prefix.len() + suffix.len() // at least one wildcard char
+                && value[..prefix.len()].eq_ignore_ascii_case(prefix)
+                && value[value.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        }
+    }
+}
+
 // Percent encode/decode. NOTE: the full unreserved-set rule here is
 // REQUIRED for the wire grammar (raw `,`/`&`/control bytes would
 // mis-frame the 6-field record or smuggle header values — op-review
 // C2/S1). The object.rs tags codec escapes only `% = & + space` and must
 // NOT be copied as-is; when the ACL plan lands `crate::percent`, its
 // encode must adopt this set (one-line coordination point).
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -208,7 +222,11 @@ fn encode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(b as char)
             }
-            _ => out.push_str(&format!("%{:02X}", b)),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
         }
     }
     out
@@ -331,6 +349,37 @@ mod tests {
         assert!(!wire.contains("&,c"), "{wire}"); // the id's ',' must be encoded
         assert!(!wire.contains(';'), "{wire}"); // so must ';' — a tags-style narrow escape set would leak it raw
         assert_eq!(CorsConfig::from_wire(&wire), cfg);
+    }
+
+    #[test]
+    fn wire_round_trips_percent_in_value() {
+        // The escape CHARACTER itself must round-trip (`%` → `%25`) —
+        // the one byte the encode/decode pair never passes through raw.
+        let cfg = CorsConfig {
+            rules: vec![CorsRule {
+                id: Some("a%b".into()),
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["https://a.example.com/?x=%2F&y=1%".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        };
+        let wire = cfg.to_wire();
+        assert!(wire.contains("%25"), "{wire}");
+        assert_eq!(CorsConfig::from_wire(&wire), cfg, "{wire}");
+    }
+
+    #[test]
+    fn origin_matching_is_case_sensitive() {
+        // Byte-exact origins (design §9): header NAMES are case-insensitive;
+        // origins are not — the scheme host path must match exactly.
+        let cfg = CorsConfig { rules: vec![rule()] };
+        assert!(cfg.preflight("https://example.com", "GET", &[]).is_some());
+        assert!(
+            cfg.preflight("https://EXAMPLE.com", "GET", &[]).is_none(),
+            "uppercase host must not match a mixed-case origin pattern"
+        );
     }
 
     #[test]

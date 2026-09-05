@@ -123,11 +123,11 @@ impl BucketOps for MemoryStorage {
         // empty when the wire is domain-invalid (self-healing, cap 50).
         self.db.read(|txn| {
             let buckets = bucket::Table::open_readonly(txn)?;
-            let Some((_created, tags_wire, _, _, _)) = buckets.row(name.as_ref().as_str())? else {
+            let Some(row) = buckets.row(name.as_ref().as_str())? else {
                 return Err(no_such_bucket(name));
             };
             Ok(object::Tags::from_wire_limited(
-                &tags_wire,
+                &row.tags,
                 object::BUCKET_TAGS_MAX,
             ))
         })
@@ -136,10 +136,7 @@ impl BucketOps for MemoryStorage {
     async fn put_bucket_tags(&self, name: &Name, tags: &object::Tags) -> Result<(), Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`).
-        if !self
-            .rewrite_bucket_tags_element(name, &tags.to_wire())
-            .await?
-        {
+        if !self.rewrite_bucket_element(name, Some(&tags.to_wire()), None).await? {
             return Err(no_such_bucket(name));
         }
         Ok(())
@@ -150,7 +147,7 @@ impl BucketOps for MemoryStorage {
         // contract's delete leniency, mirroring the fs backend's
         // row-only clear). A live row keeps its creation time and loses
         // its tags; a row-less bucket has nothing to clear.
-        self.rewrite_bucket_tags_element(name, "").await?;
+        self.rewrite_bucket_element(name, Some(""), None).await?;
         Ok(())
     }
 
@@ -162,28 +159,19 @@ impl BucketOps for MemoryStorage {
         // (self-healing, the store's `decode_cors_wire`).
         self.db.read(|txn| {
             let buckets = bucket::Table::open_readonly(txn)?;
-            let Some((_created, _tags, _owner, _acl, cors_wire)) =
-                buckets.row(name.as_ref().as_str())?
-            else {
+            let Some(row) = buckets.row(name.as_ref().as_str())? else {
                 return Err(no_such_bucket(name));
             };
-            let config = bucket::decode_cors_wire(&cors_wire);
-            // op-review G2: the `''` wire — a zero-rule config, the
-            // cleared state — is "no configuration".
-            Ok((!config.rules.is_empty()).then_some(config))
+            Ok(bucket::decode_cors_wire(&row.cors))
         })
     }
 
     async fn put_bucket_cors(&self, name: &Name, config: &cors::CorsConfig) -> Result<(), Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
-        // mirroring `head_bucket`). op-review G2: a zero-rule config
-        // normalizes to the `''` wire — "no configuration".
-        let wire = if config.rules.is_empty() {
-            String::new()
-        } else {
-            config.to_wire()
-        };
-        if !self.rewrite_bucket_cors_element(name, &wire).await? {
+        // mirroring `head_bucket`). A zero-rule config normalizes to the
+        // `''` wire by the codec itself (op-review G2 — "no
+        // configuration").
+        if !self.rewrite_bucket_element(name, None, Some(&config.to_wire())).await? {
             return Err(no_such_bucket(name));
         }
         Ok(())
@@ -195,7 +183,7 @@ impl BucketOps for MemoryStorage {
         // CORS spec mandates `NoSuchBucket` for a missing bucket); a
         // bucket that simply has no configuration clears to the same
         // state (idempotent).
-        if !self.rewrite_bucket_cors_element(name, "").await? {
+        if !self.rewrite_bucket_element(name, None, Some("")).await? {
             return Err(no_such_bucket(name));
         }
         Ok(())
@@ -203,62 +191,28 @@ impl BucketOps for MemoryStorage {
 }
 
 impl MemoryStorage {
-    /// The tag-write transaction of the bucket trio — the shared body of
-    /// `put_bucket_tags` and `delete_bucket_tags`: one read-modify-write
-    /// transaction replaces the row's tags element with `tags_wire`,
-    /// keeping the creation time and the other wire elements verbatim
-    /// (as the CORS helper). Returns whether the row existed (the caller
-    /// maps: put → `NoSuchBucket`, delete → no-op).
-    async fn rewrite_bucket_tags_element(
+    /// The wire-element write transaction of the bucket trio — the shared
+    /// body of the tags and CORS put/delete operations: one
+    /// read-modify-write transaction replaces the tagged elements with
+    /// the given wires (`None` = keep the row's value verbatim) and sets
+    /// every other element verbatim. Returns whether the row existed (the
+    /// caller maps to the per-operation missing-bucket semantics).
+    async fn rewrite_bucket_element(
         &self,
         name: &Name,
-        tags_wire: &str,
+        tags_wire: Option<&str>,
+        cors_wire: Option<&str>,
     ) -> Result<bool, Error> {
         self.db.write(|txn| {
             let mut buckets = bucket::Table::open(txn)?;
-            let Some((created, _prev_tags, owner_wire, acl_wire, cors_wire)) =
-                buckets.row(name.as_ref().as_str())?
-            else {
+            let Some(row) = buckets.row(name.as_ref().as_str())? else {
                 return Ok(false);
             };
+            let tags = tags_wire.map(str::to_string).unwrap_or(row.tags);
+            let cors = cors_wire.map(str::to_string).unwrap_or(row.cors);
             buckets.put_full(
                 name.as_ref().as_str(),
-                created,
-                tags_wire,
-                &owner_wire,
-                &acl_wire,
-                &cors_wire,
-            )?;
-            Ok(true)
-        })
-    }
-
-    /// The CORS write transaction of the bucket trio — the shared body
-    /// of `put_bucket_cors` and `delete_bucket_cors`: one
-    /// read-modify-write transaction replaces the row's CORS element
-    /// with `cors_wire`, keeping the creation time and the other wire
-    /// elements verbatim. Returns whether the row existed (the caller
-    /// maps both to `NoSuchBucket` — the CORS spec, unlike
-    /// delete-bucket-tagging's idempotent Ok-on-missing).
-    async fn rewrite_bucket_cors_element(
-        &self,
-        name: &Name,
-        cors_wire: &str,
-    ) -> Result<bool, Error> {
-        self.db.write(|txn| {
-            let mut buckets = bucket::Table::open(txn)?;
-            let Some((created, tags_wire, owner_wire, acl_wire, _prev_cors)) =
-                buckets.row(name.as_ref().as_str())?
-            else {
-                return Ok(false);
-            };
-            buckets.put_full(
-                name.as_ref().as_str(),
-                created,
-                &tags_wire,
-                &owner_wire,
-                &acl_wire,
-                cors_wire,
+                &bucket::BucketRow { tags, cors, ..row },
             )?;
             Ok(true)
         })

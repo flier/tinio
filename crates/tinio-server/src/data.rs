@@ -25,13 +25,7 @@ use std::{
 };
 
 #[cfg(feature = "cors")]
-use http::{
-    HeaderValue,
-    header::{
-        ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_METHODS,
-        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ORIGIN, VARY,
-    },
-};
+use http::header::ORIGIN;
 use http::{
     Method, Request, Response,
     header::{CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT},
@@ -58,7 +52,9 @@ use tower::Service as TowerService;
 use tracing::Level;
 
 #[cfg(feature = "cors")]
-use crate::backend::cors::{CorsConfigs, CorsLookup, CorsPreflightRoute, bucket_from_uri};
+use crate::backend::cors::{
+    apply_cors_headers, bucket_from_uri, CorsConfigs, CorsLookup, CorsPreflightRoute,
+};
 use crate::{
     _core::storage::Storage,
     backend::{Capabilities, S3Backend},
@@ -125,14 +121,11 @@ impl DataPlane {
             // capability arm the preflight route; the erased lookup rides
             // on the service either way (None with the capability off — no
             // route, no decoration).
-            let configs = Arc::new(CorsConfigs::new(Arc::clone(&storage)));
-            if caps.cors {
-                builder.set_route(CorsPreflightRoute::new(Arc::clone(&configs)));
+            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
+                builder.set_route(CorsPreflightRoute::new(Arc::clone(&lookup)));
+                return Self::from_service(builder.build(), Some(lookup));
             }
-            Self::from_service(
-                builder.build(),
-                caps.cors.then_some(configs as Arc<dyn CorsLookup>),
-            )
+            Self::from_service(builder.build(), None)
         }
         #[cfg(not(feature = "cors"))]
         Self::from_service(S3ServiceBuilder::new(backend).build())
@@ -160,17 +153,25 @@ impl DataPlane {
         });
         #[cfg(feature = "cors")]
         {
-            let configs = Arc::new(CorsConfigs::new(Arc::clone(&storage)));
-            if caps.cors {
-                builder.set_route(CorsPreflightRoute::new(Arc::clone(&configs)));
+            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
+                builder.set_route(CorsPreflightRoute::new(Arc::clone(&lookup)));
+                return Self::from_service(builder.build(), Some(lookup));
             }
-            Self::from_service(
-                builder.build(),
-                caps.cors.then_some(configs as Arc<dyn CorsLookup>),
-            )
+            Self::from_service(builder.build(), None)
         }
         #[cfg(not(feature = "cors"))]
         Self::from_service(builder.build())
+    }
+
+    /// The double-gate CORS lookup (feature is compile-gated; the runtime
+    /// capability arms the route and the decoration together).
+    #[cfg(feature = "cors")]
+    fn cors_lookup<S: Storage>(
+        storage: &Arc<S>,
+        caps: &Capabilities,
+    ) -> Option<Arc<dyn CorsLookup>> {
+        let configs = Arc::new(CorsConfigs::new(Arc::clone(storage)));
+        caps.cors.then_some(configs as Arc<dyn CorsLookup>)
     }
 
     /// Attach the scrape-time metrics refresh (F10): the `/metrics`
@@ -373,8 +374,11 @@ impl DataPlaneService {
             .get(ORIGIN)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        // The URI is only needed when the decoration can run (an Origin
+        // header AND an armed lookup) — requests from boto3/aws-cli carry
+        // no Origin and pay no clone.
         #[cfg(feature = "cors")]
-        let uri = req.uri().clone();
+        let uri = (origin.is_some() && self.cors.is_some()).then(|| req.uri().clone());
 
         // Count upload bytes on the request body.
         let (parts, body) = req.into_parts();
@@ -432,50 +436,15 @@ impl DataPlaneService {
                     // read would be wasted on every preflight.
                     if method != "OPTIONS"
                         && let (Some(cors), Some(origin)) = (cors.as_deref(), origin.as_deref())
-                        && let Some(bucket) = bucket_from_uri(&uri)
+                        && let Some(uri) = uri.as_ref()
+                        && let Some(bucket) = bucket_from_uri(uri)
                         && let Some(config) = cors.get(&bucket).await
                         && let Some(rule) = config.rule_for(origin, &method)
                     {
-                        let headers = response.headers_mut();
-                        // grilling Q11: a rule whose allowed_origins
-                        // contains bare "*" answers ACAO "*" and OMITS
-                        // Allow-Credentials (the two are incompatible);
-                        // otherwise echo the origin + allow the credentials.
-                        // Fallible HeaderValue construction — every value
-                        // here is request or config data — SKIPS, never
-                        // unwraps (op-review S1).
-                        let star_rule = rule.allowed_origins.iter().any(|o| o == "*");
-                        if let Ok(v) = HeaderValue::from_str(if star_rule { "*" } else { origin }) {
-                            headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, v);
-                        }
-                        let methods = rule.allowed_methods.join(", ");
-                        if let Ok(v) = HeaderValue::from_str(&methods) {
-                            headers.insert(ACCESS_CONTROL_ALLOW_METHODS, v);
-                        }
-                        if let Some(expose) = &rule.expose_headers
-                            && !expose.is_empty()
-                            && let Ok(v) = HeaderValue::from_str(&expose.join(", "))
-                        {
-                            headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, v);
-                        }
-                        if !star_rule {
-                            // The literal is not request data — the safe
-                            // constant form (the preflight route's pattern).
-                            headers.insert(
-                                ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                                HeaderValue::from_static("true"),
-                            );
-                        }
-                        // grilling Q4 + op-review G3: APPEND (merge, never
-                        // replace) the Vary trio; the wire carries the
-                        // three as separate Vary lines.
-                        for v in [
-                            "Origin",
-                            "Access-Control-Request-Headers",
-                            "Access-Control-Request-Method",
-                        ] {
-                            headers.append(VARY, HeaderValue::from_static(v));
-                        }
+                        // The shared decoration (the preflight route's
+                        // common header set — the two must never answer
+                        // differently; the Q11/S1 semantics live there).
+                        apply_cors_headers(response.headers_mut(), rule, origin);
                     }
                     // Count download bytes on the response body (recorded
                     // when the stream ends); the access log uses the

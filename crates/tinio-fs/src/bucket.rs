@@ -75,8 +75,8 @@ impl Store {
             .read(move |txn| {
                 let table = bucket::Table::open_readonly(txn)?;
                 let row = table.row(&name)?;
-                Ok(row.map_or_else(object::Tags::empty, |(_, wire, _, _, _)| {
-                    object::Tags::from_wire_limited(&wire, BUCKET_TAGS_MAX)
+                Ok(row.map_or_else(object::Tags::empty, |row| {
+                    object::Tags::from_wire_limited(&row.tags, BUCKET_TAGS_MAX)
                 }))
             })
             .map_err(Into::into)
@@ -95,23 +95,27 @@ impl Store {
         self.handle
             .write_if(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let Some((created, wire, owner_wire, acl_wire, cors_wire)) = table.row(&name)?
-                else {
+                let Some(row) = table.row(&name)? else {
                     // No row yet — the lazy first-sight record (a real
                     // change: it creates the entry).
-                    table.put_full(&name, SystemTime::now(), &tags_wire, "", "", "")?;
+                    table.put_full(
+                        &name,
+                        &bucket::BucketRow {
+                            tags: tags_wire,
+                            ..bucket::BucketRow::at(SystemTime::now())
+                        },
+                    )?;
                     return Ok(Some(()));
                 };
-                if wire == tags_wire {
+                if row.tags == tags_wire {
                     return Ok(None);
                 }
                 table.put_full(
                     &name,
-                    created,
-                    &tags_wire,
-                    &owner_wire,
-                    &acl_wire,
-                    &cors_wire,
+                    &bucket::BucketRow {
+                        tags: tags_wire,
+                        ..row
+                    },
                 )?;
                 Ok(Some(()))
             })
@@ -129,15 +133,20 @@ impl Store {
         self.handle
             .write_if(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let Some((created, wire, owner_wire, acl_wire, cors_wire)) = table.row(&name)?
-                else {
+                let Some(row) = table.row(&name)? else {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
                 };
-                if wire.is_empty() {
+                if row.tags.is_empty() {
                     return Ok(None);
                 }
-                table.put_full(&name, created, "", &owner_wire, &acl_wire, &cors_wire)?;
+                table.put_full(
+                    &name,
+                    &bucket::BucketRow {
+                        tags: String::new(),
+                        ..row
+                    },
+                )?;
                 Ok(Some(()))
             })
             .await
@@ -156,89 +165,54 @@ impl Store {
             .read(move |txn| {
                 let table = bucket::Table::open_readonly(txn)?;
                 let row = table.row(&name)?;
-                Ok(row.and_then(|(_, _, _, _, cors_wire)| {
-                    let config = bucket::decode_cors_wire(&cors_wire);
-                    // op-review G2: the `''` wire — a zero-rule config,
-                    // the cleared state — is "no configuration".
-                    (!config.rules.is_empty()).then_some(config)
-                }))
+                Ok(row.and_then(|row| bucket::decode_cors_wire(&row.cors)))
             })
             .map_err(Into::into)
     }
 
     /// Replace the bucket's CORS configuration, preserving the creation
     /// time and the other wire elements (replace-all, no merge). A bucket
-    /// without a state record answers `NoSuchBucket`.
+    /// without a state record answers `NoSuchBucket`. The empty rule set
+    /// normalizes to the `''` wire by the codec itself (op-review G2 — a
+    /// zero-rule config is "no configuration", never a non-empty row).
     pub async fn set_cors(&self, name: &Name, config: &cors::CorsConfig) -> Result<(), Error> {
-        let row_name = name.clone();
-        let config = config.clone();
-        let changed = self
-            .handle
-            .write_if(move |txn| {
-                let mut table = bucket::Table::open(txn)?;
-                let Some((created, tags_wire, owner_wire, acl_wire, cors_now)) =
-                    table.row(&row_name)?
-                else {
-                    return Ok(None);
-                };
-                // op-review G2: an empty rule set normalizes to the `''`
-                // wire — a zero-rule config is "no configuration", never
-                // a non-empty row.
-                let cors_wire = if config.rules.is_empty() {
-                    String::new()
-                } else {
-                    config.to_wire()
-                };
-                if cors_wire == cors_now {
-                    // Nothing to change — no commit (no fsync), the tag
-                    // siblings' `Ok(None)` abort.
-                    return Ok(None);
-                }
-                table.put_full(
-                    &row_name,
-                    created,
-                    &tags_wire,
-                    &owner_wire,
-                    &acl_wire,
-                    &cors_wire,
-                )?;
-                Ok(Some(()))
-            })
-            .await?
-            .is_some();
-        if changed {
-            return Ok(());
-        }
-        // `None` cuts two ways: the unchanged-wire abort (a clean no-op)
-        // and the row-miss (`NoSuchBucket`) — one read breaks the tie
-        // (the write_if closure's error type is the database error, not
-        // the storage error, so the miss cannot ride the `Err` arm).
-        if self.created_at(name).await?.is_none() {
-            return Err(no_such_bucket(name).into());
-        }
-        Ok(())
+        self.rewrite_cors(name, &config.to_wire()).await
     }
 
     /// Remove the bucket's CORS configuration, preserving the creation
     /// time and the other wire elements (`''` = "no configuration").
     /// A bucket without a state record answers `NoSuchBucket`.
     pub async fn clear_cors(&self, name: &Name) -> Result<(), Error> {
+        self.rewrite_cors(name, "").await
+    }
+
+    /// The shared CORS row rewrite: set or clear the CORS wire,
+    /// preserving the other elements. An identical wire is a clean no-op
+    /// (`write_if`'s `Ok(None)` abort — no commit, no fsync).
+    /// `None` cuts two ways: the unchanged-wire abort and the row-miss
+    /// (`NoSuchBucket`) — one read breaks the tie (the write_if
+    /// closure's error type is the database error, not the storage
+    /// error, so the miss cannot ride the `Err` arm).
+    async fn rewrite_cors(&self, name: &Name, wire: &str) -> Result<(), Error> {
         let row_name = name.clone();
+        let wire = wire.to_string();
         let changed = self
             .handle
             .write_if(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let Some((created, tags_wire, owner_wire, acl_wire, cors_now)) =
-                    table.row(&row_name)?
-                else {
+                let Some(row) = table.row(&row_name)? else {
                     return Ok(None);
                 };
-                if cors_now.is_empty() {
-                    // Already cleared — no commit (no fsync), the tag
-                    // siblings' `Ok(None)` abort.
+                if wire == row.cors {
                     return Ok(None);
                 }
-                table.put_full(&row_name, created, &tags_wire, &owner_wire, &acl_wire, "")?;
+                table.put_full(
+                    &row_name,
+                    &bucket::BucketRow {
+                        cors: wire,
+                        ..row
+                    },
+                )?;
                 Ok(Some(()))
             })
             .await?
