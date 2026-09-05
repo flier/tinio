@@ -90,21 +90,28 @@ impl BucketOps for FsStorage {
         // The unix ownership hardening (spec 2026-09-05 §5a): the fresh
         // bucket dir lands `0700` and chowned to the bucket owner's
         // mapped uid (an unmapped owner stays server-user-owned, still
-        // `0700`). A chown failure is warned — the dir is `0700` either
-        // way — never fatal (unlike an object file, a dir holds no
-        // wrongly-owned readable content).
+        // `0700`). FAIL-CLOSED (review round 1): a hardening failure
+        // removes the just-created dir (the mutation lock is held —
+        // nothing else lives in it) and errors the create — a
+        // wrongly-owned `0700` bucket dir must not be left behind with
+        // the create reporting success, or every object of the mapped
+        // owner under it is stranded.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, std::fs::Permissions::from_mode(crate::fsutil::DIR_MODE_PRIVATE))
-                .await?;
+            if let Err(err) = fs::set_permissions(
+                &dir,
+                std::fs::Permissions::from_mode(crate::fsutil::DIR_MODE_PRIVATE),
+            )
+            .await
+            {
+                let _ = fs::remove_dir(&dir).await;
+                return Err(err.into());
+            }
             if let Some(uid) = self.owner_uid(owner) {
                 if let Err(err) = crate::fsutil::chown_file(&dir, uid).await {
-                    tracing::warn!(
-                        path = %dir.display(),
-                        error = %err,
-                        "bucket dir chown failed; the dir stays server-user-owned (0700)"
-                    );
+                    let _ = fs::remove_dir(&dir).await;
+                    return Err(err.into());
                 }
             }
         }
@@ -1143,4 +1150,39 @@ mod tests {
         assert_eq!(mode, 0o700, "a fresh bucket dir must be 0700");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_bucket_dir_chown_failure_removes_dir_and_errors() {
+        // Review round 1: the bucket-dir chown failure is fail-closed —
+        // the create removes the just-created dir and errors (a
+        // wrongly-owned 0700 bucket dir must not be left behind with
+        // the create reporting success). Runs UNPRIVILEGED (the chown
+        // to uid 0 fails with EPERM — the failure the test needs); as
+        // root the chown succeeds, so the test skips.
+        if crate::testutil::euid() == 0 {
+            eprintln!("skipped: the fail-closed tests need an UNPRIVILEGED process");
+            return;
+        }
+        use crate::{FsOptions, testutil::fs_options};
+        let root = tempfile::tempdir().unwrap();
+        let owner = crate::testutil::owner_id();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([(owner.clone(), 0)]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        let err = storage
+            .create_bucket(&b, Some(&owner), &acl::Acl::default_private(Some(owner.clone())))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert!(
+            !root.path().join("data").exists(),
+            "a wrongly-owned bucket dir must not be left behind"
+        );
+    }
 }

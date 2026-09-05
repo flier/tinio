@@ -599,9 +599,16 @@ impl DirOwnerUid {
 /// `0700` and — when `owner_uid` carries a mapped uid — chowned to it
 /// (an implicitly created bucket/prefix dir takes the bucket owner's
 /// uid; private-state dirs pass `None` and stay server-user-owned). A
-/// pre-existing component is never chmodded or chowned; a chown failure
-/// on a NEW dir is warned (the dir is `0700` either way — it holds no
-/// wrongly-owned readable content; object files fail closed instead).
+/// pre-existing component is never chmodded or chowned. FAIL-CLOSED
+/// (review round 1): a failure hardening a NEW component — the create,
+/// the mode set, the chown, or the chown task itself — removes the
+/// components THIS call created (deepest first, so each removal finds
+/// an empty dir) and errors the request. A wrongly-owned `0700` prefix
+/// dir must not be left behind with the write reporting success: it
+/// would permanently strand the mapped owner's own `0600` objects (no
+/// retroactive chmod, no self-heal). An unmapped owner performs no
+/// chown, so no failure path fires; EPERM-at-startup is Task 14's
+/// concern, not a runtime carve-out.
 pub(crate) async fn ensure_dir(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<bool> {
     match fs::try_exists(dir).await {
         Ok(true) => Ok(false),
@@ -621,7 +628,7 @@ pub(crate) async fn ensure_dir(dir: &Path, owner_uid: DirOwnerUid) -> io::Result
 
 /// The unix creation tail of [`ensure_dir`]: create each missing
 /// component (deepest ancestor first) at `0700`, then chown it to the
-/// mapped uid when one was passed.
+/// mapped uid when one was passed. Fail-closed — see [`ensure_dir`].
 #[cfg(unix)]
 async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
     use std::os::unix::fs::{PermissionsExt, chown};
@@ -638,6 +645,12 @@ async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
         missing.push(parent.to_path_buf());
         current = parent;
     }
+    // The components THIS call created, in creation order — the
+    // fail-closed cleanup removes them deepest-first on any hardening
+    // failure. Pre-existing components and a concurrent creator's dir
+    // (`AlreadyExists`) are never touched.
+    let mut created: Vec<PathBuf> = Vec::with_capacity(missing.len());
+    let mut outcome: io::Result<()> = Ok(());
     for component in missing.iter().rev() {
         match fs::create_dir(component).await {
             Ok(()) => {}
@@ -646,29 +659,43 @@ async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
                 // pre-existing: untouched.
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                outcome = Err(err);
+                break;
+            }
         }
-        fs::set_permissions(component, std::fs::Permissions::from_mode(DIR_MODE_PRIVATE)).await?;
+        created.push(component.clone());
+        if let Err(err) =
+            fs::set_permissions(component, std::fs::Permissions::from_mode(DIR_MODE_PRIVATE)).await
+        {
+            outcome = Err(err);
+            break;
+        }
         if let Some(uid) = owner_uid.0 {
             let path = component.clone();
-            match spawn_blocking(move || chown(&path, Some(uid), None)).await {
+            let chowned = spawn_blocking(move || chown(&path, Some(uid), None)).await;
+            match chowned {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    tracing::warn!(
-                        path = %component.display(),
-                        error = %err,
-                        "directory chown failed; the dir stays server-user-owned (0700)"
-                    );
+                    outcome = Err(err);
+                    break;
                 }
                 Err(join) => {
-                    tracing::warn!(
-                        path = %component.display(),
-                        error = %join,
-                        "directory chown task join failed"
-                    );
+                    outcome = Err(IoError::other(format!("chown task join failed: {join}")));
+                    break;
                 }
             }
         }
+    }
+    if let Err(err) = outcome {
+        // Deepest first — each created dir is still empty, so the plain
+        // rmdir removes the chain. A concurrent interference (a racing
+        // creator's entry) makes the removal fail harmlessly; the
+        // original error is what the caller reports.
+        for component in created.iter().rev() {
+            let _ = fs::remove_dir(component).await;
+        }
+        return Err(err);
     }
     Ok(())
 }

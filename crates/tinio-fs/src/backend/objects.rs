@@ -2559,6 +2559,65 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn fs_prefix_dir_chown_failure_removes_dirs_and_errors() {
+        // Review round 1: a prefix-dir chown failure is fail-closed —
+        // the write removes the components IT created (deepest first)
+        // and errors, so a wrongly-owned 0700 prefix dir never strands
+        // the mapped owner's own 0600 objects while the request
+        // reported success. Runs UNPRIVILEGED (the chown to uid 0 fails
+        // with EPERM — the failure the test needs); as root the chown
+        // succeeds, so the test skips.
+        if crate::testutil::euid() == 0 {
+            eprintln!("skipped: the fail-closed tests need an UNPRIVILEGED process");
+            return;
+        }
+        let owner = crate::testutil::owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([(owner.clone(), 0)]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        // The bucket ROW records a mapped owner, but the bucket dir is
+        // hand-created (a pre-existing dir is never touched — an
+        // unprivileged create_bucket with a mapped owner would itself
+        // fail closed, see the buckets test).
+        storage
+            .bucket_store()
+            .record_full(
+                &b,
+                SystemTime::now(),
+                Some(&owner),
+                &acl::Acl::default_private(Some(owner.clone())),
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir(root.path().join("data")).unwrap();
+        // A non-bucket-owner PutObject creating a two-level prefix: the
+        // first created dir's chown fails — the created chain is
+        // removed and the PUT errors.
+        let k = object::key("dir/sub/f.txt").unwrap();
+        let err = storage
+            .put_object(&b, &k, body(b"x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert!(
+            !root.path().join("data/dir").exists(),
+            "the failed-hardening prefix chain must be removed"
+        );
+        assert!(
+            root.path().join("data").is_dir(),
+            "the pre-existing bucket dir is never touched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn fs_chown_failure_after_rename_removes_file_and_errors() {
         use std::os::unix::fs::MetadataExt;
         if crate::testutil::euid() == 0 {
