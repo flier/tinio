@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use super::Storage;
 use crate::{
     bucket::{self, Bucket},
+    cors,
     object,
 };
 
@@ -134,6 +135,35 @@ pub trait BucketOps: Send + Sync + 'static {
     /// Remove the bucket's tag set (S3 DeleteBucketTagging). S3
     /// semantics: idempotent — a missing bucket is Ok.
     async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// The bucket's CORS configuration (S3 GetBucketCors). `NoSuchBucket`
+    /// when the bucket is missing; `None` when it has no CORS
+    /// configuration.
+    async fn get_bucket_cors(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<cors::CorsConfig>, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the bucket's CORS configuration (S3 PutBucketCors —
+    /// replace-all, no merge). `NoSuchBucket` when the bucket is missing.
+    /// The caller guarantees ≥1 rule; the contract stores what it
+    /// receives.
+    async fn put_bucket_cors(
+        &self,
+        name: &bucket::Name,
+        cors: &cors::CorsConfig,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Remove the bucket's CORS configuration (S3 DeleteBucketCors).
+    /// `NoSuchBucket` when the bucket is missing; otherwise idempotent —
+    /// deleting when no configuration is stored is `Ok`.
+    async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
 }
