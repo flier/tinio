@@ -17,6 +17,13 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
+  # Toolchain pins. Stable is pinned because sccache cache keys include the
+  # rustc version — a moving "stable" channel invalidates the whole store
+  # every ~6 weeks. Nightly is used only for rustfmt (no sccache), so it
+  # stays on the moving channel unless a pinned date is desired for a fully
+  # deterministic fmt gate.
+  RUST_STABLE: "1.98.0"
+  RUST_NIGHTLY: "nightly"
 
 permissions:
   # Job default for every job (unlisted scopes = none): checkout needs
@@ -67,6 +74,8 @@ jobs:
       # adds the clippy component — see the lint job below).
       - &toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
 
       # rust-cache, registry-only (cache-targets off): per-job target/
       # dirs never serve the cross-job chain (sccache carries that) and
@@ -87,8 +96,24 @@ jobs:
 
   # Lint and tests are separate jobs so a clippy failure never blocks the
   # test legs — both matrices run in parallel and report independently.
+  fmt:
+    name: fmt (rustfmt)
+    # fmt is platform-neutral and non-compiling (rustfmt parses source, no
+    # codegen), so it does not wait on the compile gate — an independent
+    # fast gate next to clippy. Nightly rustfmt for rustfmt.toml
+    # unstable_features.
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
+          components: rustfmt
+      - name: fmt --check
+        run: cargo +nightly fmt --all -- --check
+
   lint:
-    name: Lint (fmt/clippy)
+    name: Lint (clippy)
     # All gates run behind the lightweight compile check: a tree that
     # does not build skips the 3-OS matrices instead of burning them.
     needs: check
@@ -118,18 +143,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mingw-w64
 
-      # Nightly rustfmt for rustfmt.toml unstable_features. fmt output is
-      # platform-neutral, so only the unix leg installs nightly and runs
-      # fmt --check; the windows-gnu leg skips it.
-      - uses: dtolnay/rust-toolchain@nightly
-        if: matrix.target == 'unix'
-        with:
-          components: rustfmt
-
       # Lint installs stable with the clippy component; the shared stable
       # toolchain step (*toolchain) is defined in the check job above.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_STABLE }}
           components: clippy
 
       # windows-gnu rust-std for the (now-default) stable toolchain clippy uses.
@@ -141,29 +159,23 @@ jobs:
 
       - *sccache
 
-      # Quality gates (constitution "Rust Tooling & Quality Gates").
-      - name: fmt --check
-        if: matrix.target == 'unix'
-        run: cargo +nightly fmt --all -- --check
-
-      # Clippy-driver objects never warm from the rustc chains (they stay
-      # cold every run), so its sccache writes only burn the shared cache-
-      # API write budget (~200 uploads/min) without being reused. Disable
-      # caching just for clippy; sccache stays installed so the global
-      # RUSTC_WRAPPER still resolves, and SCCACHE_DISABLE just passes
-      # clippy through.
+      # clippy: the unix leg keeps sccache — it reads the warm linux cache
+      # (297 hits on the first run, a real win). The windows-gnu leg is a
+      # cold cross target (0 hits), so it bypasses sccache entirely by
+      # clearing RUSTC_WRAPPER — avoids writing ~324 cold objects into the
+      # shared ~200/min write budget where they mostly fail anyway.
       - name: clippy (-D warnings)
         run: cargo clippy ${{ matrix.target == 'windows-gnu' && '--target x86_64-pc-windows-gnu' || '' }} --profile ci --workspace --all-targets -- -D warnings
         env:
-          SCCACHE_DISABLE: "1"
+          RUSTC_WRAPPER: ${{ matrix.target == 'unix' && 'sccache' || '' }}
 
   test:
     name: Test (unit/features, default)
     # Ubuntu default-features leg ONLY: it owns the fast gates and its
     # profile-ci artifacts (workspace libs + dev-deps incl. criterion) warm
     # the sccache/rust-cache stores the chain reuses — e2e/bench-smoke chain
-    # behind THIS job, so they never wait on the no-default/doc legs
-    # (test-extra) or the windows/macos legs (test-port), which compile
+    # behind THIS job, so they never wait on the no-default leg
+    # (test-no-default) or the windows/macos legs (test-port), which compile
     # different graphs and warm nothing downstream.
     needs: check
     strategy:
@@ -197,37 +209,51 @@ jobs:
   # The no-default-features and rustdoc legs: different compile graphs that
   # warm nothing downstream, so they run as a leaf job instead of holding
   # up the ubuntu chain (previously e2e/bench-smoke waited on them).
-  test-extra:
-    name: Test (no-default features / doc)
+  test-no-default:
+    name: Test (no-default features)
     needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [no-default, doc]
     runs-on: ubuntu-latest
     steps:
       - *checkout
       - *lld
       - *toolchain
 
-      # Registry-only rust-cache; the no-default leg saves for both legs
-      # (single writer per job — parallel legs race one cache key).
+      # Registry-only rust-cache (single leg — one writer, no race).
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "false"
-          save-if: ${{ matrix.target == 'no-default' }}
 
       - *sccache
 
       - uses: ./.github/actions/run-test-leg
         with:
-          mode: ${{ matrix.target }}
+          mode: no-default
+
+  docs:
+    name: Docs
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+
+      # Registry-only rust-cache (single leg — one writer, no race).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - *sccache
+
+      - uses: ./.github/actions/run-test-leg
+        with:
+          mode: doc
 
   # Windows/macOS unit legs: identical commands to the ubuntu test jobs,
   # run on the portable OSes for platform coverage. They run in parallel
   # with them — same graph, different target platform, so neither warms
-  # the other. The doc leg stays on ubuntu (test-extra): rustdoc warnings
-  # are platform-neutral.
+  # the other. The rustdoc warnings gate runs on ubuntu (docs job):
+  # rustdoc warnings are platform-neutral.
   test-port:
     name: Test (portable OS, unit/features)
     needs: check
