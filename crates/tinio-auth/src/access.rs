@@ -81,9 +81,13 @@ impl<S: Storage> S3Access for AclAccess<S> {
             op: cx.s3_op().name(),
             path: cx.s3_path(),
             query: cx.uri().query().unwrap_or(""),
-            expected_bucket_owner: headers
-                .get("x-amz-expected-bucket-owner")
-                .and_then(|v| v.to_str().ok()),
+            // A present-but-unreadable (non-UTF-8) expected-bucket-owner
+            // header fails closed (403) — never a silent skip; the source
+            // headers fail closed the same way (None → deny downstream).
+            expected_bucket_owner: match headers.get("x-amz-expected-bucket-owner") {
+                Some(value) => Some(value.to_str().map_err(|_| denied())?),
+                None => None,
+            },
             copy_source: headers
                 .get("x-amz-copy-source")
                 .and_then(|v| v.to_str().ok()),
@@ -289,10 +293,12 @@ impl<S: Storage> AclAccess<S> {
                     | Requirement::BucketReadAcp
                     | Requirement::BucketWriteAcp => {
                         // PostObject (existence_dispatch on a bucket path)
-                        // runs the base only — the form key is unavailable
-                        // pre-deserialization (s3s routes POST to
-                        // S3Path::Bucket), so the B1 destination head is
-                        // not enforceable at the access layer.
+                        // runs the base only — the B1 existence head for
+                        // PostObject is enforced at the handler
+                        // (op_put_object sees the form key via s3s's
+                        // default delegation), Task 11/12; the access
+                        // layer applies the base BucketWrite only —
+                        // recorded deviation per the B1 amendment.
                         self.bucket_gate(&name, rule.base, request).await
                     }
                     _ => Err(denied()),
@@ -310,11 +316,14 @@ impl<S: Storage> AclAccess<S> {
                     // PutObject: the B1 destination head REPLACES the
                     // base (an existing key needs destination owner
                     // parity; a missing key runs bucket WRITE).
+                    // CreateMultipartUpload (object path, no dispatch,
+                    // not upload-scoped): the base bucket-WRITE gate.
                     Requirement::BucketWrite => {
                         if rule.existence_dispatch {
                             self.put_object_gate(&name, &key, request).await
                         } else {
-                            Err(denied()) // unreachable per the matrix — fail closed
+                            self.bucket_gate(&name, Requirement::BucketWrite, request)
+                                .await
                         }
                     }
                     // DeleteObject, object tagging, GetObjectAttributes:
@@ -1095,6 +1104,37 @@ mod tests {
         )
         .await;
         assert_denied(&access, &req(alice(), true, "GetBucketLocation", &path)).await;
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_denied_without_bucket_write() {
+        // CMU resolves to an object path (POST /bucket/key?uploads) but
+        // is NOT upload-scoped and carries no existence dispatch — the
+        // base bucket-WRITE gate applies (regression: the object-path
+        // BucketWrite branch once denied every CMU).
+        let owner = uid();
+        let storage = storage_with_bucket(&owner, vec![]).await;
+        let access = AclAccess::new(storage, identity());
+        let path = S3Path::object("data", "big.txt");
+        assert_denied(&access, &req(anon(), false, "CreateMultipartUpload", &path)).await;
+        assert_denied(&access, &req(bob(), true, "CreateMultipartUpload", &path)).await;
+        assert_allowed(
+            &access,
+            &req(owner.clone(), true, "CreateMultipartUpload", &path),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_write_grantee_allowed() {
+        // CMU on a public-write bucket: the anonymous WRITE grantee is
+        // allowed (no existence head — there is no destination key yet).
+        let owner = uid();
+        let storage =
+            storage_with_bucket(&owner, vec![group(GROUP_ALL_USERS, Permission::Write)]).await;
+        let access = AclAccess::new(storage, identity());
+        let path = S3Path::object("data", "big.txt");
+        assert_allowed(&access, &req(anon(), false, "CreateMultipartUpload", &path)).await;
     }
 
     #[tokio::test]
