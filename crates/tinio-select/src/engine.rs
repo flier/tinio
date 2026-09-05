@@ -360,7 +360,13 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError> {
                 "internal: unexpected aggregate call".into(),
             ))
         }
-        Expr::Like { .. } => Err(SelectError::Unsupported("LIKE".into())),
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => eval_like(expr, pattern, escape_char, *any, *negated, ctx),
         Expr::ILike { .. } => Err(SelectError::Unsupported("ILIKE".into())),
         other => Err(SelectError::Unsupported(other.to_string())),
     }
@@ -462,6 +468,109 @@ fn invert_bool(v: Value) -> Value {
         Value::Bool(b) => Value::Bool(!b),
         other => other,
     }
+}
+
+/// One pattern element after ESCAPE resolution.
+enum LikeTok {
+    Star,
+    Single,
+    Char(char),
+}
+
+/// `LIKE` per the plan: case-sensitive, `%` any sequence (incl. empty), `_`
+/// exactly one char, optional one-char `ESCAPE`; the `negated` flag flips
+/// the result. Only String operands match — Null/MISSING, numbers, bools
+/// and JSON are false — with the match text taken from `display` (the row
+/// model's canonical text form; for strings it is the string itself).
+fn eval_like(
+    expr: &Expr,
+    pattern: &Expr,
+    escape_char: &Option<String>,
+    any: bool,
+    negated: bool,
+    ctx: &RowCtx,
+) -> Result<Value, SelectError> {
+    // Snowflake's `LIKE ANY` is outside the AWS surface and the covered
+    // grammar: refuse rather than silently run plain LIKE semantics.
+    if any {
+        return Err(SelectError::Unsupported("LIKE ANY".into()));
+    }
+    let escape = like_escape(escape_char)?;
+    let subject = eval(expr, ctx)?;
+    let pattern = eval(pattern, ctx)?;
+    let matched = match (&subject, &pattern) {
+        (Value::String(_), Value::String(_)) => {
+            like_match(&display(&subject), &display(&pattern), escape)
+        }
+        _ => false,
+    };
+    Ok(Value::Bool(if negated { !matched } else { matched }))
+}
+
+/// The ESCAPE operand: exactly one character. sqlparser 0.57 parses any
+/// literal string here without validating the width, so a bad one is a
+/// value error.
+fn like_escape(v: &Option<String>) -> Result<Option<char>, SelectError> {
+    match v {
+        None => Ok(None),
+        Some(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Ok(Some(c)),
+                _ => Err(SelectError::Value(
+                    "ESCAPE must be a single character".into(),
+                )),
+            }
+        }
+    }
+}
+
+/// O(n·m) wildcard DP — no backtracking, so `%`-heavy patterns stay
+/// polynomial under the expression and record caps (review 2026-09-05 #5).
+fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let toks = like_tokens(pattern, escape);
+    let m = text.len();
+    let mut prev = vec![false; m + 1];
+    let mut cur = vec![false; m + 1];
+    prev[0] = true;
+    for tok in &toks {
+        // `%` may match the empty prefix; nothing else may.
+        cur[0] = matches!(tok, LikeTok::Star) && prev[0];
+        for j in 1..=m {
+            cur[j] = match tok {
+                LikeTok::Star => prev[j] || cur[j - 1],
+                LikeTok::Single => prev[j - 1],
+                LikeTok::Char(c) => prev[j - 1] && text[j - 1] == *c,
+            };
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+/// ESCAPE resolution to tokens: the escape char literalizes the next
+/// pattern char (a trailing escape stays literal); consecutive `%` runs
+/// collapse to one star.
+fn like_tokens(pattern: &str, escape: Option<char>) -> Vec<LikeTok> {
+    let p: Vec<char> = pattern.chars().collect();
+    let mut toks = Vec::with_capacity(p.len());
+    let mut i = 0;
+    while i < p.len() {
+        if escape == Some(p[i]) {
+            let literal = p.get(i + 1).copied().unwrap_or(p[i]);
+            toks.push(LikeTok::Char(literal));
+            i += 2;
+        } else {
+            match p[i] {
+                '%' if !matches!(toks.last(), Some(LikeTok::Star)) => toks.push(LikeTok::Star),
+                '_' => toks.push(LikeTok::Single),
+                c => toks.push(LikeTok::Char(c)),
+            }
+            i += 1;
+        }
+    }
+    toks
 }
 
 /// Equality per the comparison rules: Bool only with Bool, everything else
@@ -945,16 +1054,206 @@ mod tests {
     }
 
     #[test]
-    fn like_ilike_unsupported() {
-        let mut engine =
-            Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 LIKE 'a%'").unwrap());
-        match engine.next(csv(&["a"], &["_1"])) {
-            Err(SelectError::Unsupported(m)) => assert_eq!(m, "LIKE"),
-            other => panic!("expected LIKE unsupported, got {other:?}"),
+    fn like_percent_matches_any_sequence() {
+        // `%` matches any sequence, including the empty one.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'h%'",
+            vec![
+                csv(&["hello", "x"], &["_1", "_2"]),
+                csv(&["world", "y"], &["_1", "_2"]),
+            ],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("hello"));
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE '%llo'",
+            vec![csv(&["hello"], &["_1"]), csv(&["help"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE '%'",
+            vec![csv(&[""], &["_1"]), csv(&["anything"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn like_underscore_matches_exactly_one_char() {
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'h_llo'",
+            vec![
+                csv(&["hello"], &["_1"]),
+                csv(&["hllo"], &["_1"]),
+                csv(&["helloo"], &["_1"]),
+            ],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("hello"));
+        // `_` is exactly one character: `a` passes, `ab` and `''` do not.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE '_'",
+            vec![
+                csv(&["a"], &["_1"]),
+                csv(&["ab"], &["_1"]),
+                csv(&[""], &["_1"]),
+            ],
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn like_is_case_sensitive() {
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'h%'",
+            vec![csv(&["HELLO"], &["_1"]), csv(&["hello"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("hello"));
+    }
+
+    #[test]
+    fn like_without_wildcards_is_exact() {
+        // A pattern with no `%`/`_` is exact equality.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'hello'",
+            vec![csv(&["hello"], &["_1"]), csv(&["hell"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("hello"));
+    }
+
+    #[test]
+    fn like_escape_makes_wildcards_literal() {
+        // ESCAPE '\' turns `\%`/`\_` into literal characters.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\%b' ESCAPE '\\'",
+            vec![csv(&["a%b"], &["_1"]), csv(&["axb"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("a%b"));
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\_b' ESCAPE '\\'",
+            vec![csv(&["a_b"], &["_1"]), csv(&["ab"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("a_b"));
+    }
+
+    #[test]
+    fn like_escape_of_the_escape_char() {
+        // The escape char escapes itself: pattern `a\\b` with ESCAPE '\' is
+        // the literal 3-char text `a\b`.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\\\b' ESCAPE '\\'",
+            vec![csv(&["a\\b"], &["_1"]), csv(&["ab"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("a\\b"));
+    }
+
+    #[test]
+    fn like_escape_must_be_one_char() {
+        // sqlparser 0.57 parses any literal string after ESCAPE; standard
+        // SQL takes exactly one character.
+        let mut engine = Engine::new(
+            parse("SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\%b' ESCAPE '\\%'").unwrap(),
+        );
+        match engine.next(csv(&["a%b"], &["_1"])) {
+            Err(SelectError::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
+            other => panic!("expected one-char escape error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn like_not_negates() {
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._1 NOT LIKE 'd%'",
+            vec![csv(&["abc"], &["_1"]), csv(&["dab"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals[0], s("abc"));
+    }
+
+    #[test]
+    fn like_missing_subject_is_false() {
+        // `_5` is past the row width: MISSING → false, like every
+        // non-string operand.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE s._5 LIKE 'x%'",
+            vec![csv(&["1", "2"], &["_1", "_2"])],
+        );
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn like_non_string_operands_are_false() {
+        // Numbers, bools and NULL never match — no coercion.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE 5 LIKE '5%'",
+            vec![csv(&["x"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 0);
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE '5' LIKE 5",
+            vec![csv(&["x"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 0);
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE NULL LIKE 'x%'",
+            vec![csv(&["x"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn like_empty_pattern_and_subject_edges() {
+        // Empty pattern matches only the empty subject; `%` matches the
+        // empty subject; `_` needs exactly one character.
+        let rows = |sql| run(sql, vec![csv(&["x"], &["_1"])]).len();
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE '' LIKE ''"), 1);
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE 'a' LIKE ''"), 0);
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE '' LIKE '%'"), 1);
+        assert_eq!(rows("SELECT * FROM S3Object s WHERE '' LIKE '_'"), 0);
+    }
+
+    #[test]
+    fn like_percent_heavy_pattern_is_polynomial() {
+        // (%a)×300 vs 600 chars ≈ 3.6·10^5 DP cells; a backtracking matcher
+        // would wander 2^300 paths (review 2026-09-05 #5).
+        let pattern = "%a".repeat(300);
+        assert!(like_match(
+            &format!("{}{}", "b".repeat(300), "a".repeat(300)),
+            &pattern,
+            None
+        ));
+        // The trailing `b`s cannot be absorbed: no star follows the last
+        // literal `a`.
+        assert!(!like_match(
+            &format!("{}{}", "a".repeat(300), "b".repeat(300)),
+            &pattern,
+            None
+        ));
+    }
+
+    #[test]
+    fn like_any_is_refused() {
+        // Snowflake's `LIKE ANY` is outside the AWS surface: refuse rather
+        // than silently run single-pattern LIKE semantics.
         let mut engine =
-            Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 ILIKE 'a%'").unwrap());
-        match engine.next(csv(&["a"], &["_1"])) {
+            Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 LIKE ANY 'x%'").unwrap());
+        match engine.next(csv(&["x"], &["_1"])) {
+            Err(SelectError::Unsupported(m)) => assert_eq!(m, "LIKE ANY"),
+            other => panic!("expected LIKE ANY unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ilike_is_unsupported() {
+        // AWS S3 Select has no case-insensitive LIKE: reject rather than
+        // silently behave as a case-sensitive LIKE (review 2026-09-05b).
+        let mut engine =
+            Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 ILIKE 'X'").unwrap());
+        match engine.next(csv(&["x"], &["_1"])) {
             Err(SelectError::Unsupported(m)) => assert_eq!(m, "ILIKE"),
             other => panic!("expected ILIKE unsupported, got {other:?}"),
         }
