@@ -26,8 +26,13 @@
 //! the tagging contract — object and bucket tag sets, the tagged write
 //! paths (commit/copy/multipart completion) and recorded checksums;
 //! the bucket CORS trio with zero-rule normalization and idempotent
-//! delete; rename_object; and the completed-object part listing with
-//! its OBJECT_PARTS lifecycle (spec 2026-08-31).
+//! delete; the ACL contract — object and bucket ACL round-trips
+//! (replace-all, owner preserved), owner/ACL recording on the write
+//! paths (commit, copy with the caller's pair, multipart completion
+//! from the upload state), rename preservation, and the `list_buckets`
+//! owner filter (filter-then-paginate) (spec 2026-09-05);
+//! rename_object; and the completed-object part listing with its
+//! OBJECT_PARTS lifecycle (spec 2026-08-31).
 //! [`tinio_mem::MemoryStorage`] — the in-memory reference backend —
 //! backs conformance tests in the `tinio-mem` crate.
 //!
@@ -85,6 +90,28 @@ pub fn assert_send_sync<T: Send + Sync + 'static>() {}
 /// Build a validated [`ETag`] from a wire-format hex string (harness helper).
 pub fn etag(hex: &str) -> ETag {
     ETag::new(hex).expect("valid etag")
+}
+
+/// The harness's fixed canonical owner id (64 lowercase hex) — the
+/// recorded owner element the ACL blocks write and assert.
+fn conform_owner() -> acl::OwnerId {
+    acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+        .expect("64 lowercase hex")
+}
+
+/// A second canonical owner id, distinct from [`conform_owner`].
+fn conform_other_owner() -> acl::OwnerId {
+    acl::OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100")
+        .expect("64 lowercase hex")
+}
+
+/// The standard group-read grant (AllUsers READ) — the ACL-block
+/// fixture grant both backends share.
+fn conform_group_read_grant() -> acl::Grant {
+    acl::Grant {
+        grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
+        permission: acl::Permission::Read,
+    }
 }
 
 /// The server's checksum tee slot with `algorithm`/`value` pre-loaded —
@@ -263,6 +290,64 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
         "the copy ETag must be the content MD5",
     );
 
+    // The copy's owner is the caller's and its ACL is the caller's —
+    // never the source's (AWS: the destination takes the request's ACL
+    // or the default; the copy's owner = the requester).
+    let src_owner = conform_owner();
+    let requester = conform_other_owner();
+    let src_grants = vec![conform_group_read_grant()];
+    let dst_grants = vec![
+        acl::Grant {
+            grantee: acl::Grantee::Canonical(requester.clone()),
+            permission: acl::Permission::ReadAcp,
+        },
+        conform_group_read_grant(),
+    ];
+    let src_acled = object::key("copy-owned-src.bin").unwrap();
+    let staged = storage
+        .stage_body(b, &src_acled, body(data.to_vec()), None)
+        .await
+        .unwrap();
+    storage
+        .commit_object(
+            b,
+            &src_acled,
+            staged,
+            object::Tags::empty(),
+            Some(&src_owner),
+            &acl::Acl { owner: Some(src_owner.clone()), grants: src_grants.clone() },
+        )
+        .await
+        .unwrap();
+    let owned_dst = object::key("copy-owned-dst.bin").unwrap();
+    let copied = storage
+        .copy_object(
+            b,
+            &src_acled,
+            b,
+            &owned_dst,
+            object::Tags::empty(),
+            Some(&requester),
+            &acl::Acl { owner: Some(requester.clone()), grants: dst_grants.clone() },
+            None,
+        )
+        .await
+        .unwrap();
+    check(
+        copied.owner.as_ref() == Some(&requester) && copied.acl.grants == dst_grants,
+        "the copy must record the caller's owner and its own ACL",
+    );
+    let head = storage.head_object(b, &owned_dst).await.unwrap();
+    check(
+        head.owner.as_ref() == Some(&requester) && head.acl.grants == dst_grants,
+        "the copy's head must echo the caller's owner and ACL",
+    );
+    let head_src = storage.head_object(b, &src_acled).await.unwrap();
+    check(
+        head_src.owner.as_ref() == Some(&src_owner) && head_src.acl.grants == src_grants,
+        "the source's owner and ACL must be untouched by the copy",
+    );
+
     // Copy into a folder-marker destination creates the marker (the
     // destination is a directory, never an object).
     let marker = object::key("copied-dir/").unwrap();
@@ -338,6 +423,8 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.delete_object(b, &tagged_src).await.unwrap();
     storage.delete_object(b, &bare_dst).await.unwrap();
     storage.delete_object(b, &carried_dst).await.unwrap();
+    storage.delete_object(b, &src_acled).await.unwrap();
+    storage.delete_object(b, &owned_dst).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
 }
 
@@ -506,6 +593,156 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     );
     storage.delete_bucket(&p1).await.unwrap();
     storage.delete_bucket(&p2).await.unwrap();
+
+    // The owner filter runs during the walk, BEFORE pagination (review
+    // P2#4): seed an interleaved A/B pair on the `own` prefix (the
+    // unique_bucket counter alternates them — a raw-walk page would
+    // pair an A with a B), page the A-owned sub-collection with a size
+    // smaller than its count, and assert the continuation-token math
+    // applies to the FILTERED set: no B-owned leak, the paged union
+    // equals the full filtered listing, the last page carries no token.
+    let owner_a = conform_owner();
+    let owner_b = conform_other_owner();
+    let (mut a_buckets, mut b_buckets) = (Vec::new(), Vec::new());
+    for i in 0..4 {
+        a_buckets.push(bucket::name(format!("own-{}-{i}a", id())).unwrap());
+        b_buckets.push(bucket::name(format!("own-{}-{i}b", id())).unwrap());
+    }
+    for (a_name, b_name) in a_buckets.iter().zip(&b_buckets) {
+        storage
+            .create_bucket(a_name, Some(&owner_a), &acl::Acl::default_private(Some(owner_a.clone())))
+            .await
+            .unwrap();
+        storage
+            .create_bucket(b_name, Some(&owner_b), &acl::Acl::default_private(Some(owner_b.clone())))
+            .await
+            .unwrap();
+    }
+    let full = storage
+        .list_buckets(page("own", None, usize::MAX), Some(&owner_a))
+        .await
+        .unwrap();
+    check(
+        full.buckets.len() == a_buckets.len()
+            && !full.truncated
+            && full.next_start_after.is_none(),
+        "the full filtered listing must hold exactly the A-owned set",
+    );
+    let mut paged = Vec::new();
+    let mut start_after = None;
+    let mut pages = 0;
+    loop {
+        let p = storage
+            .list_buckets(page("own", start_after.clone(), 2), Some(&owner_a))
+            .await
+            .unwrap();
+        check(
+            p.buckets.iter().all(|x| a_buckets.contains(&x.name)),
+            "a filtered page must not leak another owner's bucket",
+        );
+        paged.extend(p.buckets.iter().map(|x| x.name.clone()));
+        pages += 1;
+        match p.next_start_after {
+            Some(next) => {
+                check(p.truncated, "a resume marker must mark the page truncated");
+                start_after = Some(next);
+            }
+            None => {
+                check(!p.truncated, "the final filtered page must be untruncated");
+                break;
+            }
+        }
+    }
+    check(
+        pages >= 2,
+        "the page size must force at least one continuation token",
+    );
+    check(
+        paged
+            == full
+                .buckets
+                .iter()
+                .map(|x| x.name.clone())
+                .collect::<Vec<_>>(),
+        "the paged union must equal the full filtered listing, in name order",
+    );
+    // The mirror principal: B's listing holds exactly its own buckets.
+    let b_full = storage
+        .list_buckets(page("own", None, usize::MAX), Some(&owner_b))
+        .await
+        .unwrap();
+    check(
+        b_full.buckets.len() == b_buckets.len()
+            && b_full
+                .buckets
+                .iter()
+                .all(|x| b_buckets.contains(&x.name)),
+        "the other owner's listing must hold exactly its own buckets",
+    );
+    for n in a_buckets.iter().chain(&b_buckets) {
+        storage.delete_bucket(n).await.unwrap();
+    }
+    let legacy = storage
+        .list_buckets(page("own", None, usize::MAX), None)
+        .await
+        .unwrap();
+    check(
+        legacy.buckets.is_empty(),
+        "the filtered seed buckets must be gone",
+    );
+
+    // Bucket ACL: the write path records the caller-provided owner and
+    // grant set, and put_bucket_acl replaces the grants, never the
+    // owner (the bucket counterpart of the object block).
+    let acl_bucket = bucket::name(unique_bucket("conform")).unwrap();
+    let acl_owner = conform_owner();
+    let acl_grants = vec![conform_group_read_grant()];
+    storage
+        .create_bucket(
+            &acl_bucket,
+            Some(&acl_owner),
+            &acl::Acl { owner: Some(acl_owner.clone()), grants: acl_grants.clone() },
+        )
+        .await
+        .unwrap();
+    let got = storage.get_bucket_acl(&acl_bucket).await.unwrap();
+    check(
+        got.owner.as_ref() == Some(&acl_owner) && got.grants == acl_grants,
+        "create_bucket must record the owner and grant set",
+    );
+    storage.put_bucket_acl(&acl_bucket, &acl::AclGrants::new()).await.unwrap();
+    let got = storage.get_bucket_acl(&acl_bucket).await.unwrap();
+    check(
+        got.grants.is_empty() && got.owner.as_ref() == Some(&acl_owner),
+        "put_bucket_acl must replace the grants and preserve the owner",
+    );
+    storage.put_bucket_acl(&acl_bucket, &acl_grants).await.unwrap();
+    let got = storage.get_bucket_acl(&acl_bucket).await.unwrap();
+    check(
+        got.grants == acl_grants && got.owner.as_ref() == Some(&acl_owner),
+        "put_bucket_acl must round-trip the new grant set",
+    );
+    let err = into_core_error(
+        storage
+            .get_bucket_acl(&bucket::name(unique_bucket("missing")).unwrap())
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "the ACL of a missing bucket must be NoSuchBucket",
+    );
+    let err = into_core_error(
+        storage
+            .put_bucket_acl(&bucket::name(unique_bucket("missing")).unwrap(), &acl_grants)
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "put_bucket_acl on a missing bucket must be NoSuchBucket",
+    );
+    storage.delete_bucket(&acl_bucket).await.unwrap();
 
     // Head.
     let head = storage.head_bucket(b).await.unwrap();
@@ -799,6 +1036,68 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         "get must serve the committed tags",
     );
 
+    // Object ACL (spec 2026-09-05): the write paths record the
+    // caller-provided owner and grant set, a put_object_acl replaces
+    // the grants never the owner, and a plain put_object records the
+    // default-private ACL with no owner (review B4 — a no-identity
+    // write records an empty owner wire, never the default owner).
+    let acl_owner = conform_owner();
+    let acl_grants = vec![conform_group_read_grant()];
+    let acl_key = object::key("acl.bin").unwrap();
+    let staged = storage
+        .stage_body(b, &acl_key, body(data.to_vec()), None)
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(
+            b,
+            &acl_key,
+            staged,
+            object::Tags::empty(),
+            Some(&acl_owner),
+            &acl::Acl { owner: Some(acl_owner.clone()), grants: acl_grants.clone() },
+        )
+        .await
+        .unwrap();
+    check(
+        committed.owner.as_ref() == Some(&acl_owner) && committed.acl.grants == acl_grants,
+        "a commit must record the caller-provided owner and grant set",
+    );
+    let got = storage.get_object_acl(b, &acl_key).await.unwrap();
+    check(
+        got.owner.as_ref() == Some(&acl_owner) && got.grants == acl_grants,
+        "get_object_acl must recombine the recorded owner and grant set",
+    );
+    let head = storage.head_object(b, &acl_key).await.unwrap();
+    check(
+        head.owner.as_ref() == Some(&acl_owner) && head.acl.grants == acl_grants,
+        "head must echo the recorded owner and grant set",
+    );
+    storage.put_object_acl(b, &acl_key, &acl::AclGrants::new()).await.unwrap();
+    let got = storage.get_object_acl(b, &acl_key).await.unwrap();
+    check(
+        got.grants.is_empty() && got.owner.as_ref() == Some(&acl_owner),
+        "put_object_acl must replace the grants and preserve the owner",
+    );
+    storage.put_object_acl(b, &acl_key, &acl_grants).await.unwrap();
+    let got = storage.get_object_acl(b, &acl_key).await.unwrap();
+    check(
+        got.grants == acl_grants && got.owner.as_ref() == Some(&acl_owner),
+        "put_object_acl must round-trip the new grant set",
+    );
+    let plain = object::key("acl-plain.bin").unwrap();
+    storage.put_object(b, &plain, body(b"x")).await.unwrap();
+    let got = storage.get_object_acl(b, &plain).await.unwrap();
+    check(
+        got.owner.is_none() && got.grants.is_empty(),
+        "a plain put_object must record the default-private ACL with no owner",
+    );
+    let err = into_core_error(storage.get_object_acl(b, &missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchKey(_)),
+        "the ACL of a missing object must be NoSuchKey",
+    );
+
     // Recorded checksums: a plain PUT staged with the server's tee slot
     // records the validated digest as FULL_OBJECT — the kind is fixed by
     // the write path — and head/get echo the record. A commit staged
@@ -877,6 +1176,8 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         },
         kind: Type::FullObject,
     };
+    let mv_owner = conform_owner();
+    let mv_grants = vec![conform_group_read_grant()];
     let staged = storage
         .stage_body(
             b,
@@ -887,7 +1188,14 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let committed = storage
-        .commit_object(b, &mv_src, staged, mv_tags.clone(), None, &acl::Acl::default_private(None))
+        .commit_object(
+            b,
+            &mv_src,
+            staged,
+            mv_tags.clone(),
+            Some(&mv_owner),
+            &acl::Acl { owner: Some(mv_owner.clone()), grants: mv_grants.clone() },
+        )
         .await
         .unwrap();
     let renamed = storage.rename_object(b, &mv_src, &mv_dst).await.unwrap();
@@ -899,12 +1207,18 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         renamed.tags == mv_tags && renamed.checksum == Some(mv_checksum.clone()),
         "rename must move the tags and the recorded checksum",
     );
+    check(
+        renamed.owner.as_ref() == Some(&mv_owner) && renamed.acl.grants == mv_grants,
+        "rename must move the owner and the ACL",
+    );
     check(renamed.etag == committed.etag, "rename must move the ETag");
     let head = storage.head_object(b, &mv_dst).await.unwrap();
     check(
         head.size == mv_data.len() as u64
             && head.tags == mv_tags
-            && head.checksum == Some(mv_checksum.clone()),
+            && head.checksum == Some(mv_checksum.clone())
+            && head.owner.as_ref() == Some(&mv_owner)
+            && head.acl.grants == mv_grants,
         "the destination must hold the moved metadata",
     );
     let get = storage.get_object(b, &mv_dst, None).await.unwrap();
@@ -925,7 +1239,10 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .unwrap();
     let renamed = storage.rename_object(b, &mv_dst, &mv_over).await.unwrap();
     check(
-        renamed.tags == mv_tags && renamed.checksum == Some(mv_checksum.clone()),
+        renamed.tags == mv_tags
+            && renamed.checksum == Some(mv_checksum.clone())
+            && renamed.owner.as_ref() == Some(&mv_owner)
+            && renamed.acl.grants == mv_grants,
         "an overwriting rename must carry the source metadata",
     );
     let get = storage.get_object(b, &mv_over, None).await.unwrap();
@@ -1038,6 +1355,8 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.delete_object(b, &digits).await.unwrap();
     storage.delete_object(b, &tagged).await.unwrap();
     storage.delete_object(b, &recorded).await.unwrap();
+    storage.delete_object(b, &acl_key).await.unwrap();
+    storage.delete_object(b, &plain).await.unwrap();
     storage.delete_object(b, &mv_over).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
 }
@@ -1110,6 +1429,40 @@ async fn conformance_listing<S: Storage>(storage: &S, b: &bucket::Name) {
     check(all.len() == 5, "paginated listing must cover everything");
     check(!page2.truncated, "second page must be the last");
 
+    // The listing's Info echoes the recorded owner (the access layer's
+    // owner-population read): a commit with an owner is served by the
+    // listing; a plain put records none.
+    let own_key = object::key("own.txt").unwrap();
+    let listed_owner = conform_owner();
+    let staged = storage
+        .stage_body(b, &own_key, body(b"owned"), None)
+        .await
+        .unwrap();
+    storage
+        .commit_object(
+            b,
+            &own_key,
+            staged,
+            object::Tags::empty(),
+            Some(&listed_owner),
+            &acl::Acl::default_private(Some(listed_owner.clone())),
+        )
+        .await
+        .unwrap();
+    let page = storage
+        .list_objects(list_params(b, "", None, None, 1000))
+        .await
+        .unwrap();
+    let own = page
+        .objects
+        .iter()
+        .find(|o| o.key == own_key)
+        .expect("the owned key must be listed");
+    check(
+        own.owner.as_ref() == Some(&listed_owner),
+        "the listing must echo the recorded owner",
+    );
+
     // Listing a missing bucket.
     let missing = bucket::name(unique_bucket("missing")).unwrap();
     let err = into_core_error(
@@ -1129,6 +1482,7 @@ async fn conformance_listing<S: Storage>(storage: &S, b: &bucket::Name) {
             .await
             .unwrap();
     }
+    storage.delete_object(b, &own_key).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
 }
 
@@ -1866,6 +2220,58 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         matches!(err, NoSuchKey(_)),
         "the parts of a deleted object must be gone with it",
     );
+
+    // The completion applies the create-time owner/ACL: the CMU
+    // records the pair in the upload state and the completion consumes
+    // it (the tags precedent — never re-ferried through the interface),
+    // so the completed object's owner is the CMU's, not the
+    // completing principal's (the contract has no such parameter).
+    let owned = object::key("owned.bin").unwrap();
+    let cmu_owner = conform_owner();
+    let cmu_grants = vec![conform_group_read_grant()];
+    let upload = storage
+        .create_multipart_upload(
+            b,
+            &owned,
+            None,
+            object::Tags::empty(),
+            Some(&cmu_owner),
+            &acl::Acl { owner: Some(cmu_owner.clone()), grants: cmu_grants.clone() },
+        )
+        .await
+        .unwrap();
+    check(
+        upload.owner.as_ref() == Some(&cmu_owner) && upload.acl.grants == cmu_grants,
+        "the upload state must carry the create-time owner and grant set",
+    );
+    let part = storage
+        .upload_part(b, &owned, &upload.upload_id, 1.into(), body(b"tiny"), None)
+        .await
+        .unwrap();
+    let completed = storage
+        .complete_multipart_upload(
+            b,
+            &owned,
+            &upload.upload_id,
+            &[CompletedPart {
+                part_number: part.part_number,
+                etag: part.etag,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    check(
+        completed.owner.as_ref() == Some(&cmu_owner)
+            && completed.acl.grants == cmu_grants,
+        "the completion must apply the create-time owner and grant set",
+    );
+    let got = storage.get_object_acl(b, &owned).await.unwrap();
+    check(
+        got.owner.as_ref() == Some(&cmu_owner) && got.grants == cmu_grants,
+        "the completed object's ACL must come from the upload state",
+    );
+    storage.delete_object(b, &owned).await.unwrap();
 
     storage.delete_object(b, &big).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
