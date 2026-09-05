@@ -37,6 +37,92 @@ assert "dir/" in [p["Prefix"] for p in page.get("CommonPrefixes", [])]
 page = s3.list_objects_v2(Bucket="boto3-bucket", Prefix="dir/")
 assert page["KeyCount"] == 1
 
+# Bucket CORS trio (gap-analysis Tier A#2): delete on a fresh config is
+# idempotent, the following get answers NoSuchCORSConfiguration, and the
+# put/get round trip echoes the configuration.
+s3.delete_bucket_cors(Bucket="boto3-bucket")
+try:
+    s3.get_bucket_cors(Bucket="boto3-bucket")
+    raise AssertionError("CORS config should not exist on a fresh bucket")
+except s3.exceptions.ClientError as e:
+    assert e.response["Error"]["Code"] == "NoSuchCORSConfiguration", e.response
+
+import urllib.error
+import urllib.request
+
+# boto3 does not compute Content-MD5 for this call; tinio requires it
+# (AWS three-state: missing → 400 InvalidRequest). The value is base64 of
+# 16 zero bytes — sufficient, since digest equality is not verified.
+s3.put_bucket_cors(
+    Bucket="boto3-bucket",
+    CORSConfiguration={
+        "CORSRules": [
+            {
+                "ID": "allow-example",
+                "AllowedOrigins": ["https://example.com"],
+                "AllowedMethods": ["GET", "PUT"],
+                "ExposeHeaders": ["ETag"],
+                "MaxAgeSeconds": 300,
+            },
+            {"AllowedOrigins": ["*"], "AllowedMethods": ["DELETE"]},
+        ]
+    },
+    ContentMD5="AAAAAAAAAAAAAAAAAAAAAA==",
+)
+rules = s3.get_bucket_cors(Bucket="boto3-bucket")["CORSRules"]
+assert [r.get("ID") for r in rules] == ["allow-example", None], rules
+assert rules[0]["AllowedOrigins"] == ["https://example.com"], rules[0]
+assert rules[0]["AllowedMethods"] == ["GET", "PUT"], rules[0]
+assert rules[0]["MaxAgeSeconds"] == 300, rules[0]
+assert rules[1]["AllowedOrigins"] == ["*"], rules[1]
+s3.delete_bucket_cors(Bucket="boto3-bucket")
+try:
+    s3.get_bucket_cors(Bucket="boto3-bucket")
+    raise AssertionError("CORS config still exists after delete")
+except s3.exceptions.ClientError as e:
+    assert e.response["Error"]["Code"] == "NoSuchCORSConfiguration", e.response
+
+# Preflight leg: browsers cannot sign an OPTIONS preflight and boto3 has
+# no OPTIONS call, so the raw preflight rides the stdlib HTTP client (the
+# journey's only dependency beyond boto3). Allowed → 200 with the allow
+# headers; denied → 403 AccessDenied without them.
+s3.put_bucket_cors(
+    Bucket="boto3-bucket",
+    CORSConfiguration={
+        "CORSRules": [
+            {
+                "AllowedOrigins": ["https://example.com"],
+                "AllowedMethods": ["GET"],
+            },
+        ]
+    },
+    ContentMD5="AAAAAAAAAAAAAAAAAAAAAA==",
+)
+
+
+def preflight(origin, method):
+    req = urllib.request.Request(
+        f"http://{endpoint}/boto3-bucket/hello.txt",
+        method="OPTIONS",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": method,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.headers
+    except urllib.error.HTTPError as err:
+        return err.code, err.headers
+
+
+status, headers = preflight("https://example.com", "GET")
+assert status == 200, status
+assert headers["Access-Control-Allow-Origin"] == "https://example.com", headers
+status, headers = preflight("https://foreign.com", "GET")
+assert status == 403, status
+assert "Access-Control-Allow-Origin" not in headers, headers
+
 # Multipart via upload_file (> 8 MiB -> composed ETag with -N suffix).
 big = tempfile.NamedTemporaryFile(delete=False)
 big.write(b"x" * (10 * 1024 * 1024))
