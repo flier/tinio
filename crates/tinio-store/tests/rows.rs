@@ -44,21 +44,35 @@ fn bucket_put_get_put_full_and_get_or_insert() {
         // Absent bucket -> no row.
         assert!(!t.exists("data")?);
         assert!(t.get("data")?.is_none());
-        // Record: put writes (created, empty tags).
+        // Record: put writes (created, empty tags/owner/acl/cors).
         t.put("data", now)?;
         assert!(t.exists("data")?);
         assert_eq!(t.get("data")?, Some(now));
-        let (created, tags) = t.row("data")?.expect("present");
+        let (created, tags, owner, acl, cors) = t.row("data")?.expect("present");
         assert_eq!((created, tags), (now, "".to_string()));
+        assert_eq!(
+            (owner, acl, cors),
+            ("".to_string(), "".to_string(), "".to_string())
+        );
         // The tagging write upserts the whole row.
-        t.put_full("data", now, "env=prod")?;
-        assert_eq!(t.row("data")?.unwrap().1, "env=prod");
+        t.put_full("data", now, "env=prod", "", "", "")?;
+        let (_, tags, ..) = t.row("data")?.unwrap();
+        assert_eq!(tags, "env=prod");
         // The list/head first-sight upsert must keep the first time AND
-        // the stored tags element (never clear it).
+        // the stored wires (never clear them).
         let recorded = t.get_or_insert("data", now + Duration::from_secs(1))?;
         assert_eq!(recorded, now);
-        let (created, tags) = t.row("data")?.unwrap();
-        assert_eq!((created, tags), (now, "env=prod".to_string()));
+        let (created, tags, owner, acl, cors) = t.row("data")?.unwrap();
+        assert_eq!(
+            (created, tags, owner, acl, cors),
+            (
+                now,
+                "env=prod".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+            )
+        );
         Ok(())
     })
     .unwrap();

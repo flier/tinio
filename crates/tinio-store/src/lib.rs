@@ -47,6 +47,12 @@ mod tests {
     use redb::{Database, ReadableDatabase, TableHandle};
 
     use super::*;
+    use crate::table::TableDef;
+
+    /// Typestate equality: `Same<A, A>` is the only instance — an
+    /// `A != B` pair never satisfies the impl.
+    struct Same<A, B>(std::marker::PhantomData<(A, B)>);
+    impl<A> Same<A, A> {}
 
     #[test]
     fn ensure_all_creates_exactly_the_seven_tables_idempotently() {
@@ -83,5 +89,20 @@ mod tests {
                 "uploads",
             ]
         );
+    }
+
+    #[test]
+    fn buckets_value_slot_is_the_five_tuple() {
+        // The BUCKETS row pins the ACL 4-tuple with the CORS element
+        // appended fifth: `(created_at_nanos, tags_wire, owner_wire,
+        // acl_wire, cors_wire)`. redb 4.x exposes no runtime arity
+        // accessor (`TableDefinition`/`Value` have no `value_arity`), so
+        // the pin is type-level — the equality below compiles only while
+        // the value slot IS the 5-tuple; change the arity and the crate
+        // fails to build.
+        let _: Same<
+            <bucket::Def as TableDef>::Value,
+            (u64, &'static str, &'static str, &'static str, &'static str),
+        > = Same(std::marker::PhantomData);
     }
 }
