@@ -41,18 +41,17 @@ permissions:
 # ---------------------------------------------------------------------------
 
 jobs:
-  # Lint and tests are separate jobs so a clippy failure never blocks the
-  # test legs — both matrices run in parallel and report independently.
-  lint:
-    name: Lint (fmt/clippy)
-    # All gates run behind the lightweight compile check: a tree that
-    # does not build skips the 3-OS matrices instead of burning them.
-    needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  # Check is the single prerequisite gate and the definition site for the
+  # shared preamble steps (checkout/lld/toolchain/rust-cache/sccache):
+  # they are inlined here with their anchors, and every later job aliases
+  # them (*checkout, *lld, *toolchain, *rust-cache, *sccache).
+  check:
+    name: Check (workspace compile)
+    # The single prerequisite of every gate: one ubuntu leg proves the
+    # tree compiles before the 3-OS matrices and external-client
+    # scenarios spend their runners; the full clippy matrix in lint
+    # stays the quality gate.
+    runs-on: ubuntu-latest
     steps:
       - &checkout
         uses: actions/checkout@v7
@@ -64,25 +63,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y lld
 
-      # Nightly rustfmt for rustfmt.toml unstable_features. fmt output is
-      # platform-neutral, so only the ubuntu leg installs nightly and runs
-      # fmt --check; the win/mac legs skip it (stable then stays the only —
-      # hence default — toolchain for clippy).
-      - uses: dtolnay/rust-toolchain@nightly
-        if: runner.os == 'Linux'
-        with:
-          components: rustfmt
+      # Plain stable toolchain, shared by every job except lint (which
+      # adds the clippy component — see the lint job below).
+      - &toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      # Lint installs stable with the clippy component; the plain stable
-      # toolchain step (*toolchain) is defined in the test job below.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      # rust-cache here caches only the cargo registry (cache-targets off):
-      # per-job target/ dirs never serve the cross-job chain (sccache
-      # carries that) and were the biggest cache-store pressure. Only test
-      # (the ubuntu chain head) keeps its target dir.
+      # rust-cache, registry-only (cache-targets off): per-job target/
+      # dirs never serve the cross-job chain (sccache carries that) and
+      # dominated cache-store pressure. Only test (the ubuntu chain head)
+      # keeps its target dir.
       - &rust-cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -93,13 +82,80 @@ jobs:
       - &sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
+      - name: check (all targets)
+        run: cargo check --profile ci --workspace --all-targets
+
+  # Lint and tests are separate jobs so a clippy failure never blocks the
+  # test legs — both matrices run in parallel and report independently.
+  lint:
+    name: Lint (fmt/clippy)
+    # All gates run behind the lightweight compile check: a tree that
+    # does not build skips the 3-OS matrices instead of burning them.
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        # 2 clippy runs, both on ubuntu. The unix leg lints linux AND macos:
+        # the source has no cfg(target_os = "macos") — every macOS code path
+        # is cfg(unix) — so a native linux clippy covers it (linux + macos
+        # share this one compile). The windows-gnu leg cross-lints the
+        # cfg(windows) code; the macos/msvc-native clippy legs are dropped
+        # (their compile coverage already comes from the test-port matrix).
+        target:
+          - unix
+          - windows-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+
+      - *lld
+
+      # windows-gnu cross needs the mingw C toolchain (alloca/criterion's
+      # cc-rs compiles a C shim for --target) and the windows-gnu rust-std.
+      - name: install mingw cross compiler (windows-gnu)
+        if: matrix.target == 'windows-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      # Nightly rustfmt for rustfmt.toml unstable_features. fmt output is
+      # platform-neutral, so only the unix leg installs nightly and runs
+      # fmt --check; the windows-gnu leg skips it.
+      - uses: dtolnay/rust-toolchain@nightly
+        if: matrix.target == 'unix'
+        with:
+          components: rustfmt
+
+      # Lint installs stable with the clippy component; the shared stable
+      # toolchain step (*toolchain) is defined in the check job above.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # windows-gnu rust-std for the (now-default) stable toolchain clippy uses.
+      - name: add windows-gnu target
+        if: matrix.target == 'windows-gnu'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - *rust-cache
+
+      - *sccache
+
       # Quality gates (constitution "Rust Tooling & Quality Gates").
       - name: fmt --check
-        if: runner.os == 'Linux'
+        if: matrix.target == 'unix'
         run: cargo +nightly fmt --all -- --check
 
+      # Clippy-driver objects never warm from the rustc chains (they stay
+      # cold every run), so its sccache writes only burn the shared cache-
+      # API write budget (~200 uploads/min) without being reused. Disable
+      # caching just for clippy; sccache stays installed so the global
+      # RUSTC_WRAPPER still resolves, and SCCACHE_DISABLE just passes
+      # clippy through.
       - name: clippy (-D warnings)
-        run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
+        run: cargo clippy ${{ matrix.target == 'windows-gnu' && '--target x86_64-pc-windows-gnu' || '' }} --profile ci --workspace --all-targets -- -D warnings
+        env:
+          SCCACHE_DISABLE: "1"
 
   test:
     name: Test (unit/features, default)
@@ -121,8 +177,7 @@ jobs:
 
       # Plain stable toolchain, shared by every job except lint (which
       # adds the clippy component — see the lint job above).
-      - &toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - *toolchain
 
       # Chain head: test keeps its full target dir (the e2e/interop/
       # bench-smoke chain rides these artifacts); every other job runs
@@ -449,23 +504,6 @@ jobs:
       - *e2e-mem
       - *e2e-trace
       - *upload-report
-
-  check:
-    name: Check (workspace compile)
-    # The single prerequisite of every gate: one ubuntu leg proves the
-    # tree compiles before the 3-OS matrices and external-client
-    # scenarios spend their runners; the full clippy matrix in lint
-    # stays the quality gate.
-    runs-on: ubuntu-latest
-    steps:
-      - *checkout
-      - *lld
-      - *toolchain
-      - *rust-cache
-      - *sccache
-
-      - name: check (all targets)
-        run: cargo check --profile ci --workspace --all-targets
 
   bench-smoke:
     name: Benchmark smoke (criterion --test)
