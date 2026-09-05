@@ -50,7 +50,12 @@ fn loads_a_full_config_file_and_round_trips() {
     assert!(!config.s3.as_ref().unwrap().capabilities.multipart);
     assert!(config.s3.as_ref().unwrap().capabilities.list_objects_v1);
     assert_eq!(
-        config.storage.as_ref().unwrap().fs.compact_threshold_percent,
+        config
+            .storage
+            .as_ref()
+            .unwrap()
+            .fs
+            .compact_threshold_percent,
         50
     );
     assert_eq!(config.scanner.as_ref().unwrap().delay, 2.5);
@@ -81,7 +86,16 @@ fn all_optional_sections_serialize_away_when_absent() {
     // section, so `to_toml` never emits `[pipeline.*]` or a section a
     // consumer could not round-trip.
     let toml = Config::default().to_toml().unwrap();
-    for section in ["scanner", "api", "telemetry", "pipeline", "auth", "log", "s3", "storage"] {
+    for section in [
+        "scanner",
+        "api",
+        "telemetry",
+        "pipeline",
+        "auth",
+        "log",
+        "s3",
+        "storage",
+    ] {
         assert!(
             !toml.contains(section),
             "absent section {section:?} leaked into {toml}"

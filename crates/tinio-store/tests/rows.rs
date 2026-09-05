@@ -15,8 +15,8 @@ use tinio_core::{
     object::{self, Tags},
 };
 use tinio_store::{
-    bucket, meta, object_part, objects, part, part_checksum, part_data, part_meta, state, upload,
-    upload_checksum, store::Handle, ensure_all,
+    bucket, ensure_all, meta, object_part, objects, part, part_checksum, part_data, part_meta,
+    state, store::Handle, upload, upload_checksum,
 };
 
 /// A ready store handle over a fresh in-memory redb database — the
@@ -173,8 +173,11 @@ fn object_meta_walk_self_heals_a_corrupt_etag_row() {
         t.put("data", &object::key("ok.txt").unwrap(), &valid)?;
         // A corrupt-etag row (written by a stale writer) self-heals on
         // the walk rather than failing it — the gating load's discipline.
-        t.insert(("data", "bad-etag"), ("not-an-etag", 1u64, 0u64, 0u64, "", ""))
-            .map_err(tinio_store::Error::from)?;
+        t.insert(
+            ("data", "bad-etag"),
+            ("not-an-etag", 1u64, 0u64, 0u64, "", ""),
+        )
+        .map_err(tinio_store::Error::from)?;
         Ok(())
     })
     .unwrap();
@@ -293,9 +296,10 @@ fn upload_drain_bucket_removes_only_the_bucket() {
         Ok(())
     })
     .unwrap();
-    assert!(!h
-        .read(|txn| upload::Table::open_readonly(txn)?.key_matches("data", &key, "u1"))
-        .unwrap());
+    assert!(
+        !h.read(|txn| upload::Table::open_readonly(txn)?.key_matches("data", &key, "u1"))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -366,10 +370,11 @@ fn object_part_rows_list_in_order_and_remove_key() {
         Ok(())
     })
     .unwrap();
-    assert!(h
-        .read(|txn| object_part::Table::open_readonly(txn)?.list("data", "big.bin"))
-        .unwrap()
-        .is_empty());
+    assert!(
+        h.read(|txn| object_part::Table::open_readonly(txn)?.list("data", "big.bin"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -410,9 +415,10 @@ fn upload_checksum_and_part_checksum_rows() {
         Ok(())
     })
     .unwrap();
-    assert!(!h
-        .read(|txn| part_checksum::Table::open_readonly(txn)?.has_upload("data", "u1"))
-        .unwrap());
+    assert!(
+        !h.read(|txn| part_checksum::Table::open_readonly(txn)?.has_upload("data", "u1"))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -450,7 +456,7 @@ fn part_data_and_part_meta_rows_round_trip_and_total_len() {
     .unwrap();
     assert_eq!(
         h.read(|txn| part_data::Table::open_readonly(txn)?.total_len("data", "u1"))
-        .unwrap(),
+            .unwrap(),
         0
     );
 }
@@ -475,9 +481,10 @@ fn state_version_and_compact_marker_round_trip() {
         Ok(())
     })
     .unwrap();
-    assert!(h
-        .read(|txn| state::Table::open_readonly(txn)?.compact_marker())
-        .unwrap());
+    assert!(
+        h.read(|txn| state::Table::open_readonly(txn)?.compact_marker())
+            .unwrap()
+    );
 }
 
 #[test]
@@ -491,16 +498,18 @@ fn handle_write_commits_on_success_and_aborts_on_error() {
         )))
     });
     assert!(err.is_err());
-    assert!(!h
-        .read(|txn| bucket::Table::open_readonly(txn)?.exists("rolled-back"))
-        .unwrap());
+    assert!(
+        !h.read(|txn| bucket::Table::open_readonly(txn)?.exists("rolled-back"))
+            .unwrap()
+    );
     // A succeeding write commits.
     h.write(|txn| -> Result<(), tinio_store::Error> {
         bucket::Table::open(txn)?.put("committed", SystemTime::UNIX_EPOCH)?;
         Ok(())
     })
     .unwrap();
-    assert!(h
-        .read(|txn| bucket::Table::open_readonly(txn)?.exists("committed"))
-        .unwrap());
+    assert!(
+        h.read(|txn| bucket::Table::open_readonly(txn)?.exists("committed"))
+            .unwrap()
+    );
 }

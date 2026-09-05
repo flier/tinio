@@ -9,6 +9,7 @@
 
 - Never auto-commit/push/merge/rebase/stash — git writes: ask first, per operation.
 - Leave changes in tree; report pending; user decides when to commit.
+- No agent/AI trailers in commit messages (no `Co-Authored-By:`, "Generated with ...", or similar rows).
 
 ## Docs
 

@@ -119,11 +119,7 @@ mod tests {
 
     #[test]
     fn tag_set_from_tags_round_trips() {
-        let tags = Tags::from_pairs([
-            ("b".into(), "2".into()),
-            ("a".into(), "1".into()),
-        ])
-        .unwrap();
+        let tags = Tags::from_pairs([("b".into(), "2".into()), ("a".into(), "1".into())]).unwrap();
         let set = tag_set_from_tags(&tags);
         assert_eq!(set.len(), 2);
         assert_eq!(set[0].key.as_deref(), Some("a"));

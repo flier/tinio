@@ -453,5 +453,4 @@ mod tests {
         // The failed delta left the total unchanged.
         assert_eq!(storage.total_bytes(), 4);
     }
-
 }

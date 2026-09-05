@@ -13,8 +13,8 @@ use tinio_core::{
     object::{self, Tags},
 };
 use tinio_store::{
-    bucket, meta, object_part, part, part_checksum, part_data, part_meta, upload, upload_checksum,
-    store::Handle, ensure_all,
+    bucket, ensure_all, meta, object_part, part, part_checksum, part_data, part_meta,
+    store::Handle, upload, upload_checksum,
 };
 
 fn handle() -> Handle {
@@ -109,10 +109,16 @@ fn object_lifecycle_across_all_row_tables() {
         let u = upload::Table::open_readonly(txn)?;
         assert!(u.key_matches("demo", &key, "u1")?);
         let (got_key, _, tags) = u.get_matching("demo", &key, "u1")?.unwrap();
-        assert_eq!((got_key, tags), ("big.bin".to_string(), "env=prod".to_string()));
+        assert_eq!(
+            (got_key, tags),
+            ("big.bin".to_string(), "env=prod".to_string())
+        );
 
         let uc = upload_checksum::Table::open_readonly(txn)?;
-        assert_eq!(uc.get("demo", "u1")?, Some(("SHA256".into(), "FULL_OBJECT".into())));
+        assert_eq!(
+            uc.get("demo", "u1")?,
+            Some(("SHA256".into(), "FULL_OBJECT".into()))
+        );
 
         let p = part::Table::open_readonly(txn)?;
         assert_eq!(p.get_hex("demo", "u1", 1)?, Some(etag.to_string()));
@@ -127,7 +133,10 @@ fn object_lifecycle_across_all_row_tables() {
         let m = meta::Table::open_readonly(txn)?;
         assert_eq!(m.get("demo", &key)?, Some(completed));
         let op = object_part::Table::open_readonly(txn)?;
-        assert_eq!(op.list("demo", &key)?, vec![(1, 3, "SHA256".into(), "QjI0Ng==".into())]);
+        assert_eq!(
+            op.list("demo", &key)?,
+            vec![(1, 3, "SHA256".into(), "QjI0Ng==".into())]
+        );
         Ok(())
     })
     .unwrap();

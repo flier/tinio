@@ -1,0 +1,23 @@
+{
+  "skillOverrides": {
+    "github:code-review": "name-only",
+    "github:code-review-swarm": "name-only",
+    "github:github-modes": "name-only",
+    "github:github-swarm": "name-only",
+    "github:issue-tracker": "name-only",
+    "github:issue-triage": "name-only",
+    "github:multi-repo-swarm": "name-only",
+    "github:pr-enhance": "name-only",
+    "github:pr-manager": "name-only",
+    "github:project-board-sync": "name-only",
+    "github:README": "name-only",
+    "github:release-manager": "name-only",
+    "github:release-swarm": "name-only",
+    "github:repo-analyze": "name-only",
+    "github:repo-architect": "name-only",
+    "github:swarm-issue": "name-only",
+    "github:swarm-pr": "name-only",
+    "github:sync-coordinator": "name-only",
+    "github:workflow-automation": "name-only"
+  }
+}

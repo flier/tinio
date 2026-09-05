@@ -62,7 +62,6 @@ uuid = "1"
 winapi-util = "0.1"
 windows-sys = "0.61"
 
-tinio = { path = "crates/tinio" }
 tinio-api = { path = "crates/tinio-api", default-features = false }
 tinio-cli = { path = "crates/tinio-cli", default-features = false }
 tinio-config = { path = "crates/tinio-config" }
