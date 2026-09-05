@@ -218,9 +218,11 @@ impl<S: Storage> S3Route for CorsPreflightRoute<S> {
             .filter(|h| !h.is_empty())
             .map(str::to_string)
             .collect();
-        // op-review C1: `prepare` validated the path already (a bad name
-        // is a 400 before the route matches) — this parse sees valid names;
-        // the guard stays as defense.
+        // op-review C1 (precision): `prepare` validated the DECODED path
+        // already — a bad name is a 400 before the route matches — while
+        // this parse reads the RAW `req.uri`; a percent-encoded name could
+        // answer a 403 here instead. Impact nil (legal bucket names never
+        // percent-encode); the guard stays as defense.
         let bucket = bucket_from_uri(&req.uri)
             .ok_or_else(|| cors_denied_err_at(CORS_DENIED_MISMATCH_MSG))?;
         let Some(config) = self.configs.get(&bucket).await else {

@@ -426,7 +426,12 @@ impl DataPlaneService {
                     #[cfg(feature = "cors")]
                     let mut response = response;
                     #[cfg(feature = "cors")]
-                    if let (Some(cors), Some(origin)) = (cors.as_deref(), origin.as_deref())
+                    // OPTIONS is skipped outright: the preflight route
+                    // answers it, and no rule may allow OPTIONS — so
+                    // `rule_for` cannot match and the per-request config
+                    // read would be wasted on every preflight.
+                    if method != "OPTIONS"
+                        && let (Some(cors), Some(origin)) = (cors.as_deref(), origin.as_deref())
                         && let Some(bucket) = bucket_from_uri(&uri)
                         && let Some(config) = cors.get(&bucket).await
                         && let Some(rule) = config.rule_for(origin, &method)

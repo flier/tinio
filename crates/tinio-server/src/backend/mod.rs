@@ -9,7 +9,7 @@
 //! `s3.rs` delegates to them.
 //!
 //! Capability groups are strippable at compile time (`multipart`, `copy`,
-//! `list-v1`, `list-v2` cargo features) and disableable at runtime
+//! `list-v1`, `list-v2`, `cors` cargo features) and disableable at runtime
 //! ([`Capabilities`], from the `[s3]` config section) — disabled groups
 //! answer `NotImplemented` (FR-021).
 

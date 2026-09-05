@@ -328,8 +328,8 @@ mod tests {
             }],
         };
         let wire = cfg.to_wire();
-        assert!(!wire.contains("&,c"), "{wire}"); // the value's ',' must be encoded
-        assert!(!wire.contains(",;"), "{wire}"); // and so must ';' (F1 separator class, not a field sep)
+        assert!(!wire.contains("&,c"), "{wire}"); // the id's ',' must be encoded
+        assert!(!wire.contains(';'), "{wire}"); // so must ';' — a tags-style narrow escape set would leak it raw
         assert_eq!(CorsConfig::from_wire(&wire), cfg);
     }
 

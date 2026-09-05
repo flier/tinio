@@ -206,8 +206,9 @@ impl MemoryStorage {
     /// The tag-write transaction of the bucket trio — the shared body of
     /// `put_bucket_tags` and `delete_bucket_tags`: one read-modify-write
     /// transaction replaces the row's tags element with `tags_wire`,
-    /// keeping the creation time verbatim. Returns whether the row
-    /// existed (the caller maps: put → `NoSuchBucket`, delete → no-op).
+    /// keeping the creation time and the other wire elements verbatim
+    /// (as the CORS helper). Returns whether the row existed (the caller
+    /// maps: put → `NoSuchBucket`, delete → no-op).
     async fn rewrite_bucket_tags_element(
         &self,
         name: &Name,

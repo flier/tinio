@@ -8,7 +8,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use redb::Database;
+use redb::{Database, TableDefinition};
 use tinio_core::{
     checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Value},
     etag::ETag,
@@ -54,10 +54,15 @@ fn bucket_put_get_put_full_and_get_or_insert() {
             (owner, acl, cors),
             ("".to_string(), "".to_string(), "".to_string())
         );
-        // The tagging write upserts the whole row.
-        t.put_full("data", now, "env=prod", "", "", "")?;
-        let (_, tags, ..) = t.row("data")?.unwrap();
+        // The tagging write upserts the whole row — every wire is
+        // preserved at its own position (the same-typed `&str` wires
+        // must not swap positions).
+        t.put_full("data", now, "env=prod", "owner:w", "acl:w", "cors:w")?;
+        let (_, tags, owner, acl, cors) = t.row("data")?.unwrap();
         assert_eq!(tags, "env=prod");
+        assert_eq!(owner, "owner:w");
+        assert_eq!(acl, "acl:w");
+        assert_eq!(cors, "cors:w");
         // The list/head first-sight upsert must keep the first time AND
         // the stored wires (never clear them).
         let recorded = t.get_or_insert("data", now + Duration::from_secs(1))?;
@@ -68,9 +73,9 @@ fn bucket_put_get_put_full_and_get_or_insert() {
             (
                 now,
                 "env=prod".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "".to_string(),
+                "owner:w".to_string(),
+                "acl:w".to_string(),
+                "cors:w".to_string(),
             )
         );
         Ok(())
@@ -110,6 +115,45 @@ fn bucket_iterates_in_name_order_and_remove_is_idempotent() {
         })
         .unwrap();
     assert_eq!(names, ["alpha", "zeta"]);
+}
+
+/// The on-disk format guard (final-review F2, no-migration ruling): a
+/// `buckets` table written under a LEGACY tuple arity must NOT open under
+/// the current 5-tuple definition. redb binds the key/value type names at
+/// the `TableDefinition`, so `check_match` answers `TableTypeMismatch`
+/// at open — an old state dir fails loudly (never silently misreads a
+/// row); there is no migration, and the documented recovery is deleting
+/// the state dir.
+#[test]
+fn legacy_buckets_arity_fails_loudly_on_open() {
+    // The pre-tagging row shape: (created_at_nanos, tags_wire).
+    const LEGACY: TableDefinition<'static, &'static str, (u64, &'static str)> =
+        TableDefinition::new("buckets");
+
+    let db = Database::builder()
+        .create_with_backend(redb::backends::InMemoryBackend::new())
+        .unwrap();
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(LEGACY).unwrap();
+            table.insert("legacy-bucket", (42u64, "tag=wire")).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    // Opening the SAME table under the CURRENT definition (the store's
+    // 5-tuple) must fail at open with the table-type mismatch.
+    let mut txn = db.begin_write().unwrap();
+    let err = bucket::Table::open(&mut txn)
+        .err()
+        .expect("legacy arity must not open");
+    assert!(
+        matches!(
+            err,
+            tinio_store::Error::Table(redb::TableError::TableTypeMismatch { .. })
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]
