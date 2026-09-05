@@ -546,20 +546,145 @@ pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The unix mode of object files and private directories the backend
+/// creates (spec 2026-09-05 §5a): files land `0600`, dirs `0700`,
+/// regardless of the process umask — the create-then-chmod shape of the
+/// `STATE_DIR_MODE` precedent in `database::open`. Pre-existing
+/// files/dirs are never touched (no retroactive chmod pass); on Windows
+/// the created files inherit the creating user's ACLs (std has no ACL
+/// API).
+#[cfg(unix)]
+pub(crate) const FILE_MODE_PRIVATE: u32 = 0o600;
+#[cfg(unix)]
+pub(crate) const DIR_MODE_PRIVATE: u32 = 0o700;
+
+/// The dir-hardening context of a directory creation (spec 2026-09-05
+/// §5a): the uid every newly created component chowns to (`None` =
+/// leave server-user-owned, still `0700` — the private-state dirs and
+/// unmapped owners). Unix-only in effect; off-unix the value is inert
+/// (the creating user's platform ACLs isolate) but the type keeps the
+/// call sites uniform.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirOwnerUid(pub(crate) Option<u32>);
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirOwnerUid;
+
+impl DirOwnerUid {
+    /// The dir-hardening context: the uid every newly created component
+    /// chowns to (`None` = server-user-owned, still `0700` — the
+    /// private-state dirs and unmapped owners). Inert off-unix.
+    pub(crate) fn new(owner_uid: Option<u32>) -> Self {
+        #[cfg(unix)]
+        {
+            Self(owner_uid)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = owner_uid;
+            Self
+        }
+    }
+}
+
 /// Ensure `dir` exists — one probe instead of the per-component walk of
 /// `create_dir_all` (the fs-backed directory idiom: the dir exists in
 /// steady state — the write tmp dir, a PUT's parent chain, the
 /// tombstone staging dir). Returns whether it was created (the commit
 /// path's ancestor-chain sync decision, F03).
-pub(crate) async fn ensure_dir(dir: &Path) -> io::Result<bool> {
+///
+/// Unix hardening (spec 2026-09-05 §5a): every created component lands
+/// `0700` and — when `owner_uid` carries a mapped uid — chowned to it
+/// (an implicitly created bucket/prefix dir takes the bucket owner's
+/// uid; private-state dirs pass `None` and stay server-user-owned). A
+/// pre-existing component is never chmodded or chowned; a chown failure
+/// on a NEW dir is warned (the dir is `0700` either way — it holds no
+/// wrongly-owned readable content; object files fail closed instead).
+pub(crate) async fn ensure_dir(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<bool> {
     match fs::try_exists(dir).await {
         Ok(true) => Ok(false),
         Ok(false) => {
-            fs::create_dir_all(dir).await?;
+            #[cfg(unix)]
+            ensure_dir_unix(dir, owner_uid).await?;
+            #[cfg(not(unix))]
+            {
+                let _ = owner_uid;
+                fs::create_dir_all(dir).await?;
+            }
             Ok(true)
         }
         Err(err) => Err(err),
     }
+}
+
+/// The unix creation tail of [`ensure_dir`]: create each missing
+/// component (deepest ancestor first) at `0700`, then chown it to the
+/// mapped uid when one was passed.
+#[cfg(unix)]
+async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
+    use std::os::unix::fs::{PermissionsExt, chown};
+
+    // The missing chain, deepest ancestor first — the caller proved
+    // `dir` absent; every component up to the first existing ancestor
+    // lands private and chowned.
+    let mut missing: Vec<PathBuf> = vec![dir.to_path_buf()];
+    let mut current = dir;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() || fs::try_exists(parent).await? {
+            break;
+        }
+        missing.push(parent.to_path_buf());
+        current = parent;
+    }
+    for component in missing.iter().rev() {
+        match fs::create_dir(component).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                // A concurrent creator won the race — its dir counts as
+                // pre-existing: untouched.
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+        fs::set_permissions(component, std::fs::Permissions::from_mode(DIR_MODE_PRIVATE)).await?;
+        if let Some(uid) = owner_uid.0 {
+            let path = component.clone();
+            match spawn_blocking(move || chown(&path, Some(uid), None)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        path = %component.display(),
+                        error = %err,
+                        "directory chown failed; the dir stays server-user-owned (0700)"
+                    );
+                }
+                Err(join) => {
+                    tracing::warn!(
+                        path = %component.display(),
+                        error = %join,
+                        "directory chown task join failed"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Chown `path` to `uid` — the object-file hardening tail (spec
+/// 2026-09-05 §5a, unix): the sync syscall runs on the blocking pool
+/// (item 7a — never inline on a request thread). The caller fails
+/// closed on `Err` (a wrongly-owned `0600` file must not be left
+/// behind).
+#[cfg(unix)]
+pub(crate) async fn chown_file(path: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::chown;
+    let path = path.to_path_buf();
+    spawn_blocking(move || chown(&path, Some(uid), None))
+        .await
+        .map_err(|join| IoError::other(format!("chown task join failed: {join}")))?
 }
 
 /// The entries of `dir` (a missing directory is empty), as `(path, name)`

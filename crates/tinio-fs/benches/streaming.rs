@@ -64,7 +64,10 @@ fn streaming_read(c: &mut Criterion) {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
+            storage
+                .create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None))
+                .await
+                .unwrap();
             storage
                 .put_object(&b, &object::key("big.bin").unwrap(), chunk_stream())
                 .await
@@ -100,7 +103,11 @@ fn small_write(c: &mut Criterion) {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
             storage
-                .create_bucket(&bucket::name("data").unwrap())
+                .create_bucket(
+                    &bucket::name("data").unwrap(),
+                    None,
+                    &tinio_core::acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         });

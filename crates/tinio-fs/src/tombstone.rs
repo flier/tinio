@@ -39,8 +39,9 @@ pub(crate) async fn prepare(root: &Path) -> Result<PathBuf, Error> {
     let dir = dir(root);
     // The deleting dir exists in steady state — one probe instead of
     // the per-component walk (the create still runs on the first
-    // delete).
-    ensure_dir(&dir).await?;
+    // delete). Private residue, server-user-owned: the mode hardening
+    // only (spec 2026-09-05 §5a — no chown).
+    ensure_dir(&dir, crate::fsutil::DirOwnerUid::new(None)).await?;
     Ok(dir.join(Uuid::new_v4().to_string()))
 }
 

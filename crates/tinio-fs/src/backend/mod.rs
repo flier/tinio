@@ -13,6 +13,7 @@ mod multipart;
 mod objects;
 
 use std::{
+    collections::HashMap,
     fs::{Metadata, canonicalize},
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -32,6 +33,7 @@ pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
 use crate::{
     _core::{
         ETag,
+        acl,
         bucket::{Name, name},
         checksum, object, pipeline,
         storage::{
@@ -41,7 +43,7 @@ use crate::{
         },
         to_nanos,
     },
-    _store::{bucket, meta, object_part, upload},
+    _store::{bucket, decode_acl_wire, decode_owner_wire, meta, object_part, upload},
     _util::lockmap,
     bucket::Store as BucketStore,
     database::{self, Handle, compact_if_needed},
@@ -92,6 +94,7 @@ use crate::{
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     owner_uids: std::collections::HashMap::new(),
 ///     io_pipeline: Arc::new(InlineRunner::default()),
 ///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
@@ -132,6 +135,16 @@ pub struct FsOptions {
     /// (≈ 56 B + key length per entry) reaches this (pipeline-spec.md Q5).
     #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
     pub meta_batch_bytes: u32,
+    /// The config-supplied `OwnerId → uid` map (unix ownership
+    /// hardening, spec 2026-09-05 §5a): an object file lands chowned to
+    /// its owner's mapped uid, and bucket/prefix dirs to the bucket
+    /// owner's. An owner without an entry stays server-user-owned
+    /// (still `0600`/`0700`). Plain injected data — tinio-fs takes no
+    /// tinio-config/tinio-auth dependency; the config layer builds the
+    /// map (Task 14). Inert on Windows (the creating user's ACLs
+    /// isolate).
+    #[garde(skip)]
+    pub owner_uids: HashMap<acl::OwnerId, u32>,
     /// The IO pipeline (pipeline-spec.md §3.1): the cold list/scanner
     /// paths enqueue `etag::ComputeTask` instances here. Mandatory
     /// (P4) — the pipeline (or `InlineRunner` in offline contexts) is a
@@ -186,6 +199,7 @@ pub struct FsOptions {
 ///         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///         meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///         owner_uids: std::collections::HashMap::new(),
 ///         io_pipeline: Arc::new(InlineRunner::default()),
 ///         remove_pipeline: Arc::new(InlineRunner::default()),
 ///         db_pipeline: Arc::new(InlineRunner::default()),
@@ -194,7 +208,10 @@ pub struct FsOptions {
 /// .unwrap();
 /// let b = bucket::name("data").unwrap();
 /// Runtime::new().unwrap().block_on(async {
-///     storage.create_bucket(&b).await.unwrap();
+///     storage
+///         .create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None))
+///         .await
+///         .unwrap();
 ///     storage
 ///         .put_object(&b, &"hello.txt".into(), body(b"hi"))
 ///         .await
@@ -237,6 +254,13 @@ pub struct FsStorage {
     /// The tree-walk listing (shared with the scanner).
     #[getset(get = "pub(crate)")]
     listing: FsListing,
+    /// The config-supplied `OwnerId → uid` map (unix ownership
+    /// hardening, spec 2026-09-05 §5a): object files land chowned to
+    /// their owner's mapped uid, bucket/prefix dirs to the bucket
+    /// owner's — an unmapped owner stays server-user-owned (still
+    /// `0600`/`0700`). Inert on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    owner_uids: HashMap<acl::OwnerId, u32>,
     /// The removal pipeline (D-A): `delete_bucket` enqueues the tombstone
     /// `remove_dir_all` here — the tree walk is physically isolated from
     /// ETag compute on the IO pipeline.
@@ -368,6 +392,7 @@ impl FsStorage {
             compact_threshold_percent,
             meta_batch_size,
             meta_batch_bytes,
+            owner_uids,
             io_pipeline,
             remove_pipeline,
             db_pipeline,
@@ -386,6 +411,7 @@ impl FsStorage {
                 meta_batch_size,
                 meta_batch_bytes,
             ),
+            owner_uids,
             remove_pipeline,
             bucket_store: BucketStore::from_handle(handle.clone()),
             meta_store: MetaStore::from_handle(handle.clone()),
@@ -410,6 +436,32 @@ impl FsStorage {
     /// `TooManyMultipartUploads` (mapped to S3 `SlowDown`).
     pub fn set_max_concurrent_uploads(&mut self, max: u32) {
         self.multipart_store.set_max_concurrent_uploads(max);
+    }
+
+    /// The mapped uid of an owner element (unix ownership hardening):
+    /// the chown target of a landed object. `None` when the owner is
+    /// absent or has no configured uid — the file stays
+    /// server-user-owned (still `0600`).
+    #[cfg(unix)]
+    fn owner_uid(&self, owner: Option<&acl::OwnerId>) -> Option<u32> {
+        owner.and_then(|o| self.owner_uids.get(o)).copied()
+    }
+
+    /// The mapped uid of the bucket's recorded owner (unix ownership
+    /// hardening): the chown target of an implicitly created bucket/
+    /// prefix directory (a non-bucket-owner's PUT creating prefix dirs
+    /// must not leave server-user-owned dirs). `None` when the bucket
+    /// row has no owner or the owner has no configured uid — the dir
+    /// stays server-user-owned (still `0700`).
+    #[cfg(unix)]
+    pub(crate) async fn bucket_owner_uid(&self, name: &Name) -> Option<u32> {
+        self.bucket_store
+            .owner(name)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|o| self.owner_uids.get(&o))
+            .copied()
     }
 
     /// The bucket directory `<root>/<bucket>`.
@@ -615,20 +667,22 @@ impl FsStorage {
     /// The post-rename state of a completed multipart upload: delete its
     /// `UPLOADS` + `PARTS` records, persist the object's `OBJECT_META`
     /// entry (with the completion's `tags` and the interface-computed
-    /// composite `checksum` — the backends never hash, spec 2026-08-31),
-    /// and persist the assembled parts into `OBJECT_PARTS` — the
-    /// completed object's retained part list (`object_part::Stored`);
+    /// composite `checksum` — the backends never hash, spec 2026-08-31 —
+    /// and the upload's create-time owner/ACL, read from the upload row
+    /// this transaction consumes, the tags precedent — never re-ferried
+    /// through the interface), and persist the assembled parts into
+    /// `OBJECT_PARTS` — the completed object's retained part list, each
+    /// row `(part number, size, algorithm wire, base64 checksum value)`;
     /// `parts` is `Store::complete`'s assembled rows (in part-number
     /// order), and any stale rows of the key are replaced (an
     /// overwriting completion leaves only its own parts). ONE write
-    /// transaction
-    /// (meta-redb-spec §5.3 — rename, then a single all-or-nothing state
-    /// transaction). Idempotent: on a retry after a crash before this
-    /// call the records are still there and get deleted; a concurrent
-    /// abort that already removed them is a no-op. Errors propagate —
-    /// the transaction rolls back as a unit, so a failed call leaves the
-    /// upload records intact and a client retry re-runs the whole
-    /// completion safely.
+    /// transaction (meta-redb-spec §5.3 — rename, then a single
+    /// all-or-nothing state transaction). Idempotent: on a retry after a
+    /// crash before this call the records are still there and get
+    /// deleted; a concurrent abort that already removed them is a
+    /// no-op. Errors propagate — the transaction rolls back as a unit,
+    /// so a failed call leaves the upload records intact and a client
+    /// retry re-runs the whole completion safely.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_object_state(
         &self,
@@ -640,7 +694,7 @@ impl FsStorage {
         metadata: &Metadata,
         checksum: Option<checksum::Recorded>,
         parts: Vec<CompletedPartRow>,
-    ) -> Result<object::Tags, Error> {
+    ) -> Result<(object::Tags, Option<acl::OwnerId>, acl::Acl), Error> {
         let size = metadata.len();
         let mtime = metadata.modified()?;
         let identity = fsutil::file_identity(path, metadata);
@@ -652,15 +706,28 @@ impl FsStorage {
         let parts = parts.clone();
         self.handle
             .write(move |txn| {
-                // The create-time tags ride in the upload row this
-                // transaction consumes (spec 2026-08-31) — read before
-                // the drain, never re-ferried through the interface. A
-                // garbage wire self-heals to the empty set.
-                let tags = {
+                // The create-time tags, owner and ACL ride in the upload
+                // row this transaction consumes (spec 2026-08-31;
+                // owner/ACL spec 2026-09-05) — read before the drain,
+                // never re-ferried through the interface. A garbage wire
+                // self-heals to the empty set / `None` / the private
+                // default.
+                let (tags, owner, acl) = {
                     let uploads = upload::Table::open(txn)?;
-                    uploads
-                        .tags(&bucket, &key, &upload_id)?
-                        .unwrap_or_else(object::Tags::empty)
+                    let (tags_wire, owner_wire, acl_wire) = uploads
+                        .get_matching(&bucket, &key, &upload_id)?
+                        .map_or_else(
+                            || (String::new(), String::new(), String::new()),
+                            |(_, _, tags_wire, owner_wire, acl_wire)| {
+                                (tags_wire, owner_wire, acl_wire)
+                            },
+                        );
+                    (
+                        object::Tags::parse_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
+                            .unwrap_or_default(),
+                        decode_owner_wire(&owner_wire),
+                        decode_acl_wire(&acl_wire),
+                    )
                 };
                 drain_upload(txn, &bucket, &upload_id)?;
                 {
@@ -675,6 +742,8 @@ impl FsStorage {
                             file_identity: identity,
                             tags: tags.clone(),
                             checksum: checksum.clone(),
+                            owner: owner.clone(),
+                            acl: acl.clone(),
                         },
                     )?;
                 }
@@ -688,7 +757,7 @@ impl FsStorage {
                         parts_table.put(&bucket, &key, &part)?;
                     }
                 }
-                Ok(tags)
+                Ok((tags, owner, acl))
             })
             .await
             .map_err(Into::into)

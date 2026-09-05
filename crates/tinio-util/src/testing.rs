@@ -50,7 +50,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
-    ListPartsParams, ListUploadsParams, MultipartOps, Storage, bucket,
+    ListPartsParams, ListUploadsParams, MultipartOps, Storage, acl, bucket,
     checksum::{self, Algorithm, Type},
     cors, multipart, object, storage,
     storage::Error::*,
@@ -130,7 +130,7 @@ where
     S: Storage + MultipartOps,
 {
     let upload = storage
-        .create_multipart_upload(b, key, None, object::Tags::empty())
+        .create_multipart_upload(b, key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let part = storage
@@ -153,7 +153,7 @@ where
 }
 
 async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
-    storage.create_bucket(b).await.unwrap();
+    storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap();
 
     // CopyObject: the destination holds the source's bytes, and its ETag
     // is the content MD5 (a full copy of a single-form source may reuse
@@ -166,7 +166,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let put = storage
-        .copy_object(b, &src, b, &dst, object::Tags::empty(), None)
+        .copy_object(b, &src, b, &dst, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
         .await
         .unwrap();
     check(
@@ -184,7 +184,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     let missing = object::key("ghost.bin").unwrap();
     let err = into_core_error(
         storage
-            .copy_object(b, &missing, b, &dst, object::Tags::empty(), None)
+            .copy_object(b, &missing, b, &dst, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
             .await
             .unwrap_err(),
     );
@@ -217,12 +217,12 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     storage
-        .commit_object(b, &tagged_src, staged, src_tags)
+        .commit_object(b, &tagged_src, staged, src_tags, None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let bare_dst = object::key("copy-bare-dst.bin").unwrap();
     let bare = storage
-        .copy_object(b, &tagged_src, b, &bare_dst, object::Tags::empty(), None)
+        .copy_object(b, &tagged_src, b, &bare_dst, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
         .await
         .unwrap();
     check(
@@ -242,6 +242,8 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &carried_dst,
             copy_tags.clone(),
+            None,
+            &acl::Acl::default_private(None),
             Some(src_checksum.clone()),
         )
         .await
@@ -265,7 +267,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     // destination is a directory, never an object).
     let marker = object::key("copied-dir/").unwrap();
     storage
-        .copy_object(b, &src, b, &marker, object::Tags::empty(), None)
+        .copy_object(b, &src, b, &marker, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
         .await
         .unwrap();
     let err = into_core_error(storage.get_object(b, &marker, None).await.unwrap_err());
@@ -278,7 +280,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     // UploadPartCopy: the part holds the source's bytes (optionally a
     // byte range); the part ETag is the content MD5 of the part bytes.
     let upload = storage
-        .create_multipart_upload(b, &src, None, object::Tags::empty())
+        .create_multipart_upload(b, &src, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let part = storage
@@ -353,7 +355,7 @@ fn page(prefix: &str, start_after: Option<String>, max_buckets: usize) -> ListBu
 async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // Start empty.
     let buckets = storage
-        .list_buckets(page("", None, usize::MAX))
+        .list_buckets(page("", None, usize::MAX), None)
         .await
         .unwrap();
     check(
@@ -362,9 +364,9 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     );
 
     // Create.
-    storage.create_bucket(b).await.unwrap();
+    storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap();
     let buckets = storage
-        .list_buckets(page("", None, usize::MAX))
+        .list_buckets(page("", None, usize::MAX), None)
         .await
         .unwrap();
     check(
@@ -378,10 +380,10 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // the union of pages equals the full listing, in name order.
     let extra1 = bucket::name(unique_bucket("conform")).unwrap();
     let extra2 = bucket::name(unique_bucket("conform")).unwrap();
-    storage.create_bucket(&extra1).await.unwrap();
-    storage.create_bucket(&extra2).await.unwrap();
+    storage.create_bucket(&extra1, None, &acl::Acl::default_private(None)).await.unwrap();
+    storage.create_bucket(&extra2, None, &acl::Acl::default_private(None)).await.unwrap();
     let full = storage
-        .list_buckets(page("", None, usize::MAX))
+        .list_buckets(page("", None, usize::MAX), None)
         .await
         .unwrap();
     check(
@@ -392,7 +394,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     let mut start_after = None;
     loop {
         let page = storage
-            .list_buckets(page("", start_after.clone(), 2))
+            .list_buckets(page("", start_after.clone(), 2), None)
             .await
             .unwrap();
         check(
@@ -427,7 +429,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // page; the contract-level `max_buckets = 0` asks for an empty,
     // untruncated page.
     let exact = storage
-        .list_buckets(page("", None, full.buckets.len()))
+        .list_buckets(page("", None, full.buckets.len()), None)
         .await
         .unwrap();
     check(
@@ -443,7 +445,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
         .name
         .to_string();
     let exhausted = storage
-        .list_buckets(page("", Some(last), 1000))
+        .list_buckets(page("", Some(last), 1000), None)
         .await
         .unwrap();
     check(
@@ -452,7 +454,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
             && exhausted.next_start_after.is_none(),
         "a marker past the end must yield an empty, untruncated page",
     );
-    let empty = storage.list_buckets(page("", None, 0)).await.unwrap();
+    let empty = storage.list_buckets(page("", None, 0), None).await.unwrap();
     check(
         empty.buckets.is_empty() && !empty.truncated && empty.next_start_after.is_none(),
         "max_buckets = 0 must yield an empty, untruncated page",
@@ -460,7 +462,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // Prefix filtering: the fixture bucket's full name matches exactly
     // that bucket (the counter in `unique_bucket` differs for the rest).
     let prefixed = storage
-        .list_buckets(page(b.as_ref(), None, 1000))
+        .list_buckets(page(b.as_ref(), None, 1000), None)
         .await
         .unwrap();
     check(
@@ -481,15 +483,18 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // from creation order.
     let p1 = bucket::name(unique_bucket("pg")).unwrap();
     let p2 = bucket::name(unique_bucket("pg")).unwrap();
-    storage.create_bucket(&p1).await.unwrap();
-    storage.create_bucket(&p2).await.unwrap();
-    let prefixed = storage.list_buckets(page("pg", None, 1000)).await.unwrap();
+    storage.create_bucket(&p1, None, &acl::Acl::default_private(None)).await.unwrap();
+    storage.create_bucket(&p2, None, &acl::Acl::default_private(None)).await.unwrap();
+    let prefixed = storage.list_buckets(page("pg", None, 1000), None).await.unwrap();
     check(
         prefixed.buckets.len() == 2,
         "the pg pair must be the only prefix matches",
     );
     let resumed = storage
-        .list_buckets(page("pg", Some(prefixed.buckets[0].name.to_string()), 1000))
+        .list_buckets(
+            page("pg", Some(prefixed.buckets[0].name.to_string()), 1000),
+            None,
+        )
         .await
         .unwrap();
     check(
@@ -507,7 +512,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     check(head.name == *b, "head_bucket returns the bucket name");
 
     // Duplicate create.
-    let err = into_core_error(storage.create_bucket(b).await.unwrap_err());
+    let err = into_core_error(storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap_err());
     check(
         matches!(err, AlreadyExists(_)),
         "duplicate create must be AlreadyExists",
@@ -649,7 +654,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
 }
 
 async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
-    storage.create_bucket(b).await.unwrap();
+    storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap();
 
     // Zero-byte round-trip.
     let empty = object::key("empty").unwrap();
@@ -703,7 +708,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let put = storage
-        .commit_object(b, &hello, staged, object::Tags::empty())
+        .commit_object(b, &hello, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(
@@ -776,7 +781,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let committed = storage
-        .commit_object(b, &tagged, staged, write_tags.clone())
+        .commit_object(b, &tagged, staged, write_tags.clone(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(
@@ -816,7 +821,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let committed = storage
-        .commit_object(b, &recorded, staged, object::Tags::empty())
+        .commit_object(b, &recorded, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(
@@ -838,7 +843,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let committed = storage
-        .commit_object(b, &recorded, staged, object::Tags::empty())
+        .commit_object(b, &recorded, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(
@@ -882,7 +887,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let committed = storage
-        .commit_object(b, &mv_src, staged, mv_tags.clone())
+        .commit_object(b, &mv_src, staged, mv_tags.clone(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let renamed = storage.rename_object(b, &mv_src, &mv_dst).await.unwrap();
@@ -1038,7 +1043,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
 }
 
 async fn conformance_listing<S: Storage>(storage: &S, b: &bucket::Name) {
-    storage.create_bucket(b).await.unwrap();
+    storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap();
     for key in ["a.txt", "b.txt", "dir/c.txt", "dir/sub/d.txt", "dir/e.txt"] {
         storage
             .put_object(b, &object::key(key).unwrap(), body(format!("{key}!")))
@@ -1144,14 +1149,14 @@ fn list_params(
 }
 
 async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
-    storage.create_bucket(b).await.unwrap();
+    storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap();
 
     // Reserved keys are refused at multipart creation too (FR-020) — the
     // multipart path must not be a backdoor for materializing `.tinio`.
     let reserved = object::key("a/.tinio/b").unwrap();
     let err = into_core_error(
         storage
-            .create_multipart_upload(b, &reserved, None, object::Tags::empty())
+            .create_multipart_upload(b, &reserved, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap_err(),
     );
@@ -1163,7 +1168,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Full lifecycle: create → upload 3 parts → list → complete.
     let big = object::key("big.bin").unwrap();
     let upload = storage
-        .create_multipart_upload(b, &big, None, object::Tags::empty())
+        .create_multipart_upload(b, &big, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(!upload.upload_id.is_empty(), "upload id must be non-empty");
@@ -1254,7 +1259,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // backends' own suites keep only their mechanism-specific angles.
     let min_key = object::key("min.bin").unwrap();
     let failing = storage
-        .create_multipart_upload(b, &min_key, None, object::Tags::empty())
+        .create_multipart_upload(b, &min_key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let under = storage
@@ -1319,7 +1324,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // minimum: a single small part still completes.
     let single_key = object::key("single.bin").unwrap();
     let single_upload = storage
-        .create_multipart_upload(b, &single_key, None, object::Tags::empty())
+        .create_multipart_upload(b, &single_key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let only = storage
@@ -1363,7 +1368,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Complete with no parts is an error.
     let empty_mp = object::key("empty-mp.bin").unwrap();
     let u = storage
-        .create_multipart_upload(b, &empty_mp, None, object::Tags::empty())
+        .create_multipart_upload(b, &empty_mp, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let err = into_core_error(
@@ -1384,7 +1389,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // A bucket with in-progress uploads is not empty.
     let busy = object::key("busy.bin").unwrap();
     let busy_upload = storage
-        .create_multipart_upload(b, &busy, None, object::Tags::empty())
+        .create_multipart_upload(b, &busy, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let err = into_core_error(storage.delete_bucket(b).await.unwrap_err());
@@ -1400,7 +1405,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // Abort removes parts and leaves no object.
     let abort_bin = object::key("abort.bin").unwrap();
     let upload2 = storage
-        .create_multipart_upload(b, &abort_bin, None, object::Tags::empty())
+        .create_multipart_upload(b, &abort_bin, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     storage
@@ -1427,7 +1432,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // List uploads.
     let pending = object::key("pending.bin").unwrap();
     let upload3 = storage
-        .create_multipart_upload(b, &pending, None, object::Tags::empty())
+        .create_multipart_upload(b, &pending, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let listing = storage
@@ -1461,7 +1466,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         r#type: Some(Type::FullObject),
     };
     let cs_upload = storage
-        .create_multipart_upload(b, &cs_big, Some(cs_spec.clone()), object::Tags::empty())
+        .create_multipart_upload(b, &cs_big, Some(cs_spec.clone()), object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(
@@ -1623,7 +1628,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     ])
     .unwrap();
     let upload = storage
-        .create_multipart_upload(b, &attrs, None, create_tags.clone())
+        .create_multipart_upload(b, &attrs, None, create_tags.clone(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(
@@ -1726,7 +1731,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // commit and delete leave none behind.
     let overwrite = object::key("overwrite.bin").unwrap();
     let upload = storage
-        .create_multipart_upload(b, &overwrite, None, object::Tags::empty())
+        .create_multipart_upload(b, &overwrite, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let part = storage
@@ -1759,7 +1764,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         "a completion must retain its own parts",
     );
     storage
-        .copy_object(b, &attrs, b, &overwrite, object::Tags::empty(), None)
+        .copy_object(b, &attrs, b, &overwrite, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
         .await
         .unwrap();
     let rows = storage.list_object_parts(b, &overwrite).await.unwrap();
@@ -1797,7 +1802,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // accumulation) and its metadata (the completion's own tags and
     // checksum, not the moved ones).
     let upload = storage
-        .create_multipart_upload(b, &moved, None, object::Tags::empty())
+        .create_multipart_upload(b, &moved, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     let part = storage
@@ -1836,7 +1841,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let committed = storage
-        .commit_object(b, &moved, staged, commit_tags.clone())
+        .commit_object(b, &moved, staged, commit_tags.clone(), None, &acl::Acl::default_private(None))
         .await
         .unwrap();
     check(

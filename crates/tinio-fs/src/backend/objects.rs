@@ -31,7 +31,7 @@ use tokio::{
 use super::{Error, FsStorage};
 use crate::{
     _core::{
-        BodyStream, ETag, bucket, checksum,
+        BodyStream, ETag, acl, bucket, checksum,
         multipart::ObjectPart,
         object::{self, Info, Tags},
         storage::{
@@ -370,7 +370,8 @@ impl FsStorage {
     /// source's single-form ETag is reused for a full copy when the file
     /// is provably unchanged (AWS semantics — the content MD5 of a full
     /// copy is the source's), and the shared commit publishes the
-    /// destination under the mutation lock with the caller's tags and
+    /// destination under the mutation lock with the caller's tags, owner
+    /// and ACL (a copy is a fresh object — never the source's) and
     /// recorded checksum.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
@@ -381,6 +382,8 @@ impl FsStorage {
         dst_bucket: &bucket::Name,
         dst_key: &object::Key,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<Info, Error> {
         // Folder-marker destination: the sentinel commit (mirrors
@@ -396,6 +399,8 @@ impl FsStorage {
                         checksum: None,
                     },
                     tags,
+                    owner,
+                    acl,
                     checksum,
                 )
                 .await;
@@ -452,6 +457,8 @@ impl FsStorage {
                 checksum: None,
             },
             tags,
+            owner,
+            acl,
             checksum,
         )
         .await
@@ -461,19 +468,24 @@ impl FsStorage {
     /// and the copy primitives): atomically publish a staged body onto
     /// `key` under the mutation lock (the same re-checks and guards as a
     /// plain commit), then write the object's `OBJECT_META` entry — the
-    /// interface-validated `tags` and the recorded `checksum` (the
-    /// FULL_OBJECT tee digest of a plain commit, or the copy's carried
-    /// value — kind included) ride in the same row — and remove any
-    /// stale `OBJECT_PARTS` rows of the key in ONE write transaction (a
-    /// fresh object is single-part: overwriting a previously
-    /// multipart-completed object must not leave its parts behind).
-    /// Returns the committed object metadata.
+    /// interface-validated `tags`, the caller's `owner`/`acl` (the owner
+    /// rides its own row element; the stored ACL holds the grant set
+    /// only — `Stored.acl.owner` stays `None` by construction) and the
+    /// recorded `checksum` (the FULL_OBJECT tee digest of a plain
+    /// commit, or the copy's carried value — kind included) ride in the
+    /// same row — and remove any stale `OBJECT_PARTS` rows of the key in
+    /// ONE write transaction (a fresh object is single-part:
+    /// overwriting a previously multipart-completed object must not
+    /// leave its parts behind). Returns the committed object metadata.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_staged(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         staged: StagedBody,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<Info, Error> {
         // The single resolve runs under the mutation lock (P5): the
@@ -487,13 +499,25 @@ impl FsStorage {
         // the directory, idempotently. Under the mutation lock with the
         // same guards as a real object — a concurrent delete_bucket must
         // not be resurrected, and the symlink policy applies to markers
-        // too. Markers hold no row: the tags/checksum params are
-        // accept-and-dropped here.
+        // too. Markers hold no row: the tags/owner/acl/checksum params
+        // are accept-and-dropped here.
         if key.is_folder_marker() {
             let _guard = self.lock_bucket_mutations(bucket).await;
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
-            fs::create_dir_all(&target).await?;
+            // The unix dir hardening (spec 2026-09-05 §5a): the marker
+            // dir is bucket content — `0700`, chowned to the bucket
+            // owner's mapped uid.
+            #[cfg(unix)]
+            let dir_owner_uid = self.bucket_owner_uid(bucket).await;
+            fsutil::ensure_dir(
+                &target,
+                #[cfg(unix)]
+                fsutil::DirOwnerUid(dir_owner_uid),
+                #[cfg(not(unix))]
+                fsutil::DirOwnerUid,
+            )
+            .await?;
             let mtime = fs::metadata(&target).await?.modified()?;
             return Ok(Info {
                 key: key.clone(),
@@ -502,6 +526,8 @@ impl FsStorage {
                 etag,
                 tags: Tags::empty(),
                 checksum: None,
+                owner: None,
+                acl: acl::Acl::default_private(None),
             });
         }
         // A real object always arrives with a staged temp (the marker
@@ -518,10 +544,41 @@ impl FsStorage {
             let _guard = self.lock_bucket_mutations(bucket).await;
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
+            // The unix dir hardening (spec 2026-09-05 §5a): a prefix
+            // dir implicitly created by a non-bucket-owner's PUT lands
+            // `0700` and chowned to the bucket owner's mapped uid (the
+            // lookup runs once per commit).
+            #[cfg(unix)]
+            let dir_owner_uid = self.bucket_owner_uid(bucket).await;
             // F03: the bucket root bounds the first-into-a-new-prefix
             // ancestor sync.
-            AtomicWriter::commit(&temp, &target, Some(&bucket_dir)).await?;
+            AtomicWriter::commit(
+                &temp,
+                &target,
+                Some(&bucket_dir),
+                #[cfg(unix)]
+                fsutil::DirOwnerUid(dir_owner_uid),
+                #[cfg(not(unix))]
+                fsutil::DirOwnerUid,
+            )
+            .await?;
             let metadata = fs::metadata(&target).await?;
+            // The unix ownership hardening (spec 2026-09-05 §5a): the
+            // landed object chowns to the NEW owner's mapped uid (an
+            // overwrite replaces the owner; a copy's owner is the
+            // caller's). A chown failure fails closed — the rename
+            // already landed, so a wrongly-owned 0600 file must not be
+            // left behind: remove it and error the request (the row was
+            // not written yet; the upload-side temp was consumed by the
+            // rename). An unmapped owner stays server-user-owned, still
+            // `0600`.
+            #[cfg(unix)]
+            if let Some(uid) = self.owner_uid(owner) {
+                if let Err(err) = fsutil::chown_file(&target, uid).await {
+                    let _ = fs::remove_file(&target).await;
+                    return Err(err.into());
+                }
+            }
             // The object is committed — a meta-write failure (full
             // state dir) must not fail the PUT: the entry is recomputed
             // from the content on the next read (self-healing, FR-022).
@@ -537,6 +594,8 @@ impl FsStorage {
                 identity,
                 &tags,
                 checksum.as_ref(),
+                owner,
+                acl,
             )
             .await;
             Ok::<_, Error>((metadata.len(), mtime))
@@ -553,14 +612,21 @@ impl FsStorage {
             etag,
             tags,
             checksum,
+            owner: owner.cloned(),
+            acl: acl::Acl {
+                owner: None,
+                grants: acl.grants.clone(),
+            },
         })
     }
 
     /// The committed object's row write: the `OBJECT_META` entry (tags +
-    /// checksum elements) and the removal of any stale `OBJECT_PARTS`
-    /// rows of the key in ONE write transaction. Best-effort — a failed
-    /// meta write must not fail the PUT (the entry self-heals on the
-    /// next read, FR-022); the failure is warned.
+    /// checksum + owner + ACL elements — the stored ACL holds the grant
+    /// set only, the owner rides its own element) and the removal of any
+    /// stale `OBJECT_PARTS` rows of the key in ONE write transaction.
+    /// Best-effort — a failed meta write must not fail the PUT (the
+    /// entry self-heals on the next read, FR-022); the failure is
+    /// warned.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed(
         &self,
@@ -572,12 +638,19 @@ impl FsStorage {
         identity: u64,
         tags: &object::Tags,
         checksum: Option<&checksum::Recorded>,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) {
         let bucket = bucket.clone();
         let key = key.clone();
         let etag = etag.clone();
         let tags = tags.clone();
         let checksum = checksum.cloned();
+        let owner = owner.cloned();
+        let acl = acl::Acl {
+            owner: None,
+            grants: acl.grants.clone(),
+        };
         if let Err(err) = self
             .handle
             .write(move |txn| {
@@ -591,6 +664,8 @@ impl FsStorage {
                         file_identity: identity,
                         tags: tags.clone(),
                         checksum: checksum.clone(),
+                        owner: owner.clone(),
+                        acl: acl.clone(),
                     },
                 )?;
                 object_part::Table::open(txn)?.remove_key(&bucket, &key)?;
@@ -655,6 +730,8 @@ impl ObjectOps for FsStorage {
         key: &object::Key,
         staged: StagedBody,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<Info, Error> {
         // The stage's tee digest records as the object's FULL_OBJECT
         // checksum (the kind is fixed by the write path — a plain PUT's
@@ -663,10 +740,11 @@ impl ObjectOps for FsStorage {
             part,
             kind: checksum::Type::FullObject,
         });
-        self.commit_staged(bucket, key, staged, tags, checksum)
+        self.commit_staged(bucket, key, staged, tags, owner, acl, checksum)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn copy_object(
         &self,
         src_bucket: &bucket::Name,
@@ -674,23 +752,36 @@ impl ObjectOps for FsStorage {
         dst_bucket: &bucket::Name,
         dst_key: &object::Key,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<Info, Error> {
         #[cfg(unix)]
         {
-            self.copy_object_fast(src_bucket, src_key, dst_bucket, dst_key, tags, checksum)
-                .await
+            self.copy_object_fast(
+                src_bucket,
+                src_key,
+                dst_bucket,
+                dst_key,
+                tags,
+                owner,
+                acl,
+                checksum,
+            )
+            .await
         }
         #[cfg(not(unix))]
         {
             // No kernel copy primitive on Windows — stream the source
             // through the body contract (get → stage → commit). The
             // commit tail is the shared `commit_staged` so the copy's
-            // `checksum` (kind included) is recorded and the destination
-            // never inherits the source's retained parts.
+            // owner/ACL (the caller's — a copy never inherits the
+            // source's) and `checksum` (kind included) are recorded and
+            // the destination never inherits the source's retained
+            // parts.
             let get = self.get_object(src_bucket, src_key, None).await?;
             let staged = self.stage_body(dst_bucket, dst_key, get.body, None).await?;
-            self.commit_staged(dst_bucket, dst_key, staged, tags, checksum)
+            self.commit_staged(dst_bucket, dst_key, staged, tags, owner, acl, checksum)
                 .await
         }
     }
@@ -722,6 +813,8 @@ impl ObjectOps for FsStorage {
                 etag: row.etag,
                 tags: row.tags,
                 checksum: row.checksum,
+                owner: row.owner,
+                acl: row.acl,
             },
             body,
             served_range,
@@ -739,6 +832,8 @@ impl ObjectOps for FsStorage {
             etag: row.etag,
             tags: row.tags,
             checksum: row.checksum,
+            owner: row.owner,
+            acl: row.acl,
         })
     }
 
@@ -794,9 +889,24 @@ impl ObjectOps for FsStorage {
             .await?;
         // The file move: same-volume (one bucket), atomic, overwriting an
         // existing destination. New ancestor directories are synced like
-        // the first commit into a new prefix (F03).
+        // the first commit into a new prefix (F03); the unix dir
+        // hardening (spec 2026-09-05 §5a) applies like a PUT's — the
+        // created prefix dirs take the bucket owner's mapped uid.
+        // Ownership of the OBJECT itself is preserved naturally (the
+        // inode moves — no chown, a rename is not a fresh object).
+        #[cfg(unix)]
+        let dir_owner_uid = self.bucket_owner_uid(bucket).await;
         let created_parent = match dst_path.parent() {
-            Some(parent) => fsutil::ensure_dir(parent).await?,
+            Some(parent) => {
+                fsutil::ensure_dir(
+                    parent,
+                    #[cfg(unix)]
+                    fsutil::DirOwnerUid(dir_owner_uid),
+                    #[cfg(not(unix))]
+                    fsutil::DirOwnerUid,
+                )
+                .await?
+            }
             None => false,
         };
         match fs::rename(&src_path, &dst_path).await {
@@ -814,13 +924,20 @@ impl ObjectOps for FsStorage {
             }
         }
         // The state move in ONE transaction: the src `OBJECT_META` row →
-        // dst (metadata — mtime, tags, checksum — moves with the record,
-        // a rename is not a fresh object), the src `OBJECT_PARTS` rows →
-        // dst, and the dst's own stale parts rows removed (an overwritten
-        // destination's part list dies). A missing src row (a concurrent
-        // delete_object removed it between the ensure and here) leaves
-        // the dst file to self-heal — nothing to migrate.
-        let migrated: Option<(ETag, Tags, Option<checksum::Recorded>)> = {
+        // dst (metadata — mtime, tags, checksum, owner, ACL — moves with
+        // the record, a rename is not a fresh object), the src
+        // `OBJECT_PARTS` rows → dst, and the dst's own stale parts rows
+        // removed (an overwritten destination's part list dies). A
+        // missing src row (a concurrent delete_object removed it between
+        // the ensure and here) leaves the dst file to self-heal —
+        // nothing to migrate.
+        let migrated: Option<(
+            ETag,
+            Tags,
+            Option<checksum::Recorded>,
+            Option<acl::OwnerId>,
+            acl::Acl,
+        )> = {
             let bucket = bucket.clone();
             let src = src.clone();
             let dst = dst.clone();
@@ -828,9 +945,11 @@ impl ObjectOps for FsStorage {
                 .write(move |txn| {
                     // The meta-row half: read the src row, remove it, and
                     // re-insert it under dst (metadata — mtime, tags,
-                    // checksum — moves with the record). One handle per
-                    // table per transaction (redb refuses a second open of
-                    // one table in a transaction) — the two halves run in
+                    // checksum, owner, ACL — moves with the record; the
+                    // whole 8-element row copies, nothing is
+                    // destructured away). One handle per table per
+                    // transaction (redb refuses a second open of one
+                    // table in a transaction) — the two halves run in
                     // separate scopes.
                     let row = {
                         let mut meta = meta::Table::open(txn)?;
@@ -855,17 +974,17 @@ impl ObjectOps for FsStorage {
                     for row in rows {
                         parts.put(&bucket, &dst, &row)?;
                     }
-                    Ok(Some((row.etag, row.tags, row.checksum)))
+                    Ok(Some((row.etag, row.tags, row.checksum, row.owner, row.acl)))
                 })
                 .await
                 .map_err(Error::from)?
         };
-        let (etag, tags, checksum) = match migrated {
-            Some((etag, tags, checksum)) => (etag, tags, checksum),
+        let (etag, tags, checksum, owner, acl) = match migrated {
+            Some((etag, tags, checksum, owner, acl)) => (etag, tags, checksum, owner, acl),
             // No row to migrate (a concurrent delete): the ensured etag
             // describes the moved file; the row self-heals on the next
             // read.
-            None => (ensured.etag, ensured.tags, ensured.checksum),
+            None => (ensured.etag, ensured.tags, ensured.checksum, ensured.owner, ensured.acl),
         };
         Ok(Info {
             key: dst.clone(),
@@ -874,6 +993,8 @@ impl ObjectOps for FsStorage {
             etag,
             tags,
             checksum,
+            owner,
+            acl,
         })
     }
 
@@ -999,6 +1120,35 @@ impl ObjectOps for FsStorage {
         self.meta_store.clear_tags(bucket, key).await
     }
 
+    async fn get_object_acl(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<acl::Acl, Error> {
+        // Existence is the object file (folder markers, reserved keys,
+        // and missing files answer `NoSuchKey` — mirroring
+        // get_object_tags); the ACL comes from the stored row, the
+        // private default with no owner when the file has no row yet (a
+        // hand-dropped object has never had an ACL written).
+        self.ensure_object_file(bucket, key).await?;
+        self.meta_store.acl(bucket, key).await
+    }
+
+    async fn put_object_acl(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        grants: &acl::AclGrants,
+    ) -> Result<(), Error> {
+        // Existence is the object file (`NoSuchKey` when missing —
+        // mirroring put_object_tags). The row update preserves the
+        // row's other elements — the owner element included, a put
+        // never changes it.
+        self.ensure_object_file(bucket, key).await?;
+        self.meta_store.set_acl(bucket, key, grants).await?;
+        Ok(())
+    }
+
     async fn list_object_parts(
         &self,
         bucket: &bucket::Name,
@@ -1055,7 +1205,7 @@ mod tests {
     use crate::_core::storage::MultipartOps;
     use crate::{
         _core::{
-            object,
+            acl, object,
             storage::{BucketOps, Error as StorageError},
         },
         _util::testing::{assert_conformance, body, complete_single_part, etag, read_body},
@@ -1072,7 +1222,7 @@ mod tests {
     async fn put_get_head_delete_round_trip() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("dir/a.txt").unwrap();
 
         let put = storage.put_object(&b, &k, body(b"hello")).await.unwrap();
@@ -1104,8 +1254,8 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         let b2 = bucket::name("other").unwrap();
-        storage.create_bucket(&b).await.unwrap();
-        storage.create_bucket(&b2).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage.create_bucket(&b2, None, &acl::Acl::default_private(None)).await.unwrap();
         let src = object::key("src.bin").unwrap();
         let dst = object::key("dir/dst.bin").unwrap();
         storage
@@ -1113,7 +1263,7 @@ mod tests {
             .await
             .unwrap();
         let put = storage
-            .copy_object(&b, &src, &b2, &dst, object::Tags::empty(), None)
+            .copy_object(&b, &src, &b2, &dst, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
             .await
             .unwrap();
         assert_eq!(put.etag, ETag::from_content(b"cross-bucket copy"));
@@ -1133,11 +1283,11 @@ mod tests {
 
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let dst = object::key("copy.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         // The non-final part must meet the backend's 5 MiB minimum at
@@ -1184,7 +1334,7 @@ mod tests {
             .unwrap();
         assert!(matches!(info.etag, ETag::Composed(_, 2)));
         let put = storage
-            .copy_object(&b, &k, &b, &dst, object::Tags::empty(), None)
+            .copy_object(&b, &k, &b, &dst, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
             .await
             .unwrap();
         assert_eq!(put.etag, ETag::from_content(&concat));
@@ -1196,11 +1346,11 @@ mod tests {
     async fn copy_of_a_missing_source_is_no_such_key() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let missing = object::key("ghost.bin").unwrap();
         let dst = object::key("dst.bin").unwrap();
         let err = storage
-            .copy_object(&b, &missing, &b, &dst, object::Tags::empty(), None)
+            .copy_object(&b, &missing, &b, &dst, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
             .await
             .unwrap_err();
         assert!(matches!(err.into(), StorageError::NoSuchKey(_)));
@@ -1222,7 +1372,7 @@ mod tests {
     async fn get_ranges() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("digits").unwrap();
         storage
             .put_object(&b, &k, body(b"0123456789"))
@@ -1260,7 +1410,7 @@ mod tests {
     async fn get_stream_chunk_sequence() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("chunked.bin").unwrap();
         let payload: Vec<u8> = (0..(2 * CHUNK_SIZE + 1234) as u32)
             .map(|i| (i % 251) as u8)
@@ -1285,7 +1435,7 @@ mod tests {
     async fn get_stream_stops_at_the_range_end() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("ranged.bin").unwrap();
         let payload: Vec<u8> = (0..(CHUNK_SIZE + 100) as u32)
             .map(|i| (i % 251) as u8)
@@ -1316,7 +1466,7 @@ mod tests {
     async fn streamed_chunks_own_their_memory() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("owned.bin").unwrap();
         let payload = [vec![0xAB; CHUNK_SIZE], vec![0xCD; 100]].concat();
         storage.put_object(&b, &k, body(payload)).await.unwrap();
@@ -1336,7 +1486,7 @@ mod tests {
     async fn delete_of_a_directory_without_slash_is_204() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         // 'dir' exists as a directory (a folder marker was PUT).
         storage
             .put_object(&b, &"dir/".into(), body(b""))
@@ -1359,7 +1509,7 @@ mod tests {
     async fn folder_marker_semantics() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let marker = object::key("dir/").unwrap();
 
         // PUT creates the directory, idempotently.
@@ -1395,7 +1545,7 @@ mod tests {
     async fn reserved_keys_denied() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         for key in [".tinio", ".tinio/x", "a/.tinio", "a/.tinio/b"] {
             let k = object::key(key).unwrap();
             let err: StorageError = storage
@@ -1478,7 +1628,7 @@ mod tests {
     async fn head_of_folder_marker_is_no_such_key() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
             .put_object(&b, &"dir/".into(), body(b""))
             .await
@@ -1495,7 +1645,7 @@ mod tests {
     async fn commit_after_bucket_deleted_is_no_such_bucket() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("a.txt").unwrap();
         let staged = storage
             .stage_body(&b, &k, body(b"hello"), None)
@@ -1503,7 +1653,7 @@ mod tests {
             .unwrap();
         storage.delete_bucket(&b).await.unwrap();
         let err: StorageError = storage
-            .commit_object(&b, &k, staged, object::Tags::empty())
+            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap_err()
             .into();
@@ -1524,7 +1674,7 @@ mod tests {
         use crate::_core::storage::ObjectOps;
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let staged = storage
             .stage_body(&b, &k, body(b"x".repeat(1024)), None)
@@ -1551,7 +1701,7 @@ mod tests {
     async fn out_of_band_change_served_immediately() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         // Hand-dropped file (SC-006).
         fs::write(root.path().join("data/dropped.txt"), b"out-of-band")
             .await
@@ -1568,7 +1718,7 @@ mod tests {
     async fn interrupted_upload_leaves_no_object() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("partial").unwrap();
         let stream = stream::iter(vec![
             Ok(Bytes::from_static(b"data")),
@@ -1685,7 +1835,7 @@ mod tests {
             wait_for_lock_waiter(),
             move || async move {
                 storage2
-                    .commit_object(&b2, &k2, staged, object::Tags::empty())
+                    .commit_object(&b2, &k2, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
                     .await
                     .unwrap()
             },
@@ -1709,7 +1859,7 @@ mod tests {
     async fn fs_object_tags_round_trip_and_replace() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("t.txt").unwrap();
         storage.put_object(&b, &k, body(b"x")).await.unwrap();
         assert!(
@@ -1769,14 +1919,14 @@ mod tests {
     async fn fs_commit_and_copy_carry_tags() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let a = object::key("a.txt").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         // The commit records the tags with the object — no post-commit
         // tag window.
         let staged = storage.stage_body(&b, &a, body(b"hi"), None).await.unwrap();
         let info = storage
-            .commit_object(&b, &a, staged, tags.clone())
+            .commit_object(&b, &a, staged, tags.clone(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert_eq!(info.etag, ETag::from_content(b"hi"));
@@ -1788,7 +1938,16 @@ mod tests {
         let dst = object::key("b.txt").unwrap();
         let copy_tags = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
         storage
-            .copy_object(&b, &a, &b, &dst, copy_tags.clone(), None)
+            .copy_object(
+                &b,
+                &a,
+                &b,
+                &dst,
+                copy_tags.clone(),
+                None,
+                &acl::Acl::default_private(None),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(storage.get_object_tags(&b, &dst).await.unwrap(), copy_tags);
@@ -1802,7 +1961,7 @@ mod tests {
         // — the backend never re-hashes.
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("c.txt").unwrap();
         let staged = storage
             .stage_body(
@@ -1814,7 +1973,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, object::Tags::empty())
+            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let head = storage.head_object(&b, &k).await.unwrap();
@@ -1842,7 +2001,7 @@ mod tests {
         // read — carries them over. Only an API write clears them.
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("a.txt").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let staged = storage
@@ -1855,7 +2014,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, tags.clone())
+            .commit_object(&b, &k, staged, tags.clone(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
 
@@ -1890,7 +2049,7 @@ mod tests {
         // them with the record, and copy never inherits them.
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("mp.bin").unwrap();
         complete_single_part(&storage, &b, &k).await;
         assert_eq!(storage.list_object_parts(&b, &k).await.unwrap().len(), 1);
@@ -1902,7 +2061,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, object::Tags::empty())
+            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert!(
@@ -1938,7 +2097,7 @@ mod tests {
         // (d) copy_object never inherits the source's parts.
         let copy = object::key("copy.bin").unwrap();
         storage
-            .copy_object(&b, &dst, &b, &copy, object::Tags::empty(), None)
+            .copy_object(&b, &dst, &b, &copy, object::Tags::empty(), None, &acl::Acl::default_private(None), None)
             .await
             .unwrap();
         assert!(
@@ -1977,5 +2136,473 @@ mod tests {
             parts.list(&b, &moved).unwrap().is_empty(),
             "rename migrated the rows away"
         );
+    }
+
+    // --- owner + ACL (spec 2026-09-05) ---
+
+    #[tokio::test]
+    async fn fs_object_acl_replace_all() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let k = object::key("a.txt").unwrap();
+        storage.put_object(&b, &k, body(b"x")).await.unwrap();
+        assert_eq!(
+            storage.get_object_acl(&b, &k).await.unwrap(),
+            acl::Acl::default_private(None),
+            "an unwritten ACL answers the private default"
+        );
+
+        // Put → Get round-trip (replace-all, no merge).
+        let grants = vec![crate::testutil::all_users_read_grant()];
+        storage.put_object_acl(&b, &k, &grants).await.unwrap();
+        assert_eq!(storage.get_object_acl(&b, &k).await.unwrap().grants, grants);
+        storage.put_object_acl(&b, &k, &Vec::new()).await.unwrap();
+        assert_eq!(
+            storage.get_object_acl(&b, &k).await.unwrap().grants,
+            Vec::new()
+        );
+
+        // Missing object: get/put → NoSuchKey.
+        let missing = object::key("missing.txt").unwrap();
+        let err: StorageError = storage.get_object_acl(&b, &missing).await.unwrap_err().into();
+        assert!(matches!(err, StorageError::NoSuchKey(_)));
+        let err: StorageError = storage
+            .put_object_acl(&b, &missing, &grants)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, StorageError::NoSuchKey(_)));
+    }
+
+    #[tokio::test]
+    async fn fs_commit_records_owner_and_acl() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let k = object::key("a.txt").unwrap();
+        let owner = crate::testutil::owner_id();
+        let grants = vec![crate::testutil::all_users_read_grant()];
+        let write_acl = acl::Acl {
+            owner: Some(owner.clone()),
+            grants: grants.clone(),
+        };
+        let staged = storage.stage_body(&b, &k, body(b"hello"), None).await.unwrap();
+        let info = storage
+            .commit_object(&b, &k, staged, object::Tags::empty(), Some(&owner), &write_acl)
+            .await
+            .unwrap();
+        assert_eq!(info.owner.as_ref(), Some(&owner));
+        assert_eq!(info.acl.grants, grants);
+        // head/get echo the recorded owner and ACL.
+        let head = storage.head_object(&b, &k).await.unwrap();
+        assert_eq!(head.owner.as_ref(), Some(&owner));
+        assert_eq!(head.acl.grants, grants);
+        // get_object_acl recombines the owner element with the grants.
+        let got = storage.get_object_acl(&b, &k).await.unwrap();
+        assert_eq!(got.owner.as_ref(), Some(&owner));
+        assert_eq!(got.grants, grants);
+        // A put_object_acl replaces the grants, never the owner.
+        let replaced = Vec::new();
+        storage.put_object_acl(&b, &k, &replaced).await.unwrap();
+        let got = storage.get_object_acl(&b, &k).await.unwrap();
+        assert_eq!(got.owner.as_ref(), Some(&owner));
+        assert_eq!(got.grants, replaced);
+    }
+
+    #[tokio::test]
+    async fn fs_copy_records_the_callers_owner_and_acl() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let src = object::key("src.bin").unwrap();
+        let dst = object::key("dst.bin").unwrap();
+        storage
+            .put_object(&b, &src, body(b"copy me"))
+            .await
+            .unwrap();
+        let owner = crate::testutil::owner_id();
+        let grants = vec![crate::testutil::all_users_read_grant()];
+        let info = storage
+            .copy_object(
+                &b,
+                &src,
+                &b,
+                &dst,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl {
+                    owner: Some(owner.clone()),
+                    grants: grants.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.owner.as_ref(), Some(&owner));
+        assert_eq!(info.acl.grants, grants);
+        // The copy's ACL is the caller's — never the source's.
+        let head = storage.head_object(&b, &dst).await.unwrap();
+        assert_eq!(head.owner.as_ref(), Some(&owner));
+        assert_eq!(head.acl.grants, grants);
+        let head_src = storage.head_object(&b, &src).await.unwrap();
+        assert_eq!(head_src.owner, None, "the source is untouched");
+        assert_eq!(head_src.acl.grants, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn fs_rename_moves_owner_and_acl() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let src = object::key("src.bin").unwrap();
+        let dst = object::key("dst.bin").unwrap();
+        let owner = crate::testutil::owner_id();
+        let grants = vec![crate::testutil::all_users_read_grant()];
+        let staged = storage
+            .stage_body(&b, &src, body(b"rename me"), None)
+            .await
+            .unwrap();
+        storage
+            .commit_object(
+                &b,
+                &src,
+                staged,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl {
+                    owner: Some(owner.clone()),
+                    grants: grants.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        // A rename is not a fresh object: the owner and ACL move with
+        // the record.
+        let renamed = storage.rename_object(&b, &src, &dst).await.unwrap();
+        assert_eq!(renamed.owner.as_ref(), Some(&owner));
+        assert_eq!(renamed.acl.grants, grants);
+        let head = storage.head_object(&b, &dst).await.unwrap();
+        assert_eq!(head.owner.as_ref(), Some(&owner));
+        assert_eq!(head.acl.grants, grants);
+        let got = storage.get_object_acl(&b, &dst).await.unwrap();
+        assert_eq!(got.owner.as_ref(), Some(&owner));
+        assert_eq!(got.grants, grants);
+    }
+
+    // --- unix mode + ownership hardening (spec 2026-09-05 §5a) ---
+    //
+    // The chown-asserting tests run only as root (a foreign-uid chown
+    // would otherwise fail with EPERM — the fail-closed test runs only
+    // when NOT root, where that EPERM is exactly the failure it needs).
+    // Their real run is the Task 16 WSL2 gate; here they typecheck on the
+    // linux target and the mode tests run everywhere.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_object_file_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let k = object::key("a.txt").unwrap();
+        storage.put_object(&b, &k, body(b"x")).await.unwrap();
+        let mode = std::fs::metadata(root.path().join("data/a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a fresh object file must be 0600");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_object_chowned_to_mapped_owner_uid() {
+        use std::os::unix::fs::MetadataExt;
+        if crate::testutil::euid() != 0 {
+            eprintln!("skipped: the chown tests need root");
+            return;
+        }
+        let uid = 2345;
+        let owner = crate::testutil::owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([(owner.clone(), uid)]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, Some(&owner), &acl::Acl::default_private(Some(owner.clone())))
+            .await
+            .unwrap();
+        let k = object::key("a.txt").unwrap();
+        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        storage
+            .commit_object(
+                &b,
+                &k,
+                staged,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl::default_private(Some(owner.clone())),
+            )
+            .await
+            .unwrap();
+        let metadata = std::fs::metadata(root.path().join("data/a.txt")).unwrap();
+        assert_eq!(metadata.uid(), uid, "the file must land chowned");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_unmapped_owner_file_stays_server_user_owned() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        // An owner with no configured uid: no chown — the file stays
+        // server-user-owned, still 0600.
+        let owner = crate::testutil::owner_id();
+        let k = object::key("unmapped.txt").unwrap();
+        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        storage
+            .commit_object(
+                &b,
+                &k,
+                staged,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl::default_private(Some(owner.clone())),
+            )
+            .await
+            .unwrap();
+        let path = storage.root().join("data/unmapped.txt");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), crate::testutil::euid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        // The anonymous path (owner None) is the same.
+        let k2 = object::key("anon.txt").unwrap();
+        storage.put_object(&b, &k2, body(b"x")).await.unwrap();
+        let metadata = std::fs::metadata(storage.root().join("data/anon.txt")).unwrap();
+        assert_eq!(metadata.uid(), crate::testutil::euid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_rename_preserves_ownership() {
+        use std::os::unix::fs::MetadataExt;
+        if crate::testutil::euid() != 0 {
+            eprintln!("skipped: the chown tests need root");
+            return;
+        }
+        let uid = 3456;
+        let owner = crate::testutil::owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([(owner.clone(), uid)]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let k = object::key("a.txt").unwrap();
+        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        storage
+            .commit_object(
+                &b,
+                &k,
+                staged,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl::default_private(Some(owner.clone())),
+            )
+            .await
+            .unwrap();
+        // The inode moves — the uid is preserved, no chown.
+        let moved = object::key("b.txt").unwrap();
+        storage.rename_object(&b, &k, &moved).await.unwrap();
+        let metadata = std::fs::metadata(root.path().join("data/b.txt")).unwrap();
+        assert_eq!(metadata.uid(), uid);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_copy_overwrite_rechown_to_new_owner() {
+        use std::os::unix::fs::MetadataExt;
+        if crate::testutil::euid() != 0 {
+            eprintln!("skipped: the chown tests need root");
+            return;
+        }
+        let uid_a = 4567;
+        let uid_b = 5678;
+        let owner_a = crate::testutil::owner_id();
+        let owner_b = crate::testutil::other_owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([
+                    (owner_a.clone(), uid_a),
+                    (owner_b.clone(), uid_b),
+                ]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let src = object::key("src.bin").unwrap();
+        let dst = object::key("dst.bin").unwrap();
+        let staged = storage.stage_body(&b, &src, body(b"x"), None).await.unwrap();
+        storage
+            .commit_object(
+                &b,
+                &src,
+                staged,
+                object::Tags::empty(),
+                Some(&owner_a),
+                &acl::Acl::default_private(Some(owner_a.clone())),
+            )
+            .await
+            .unwrap();
+        // An overwriting copy records the NEW owner's uid.
+        storage
+            .copy_object(
+                &b,
+                &src,
+                &b,
+                &dst,
+                object::Tags::empty(),
+                Some(&owner_b),
+                &acl::Acl::default_private(Some(owner_b.clone())),
+                None,
+            )
+            .await
+            .unwrap();
+        let metadata = std::fs::metadata(root.path().join("data/dst.bin")).unwrap();
+        assert_eq!(metadata.uid(), uid_b);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_prefix_dir_chowned_to_bucket_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if crate::testutil::euid() != 0 {
+            eprintln!("skipped: the chown tests need root");
+            return;
+        }
+        let uid = 6789;
+        let owner = crate::testutil::owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([(owner.clone(), uid)]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, Some(&owner), &acl::Acl::default_private(Some(owner.clone())))
+            .await
+            .unwrap();
+        // A non-bucket-owner PutObject (owner None) creating prefix dirs:
+        // the dirs take the bucket owner's mapped uid, 0700.
+        let k = object::key("dir/sub/f.txt").unwrap();
+        storage.put_object(&b, &k, body(b"x")).await.unwrap();
+        let dir = std::fs::metadata(root.path().join("data/dir")).unwrap();
+        assert_eq!(dir.uid(), uid, "the prefix dir must be bucket-owner-owned");
+        assert_eq!(dir.permissions().mode() & 0o777, 0o700);
+        let sub = std::fs::metadata(root.path().join("data/dir/sub")).unwrap();
+        assert_eq!(sub.uid(), uid);
+        assert_eq!(sub.permissions().mode() & 0o777, 0o700);
+        // The object file itself is server-user-owned (its owner is
+        // unmapped) and 0600.
+        let file = std::fs::metadata(root.path().join("data/dir/sub/f.txt")).unwrap();
+        assert_eq!(file.uid(), crate::testutil::euid());
+        assert_eq!(file.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_chown_failure_after_rename_removes_file_and_errors() {
+        use std::os::unix::fs::MetadataExt;
+        if crate::testutil::euid() == 0 {
+            eprintln!("skipped: the fail-closed test needs an UNPRIVILEGED process");
+            return;
+        }
+        // The map points at uid 0 — an unprivileged process can never
+        // chown to root: the chown fails (EPERM) after the rename
+        // landed, and the fail-closed path must remove the file and
+        // error the request.
+        let owner = crate::testutil::owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                owner_uids: std::collections::HashMap::from([(owner.clone(), 0)]),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let k = object::key("a.txt").unwrap();
+        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        let err = storage
+            .commit_object(
+                &b,
+                &k,
+                staged,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl::default_private(Some(owner.clone())),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert!(
+            !root.path().join("data/a.txt").exists(),
+            "a wrongly-owned 0600 file must not be left behind"
+        );
+        let err: StorageError = storage.head_object(&b, &k).await.unwrap_err().into();
+        assert!(matches!(err, StorageError::NoSuchKey(_)));
     }
 }

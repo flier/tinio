@@ -16,8 +16,8 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 
 pub use crate::_core::bucket::{Name, name};
 use crate::{
-    _core::{cors, object, storage::no_such_bucket},
-    _store::bucket,
+    _core::{acl, cors, object, storage::no_such_bucket},
+    _store::{bucket, decode_acl_wire, decode_owner_wire},
     Error,
     database::{self, Handle},
 };
@@ -118,6 +118,63 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The bucket's ACL — the owner element recombined with the stored
+    /// grant set (the row form keeps them apart; a domain-invalid wire
+    /// self-heals via the shared decode helpers). A row-less bucket (a
+    /// directory never seen through the API — the lazy first-sight
+    /// record) answers the default private ACL with no owner.
+    pub async fn acl(&self, name: &Name) -> Result<acl::Acl, Error> {
+        let name = name.clone();
+        self.handle
+            .read(move |txn| {
+                let table = bucket::Table::open_readonly(txn)?;
+                Ok(table.row(&name)?.map_or_else(
+                    || acl::Acl::default_private(None),
+                    |row| acl::Acl {
+                        owner: decode_owner_wire(&row.owner),
+                        grants: decode_acl_wire(&row.acl).grants,
+                    },
+                ))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Replace the bucket's grant set, preserving the owner element and
+    /// the other wires — one read-modify-write transaction (a row-less
+    /// bucket is lazily recorded first-sight with the new grant set;
+    /// only a real change commits — no fsync).
+    pub async fn set_acl(&self, name: &Name, grants: &acl::AclGrants) -> Result<(), Error> {
+        let name = name.clone();
+        let wire = acl::Acl {
+            owner: None,
+            grants: grants.clone(),
+        }
+        .to_grants_wire();
+        self.handle
+            .write_if(move |txn| {
+                let mut table = bucket::Table::open(txn)?;
+                let Some(mut row) = table.row(&name)? else {
+                    table.put_full(
+                        &name,
+                        &bucket::BucketRow {
+                            acl: wire.clone(),
+                            ..bucket::BucketRow::at(SystemTime::now())
+                        },
+                    )?;
+                    return Ok(Some(()));
+                };
+                if row.acl == wire {
+                    return Ok(None);
+                }
+                row.acl = wire;
+                table.put_full(&name, &row)?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
     /// The bucket's CORS configuration, in stored order — `None` when
     /// the bucket has no CORS configuration: no state record (a bucket
     /// never seen through the API), the `''` wire (the cleared or
@@ -177,6 +234,25 @@ impl Store {
             return Err(no_such_bucket(name).into());
         }
         Ok(())
+    }
+
+    /// The recorded owner element of each `Name`, index-aligned with the
+    /// input (`None` = the row is missing, a legacy bucket never sighted
+    /// through the API — the auth layer's lazy default owner; a garbage
+    /// wire reads `None` too, the shared decode self-heal). One read
+    /// transaction for the whole page — the list-buckets walk-time
+    /// owner filter's row probe.
+    pub async fn owners(&self, names: &[Name]) -> Result<Vec<Option<acl::OwnerId>>, Error> {
+        self.handle
+            .read(|txn| {
+                let table = bucket::Table::open_readonly(txn)?;
+                let mut out = Vec::with_capacity(names.len());
+                for name in names {
+                    out.push(table.row(name)?.and_then(|row| decode_owner_wire(&row.owner)));
+                }
+                Ok(out)
+            })
+            .map_err(Into::into)
     }
 
     /// The creation time of a bucket, lazily recorded on first sight:
@@ -245,6 +321,35 @@ impl Store {
                 bucket::Table::open(txn)?
                     .put(&name, created_at)
                     .map_err(Into::into)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Record (or overwrite) the creation time of `name` WITH the owner
+    /// and ACL wires (the create-time ACL rows — the creation time is
+    /// preserved by the CORS/tagging rewrite paths).
+    pub async fn record_full(
+        &self,
+        name: &Name,
+        created_at: SystemTime,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
+    ) -> Result<(), Error> {
+        let name = name.clone();
+        let owner_wire = owner.map_or_else(String::new, |o| o.as_str().to_string());
+        let acl_wire = acl.to_grants_wire();
+        self.handle
+            .write(move |txn| {
+                let mut table = bucket::Table::open(txn)?;
+                let row = bucket::BucketRow {
+                    tags: String::new(),
+                    owner: owner_wire,
+                    acl: acl_wire,
+                    ..bucket::BucketRow::at(created_at)
+                };
+                table.put_full(&name, &row)?;
+                Ok(())
             })
             .await
             .map_err(Into::into)

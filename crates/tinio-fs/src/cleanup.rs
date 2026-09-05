@@ -101,6 +101,7 @@ async fn record_repair(
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     owner_uids: std::collections::HashMap::new(),
 ///     io_pipeline: Arc::new(InlineRunner::default()),
 ///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
@@ -660,7 +661,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            bucket, object,
+            acl, bucket, object,
             pipeline::InlineRunner,
             storage::{BucketOps, ObjectOps},
         },
@@ -717,7 +718,7 @@ mod tests {
         // A live bucket + upload must be untouched (a real upload: the
         // record commits before its directory exists).
         let live = bucket::name("live-bucket").unwrap();
-        storage.create_bucket(&live).await.unwrap();
+        storage.create_bucket(&live, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
             .multipart_store()
             .create(
@@ -725,6 +726,8 @@ mod tests {
                 &object::key("k").unwrap(),
                 None,
                 object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -756,7 +759,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         fs::create_dir_all(root.path().join("data/.tinio"))
             .await
             .unwrap();
@@ -860,11 +863,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let gone = bucket::name("gone-bucket").unwrap();
-        storage.create_bucket(&gone).await.unwrap();
+        storage.create_bucket(&gone, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("k").unwrap();
         storage
             .multipart_store()
-            .create(&gone, &k, None, object::Tags::empty())
+            .create(&gone, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         assert!(storage.multipart_store().has_uploads(&gone).await.unwrap());
@@ -895,13 +898,13 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("live").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
 
         // A live upload: record committed, directory present.
         let k = object::key("k").unwrap();
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None, object::Tags::empty())
+            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let live_dir = state.path().join("multipart/live").join(&upload.upload_id);
@@ -954,11 +957,11 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("live").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("k").unwrap();
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None, object::Tags::empty())
+            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -1025,7 +1028,7 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("live").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("k").unwrap();
         let cleanup = || {
             FsCleanup::new(&storage, CleanupOptions::default()).with_multipart_grace(Duration::ZERO)
@@ -1036,7 +1039,7 @@ mod tests {
         // record survives.
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None, object::Tags::empty())
+            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let actions = collect(cleanup().repair(RepairKind::Startup).await.unwrap()).await;
@@ -1170,7 +1173,7 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("live").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
 
         // A part-less orphan (no UPLOADS record, no part files).
         let orphan_dir = state.path().join("multipart/live/u-partless");
@@ -1209,7 +1212,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         fs::create_dir_all(root.path().join("data/sub"))
             .await
             .unwrap();
@@ -1241,7 +1244,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let stale = bucket::name("stale-bucket").unwrap();
         let live = bucket::name("live-bucket").unwrap();
-        storage.create_bucket(&live).await.unwrap();
+        storage.create_bucket(&live, None, &acl::Acl::default_private(None)).await.unwrap();
         // A stale record: the bucket directory is gone out-of-band.
         storage
             .bucket_store()
@@ -1271,7 +1274,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("a.txt").unwrap();
         storage.put_object(&b, &k, body(b"x")).await.unwrap();
 
@@ -1311,7 +1314,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("a.txt").unwrap();
         storage.put_object(&b, &k, body(b"x")).await.unwrap();
         assert_eq!(storage.meta_store().walk(&b).await.unwrap().len(), 1);
@@ -1334,7 +1337,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let gone = object::key("gone.txt").unwrap();
         let alive = object::key("alive.txt").unwrap();
         storage.put_object(&b, &gone, body(b"x")).await.unwrap();
@@ -1454,7 +1457,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         fs::create_dir_all(root.path().join("data/blocked"))
             .await
             .unwrap();
@@ -1514,7 +1517,7 @@ mod tests {
             )
             .unwrap();
             let b = bucket::name("data").unwrap();
-            storage.create_bucket(&b).await.unwrap();
+            storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
             fs::create_dir(root.path().join("data/real")).await.unwrap();
             symlink(outside.path(), root.path().join("data/link")).unwrap();
 
@@ -1550,7 +1553,7 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("a.txt").unwrap();
         storage.put_object(&b, &k, body(b"x")).await.unwrap();
         // A multipart subtree + a stale bucket record to probe.
@@ -1666,7 +1669,7 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("live").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let blocked = state.path().join("multipart/live/u-blocked");
         fs::create_dir_all(&blocked).await.unwrap();
         fs::write(blocked.join("part-1"), b"x").await.unwrap();
@@ -1710,8 +1713,8 @@ mod tests {
         .unwrap();
         let b = bucket::name("live").unwrap();
         let stray = bucket::name("stray").unwrap();
-        storage.create_bucket(&b).await.unwrap();
-        storage.create_bucket(&stray).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage.create_bucket(&stray, None, &acl::Acl::default_private(None)).await.unwrap();
         fs::create_dir_all(state.path().join("multipart/live"))
             .await
             .unwrap();

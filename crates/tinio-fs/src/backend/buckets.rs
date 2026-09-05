@@ -13,7 +13,7 @@ use tokio::fs;
 use super::{Error, FsStorage};
 use crate::{
     _core::{
-        BucketsListing, ListBucketsParams,
+        BucketsListing, ListBucketsParams, acl,
         bucket::{self, Bucket},
         cors, object,
         storage::{BucketOps, UnorderedPager, already_exists, no_such_bucket, not_empty},
@@ -51,7 +51,12 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
 
 #[async_trait]
 impl BucketOps for FsStorage {
-    async fn create_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
+    async fn create_bucket(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
+    ) -> Result<(), Error> {
         // The lexical mapping: the validation supplements (the reserved
         // `.tinio` refusal — FR-020 — and the Windows charset/aliasing
         // refusal — F21, the same clean `InvalidBucketName` the object
@@ -82,7 +87,30 @@ impl BucketOps for FsStorage {
             }
             Err(err) => return Err(err.into()),
         }
-        self.bucket_store.record(name, SystemTime::now()).await?;
+        // The unix ownership hardening (spec 2026-09-05 §5a): the fresh
+        // bucket dir lands `0700` and chowned to the bucket owner's
+        // mapped uid (an unmapped owner stays server-user-owned, still
+        // `0700`). A chown failure is warned — the dir is `0700` either
+        // way — never fatal (unlike an object file, a dir holds no
+        // wrongly-owned readable content).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, std::fs::Permissions::from_mode(crate::fsutil::DIR_MODE_PRIVATE))
+                .await?;
+            if let Some(uid) = self.owner_uid(owner) {
+                if let Err(err) = crate::fsutil::chown_file(&dir, uid).await {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %err,
+                        "bucket dir chown failed; the dir stays server-user-owned (0700)"
+                    );
+                }
+            }
+        }
+        self.bucket_store
+            .record_full(name, SystemTime::now(), owner, acl)
+            .await?;
         Ok(())
     }
 
@@ -139,7 +167,11 @@ impl BucketOps for FsStorage {
         })
     }
 
-    async fn list_buckets(&self, params: ListBucketsParams) -> Result<BucketsListing, Error> {
+    async fn list_buckets(
+        &self,
+        params: ListBucketsParams,
+        owner: Option<&acl::OwnerId>,
+    ) -> Result<BucketsListing, Error> {
         // The bounded pagination engine (`UnorderedPager`, the
         // uploads-page engine) consumes the root sweep incrementally:
         // the streaming walk offers only prefix-matching, name-valid
@@ -151,6 +183,15 @@ impl BucketOps for FsStorage {
         // metadata reads (the cost-profile parity with the mem backend,
         // which never drains the table for an empty page); the engine
         // produces the empty page itself, so the contract has one home.
+        //
+        // The `owner` filter applies DURING the walk, before pagination
+        // (contract review P2#4 — the continuation-token math applies to
+        // the filtered set): the candidate names collect first (the
+        // filtered walk cannot stream into the pager — each name's row
+        // must be read before the offer), then one read transaction
+        // resolves every candidate's owner element, and only the
+        // principal's buckets reach the pager. `None` = no filter, the
+        // legacy listing, with the streaming walk unchanged.
         let max = params.max_buckets;
         let mut pager = UnorderedPager::new(
             &params.prefix,
@@ -160,8 +201,23 @@ impl BucketOps for FsStorage {
             |name: &bucket::Name| name.as_ref().as_str(),
         );
         if max > 0 {
-            self.for_each_bucket_name(&params.prefix, |name| pager.offer_keyed(name))
-                .await?;
+            match owner {
+                Some(owner) => {
+                    let mut names = Vec::new();
+                    self.for_each_bucket_name(&params.prefix, |name| names.push(name))
+                        .await?;
+                    let recorded = self.bucket_store.owners(&names).await?;
+                    for (name, recorded_owner) in names.into_iter().zip(recorded) {
+                        if recorded_owner.as_ref() == Some(owner) {
+                            pager.offer_keyed(name);
+                        }
+                    }
+                }
+                None => {
+                    self.for_each_bucket_name(&params.prefix, |name| pager.offer_keyed(name))
+                        .await?;
+                }
+            }
         }
         let (page, _prefixes, truncated, next) = pager.finish();
         // Creation times resolve only for the page's buckets — the
@@ -244,6 +300,20 @@ impl BucketOps for FsStorage {
         self.ensure_bucket(name).await?;
         self.bucket_store.clear_cors(name).await
     }
+
+    async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<acl::Acl, Error> {
+        // Existence is the bucket directory (`NoSuchBucket` when missing
+        // — mirroring head_bucket); the ACL comes from the `BUCKETS`
+        // row, which answers `NoSuchBucket` itself when unrecorded (a
+        // legacy bucket has no ACL row until first sight).
+        self.ensure_bucket(name).await?;
+        self.bucket_store.acl(name).await
+    }
+
+    async fn put_bucket_acl(&self, name: &bucket::Name, grants: &acl::AclGrants) -> Result<(), Error> {
+        self.ensure_bucket(name).await?;
+        self.bucket_store.set_acl(name, grants).await
+    }
 }
 
 #[cfg(test)]
@@ -261,9 +331,11 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
+            acl,
             object,
             storage::{
-                Error as StorageError, Error::*, ListBucketsParams, MultipartOps, ObjectOps,
+                BucketsListing, Error as StorageError, Error::*, ListBucketsParams, MultipartOps,
+                ObjectOps,
             },
         },
         _util::testing::{assert_conformance, body, etag},
@@ -283,7 +355,7 @@ mod tests {
         let b = bucket::name("my-bucket").unwrap();
         assert!(storage.head_bucket(&b).await.is_err());
 
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         assert_eq!(storage.head_bucket(&b).await.unwrap().name, b);
 
         // The bucket is a real directory.
@@ -294,14 +366,15 @@ mod tests {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 1000,
-            })
+            },
+            None)
             .await
             .unwrap();
         assert_eq!(listing.buckets.len(), 1);
         assert_eq!(listing.buckets[0].name, b);
 
         // Duplicate create.
-        let err: StorageError = storage.create_bucket(&b).await.unwrap_err().into();
+        let err: StorageError = storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap_err().into();
         assert!(matches!(err, AlreadyExists(_)));
 
         // Delete.
@@ -315,10 +388,10 @@ mod tests {
         let (_root, storage) = storage();
         let a = bucket::name("alpha").unwrap();
         let b = bucket::name("beta").unwrap();
-        storage.create_bucket(&a).await.unwrap();
+        storage.create_bucket(&a, None, &acl::Acl::default_private(None)).await.unwrap();
         let _guard = storage.lock_bucket_mutations(&a).await;
         let storage2 = storage.clone();
-        let create_b = tokio::spawn(async move { storage2.create_bucket(&b).await });
+        let create_b = tokio::spawn(async move { storage2.create_bucket(&b, None, &acl::Acl::default_private(None)).await });
         let created = timeout(Duration::from_millis(500), create_b)
             .await
             .expect("create of a different bucket must not wait on another bucket's lock")
@@ -332,7 +405,7 @@ mod tests {
         let a = bucket::name("alpha").unwrap();
         let _guard = storage.lock_bucket_mutations(&a).await;
         let storage2 = storage.clone();
-        let create_a = tokio::spawn(async move { storage2.create_bucket(&a).await });
+        let create_a = tokio::spawn(async move { storage2.create_bucket(&a, None, &acl::Acl::default_private(None)).await });
         assert!(
             timeout(Duration::from_millis(80), create_a).await.is_err(),
             "create of the same bucket must wait on the mutation lock"
@@ -343,7 +416,7 @@ mod tests {
     async fn delete_bucket_unpublishes_into_deleting_dir() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage.delete_bucket(&b).await.unwrap();
         assert!(!root.path().join("data").exists());
         let deleting = tombstone::dir(root.path());
@@ -376,7 +449,7 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage.delete_bucket(&b).await.unwrap();
         assert!(!root.path().join("data").exists());
         assert!(tombstone::dir(root.path()).is_dir());
@@ -387,7 +460,7 @@ mod tests {
     async fn delete_bucket_does_not_split_the_mutation_lock() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let held = storage.lock_bucket_mutations(&b).await;
         let storage_d = storage.clone();
         let bd = b.clone();
@@ -406,7 +479,7 @@ mod tests {
         let bc = b.clone();
         let created = timeout(
             Duration::from_millis(80),
-            tokio::spawn(async move { storage_c.create_bucket(&bc).await }),
+            tokio::spawn(async move { storage_c.create_bucket(&bc, None, &acl::Acl::default_private(None)).await }),
         )
         .await;
         waiter.abort();
@@ -437,7 +510,7 @@ mod tests {
                                 None
                             }
                             1 => {
-                                let _ = storage.create_bucket(&b).await;
+                                let _ = storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await;
                                 None
                             }
                             // PUT: only `NoSuchBucket` is benign.
@@ -490,7 +563,7 @@ mod tests {
     async fn delete_non_empty_is_not_empty() {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
             .put_object(&b, &"a.txt".into(), body(b"x"))
             .await
@@ -534,14 +607,15 @@ mod tests {
             .unwrap_err()
             .into();
         assert!(matches!(err, NoSuchBucket(_)), "{err:?}");
-        let err: StorageError = storage.create_bucket(&b).await.unwrap_err().into();
+        let err: StorageError = storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap_err().into();
         assert!(matches!(err, AlreadyExists(_)), "{err:?}");
         let listing = storage
             .list_buckets(ListBucketsParams {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 1000,
-            })
+            },
+            None)
             .await
             .unwrap();
         assert!(listing.buckets.is_empty(), "{listing:?}");
@@ -569,7 +643,8 @@ mod tests {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 1000,
-            })
+            },
+            None)
             .await
             .unwrap();
         assert_eq!(listing.buckets.len(), 1);
@@ -594,7 +669,7 @@ mod tests {
     async fn bucket_with_only_staging_residue_is_empty() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         fs::create_dir_all(root.path().join("data/.tinio")).unwrap();
         fs::write(root.path().join("data/.tinio/aaaa"), b"residue").unwrap();
         storage.delete_bucket(&b).await.unwrap();
@@ -605,9 +680,16 @@ mod tests {
     async fn delete_bucket_with_uploads_is_not_empty() {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty())
+            .create_multipart_upload(
+                &b,
+                &"big.bin".into(),
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let err: StorageError = storage.delete_bucket(&b).await.unwrap_err().into();
@@ -628,7 +710,8 @@ mod tests {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 1000,
-            })
+            },
+            None)
             .await
             .unwrap();
         assert_eq!(listing.buckets.len(), 1);
@@ -654,7 +737,8 @@ mod tests {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 1000,
-            })
+            },
+            None)
             .await
             .unwrap();
         assert!(listing.buckets.is_empty(), "{listing:?}");
@@ -664,7 +748,7 @@ mod tests {
     async fn bucket_delete_prunes_private_state() {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
             .put_object(&b, &"a.txt".into(), body(b"x"))
             .await
@@ -702,7 +786,14 @@ mod tests {
         // Upload + part rows.
         let upload = storage
             .multipart_store()
-            .create(&b, &k, None, object::Tags::empty())
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         storage
@@ -731,7 +822,11 @@ mod tests {
         let (_root, storage) = storage();
         for name in ["zeta", "alpha", "mid"] {
             storage
-                .create_bucket(&bucket::name(name).unwrap())
+                .create_bucket(
+                    &bucket::name(name).unwrap(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
         }
@@ -740,7 +835,8 @@ mod tests {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 1000,
-            })
+            },
+            None)
             .await
             .unwrap();
         let names: Vec<&str> = listing
@@ -769,7 +865,7 @@ mod tests {
         )
         .unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         // Move the root aside: `bucket_names` would fail its `read_dir`.
         let moved = root.path().with_extension("swept");
         fs::rename(root.path(), &moved).unwrap();
@@ -778,7 +874,8 @@ mod tests {
                 prefix: String::new(),
                 start_after: None,
                 max_buckets: 0,
-            })
+            },
+            None)
             .await;
         fs::rename(&moved, root.path()).unwrap();
         let listing = listing.expect("max_buckets = 0 must not touch the storage root");
@@ -791,7 +888,7 @@ mod tests {
     async fn fs_bucket_tags_round_trip_and_replace() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         assert!(
             storage.get_bucket_tags(&b).await.unwrap().is_empty(),
             "an untagged bucket answers the empty set"
@@ -835,7 +932,10 @@ mod tests {
     async fn fs_bucket_cors_round_trip_and_replace() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         assert!(
             storage.get_bucket_cors(&b).await.unwrap().is_none(),
             "an unconfigured bucket answers None"
@@ -861,7 +961,7 @@ mod tests {
                 },
             ],
         };
-        // Put → Get round-trip (replace-all, no merge; order + fields kept).
+        // Put -> Get round-trip (replace-all, no merge; order + fields kept).
         storage.put_bucket_cors(&b, &config).await.unwrap();
         assert_eq!(
             storage.get_bucket_cors(&b).await.unwrap(),
@@ -894,7 +994,7 @@ mod tests {
         assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);
         storage.delete_bucket_cors(&b).await.unwrap();
 
-        // Missing bucket: get/put/delete → NoSuchBucket (the CORS spec —
+        // Missing bucket: get/put/delete -> NoSuchBucket (the CORS spec -
         // unlike the delete-bucket-tags idempotent Ok).
         let ghost = bucket::name("ghost").unwrap();
         let err: StorageError = storage.get_bucket_cors(&ghost).await.unwrap_err().into();
@@ -908,4 +1008,139 @@ mod tests {
         let err: StorageError = storage.delete_bucket_cors(&ghost).await.unwrap_err().into();
         assert!(matches!(err, NoSuchBucket(_)));
     }
+
+    #[tokio::test]
+    async fn fs_bucket_acl_round_trip_preserves_owner() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        let owner = crate::testutil::owner_id();
+        let grants = vec![crate::testutil::all_users_read_grant()];
+        storage
+            .create_bucket(&b, Some(&owner), &acl::Acl::default_private(Some(owner.clone())))
+            .await
+            .unwrap();
+        // The create-time ACL round-trips (owner + the owner's own
+        // FULL_CONTROL).
+        let created = storage.get_bucket_acl(&b).await.unwrap();
+        assert_eq!(created.owner.as_ref(), Some(&owner));
+        assert_eq!(created, acl::Acl::default_private(Some(owner.clone())));
+        // A put replaces the grant set; the owner element is preserved,
+        // never changed by a put.
+        storage.put_bucket_acl(&b, &grants).await.unwrap();
+        let got = storage.get_bucket_acl(&b).await.unwrap();
+        assert_eq!(got.owner.as_ref(), Some(&owner));
+        assert_eq!(got.grants, grants);
+        // head_bucket still reports the creation time (the row's other
+        // elements survive the ACL write).
+        let head = storage.head_bucket(&b).await.unwrap();
+        assert!(
+            head.creation_time <= std::time::SystemTime::now(),
+            "the creation time must survive the ACL put"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_bucket_acl_missing_bucket_no_such_bucket() {
+        let (_root, storage) = storage();
+        let ghost = bucket::name("ghost").unwrap();
+        let err: StorageError = storage.get_bucket_acl(&ghost).await.unwrap_err().into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        let err: StorageError = storage
+            .put_bucket_acl(&ghost, &Vec::new())
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, NoSuchBucket(_)));
+    }
+
+    #[tokio::test]
+    async fn fs_list_buckets_filters_by_owner_during_the_walk() {
+        let (_root, storage) = storage();
+        let owner_a = crate::testutil::owner_id();
+        let owner_b = crate::testutil::other_owner_id();
+        for (name, owner) in [
+            ("alpha-a", &owner_a),
+            ("alpha-b", &owner_a),
+            ("beta-b", &owner_b),
+        ] {
+            storage
+                .create_bucket(
+                    &bucket::name(name).unwrap(),
+                    Some(owner),
+                    &acl::Acl::default_private(Some(owner.clone())),
+                )
+                .await
+                .unwrap();
+        }
+        async fn list_filtered(
+            storage: &FsStorage,
+            owner: &acl::OwnerId,
+            start_after: Option<String>,
+            max: usize,
+        ) -> BucketsListing {
+            storage
+                .list_buckets(
+                    ListBucketsParams {
+                        prefix: String::new(),
+                        start_after,
+                        max_buckets: max,
+                    },
+                    Some(owner),
+                )
+                .await
+                .unwrap()
+        }
+        // The filtered listing holds exactly A's buckets.
+        let full = list_filtered(&storage, &owner_a, None, 1000).await;
+        let names: Vec<&str> = full
+            .buckets
+            .iter()
+            .map(|x| x.name.as_ref().as_str())
+            .collect();
+        assert_eq!(names, ["alpha-a", "alpha-b"], "{names:?}");
+        // The continuation-token math applies to the FILTERED set: a
+        // page of 1 over the filtered walk yields exactly A's two
+        // buckets across two pages - B's bucket never leaks in.
+        let page1 = list_filtered(&storage, &owner_a, None, 1).await;
+        assert_eq!(page1.buckets.len(), 1);
+        assert!(page1.truncated);
+        let resume = page1.next_start_after.clone();
+        assert!(resume.is_some(), "a truncated page must carry a resume marker");
+        let page2 = list_filtered(&storage, &owner_a, resume, 1).await;
+        assert_eq!(page2.buckets.len(), 1);
+        assert!(!page2.truncated);
+        assert_eq!(page2.buckets[0].name.as_ref(), "alpha-b");
+        // The legacy listing (`None`) still shows everything.
+        let legacy = storage
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.buckets.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_bucket_dir_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(root.path().join("data"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "a fresh bucket dir must be 0700");
+    }
+
 }

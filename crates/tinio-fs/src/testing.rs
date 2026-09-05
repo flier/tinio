@@ -38,6 +38,7 @@ pub fn fs_options() -> FsOptions {
         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
         meta_batch_size: DEFAULT_META_BATCH_SIZE,
         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+        owner_uids: std::collections::HashMap::new(),
         io_pipeline: Arc::new(InlineRunner::default()),
         remove_pipeline: Arc::new(InlineRunner::default()),
         db_pipeline: Arc::new(InlineRunner::default()),

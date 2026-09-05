@@ -427,6 +427,8 @@ mod tests {
             file_identity: 0,
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: crate::_core::acl::Acl::default_private(None),
         };
         let handle = File::options().write(true).open(&file).unwrap();
         handle
@@ -462,6 +464,8 @@ mod tests {
             file_identity: fsutil::file_identity(&file, &metadata),
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: crate::_core::acl::Acl::default_private(None),
         };
         let handle = File::options().write(true).open(&file).unwrap();
         handle
@@ -493,6 +497,8 @@ mod tests {
             file_identity: fsutil::file_identity(&file, &metadata),
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: crate::_core::acl::Acl::default_private(None),
         };
         // Overwrite in place with different same-size content. The sleep
         // lands the rewrite in a later Windows FILETIME tick (~16 ms
@@ -532,6 +538,8 @@ mod tests {
             file_identity: fsutil::file_identity(&file, &metadata),
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: crate::_core::acl::Acl::default_private(None),
         };
         let replacement = state.path().join("replacement.bin");
         std_fs::write(&replacement, b"hello").unwrap();
@@ -566,6 +574,8 @@ mod tests {
             file_identity: fsutil::file_identity(&file, &metadata),
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: crate::_core::acl::Acl::default_private(None),
         };
         let replacement = state.path().join("replacement.bin");
         std_fs::write(&replacement, b"hello").unwrap();

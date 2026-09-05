@@ -13,7 +13,7 @@ use super::*;
 use crate::testutil::link_directory;
 use crate::{
     _core::{
-        object,
+        acl, object,
         storage::{BucketOps, Error as StorageError, ObjectOps},
     },
     _util::testing::body,
@@ -56,7 +56,7 @@ async fn new_from_db_constructs_over_an_opened_database() {
     .unwrap();
     assert_eq!(storage.state_dir(), state.path());
     let b = name("data").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     assert!(storage.bucket_names("").await.unwrap() == vec![b]);
 }
 
@@ -74,7 +74,7 @@ async fn read_only_state_relocation_keeps_root_clean() {
     )
     .unwrap();
     let b = name("data").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     storage
         .put_object(&b, &"a.txt".into(), body(b"hello"))
         .await
@@ -178,17 +178,31 @@ async fn set_max_concurrent_uploads_is_enforced() {
     let root = tempfile::tempdir().unwrap();
     let mut storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     let k = object::key("k").unwrap();
     storage.set_max_concurrent_uploads(1);
     storage
         .multipart_store()
-        .create(&b, &k, None, object::Tags::empty())
+        .create(
+            &b,
+            &k,
+            None,
+            object::Tags::empty(),
+            None,
+            &acl::Acl::default_private(None),
+        )
         .await
         .unwrap();
     let err = storage
         .multipart_store()
-        .create(&b, &k, None, object::Tags::empty())
+        .create(
+            &b,
+            &k,
+            None,
+            object::Tags::empty(),
+            None,
+            &acl::Acl::default_private(None),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("uploads"), "{err}");
@@ -199,7 +213,7 @@ async fn bucket_names_skips_root_level_files() {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     fs::write(root.path().join("notes.txt"), b"not a bucket")
         .await
         .unwrap();
@@ -212,7 +226,7 @@ async fn bucket_names_filters_by_prefix() {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     for raw in ["alpha-1", "alpha-2", "beta-1"] {
-        storage.create_bucket(&name(raw).unwrap()).await.unwrap();
+        storage.create_bucket(&name(raw).unwrap(), None, &acl::Acl::default_private(None)).await.unwrap();
     }
     let names = storage
         .bucket_names("alpha")
@@ -243,7 +257,7 @@ async fn bucket_names_with_links(follow_symlinks: bool) -> Vec<String> {
     )
     .unwrap();
     let b = name("real-bucket").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     #[cfg(unix)]
     symlink(target.path(), root.path().join("linked")).unwrap();
     #[cfg(windows)]
@@ -326,7 +340,7 @@ async fn bucket_names_skips_non_utf8_directory_names() {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     let mut name = b"bad-".to_vec();
     name.push(0xff);
     fs::create_dir(root.path().join(OsStr::from_bytes(&name)))
@@ -428,7 +442,7 @@ async fn resolve_object_file_rejects_a_junction_leaf_when_following_is_disabled(
     let outside = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
     fs::write(outside.path().join("x.txt"), b"s").await.unwrap();
     link_directory(outside.path(), &root.path().join("data/subdir"));
     let k = object::key("subdir/x.txt").unwrap();

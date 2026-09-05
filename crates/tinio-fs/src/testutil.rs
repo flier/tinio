@@ -27,12 +27,44 @@ use tokio::{
 
 use crate::{
     _core::{
-        bucket, checksum,
+        acl, bucket, checksum,
         pipeline::{self, Completion, Error::ShutDown, Reply, Runner, Stats, Task},
     },
     _util::testing::wait_for as util_wait_for,
     Error, FsOptions, FsStorage, etag, testing,
 };
+
+/// A canonical owner id for the ACL tests (64 lowercase hex).
+pub(crate) fn owner_id() -> acl::OwnerId {
+    acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap()
+}
+
+/// A second canonical owner id, distinct from [`owner_id`].
+pub(crate) fn other_owner_id() -> acl::OwnerId {
+    acl::OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap()
+}
+
+/// A group-read grant over the documented AllUsers URI — the standard
+/// test grant.
+pub(crate) fn all_users_read_grant() -> acl::Grant {
+    acl::Grant {
+        grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
+        permission: acl::Permission::Read,
+    }
+}
+
+/// The effective uid of the test process (unix): the probe file's uid IS
+/// the creator's euid — root creates root-owned files, an unprivileged
+/// process owns its own. The chown tests run only when this is `0`
+/// (root; a chown to a foreign uid would otherwise fail with EPERM),
+/// and the fail-closed test runs only when it is NOT `0` (unprivileged
+/// chown fails with EPERM — the failure the test needs).
+#[cfg(unix)]
+pub(crate) fn euid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    let probe = tempfile::tempdir().unwrap();
+    std::fs::metadata(probe.path()).unwrap().uid()
+}
 
 /// A preset server tee slot (spec 2026-08-31): the digest cell already
 /// holds `algorithm`/`base64_value`, so a staged body commits it as the

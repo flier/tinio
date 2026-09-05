@@ -86,7 +86,10 @@ async fn copy_across_volumes(temp: &Path, target: &Path) -> Result<(), Error> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(RESERVED_SEGMENT);
-    fs::create_dir_all(&staging_dir).await?;
+    // Private residue, server-user-owned: the mode hardening only
+    // (spec 2026-09-05 §5a — no chown; `.tinio` dirs stay the server
+    // user's).
+    fsutil::ensure_dir(&staging_dir, fsutil::DirOwnerUid::new(None)).await?;
     let staging = staging_dir.join(Uuid::new_v4().to_string());
     let copied = async {
         fs::copy(temp, &staging).await?;
@@ -174,7 +177,7 @@ impl AtomicWriter {
     /// the sweep / startup repair (failure-handling.md §2C).
     pub async fn write(&self, target: &Path, body: BodyStream) -> Result<ETag, Error> {
         let (temp, etag) = self.stage(body, None).await?;
-        Self::commit(&temp, target, None).await?;
+        Self::commit(&temp, target, None, fsutil::DirOwnerUid::new(None)).await?;
         Ok(etag)
     }
 
@@ -188,6 +191,10 @@ impl AtomicWriter {
     /// and including the bucket root — make the rename's path durable.
     /// The production callers pass the bucket directory; standalone users
     /// (`AtomicWriter::write`) pass `None` and get the leaf-only sync.
+    /// `dir_owner_uid` is the unix dir-hardening context of the parent
+    /// creation (spec 2026-09-05 §5a): the production callers pass the
+    /// bucket owner's mapped uid; private/standalone commits pass the
+    /// default (mode `0700` only, server-user-owned).
     ///
     /// A cross-volume state dir (FR-023 relocation) makes `rename` fail
     /// with `CrossesDevices` — the fallback copies the temp through a
@@ -201,6 +208,7 @@ impl AtomicWriter {
         temp: &Path,
         target: &Path,
         sync_root: Option<&Path>,
+        dir_owner_uid: fsutil::DirOwnerUid,
     ) -> Result<(), Error> {
         // Every commit target is `bucket_dir.join(key)` — a parent always
         // exists (item 8: a `None` here would silently skip the dir
@@ -219,7 +227,7 @@ impl AtomicWriter {
                 // create still runs when the parent is missing (the
                 // first PUT into a new prefix), and the created flag
                 // drives the ancestor-chain sync (F03).
-                created_parent = fsutil::ensure_dir(parent).await?;
+                created_parent = fsutil::ensure_dir(parent, dir_owner_uid).await?;
             }
             match fs::rename(temp, target).await {
                 Ok(()) => Ok(()),
@@ -294,8 +302,10 @@ impl AtomicWriter {
     /// The tmp dir exists in steady state — one probe instead of the
     /// per-component walk (the create still runs when the sweep cleared
     /// it). Shared by [`Self::stage`] and [`Self::stage_copy`].
+    /// Private state, server-user-owned: the mode hardening only
+    /// (spec 2026-09-05 §5a — no chown).
     async fn ensure_tmp_dir(&self) -> io::Result<()> {
-        fsutil::ensure_dir(&self.tmp_dir).await?;
+        fsutil::ensure_dir(&self.tmp_dir, fsutil::DirOwnerUid::new(None)).await?;
         Ok(())
     }
 
@@ -325,14 +335,22 @@ impl AtomicWriter {
 
     /// The stream+hash core: drain `body` into `temp` with bounded
     /// buffers, returning the content MD5 (from the tee's `etag` cell
-    /// when promised — the write skips its own hash).
+    /// when promised — the write skips its own hash). The temp is the
+    /// future object file — created at `0600` on unix regardless of the
+    /// umask (spec 2026-09-05 §5a; the rename preserves the mode).
     async fn write_temp(
         &self,
         temp: &Path,
         body: BodyStream,
         checksum: Option<&checksum::PartChecksum>,
     ) -> Result<ETag, Error> {
-        let mut file = File::create(temp).await?;
+        let mut file = {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(fsutil::FILE_MODE_PRIVATE);
+            options.open(temp).await?
+        };
         let mut hasher = (!checksum.is_some_and(|c| c.etag.is_some())).then(Md5::new);
         let mut stream = pin!(body);
         while let Some(chunk) = stream.next().await {
@@ -393,13 +411,20 @@ impl AtomicWriter {
         let result = task::spawn_blocking(move || {
             // Read+write: the hash pass reads the temp back after the
             // kernel copy (a write-only handle would fail it with EBADF).
-            let mut dst = OpenOptions::new()
+            // The temp is the future object file — created at `0600` on
+            // unix regardless of the umask (spec 2026-09-05 §5a).
+            let mut options = OpenOptions::new();
+            options
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(true)
-                .open(&temp_task)
-                .map_err(Error::from)?;
+                .truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(fsutil::FILE_MODE_PRIVATE);
+            }
+            let mut dst = options.open(&temp_task).map_err(Error::from)?;
             fsutil::copy_file_range(&source, offset, len, &dst)?;
             dst.sync_all()?;
             // The kernel copy advanced the file position — rewind for
@@ -507,7 +532,7 @@ mod tests {
         let (temp, _) = writer.stage(body(b"x"), None).await.unwrap();
         // rename(file, existing-directory) fails on every platform — the
         // target stays untouched and the failed temp is removed (item 7c).
-        let err = AtomicWriter::commit(&temp, &target, None)
+        let err = AtomicWriter::commit(&temp, &target, None, fsutil::DirOwnerUid::new(None))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Io(_)));
@@ -582,7 +607,9 @@ mod tests {
         fs::set_permissions(&root, Permissions::from_mode(0o300))
             .await
             .unwrap();
-        let result = AtomicWriter::commit(&temp, &target, Some(&root)).await;
+        let result =
+            AtomicWriter::commit(&temp, &target, Some(&root), fsutil::DirOwnerUid::new(None))
+                .await;
         fs::set_permissions(&root, Permissions::from_mode(0o755))
             .await
             .unwrap();

@@ -18,7 +18,7 @@ use super::{Error, FsStorage};
 use crate::_core::storage::ObjectOps;
 use crate::{
     _core::{
-        BodyStream, bucket, checksum,
+        BodyStream, acl, bucket, checksum,
         multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
         object::{self, Info},
         storage::{
@@ -26,6 +26,7 @@ use crate::{
             UploadsListing, access_denied, invalid_key, key_marker_order, split_uploads_order,
         },
     },
+    fsutil,
     write::AtomicWriter,
 };
 
@@ -82,6 +83,8 @@ impl MultipartOps for FsStorage {
         key: &object::Key,
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<MultipartUpload, Error> {
         self.ensure_bucket(bucket).await?;
         // The multipart path must not be a backdoor for `.tinio` (FR-020).
@@ -94,7 +97,7 @@ impl MultipartOps for FsStorage {
             return Err(invalid_key(key.to_string()).into());
         }
         self.multipart_store
-            .create(bucket, key, checksum, tags)
+            .create(bucket, key, checksum, tags, owner, acl)
             .await
     }
 
@@ -236,9 +239,23 @@ impl MultipartOps for FsStorage {
         let phase2 = async {
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
+            // The unix dir hardening (spec 2026-09-05 §5a): a prefix
+            // dir implicitly created by the completion lands `0700` and
+            // chowned to the bucket owner's mapped uid.
+            #[cfg(unix)]
+            let dir_owner_uid = self.bucket_owner_uid(bucket).await;
             // F03: the bucket root bounds the first-into-a-new-prefix
             // ancestor sync.
-            AtomicWriter::commit(&temp, &target, Some(&bucket_dir)).await?;
+            AtomicWriter::commit(
+                &temp,
+                &target,
+                Some(&bucket_dir),
+                #[cfg(unix)]
+                fsutil::DirOwnerUid(dir_owner_uid),
+                #[cfg(not(unix))]
+                fsutil::DirOwnerUid,
+            )
+            .await?;
             Ok::<_, Error>(target)
         }
         .await;
@@ -249,19 +266,44 @@ impl MultipartOps for FsStorage {
                 return Err(err);
             }
         };
-        // Consume the upload and persist the object's meta entry in one
-        // all-or-nothing transaction (rename → single-txn state, §5.3).
-        // On failure the records survive the rollback, so a client retry
-        // re-runs the completion idempotently — the rename already
-        // landed, and re-assembly overwrites it atomically.
         let metadata = fs::metadata(&target).await?;
+        // The unix ownership hardening (spec 2026-09-05 §5a): the
+        // completion is where the assembled object lands, so the final
+        // chown happens here — the upload's create-time owner is read
+        // from the upload row (never re-ferried through the interface),
+        // and an unmapped owner stays server-user-owned (still `0600`).
+        // A chown failure fails closed BEFORE the state transaction
+        // consumes the upload (the records must survive for the retry):
+        // remove the file and error the request — a wrongly-owned 0600
+        // file must not be left behind, and a retry re-runs the whole
+        // completion idempotently.
+        #[cfg(unix)]
+        if !self.owner_uids.is_empty() {
+            let stored_owner = self
+                .handle
+                .read(|txn| {
+                    let uploads = crate::_store::upload::Table::open_readonly(txn)?;
+                    Ok(uploads
+                        .get_matching(bucket, key, upload_id)?
+                        .and_then(|(_, _, _, owner_wire, _)| crate::_store::decode_owner_wire(&owner_wire)))
+                })
+                .map_err(Error::from)?;
+            if let Some(uid) = self.owner_uid(stored_owner.as_ref()) {
+                if let Err(err) = fsutil::chown_file(&target, uid).await {
+                    let _ = fs::remove_file(&target).await;
+                    return Err(err.into());
+                }
+            }
+        }
         let size = metadata.len();
         let mtime = metadata.modified()?;
         // The single state transaction: consume the upload records,
         // persist the object row (tags + the interface-computed composite
-        // checksum — the backend never hashes), and retain the assembled
-        // parts in `OBJECT_PARTS`.
-        let tags = self
+        // checksum — the backend never hashes — plus the upload's
+        // create-time owner/ACL, read from the row this transaction
+        // consumes, the tags precedent), and retain the assembled parts
+        // in `OBJECT_PARTS`.
+        let (tags, owner, acl) = self
             .complete_object_state(
                 bucket,
                 key,
@@ -292,6 +334,8 @@ impl MultipartOps for FsStorage {
             etag,
             tags,
             checksum,
+            owner,
+            acl,
         })
     }
 
@@ -360,7 +404,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            object,
+            acl, object,
             storage::{BucketOps, ObjectOps},
         },
         _util::testing::{body, read_body},
@@ -373,10 +417,10 @@ mod tests {
         // stream the same way) must leave no part file and no PARTS row.
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let err = storage
@@ -418,10 +462,10 @@ mod tests {
     async fn multipart_lifecycle_via_contract() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let mut parts = Vec::new();
@@ -499,10 +543,10 @@ mod tests {
     async fn part_number_marker_pagination() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         for i in 1..=5u32 {
@@ -553,13 +597,15 @@ mod tests {
     async fn list_multipart_uploads_filters_by_prefix() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
             .create_multipart_upload(
                 &b,
                 &object::key("a.bin").unwrap(),
                 None,
                 object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -569,6 +615,8 @@ mod tests {
                 &object::key("b.bin").unwrap(),
                 None,
                 object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -595,7 +643,7 @@ mod tests {
     async fn delimiter_rollup_paginates_and_resumes() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
             storage
                 .create_multipart_upload(
@@ -603,6 +651,8 @@ mod tests {
                     &object::key(key).unwrap(),
                     None,
                     object::Tags::empty(),
+                    None,
+                    &acl::Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -649,14 +699,14 @@ mod tests {
     async fn bare_key_marker_skips_the_whole_key_group() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("same.bin").unwrap();
         let u1 = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let page = storage
@@ -678,14 +728,14 @@ mod tests {
     async fn same_key_uploads_paginate_without_skipping() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("same.bin").unwrap();
         storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let page1 = storage
@@ -742,7 +792,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let part = storage
@@ -792,11 +842,18 @@ mod tests {
         // checksum (the backend never hashes).
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let k = object::key("big.bin").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, tags.clone())
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                tags.clone(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // Two parts: the non-final first must meet the 5 MiB S3 minimum;
@@ -872,7 +929,7 @@ mod tests {
         // A second completion over the same key replaces the rows (the
         // old completion's parts must not accumulate).
         let upload2 = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty())
+            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let p = storage
@@ -895,5 +952,62 @@ mod tests {
         let parts = storage.list_object_parts(&b, &k).await.unwrap();
         assert_eq!(parts.len(), 1, "re-completion replaces the retained rows");
         assert_eq!(u32::from(parts[0].part_number), 3);
+    }
+
+    #[tokio::test]
+    async fn fs_complete_applies_the_uploads_owner_and_acl() {
+        // The create-time owner/ACL ride in the upload row and are
+        // applied by the completion — never re-ferried through the
+        // interface (the tags precedent, spec 2026-09-05).
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let k = object::key("big.bin").unwrap();
+        let owner = crate::testutil::owner_id();
+        let grants = vec![crate::testutil::all_users_read_grant()];
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                Some(&owner),
+                &acl::Acl {
+                    owner: Some(owner.clone()),
+                    grants: grants.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.owner.as_ref(), Some(&owner));
+        assert_eq!(upload.acl.grants, grants);
+        let part = storage
+            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"hello"), None)
+            .await
+            .unwrap();
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload.upload_id,
+                &[crate::_core::CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.owner.as_ref(), Some(&owner));
+        assert_eq!(info.acl.grants, grants);
+        let head = storage.head_object(&b, &k).await.unwrap();
+        assert_eq!(head.owner.as_ref(), Some(&owner));
+        assert_eq!(head.acl.grants, grants);
+        let got = storage.get_object_acl(&b, &k).await.unwrap();
+        assert_eq!(got.owner.as_ref(), Some(&owner));
+        assert_eq!(got.grants, grants);
     }
 }

@@ -2,10 +2,12 @@
 //!
 //! Entries live in the `OBJECT_META` table of `<state-dir>/meta.redb`:
 //! key `(bucket, key)`, value `(etag hex, size, mtime unix nanos, file
-//! identity, tags wire, checksum wire)` (spec 2026-08-31 — the object row
-//! also records the API-written tag set and the write-time checksum). The
-//! composite key keeps one bucket's entries contiguous, so `walk` and
-//! `remove_bucket` are cheap prefix range scans.
+//! identity, tags wire, checksum wire, owner wire, acl wire)` (spec
+//! 2026-08-31 — the object row also records the API-written tag set and
+//! the write-time checksum; spec 2026-09-05 — the owner and ACL elements,
+//! the owner riding its own wire). The composite key keeps one bucket's
+//! entries contiguous, so `walk` and `remove_bucket` are cheap prefix
+//! range scans.
 //!
 //! Entries are served only when size + mtime match the object file
 //! (FR-022); otherwise the ETag is recomputed streaming and the entry
@@ -46,7 +48,7 @@ pub use object::{Key, key};
 
 pub use crate::bucket::{Name, name};
 use crate::{
-    _core::{checksum, etag::ETag, from_nanos, object, to_nanos},
+    _core::{acl, checksum, etag::ETag, from_nanos, object, to_nanos},
     _store::{meta, object_part},
     Error, bucket,
     database::{Handle, for_bucket_strict},
@@ -409,7 +411,7 @@ impl Store {
             if composed_gate(&stored.etag, stored.size, size)
                 && composed_keep(stored.file_identity, stored.mtime, identity, mtime)
             {
-                let (tags, checksum) = self
+                let (tags, checksum, owner, acl) = self
                     .rewrite_preserving(bucket, key, &stored.etag, size, mtime, identity)
                     .await?;
                 return Ok((
@@ -420,6 +422,8 @@ impl Store {
                         file_identity: identity,
                         tags,
                         checksum,
+                        owner,
+                        acl,
                     },
                     false,
                 ));
@@ -430,7 +434,7 @@ impl Store {
         // return above) — the rewrite rule has ONE home (F19).
         let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
         let etag = ETag::Single(digest);
-        let (tags, checksum) = self
+        let (tags, checksum, owner, acl) = self
             .rewrite_preserving(bucket, key, &etag, size, mtime, identity)
             .await?;
         Ok((
@@ -441,6 +445,8 @@ impl Store {
                 file_identity: identity,
                 tags,
                 checksum,
+                owner,
+                acl,
             },
             true,
         ))
@@ -489,13 +495,14 @@ impl Store {
 
     /// One write transaction: read the row being replaced, then
     /// re-insert it with `etag`/`size`/`mtime`/`identity` refreshed and
-    /// the row's tags + checksum elements carried over (empty/`None`
-    /// when the row is absent) — the content-derived rewrite semantics
-    /// (see the module doc). Returns the elements written, so the
-    /// caller's response metadata matches the row exactly (the
-    /// read-modify-write runs inside the single write transaction —
-    /// redb's serialized writers make the carried-over elements the
-    /// latest committed at rewrite time).
+    /// the row's tags + checksum + owner + ACL elements carried over
+    /// (empty/`None`/the private default when the row is absent) — the
+    /// content-derived rewrite semantics (see the module doc). Returns
+    /// the elements written, so the caller's response metadata matches
+    /// the row exactly (the read-modify-write runs inside the single
+    /// write transaction — redb's serialized writers make the
+    /// carried-over elements the latest committed at rewrite time).
+    #[allow(clippy::type_complexity)]
     async fn rewrite_preserving(
         &self,
         bucket: &bucket::Name,
@@ -504,7 +511,10 @@ impl Store {
         size: u64,
         mtime: SystemTime,
         identity: u64,
-    ) -> Result<(object::Tags, Option<checksum::Recorded>), Error> {
+    ) -> Result<
+        (object::Tags, Option<checksum::Recorded>, Option<acl::OwnerId>, acl::Acl),
+        Error,
+    > {
         // The closure runs on the blocking pool (`Handle::write` is
         // async, G3 revision) — clone the borrowed captures into it.
         let bucket = bucket.clone();
@@ -518,6 +528,10 @@ impl Store {
                     .as_ref()
                     .map_or_else(object::Tags::empty, |row| row.tags.clone());
                 let checksum = row.as_ref().and_then(|row| row.checksum.clone());
+                let owner = row.as_ref().and_then(|row| row.owner.clone());
+                let acl = row
+                    .as_ref()
+                    .map_or_else(|| acl::Acl::default_private(None), |row| row.acl.clone());
                 table.put(
                     &bucket,
                     &key,
@@ -528,9 +542,11 @@ impl Store {
                         file_identity: identity,
                         tags: tags.clone(),
                         checksum: checksum.clone(),
+                        owner: owner.clone(),
+                        acl: acl.clone(),
                     },
                 )?;
-                Ok((tags, checksum))
+                Ok((tags, checksum, owner, acl))
             })
             .await
             .map_err(Into::into)
@@ -607,12 +623,14 @@ impl Store {
         self.handle
             .write(move |txn| {
                 let mut table = meta::Table::open(txn)?;
-                // A row that appeared during the hash keeps its checksum
-                // (the etag/size/mtime/identity are the hash-time ones —
-                // the row describes the same file read at hash time).
-                let checksum = table
-                    .get(&bucket, &key)?
-                    .and_then(|row| row.checksum.clone());
+                // A row that appeared during the hash keeps its checksum,
+                // owner and ACL (the etag/size/mtime/identity are the
+                // hash-time ones — the row describes the same file read
+                // at hash time).
+                let (checksum, owner, acl) = table.get(&bucket, &key)?.map_or_else(
+                    || (None, None, acl::Acl::default_private(None)),
+                    |row| (row.checksum, row.owner, row.acl),
+                );
                 table.put(
                     &bucket,
                     &key,
@@ -623,6 +641,8 @@ impl Store {
                         file_identity: identity,
                         tags: tags.clone(),
                         checksum,
+                        owner,
+                        acl,
                     },
                 )?;
                 Ok(())
@@ -646,6 +666,64 @@ impl Store {
             })
             .await
             .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// The stored ACL of `key` — the owner element recombined with the
+    /// grant set (the row form keeps them apart); the private default
+    /// with no owner when the row is absent (a hand-dropped object has
+    /// never had an ACL written) or its wires are domain-invalid
+    /// (self-healing).
+    pub async fn acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<acl::Acl, Error> {
+        Ok(self
+            .stored_entry(bucket, key)
+            .await?
+            .map_or_else(|| acl::Acl::default_private(None), |row| acl::Acl {
+                owner: row.owner,
+                grants: row.acl.grants,
+            }))
+    }
+
+    /// Replace the stored grant set of `key` (S3 PutObjectAcl —
+    /// replace-all, no merge), preserving the row's other elements —
+    /// the owner element included, a put never changes it. One
+    /// read-modify-write transaction, mirroring [`Self::set_tags`]
+    /// (last-writer-wins against concurrent writers; no per-key lock).
+    /// Returns whether a row was updated: a missing row is not created
+    /// here (the object file exists but its row is absent — a
+    /// hand-dropped object; the row self-heals on the next read with the
+    /// private default, matching the tags op's contract).
+    pub async fn set_acl(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        grants: &acl::AclGrants,
+    ) -> Result<bool, Error> {
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let fresh = acl::Acl {
+            owner: None,
+            grants: grants.clone(),
+        };
+        self.handle
+            .write_if(move |txn| {
+                let mut table = meta::Table::open(txn)?;
+                let Some(row) = table.get(&bucket, &key)? else {
+                    // Nothing to change — no commit (no fsync).
+                    return Ok(None);
+                };
+                table.put(
+                    &bucket,
+                    &key,
+                    &meta::Stored {
+                        acl: fresh.clone(),
+                        ..row
+                    },
+                )?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|wrote| wrote.is_some())
             .map_err(Into::into)
     }
 
@@ -702,6 +780,10 @@ impl Store {
                         .as_ref()
                         .map_or_else(object::Tags::empty, |row| row.tags.clone());
                     let checksum = row.as_ref().and_then(|row| row.checksum.clone());
+                    let owner = row.as_ref().and_then(|row| row.owner.clone());
+                    let acl = row
+                        .as_ref()
+                        .map_or_else(|| acl::Acl::default_private(None), |row| row.acl.clone());
                     table.put(
                         &bucket,
                         &entry.key,
@@ -712,6 +794,8 @@ impl Store {
                             file_identity: entry.identity,
                             tags: tags.clone(),
                             checksum: checksum.clone(),
+                            owner: owner.clone(),
+                            acl: acl.clone(),
                         },
                     )?;
                 }
@@ -917,7 +1001,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{bucket, object},
+        _core::{acl, bucket, object},
         _store::meta::{Stored, Table},
         _util::testing::etag,
         database, fsutil, meta,
@@ -937,7 +1021,7 @@ mod tests {
         {
             let mut table = Table::open(&mut txn).unwrap();
             table
-                .insert((bucket, key), ("not-an-etag", 1, 1, 0, "", ""))
+                .insert((bucket, key), ("not-an-etag", 1, 1, 0, "", "", "", ""))
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -954,7 +1038,7 @@ mod tests {
             table
                 .insert(
                     (bucket, key),
-                    ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 0, "", ""),
+                    ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 0, "", "", "", ""),
                 )
                 .unwrap();
         }
@@ -1387,7 +1471,7 @@ mod tests {
                 table
                     .insert(
                         ("data", "a.txt"),
-                        ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9, "", ""),
+                        ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9, "", "", "", ""),
                     )
                     .unwrap();
             }
@@ -1544,6 +1628,149 @@ mod tests {
             .unwrap();
         assert_eq!(etag, ETag::from_content(b"hello"));
         assert!(store.get(&b, &k).await.unwrap().is_some());
+    }
+
+    fn owner() -> acl::OwnerId {
+        acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap()
+    }
+
+    fn group_read_grant() -> acl::Grant {
+        acl::Grant {
+            grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
+            permission: acl::Permission::Read,
+        }
+    }
+
+    /// Inject garbage owner/ACL wires straight into the table (the same
+    /// defensive pattern as [`corrupt_entry`] — the row's etag stays
+    /// valid, so the row is served).
+    fn corrupt_acl_entry(state_dir: &Path, bucket: &str, key: &str) {
+        let db = database::open(state_dir).unwrap().db;
+        let mut txn = db.begin_write().unwrap();
+        {
+            let mut table = Table::open(&mut txn).unwrap();
+            table
+                .insert(
+                    (bucket, key),
+                    (
+                        "d41d8cd98f00b204e9800998ecf8427e",
+                        1,
+                        1,
+                        0,
+                        "a=b",
+                        "",
+                        "not-a-canonical-id",
+                        "id=short,READ",
+                    ),
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fs_object_acl_round_trip_and_replace() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                4,
+                mtime(100),
+                0,
+            )
+            .await
+            .unwrap();
+        // A fresh row has no owner and the private default.
+        assert_eq!(
+            store.acl(&b, &k).await.unwrap(),
+            acl::Acl::default_private(None)
+        );
+        // Put → Get round-trip (replace-all, no merge).
+        let grants = vec![group_read_grant()];
+        assert!(store.set_acl(&b, &k, &grants).await.unwrap());
+        assert_eq!(store.acl(&b, &k).await.unwrap().grants, grants);
+        let replaced: acl::AclGrants = Vec::new();
+        assert!(store.set_acl(&b, &k, &replaced).await.unwrap());
+        assert_eq!(store.acl(&b, &k).await.unwrap().grants, replaced);
+        // The row's other elements survive the ACL writes.
+        let record = store.get(&b, &k).await.unwrap().unwrap();
+        assert_eq!(record.etag, etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(record.size, 4);
+        // A missing row is not created (the caller heals it first, the
+        // tags op's contract).
+        let missing = object::key("ghost.txt").unwrap();
+        assert!(!store.set_acl(&b, &missing, &grants).await.unwrap());
+        assert_eq!(
+            store.acl(&b, &missing).await.unwrap(),
+            acl::Acl::default_private(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_object_acl_put_preserves_the_owner_element() {
+        let state = tempfile::tempdir().unwrap();
+        let owner = owner();
+        {
+            // A row written with a recorded owner (the backend commit
+            // path writes it — the store has no owner API; inject the
+            // wire directly, the defensive pattern).
+            let db = database::open(state.path()).unwrap().db;
+            let mut txn = db.begin_write().unwrap();
+            {
+                let mut table = Table::open(&mut txn).unwrap();
+                table
+                    .insert(
+                        ("data", "a.txt"),
+                        (
+                            "d41d8cd98f00b204e9800998ecf8427e",
+                            1,
+                            1,
+                            0,
+                            "",
+                            "",
+                            owner.as_str(),
+                            "",
+                        ),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        // get_object_acl recombines the owner element with the grants.
+        assert_eq!(store.acl(&b, &k).await.unwrap().owner.as_ref(), Some(&owner));
+        // A put replaces the grants and never the owner.
+        let grants = vec![group_read_grant()];
+        assert!(store.set_acl(&b, &k, &grants).await.unwrap());
+        let got = store.acl(&b, &k).await.unwrap();
+        assert_eq!(got.owner.as_ref(), Some(&owner));
+        assert_eq!(got.grants, grants);
+    }
+
+    #[tokio::test]
+    async fn fs_object_acl_self_heals_on_garbage() {
+        let state = tempfile::tempdir().unwrap();
+        corrupt_acl_entry(state.path(), "data", "a.txt");
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        // Garbage owner/ACL wires self-heal to no owner and the private
+        // default; the row itself is still served (its etag is valid).
+        assert_eq!(
+            store.acl(&b, &k).await.unwrap(),
+            acl::Acl::default_private(None)
+        );
+        let record = store.get(&b, &k).await.unwrap().unwrap();
+        assert_eq!(record.etag, etag("d41d8cd98f00b204e9800998ecf8427e"));
+        // The tags element survives independently.
+        assert_eq!(store.tags(&b, &k).await.unwrap().to_wire(), "a=b");
     }
 
     #[tokio::test]

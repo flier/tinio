@@ -46,7 +46,7 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
     let storage = FsStorage::new(root.path(), fs_options(state.path())).unwrap();
 
     let b = bucket_name("data");
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None)).await.unwrap();
     storage
         .put_object(&b, &"hello.txt".into(), body(b"hello"))
         .await
@@ -55,7 +55,14 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
     // Multipart lifecycle leaves part files only.
     let key = "big.bin".into();
     let upload = storage
-        .create_multipart_upload(&b, &key, None, object::Tags::empty())
+        .create_multipart_upload(
+            &b,
+            &key,
+            None,
+            object::Tags::empty(),
+            None,
+            &tinio_core::acl::Acl::default_private(None),
+        )
         .await
         .unwrap();
     storage
@@ -111,7 +118,7 @@ async fn deleting_meta_redb_self_heals() {
     let state_dir = state.path().to_path_buf();
     let storage = FsStorage::new(root.path(), fs_options(&state_dir)).unwrap();
     let b = bucket_name("data");
-    storage.create_bucket(&b).await.unwrap();
+    storage.create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None)).await.unwrap();
     storage
         .put_object(&b, &"a.txt".into(), body(b"hello"))
         .await

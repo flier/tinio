@@ -27,7 +27,7 @@ pub(crate) fn for_bucket_strict(
         table.deref(),
         (bucket, ""),
         |b, _| b == bucket,
-        |_, raw_key, (etag, size, mtime, _, _, _)| {
+        |_, raw_key, (etag, size, mtime, _, _, _, _, _)| {
             let key = object::key(raw_key).map_err(|err| corrupt_meta(raw_key, err))?;
             let etag = ETag::new(etag).map_err(|err| corrupt_meta(raw_key, err))?;
             visit(key, etag, size, mtime)

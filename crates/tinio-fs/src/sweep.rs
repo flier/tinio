@@ -70,6 +70,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     owner_uids: std::collections::HashMap::new(),
 ///     io_pipeline: Arc::new(InlineRunner::default()),
 ///     remove_pipeline: Arc::new(InlineRunner::default()),
 ///     db_pipeline: Arc::new(InlineRunner::default()),
@@ -242,7 +243,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            bucket, object,
+            acl, bucket, object,
             storage::{BucketOps, MultipartOps},
         },
         _util::testing::body,
@@ -299,9 +300,9 @@ mod tests {
             (root, storage)
         };
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
-            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty())
+            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
@@ -341,9 +342,9 @@ mod tests {
         fs::create_dir(state.path().join("tmp")).unwrap();
         fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
+        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty())
+            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty(), None, &acl::Acl::default_private(None))
             .await
             .unwrap();
         storage
