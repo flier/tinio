@@ -25,8 +25,9 @@
 //! multipart lifecycle with composed-ETag verification (FR-014/FR-022);
 //! the tagging contract — object and bucket tag sets, the tagged write
 //! paths (commit/copy/multipart completion) and recorded checksums;
-//! rename_object; and the completed-object part listing with its
-//! OBJECT_PARTS lifecycle (spec 2026-08-31).
+//! the bucket CORS trio with zero-rule normalization and idempotent
+//! delete; rename_object; and the completed-object part listing with
+//! its OBJECT_PARTS lifecycle (spec 2026-08-31).
 //! [`tinio_mem::MemoryStorage`] — the in-memory reference backend —
 //! backs conformance tests in the `tinio-mem` crate.
 //!
@@ -51,6 +52,7 @@ use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
     ListPartsParams, ListUploadsParams, MultipartOps, Storage, bucket,
     checksum::{self, Algorithm, Type},
+    cors::{CorsConfig, CorsRule},
     multipart, object, storage,
     storage::Error::*,
 };
@@ -582,6 +584,48 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
         "put_bucket_tags on a missing bucket must be NoSuchBucket",
     );
     storage.delete_bucket_tags(&missing).await.unwrap(); // idempotent
+
+    // Bucket CORS: put/get round-trip, re-put replaces, delete clears —
+    // with the zero-rule normalization (a `CorsConfig::default()` through
+    // the storage layer is "no config", op-review G2) and the
+    // missing-bucket get semantics.
+    let config = CorsConfig {
+        rules: vec![CorsRule {
+            id: Some("one".into()),
+            allowed_methods: vec!["GET".into()],
+            allowed_origins: vec!["*".into()],
+            allowed_headers: None,
+            expose_headers: None,
+            max_age_seconds: None,
+        }],
+    };
+    storage.put_bucket_cors(b, &config).await.unwrap();
+    let got = storage.get_bucket_cors(b).await.unwrap();
+    check(
+        got == Some(config.clone()),
+        "bucket CORS config must round-trip",
+    );
+    storage.put_bucket_cors(b, &CorsConfig::default()).await.unwrap();
+    let got = storage.get_bucket_cors(b).await.unwrap();
+    check(
+        got.is_none(),
+        "a zero-rule CORS config must store as no config",
+    );
+    storage.put_bucket_cors(b, &config).await.unwrap();
+    let got = storage.get_bucket_cors(b).await.unwrap();
+    check(
+        got == Some(config.clone()),
+        "a re-put CORS config must round-trip",
+    );
+    let err = into_core_error(storage.get_bucket_cors(&missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "get_bucket_cors on a missing bucket must be NoSuchBucket",
+    );
+    storage.delete_bucket_cors(b).await.unwrap();
+    let got = storage.get_bucket_cors(b).await.unwrap();
+    check(got.is_none(), "delete_bucket_cors must clear the config");
+    storage.delete_bucket_cors(b).await.unwrap(); // idempotent
 
     // Delete non-empty (a folder marker counts as content).
     let marker = object::key("dir/").unwrap();
