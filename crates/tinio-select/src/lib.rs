@@ -9,5 +9,6 @@
 //! `docs/superpowers/specs/2026-09-04-select-object-content-design.md`.
 
 pub mod error;
+pub mod row;
 
 pub use error::SelectError;
