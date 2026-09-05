@@ -106,6 +106,9 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
     if tagged("tagging-off") {
         caps.tagging = false;
     }
+    if tagged("cors-off") {
+        caps.cors = false;
+    }
     if tagged("minimal-caps") {
         caps.multipart = false;
         caps.copy_object = false;
