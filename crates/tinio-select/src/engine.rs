@@ -23,7 +23,7 @@ use sqlparser::ast::{
 
 use crate::SelectError;
 use crate::row::{Field, Record, Value, display, parse_number};
-use crate::sql::{Projection, QueryPlan};
+use crate::sql::{Projection, QueryPlan, contains_aggregate};
 
 /// One output row: keys (alias > plain field name > the record's names) and
 /// the projected values (a filtered row never reaches here).
@@ -309,7 +309,7 @@ fn accumulate_extrema(
                 *current = Some(Value::String(text));
             }
         }
-        None => match numeric(&v) {
+        None => match first_contrib_spine(&v)? {
             Some(d) => {
                 col.extrema = Some(ExtremaMode::Numeric);
                 *current = Some(Value::Decimal(d));
@@ -321,6 +321,30 @@ fn accumulate_extrema(
         },
     }
     Ok(())
+}
+
+/// The first-contributor typing probe for MIN/MAX: a value that parses
+/// numerically opens the numeric spine; a plain non-numeric string opens
+/// the string spine. A number that exceeds the 28-digit spine is a hard
+/// error — the precision contract, never a silent string-column demotion
+/// (a 29-digit "9…9" must not lexicographically lose to "2").
+fn first_contrib_spine(v: &Value) -> Result<Option<Decimal>, SelectError> {
+    match v {
+        Value::Decimal(d) => Ok(Some(*d)),
+        Value::Int(i) => Ok(Some(Decimal::from(*i))),
+        Value::String(s) | Value::RawNumber(s) => {
+            // Mirrors `parse_number`'s digit guard (row.rs) — the probe runs
+            // before it so the precision error can be separated from the
+            // plain non-numeric fall-through to string mode.
+            if s.chars().filter(char::is_ascii_digit).count() > 28 {
+                return Err(SelectError::Value(format!(
+                    "numeric value exceeds 28-digit precision: {s}"
+                )));
+            }
+            Ok(parse_number(s).ok())
+        }
+        _ => Ok(None),
+    }
 }
 
 /// One aggregate column's finished value: COUNT → Int; SUM/AVG/MIN/MAX with
@@ -371,6 +395,11 @@ fn aggregate_kind(item: &Projection) -> Result<AggKind, SelectError> {
     }
     match (name.as_str(), list.args.as_slice()) {
         ("count", [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok(AggKind::CountStar),
+        (_, [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) if contains_aggregate(e) => {
+            // Parity with the parse-layer rule: an aggregate nested in the
+            // argument is not a bare call.
+            Err(not_aggregate())
+        }
         ("count", [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => {
             Ok(AggKind::Count(e.clone()))
         }
@@ -1728,6 +1757,21 @@ mod tests {
         match engine.next(csv(&["x"], &["_1"])) {
             Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
             other => panic!("expected invalid numeric error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_max_first_contributor_over_precision_is_an_error() {
+        // A 29+ digit first contributor hits the 28-digit precision contract
+        // — the error surfaces on the spot; it is never demoted to a string
+        // column, which would silently answer a lexicographic "2".
+        let big = "9".repeat(29);
+        let mut engine = Engine::new(parse("SELECT min(s._1) FROM S3Object s").unwrap());
+        match engine.next(csv(&[big.as_str()], &["_1"])) {
+            Err(SelectError::Value(m)) => {
+                assert_eq!(m, format!("numeric value exceeds 28-digit precision: {big}"))
+            }
+            other => panic!("expected precision error, got {other:?}"),
         }
     }
 

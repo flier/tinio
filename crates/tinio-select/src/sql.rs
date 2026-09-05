@@ -690,7 +690,9 @@ fn positions(sql: &str) -> HashMap<(u64, u64), usize> {
 
 /// Does the select/list expression tree contain one of the five aggregate
 /// functions (`count`/`sum`/`avg`/`min`/`max`, case-insensitive)?
-fn contains_aggregate(expr: &Expr) -> bool {
+/// Shared with the engine (Task 7): an aggregate nested inside another
+/// aggregate's argument is rejected in both layers.
+pub(crate) fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(f) => is_aggregate_name(&f.name) || function_exprs(f).iter().any(|e| contains_aggregate(e)),
         Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
@@ -806,6 +808,12 @@ fn validate_aggregate_item(expr: &Expr) -> Result<(), SelectError> {
     let name = part.value.to_ascii_lowercase();
     match (name.as_str(), list.args.as_slice()) {
         ("count", [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok(()),
+        (_, [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) if contains_aggregate(e) => {
+            // An aggregate nested in the argument (`count(sum(s._1))`) is
+            // not a bare call — refused here, so the engine's internal
+            // guard can never surface for a user-constructed query.
+            Err(not_aggregate())
+        }
         (_, [FunctionArg::Unnamed(FunctionArgExpr::Expr(_))]) => Ok(()),
         _ => Err(not_aggregate()),
     }
@@ -1018,6 +1026,17 @@ mod tests {
         // aggregate call: rejected at parse like the mixed list.
         rej(
             "SELECT count(*) + 1 FROM S3Object s",
+            "non-aggregate expression in aggregate select list",
+        );
+    }
+
+    #[test]
+    fn reject_nested_aggregate_arg() {
+        // An aggregate nested in an aggregate's argument is still not a bare
+        // call — the arg carrying its own aggregate is the same invalid
+        // shape, refused at parse (never leaking an internal guard).
+        rej(
+            "SELECT count(sum(s._1)) FROM S3Object s",
             "non-aggregate expression in aggregate select list",
         );
     }
