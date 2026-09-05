@@ -11,6 +11,13 @@
 //! declared once on [`Storage`]; it must convert into the contract error
 //! [`Error`] for the mapping layer and the conformance harness.
 //!
+//! Owner and ACL are contract-level state: the write params of
+//! [`BucketOps::create_bucket`], [`ObjectOps::commit_object`],
+//! [`ObjectOps::copy_object`], and
+//! [`MultipartOps::create_multipart_upload`], the four ACL methods
+//! (`get/put_bucket_acl`, `get/put_object_acl`), and the row echoes on
+//! [`crate::object::Info`] and [`crate::MultipartUpload`].
+//!
 //! Methods are `async fn` via the `async_trait` macro — every returned future is
 //! `Send`, which the s3s/hyper hosting layers require. The contract is used
 //! generically (`S: Storage`), not as `dyn Storage`: the associated error
@@ -89,7 +96,7 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 /// impl MultipartOps for X { ... }
 /// impl Storage for X { type Error = MyError; }
 ///
-/// use tinio_core::{bucket, ListBucketsParams};
+/// use tinio_core::{acl, bucket, ListBucketsParams};
 /// use tinio_mem::MemoryStorage;
 /// use tokio::runtime::Runtime;
 ///
@@ -98,13 +105,19 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 /// let buckets = Runtime::new()
 ///     .unwrap()
 ///     .block_on(async {
-///         storage.create_bucket(&bucket).await.unwrap();
 ///         storage
-///             .list_buckets(ListBucketsParams {
-///                 prefix: String::new(),
-///                 start_after: None,
-///                 max_buckets: 10,
-///             })
+///             .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+///             .await
+///             .unwrap();
+///         storage
+///             .list_buckets(
+///                 ListBucketsParams {
+///                     prefix: String::new(),
+///                     start_after: None,
+///                     max_buckets: 10,
+///                 },
+///                 None,
+///             )
 ///             .await
 ///             .unwrap()
 ///             .buckets

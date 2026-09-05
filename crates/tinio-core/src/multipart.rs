@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use derive_more::{AsRef, Deref, Display, Into};
 
 use crate::{
-    bucket, checksum,
+    acl, bucket, checksum,
     etag::ETag,
     object,
     storage::{self, Error::*},
@@ -104,7 +104,7 @@ pub struct CompletedPart {
 /// ```rust
 /// use std::time::SystemTime;
 ///
-/// use tinio_core::{MultipartUpload, object};
+/// use tinio_core::{MultipartUpload, acl, object};
 ///
 /// let upload = MultipartUpload {
 ///     upload_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
@@ -113,6 +113,8 @@ pub struct CompletedPart {
 ///     initiated_at: SystemTime::UNIX_EPOCH,
 ///     checksum: None,
 ///     tags: object::Tags::empty(),
+///     owner: None,
+///     acl: acl::Acl::default_private(None),
 /// };
 /// assert_eq!(upload.upload_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
 /// ```
@@ -131,6 +133,13 @@ pub struct MultipartUpload {
     /// The create-time object tags (empty when none; persisted in the
     /// upload state and applied to the object at completion).
     pub tags: object::Tags,
+    /// The create-time owner element (`None` = the empty owner wire —
+    /// the lazy default owner; persisted in the upload state and applied
+    /// to the object at completion; the ListParts access check needs it).
+    pub owner: Option<acl::OwnerId>,
+    /// The create-time ACL (persisted in the upload state and applied to
+    /// the object at completion).
+    pub acl: acl::Acl,
 }
 
 /// Metadata of a single uploaded multipart part.
@@ -219,6 +228,8 @@ mod tests {
             initiated_at: SystemTime::UNIX_EPOCH,
             checksum: None,
             tags: object::Tags::empty(),
+            owner: None,
+            acl: acl::Acl::default_private(None),
         };
         assert_eq!(m.upload_id, "uuid-v4");
         assert_eq!(m.key.as_ref(), "big.bin");

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use derive_more::Debug;
 
 use super::{Storage, body::BodyStream, range::ByteRange};
-use crate::{bucket, checksum, etag::ETag, multipart::ObjectPart, object};
+use crate::{acl, bucket, checksum, etag::ETag, multipart::ObjectPart, object};
 
 /// Result of a successful object write.
 ///
@@ -38,7 +38,7 @@ pub struct PutObjectResult {
 /// use std::time::SystemTime;
 ///
 /// use futures::stream;
-/// use tinio_core::{ETag, GetObjectResult, object};
+/// use tinio_core::{ETag, GetObjectResult, acl, object};
 ///
 /// let result = GetObjectResult {
 ///     info: object::Info {
@@ -48,6 +48,8 @@ pub struct PutObjectResult {
 ///         etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
 ///         tags: object::Tags::empty(),
 ///         checksum: None,
+///         owner: None,
+///         acl: acl::Acl::default_private(None),
 ///     },
 ///     body: Box::pin(stream::empty()),
 ///     served_range: Some((0, 4)),
@@ -154,8 +156,9 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// Stream an object body into storage (atomic on the backend side —
     /// last completed write wins, never a torn object, FR-011). The
     /// default implementation is [`ObjectOps::stage_body`] followed by
-    /// [`ObjectOps::commit_object`] with empty tags (the tagged write
-    /// paths call the pair directly); it returns the committed ETag.
+    /// [`ObjectOps::commit_object`] with empty tags, an empty owner
+    /// wire, and the default private ACL (the tagged/ACL write paths call
+    /// the pair directly); it returns the committed ETag.
     async fn put_object(
         &self,
         bucket: &bucket::Name,
@@ -167,7 +170,14 @@ pub trait ObjectOps: Send + Sync + 'static {
     {
         let staged = self.stage_body(bucket, key, body, None).await?;
         let info = self
-            .commit_object(bucket, key, staged, object::Tags::empty())
+            .commit_object(
+                bucket,
+                key,
+                staged,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await?;
         Ok(PutObjectResult { etag: info.etag })
     }
@@ -202,13 +212,19 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// is safe against concurrent bucket deletion. `tags` — validated by
     /// the interface — and the stage's tee digest (when the stage
     /// carried one) are recorded atomically with the write, with no
-    /// post-commit tag window. Returns the committed object metadata.
+    /// post-commit tag window. `owner` is the recorded owner element —
+    /// `None` = the empty owner wire (the lazy default owner at the auth
+    /// layer; a no-identity path records empty, NOT the default owner,
+    /// review B4) — and `acl` the ACL row written with it. Returns the
+    /// committed object metadata.
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         staged: Self::StagedBody,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -227,18 +243,20 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// content is stored under `dst` atomically (FR-011), and the copy
     /// is a fresh object — its mtime is the copy time and its ETag is
     /// the content's; its metadata is what the caller passes, not what
-    /// the source holds. `tags` is the new object's tag set and
-    /// `checksum` the recorded checksum carried into its record (the
-    /// interface passes the source's recorded value — a full copy's
-    /// bytes are the source's — or the directive's replacement; `None`
-    /// stores none); a copy never inherits the source's retained parts.
-    /// The default implementation streams the source through the body
-    /// contract (get → stage → commit, carrying `tags`); a backend may
-    /// override with a filesystem-level copy (same filesystem, zero
-    /// userspace buffering), carrying `checksum` too and reusing the
-    /// source's ETag for a single-form source (the content MD5 is
-    /// unchanged by a copy). `NoSuchKey` when the source does not
-    /// exist; `NoSuchBucket` when either bucket does not.
+    /// the source holds. `tags` is the new object's tag set, `owner` its
+    /// recorded owner element (`None` = the empty owner wire — the lazy
+    /// default owner), `acl` its ACL, and `checksum` the recorded
+    /// checksum carried into its record (the interface passes the
+    /// source's recorded value — a full copy's bytes are the source's —
+    /// or the directive's replacement; `None` stores none); a copy never
+    /// inherits the source's retained parts or its owner/ACL. The
+    /// default implementation streams the source through the body
+    /// contract (get → stage → commit, carrying `tags` and the
+    /// owner/ACL); a backend may override with a filesystem-level copy
+    /// (same filesystem, zero userspace buffering), carrying `checksum`
+    /// too and reusing the source's ETag for a single-form source (the
+    /// content MD5 is unchanged by a copy). `NoSuchKey` when the source
+    /// does not exist; `NoSuchBucket` when either bucket does not.
     async fn copy_object(
         &self,
         src_bucket: &bucket::Name,
@@ -246,6 +264,8 @@ pub trait ObjectOps: Send + Sync + 'static {
         dst_bucket: &bucket::Name,
         dst_key: &object::Key,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
         _checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
@@ -253,14 +273,15 @@ pub trait ObjectOps: Send + Sync + 'static {
     {
         let get = self.get_object(src_bucket, src_key, None).await?;
         let staged = self.stage_body(dst_bucket, dst_key, get.body, None).await?;
-        self.commit_object(dst_bucket, dst_key, staged, tags).await
+        self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl)
+            .await
     }
 
     /// Atomically move `src` to `dst` (S3 RenameObject): the object's
-    /// metadata — mtime, tags, recorded checksum, retained parts —
-    /// moves with it; a rename is not a fresh object. An existing `dst`
-    /// is overwritten. `NoSuchKey` when `src` is missing; `NoSuchBucket`
-    /// when the bucket does not.
+    /// metadata — mtime, tags, recorded checksum, owner, ACL, retained
+    /// parts — moves with it; a rename is not a fresh object. An
+    /// existing `dst` is overwritten. `NoSuchKey` when `src` is missing;
+    /// `NoSuchBucket` when the bucket does not.
     async fn rename_object(
         &self,
         bucket: &bucket::Name,
@@ -319,6 +340,28 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage;
 
+    /// The object's ACL (S3 GetObjectAcl). `NoSuchKey` when the object
+    /// is missing.
+    async fn get_object_acl(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<acl::Acl, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the object's grant set (S3 PutObjectAcl — replace-all,
+    /// no merge); the owner element is preserved by the store, never
+    /// changed by a put. `NoSuchKey` when the object is missing.
+    async fn put_object_acl(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        grants: &acl::AclGrants,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
     /// List objects with prefix filtering, delimiter grouping, and
     /// pagination (S3 semantics).
     async fn list_objects(
@@ -360,6 +403,8 @@ mod tests {
             etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: acl::Acl::default_private(None),
         };
         let listing = ObjectListing {
             objects: vec![info],
@@ -388,6 +433,8 @@ mod tests {
                 etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
                 tags: object::Tags::empty(),
                 checksum: None,
+                owner: None,
+                acl: acl::Acl::default_private(None),
             },
             body: Box::pin(stream::empty()),
             served_range: Some((0, 0)),
@@ -404,6 +451,8 @@ mod tests {
             etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
             tags: object::Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: acl::Acl::default_private(None),
         };
         let result = GetObjectResult {
             info,

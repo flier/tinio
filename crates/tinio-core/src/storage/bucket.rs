@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use super::Storage;
 use crate::{
+    acl,
     bucket::{self, Bucket},
     cors, object,
 };
@@ -83,8 +84,17 @@ pub struct BucketsListing {
 /// ```
 #[async_trait]
 pub trait BucketOps: Send + Sync + 'static {
-    /// Create a bucket. `AlreadyExists` when the name is taken.
-    async fn create_bucket(&self, name: &bucket::Name) -> Result<(), <Self as Storage>::Error>
+    /// Create a bucket. `AlreadyExists` when the name is taken. `owner`
+    /// is the recorded owner element — `None` = the empty owner wire
+    /// (the lazy default owner at the auth layer; a no-identity path
+    /// records empty, NOT the default owner, review B4); `acl` the ACL
+    /// row written with it.
+    async fn create_bucket(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
+    ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -102,12 +112,17 @@ pub trait BucketOps: Send + Sync + 'static {
     /// List buckets, in name order, per S3 listing semantics: only names
     /// starting with `params.prefix`, a page of at most
     /// `params.max_buckets` entries resuming after `params.start_after`
-    /// (exclusive). `truncated` + `next_start_after` mark a page with
-    /// more results (`max_buckets = 0` requests an empty, untruncated
-    /// page — strictness is a mapping-layer policy).
+    /// (exclusive). `owner` filters the walk to that principal's buckets
+    /// — applied DURING the walk, before pagination, so the
+    /// continuation-token math applies to the filtered set (P2#4;
+    /// `None` = no filter, the legacy listing). `truncated` +
+    /// `next_start_after` mark a page with more results (`max_buckets =
+    /// 0` requests an empty, untruncated page — strictness is a
+    /// mapping-layer policy).
     async fn list_buckets(
         &self,
         params: ListBucketsParams,
+        owner: Option<&acl::OwnerId>,
     ) -> Result<BucketsListing, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -163,6 +178,26 @@ pub trait BucketOps: Send + Sync + 'static {
     /// `NoSuchBucket` when the bucket is missing; otherwise idempotent —
     /// deleting when no configuration is stored is `Ok`.
     async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// The bucket's ACL (S3 GetBucketAcl). `NoSuchBucket` when the
+    /// bucket is missing.
+    async fn get_bucket_acl(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<acl::Acl, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the bucket's grant set (S3 PutBucketAcl — replace-all,
+    /// no merge); the owner element is preserved by the store, never
+    /// changed by a put. `NoSuchBucket` when the bucket is missing.
+    async fn put_bucket_acl(
+        &self,
+        name: &bucket::Name,
+        grants: &acl::AclGrants,
+    ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
 }

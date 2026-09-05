@@ -8,7 +8,7 @@ use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_enco
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{
-    ETag, checksum,
+    ETag, acl, checksum,
     storage::{self, Error::*},
 };
 
@@ -100,7 +100,8 @@ impl From<String> for Key {
     }
 }
 
-/// Metadata of a stored object (key, size, mtime, ETag, tags, checksum).
+/// Metadata of a stored object (key, size, mtime, ETag, tags, checksum,
+/// owner, ACL).
 ///
 /// ETags are stored without the surrounding quotes S3 headers use: single
 /// uploads carry the content MD5 hex, multipart uploads the composed
@@ -112,7 +113,10 @@ impl From<String> for Key {
 /// ```rust
 /// use std::time::SystemTime;
 ///
-/// use tinio_core::object::{Info, Tags};
+/// use tinio_core::{
+///     acl,
+///     object::{Info, Tags},
+/// };
 ///
 /// let info = Info {
 ///     key: "dir/file.txt".into(),
@@ -121,6 +125,8 @@ impl From<String> for Key {
 ///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
 ///     tags: Tags::empty(),
 ///     checksum: None,
+///     owner: None,
+///     acl: acl::Acl::default_private(None),
 /// };
 /// assert_eq!(info.size, 4);
 /// ```
@@ -139,6 +145,11 @@ pub struct Info {
     /// The recorded object checksum (validated at write time under the
     /// `checksum` toggle; `None` when the object has none).
     pub checksum: Option<checksum::Recorded>,
+    /// The recorded owner element (`None` = legacy/lazy — the default
+    /// owner at the auth layer).
+    pub owner: Option<acl::OwnerId>,
+    /// The object's ACL (default private when none was written).
+    pub acl: acl::Acl,
 }
 
 /// The per-surface tag-count caps (S3): object tags ≤ 10, bucket tags
@@ -417,6 +428,8 @@ mod tests {
             etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
             tags: Tags::empty(),
             checksum: None,
+            owner: None,
+            acl: acl::Acl::default_private(None),
         };
         assert_eq!(o.size, 5);
         assert_eq!(o.last_modified, t);

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use super::{Storage, body::BodyStream, range::ByteRange};
 use crate::{
-    bucket, checksum,
+    acl, bucket, checksum,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object,
 };
@@ -149,13 +149,18 @@ pub trait MultipartOps: Send + Sync + 'static {
     /// upload id. `checksum` is the create-time checksum spec
     /// (persisted; echoed by `get_multipart_upload`/`list_multipart_uploads`),
     /// `tags` the object's create-time tag set (persisted in the upload
-    /// state; applied to the completed object).
+    /// state; applied to the completed object), and `owner`/`acl` the
+    /// create-time owner element and ACL (persisted the same way —
+    /// `None` owner = the empty owner wire, the lazy default owner) —
+    /// applied by the completion, never re-ferried through the interface.
     async fn create_multipart_upload(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &acl::Acl,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage;
