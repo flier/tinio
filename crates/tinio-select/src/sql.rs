@@ -232,11 +232,20 @@ fn preprocess_from(sql: &str) -> Result<(FromClause, String), SelectError> {
     while j < bytes.len() && bytes[j].is_ascii_whitespace() {
         j += 1;
     }
-    let clause_end = from_clause_end(bytes, j);
-    if clause_has_join(bytes, j, clause_end) {
-        return Err(SelectError::Unsupported("JOIN".into()));
-    }
-    let (clause, seg_end) = parse_object_clause(&sql[j..clause_end])?;
+    // The object clause is self-terminating (its grammar binds segments
+    // before any clause keyword), so parse the full remainder directly;
+    // only when it is not an S3Object path do we need a roomy FROM-clause
+    // scan to separate JOIN (unsupported) from a malformed object.
+    let (clause, seg_end) = match parse_object_clause(&sql[j..]) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let clause_end = from_clause_end(bytes, j);
+            if clause_has_join(bytes, j, clause_end) {
+                return Err(SelectError::Unsupported("JOIN".into()));
+            }
+            return Err(e);
+        }
+    };
     let rewritten = format!("{}{}{}", &sql[..j], S3_OBJECT, &sql[j + seg_end..]);
     Ok((clause, rewritten))
 }
@@ -521,13 +530,20 @@ fn is_ascii_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-/// Case-insensitive word match with identifier boundaries.
+/// Case-insensitive keyword match: the word must sit at statement position
+/// (start, whitespace, `(`, `,` or `;`) — never after `.`/identifier-bytes,
+/// which are field names like `s.from`.
 fn word_at(bytes: &[u8], i: usize, word: &str) -> bool {
     let end = i + word.len();
     if end > bytes.len() || !bytes[i..end].eq_ignore_ascii_case(word.as_bytes()) {
         return false;
     }
-    (i == 0 || !is_ident_byte(bytes[i - 1])) && (end == bytes.len() || !is_ident_byte(bytes[end]))
+    let boundary_before = i == 0
+        || matches!(
+            bytes[i - 1],
+            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b',' | b';'
+        );
+    boundary_before && (end == bytes.len() || !is_ident_byte(bytes[end]))
 }
 
 /// Rewrite every top-level `X IS [NOT] MISSING` into the sentinel calls
@@ -558,7 +574,8 @@ fn rewrite_is_missing(sql: &str) -> String {
             continue;
         }
         // Walk back over the operand, tracking matching parens; stop at a
-        // top-level token that binds looser than `IS`.
+        // top-level token that binds looser than `IS` (a boundary keyword
+        // after a `.` is a field name, e.g. `s.from`, not the keyword).
         let mut depth = 0usize;
         let mut k = i as isize - 1;
         while k >= 0 {
@@ -574,9 +591,14 @@ fn rewrite_is_missing(sql: &str) -> String {
                 Token::Comma | Token::SemiColon if depth == 0 => break,
                 Token::Word(w)
                     if depth == 0
+                        && !(k > 0
+                            && matches!(
+                                tokens.get((k - 1) as usize).map(|t| &t.token),
+                                Some(Token::Period)
+                            ))
                         && OPERAND_BOUNDARY_KEYWORDS
                             .iter()
-                            .any(|k| w.value.eq_ignore_ascii_case(k)) =>
+                            .any(|kw| w.value.eq_ignore_ascii_case(kw)) =>
                 {
                     break;
                 }
@@ -976,5 +998,22 @@ mod tests {
     fn expression_too_long() {
         let sql = format!("SELECT s.x FROM S3Object s WHERE s.x = '{}'", "a".repeat(300 * 1024));
         rej(&sql, "expression exceeds 256 KiB");
+    }
+
+    #[test]
+    fn keyword_named_fields_are_not_keywords() {
+        // A path segment spelled like a clause keyword stays a segment.
+        let q = ok("SELECT x FROM S3Object[*].limit.name s");
+        assert_eq!(
+            q.from.segments,
+            vec![PathSeg::Wild, PathSeg::Name("limit".into()), PathSeg::Name("name".into())]
+        );
+        // A field named `from` is a field, and its MISSING operand is exact.
+        let q = ok("SELECT s.from FROM S3Object s WHERE s.from IS MISSING");
+        assert_eq!(q.projections.len(), 1);
+        match q.where_expr {
+            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), "__s3_is_missing"),
+            other => panic!("expected missing sentinel, got {other:?}"),
+        }
     }
 }
