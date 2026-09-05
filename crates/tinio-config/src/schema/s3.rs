@@ -101,6 +101,11 @@ pub struct Capabilities {
     #[default = true]
     pub select: bool,
 
+    /// Bucket/object ACL reads and writes (Get/Put*Acl). Default on.
+    #[serde(default = "acl")]
+    #[default = true]
+    pub acl: bool,
+
     /// Cap on concurrently streaming SelectObjectContent responses
     /// (default 4): each job owns a body forwarder and a seat on the
     /// select rayon pool — without a cap, concurrent selects exhaust
@@ -201,6 +206,10 @@ fn cors() -> bool {
 
 fn select() -> bool {
     Capabilities::default().select
+}
+
+fn acl() -> bool {
+    Capabilities::default().acl
 }
 
 fn select_concurrency() -> u32 {
@@ -375,6 +384,17 @@ mod tests {
         let toml = "select = false";
         let caps: Capabilities = toml::from_str(toml).unwrap();
         assert!(!caps.select);
+    }
+
+    #[test]
+    fn acl_defaults_on_and_can_be_disabled() {
+        // The default config has the ACL ops enabled.
+        let caps = Capabilities::default();
+        assert!(caps.acl);
+        // A config with acl: false round-trips.
+        let toml = "acl = false";
+        let caps: Capabilities = toml::from_str(toml).unwrap();
+        assert!(!caps.acl);
     }
 
     #[test]

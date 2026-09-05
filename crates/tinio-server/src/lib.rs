@@ -4,13 +4,16 @@
 //! verification) over the `tinio-core` storage contract: the `backend/`
 //! modules map the ~30 S3 operations onto the contract, `data.rs` wires the
 //! hyper data plane, and `log.rs`/`metrics.rs` provide observability. The
-//! capability groups `multipart`, `copy`, `list-v1`, `list-v2` are strippable
-//! cargo features (default on); `otel` enables the opt-in OpenTelemetry
-//! export layer.
+//! capability groups `multipart`, `copy`, `list-v1`, `list-v2`, `acl` are
+//! strippable cargo features (default on); `otel` enables the opt-in
+//! OpenTelemetry export layer.
 
 #[cfg(feature = "api")]
 #[doc(hidden)]
 pub extern crate tinio_api as _api;
+#[cfg(feature = "acl")]
+#[doc(hidden)]
+pub extern crate tinio_auth as _auth;
 #[doc(hidden)]
 pub extern crate tinio_config as _config;
 #[doc(hidden)]

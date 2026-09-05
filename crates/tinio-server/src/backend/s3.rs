@@ -89,6 +89,39 @@ impl<S: Storage> S3 for S3Backend<S> {
         self.op_delete_bucket_cors(req).await
     }
 
+    // --- bucket/object ACL (spec 2026-09-05) ---
+    #[cfg(feature = "acl")]
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<dto::GetBucketAclInput>,
+    ) -> S3Result<S3Response<dto::GetBucketAclOutput>> {
+        self.op_get_bucket_acl(req).await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request<dto::PutBucketAclInput>,
+    ) -> S3Result<S3Response<dto::PutBucketAclOutput>> {
+        self.op_put_bucket_acl(req).await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn get_object_acl(
+        &self,
+        req: S3Request<dto::GetObjectAclInput>,
+    ) -> S3Result<S3Response<dto::GetObjectAclOutput>> {
+        self.op_get_object_acl(req).await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn put_object_acl(
+        &self,
+        req: S3Request<dto::PutObjectAclInput>,
+    ) -> S3Result<S3Response<dto::PutObjectAclOutput>> {
+        self.op_put_object_acl(req).await
+    }
+
     // --- objects + copy (T048) ---
     async fn put_object(
         &self,

@@ -16,6 +16,8 @@
 mod conditions;
 #[cfg(feature = "cors")]
 pub(crate) mod cors;
+#[cfg(feature = "acl")]
+pub(crate) mod acls;
 mod errors;
 mod locks;
 mod s3;
@@ -148,6 +150,14 @@ use crate::{
     },
     _util::lockmap::{self, Map},
 };
+#[cfg(feature = "acl")]
+use crate::_auth::canned::GrantHeaders;
+#[cfg(feature = "acl")]
+use crate::_core::acl;
+#[cfg(feature = "acl")]
+use crate::_auth::identity::Identity;
+#[cfg(feature = "acl")]
+use self::acls::object_write_acl;
 
 /// The S3 mapping over one [`Storage`] backend.
 ///
@@ -235,6 +245,13 @@ pub struct S3Backend<S: Storage> {
     /// request.
     #[cfg(feature = "select")]
     pub(crate) select_pool: Arc<ThreadPool>,
+    /// The identity map (feature `acl`): `Some` = the auth-configured
+    /// principals and default owner, `None` = the legacy/no-identity
+    /// mode (the ACL ops answer with the core default-owner pair and
+    /// no identity name resolution; Task 11's write paths record the
+    /// empty owner wire under it — review B4).
+    #[cfg(feature = "acl")]
+    pub(crate) identity: Option<Arc<Identity>>,
 }
 
 impl<S: Storage> S3Backend<S> {
@@ -269,6 +286,8 @@ impl<S: Storage> S3Backend<S> {
                     .build()
                     .expect("select rayon pool"),
             ),
+            #[cfg(feature = "acl")]
+            identity: None,
         }
     }
 
@@ -423,6 +442,95 @@ impl<S: Storage> S3Backend<S> {
             .first_or_octet_stream()
             .essence_str()
             .to_string()
+    }
+    /// The requester's owner for the write paths: the identity map's
+    /// principal (the authenticated user's canonical ID, or the
+    /// anonymous special ID for an unsigned request), or `None` under
+    /// no-identity mode — the row records the empty owner wire (review
+    /// B4, never the default owner). The write paths resolve through it;
+    /// the ACL ops use the row-owner resolution instead.
+    #[cfg(feature = "acl")]
+    pub(crate) fn owner_for(
+        &self,
+        credentials: Option<&s3s::auth::Credentials>,
+    ) -> Option<acl::OwnerId> {
+        self.identity
+            .as_ref()
+            .map(|identity| identity.principal(credentials))
+    }
+
+    /// The lazy-resolved owner of a row (review B4): the recorded owner
+    /// element, or the default owner — the identity's configured
+    /// default, the core built-in [`acl::default_owner_id`] in
+    /// no-identity mode.
+    #[cfg(feature = "acl")]
+    pub(crate) fn row_owner(&self, row: Option<&acl::OwnerId>) -> acl::OwnerId {
+        match row {
+            Some(id) => id.clone(),
+            None => match &self.identity {
+                Some(identity) => identity.default_owner.clone(),
+                None => acl::default_owner_id(),
+            },
+        }
+    }
+
+    /// The write-path ACL of an OBJECT surface (Task 11): the
+    /// capability gate + the identity-mode owner and the request's
+    /// canned / `x-amz-grant-*` expansion — `Some((owner, grants-only
+    /// acl))` under identity mode with the toggle on, `None` under
+    /// no-identity / toggle-off (the caller records the empty owner wire
+    /// and the private default — review B4 rule 3). The bucket owner is
+    /// resolved lazily from the bucket row — only a canned
+    /// `bucket-owner-*` expansion needs it (review A6).
+    #[cfg(feature = "acl")]
+    pub(crate) async fn write_acl_for(
+        &self,
+        credentials: Option<&s3s::auth::Credentials>,
+        bucket: &bucket::Name,
+        canned: Option<&str>,
+        headers: GrantHeaders<'_>,
+    ) -> S3Result<Option<(acl::OwnerId, acl::Acl)>> {
+        if !self.caps.acl || self.identity.is_none() {
+            return Ok(None);
+        }
+        let owner = self
+            .owner_for(credentials)
+            .expect("identity attached above");
+        let bucket_owner =
+            if matches!(canned, Some("bucket-owner-read" | "bucket-owner-full-control")) {
+                self.row_owner(
+                    self.storage
+                        .get_bucket_acl(bucket)
+                        .await
+                        .map_err(map_backend_error)?
+                        .owner
+                        .as_ref(),
+                )
+            } else {
+                // The expansion touches the bucket owner only for the
+                // `bucket-owner-*` names — the owner stands in.
+                owner.clone()
+            };
+        let acl = object_write_acl(&owner, &bucket_owner, canned, &headers)?;
+        Ok(Some((owner, acl)))
+    }
+
+    /// The dto `Owner` element of an ACL row: the display name resolved
+    /// through the identity map (an unknown ID — the anonymous one
+    /// included — is ID-only, AWS's unknown-account shape); no-identity
+    /// mode resolves the lazy default-owner pair for a row without one
+    /// and ID-only for a recorded one.
+    #[cfg(feature = "acl")]
+    pub(crate) fn acl_owner(&self, row: Option<&acl::OwnerId>) -> dto::Owner {
+        match &self.identity {
+            Some(identity) => identity.owner(row),
+            None => dto::Owner {
+                id: Some(self.row_owner(row).as_str().to_string()),
+                display_name: row
+                    .is_none()
+                    .then(|| acl::DEFAULT_OWNER_DISPLAY_NAME.to_string()),
+            },
+        }
     }
 }
 

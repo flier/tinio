@@ -20,6 +20,7 @@ pub fn derive_canonical_id(access_key: &str) -> OwnerId {
 
 /// One configured SigV4 principal: the access key and secret, the
 /// canonical grant/owner ID, and the presentation display name.
+#[derive(Debug)]
 pub struct User {
     pub access_key: String,
     pub canonical_id: OwnerId,
@@ -41,6 +42,7 @@ impl User {
 
 /// The identity map: access key → user, plus the default owner element
 /// (the config defaults; the lazy owner for rows without one).
+#[derive(Debug)]
 pub struct Identity {
     pub users: HashMap<String, User>,
     pub default_owner: OwnerId,

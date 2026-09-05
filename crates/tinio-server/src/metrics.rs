@@ -1017,6 +1017,13 @@ mod tests {
                 })),
             );
         }
+        #[cfg(feature = "acl")]
+        {
+            call!(get_bucket_acl, dto::GetBucketAclInput);
+            call!(put_bucket_acl, dto::PutBucketAclInput);
+            call!(get_object_acl, dto::GetObjectAclInput);
+            call!(put_object_acl, dto::PutObjectAclInput);
+        }
         let expected: Vec<&str> = {
             let base = [
                 "DeleteBucket",
@@ -1037,6 +1044,8 @@ mod tests {
                 "DeleteObjectTagging",
             ]
             .into_iter();
+            #[cfg(feature = "acl")]
+            let base = base.chain(["GetBucketAcl", "PutBucketAcl", "GetObjectAcl", "PutObjectAcl"]);
             #[cfg(feature = "multipart")]
             let base = base.chain(["UploadPart", "ListParts", "ListMultipartUploads"]);
             #[cfg(feature = "cors")]
@@ -1232,6 +1241,42 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         req: S3Request<dto::DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<dto::DeleteBucketCorsOutput>> {
         self.record("DeleteBucketCors", self.inner.delete_bucket_cors(req))
+            .await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<dto::GetBucketAclInput>,
+    ) -> S3Result<S3Response<dto::GetBucketAclOutput>> {
+        self.record("GetBucketAcl", self.inner.get_bucket_acl(req))
+            .await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request<dto::PutBucketAclInput>,
+    ) -> S3Result<S3Response<dto::PutBucketAclOutput>> {
+        self.record("PutBucketAcl", self.inner.put_bucket_acl(req))
+            .await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn get_object_acl(
+        &self,
+        req: S3Request<dto::GetObjectAclInput>,
+    ) -> S3Result<S3Response<dto::GetObjectAclOutput>> {
+        self.record("GetObjectAcl", self.inner.get_object_acl(req))
+            .await
+    }
+
+    #[cfg(feature = "acl")]
+    async fn put_object_acl(
+        &self,
+        req: S3Request<dto::PutObjectAclInput>,
+    ) -> S3Result<S3Response<dto::PutObjectAclOutput>> {
+        self.record("PutObjectAcl", self.inner.put_object_acl(req))
             .await
     }
 

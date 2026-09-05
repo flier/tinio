@@ -36,6 +36,14 @@ use crate::{
     },
 };
 
+#[cfg(feature = "acl")]
+use crate::{
+    _auth::canned::GrantHeaders,
+    backend::acls::{bucket_acl_grants, grants_dto, policy_owner_matches, require_content_md5},
+};
+#[cfg(feature = "acl")]
+use s3s::dto;
+
 /// The ListBuckets default page size when `max-buckets` is absent — the
 /// AWS documented default (2025-03 API), the config's `max_buckets` cap
 /// default ([`MAX_BUCKETS`]): one home for the number.
@@ -241,6 +249,81 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(DeleteBucketTaggingOutput::default()))
+    }
+
+    /// GetBucketAcl — the bucket's real ACL (spec 2026-09-05). A
+    /// missing bucket answers 404 `NoSuchBucket` (the bucket-tags
+    /// precedent). The Owner element resolves through the identity map
+    /// (an unknown ID — the anonymous one included — is ID-only, AWS's
+    /// unknown-account shape) and the grants echo the row's canonical
+    /// set (the wire codec canonicalized what the writes stored).
+    #[cfg(feature = "acl")]
+    pub(crate) async fn op_get_bucket_acl(
+        &self,
+        req: S3Request<dto::GetBucketAclInput>,
+    ) -> S3Result<S3Response<dto::GetBucketAclOutput>> {
+        Self::require_cap(self.caps.acl, "GetBucketAcl")?;
+        let bucket = self.bucket(req.input.bucket)?;
+        let acl = self
+            .storage
+            .get_bucket_acl(&bucket)
+            .await
+            .map_err(map_backend_error)?;
+        Ok(S3Response::new(dto::GetBucketAclOutput {
+            owner: Some(self.acl_owner(acl.owner.as_ref())),
+            grants: Some(grants_dto(&acl.grants)),
+        }))
+    }
+
+    /// PutBucketAcl — replace the bucket's grant set (replace-all, no
+    /// merge; the owner element is preserved by the store, never
+    /// changed by a put — contract ruling). `Content-MD5` is present
+    /// and well-formed (spec §5 — missing 400 `InvalidRequest` with the
+    /// AWS message, malformed 400 `InvalidDigest`); exactly one grant
+    /// source is given (canned ACL / grant headers / policy body — a
+    /// combination or none answers 400 `InvalidArgument`); a policy
+    /// body whose Owner does not match the row owner (the lazy default
+    /// when the row records none — review B4) answers 400
+    /// `InvalidArgument` (fail-closed). The grant set is validated
+    /// strictly — the codec's self-heal is read-path only. A missing
+    /// bucket answers 404 `NoSuchBucket`.
+    #[cfg(feature = "acl")]
+    pub(crate) async fn op_put_bucket_acl(
+        &self,
+        req: S3Request<dto::PutBucketAclInput>,
+    ) -> S3Result<S3Response<dto::PutBucketAclOutput>> {
+        Self::require_cap(self.caps.acl, "PutBucketAcl")?;
+        require_content_md5(req.input.content_md5.as_deref())?;
+        let bucket = self.bucket(req.input.bucket)?;
+        // The ACL row read doubles as the existence check (NoSuchBucket
+        // 404) and the owner the policy Owner must match.
+        let row = self
+            .storage
+            .get_bucket_acl(&bucket)
+            .await
+            .map_err(map_backend_error)?;
+        let owner = self.row_owner(row.owner.as_ref());
+        let policy = req.input.access_control_policy.as_ref();
+        if let Some(policy) = policy {
+            policy_owner_matches(policy.owner.as_ref(), &owner)?;
+        }
+        let grants = bucket_acl_grants(
+            req.input.acl.as_ref().map(|c| c.as_str()),
+            &GrantHeaders {
+                full_control: req.input.grant_full_control.as_deref(),
+                read: req.input.grant_read.as_deref(),
+                read_acp: req.input.grant_read_acp.as_deref(),
+                write: req.input.grant_write.as_deref(),
+                write_acp: req.input.grant_write_acp.as_deref(),
+            },
+            policy.and_then(|p| p.grants.as_deref()),
+            &owner,
+        )?;
+        self.storage
+            .put_bucket_acl(&bucket, &grants)
+            .await
+            .map_err(map_backend_error)?;
+        Ok(S3Response::new(dto::PutBucketAclOutput::default()))
     }
 }
 
@@ -986,6 +1069,278 @@ mod tests {
         let err = backend
             .delete_bucket_tagging(s3_request(dto::DeleteBucketTaggingInput {
                 bucket: "data".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
+    }
+
+    // --- bucket ACL ops (spec 2026-09-05) ---
+
+    /// A well-formed Content-MD5 value (base64 of 16 zero bytes).
+    #[cfg(feature = "acl")]
+    fn valid_md5() -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 16])
+    }
+
+    #[cfg(feature = "acl")]
+    fn canonical_grantee(id: &str) -> dto::Grantee {
+        dto::Grantee {
+            type_: dto::Type::from_static(dto::Type::CANONICAL_USER),
+            id: Some(id.into()),
+            uri: None,
+            display_name: None,
+            email_address: None,
+        }
+    }
+
+    #[cfg(feature = "acl")]
+    fn group_grantee(uri: &str) -> dto::Grantee {
+        dto::Grantee {
+            type_: dto::Type::from_static(dto::Type::GROUP),
+            uri: Some(uri.into()),
+            id: None,
+            display_name: None,
+            email_address: None,
+        }
+    }
+
+    #[cfg(feature = "acl")]
+    fn grant(grantee: dto::Grantee, permission: &'static str) -> dto::Grant {
+        dto::Grant {
+            grantee: Some(grantee),
+            permission: Some(dto::Permission::from_static(permission)),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn bucket_acl_ops_round_trip() {
+        let (backend, b) = setup_name().await;
+        // The canned surface: `public-read` expands to the owner's
+        // FULL_CONTROL plus AllUsers READ (the child-owner canned ACLs
+        // are ignored on buckets, per AWS — the lazy default owner is
+        // both owner and bucket owner here).
+        backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: b.to_string(),
+                acl: Some(dto::BucketCannedACL::from_static("public-read")),
+                content_md5: Some(valid_md5()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let out = backend
+            .get_bucket_acl(s3_request(dto::GetBucketAclInput {
+                bucket: b.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let default_id = acl::default_owner_id();
+        let owner = out.owner.unwrap();
+        assert_eq!(owner.id.as_deref(), Some(default_id.as_str()));
+        assert_eq!(
+            owner.display_name.as_deref(),
+            Some(acl::DEFAULT_OWNER_DISPLAY_NAME)
+        );
+        assert_eq!(
+            out.grants.as_deref(),
+            Some(
+                [
+                    grant(
+                        canonical_grantee(default_id.as_str()),
+                        dto::Permission::FULL_CONTROL,
+                    ),
+                    grant(group_grantee(acl::GROUP_ALL_USERS), dto::Permission::READ),
+                ]
+                .as_slice()
+            )
+        );
+        // The body-policy surface replaces the set (the lazy default
+        // owner's ID as the policy Owner — what GET just echoed).
+        let policy = dto::AccessControlPolicy {
+            owner: Some(dto::Owner {
+                id: Some(default_id.as_str().to_string()),
+                display_name: None,
+            }),
+            grants: Some(vec![grant(
+                group_grantee(acl::GROUP_ALL_USERS),
+                dto::Permission::READ,
+            )]),
+        };
+        backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: b.to_string(),
+                access_control_policy: Some(policy),
+                content_md5: Some(valid_md5()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let out = backend
+            .get_bucket_acl(s3_request(dto::GetBucketAclInput {
+                bucket: b.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(
+            out.grants.as_deref(),
+            Some([grant(group_grantee(acl::GROUP_ALL_USERS), dto::Permission::READ)].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn bucket_acl_ops_missing_bucket_semantics() {
+        let backend = backend();
+        let err = backend
+            .get_bucket_acl(s3_request(dto::GetBucketAclInput {
+                bucket: "ghost".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchBucket");
+        let err = backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: "ghost".into(),
+                access_control_policy: Some(dto::AccessControlPolicy::default()),
+                content_md5: Some(valid_md5()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchBucket");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn put_bucket_acl_rejects_missing_or_mixed_grant_sources() {
+        let (backend, b) = setup_name().await;
+        // No ACL source at all → InvalidArgument (AWS: exactly one of
+        // canned, grant headers, or a body).
+        let err = backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: b.to_string(),
+                content_md5: Some(valid_md5()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+        // Canned + grant headers together → InvalidArgument (the
+        // write-path conflict rule).
+        let err = backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: b.to_string(),
+                acl: Some(dto::BucketCannedACL::from_static("public-read")),
+                grant_read: Some(r#"id="aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#.into()),
+                content_md5: Some(valid_md5()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+        // Canned + body together → the same conflict.
+        let err = backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: b.to_string(),
+                acl: Some(dto::BucketCannedACL::from_static("public-read")),
+                access_control_policy: Some(dto::AccessControlPolicy::default()),
+                content_md5: Some(valid_md5()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn bucket_acl_owner_resolves_through_identity() {
+        use std::sync::Arc;
+
+        use crate::_auth::identity::{Identity, User};
+        // A recorded row owner: the identity map's user, with its
+        // display name resolved on the response.
+        let user = User::test("AKID", "secret", "user1");
+        let canonical_id = user.canonical_id.clone();
+        let identity = Arc::new(Identity::test(vec![user]));
+        let backend = S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
+            .with_identity(identity);
+        backend
+            .storage()
+            .create_bucket(
+                &bucket::name("data").unwrap(),
+                Some(&canonical_id),
+                &acl::Acl::default_private(Some(canonical_id.clone())),
+            )
+            .await
+            .unwrap();
+        let out = backend
+            .get_bucket_acl(s3_request(dto::GetBucketAclInput {
+                bucket: "data".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let owner = out.owner.unwrap();
+        assert_eq!(owner.id.as_deref(), Some(canonical_id.as_str()));
+        assert_eq!(owner.display_name.as_deref(), Some("user1"));
+        // An unknown row owner resolves ID-only (AWS's unknown-account
+        // shape — no display name).
+        let unknown = acl::OwnerId::new(
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        )
+        .unwrap();
+        backend
+            .storage()
+            .create_bucket(
+                &bucket::name("other").unwrap(),
+                Some(&unknown),
+                &acl::Acl::default_private(Some(unknown.clone())),
+            )
+            .await
+            .unwrap();
+        let out = backend
+            .get_bucket_acl(s3_request(dto::GetBucketAclInput {
+                bucket: "other".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        let owner = out.owner.unwrap();
+        assert_eq!(owner.id.as_deref(), Some(unknown.as_str()));
+        assert_eq!(owner.display_name, None);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn bucket_acl_toggle_off_gates_the_ops() {
+        let backend = backend_with(Capabilities {
+            acl: false,
+            ..Default::default()
+        });
+        let err = backend
+            .get_bucket_acl(s3_request(dto::GetBucketAclInput {
+                bucket: "data".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented");
+        let err = backend
+            .put_bucket_acl(s3_request(dto::PutBucketAclInput {
+                bucket: "data".into(),
+                access_control_policy: Some(dto::AccessControlPolicy::default()),
+                content_md5: Some(valid_md5()),
                 ..Default::default()
             }))
             .await

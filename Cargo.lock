@@ -3783,6 +3783,7 @@ dependencies = [
  "thread-priority",
  "time",
  "tinio-api",
+ "tinio-auth",
  "tinio-config",
  "tinio-core",
  "tinio-fs",
