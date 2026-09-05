@@ -49,6 +49,8 @@ use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
 use tracing::Level;
 
+#[cfg(feature = "cors")]
+use crate::backend::cors::{CorsConfigs, CorsLookup, CorsPreflightRoute};
 use crate::{
     _core::storage::Storage,
     backend::{Capabilities, S3Backend},
@@ -97,9 +99,35 @@ pub struct DataPlane {
 impl DataPlane {
     /// Build the data plane over a storage backend.
     pub fn new<S: Storage>(storage: S, caps: Capabilities) -> Self {
-        let backend = MetricS3::new(S3Backend::new(storage, caps));
-        let service = S3ServiceBuilder::new(backend).build();
-        Self::from_service(service)
+        Self::new_shared(Arc::new(storage), caps)
+    }
+
+    /// Build the data plane over a SHARED storage handle: the backend and
+    /// the CORS preflight route (when armed) share the one `Arc<S>`.
+    ///
+    /// UNGATED: it exists in every build (feature-off builds keep a
+    /// constructor via [`DataPlane::new`]); only the cors wiring is
+    /// `#[cfg(feature = "cors")]`.
+    pub fn new_shared<S: Storage>(storage: Arc<S>, caps: Capabilities) -> Self {
+        let backend = MetricS3::new(S3Backend::new_shared(Arc::clone(&storage), caps));
+        #[cfg(feature = "cors")]
+        {
+            let mut builder = S3ServiceBuilder::new(backend);
+            // Double gate: the compile-time feature AND the runtime
+            // capability arm the preflight route; the erased lookup rides
+            // on the service either way (None with the capability off — no
+            // route, no decoration).
+            let configs = Arc::new(CorsConfigs::new(Arc::clone(&storage)));
+            if caps.cors {
+                builder.set_route(CorsPreflightRoute::new(Arc::clone(&configs)));
+            }
+            Self::from_service(
+                builder.build(),
+                caps.cors.then_some(configs as Arc<dyn CorsLookup>),
+            )
+        }
+        #[cfg(not(feature = "cors"))]
+        Self::from_service(S3ServiceBuilder::new(backend).build())
     }
 
     /// Build the data plane with a single static credential pair (SigV4).
@@ -115,12 +143,25 @@ impl DataPlane {
         access_key: &str,
         secret_key: &str,
     ) -> Self {
-        let backend = MetricS3::new(S3Backend::new(storage, caps));
+        let storage = Arc::new(storage);
+        let backend = MetricS3::new(S3Backend::new_shared(Arc::clone(&storage), caps));
         let mut builder = S3ServiceBuilder::new(backend);
         builder.set_auth(StaticAuth {
             access_key: access_key.to_string(),
             secret_key: secret_key.into(),
         });
+        #[cfg(feature = "cors")]
+        {
+            let configs = Arc::new(CorsConfigs::new(Arc::clone(&storage)));
+            if caps.cors {
+                builder.set_route(CorsPreflightRoute::new(Arc::clone(&configs)));
+            }
+            Self::from_service(
+                builder.build(),
+                caps.cors.then_some(configs as Arc<dyn CorsLookup>),
+            )
+        }
+        #[cfg(not(feature = "cors"))]
         Self::from_service(builder.build())
     }
 
@@ -136,6 +177,14 @@ impl DataPlane {
         self
     }
 
+    #[cfg(feature = "cors")]
+    fn from_service(service: S3Service, cors: Option<Arc<dyn CorsLookup>>) -> Self {
+        Self {
+            service: Arc::new(DataPlaneService::new(service, cors)),
+        }
+    }
+
+    #[cfg(not(feature = "cors"))]
     fn from_service(service: S3Service) -> Self {
         Self {
             service: Arc::new(DataPlaneService::new(service)),
@@ -240,6 +289,12 @@ pub struct DataPlaneService {
     /// The scrape-time metrics refresh (F10/F49) — a no-op until
     /// [`DataPlane::with_metrics`] attaches the server's hook.
     metrics: MetricsRefresh,
+    /// The CORS config lookup (feature + capability double-gated; `None`
+    /// when the preflight route is not armed) — the Task-10 decoration
+    /// reads it (not yet built; hence dead_code here).
+    #[cfg(feature = "cors")]
+    #[allow(dead_code)]
+    cors: Option<Arc<dyn CorsLookup>>,
 }
 
 /// Decrements `HTTP_IN_FLIGHT` when dropped — on request completion and
@@ -254,6 +309,16 @@ impl Drop for InFlightGauge {
 }
 
 impl DataPlaneService {
+    #[cfg(feature = "cors")]
+    fn new(inner: S3Service, cors: Option<Arc<dyn CorsLookup>>) -> Self {
+        Self {
+            inner,
+            metrics: Arc::new(|| {}),
+            cors,
+        }
+    }
+
+    #[cfg(not(feature = "cors"))]
     fn new(inner: S3Service) -> Self {
         Self {
             inner,
@@ -516,7 +581,15 @@ mod tests {
     };
 
     use super::*;
-    use crate::{_core::pipeline::Stats, _mem::MemoryStorage};
+    use crate::{
+        _core::{
+            bucket,
+            cors::{CorsConfig, CorsRule},
+            pipeline::Stats,
+            storage::BucketOps,
+        },
+        _mem::MemoryStorage,
+    };
 
     /// One captured event: the target and its key/value fields.
     type CaptureEvent = (String, HashMap<String, String>);
@@ -829,6 +902,88 @@ mod tests {
             "{body_text}"
         );
         shutdown.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn options_preflight_answered_on_the_plane() {
+        // The preflight route on the real data plane: seed the mem storage
+        // with a CORS config (via the storage handle), spawn the plane
+        // (`Capabilities::default` → cors on), then a raw browser OPTIONS
+        // (Origin + Access-Control-Request-Method) is answered 200 with the
+        // allow headers — and a bare OPTIONS (no Origin) still falls
+        // through to s3s: 501 unknown operation (the old behavior).
+        let storage = MemoryStorage::new().unwrap();
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        storage
+            .put_bucket_cors(
+                &name,
+                &CorsConfig {
+                    rules: vec![CorsRule {
+                        id: Some("allow".into()),
+                        allowed_methods: vec!["PUT".into()],
+                        allowed_origins: vec!["https://example.com".into()],
+                        allowed_headers: None,
+                        expose_headers: None,
+                        max_age_seconds: Some(300),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, rx) = watch::channel(false);
+        let plane = DataPlane::new(storage, Capabilities::default());
+        let handle = tokio::spawn(async move {
+            plane.serve(listener, rx).await.unwrap();
+        });
+
+        let (status, body) = raw_request(
+            addr,
+            "OPTIONS /data/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: PUT\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 200, "{text}");
+        assert!(
+            text.contains("access-control-allow-origin: https://example.com"),
+            "{text}"
+        );
+        assert!(text.contains("access-control-allow-methods: put"), "{text}");
+
+        // A bare OPTIONS (non-browser probe): the route's `is_match` falls
+        // through to s3s — 501 unknown operation, the pre-route behavior.
+        let (status, body) = raw_request(
+            addr,
+            "OPTIONS /data/key HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 501, "{}", String::from_utf8_lossy(&body));
+
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_invalid_bucket_name_is_400_by_s3s_not_403() {
+        // op-review C1: s3s validates the path in `prepare` (AwsNameValidation)
+        // BEFORE the route matches — an invalid bucket (uppercase) is a 400
+        // InvalidBucketName, never a 403 CORS denial from the route.
+        let (addr, shutdown, handle) = spawn_plane().await;
+        let (status, body) = raw_request(
+            addr,
+            "OPTIONS /MyBucket/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("InvalidBucketName"), "{text}");
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
     }
 
     #[test]

@@ -6,12 +6,20 @@
 //! The put validates the config on the request path (400 InvalidRequest
 //! on any violation) — the storage codec's self-heal applies to rows,
 //! never input — and enforces the Content-MD5 header three-state.
+//! The browser preflight is a CUSTOM ROUTE on the data plane
+//! ([`CorsPreflightRoute`]): OPTIONS with Origin + Access-Control-Request-
+//! Method is answered before s3s's op dispatch, anonymously (browsers
+//! cannot sign it), with the rule's allow-list and the echoed request.
+
+use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use s3s::{S3Request, S3Response, S3Result, dto, s3_error};
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, dto, route::S3Route, s3_error};
 
 use crate::{
     _core::{
+        bucket,
         cors::{
             CORS_CONFIG_BYTES_MAX, CORS_METHODS, CORS_RULE_ID_MAX, CORS_RULES_MAX, CorsConfig,
             CorsRule,
@@ -70,6 +78,227 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(dto::DeleteBucketCorsOutput::default()))
+    }
+}
+
+/// The CORS config lookup for the preflight route and the Task-10
+/// decoration — the erased boundary over the shared storage handle.
+/// `#[async_trait]` REQUIRED: a native async-fn-in-trait is not
+/// dyn-compatible on stable Rust (E0038); the same pattern the storage
+/// traits use.
+/// (dead_code: the erased method's only call site is the Task-10
+/// decoration, not yet built — the route resolves it statically.)
+#[async_trait::async_trait]
+#[allow(dead_code)]
+pub(crate) trait CorsLookup: Send + Sync {
+    /// The bucket's CORS configuration — `None` on ANY resolution
+    /// failure (missing bucket, invalid name, codec self-heal), which the
+    /// route maps to the single "CORS is not enabled" message (N1 — the
+    /// existence-oracle closure).
+    async fn get(&self, bucket: &str) -> Option<CorsConfig>;
+}
+
+/// The `CorsLookup` adapter over the storage handle shared with the
+/// backend: `get` resolves through the contract's three-state accessor and
+/// keeps every non-resolution as `None` (callers never see the backend
+/// error — the route's denial is the only answer).
+pub(crate) struct CorsConfigs<S: Storage> {
+    storage: Arc<S>,
+}
+
+impl<S: Storage> CorsConfigs<S> {
+    pub fn new(storage: Arc<S>) -> Self {
+        Self { storage }
+    }
+
+    pub async fn get(&self, bucket: &str) -> Option<CorsConfig> {
+        match bucket::name(bucket) {
+            Ok(name) => self.storage.get_bucket_cors(&name).await.ok().flatten(),
+            Err(_) => None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: Storage> CorsLookup for CorsConfigs<S> {
+    async fn get(&self, bucket: &str) -> Option<CorsConfig> {
+        CorsConfigs::get(self, bucket).await
+    }
+}
+
+/// The browser preflight: OPTIONS `/key` with `Origin` +
+/// `Access-Control-Request-Method` answered before the op dispatch — with
+/// the rule's allow-list (Q9), the echoed request headers, and the
+/// `Vary` trio (Q4). Bare OPTIONS falls through to s3s (501, as today) —
+/// `is_match` decides what a preflight is.
+#[derive(Clone)]
+pub(crate) struct CorsPreflightRoute<S: Storage> {
+    configs: Arc<CorsConfigs<S>>,
+}
+
+impl<S: Storage> CorsPreflightRoute<S> {
+    pub fn new(configs: Arc<CorsConfigs<S>>) -> Self {
+        Self { configs }
+    }
+}
+
+/// The bucket of a path-style request (`/bucket/key` → "bucket"), owned:
+/// s3s parses to a fresh `S3Path` per call and its accessors borrow it (a
+/// `&str` return would outlive the temporary — E0515). The tinio data
+/// plane serves path-style only (no virtual-hosted `S3Host` configured),
+/// so this parse is consistent with s3s's own op routing. NOTE:
+/// `parse_path_style(...).as_bucket()` would be the wrong accessor — it
+/// answers `None` for `/bucket/key` (the `Bucket`-variant-only view, s3s
+/// 0.15); `get_bucket_name()` covers both the bucket-only and the object
+/// path.
+pub(crate) fn bucket_from_uri(uri: &Uri) -> Option<String> {
+    s3s::path::parse_path_style(uri.path())
+        .ok()
+        .and_then(|path| path.get_bucket_name().map(str::to_string))
+}
+
+/// The verbatim AWS mismatch message (grilling Q10 — the "evalution" typo
+/// is AWS's own, kept verbatim).
+const CORS_DENIED_MISMATCH_MSG: &str = "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.";
+/// The single no-config message (N1): no configuration AND a well-formed
+/// but missing bucket answer the same — a probe cannot distinguish the two.
+const CORS_NO_CONFIG_MSG: &str = "CORS is not enabled for this bucket.";
+
+/// One home for every 403 denial of the route: the `?`-sites and the
+/// `return`-sites both route here. A denial is `AccessDenied` with the
+/// message and NO `Access-Control-*` headers and no `Vary` — s3s's
+/// `serialize_error` produces only the XML body.
+fn cors_denied_err_at(message: &str) -> S3Error {
+    s3_error!(AccessDenied, "{message}")
+}
+
+#[async_trait::async_trait]
+impl<S: Storage> S3Route for CorsPreflightRoute<S> {
+    fn is_match(
+        &self,
+        method: &Method,
+        _uri: &Uri,
+        headers: &HeaderMap,
+        _extensions: &mut Extensions,
+    ) -> bool {
+        // A true preflight: browsers send Origin + Access-Control-Request-
+        // Method. Bare OPTIONS (non-browser probes) fall through to s3s —
+        // 501 as today. (s3s runs `prepare` BEFORE `is_match`: an invalid
+        // bucket name is already a 400 `InvalidBucketName`, never a 403
+        // from here — op-review C1.)
+        method == Method::OPTIONS
+            && headers.contains_key(header::ORIGIN)
+            && headers.contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+    }
+
+    // Preflight is anonymous by definition (browsers cannot sign OPTIONS);
+    // the default `S3Route::check_access` would demand credentials (403
+    // "Signature is required") — this is the ONLY auth override.
+    async fn check_access(&self, _req: &mut S3Request<Body>) -> S3Result<()> {
+        Ok(())
+    }
+
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        let origin = req
+            .headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| cors_denied_err_at(CORS_DENIED_MISMATCH_MSG))?;
+        let method = req
+            .headers
+            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| cors_denied_err_at(CORS_DENIED_MISMATCH_MSG))?;
+        let requested_headers: Vec<String> = req
+            .headers
+            .get_all(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .collect();
+        // op-review C1: `prepare` validated the path already (a bad name
+        // is a 400 before the route matches) — this parse sees valid names;
+        // the guard stays as defense.
+        let bucket = bucket_from_uri(&req.uri)
+            .ok_or_else(|| cors_denied_err_at(CORS_DENIED_MISMATCH_MSG))?;
+        let Some(config) = self.configs.get(&bucket).await else {
+            return Err(cors_denied_err_at(CORS_NO_CONFIG_MSG));
+        };
+        let Some(matched) = config.preflight(origin, method, &requested_headers) else {
+            return Err(cors_denied_err_at(CORS_DENIED_MISMATCH_MSG));
+        };
+
+        let mut resp = S3Response::new(Body::empty());
+        // op-review S1: fallible HeaderValue construction — a value that is
+        // not settable as a header is SKIPPED, never unwrap/panicked.
+        let star_rule = matched.rule.allowed_origins.iter().any(|o| o == "*"); // Q11
+        let acao = if star_rule {
+            "*"
+        } else {
+            matched.origin.as_str()
+        };
+        if let Ok(v) = HeaderValue::from_str(acao) {
+            resp.headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        // grilling Q9: the RULE's method list (a requested-method echo is
+        // stale AWS docs behavior).
+        let methods = matched.rule.allowed_methods.join(", ");
+        if let Ok(v) = HeaderValue::from_str(&methods) {
+            resp.headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
+        }
+        // The request's own names (case/spelling verbatim — the codec
+        // stores the request's values), echoed as one list.
+        if !matched.requested_headers.is_empty() {
+            let joined = matched.requested_headers.join(", ");
+            if let Ok(v) = HeaderValue::from_str(&joined) {
+                resp.headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+            }
+        }
+        // Q11: OMIT Allow-Credentials for a bare `*` origin rule (the two
+        // are incompatible); echo the origin + allow the credentials on
+        // concrete rules. The literals are not request data — built once
+        // (http 1.5 insert takes a HeaderValue; `from_static` panics only
+        // on an invalid literal, these are constant).
+        if !star_rule {
+            resp.headers.insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                HeaderValue::from_static("true"),
+            );
+        }
+        if let Some(expose) = &matched.rule.expose_headers
+            && !expose.is_empty()
+        {
+            let joined = expose.join(", ");
+            if let Ok(v) = HeaderValue::from_str(&joined) {
+                resp.headers
+                    .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
+            }
+        }
+        if let Some(max_age) = matched.rule.max_age_seconds {
+            // op-review S1 applies here too (never unwrap; the insert of a
+            // String would panic on failure).
+            if let Ok(v) = HeaderValue::from_str(&max_age.to_string()) {
+                resp.headers.insert(header::ACCESS_CONTROL_MAX_AGE, v);
+            }
+        }
+        // grilling Q4 + op-review G3: APPEND (merge, never replace) the
+        // Vary trio; the wire carries them as a multi-valued header.
+        for v in [
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+        ] {
+            resp.headers
+                .append(header::VARY, HeaderValue::from_static(v));
+        }
+        // op-review G4: s3s copies custom-route headers verbatim and sets
+        // nothing — an explicit empty body length.
+        resp.headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        Ok(resp)
     }
 }
 
@@ -263,11 +492,26 @@ fn cors_rules_to_dto(config: &CorsConfig) -> dto::CORSRules {
 
 #[cfg(test)]
 mod tests {
-    use s3s::{S3, dto};
+    use std::sync::Arc;
 
-    use crate::backend::{
-        Capabilities,
-        testutil::{s3_request, setup, setup_with_caps},
+    use http::{Extensions, HeaderMap, HeaderValue, Method, header};
+    use s3s::{Body, S3, S3Request, dto, route::S3Route};
+
+    use super::{
+        CORS_DENIED_MISMATCH_MSG, CORS_NO_CONFIG_MSG, CorsConfigs, CorsPreflightRoute,
+        bucket_from_uri,
+    };
+    use crate::{
+        _core::{
+            bucket,
+            cors::{CorsConfig, CorsRule},
+            storage::BucketOps,
+        },
+        _mem::MemoryStorage,
+        backend::{
+            Capabilities,
+            testutil::{s3_request, setup, setup_with_caps},
+        },
     };
 
     /// A valid Content-MD5: base64 of 16 zero bytes. The ops never verify
@@ -561,5 +805,249 @@ mod tests {
             .await
             .unwrap_err();
         disabled(err);
+    }
+
+    /// The preflight route over a fresh MemoryStorage seeded with `config`
+    /// for the bucket "data" (created first — mem's CORS trio answers
+    /// NoSuchBucket for a missing row).
+    async fn test_route(config: CorsConfig) -> CorsPreflightRoute<MemoryStorage> {
+        let storage = Arc::new(MemoryStorage::new().unwrap());
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        storage.put_bucket_cors(&name, &config).await.unwrap();
+        CorsPreflightRoute::new(Arc::new(CorsConfigs::new(storage)))
+    }
+
+    /// A browser preflight: anonymous OPTIONS `<path>` with Origin +
+    /// Access-Control-Request-Method (+ optional requested headers).
+    fn preflight_req(
+        path: &str,
+        origin: &str,
+        method: &str,
+        requested_headers: Option<&str>,
+    ) -> S3Request<Body> {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        headers.insert(
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_str(method).unwrap(),
+        );
+        if let Some(requested) = requested_headers {
+            headers.insert(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                HeaderValue::from_str(requested).unwrap(),
+            );
+        }
+        S3Request {
+            input: Body::empty(),
+            method: Method::OPTIONS,
+            uri: path.parse().unwrap(),
+            headers,
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_matches_allowed_origin_and_answers_headers() {
+        let route = test_route(CorsConfig {
+            rules: vec![CorsRule {
+                id: Some("allow-example".into()),
+                allowed_methods: vec!["GET".into(), "PUT".into()],
+                allowed_origins: vec!["https://example.com".into()],
+                allowed_headers: Some(vec!["x-amz-*".into()]),
+                expose_headers: Some(vec!["ETag".into()]),
+                max_age_seconds: Some(300),
+            }],
+        })
+        .await;
+        let resp = route
+            .call(preflight_req(
+                "/data/key",
+                "https://example.com",
+                "PUT",
+                Some("x-amz-foo"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://example.com"
+        );
+        // grilling Q9: Allow-Methods is the RULE's list, not the
+        // requested method.
+        assert_eq!(
+            resp.headers[header::ACCESS_CONTROL_ALLOW_METHODS],
+            "GET, PUT"
+        );
+        // The request's own case/spelling, echoed (the codec stores the
+        // request's values).
+        assert_eq!(
+            resp.headers[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "x-amz-foo"
+        );
+        assert_eq!(resp.headers[header::ACCESS_CONTROL_EXPOSE_HEADERS], "ETag");
+        assert_eq!(resp.headers[header::ACCESS_CONTROL_MAX_AGE], "300");
+        assert_eq!(
+            resp.headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+            "true"
+        );
+        // grilling Q4: the Vary trio is APPENDed — the wire carries it as
+        // a multi-valued header (three Vary lines).
+        let vary: Vec<&str> = resp
+            .headers
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            vary,
+            [
+                "Origin",
+                "Access-Control-Request-Headers",
+                "Access-Control-Request-Method"
+            ]
+        );
+        // op-review G4: set explicitly.
+        assert_eq!(resp.headers[header::CONTENT_LENGTH], "0");
+    }
+
+    #[tokio::test]
+    async fn preflight_bare_star_rule_answers_literal_star_without_credentials() {
+        // grilling Q11: origin rule = "*" → ACAO literal "*", Allow-
+        // Credentials OMITTED (the two are incompatible).
+        let route = test_route(CorsConfig {
+            rules: vec![CorsRule {
+                id: None,
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["*".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        })
+        .await;
+        let resp = route
+            .call(preflight_req(
+                "/data/key",
+                "https://example.com",
+                "GET",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert!(
+            !resp
+                .headers
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_disallowed_and_no_config_answer_403_with_aws_messages() {
+        // grilling Q10: a rule mismatch → 403 AccessDenied with the
+        // verbatim AWS message (the "evalution" typo is AWS's own).
+        let route = test_route(CorsConfig {
+            rules: vec![CorsRule {
+                id: None,
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["https://example.com".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        })
+        .await;
+        let err = route
+            .call(preflight_req(
+                "/data/key",
+                "https://example.com",
+                "PUT",
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "AccessDenied", "{err:?}");
+        assert_eq!(err.message().unwrap(), CORS_DENIED_MISMATCH_MSG, "{err:?}");
+        // Denials carry no Access-Control-* headers and no Vary.
+        assert!(err.headers().is_none(), "{err:?}");
+
+        // No CORS config (a configured-less bucket) → the same code with
+        // the no-config message.
+        let storage = Arc::new(MemoryStorage::new().unwrap());
+        let name = bucket::name("data").unwrap();
+        storage.create_bucket(&name).await.unwrap();
+        let route = CorsPreflightRoute::new(Arc::new(CorsConfigs::new(storage)));
+        let err = route
+            .call(preflight_req(
+                "/data/key",
+                "https://example.com",
+                "GET",
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "AccessDenied", "{err:?}");
+        assert_eq!(err.message().unwrap(), CORS_NO_CONFIG_MSG, "{err:?}");
+        assert!(err.headers().is_none(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn preflight_missing_bucket_uses_the_same_no_config_message() {
+        // N1 / existence-oracle closure: a well-formed but MISSING bucket
+        // resolves to `CorsConfigs::get → None` — the route answers the
+        // SAME "CORS is not enabled for this bucket." message as the
+        // no-config case: a probe cannot distinguish "bucket exists, no
+        // CORS" from "bucket missing".
+        let storage = Arc::new(MemoryStorage::new().unwrap());
+        let route = CorsPreflightRoute::new(Arc::new(CorsConfigs::new(storage)));
+        let err = route
+            .call(preflight_req(
+                "/missing/key",
+                "https://example.com",
+                "GET",
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "AccessDenied", "{err:?}");
+        assert_eq!(err.message().unwrap(), CORS_NO_CONFIG_MSG, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn preflight_anonymous_check_access_is_allowed() {
+        // Ruling 1: preflight is anonymous by definition — browsers cannot
+        // sign OPTIONS — the default `S3Route::check_access` ("Signature is
+        // required") is overridden to Ok.
+        let route = test_route(CorsConfig {
+            rules: vec![CorsRule {
+                id: None,
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["*".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        })
+        .await;
+        let mut req = preflight_req("/data/key", "https://example.com", "GET", None);
+        assert!(req.credentials.is_none());
+        S3Route::check_access(&route, &mut req).await.unwrap();
+    }
+
+    #[test]
+    fn bucket_from_uri_is_the_bucket_of_object_and_bucket_paths() {
+        // s3s 0.15's `S3Path::as_bucket()` answers None for /bucket/key
+        // (the Bucket-variant-only accessor) — the route needs
+        // `get_bucket_name()`, which covers both path shapes.
+        let bucket = |path: &str| -> Option<String> { bucket_from_uri(&path.parse().unwrap()) };
+        assert_eq!(bucket("/data/key").as_deref(), Some("data"));
+        assert_eq!(bucket("/data").as_deref(), Some("data"));
+        assert_eq!(bucket("/"), None);
+        assert_eq!(bucket("/MyBucket/key"), None);
     }
 }

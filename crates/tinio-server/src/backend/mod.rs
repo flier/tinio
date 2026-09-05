@@ -15,7 +15,7 @@
 
 mod conditions;
 #[cfg(feature = "cors")]
-mod cors;
+pub(crate) mod cors;
 mod errors;
 mod locks;
 mod s3;
