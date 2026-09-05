@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use redb::Database;
 use tinio_core::{
+    acl::Acl,
     checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Upload, Value},
     etag::ETag,
     object::{self, Tags},
@@ -47,7 +48,7 @@ fn object_lifecycle_across_all_row_tables() {
     h.write(|txn| -> Result<(), tinio_store::Error> {
         {
             let mut u = upload::Table::open(txn)?;
-            u.put("demo", "u1", &key, now, &tags)?;
+            u.put("demo", "u1", &key, now, &tags.to_wire(), "", "")?;
         }
         {
             let mut uc = upload_checksum::Table::open(txn)?;
@@ -103,6 +104,8 @@ fn object_lifecycle_across_all_row_tables() {
             },
             kind: ChecksumType::FullObject,
         }),
+        owner: None,
+        acl: Acl::default_private(None),
     };
     h.write(|txn| -> Result<(), tinio_store::Error> {
         {
@@ -135,8 +138,9 @@ fn object_lifecycle_across_all_row_tables() {
 
         let u = upload::Table::open_readonly(txn)?;
         assert!(u.key_matches("demo", &key, "u1")?);
-        let (got_key, _, got_tags) = u.get_matching("demo", &key, "u1")?.unwrap();
-        assert_eq!((got_key, got_tags), ("big.bin".to_string(), tags.clone()));
+        let (got_key, _, _, _, _) = u.get_matching("demo", &key, "u1")?.unwrap();
+        assert_eq!(got_key, "big.bin");
+        assert_eq!(u.tags("demo", &key, "u1")?.unwrap(), tags);
 
         let uc = upload_checksum::Table::open_readonly(txn)?;
         assert_eq!(

@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use redb::{Database, TableDefinition};
 use tinio_core::{
+    acl::Acl,
     checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Upload, Value},
     cors,
     etag::ETag,
@@ -314,6 +315,8 @@ fn object_meta_put_round_trips_all_elements() {
             },
             kind: ChecksumType::FullObject,
         }),
+        owner: None,
+        acl: Acl::default_private(None),
     };
     h.write(|txn| -> Result<(), tinio_store::Error> {
         meta::Table::open(txn)?.put("data", &key, &written)?;
@@ -370,6 +373,8 @@ fn object_meta_get_self_heals_garbage_tags_and_checksum() {
                     0u64,
                     "env=%zz",
                     "CRC32:AA==:NOPE",
+                    "",
+                    "",
                 ),
             )
             .map_err(tinio_store::Error::from)?;
@@ -401,6 +406,8 @@ fn object_meta_walk_self_heals_a_corrupt_etag_row() {
         file_identity: 0,
         tags: Tags::empty(),
         checksum: None,
+        owner: None,
+        acl: Acl::default_private(None),
     };
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = meta::Table::open(txn)?;
@@ -409,7 +416,7 @@ fn object_meta_walk_self_heals_a_corrupt_etag_row() {
         // the walk rather than failing it — the gating load's discipline.
         t.insert(
             ("data", "bad-etag"),
-            ("not-an-etag", 1u64, 0u64, 0u64, "", ""),
+            ("not-an-etag", 1u64, 0u64, 0u64, "", "", "", ""),
         )
         .map_err(tinio_store::Error::from)?;
         Ok(())
@@ -447,6 +454,8 @@ fn object_meta_tag_accessors_rewrite_only_the_element() {
         file_identity: 2,
         tags: Tags::empty(),
         checksum: None,
+        owner: None,
+        acl: Acl::default_private(None),
     };
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = meta::Table::open(txn)?;
@@ -481,6 +490,8 @@ fn object_meta_tag_accessors_rewrite_only_the_element() {
                 1u64,
                 2u64,
                 "team=%zz&",
+                "",
+                "",
                 "",
             ),
         )
@@ -548,9 +559,17 @@ fn upload_rows_key_match_bucket_scan_and_for_each() {
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = upload::Table::open(txn)?;
         assert!(!t.has_bucket("data")?);
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags)?;
-        t.put("data", "u2", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
-        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
+        t.put(
+            "data",
+            "u1",
+            &key,
+            SystemTime::UNIX_EPOCH,
+            &tags.to_wire(),
+            "",
+            "",
+        )?;
+        t.put("data", "u2", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
         assert!(t.has_bucket("data")?);
         Ok(())
     })
@@ -561,10 +580,11 @@ fn upload_rows_key_match_bucket_scan_and_for_each() {
         assert!(t.key_matches("data", &key, "u1")?);
         assert!(!t.key_matches("data", "wrong-key", "u1")?);
         assert!(!t.key_matches("data", &key, "u5")?);
-        let (got_key, initiated, got_tags) = t.get_matching("data", &key, "u1")?.unwrap();
+        let (got_key, initiated, tags_wire, _, _) = t.get_matching("data", &key, "u1")?.unwrap();
         assert_eq!(got_key, &*key);
         assert_eq!(initiated, 0);
-        assert_eq!(got_tags, tags);
+        assert_eq!(t.tags("data", &key, "u1")?.unwrap(), tags);
+        assert!(!tags_wire.is_empty());
         assert!(t.get_matching("data", &key, "u5")?.is_none());
         // The bucket scan visits only this bucket's uploads, in key order.
         let mut ids = Vec::new();
@@ -575,7 +595,7 @@ fn upload_rows_key_match_bucket_scan_and_for_each() {
         assert_eq!(ids, ["u1", "u2"]);
         // The whole-table walk.
         let mut all = Vec::new();
-        t.for_each(|b, id, _, _, _| {
+        t.for_each(|b, id, _, _, _, _, _| {
             all.push((b.to_string(), id.to_string()));
             Ok(())
         })?;
@@ -599,37 +619,37 @@ fn upload_tags_accessors_round_trip_and_self_heal() {
     let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = upload::Table::open(txn)?;
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags)?;
-        let (_, _, got) = t.get_matching("data", &key, "u1")?.unwrap();
-        assert_eq!(got, tags);
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
-        let (_, _, got) = t.get_matching("data", &key, "u1")?.unwrap();
-        assert!(got.is_empty());
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags.to_wire(), "", "")?;
+        assert_eq!(t.tags("data", &key, "u1")?.unwrap(), tags);
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+        assert!(t.tags("data", &key, "u1")?.unwrap().is_empty());
         Ok(())
     })
     .unwrap();
     // A garbage tags wire self-heals on the table accessor.
     h.write(|txn| -> Result<(), tinio_store::Error> {
         upload::Table::open(txn)?
-            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&"))
+            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&", "", ""))
             .map_err(tinio_store::Error::from)?;
         Ok(())
     })
     .unwrap();
     h.read(|txn| -> Result<(), tinio_store::Error> {
         let t = upload::Table::open_readonly(txn)?;
-        let (_, _, tags) = t.get_matching("data", &key, "u1")?.unwrap();
         assert!(
-            tags.is_empty(),
+            t.tags("data", &key, "u1")?.unwrap().is_empty(),
             "a corrupt upload tags wire is the empty set"
         );
-        t.for_bucket("data", |_, (_, _, tags)| {
-            assert!(tags.is_empty(), "the bucket scan self-heals the same way");
+        t.for_bucket("data", |_, (_, _, tags_wire, _, _)| {
+            assert!(
+                tags_wire.is_empty(),
+                "the bucket scan self-heals the same way"
+            );
             Ok(())
         })?;
-        t.for_each(|_, _, _, _, tags| {
+        t.for_each(|_, _, _, _, tags_wire, _, _| {
             assert!(
-                tags.is_empty(),
+                tags_wire.is_empty(),
                 "the whole-table walk self-heals the same way"
             );
             Ok(())
@@ -648,7 +668,7 @@ fn upload_tags_accessor_answers_the_identity_check() {
         let mut t = upload::Table::open(txn)?;
         // Missing row: None.
         assert!(t.tags("data", &key, "u1")?.is_none());
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags)?;
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags.to_wire(), "", "")?;
         // S3 identity is (bucket, key, uploadId): a matching key answers
         // the tags, a mismatched key or upload id answers None (the
         // caller's NoSuchUpload arm).
@@ -665,7 +685,7 @@ fn upload_tags_accessor_answers_the_identity_check() {
     // self-healed empty set.
     h.write(|txn| -> Result<(), tinio_store::Error> {
         upload::Table::open(txn)?
-            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&"))
+            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&", "", ""))
             .map_err(tinio_store::Error::from)?;
         Ok(())
     })
@@ -689,8 +709,8 @@ fn upload_drain_bucket_removes_only_the_bucket() {
     // insert in the same txn trips a redb page-manager assertion).
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = upload::Table::open(txn)?;
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
-        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
         Ok(())
     })
     .unwrap();

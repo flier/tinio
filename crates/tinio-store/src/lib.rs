@@ -10,6 +10,7 @@
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 
+mod acl;
 pub mod bucket;
 pub mod error;
 pub mod meta;
@@ -29,6 +30,7 @@ pub mod upload_checksum;
 #[cfg(test)]
 mod contract;
 
+pub use self::acl::{decode_acl_wire, decode_owner_wire};
 pub use self::error::Error;
 
 /// Create the seven shared tables inside a write transaction
