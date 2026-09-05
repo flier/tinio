@@ -88,11 +88,12 @@ name = "pipeline"
 harness = false
 
 [features]
-default = ["multipart", "copy", "list-v1", "list-v2"]
+default = ["multipart", "copy", "list-v1", "list-v2", "cors"]
 multipart = []
 copy = []
 list-v1 = []
 list-v2 = []
+cors = []
 api = ["dep:tinio-api"]
 otel = [
     "dep:opentelemetry",

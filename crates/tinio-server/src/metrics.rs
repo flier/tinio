@@ -1151,6 +1151,33 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
             .await
     }
 
+    #[cfg(feature = "cors")]
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<dto::GetBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::GetBucketCorsOutput>> {
+        self.record("GetBucketCors", self.inner.get_bucket_cors(req))
+            .await
+    }
+
+    #[cfg(feature = "cors")]
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<dto::PutBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::PutBucketCorsOutput>> {
+        self.record("PutBucketCors", self.inner.put_bucket_cors(req))
+            .await
+    }
+
+    #[cfg(feature = "cors")]
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<dto::DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketCorsOutput>> {
+        self.record("DeleteBucketCors", self.inner.delete_bucket_cors(req))
+            .await
+    }
+
     // --- objects ---
     async fn put_object(
         &self,

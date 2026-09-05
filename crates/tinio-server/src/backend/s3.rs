@@ -64,6 +64,31 @@ impl<S: Storage> S3 for S3Backend<S> {
         self.op_delete_bucket_tagging(req).await
     }
 
+    // --- bucket CORS (spec 2026-09-05) ---
+    #[cfg(feature = "cors")]
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<dto::GetBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::GetBucketCorsOutput>> {
+        self.op_get_bucket_cors(req).await
+    }
+
+    #[cfg(feature = "cors")]
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<dto::PutBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::PutBucketCorsOutput>> {
+        self.op_put_bucket_cors(req).await
+    }
+
+    #[cfg(feature = "cors")]
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<dto::DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketCorsOutput>> {
+        self.op_delete_bucket_cors(req).await
+    }
+
     // --- objects + copy (T048) ---
     async fn put_object(
         &self,

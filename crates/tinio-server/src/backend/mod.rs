@@ -14,6 +14,8 @@
 //! answer `NotImplemented` (FR-021).
 
 mod conditions;
+#[cfg(feature = "cors")]
+mod cors;
 mod errors;
 mod locks;
 mod s3;
@@ -219,8 +221,20 @@ pub struct S3Backend<S: Storage> {
 impl<S: Storage> S3Backend<S> {
     /// Construct the mapping over `storage` with the given toggles.
     pub fn new(storage: S, caps: Capabilities) -> Self {
+        // Delegates to the shared-storage constructor (wrapping first) so
+        // the route, decorator, and backend share one storage handle.
+        Self::new_shared(Arc::new(storage), caps)
+    }
+
+    /// Construct the mapping over a shared `storage` handle with the given
+    /// toggles — the shared-`Arc<S>` constructor.
+    ///
+    /// UNGATED: it exists in every build (feature-off builds keep a
+    /// constructor via [`S3Backend::new`], per spec §5); only the cors
+    /// wiring is `#[cfg(feature = "cors")]`.
+    pub fn new_shared(storage: Arc<S>, caps: Capabilities) -> Self {
         Self {
-            storage: Arc::new(storage),
+            storage,
             caps,
             conditional_put_locks: Map::new(),
             #[cfg(feature = "multipart")]
