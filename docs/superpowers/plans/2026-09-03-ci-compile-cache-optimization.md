@@ -1,6 +1,6 @@
 # CI compile-time & cache-hit-rate improvement plan (2026-09-03)
 
-Status: Phase 0 done · Phase 1 landed (d7a3fe0) · Phase 2 root-caused 2026-09-04 (quota eviction), store cleared, diagnostics removed · post-fix run (33838749905, cfbc1e6): wall 9:51 ✓, Rust hit rate 22.5 % ✗ (below armed run 55.9 % and acceptance), write errors 2797 ≈ 49 % of misses ✗ — root cause corrected to the cache API write rate limit (~200 uploads/min), not quota · next run on this commit is the payoff measurement.
+Status: Phase 0 done · Phase 1 landed (d7a3fe0) · Phase 2 root-caused 2026-09-04 (quota eviction), store cleared, diagnostics removed · post-fix run (33838749905, cfbc1e6): wall 9:51 ✓, Rust hit rate 22.5 % ✗ (below armed run 55.9 % and acceptance), write errors 2797 ≈ 49 % of misses ✗ — root cause corrected to the cache API write rate limit (~200 uploads/min), not quota · next run on this commit is the payoff measurement (see Phase 3).
 
 ## Goal
 
@@ -75,6 +75,26 @@ Write-error root cause (2026-09-04): **quota eviction, not rate-limiting** — `
 - The store clear itself worked: the run ended at 1.2 GB / 1099 entries (all written by this run), ~1/8 of the 10 GB cap — quota was not the constraint on this run.
 - Root cause corrected: with the store far below the cap, the refusals are the **Actions cache API per-repo write rate limit (~200 uploads/min, HTTP 429, documented at `docs.github.com/en/actions/reference/limits`)**, not quota. Evidence: late legs show `cache_writes: 0` / `cache_write_duration: 0 s` (instant refusal) while early legs persisted ≈ the ~1000 objects a ~5 min window allows; baseline (47.8 %) and post-fix (49.3 %) share the same miss→error ratio, both being high-miss-volume runs.
 - Forward: the store now holds this commit's objects, and reads are unaffected by the write throttle — the next run on the same commit should show a much higher hit rate. If it still undershoots, the lever is reducing write volume (fewer misses, directory-level rust-cache, fewer parallel writers) or a paid plan; clearing the store is not a fix for the write limit.
+
+## Phase 3 — post-fix cache & gate restructuring (2026-09-05)
+
+Two runs measured the deps cleanup and the clippy/gate restructure:
+
+- `33971349627` (dev `eafd5ff`, "remove unused dependencies") — 9m18s · Rust hit 51.9 % · write errors 1248.
+- `33977060096` (dev `4cf1801`, "ci(lint): run clippy on 2 ubuntu targets") — **7m57s · 59.1 % · 722 write errors** (vs 9m18s / 51.9 % / 1248): wall −14 %, hit +7.2 pp, write errors −42 %.
+
+### Decisions
+
+- **clippy folded to 2 ubuntu runners (`unix` + `windows-gnu` cross); macos/msvc clippy legs dropped.** The source has no `cfg(target_os = "macos")` — every macOS path is `cfg(unix)` (100×) — so a native linux clippy already lints the Darwin code (linux + macos share one compile); only `cfg(windows)` (53×) needs the windows target. macOS/msvc compile stays covered by the test-port matrix.
+- **clippy sccache is per-leg.** The `unix` leg keeps sccache (reads the warm linux store — 297 hits on the first run); the cold `windows-gnu` cross leg bypasses it (`RUSTC_WRAPPER` cleared) to stop writing ~324 cold objects into the ~200/min shared write budget. First `SCCACHE_DISABLE=1` was a **no-op** — sccache 0.17 ignored it (clippy still read 297 hits and made 154 writes + 171 errors).
+- **pin stable `1.98.0`** (`env.RUST_STABLE` / `env.RUST_NIGHTLY`). sccache keys include the rustc version, so the moving "stable" channel invalidates the whole store ~6-weekly; pinning keeps keys stable. Nightly is rustfmt-only (no cache), so it stays moving.
+- **fmt and docs are standalone jobs** (extracted from clippy/test): fmt is platform-neutral + non-compiling (no compile gate); docs runs `cargo doc -D warnings` (rustdoc warnings). `test-extra` renamed `test-no-default` (no-default only).
+- **feature-matrix keeps sccache** — it runs `cargo hack check` (metadata, same key-space as `check`) and measured 63 % hit / 6 write errors; disabling would lose those hits for ~no write-budget gain.
+- **rejected**: a `build` gate (`check → build → fan-out`) — `cargo build` warms link keys the test chain head already warms, and clippy/features/other-OS use different keys, so it only serializes fan-out and adds wall; per-OS port chaining (`e2e-port`/`interop-port` behind `test-port`) — the windows/macos port legs are the slow tail, chaining them ~2.3× the port wall (6m41s → ~15m31s) for a small hit-rate gain.
+
+### Open levers (unchanged)
+
+Paid plan / larger cache quota remains the decisive fix for the write-rate limit and eviction; windows larger runners and nextest sharding are wall levers, not cache.
 
 ## Verification
 
