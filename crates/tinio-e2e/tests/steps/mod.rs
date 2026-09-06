@@ -5,6 +5,7 @@
 //! `#[before]`/`#[after]` hooks ([`configure`]) spawn the in-process
 //! server per scenario and tear it down after.
 
+pub mod acl;
 pub mod buckets;
 pub mod clients;
 pub mod common;
@@ -15,6 +16,7 @@ pub mod multipart;
 pub mod objects;
 pub mod reserved_paths;
 pub mod select;
+pub mod sigv4;
 
 use std::collections::HashMap;
 
@@ -118,6 +120,17 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         caps.delete_objects = false;
         caps.tagging = false;
         caps.cors = false;
+        // The seventh capability (Task 15, Task 10 carry): the ACL
+        // subsystem's runtime toggle — off answers NotImplemented on the
+        // four ACL ops (the legacy no-identity plane, like the other
+        // off-mode scenarios).
+        caps.acl = false;
+    }
+    if tagged("acl-off") {
+        // The @acl-off scenarios' own toggle: same semantics as the
+        // @minimal-caps entry above, spelled out for the acl.feature
+        // headings (the 12 legacy feature files use @minimal-caps).
+        caps.acl = false;
     }
     if tagged("max-buckets-3") {
         // The ListBuckets-pagination scenarios need a page cap below the
@@ -159,13 +172,26 @@ fn before_hook<'a>(
             world.ext = Some(clients::External::start(&caps, fs_kind));
             return;
         }
-        let server = match (backend, fs_kind) {
-            (Backend::Mem, _) => Server::mem(caps).await,
-            (Backend::Fs, FsKind::NestedRoot) => Server::fs_nested(caps).await,
-            (Backend::Fs, FsKind::ColdListing(interval)) => {
-                Server::fs_with_scanner_interval(caps, interval).await
+        let server = if has_tag(&scenario.tags, "acl") {
+            // The identity-wired acl plane (Task 15, grilling Q2): the
+            // config-driven Identity (fixture [auth]/[owner]/[[users]])
+            // through `DataPlane::new_with_acl` — the enforced mode the
+            // @acl scenarios exercise. `@acl-off` is NOT this branch
+            // (the caps gate off runs the legacy no-identity plane,
+            // like the other @minimal-caps off-mode scenarios).
+            match backend {
+                Backend::Mem => Server::acl_mem(caps).await,
+                Backend::Fs => Server::acl(caps).await,
             }
-            (Backend::Fs, FsKind::Plain) => Server::fs(caps).await,
+        } else {
+            match (backend, fs_kind) {
+                (Backend::Mem, _) => Server::mem(caps).await,
+                (Backend::Fs, FsKind::NestedRoot) => Server::fs_nested(caps).await,
+                (Backend::Fs, FsKind::ColdListing(interval)) => {
+                    Server::fs_with_scanner_interval(caps, interval).await
+                }
+                (Backend::Fs, FsKind::Plain) => Server::fs(caps).await,
+            }
         };
         world.client.bind(server.addr());
         world.server = Some(server);

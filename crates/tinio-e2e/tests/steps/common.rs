@@ -16,7 +16,7 @@
 //! contains/omits/equals) live here too, so a new feature does not have
 //! to hunt for them in a feature-specific step module.
 
-use std::{io, net::SocketAddr, path::Path, str, time::Duration};
+use std::{io, net::SocketAddr, path::Path, str, sync::Arc, time::Duration};
 
 use cucumber::{given, then};
 use md5::{Digest, Md5};
@@ -28,7 +28,16 @@ use tokio::{
     time::sleep,
 };
 
+use super::sigv4::Signer;
 pub use crate::_fs::testing::fs_options;
+use crate::{
+    _core::storage::Storage,
+    _fs::{FsStorage, Scanner, ScannerOptions},
+    _mem::MemoryStorage,
+    _server::_config::Config,
+    _server::identity::IdentityFromConfig,
+    _server::{Capabilities, DataPlane, Identity},
+};
 
 /// Repeatable body of length `n`: `(i * 31 + 7) % 256` at position `i`.
 /// The ONE byte generator the steps share (F14): the upload-vs-verify
@@ -52,12 +61,51 @@ pub fn md5_hex(data: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
-use crate::{
-    _core::storage::Storage,
-    _fs::{FsStorage, Scanner, ScannerOptions},
-    _mem::MemoryStorage,
-    _server::{Capabilities, DataPlane},
-};
+
+/// The @acl fixture users (grilling Q2 — the config-driven identity the
+/// acl plane spawns with, mirroring `serve`): `[auth]` presents the
+/// `[owner]` element as root, `[[users]]` adds user-b. The canonical
+/// IDs are the constant values the feature files reference — the
+/// root's configured one and user-b's derived one (hex SHA-256 of
+/// `USERB`).
+pub const ACL_ROOT: (&str, &str) = ("ROOTAK", "root-secret");
+pub const ACL_USER_B: (&str, &str) = ("USERB", "user-b-secret");
+pub const ACL_ROOT_ID: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+pub const ACL_USER_B_ID: &str = "8b3873bb48d62959c9316b8bc5a1c11dcb3e14dce9426cc76ce9c67e00523b6c";
+
+/// The fixture config behind the @acl identity — the same
+/// `[auth]`/`[owner]`/`[[users]]` assembly `serve` wires (spec §6), so
+/// the e2e plane has real configured principals, not test-constructed
+/// ones. Built from the access-key / canonical-ID constants above, so
+/// the config and the Gherkin literals cannot drift.
+fn acl_fixture_config() -> Config {
+    let toml = format!(
+        r#"version = 1
+[auth]
+access_key = "{root_ak}"
+secret_key = "{root_sk}"
+[owner]
+canonical_id = "{ACL_ROOT_ID}"
+display_name = "ops"
+[[users]]
+access_key = "{userb_ak}"
+secret_key = "user-b-secret"
+canonical_id = "{ACL_USER_B_ID}"
+display_name = "bob"
+"#,
+        root_ak = ACL_ROOT.0,
+        root_sk = ACL_ROOT.1,
+        userb_ak = ACL_USER_B.0,
+    );
+    Config::parse(&toml).expect("the acl fixture config parses")
+}
+
+/// The @acl identity map assembled from the fixture config
+/// ([`IdentityFromConfig`] — the config-driven path, never a direct
+/// `Identity` construction).
+pub fn acl_fixture_identity() -> Arc<Identity> {
+    Identity::from_config(&acl_fixture_config())
+}
 
 /// Which storage backend the in-process server runs on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -166,6 +214,55 @@ impl Server {
         }
     }
 
+    /// Bind the identity-wired acl plane (`DataPlane::new_with_acl` —
+    /// ConfigAuth + AclAccess, the @acl-scenario server) over the given
+    /// identity: the same bind/serve/shutdown shape as `spawn_with`,
+    /// which itself stays untouched so the legacy 12 feature files keep
+    /// running unsigned.
+    async fn spawn_with_acl<S: Storage>(
+        storage: S,
+        caps: Capabilities,
+        root: Option<TempDir>,
+        identity: Arc<Identity>,
+    ) -> Self {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, rx) = watch::channel(false);
+        let plane = DataPlane::new_with_acl(storage, caps, identity);
+        tokio::spawn(async move {
+            plane.serve(listener, rx).await.unwrap();
+        });
+        let served = root.as_ref().map(|r| r.path().to_path_buf());
+        Self {
+            addr,
+            _root: root,
+            served,
+            shutdown,
+        }
+    }
+
+    /// Serve a fresh filesystem-backed root on the identity-wired acl
+    /// plane (the @acl scenarios' plain backend).
+    pub async fn acl(caps: Capabilities) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        Self::spawn_with_acl(storage, caps, Some(root), acl_fixture_identity()).await
+    }
+
+    /// Serve the in-memory reference backend on the identity-wired acl
+    /// plane (the @acl @mem scenarios).
+    pub async fn acl_mem(caps: Capabilities) -> Self {
+        Self::spawn_with_acl(
+            MemoryStorage::new().unwrap(),
+            caps,
+            None,
+            acl_fixture_identity(),
+        )
+        .await
+    }
+
     /// The bound address.
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -235,6 +332,31 @@ impl Client {
             body,
         )
         .await
+    }
+
+    /// One raw HTTP request signed (SigV4) as the configured fixture
+    /// user (`access_key`, `secret`): the signer's three headers
+    /// (`x-amz-date`, `x-amz-content-sha256`, `authorization`) are
+    /// merged into `headers` and the request goes through
+    /// [`Client::request`] unchanged — the step wrappers' only auth
+    /// path (anonymous stays driver-level unsigned).
+    pub async fn signed_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        user: (&str, &str),
+    ) -> LastResponse {
+        let addr = self.addr.expect("client bound to a server");
+        let signer = Signer::new(user.0, user.1);
+        let extra = signer.sign(method, path, headers, body, &addr.to_string());
+        let mut signed_headers: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + extra.len());
+        for (name, value) in &extra {
+            signed_headers.push((name, value));
+        }
+        signed_headers.extend_from_slice(headers);
+        request(addr, method, path, &signed_headers, body).await
     }
 }
 

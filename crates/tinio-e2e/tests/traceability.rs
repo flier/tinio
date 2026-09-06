@@ -33,6 +33,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The SigV4 signer's golden-vector unit tests (Task 15): the cucumber
+/// binary's harness is disabled, so the signer's `#[cfg(test)]` module
+/// rides this default-harness binary — the AWS-published canonical-
+/// request and signature vectors pin the canonicalization (an
+/// independent oracle, not a test of the server against itself). The
+/// signer's production code is exercised through the cucumber binary
+/// only, hence the dead-code allow on this include.
+#[cfg(test)]
+#[path = "steps/sigv4.rs"]
+#[allow(dead_code)]
+mod sigv4;
+
 /// IDs referenced by the spec documents but verified outside the cucumber
 /// suite, each with the reason (mirrored in the s3-surface.md "Automated
 /// coverage" section note).
