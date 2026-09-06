@@ -22,7 +22,7 @@ env:
   # every ~6 weeks. Nightly is used only for rustfmt (no sccache), so it
   # stays on the moving channel unless a pinned date is desired for a fully
   # deterministic fmt gate.
-  RUST_STABLE: "1.98.0"
+  RUST_STABLE: "1.98.1"
   RUST_NIGHTLY: "nightly"
 
 permissions:
