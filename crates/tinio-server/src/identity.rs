@@ -20,18 +20,23 @@ use secrecy::ExposeSecret;
 
 #[cfg(feature = "acl")]
 use crate::_auth::{Identity, User};
-use crate::{_config::Config, _core::acl::OwnerId};
+use crate::{
+    _config::Config,
+    _core::acl::{DEFAULT_ROOT_ACCESS_KEY, OwnerId},
+};
 
 /// The root credential pair: the configured `[auth]` keys, or the US1
 /// interop convention pair (`minioadmin`/`minioadmin`) when no `[auth]`
-/// section is present — the harness's default, kept verbatim (spec §6).
+/// section is present — the harness's default, kept verbatim (spec §6;
+/// the fallback access key is [`DEFAULT_ROOT_ACCESS_KEY`], the same
+/// constant the config uniqueness validation reserves).
 pub fn root_auth_pair(config: &Config) -> (String, String) {
     match &config.auth {
         Some(auth) => (
             auth.access_key.clone(),
             auth.secret_key.expose_secret().to_string(),
         ),
-        None => ("minioadmin".into(), "minioadmin".into()),
+        None => (DEFAULT_ROOT_ACCESS_KEY.into(), "minioadmin".into()),
     }
 }
 

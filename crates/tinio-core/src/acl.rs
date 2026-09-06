@@ -65,6 +65,14 @@ impl OwnerId {
 /// without a dependency on core's hashing.
 pub const DEFAULT_OWNER_DISPLAY_NAME: &str = "tinio";
 
+/// The root access-key fallback (`"minioadmin"` — the US1 interop pair,
+/// design §6: with no `[auth]` section the root credential is
+/// `minioadmin`/`minioadmin`). ONE home so the config uniqueness
+/// validation (tinio-config) reserves the same effective root access key
+/// the identity assembly (tinio-server) falls back to — a `[[users]]` key
+/// equal to it would shadow the root in the access-key map.
+pub const DEFAULT_ROOT_ACCESS_KEY: &str = "minioadmin";
+
 /// The default owner canonical ID: `hex(SHA-256("tinio"))` — the fixed
 /// 64-hex constant every default owner element resolves to.
 pub fn default_owner_id() -> OwnerId {

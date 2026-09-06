@@ -185,15 +185,21 @@ impl Config {
 /// (the access-key map keys by access key), and a canonical ID equal to
 /// the root owner's would make the user root.
 fn validate_owner_and_users(config: &Config, _context: &()) -> garde::Result {
-    if let Some(auth) = &config.auth
-        && let Some((i, user)) = config
-            .users()
-            .iter()
-            .enumerate()
-            .find(|(_, user)| user.access_key == auth.access_key)
+    // The effective root access key: the `[auth]` credential, or the US1
+    // fallback pair when the section is absent (DEFAULT_ROOT_ACCESS_KEY —
+    // the same fallback the identity assembly uses).
+    let root_key = match &config.auth {
+        Some(auth) => auth.access_key.as_str(),
+        None => crate::_core::acl::DEFAULT_ROOT_ACCESS_KEY,
+    };
+    if let Some((i, user)) = config
+        .users()
+        .iter()
+        .enumerate()
+        .find(|(_, user)| user.access_key == root_key)
     {
         return Err(garde::Error::new(format!(
-            "users[{i}].access_key: duplicate access key `{}` — a configured user may not shadow the root [auth] credential",
+            "users[{i}].access_key: duplicate access key `{}` — a configured user may not shadow the root [auth] credential (or the default `{root_key}` fallback when [auth] is absent)",
             user.access_key
         )));
     }
@@ -708,6 +714,20 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
         assert!(err.to_string().contains("duplicate canonical ID"), "{err}");
+    }
+
+    #[test]
+    fn users_reject_the_default_minioadmin_fallback_when_auth_is_absent() {
+        // The root credential falls back to the US1 pair when [auth] is
+        // absent — a user key equal to the fallback access key would
+        // shadow the root in the access-key map (same rule as the [auth]
+        // collision, spec §6).
+        let err = Config::parse(
+            "version = 1\n[[users]]\naccess_key = \"minioadmin\"\nsecret_key = \"sk\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("duplicate access key"), "{err}");
     }
 
     #[test]
