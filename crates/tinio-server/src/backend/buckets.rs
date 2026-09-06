@@ -185,19 +185,37 @@ impl<S: Storage> S3Backend<S> {
         // yields only the requester's buckets — the contract-level
         // filter runs DURING the walk, before pagination, so the
         // continuation-token math applies to the filtered set (review
-        // P2#4). Rows without a recorded owner element (the legacy
-        // empty wire, review B4) match no principal's recorded owner —
-        // they stay out of every filtered listing. Feature-off /
-        // toggle-off / no-identity modes keep the unfiltered legacy
-        // listing (`None`).
+        // P2#4). The walk compares the EFFECTIVE owner: a row whose
+        // owner wire is empty (the legacy shape, review B4) belongs to
+        // the identity's default owner — the lazy-default leg, the
+        // same resolution as `row_owner` — and matches only that
+        // principal. Feature-off / toggle-off / no-identity modes keep
+        // the unfiltered legacy listing (`None, None`).
         #[cfg(feature = "acl")]
-        let owner: Option<acl::OwnerId> = if self.caps.acl && self.identity.is_some() {
-            self.owner_for(req.credentials.as_ref())
+        let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = if self.caps
+            .acl
+            && self.identity.is_some()
+        {
+            // Fail-closed (fix-round Minor #2): the enforced filter
+            // must never degrade to the unfiltered listing via an
+            // unresolved principal — the identity is present above, so
+            // the resolution cannot fail (the same invariant as the
+            // write paths' `owner_for(...).expect`).
+            let principal = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            let default = self
+                .identity
+                .as_ref()
+                .expect("identity attached above")
+                .default_owner
+                .clone();
+            (Some(principal), Some(default))
         } else {
-            None
+            (None, None)
         };
         #[cfg(not(feature = "acl"))]
-        let owner: Option<acl::OwnerId> = None;
+        let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = (None, None);
         let listing = self
             .storage
             .list_buckets(
@@ -207,6 +225,7 @@ impl<S: Storage> S3Backend<S> {
                     max_buckets: effective,
                 },
                 owner.as_ref(),
+                lazy_default.as_ref(),
             )
             .await
             .map_err(map_backend_error)?;
@@ -409,6 +428,10 @@ mod tests {
             testutil::{s3_request, setup},
         },
     };
+    #[cfg(feature = "acl")]
+    use std::sync::Arc;
+    #[cfg(feature = "acl")]
+    use crate::_auth::identity::{Identity, User};
     #[cfg(feature = "acl")]
     use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
 
@@ -986,15 +1009,30 @@ mod tests {
         // contract-level filter runs during the walk, before pagination
         // (review P2#4), so the continuation-token math applies to the
         // filtered set. Each principal sees only the buckets whose
-        // recorded owner is theirs; a legacy row (empty owner wire —
-        // the lazy default owner, review B4) matches no recorded-owner
-        // comparison and stays out of every principal's filtered
-        // listing. The output Owner element is the requester's, display
+        // EFFECTIVE owner is theirs — the recorded owner, or the
+        // identity's default owner for a legacy row (empty owner wire,
+        // review B4, the lazy-default leg): the default principal's
+        // listing includes the legacy row, a non-default principal's
+        // does not. The output Owner element is the requester's, display
         // resolved via the identity map.
-        let backend = acl_backend();
-        let storage = backend.storage();
         let alice = user_id("AKID");
         let bob = user_id("BKID");
+        // The fixture identity with alice AS the default owner — the
+        // lazy-default leg's principal (a plain `acl_backend()` default
+        // owner has no signed credentials of its own).
+        let backend = S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
+            .with_identity(Arc::new(Identity {
+                users: vec![
+                    User::test("AKID", "secret", "alice"),
+                    User::test("BKID", "secret", "bob"),
+                ]
+                .into_iter()
+                .map(|u| (u.access_key.clone(), u))
+                .collect(),
+                default_owner: alice.clone(),
+                default_display_name: "tinio".into(),
+            }));
+        let storage = backend.storage();
         for (bn, owner) in [
             ("alpha-a", Some(&alice)),
             ("alpha-b", Some(&alice)),
@@ -1010,7 +1048,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // A legacy-shape bucket: no owner element ever recorded.
+        // A legacy-shape bucket: no owner element ever recorded — it
+        // belongs to the default principal (alice here).
         storage
             .create_bucket(
                 &bucket::name("legacy").unwrap(),
@@ -1041,7 +1080,7 @@ mod tests {
             .iter()
             .filter_map(|b| b.name.as_deref())
             .collect();
-        assert_eq!(names, ["alpha-a", "alpha-b"]);
+        assert_eq!(names, ["alpha-a", "alpha-b", "legacy"]);
         let owner = alice_list.owner.as_ref().unwrap();
         assert_eq!(owner.id.as_deref(), Some(alice.as_str()));
         assert_eq!(owner.display_name.as_deref(), Some("alice"));
@@ -1059,8 +1098,9 @@ mod tests {
             Some("bob")
         );
         // The continuation tokens count the FILTERED set: a page of 1
-        // over alice's walk yields exactly her two buckets across two
-        // pages — bob's and the legacy bucket never leak in.
+        // over alice's walk yields exactly her three buckets across
+        // three pages — bob's bucket never leaks in, and the legacy
+        // row pages like any other of hers.
         let page1 = list_owned(&backend, "AKID", Some(1), None).await;
         assert_eq!(page1.buckets.as_ref().unwrap().len(), 1);
         let resume = page1.continuation_token.clone();
@@ -1074,7 +1114,13 @@ mod tests {
             page2.buckets.as_ref().unwrap()[0].name.as_deref(),
             Some("alpha-b")
         );
-        assert!(page2.continuation_token.is_none());
+        let page3 = list_owned(&backend, "AKID", Some(1), page2.continuation_token.clone()).await;
+        assert_eq!(page3.buckets.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            page3.buckets.as_ref().unwrap()[0].name.as_deref(),
+            Some("legacy")
+        );
+        assert!(page3.continuation_token.is_none());
     }
 
     #[cfg(feature = "acl")]

@@ -96,6 +96,7 @@ impl BucketOps for MemoryStorage {
         &self,
         params: ListBucketsParams,
         owner: Option<&acl::OwnerId>,
+        lazy_default: Option<&acl::OwnerId>,
     ) -> Result<BucketsListing, Error> {
         self.db.read(|txn| {
             let buckets = bucket::Table::open_readonly(txn)?;
@@ -105,26 +106,44 @@ impl BucketOps for MemoryStorage {
             // name list (the F05 note of the lazy scan this replaces: it
             // only touched the rows the engine visits — immaterial at
             // bucket counts, the S3 account ceiling is ~1,000 buckets).
-            let mut items: Vec<Bucket> = Vec::new();
+            let mut candidates: Vec<(String, SystemTime)> = Vec::new();
             buckets.for_each(|name, creation_time| {
-                // The walk-time owner filter (P2#4): before pagination, so
-                // the continuation-token math applies to the filtered set.
-                let owned = owner.map_or(true, |o| {
-                    buckets
-                        .row(name)
-                        .ok()
-                        .flatten()
-                        .map(|row| decode_owner_wire(&row.owner).as_ref() == Some(o))
-                        .unwrap_or(false)
-                });
-                if name.starts_with(&params.prefix) && owned {
+                if name.starts_with(&params.prefix) {
+                    candidates.push((name.to_string(), creation_time));
+                }
+                Ok(())
+            })?;
+            // The `owner` filter applies DURING the walk, before
+            // pagination (contract review P2#4 — the continuation-token
+            // math applies to the filtered set): each candidate's owner
+            // element resolves here, and only the principal's buckets
+            // reach the pager (the fs backend's two-phase shape — the
+            // candidate names collect first, then one pass resolves
+            // every candidate's owner). The comparison uses the
+            // EFFECTIVE owner — the recorded element, or `lazy_default`
+            // for a row whose wire is empty (the uniform lazy-default
+            // semantics, review B4 — such rows belong to the default
+            // principal); `lazy_default = None` is the strict compare.
+            // `None` owner = no filter, the legacy listing.
+            let mut items: Vec<Bucket> = Vec::new();
+            for (name, creation_time) in candidates {
+                let keep = match (owner, lazy_default) {
+                    (Some(owner), lazy_default) => {
+                        let effective = buckets
+                            .row(name.as_str())?
+                            .and_then(|row| decode_owner_wire(&row.owner))
+                            .or_else(|| lazy_default.cloned());
+                        effective.as_ref() == Some(owner)
+                    }
+                    (None, _) => true,
+                };
+                if keep {
                     items.push(Bucket {
                         name: name.into(),
                         creation_time,
                     });
                 }
-                Ok(())
-            })?;
+            }
             let (page, truncated, next) = paginate_ordered(
                 items,
                 params.start_after.as_ref(),
@@ -281,6 +300,7 @@ mod tests {
     use crate::{
         _core::{MultipartOps, ObjectOps, object, storage::Error::*},
         _util::testing::body,
+        testutil::{other_owner_id, owner_id},
     };
 
     #[tokio::test]
@@ -290,11 +310,15 @@ mod tests {
             storage.create_bucket(&name(n).unwrap(), None, &acl::Acl::default_private(None)).await.unwrap();
         }
         let names: Vec<_> = storage
-            .list_buckets(ListBucketsParams {
-                prefix: String::new(),
-                start_after: None,
-                max_buckets: 1000,
-            }, None)
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                None,
+                None,
+            )
             .await
             .unwrap()
             .buckets
@@ -509,5 +533,152 @@ mod tests {
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
         let err: Error = storage.delete_bucket_cors(&ghost).await.unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
+
+    }
+
+    #[tokio::test]
+    async fn mem_bucket_acl_self_heals_on_garbage() {
+        // The read-side tolerance ruling: a bucket row whose owner/ACL
+        // wires are domain-invalid serves `None`/the private default
+        // (mirroring the fs decode-helper discipline). Rows are
+        // API-written; the garbage below is a direct database write
+        // (tampering).
+        let storage = MemoryStorage::new().unwrap();
+        let b = name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        {
+            let mut txn = storage.db.db().begin_write().unwrap();
+            bucket::Table::open(&mut txn)
+                .unwrap()
+                .insert(b.as_ref().as_str(), (1u64, "", "##bad-owner", "grants=%zz", ""))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            storage.get_bucket_acl(&b).await.unwrap(),
+            acl::Acl::default_private(None),
+            "garbage owner/ACL wires serve the private default with no owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_list_buckets_filters_by_owner_during_the_walk() {
+        let storage = MemoryStorage::new().unwrap();
+        let owner_a = owner_id();
+        let owner_b = other_owner_id();
+        for (bn, owner) in [
+            ("alpha-a", &owner_a),
+            ("alpha-b", &owner_a),
+            ("beta-b", &owner_b),
+        ] {
+            storage
+                .create_bucket(
+                    &name(bn).unwrap(),
+                    Some(owner),
+                    &acl::Acl::default_private(Some(owner.clone())),
+                )
+                .await
+                .unwrap();
+        }
+        async fn list_filtered(
+            storage: &MemoryStorage,
+            owner: &acl::OwnerId,
+            start_after: Option<String>,
+            max: usize,
+        ) -> BucketsListing {
+            storage
+                .list_buckets(
+                    ListBucketsParams {
+                        prefix: String::new(),
+                        start_after,
+                        max_buckets: max,
+                    },
+                    Some(owner),
+                    None,
+                )
+                .await
+                .unwrap()
+        }
+        // The filtered listing holds exactly A's buckets.
+        let full = list_filtered(&storage, &owner_a, None, 1000).await;
+        let names: Vec<&str> = full
+            .buckets
+            .iter()
+            .map(|x| x.name.as_ref().as_str())
+            .collect();
+        assert_eq!(names, ["alpha-a", "alpha-b"], "{names:?}");
+        // The continuation-token math applies to the FILTERED set: a
+        // page of 1 over the filtered walk yields exactly A's two
+        // buckets across two pages — B's bucket never leaks in.
+        let page1 = list_filtered(&storage, &owner_a, None, 1).await;
+        assert_eq!(page1.buckets.len(), 1);
+        assert!(page1.truncated);
+        let resume = page1.next_start_after.clone();
+        assert!(
+            resume.is_some(),
+            "a truncated page must carry a resume marker"
+        );
+        let page2 = list_filtered(&storage, &owner_a, resume, 1).await;
+        assert_eq!(page2.buckets.len(), 1);
+        assert!(!page2.truncated);
+        assert_eq!(page2.buckets[0].name.as_ref(), "alpha-b");
+        // The lazy-default leg (contract amendment): a legacy row (no
+        // recorded owner element) matches the `lazy_default` principal
+        // and nobody else — the expected-owner comparison is on the
+        // EFFECTIVE owner.
+        storage
+            .create_bucket(&name("legacy").unwrap(), None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        let lazy = storage
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                Some(&owner_b),
+                Some(&owner_b),
+            )
+            .await
+            .unwrap();
+        let names: Vec<&str> = lazy
+            .buckets
+            .iter()
+            .map(|x| x.name.as_ref().as_str())
+            .collect();
+        assert_eq!(names, ["beta-b", "legacy"], "{names:?}");
+        // The strict compare (`lazy_default = None`) excludes the
+        // legacy row even for the lazy-default principal.
+        let strict = storage
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                Some(&owner_b),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(strict.buckets.len(), 1, "{:?}", strict.buckets);
+        // The legacy listing (`None`, `None`) still shows everything.
+        let legacy = storage
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.buckets.len(), 4);
     }
 }

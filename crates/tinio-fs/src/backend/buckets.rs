@@ -178,6 +178,7 @@ impl BucketOps for FsStorage {
         &self,
         params: ListBucketsParams,
         owner: Option<&acl::OwnerId>,
+        lazy_default: Option<&acl::OwnerId>,
     ) -> Result<BucketsListing, Error> {
         // The bounded pagination engine (`UnorderedPager`, the
         // uploads-page engine) consumes the root sweep incrementally:
@@ -196,9 +197,14 @@ impl BucketOps for FsStorage {
         // the filtered set): the candidate names collect first (the
         // filtered walk cannot stream into the pager — each name's row
         // must be read before the offer), then one read transaction
-        // resolves every candidate's owner element, and only the
-        // principal's buckets reach the pager. `None` = no filter, the
-        // legacy listing, with the streaming walk unchanged.
+        // resolves every candidate's recorded owner element, and only
+        // the principal's buckets reach the pager. The comparison uses
+        // the EFFECTIVE owner — the recorded element, or `lazy_default`
+        // for a row whose wire is empty (the uniform lazy-default
+        // semantics, review B4 — such rows belong to the default
+        // principal); `lazy_default = None` is the strict compare.
+        // `None` owner = no filter, the legacy listing, with the
+        // streaming walk unchanged.
         let max = params.max_buckets;
         let mut pager = UnorderedPager::new(
             &params.prefix,
@@ -215,7 +221,7 @@ impl BucketOps for FsStorage {
                         .await?;
                     let recorded = self.bucket_store.owners(&names).await?;
                     for (name, recorded_owner) in names.into_iter().zip(recorded) {
-                        if recorded_owner.as_ref() == Some(owner) {
+                        if recorded_owner.as_ref().or(lazy_default) == Some(owner) {
                             pager.offer_keyed(name);
                         }
                     }
@@ -374,6 +380,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 1000,
             },
+            None,
             None)
             .await
             .unwrap();
@@ -622,6 +629,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 1000,
             },
+            None,
             None)
             .await
             .unwrap();
@@ -651,6 +659,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 1000,
             },
+            None,
             None)
             .await
             .unwrap();
@@ -718,6 +727,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 1000,
             },
+            None,
             None)
             .await
             .unwrap();
@@ -745,6 +755,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 1000,
             },
+            None,
             None)
             .await
             .unwrap();
@@ -843,6 +854,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 1000,
             },
+            None,
             None)
             .await
             .unwrap();
@@ -882,6 +894,7 @@ mod tests {
                 start_after: None,
                 max_buckets: 0,
             },
+            None,
             None)
             .await;
         fs::rename(&moved, root.path()).unwrap();
@@ -1093,6 +1106,7 @@ mod tests {
                         max_buckets: max,
                     },
                     Some(owner),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -1117,7 +1131,52 @@ mod tests {
         assert_eq!(page2.buckets.len(), 1);
         assert!(!page2.truncated);
         assert_eq!(page2.buckets[0].name.as_ref(), "alpha-b");
-        // The legacy listing (`None`) still shows everything.
+        // The lazy-default leg (contract amendment): a legacy row (no
+        // recorded owner element) matches the `lazy_default` principal
+        // and nobody else — the expected-owner comparison is on the
+        // EFFECTIVE owner.
+        storage
+            .create_bucket(
+                &bucket::name("legacy").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let lazy = storage
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                Some(&owner_b),
+                Some(&owner_b),
+            )
+            .await
+            .unwrap();
+        let names: Vec<&str> = lazy
+            .buckets
+            .iter()
+            .map(|x| x.name.as_ref().as_str())
+            .collect();
+        assert_eq!(names, ["beta-b", "legacy"], "{names:?}");
+        // The strict compare (`lazy_default = None`) excludes the
+        // legacy row even for the lazy-default principal.
+        let strict = storage
+            .list_buckets(
+                ListBucketsParams {
+                    prefix: String::new(),
+                    start_after: None,
+                    max_buckets: 1000,
+                },
+                Some(&owner_b),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(strict.buckets.len(), 1, "{:?}", strict.buckets);
+        // The legacy listing (`None`, `None`) still shows everything.
         let legacy = storage
             .list_buckets(
                 ListBucketsParams {
@@ -1126,10 +1185,11 @@ mod tests {
                     max_buckets: 1000,
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
-        assert_eq!(legacy.buckets.len(), 3);
+        assert_eq!(legacy.buckets.len(), 4);
     }
 
     #[cfg(unix)]

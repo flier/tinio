@@ -2105,11 +2105,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Quiet mode: the denied key is still an Error entry; a
+        // Quiet mode: the denied key is STILL an Error entry and a
         // successful delete emits no Deleted entry.
-        let out = batch_delete(&backend, "BKID", vec!["missing.txt"], true).await;
+        let out = batch_delete(&backend, "BKID", vec!["alice.txt", "missing.txt"], true).await;
         assert!(out.deleted.is_none());
-        assert!(out.errors.is_none());
+        let errors = out.errors.as_ref().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key.as_deref(), Some("alice.txt"));
+        assert_eq!(errors[0].code.as_deref(), Some("AccessDenied"));
 
         // The bucket owner: everything is deletable.
         let out = batch_delete(&backend, "AKID", vec!["alice.txt"], false).await;

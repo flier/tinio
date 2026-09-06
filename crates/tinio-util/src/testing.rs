@@ -442,7 +442,7 @@ fn page(prefix: &str, start_after: Option<String>, max_buckets: usize) -> ListBu
 async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // Start empty.
     let buckets = storage
-        .list_buckets(page("", None, usize::MAX), None)
+        .list_buckets(page("", None, usize::MAX), None, None)
         .await
         .unwrap();
     check(
@@ -453,7 +453,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // Create.
     storage.create_bucket(b, None, &acl::Acl::default_private(None)).await.unwrap();
     let buckets = storage
-        .list_buckets(page("", None, usize::MAX), None)
+        .list_buckets(page("", None, usize::MAX), None, None)
         .await
         .unwrap();
     check(
@@ -470,7 +470,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.create_bucket(&extra1, None, &acl::Acl::default_private(None)).await.unwrap();
     storage.create_bucket(&extra2, None, &acl::Acl::default_private(None)).await.unwrap();
     let full = storage
-        .list_buckets(page("", None, usize::MAX), None)
+        .list_buckets(page("", None, usize::MAX), None, None)
         .await
         .unwrap();
     check(
@@ -481,7 +481,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     let mut start_after = None;
     loop {
         let page = storage
-            .list_buckets(page("", start_after.clone(), 2), None)
+            .list_buckets(page("", start_after.clone(), 2), None, None)
             .await
             .unwrap();
         check(
@@ -516,7 +516,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // page; the contract-level `max_buckets = 0` asks for an empty,
     // untruncated page.
     let exact = storage
-        .list_buckets(page("", None, full.buckets.len()), None)
+        .list_buckets(page("", None, full.buckets.len()), None, None)
         .await
         .unwrap();
     check(
@@ -532,7 +532,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
         .name
         .to_string();
     let exhausted = storage
-        .list_buckets(page("", Some(last), 1000), None)
+        .list_buckets(page("", Some(last), 1000), None, None)
         .await
         .unwrap();
     check(
@@ -541,7 +541,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
             && exhausted.next_start_after.is_none(),
         "a marker past the end must yield an empty, untruncated page",
     );
-    let empty = storage.list_buckets(page("", None, 0), None).await.unwrap();
+    let empty = storage.list_buckets(page("", None, 0), None, None).await.unwrap();
     check(
         empty.buckets.is_empty() && !empty.truncated && empty.next_start_after.is_none(),
         "max_buckets = 0 must yield an empty, untruncated page",
@@ -549,7 +549,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     // Prefix filtering: the fixture bucket's full name matches exactly
     // that bucket (the counter in `unique_bucket` differs for the rest).
     let prefixed = storage
-        .list_buckets(page(b.as_ref(), None, 1000), None)
+        .list_buckets(page(b.as_ref(), None, 1000), None, None)
         .await
         .unwrap();
     check(
@@ -572,7 +572,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     let p2 = bucket::name(unique_bucket("pg")).unwrap();
     storage.create_bucket(&p1, None, &acl::Acl::default_private(None)).await.unwrap();
     storage.create_bucket(&p2, None, &acl::Acl::default_private(None)).await.unwrap();
-    let prefixed = storage.list_buckets(page("pg", None, 1000), None).await.unwrap();
+    let prefixed = storage.list_buckets(page("pg", None, 1000), None, None).await.unwrap();
     check(
         prefixed.buckets.len() == 2,
         "the pg pair must be the only prefix matches",
@@ -580,6 +580,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     let resumed = storage
         .list_buckets(
             page("pg", Some(prefixed.buckets[0].name.to_string()), 1000),
+            None,
             None,
         )
         .await
@@ -619,7 +620,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
             .unwrap();
     }
     let full = storage
-        .list_buckets(page("own", None, usize::MAX), Some(&owner_a))
+        .list_buckets(page("own", None, usize::MAX), Some(&owner_a), None)
         .await
         .unwrap();
     check(
@@ -633,7 +634,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     let mut pages = 0;
     loop {
         let p = storage
-            .list_buckets(page("own", start_after.clone(), 2), Some(&owner_a))
+            .list_buckets(page("own", start_after.clone(), 2), Some(&owner_a), None)
             .await
             .unwrap();
         check(
@@ -668,7 +669,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     );
     // The mirror principal: B's listing holds exactly its own buckets.
     let b_full = storage
-        .list_buckets(page("own", None, usize::MAX), Some(&owner_b))
+        .list_buckets(page("own", None, usize::MAX), Some(&owner_b), None)
         .await
         .unwrap();
     check(
@@ -683,7 +684,7 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
         storage.delete_bucket(n).await.unwrap();
     }
     let legacy = storage
-        .list_buckets(page("own", None, usize::MAX), None)
+        .list_buckets(page("own", None, usize::MAX), None, None)
         .await
         .unwrap();
     check(

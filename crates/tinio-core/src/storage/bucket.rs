@@ -115,14 +115,21 @@ pub trait BucketOps: Send + Sync + 'static {
     /// (exclusive). `owner` filters the walk to that principal's buckets
     /// — applied DURING the walk, before pagination, so the
     /// continuation-token math applies to the filtered set (P2#4;
-    /// `None` = no filter, the legacy listing). `truncated` +
-    /// `next_start_after` mark a page with more results (`max_buckets =
-    /// 0` requests an empty, untruncated page — strictness is a
-    /// mapping-layer policy).
+    /// `None` = no filter, the legacy listing). The walk matches a
+    /// bucket iff its EFFECTIVE owner equals `owner`: the recorded
+    /// owner element, or `lazy_default` when the recorded wire is
+    /// empty — the auth layer's uniform lazy-default semantics
+    /// (review B4: the row owner's `None` resolves to the default
+    /// owner there); `lazy_default = None` is the strict compare (a
+    /// row with no recorded owner matches nothing).
+    /// `truncated` + `next_start_after` mark a page with more results
+    /// (`max_buckets = 0` requests an empty, untruncated page —
+    /// strictness is a mapping-layer policy).
     async fn list_buckets(
         &self,
         params: ListBucketsParams,
         owner: Option<&acl::OwnerId>,
+        lazy_default: Option<&acl::OwnerId>,
     ) -> Result<BucketsListing, <Self as Storage>::Error>
     where
         Self: Storage;
