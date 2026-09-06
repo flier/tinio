@@ -45,6 +45,8 @@ use crate::{
         tags::parse_tagging_header,
     },
 };
+#[cfg(feature = "acl")]
+use crate::backend::acls::{grant_headers, object_write_acl};
 
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
@@ -271,19 +273,56 @@ impl<S: Storage> S3Backend<S> {
         } else {
             object::Tags::empty()
         };
+        // Write-path ACL (spec 2026-09-05, Task 11): an identity-mode
+        // CMU records the requester's owner and the request's canned /
+        // grant-header expansion (an unheadered create = the
+        // requester's private default); the completion applies the
+        // stored pair to the object (backend-side, the tags precedent).
+        // No-identity mode keeps the Task 5 defaults (B4 rule 3).
+        #[cfg(feature = "acl")]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
+            && self.identity.is_some()
+        {
+            let owner = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            // The canned expansion references the bucket owner (review
+            // A6), resolved lazily from the bucket row.
+            let bucket_owner = self.row_owner(
+                self.storage
+                    .get_bucket_acl(&bucket)
+                    .await
+                    .map_err(map_backend_error)?
+                    .owner
+                    .as_ref(),
+            );
+            let acl = object_write_acl(
+                &owner,
+                &bucket_owner,
+                req.input.acl.as_ref().map(|c| c.as_str()),
+                &grant_headers(
+                    req.input.grant_full_control.as_deref(),
+                    req.input.grant_read.as_deref(),
+                    req.input.grant_read_acp.as_deref(),
+                    None,
+                    req.input.grant_write_acp.as_deref(),
+                ),
+            )?;
+            Some((owner, acl))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "acl"))]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        // The no-identity / toggle-off default (Task 5).
+        let default_acl = acl::Acl::default_private(None);
+        let (owner, acl) = match &write_acl {
+            Some((owner, acl)) => (Some(owner), acl),
+            None => (None, &default_acl),
+        };
         let upload = self
             .storage
-            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
-            // path records an empty owner wire and the private default —
-            // Task 11 rewires this to `owner_for`/`expand_acl`.
-            .create_multipart_upload(
-                &bucket,
-                &key,
-                checksum,
-                tags,
-                None,
-                &acl::Acl::default_private(None),
-            )
+            .create_multipart_upload(&bucket, &key, checksum, tags, owner, acl)
             .await
             .map_err(map_backend_error)?;
         // Seed the spec cache (F04): the spec is immutable after create
@@ -1086,6 +1125,8 @@ mod tests {
             testutil::{s3_request, setup, setup_with_caps},
         },
     };
+    #[cfg(feature = "acl")]
+    use crate::backend::testutil::{acl_backend, user_id};
 
     /// A backend with the checksum feature on (the default toggle is
     /// off — the tests must opt in).
@@ -2291,5 +2332,79 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "NoSuchUpload");
+    }
+
+    // --- write-path ACL headers (Task 11) ---
+
+    #[cfg(all(feature = "multipart", feature = "acl"))]
+    #[tokio::test]
+    async fn multipart_acl_applies_at_completion() {
+        // The CMU records the request's canned ACL alongside the
+        // requester's owner; the completion applies the stored pair to
+        // the object (backend-side, the tags precedent) — the object
+        // carries the anonymous requester's public-read grants.
+        let alice = user_id("AKID");
+        let backend = acl_backend();
+        let b = bucket::name("data").unwrap();
+        backend
+            .storage()
+            .create_bucket(
+                &b,
+                Some(&alice),
+                &acl::Acl::default_private(Some(alice.clone())),
+            )
+            .await
+            .unwrap();
+        let create = backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.to_string(),
+                key: "big.bin".into(),
+                acl: Some(dto::ObjectCannedACL::from_static("public-read")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let upload_id = create.output.upload_id.unwrap();
+        let part = backend
+            .upload_part(s3_request(dto::UploadPartInput {
+                bucket: b.to_string(),
+                key: "big.bin".into(),
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                body: part_body(b"payload"),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        backend
+            .complete_multipart_upload(s3_request(complete_input(
+                &upload_id,
+                &[part.output.e_tag.unwrap()],
+            )))
+            .await
+            .unwrap();
+        let row = backend
+            .storage()
+            .get_object_acl(&b, &object::key("big.bin").unwrap())
+            .await
+            .unwrap();
+        let anon = acl::OwnerId::new(acl::ANONYMOUS_CANONICAL_ID).unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            acl::ANONYMOUS_CANONICAL_ID
+        );
+        assert_eq!(
+            row.grants,
+            vec![
+                acl::Grant {
+                    grantee: acl::Grantee::Canonical(anon),
+                    permission: acl::Permission::FullControl,
+                },
+                acl::Grant {
+                    grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
+                    permission: acl::Permission::Read,
+                },
+            ]
+        );
     }
 }

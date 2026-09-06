@@ -39,7 +39,10 @@ use crate::{
 #[cfg(feature = "acl")]
 use crate::{
     _auth::canned::GrantHeaders,
-    backend::acls::{bucket_acl_grants, grants_dto, policy_owner_matches, require_content_md5},
+    backend::acls::{
+        bucket_acl_grants, bucket_write_acl, grant_headers, grants_dto, policy_owner_matches,
+        require_content_md5,
+    },
 };
 #[cfg(feature = "acl")]
 use s3s::dto;
@@ -55,11 +58,46 @@ impl<S: Storage> S3Backend<S> {
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let name = self.bucket(req.input.bucket)?;
+        // Write-path ACL (spec 2026-09-05, Task 11): an identity-mode
+        // create resolves the requester's owner and expands the
+        // request's canned / `x-amz-grant-*` headers — through
+        // `canned_bucket_grants` DIRECTLY (carry 1): `expand_acl` is
+        // object-flavored, and the `bucket-owner-*` names are ignored
+        // on buckets. An unheadered create records the requester's
+        // private default. No-identity mode keeps the Task 5 defaults
+        // (B4 rule 3).
+        #[cfg(feature = "acl")]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
+            && self.identity.is_some()
+        {
+            let owner = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            let acl = bucket_write_acl(
+                &owner,
+                req.input.acl.as_ref().map(|c| c.as_str()),
+                &grant_headers(
+                    req.input.grant_full_control.as_deref(),
+                    req.input.grant_read.as_deref(),
+                    req.input.grant_read_acp.as_deref(),
+                    req.input.grant_write.as_deref(),
+                    req.input.grant_write_acp.as_deref(),
+                ),
+            )?;
+            Some((owner, acl))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "acl"))]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        // The no-identity / toggle-off default (Task 5).
+        let default_acl = acl::Acl::default_private(None);
+        let (owner, acl) = match &write_acl {
+            Some((owner, acl)) => (Some(owner), acl),
+            None => (None, &default_acl),
+        };
         self.storage
-            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
-            // path records an empty owner wire and the private default —
-            // Task 11 rewires this to `owner_for`/`expand_acl`.
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, owner, acl)
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(CreateBucketOutput {
@@ -349,6 +387,8 @@ mod tests {
             testutil::{s3_request, setup},
         },
     };
+    #[cfg(feature = "acl")]
+    use crate::backend::testutil::{acl_backend, signed_request, user_id};
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -1258,6 +1298,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");
+    }
+
+    // --- write-path ACL headers (Task 11) ---
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn create_bucket_with_canned_acl_public_read() {
+        // CreateBucket + `x-amz-acl`: the write records the canned
+        // expansion and the requester's owner. The composition goes
+        // through `canned_bucket_grants` DIRECTLY — `expand_acl` is
+        // object-flavored, and `bucket-owner-read`/`bucket-owner-full-
+        // control` are ignored on buckets (AWS).
+        let backend = acl_backend();
+        backend
+            .create_bucket(signed_request(CreateBucketInput {
+                bucket: "data".into(),
+                acl: Some(dto::BucketCannedACL::from_static("public-read")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let row = backend
+            .storage()
+            .get_bucket_acl(&bucket::name("data").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            user_id("AKID").as_str()
+        );
+        assert_eq!(
+            row.grants,
+            vec![
+                acl::Grant {
+                    grantee: acl::Grantee::Canonical(user_id("AKID")),
+                    permission: acl::Permission::FullControl,
+                },
+                acl::Grant {
+                    grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
+                    permission: acl::Permission::Read,
+                },
+            ]
+        );
+        // The bucket-owner-* names on CreateBucket are private (AWS) —
+        // a composition through `expand_acl` would emit the
+        // bucket-owner grant.
+        backend
+            .create_bucket(signed_request(CreateBucketInput {
+                bucket: "other".into(),
+                acl: Some(dto::BucketCannedACL::from_static("bucket-owner-read")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let row = backend
+            .storage()
+            .get_bucket_acl(&bucket::name("other").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.grants,
+            vec![acl::Grant {
+                grantee: acl::Grantee::Canonical(user_id("AKID")),
+                permission: acl::Permission::FullControl,
+            }]
+        );
     }
 
     #[tokio::test]

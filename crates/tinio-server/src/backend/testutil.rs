@@ -1,5 +1,8 @@
 //! Shared unit-test helpers of the backend modules.
 
+#[cfg(feature = "acl")]
+use std::sync::Arc;
+
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::S3Request;
 
@@ -8,6 +11,8 @@ use crate::{
     _core::{acl, bucket, storage::BucketOps},
     _mem::MemoryStorage,
 };
+#[cfg(feature = "acl")]
+use crate::_auth::identity::{Identity, User, derive_canonical_id};
 
 /// A minimal `S3Request` with default headers (tests fill the input).
 pub(crate) fn s3_request<T>(input: T) -> S3Request<T> {
@@ -45,4 +50,53 @@ pub(crate) async fn setup_with_caps(caps: Capabilities) -> (S3Backend<MemoryStor
         .await
         .unwrap();
     (backend, b)
+}
+
+/// The identity map of the ACL write-path fixtures: two signed users
+/// (`AKID` alice, `BKID` bob) and the built-in default owner.
+#[cfg(feature = "acl")]
+pub(crate) fn acl_identity() -> Arc<Identity> {
+    Arc::new(Identity::test(vec![
+        User::test("AKID", "secret", "alice"),
+        User::test("BKID", "secret", "bob"),
+    ]))
+}
+
+/// The fixture user's canonical ID for an access key.
+#[cfg(feature = "acl")]
+pub(crate) fn user_id(access_key: &str) -> acl::OwnerId {
+    derive_canonical_id(access_key)
+}
+
+/// The fixture user's credentials (a "signed" request).
+#[cfg(feature = "acl")]
+pub(crate) fn credentials_for(access_key: &str) -> s3s::auth::Credentials {
+    s3s::auth::Credentials {
+        access_key: access_key.into(),
+        secret_key: s3s::auth::SecretKey::from("secret"),
+    }
+}
+
+/// A request carrying the fixture user's credentials.
+#[cfg(feature = "acl")]
+pub(crate) fn signed_request<T>(input: T) -> S3Request<T> {
+    let mut req = s3_request(input);
+    req.credentials = Some(credentials_for("AKID"));
+    req
+}
+
+/// A POST request: a PostObject form upload reaches `op_put_object`
+/// through s3s's default delegation carrying the original POST method.
+#[cfg(feature = "acl")]
+pub(crate) fn post_request<T>(input: T) -> S3Request<T> {
+    let mut req = s3_request(input);
+    req.method = Method::POST;
+    req
+}
+
+/// A backend with the fixture identity attached (the enforced-mode
+/// shape of the ACL write-path fixtures).
+#[cfg(feature = "acl")]
+pub(crate) fn acl_backend() -> S3Backend<MemoryStorage> {
+    S3Backend::new(MemoryStorage::new().unwrap(), Default::default()).with_identity(acl_identity())
 }

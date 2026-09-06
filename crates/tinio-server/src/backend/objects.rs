@@ -60,8 +60,14 @@ use crate::{
 #[cfg(feature = "acl")]
 use crate::{
     _auth::canned::GrantHeaders,
-    backend::acls::{grants_dto, object_acl_grants, policy_owner_matches, require_content_md5},
+    backend::acls::{
+        grant_headers, grants_dto, object_acl_grants, object_write_acl, policy_owner_matches,
+        require_content_md5,
+    },
 };
+
+#[cfg(feature = "acl")]
+use http::Method;
 
 /// The destination-conditional protocol (`x-amz-if-match` /
 /// `x-amz-if-none-match`): evaluate against the CURRENT object at
@@ -116,6 +122,41 @@ impl<S: Storage> S3Backend<S> {
         }
         Ok(())
     }
+
+    /// The handler-side B1 destination head for PostObject (carry 3):
+    /// s3s routes the form to the bucket path, so the access layer saw
+    /// only the base bucket-WRITE gate — the form key is known only
+    /// here, in the delegated put path (`S3::post_object`'s default
+    /// forwards the form to `op_put_object`, which still carries the
+    /// original POST method). An existing destination key needs P ==
+    /// O(destination object) or P == O(destination bucket); a missing
+    /// key adds nothing (the bucket-WRITE base already passed).
+    #[cfg(feature = "acl")]
+    async fn post_object_destination_head(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        principal: &acl::OwnerId,
+    ) -> S3Result<()> {
+        let Some(info) = self.head_optional(bucket, key).await? else {
+            return Ok(());
+        };
+        if &self.row_owner(info.owner.as_ref()) == principal {
+            return Ok(());
+        }
+        let bucket_owner = self.row_owner(
+            self.storage
+                .get_bucket_acl(bucket)
+                .await
+                .map_err(map_backend_error)?
+                .owner
+                .as_ref(),
+        );
+        if &bucket_owner == principal {
+            return Ok(());
+        }
+        Err(s3_error!(AccessDenied, "Access Denied"))
+    }
 }
 
 /// The batch-delete error entry for a failed key (the S3 error into the
@@ -159,6 +200,57 @@ impl<S: Storage> S3Backend<S> {
         } else {
             object::Tags::empty()
         };
+        // Write-path ACL (spec 2026-09-05, Task 11): an identity-mode
+        // write resolves the requester's owner (a signed user's
+        // canonical ID, or the anonymous special ID for an unsigned
+        // request — B4 rules 1-2) and expands the request's canned /
+        // `x-amz-grant-*` headers into the row ACL — an unheadered
+        // write records the requester's private default. The PostObject
+        // B1 destination head (carry 3) runs here as well: the access
+        // layer saw only the bucket path, the delegated put path knows
+        // the form key. No-identity mode keeps the Task 5 defaults (B4
+        // rule 3 — the empty owner wire); the toggle off keeps the
+        // accept-and-drop.
+        #[cfg(feature = "acl")]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
+            && self.identity.is_some()
+        {
+            let owner = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            if req.method == Method::POST {
+                self.post_object_destination_head(&bucket, &key, &owner)
+                    .await?;
+            }
+            // The canned expansion references the bucket owner (the
+            // `bucket-owner-*` names — review A6), resolved lazily from
+            // the bucket row; the grant-header path never uses it.
+            let bucket_owner = self.row_owner(
+                self.storage
+                    .get_bucket_acl(&bucket)
+                    .await
+                    .map_err(map_backend_error)?
+                    .owner
+                    .as_ref(),
+            );
+            let acl = object_write_acl(
+                &owner,
+                &bucket_owner,
+                req.input.acl.as_ref().map(|c| c.as_str()),
+                &grant_headers(
+                    req.input.grant_full_control.as_deref(),
+                    req.input.grant_read.as_deref(),
+                    req.input.grant_read_acp.as_deref(),
+                    None,
+                    req.input.grant_write_acp.as_deref(),
+                ),
+            )?;
+            Some((owner, acl))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "acl"))]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
         // The PUT checksum tee (spec 2026-08-31 — the `upload_part`
         // pattern): parse the request spec and wrap the body BEFORE any
         // storage call. Toggle off ⇒ exactly today's code path.
@@ -212,19 +304,16 @@ impl<S: Storage> S3Backend<S> {
             req.input.if_none_match.as_ref(),
         )
         .await?;
+        // The no-identity / toggle-off default (Task 5): the empty owner
+        // wire and the grants-less private ACL.
+        let default_acl = acl::Acl::default_private(None);
+        let (owner, acl) = match &write_acl {
+            Some((owner, acl)) => (Some(owner), acl),
+            None => (None, &default_acl),
+        };
         let put = self
             .storage
-            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
-            // path records an empty owner wire and the private default —
-            // Task 11 rewires this to `owner_for`/`expand_acl`.
-            .commit_object(
-                &bucket,
-                &key,
-                staged,
-                tags,
-                None,
-                &acl::Acl::default_private(None),
-            )
+            .commit_object(&bucket, &key, staged, tags, owner, acl)
             .await
             .map_err(map_backend_error)?;
         let mut output = dto::PutObjectOutput {
@@ -900,6 +989,48 @@ impl<S: Storage> S3Backend<S> {
             None
         };
 
+        // Write-path ACL (Task 11, carry 5): the copy takes the
+        // REQUEST's canned / grant headers or the requester's private
+        // default — never the source object's ACL — and the copy's
+        // owner is the requester (a signed user's canonical ID, the
+        // anonymous special ID for an unsigned request). No-identity
+        // mode keeps the Task 5 defaults.
+        #[cfg(feature = "acl")]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
+            && self.identity.is_some()
+        {
+            let owner = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            // The canned expansion references the destination bucket's
+            // owner (review A6), resolved lazily from the row.
+            let bucket_owner = self.row_owner(
+                self.storage
+                    .get_bucket_acl(&dst_bucket)
+                    .await
+                    .map_err(map_backend_error)?
+                    .owner
+                    .as_ref(),
+            );
+            let acl = object_write_acl(
+                &owner,
+                &bucket_owner,
+                req.input.acl.as_ref().map(|c| c.as_str()),
+                &grant_headers(
+                    req.input.grant_full_control.as_deref(),
+                    req.input.grant_read.as_deref(),
+                    req.input.grant_read_acp.as_deref(),
+                    None,
+                    req.input.grant_write_acp.as_deref(),
+                ),
+            )?;
+            Some((owner, acl))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "acl"))]
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+
         // Server-side copy: the contract's copy primitive moves the
         // source bytes into the destination (no client passthrough,
         // FR-015 — a backend may copy them kernel-side). The head's info
@@ -953,19 +1084,22 @@ impl<S: Storage> S3Backend<S> {
             dest_if_none_match.as_ref(),
         )
         .await?;
+        // The no-identity / toggle-off default (Task 5).
+        let default_acl = acl::Acl::default_private(None);
+        let (owner, acl) = match &write_acl {
+            Some((owner, acl)) => (Some(owner), acl),
+            None => (None, &default_acl),
+        };
         let put = self
             .storage
-            // Mechanical contract adaptation (Task 5 of the acl-owner plan): the no-identity
-            // path records an empty owner wire and the private default —
-            // Task 11 rewires this to `owner_for`/`expand_acl`.
             .copy_object(
                 &src_bucket,
                 &src_key,
                 &dst_bucket,
                 &dst_key,
                 tags,
-                None,
-                &acl::Acl::default_private(None),
+                owner,
+                acl,
                 checksum,
             )
             .await
@@ -1146,13 +1280,22 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{bucket, checksum, storage::ObjectOps},
+        _core::{
+            bucket,
+            checksum,
+            storage::ObjectOps,
+        },
         _mem::MemoryStorage,
         _util::testing::{body, read_body, tags},
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},
         },
+    };
+    #[cfg(feature = "acl")]
+    use crate::{
+        _core::storage::BucketOps,
+        backend::testutil::{acl_backend, credentials_for, post_request, signed_request, user_id},
     };
 
     async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
@@ -3298,5 +3441,346 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "NotImplemented");
+    }
+
+    // --- write-path ACL headers + owner recording (Task 11) ---
+
+    /// A single-chunk PUT body.
+    #[cfg(feature = "acl")]
+    fn dto_body(data: &'static [u8]) -> Option<dto::StreamingBlob> {
+        Some(dto::StreamingBlob::wrap(stream::once(async move {
+            Ok::<_, io::Error>(Bytes::from_static(data))
+        })))
+    }
+
+    /// A canonical grantee grant.
+    #[cfg(feature = "acl")]
+    fn grant_to(id: &acl::OwnerId, permission: acl::Permission) -> acl::Grant {
+        acl::Grant {
+            grantee: acl::Grantee::Canonical(id.clone()),
+            permission,
+        }
+    }
+
+    /// A group grant.
+    #[cfg(feature = "acl")]
+    fn group_grant(uri: &str, permission: acl::Permission) -> acl::Grant {
+        acl::Grant {
+            grantee: acl::Grantee::Group(acl::GroupUri(uri.into())),
+            permission,
+        }
+    }
+
+    /// An identity-mode fixture: a backend with the fixture identity and
+    /// a `data` bucket owned by the given owner.
+    #[cfg(feature = "acl")]
+    async fn acl_setup(owner: &acl::OwnerId) -> (S3Backend<MemoryStorage>, bucket::Name) {
+        let backend = acl_backend();
+        let b = bucket::name("data").unwrap();
+        backend
+            .storage()
+            .create_bucket(
+                &b,
+                Some(owner),
+                &acl::Acl::default_private(Some(owner.clone())),
+            )
+            .await
+            .unwrap();
+        (backend, b)
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn put_object_with_canned_public_read_stores_the_expanded_grants() {
+        // PUT + `x-amz-acl: public-read`: the write records the expanded
+        // grant set — the anonymous requester's FULL_CONTROL plus the
+        // AllUsers READ — and the requester's owner element (B4 rule 2:
+        // the anonymous special ID in enforced mode).
+        let alice = user_id("AKID");
+        let (backend, b) = acl_setup(&alice).await;
+        let key = object::key("a.txt").unwrap();
+        backend
+            .put_object(s3_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "a.txt".into(),
+                body: dto_body(b"x"),
+                acl: Some(dto::ObjectCannedACL::from_static("public-read")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let row = backend.storage().get_object_acl(&b, &key).await.unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            acl::ANONYMOUS_CANONICAL_ID
+        );
+        let anon = acl::OwnerId::new(acl::ANONYMOUS_CANONICAL_ID).unwrap();
+        assert_eq!(
+            row.grants,
+            vec![
+                grant_to(&anon, acl::Permission::FullControl),
+                group_grant(acl::GROUP_ALL_USERS, acl::Permission::Read),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "acl", feature = "copy"))]
+    async fn copy_object_takes_its_own_acl_and_owner() {
+        // The copy's ACL comes from the REQUEST (default-private here) —
+        // never from the source's public grants; the copy's owner is the
+        // requester, not the source's owner (Task 11, carry 5).
+        let alice = user_id("AKID");
+        let (backend, b) = acl_setup(&alice).await;
+        let src = object::key("src.txt").unwrap();
+        let public = acl::Acl {
+            owner: Some(alice.clone()),
+            grants: vec![
+                grant_to(&alice, acl::Permission::FullControl),
+                group_grant(acl::GROUP_ALL_USERS, acl::Permission::Read),
+            ],
+        };
+        backend
+            .storage()
+            .commit_object(
+                &b,
+                &src,
+                backend
+                    .storage()
+                    .stage_body(&b, &src, body(b"source data"), None)
+                    .await
+                    .unwrap(),
+                object::Tags::empty(),
+                Some(&alice),
+                &public,
+            )
+            .await
+            .unwrap();
+        backend
+            .copy_object(signed_request(dto::CopyObjectInput::builder()
+                .bucket(b.to_string())
+                .key("dst.txt".to_string())
+                .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                .build()
+                .unwrap()))
+            .await
+            .unwrap();
+        let row = backend
+            .storage()
+            .get_object_acl(&b, &object::key("dst.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            alice.as_str()
+        );
+        assert_eq!(
+            row.grants,
+            vec![grant_to(&alice, acl::Permission::FullControl)]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn overwrite_replaces_owner_and_acl() {
+        // A PUT-overwrite replaces BOTH row elements: the new uploader's
+        // owner and the request's ACL (design Decisions — recreate
+        // semantics), never a merge with the previous pair.
+        let alice = user_id("AKID");
+        let bob = user_id("BKID");
+        let (backend, b) = acl_setup(&alice).await;
+        let key = object::key("t.txt").unwrap();
+        let put = |key: &str, body: &'static str, canned: Option<&'static str>, credentials: &str| {
+            let mut req = signed_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: key.into(),
+                body: dto_body(body.as_bytes()),
+                acl: canned.map(dto::ObjectCannedACL::from_static),
+                ..Default::default()
+            });
+            req.credentials = Some(credentials_for(credentials));
+            backend.put_object(req)
+        };
+        put("t.txt", "one", Some("public-read"), "AKID").await.unwrap();
+        let row = backend.storage().get_object_acl(&b, &key).await.unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            alice.as_str()
+        );
+        assert!(row
+            .grants
+            .iter()
+            .any(|g| matches!(g.grantee, acl::Grantee::Group(_))));
+        // Bob's headered-less overwrite: private default for bob.
+        put("t.txt", "two", None, "BKID").await.unwrap();
+        let row = backend.storage().get_object_acl(&b, &key).await.unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            bob.as_str()
+        );
+        assert_eq!(row.grants, vec![grant_to(&bob, acl::Permission::FullControl)]);
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "acl", feature = "copy"))]
+    async fn rename_preserves_owner_and_acl() {
+        // RenameObject keeps the stored pair (design §3 — the server op
+        // passes no ACL parameters; the backend preserves the row).
+        let alice = user_id("AKID");
+        let (backend, b) = acl_setup(&alice).await;
+        let src = object::key("src.txt").unwrap();
+        let public = acl::Acl {
+            owner: Some(alice.clone()),
+            grants: vec![
+                grant_to(&alice, acl::Permission::FullControl),
+                group_grant(acl::GROUP_ALL_USERS, acl::Permission::Read),
+            ],
+        };
+        backend
+            .storage()
+            .commit_object(
+                &b,
+                &src,
+                backend
+                    .storage()
+                    .stage_body(&b, &src, body(b"data"), None)
+                    .await
+                    .unwrap(),
+                object::Tags::empty(),
+                Some(&alice),
+                &public,
+            )
+            .await
+            .unwrap();
+        backend
+            .rename_object(s3_request(dto::RenameObjectInput {
+                bucket: b.to_string(),
+                key: "dst.txt".into(),
+                rename_source: "src.txt".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let row = backend
+            .storage()
+            .get_object_acl(&b, &object::key("dst.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.owner.as_ref().map(|o| o.as_str()).unwrap(),
+            alice.as_str()
+        );
+        assert!(row
+            .grants
+            .iter()
+            .any(|g| matches!(g.grantee, acl::Grantee::Group(_))));
+        assert!(
+            matches!(
+                backend.storage().head_object(&b, &src).await.unwrap_err(),
+                _mem::Error::Storage(StorageError::NoSuchKey(_))
+            ),
+            "the source is gone after the move"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn post_object_overwrite_requires_destination_owner() {
+        // The handler-side B1 head for PostObject (carry 3): s3s routes
+        // the form to the bucket path, so the access layer saw only the
+        // base bucket-WRITE gate — the delegated put path knows the key.
+        // An anonymous POST over an existing key in a public-write
+        // bucket is 403 AccessDenied; a fresh key is allowed; the
+        // owner's POST over the existing key is allowed.
+        let alice = user_id("AKID");
+        let backend = acl_backend();
+        let b = bucket::name("data").unwrap();
+        let public_write = acl::Acl {
+            owner: Some(alice.clone()),
+            grants: vec![
+                grant_to(&alice, acl::Permission::FullControl),
+                group_grant(acl::GROUP_ALL_USERS, acl::Permission::Write),
+            ],
+        };
+        backend
+            .storage()
+            .create_bucket(&b, Some(&alice), &public_write)
+            .await
+            .unwrap();
+        let existing = object::key("t.txt").unwrap();
+        backend
+            .storage()
+            .commit_object(
+                &b,
+                &existing,
+                backend
+                    .storage()
+                    .stage_body(&b, &existing, body(b"x"), None)
+                    .await
+                    .unwrap(),
+                object::Tags::empty(),
+                Some(&alice),
+                &acl::Acl::default_private(Some(alice.clone())),
+            )
+            .await
+            .unwrap();
+        let err = backend
+            .put_object(post_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "t.txt".into(),
+                body: dto_body(b"y"),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "AccessDenied");
+        backend
+            .put_object(post_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "new.txt".into(),
+                body: dto_body(b"y"),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let mut owned = post_request(dto::PutObjectInput {
+            bucket: b.to_string(),
+            key: "t.txt".into(),
+            body: dto_body(b"z"),
+            ..Default::default()
+        });
+        owned.credentials = Some(credentials_for("AKID"));
+        backend.put_object(owned).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "acl")]
+    async fn write_path_grant_headers_obey_the_100_grant_boundary() {
+        // Carry 2 (Task 8 minor #2): the request-level path counts the
+        // owner grant — 99 declared grants + the owner FULL_CONTROL =
+        // exactly the 100 cap → stored; 100 declared + the owner =
+        // 101 → 400 InvalidArgument.
+        let alice = user_id("AKID");
+        let (backend, b) = acl_setup(&alice).await;
+        let declared = |n: usize| {
+            (0..n)
+                .map(|i| format!(r#"id="{i:064x}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let put = |grant: String| {
+            let mut req = signed_request(dto::PutObjectInput {
+                bucket: b.to_string(),
+                key: "t.txt".into(),
+                body: dto_body(b"x"),
+                grant_full_control: Some(grant.into()),
+                ..Default::default()
+            });
+            req.credentials = Some(credentials_for("BKID"));
+            backend.put_object(req)
+        };
+        put(declared(99)).await.unwrap();
+        let err = put(declared(100)).await.unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
     }
 }

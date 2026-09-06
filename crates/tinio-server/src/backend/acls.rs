@@ -1,6 +1,7 @@
-//! ACL wire helpers of the four ACL ops (spec 2026-09-05, Task 10): the
-//! shared Content-MD5 gate and the dto grants ↔ core `AclGrants`
-//! conversions.
+//! ACL wire helpers of the four ACL ops (spec 2026-09-05, Task 10) and
+//! the write-path headers (Task 11): the shared Content-MD5 gate, the
+//! dto grants ↔ core `AclGrants` conversions, and the write-path
+//! `x-amz-acl`/`x-amz-grant-*` expansion.
 //!
 //! The request-input path is strict: an unknown group URI, a malformed
 //! canonical ID, an email grantee, a permission outside the five AWS
@@ -12,9 +13,11 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use s3s::{S3Result, dto, s3_error};
 
 use crate::{
-    _auth::canned::{GrantHeaders, canned_bucket_grants, canned_object_grants, grants_from_headers},
+    _auth::canned::{
+        GrantHeaders, canned_bucket_grants, canned_object_grants, expand_acl, grants_from_headers,
+    },
     _core::acl::{
-        ACL_GRANTS_MAX, AclGrants, Grant, Grantee, GroupUri, OwnerId, Permission,
+        ACL_GRANTS_MAX, Acl, AclGrants, Grant, Grantee, GroupUri, OwnerId, Permission,
     },
 };
 
@@ -264,4 +267,67 @@ pub(crate) fn grant_dto(grant: &Grant) -> dto::Grant {
 /// A core grant set into the dto grant list.
 pub(crate) fn grants_dto(grants: &AclGrants) -> Vec<dto::Grant> {
     grants.iter().map(grant_dto).collect()
+}
+
+// --- write-path headers (spec §5, Task 11) ---
+
+/// The `x-amz-grant-*` input fields of one write request into the
+/// parsed header set (the five fields every write surface shares — only
+/// the bucket surface carries `grant_write`).
+pub(crate) fn grant_headers<'a>(
+    full_control: Option<&'a str>,
+    read: Option<&'a str>,
+    read_acp: Option<&'a str>,
+    write: Option<&'a str>,
+    write_acp: Option<&'a str>,
+) -> GrantHeaders<'a> {
+    GrantHeaders {
+        full_control,
+        read,
+        read_acp,
+        write,
+        write_acp,
+    }
+}
+
+/// The write-path ACL of an OBJECT surface (PutObject, CopyObject,
+/// CreateMultipartUpload): canned expansion or grant-header parse via
+/// [`expand_acl`] — the shared object-flavored composer (the
+/// `bucket-owner-*` names reference the bucket owner; canned + grant
+/// headers → 400; strict request-level validation). A write with
+/// neither header records the owner's private default — the write-path
+/// rule, NOT the put-ACL ops' exactly-one-source 400. The returned row
+/// is grants-only (`owner: None`); the caller passes the owner element
+/// separately.
+pub(crate) fn object_write_acl(
+    owner: &OwnerId,
+    bucket_owner: &OwnerId,
+    canned: Option<&str>,
+    headers: &GrantHeaders<'_>,
+) -> S3Result<Acl> {
+    expand_acl(owner, bucket_owner, canned, *headers)
+}
+
+/// The write-path ACL of a BUCKET surface (CreateBucket): like
+/// [`object_write_acl`], but composed through [`canned_bucket_grants`]
+/// DIRECTLY — [`expand_acl`] is object-flavored, and the
+/// `bucket-owner-*` names are ignored on buckets (private, per AWS).
+pub(crate) fn bucket_write_acl(
+    owner: &OwnerId,
+    canned: Option<&str>,
+    headers: &GrantHeaders<'_>,
+) -> S3Result<Acl> {
+    let grants = match canned {
+        Some(canned) => {
+            if headers_requested(headers) {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "cannot combine a canned ACL with x-amz-grant-* headers"
+                ));
+            }
+            canned_bucket_grants(owner, canned)?
+        }
+        None => grants_from_headers(owner, headers)?,
+    };
+    Ok(Acl { owner: None, grants })
 }

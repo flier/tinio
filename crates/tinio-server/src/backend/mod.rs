@@ -443,12 +443,13 @@ impl<S: Storage> S3Backend<S> {
             .essence_str()
             .to_string()
     }
+
     /// The requester's owner for the write paths: the identity map's
     /// principal (the authenticated user's canonical ID, or the
     /// anonymous special ID for an unsigned request), or `None` under
     /// no-identity mode — the row records the empty owner wire (review
-    /// B4, never the default owner). The write paths resolve through it;
-    /// the ACL ops use the row-owner resolution instead.
+    /// B4, never the default owner). The write paths (Task 11) resolve
+    /// through it; the ACL ops use the row-owner resolution instead.
     #[cfg(feature = "acl")]
     pub(crate) fn owner_for(
         &self,
