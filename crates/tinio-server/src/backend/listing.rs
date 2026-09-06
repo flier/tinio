@@ -477,7 +477,7 @@ mod tests {
                     b,
                     &k,
                     storage
-                        .stage_body(b, &k, body(format!("{key}")), None)
+                        .stage_body(b, &k, body(key.to_string()), None)
                         .await
                         .unwrap(),
                     object::Tags::empty(),

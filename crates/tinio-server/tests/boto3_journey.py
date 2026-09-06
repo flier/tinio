@@ -1,13 +1,20 @@
 """boto3 basic-journey scenario (task T034) — the SC-001 scenario set via
-the boto3 SDK against a running serve endpoint. Driven by the Rust test
-tests/boto3.rs: `python3 boto3_journey.py <endpoint>`. Best-effort client
-per FR-025 (targeted/manual, NOT CI-gated).
+the boto3 SDK against a running serve endpoint, extended 2026-09-05/06
+with the ACL legs (design 2026-09-05-s3-acl-owner, spec verification
+item 6): public-read upload + anonymous GET, get-bucket-acl echo,
+expected-bucket-owner mismatch, list_buckets per principal. Driven by the
+@boto3 cucumber scenario (`interop/journey.feature`): `python3
+boto3_journey.py <endpoint>`. Best-effort client per FR-025 (targeted/
+manual, NOT CI-gated).
 """
 
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 import boto3
+from botocore import UNSIGNED
 from botocore.client import Config
 
 endpoint = sys.argv[1]
@@ -143,5 +150,67 @@ try:
     raise AssertionError("object still exists after delete")
 except s3.exceptions.ClientError as e:
     assert e.response["Error"]["Code"] == "404"
+
+# ACL journey (design 2026-09-05, spec verification item 6). The spawned
+# serve runs the default identity: root = the [auth] "minioadmin" pair
+# presenting the [owner] element (canonical ID hex(SHA-256("tinio")),
+# display name "tinio"); no [[users]] configured, so all "per principal"
+# legs compare root vs anonymous.
+ROOT_OWNER_ID = "d16b7e8c0bb9728d01e3bf9c30940a32622195f821325af577a87bd6284ac306"
+
+# public-read upload -> anonymous GET works (urllib — the boto3 venv
+# carries no `requests`; stdlib keeps the leg dependency-free).
+s3.create_bucket(Bucket="boto3-acl")
+s3.put_object(Bucket="boto3-acl", Key="pub.txt", Body=b"public", ACL="public-read")
+with urllib.request.urlopen(f"http://{endpoint}/boto3-acl/pub.txt") as resp:
+    assert resp.read() == b"public", "anonymous GET of a public-read object"
+
+# A private object (the default when no ACL header is sent) denies the
+# anonymous GET with 403 — the ACL layer's enforced mode.
+s3.put_object(Bucket="boto3-acl", Key="priv.txt", Body=b"private")
+try:
+    urllib.request.urlopen(f"http://{endpoint}/boto3-acl/priv.txt")
+    raise AssertionError("anonymous GET of a private object must be denied")
+except urllib.error.HTTPError as e:
+    assert e.code == 403, f"expected 403, got {e.code}"
+
+# get-bucket-acl echoes the row: the root owner element + the public-read
+# grant set (canonical sorted id=,FULL_CONTROL & uri=AllUsers,READ).
+acl = s3.get_bucket_acl(Bucket="boto3-acl")
+assert acl["Owner"]["ID"] == ROOT_OWNER_ID, f"unexpected owner {acl['Owner']['ID']}"
+grants = {(g["Grantee"].get("ID") or g["Grantee"].get("URI"), g["Permission"]) for g in acl["Grants"]}
+assert (ROOT_OWNER_ID, "FULL_CONTROL") in grants, "owner FULL_CONTROL grant missing"
+assert (
+    "http://acs.amazonaws.com/groups/global/AllUsers",
+    "READ",
+) in grants, "public-read grant missing"
+
+# expected-bucket-owner mismatch -> 403 AccessDenied; the matching owner
+# passes.
+try:
+    s3.head_bucket(Bucket="boto3-acl", ExpectedBucketOwner="f" * 64)
+    raise AssertionError("expect a 403 for a mismatching expected bucket owner")
+except s3.exceptions.ClientError as e:
+    assert e.response["Error"]["Code"] == "403", e.response["Error"]["Code"]
+s3.head_bucket(Bucket="boto3-acl", ExpectedBucketOwner=ROOT_OWNER_ID)
+
+# list_buckets per principal: the signed principal sees its buckets (the
+# ACL buckets included); an anonymous request is denied outright. The
+# error code is the body's XML code — a GET answer carries the body, so
+# botocore surfaces "AccessDenied" (unlike HEAD answers, whose body-less
+# 403 surfaces the HTTP status "403" — see the head_bucket leg above).
+names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+assert "boto3-acl" in names and "boto3-bucket" in names, names
+anon = boto3.client(
+    "s3",
+    endpoint_url=f"http://{endpoint}",
+    region_name="us-east-1",
+    config=Config(signature_version=UNSIGNED),
+)
+try:
+    anon.list_buckets()
+    raise AssertionError("anonymous list_buckets must be denied")
+except anon.exceptions.ClientError as e:
+    assert e.response["Error"]["Code"] == "AccessDenied", e.response["Error"]["Code"]
 
 print("BOTO3 JOURNEY OK")

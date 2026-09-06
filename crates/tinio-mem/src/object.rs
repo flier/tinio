@@ -69,6 +69,7 @@ impl MemoryStorage {
     /// body is dropped, the record stores the empty-content ETag, and the
     /// tags/checksum are accept-and-dropped (the fs backend's marker
     /// commit behaves the same way). Returns the committed metadata.
+    #[allow(clippy::too_many_arguments)]
     async fn write_object(
         &self,
         bucket: &Name,

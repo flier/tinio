@@ -33,7 +33,10 @@ fn multipart_assembly(c: &mut Criterion) {
         let bname = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();
         rt.block_on(async {
-            storage.create_bucket(&bname).await.unwrap();
+            storage
+                .create_bucket(&bname, None, &tinio_core::acl::Acl::default_private(None))
+                .await
+                .unwrap();
         });
         b.to_async(rt).iter(|| {
             let storage = storage.clone();
@@ -43,7 +46,14 @@ fn multipart_assembly(c: &mut Criterion) {
                 // Re-create the upload each iteration (a completed upload is
                 // consumed).
                 let upload = storage
-                    .create_multipart_upload(&bname, &key, None, object::Tags::empty())
+                    .create_multipart_upload(
+                        &bname,
+                        &key,
+                        None,
+                        object::Tags::empty(),
+                        None,
+                        &tinio_core::acl::Acl::default_private(None),
+                    )
                     .await
                     .unwrap();
                 let part_data: Vec<u8> = vec![b'p'; PART_SIZE];

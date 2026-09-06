@@ -1342,6 +1342,7 @@ mod tests {
         /// (S3-specific: `x-amz-content-sha256` is required and computes
         /// over the payload). Mirrors the canonicalization s3s verifies
         /// in `ops/signature.rs`.
+        #[allow(clippy::too_many_arguments)]
         fn authorization(
             access_key: &str,
             secret: &str,

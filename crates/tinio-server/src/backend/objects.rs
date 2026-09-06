@@ -753,7 +753,7 @@ impl<S: Storage> S3Backend<S> {
         // AWS-style mixed results. The bucket owner element resolves
         // once; the grants are irrelevant to this rule.
         #[cfg(feature = "acl")]
-        let gate: Option<(acl::OwnerId, acl::OwnerId)> = if self.caps.acl
+        let gate: Option<(acl::OwnerId, acl::OwnerId, acl::OwnerId)> = if self.caps.acl
             && self.identity.is_some()
         {
             let principal = self
@@ -767,7 +767,11 @@ impl<S: Storage> S3Backend<S> {
                     .owner
                     .as_ref(),
             );
-            Some((principal, bucket_owner))
+            // The empty wire's lazy default (review B4) resolves once,
+            // above the loop — the per-key `row_owner(None)` of the
+            // original shape is loop-invariant.
+            let lazy_default = self.row_owner(None);
+            Some((principal, bucket_owner, lazy_default))
         } else {
             None
         };
@@ -790,14 +794,14 @@ impl<S: Storage> S3Backend<S> {
             // coarse gate holds elsewhere); any other ACL-read failure
             // is a per-key entry like a delete failure.
             #[cfg(feature = "acl")]
-            if let Some((principal, bucket_owner)) = gate.as_ref() {
+            if let Some((principal, bucket_owner, lazy_default)) = gate.as_ref() {
                 match self.storage.get_object_acl(&bucket, &key).await {
                     Ok(acl) => {
                         // The one-home rule (`_core::acl::can_delete`);
-                        // the empty wire's lazy default resolves here
-                        // (review B4 — the same `row_owner(None)`).
-                        let lazy_default = self.row_owner(None);
-                        if !acl::can_delete(principal, bucket_owner, &lazy_default, acl.owner.as_ref()) {
+                        // the empty wire's lazy default is the value
+                        // resolved above (review B4 — the same
+                        // `row_owner(None)` per key).
+                        if !acl::can_delete(principal, bucket_owner, lazy_default, acl.owner.as_ref()) {
                             errors.push(delete_error(&denied, key.to_string()));
                             continue;
                         }
@@ -2033,7 +2037,7 @@ mod tests {
                     b,
                     &k,
                     storage
-                        .stage_body(b, &k, body(format!("{key}")), None)
+                        .stage_body(b, &k, body(key.to_string()), None)
                         .await
                         .unwrap(),
                     object::Tags::empty(),
@@ -4024,7 +4028,7 @@ mod tests {
                 bucket: b.to_string(),
                 key: "t.txt".into(),
                 body: dto_body(b"x"),
-                grant_full_control: Some(grant.into()),
+                grant_full_control: Some(grant),
                 ..Default::default()
             });
             req.credentials = Some(credentials_for("BKID"));

@@ -45,7 +45,15 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
         ),
         StorageError::InvalidPartKey(_) => s3_error!(InvalidArgument, "invalid part key"),
         StorageError::InvalidRange { .. } => s3_error!(InvalidRange),
-        StorageError::AccessDenied(_) => s3_error!(AccessDenied),
+        // The 403-ambiguity note (backend/mod.rs module doc): a storage
+        // AccessDenied is an OS-level permission denial or the
+        // symlink-policy refusal — NOT an ACL decision (those answer
+        // directly from the access layer). The distinction is invisible
+        // on the wire; the source is logged at debug.
+        StorageError::AccessDenied(key) => {
+            tracing::debug!(key = key.to_string(), "storage AccessDenied — OS-level permission denial or symlink-policy refusal, not an ACL decision");
+            s3_error!(AccessDenied)
+        }
         StorageError::Io(err) => s3_error!(InternalError, "storage I/O error: {err}"),
     }
 }

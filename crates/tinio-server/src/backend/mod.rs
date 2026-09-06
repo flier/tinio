@@ -12,6 +12,19 @@
 //! `list-v1`, `list-v2`, `cors` cargo features) and disableable at runtime
 //! ([`Capabilities`], from the `[s3]` config section) — disabled groups
 //! answer `NotImplemented` (FR-021).
+//!
+//! **403 ambiguity (the ACL plane, spec 2026-09-05)**: with owners/ACLs
+//! enforced, a 403 `AccessDenied` can mean an ACL denial at the access
+//! layer (`tinio-auth`'s `S3Access`), an OS-level `PermissionDenied`
+//! from the filesystem backend, or the symlink-policy refusal (the
+//! `follow_symlinks = false` answer) — the last two reach the same S3
+//! code through [`Storage`] contract `Error::AccessDenied`, which
+//! [`errors::map_backend_error`] maps onto `AccessDenied` and logs the
+//! storage source at debug. The wire cannot distinguish the cases;
+//! debug-level logs are the only forensic tool. **`/metrics` stays
+//! outside the ACL check** (grilling ruling): the reserved
+//! management-plane GET is intercepted pre-route in `data.rs` and is not
+//! subject to the access-layer pipeline.
 
 mod conditions;
 #[cfg(feature = "cors")]
@@ -450,8 +463,8 @@ impl<S: Storage> S3Backend<S> {
     /// principal (the authenticated user's canonical ID, or the
     /// anonymous special ID for an unsigned request), or `None` under
     /// no-identity mode — the row records the empty owner wire (review
-    /// B4, never the default owner). The write paths (Task 11) resolve
-    /// through it; the ACL ops use the row-owner resolution instead.
+    /// B4, never the default owner). The write paths resolve through it;
+    /// the ACL ops use the row-owner resolution instead.
     #[cfg(feature = "acl")]
     pub(crate) fn owner_for(
         &self,

@@ -257,6 +257,7 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// too and reusing the source's ETag for a single-form source (the
     /// content MD5 is unchanged by a copy). `NoSuchKey` when the source
     /// does not exist; `NoSuchBucket` when either bucket does not.
+    #[allow(clippy::too_many_arguments)]
     async fn copy_object(
         &self,
         src_bucket: &bucket::Name,

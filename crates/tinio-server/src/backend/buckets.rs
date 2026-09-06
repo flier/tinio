@@ -192,27 +192,22 @@ impl<S: Storage> S3Backend<S> {
         // principal. Feature-off / toggle-off / no-identity modes keep
         // the unfiltered legacy listing (`None, None`).
         #[cfg(feature = "acl")]
-        let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = if self.caps
-            .acl
-            && self.identity.is_some()
-        {
+        let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = match (
+            self.caps.acl,
+            self.identity.as_ref(),
+        ) {
             // Fail-closed (fix-round Minor #2): the enforced filter
             // must never degrade to the unfiltered listing via an
-            // unresolved principal — the identity is present above, so
+            // unresolved principal — the identity is present here, so
             // the resolution cannot fail (the same invariant as the
             // write paths' `owner_for(...).expect`).
-            let principal = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            let default = self
-                .identity
-                .as_ref()
-                .expect("identity attached above")
-                .default_owner
-                .clone();
-            (Some(principal), Some(default))
-        } else {
-            (None, None)
+            (true, Some(identity)) => {
+                let principal = self
+                    .owner_for(req.credentials.as_ref())
+                    .expect("identity attached above");
+                (Some(principal), Some(identity.default_owner.clone()))
+            }
+            _ => (None, None),
         };
         #[cfg(not(feature = "acl"))]
         let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = (None, None);

@@ -12,7 +12,7 @@
 
 Feature: Bucket and object ACL policy
 
-  @acl
+  @acl @FR-033 @SC-009
   Scenario: A public-read object serves anonymous GETs
     When I send a "PUT" request to "/data" signed as "root" with headers
       | x-amz-acl | public-read |
@@ -24,7 +24,7 @@ Feature: Bucket and object ACL policy
     Then the response status is 200
     And the object body is "hello"
 
-  @acl
+  @acl @FR-033
   Scenario: A private object denies anonymous GETs
     When I send a "PUT" request to "/data" signed as "root"
     Then the response status is 200
@@ -35,7 +35,7 @@ Feature: Bucket and object ACL policy
     Then the response status is 403
     And the error code is "AccessDenied"
 
-  @acl
+  @acl @FR-033
   Scenario: A READ grant lets the grantee's signed GET succeed
     When I send a "PUT" request to "/data" signed as "root"
     Then the response status is 200
@@ -49,7 +49,7 @@ Feature: Bucket and object ACL policy
     Then the response status is 200
     And the object body is "shared"
 
-  @acl
+  @acl @FR-033
   Scenario: expected-bucket-owner mismatch answers 403
     When I send a "PUT" request to "/data" signed as "root"
     Then the response status is 200
@@ -64,7 +64,7 @@ Feature: Bucket and object ACL policy
     Then the response status is 403
     And the error code is "AccessDenied"
 
-  @acl
+  @acl @FR-033
   Scenario: ListBuckets returns only the requester's buckets
     When I send a "PUT" request to "/data" signed as "root"
     Then the response status is 200
@@ -83,7 +83,7 @@ Feature: Bucket and object ACL policy
     And the response body does not contain "<Name>data</Name>"
     And the response body does not contain "<Name>other</Name>"
 
-  @acl
+  @acl @FR-033
   Scenario: Public-write denies overwriting an existing object
     When I send a "PUT" request to "/pub" signed as "root" with headers
       | x-amz-acl | public-read-write |
@@ -100,7 +100,7 @@ Feature: Bucket and object ACL policy
     Then the response status is 200
     And the object body is "anonymous"
 
-  @acl
+  @acl @FR-033
   Scenario: DeleteObjects without a grant is denied as a whole
     When I send a "PUT" request to "/data" signed as "root"
     Then the response status is 200
@@ -112,7 +112,7 @@ Feature: Bucket and object ACL policy
     Then the response status is 403
     And the error code is "AccessDenied"
 
-  @acl
+  @acl @FR-033
   Scenario: PutBucketAcl without Content-MD5 answers 400
     When I send a "PUT" request to "/data" signed as "root"
     Then the response status is 200
@@ -126,7 +126,7 @@ Feature: Bucket and object ACL policy
       | Content-MD5 | 1B2M2Y8AsgTpgAmY7PhCfg== |
     Then the response status is 200
 
-  @acl-off
+  @acl-off @FR-033
   Scenario: ACL operations answer NotImplemented when the capability is off
     Given I create bucket "data"
     And I upload "data/a.txt" with body "hello"

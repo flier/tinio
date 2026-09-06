@@ -26,7 +26,10 @@ fn listing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let bname = bucket::name("data").unwrap();
     rt.block_on(async {
-        storage.create_bucket(&bname).await.unwrap();
+        storage
+            .create_bucket(&bname, None, &tinio_core::acl::Acl::default_private(None))
+            .await
+            .unwrap();
         for i in 0..FLAT {
             storage
                 .put_object(

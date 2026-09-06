@@ -117,6 +117,7 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 ///                     max_buckets: 10,
 ///                 },
 ///                 None,
+///                 None,
 ///             )
 ///             .await
 ///             .unwrap()

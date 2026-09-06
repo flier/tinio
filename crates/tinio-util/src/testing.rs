@@ -597,8 +597,9 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // The owner filter runs during the walk, BEFORE pagination (review
     // P2#4): seed an interleaved A/B pair on the `own` prefix (the
-    // unique_bucket counter alternates them — a raw-walk page would
-    // pair an A with a B), page the A-owned sub-collection with a size
+    // `{i}a`/`{i}b` suffix of the shared-`id()` pair interleaves the
+    // names lexically — a raw-walk page would pair an A with a B),
+    // page the A-owned sub-collection with a size
     // smaller than its count, and assert the continuation-token math
     // applies to the FILTERED set: no B-owned leak, the paged union
     // equals the full filtered listing, the last page carries no token.

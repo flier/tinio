@@ -21,7 +21,7 @@ bzip2 = { workspace = true }
 cucumber = { workspace = true, features = ["output-json", "tracing"] }
 flate2 = { workspace = true }
 futures = { workspace = true }
-hmac = "0.13"
+hmac = { workspace = true }
 http = { workspace = true }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
