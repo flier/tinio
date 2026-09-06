@@ -94,11 +94,7 @@ impl IdentityFromConfig for Identity {
                 },
             );
         }
-        Arc::new(Identity {
-            users,
-            default_owner: owner_id,
-            default_display_name: owner.display_name.clone(),
-        })
+        Arc::new(Identity::new(users, owner_id, owner.display_name.clone()))
     }
 }
 

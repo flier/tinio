@@ -1016,17 +1016,17 @@ mod tests {
         // lazy-default leg's principal (a plain `acl_backend()` default
         // owner has no signed credentials of its own).
         let backend = S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
-            .with_identity(Arc::new(Identity {
-                users: vec![
+            .with_identity(Arc::new(Identity::new(
+                vec![
                     User::test("AKID", "secret", "alice"),
                     User::test("BKID", "secret", "bob"),
                 ]
                 .into_iter()
                 .map(|u| (u.access_key.clone(), u))
                 .collect(),
-                default_owner: alice.clone(),
-                default_display_name: "tinio".into(),
-            }));
+                alice.clone(),
+                "tinio".into(),
+            )));
         let storage = backend.storage();
         for (bn, owner) in [
             ("alpha-a", Some(&alice)),

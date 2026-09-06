@@ -46,7 +46,7 @@ use crate::{
     },
 };
 #[cfg(feature = "acl")]
-use crate::backend::acls::{grant_headers, object_write_acl};
+use crate::backend::acls::grant_headers;
 
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
@@ -279,39 +279,27 @@ impl<S: Storage> S3Backend<S> {
         // requester's private default); the completion applies the
         // stored pair to the object (backend-side, the tags precedent).
         // No-identity mode keeps the Task 5 defaults (B4 rule 3).
+        // Write-path ACL (spec 2026-09-05, Task 11): an identity-mode
+        // CMU records the requester's owner and the request's canned /
+        // grant-header expansion (an unheadered create = the
+        // requester's private default); the completion applies the
+        // stored pair to the object (backend-side, the tags precedent).
+        // No-identity mode keeps the Task 5 defaults (B4 rule 3).
         #[cfg(feature = "acl")]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
-            && self.identity.is_some()
-        {
-            let owner = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            // The canned expansion references the bucket owner (review
-            // A6), resolved lazily from the bucket row.
-            let bucket_owner = self.row_owner(
-                self.storage
-                    .get_bucket_acl(&bucket)
-                    .await
-                    .map_err(map_backend_error)?
-                    .owner
-                    .as_ref(),
-            );
-            let acl = object_write_acl(
-                &owner,
-                &bucket_owner,
+        let write_acl = self
+            .write_acl_for(
+                req.credentials.as_ref(),
+                &bucket,
                 req.input.acl.as_ref().map(|c| c.as_str()),
-                &grant_headers(
+                grant_headers(
                     req.input.grant_full_control.as_deref(),
                     req.input.grant_read.as_deref(),
                     req.input.grant_read_acp.as_deref(),
                     None,
                     req.input.grant_write_acp.as_deref(),
                 ),
-            )?;
-            Some((owner, acl))
-        } else {
-            None
-        };
+            )
+            .await?;
         #[cfg(not(feature = "acl"))]
         let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
         // The no-identity / toggle-off default (Task 5).

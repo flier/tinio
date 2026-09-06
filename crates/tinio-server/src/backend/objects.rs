@@ -61,8 +61,7 @@ use crate::{
 use crate::{
     _auth::canned::GrantHeaders,
     backend::acls::{
-        grant_headers, grants_dto, object_acl_grants, object_write_acl, policy_owner_matches,
-        require_content_md5,
+        grant_headers, grants_dto, object_acl_grants, policy_owner_matches, require_content_md5,
     },
 };
 
@@ -141,9 +140,8 @@ impl<S: Storage> S3Backend<S> {
         let Some(info) = self.head_optional(bucket, key).await? else {
             return Ok(());
         };
-        if &self.row_owner(info.owner.as_ref()) == principal {
-            return Ok(());
-        }
+        // The single-key rule's one home (the DeleteObjects per-key gate
+        // runs the same helper).
         let bucket_owner = self.row_owner(
             self.storage
                 .get_bucket_acl(bucket)
@@ -152,10 +150,11 @@ impl<S: Storage> S3Backend<S> {
                 .owner
                 .as_ref(),
         );
-        if &bucket_owner == principal {
-            return Ok(());
+        if acl::can_delete(principal, &bucket_owner, &self.row_owner(None), info.owner.as_ref()) {
+            Ok(())
+        } else {
+            Err(s3_error!(AccessDenied, "Access Denied"))
         }
-        Err(s3_error!(AccessDenied, "Access Denied"))
     }
 }
 
@@ -211,46 +210,37 @@ impl<S: Storage> S3Backend<S> {
         // the form key. No-identity mode keeps the Task 5 defaults (B4
         // rule 3 — the empty owner wire); the toggle off keeps the
         // accept-and-drop.
+        // Write-path ACL (Task 11): the capability-gated identity
+        // resolution + canned / grant-header expansion (an unheadered
+        // write records the requester's private default); the PostObject
+        // B1 destination head (carry 3) runs here as well: the access
+        // layer saw only the bucket path, the delegated put path knows
+        // the form key. No-identity mode keeps the Task 5 defaults (B4
+        // rule 3 — the empty owner wire); the toggle off keeps the
+        // accept-and-drop.
         #[cfg(feature = "acl")]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
-            && self.identity.is_some()
-        {
-            let owner = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            if req.method == Method::POST {
-                self.post_object_destination_head(&bucket, &key, &owner)
-                    .await?;
-            }
-            // The canned expansion references the bucket owner (the
-            // `bucket-owner-*` names — review A6), resolved lazily from
-            // the bucket row; the grant-header path never uses it.
-            let bucket_owner = self.row_owner(
-                self.storage
-                    .get_bucket_acl(&bucket)
-                    .await
-                    .map_err(map_backend_error)?
-                    .owner
-                    .as_ref(),
-            );
-            let acl = object_write_acl(
-                &owner,
-                &bucket_owner,
+        let write_acl = self
+            .write_acl_for(
+                req.credentials.as_ref(),
+                &bucket,
                 req.input.acl.as_ref().map(|c| c.as_str()),
-                &grant_headers(
+                grant_headers(
                     req.input.grant_full_control.as_deref(),
                     req.input.grant_read.as_deref(),
                     req.input.grant_read_acp.as_deref(),
                     None,
                     req.input.grant_write_acp.as_deref(),
                 ),
-            )?;
-            Some((owner, acl))
-        } else {
-            None
-        };
+            )
+            .await?;
         #[cfg(not(feature = "acl"))]
         let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        if let Some((owner, _)) = &write_acl {
+            if req.method == Method::POST {
+                self.post_object_destination_head(&bucket, &key, owner)
+                    .await?;
+            }
+        }
         // The PUT checksum tee (spec 2026-08-31 — the `upload_part`
         // pattern): parse the request spec and wrap the body BEFORE any
         // storage call. Toggle off ⇒ exactly today's code path.
@@ -795,22 +785,35 @@ impl<S: Storage> S3Backend<S> {
             // is a per-key entry like a delete failure.
             #[cfg(feature = "acl")]
             if let Some((principal, bucket_owner, lazy_default)) = gate.as_ref() {
-                match self.storage.get_object_acl(&bucket, &key).await {
-                    Ok(acl) => {
-                        // The one-home rule (`_core::acl::can_delete`);
-                        // the empty wire's lazy default is the value
-                        // resolved above (review B4 — the same
-                        // `row_owner(None)` per key).
-                        if !acl::can_delete(principal, bucket_owner, lazy_default, acl.owner.as_ref()) {
-                            errors.push(delete_error(&denied, key.to_string()));
-                            continue;
+                // The bucket owner's second disjunct authorizes every
+                // key — no per-key read can deny (the short-circuit
+                // skips N reads on every owner batch delete).
+                if principal != bucket_owner {
+                    match self.storage.get_object_acl(&bucket, &key).await {
+                        Ok(acl) => {
+                            // The one-home rule (`_core::acl::can_delete`);
+                            // the empty wire's lazy default is the value
+                            // resolved above (review B4 — the same
+                            // `row_owner(None)` per key).
+                            if !acl::can_delete(
+                                principal,
+                                bucket_owner,
+                                lazy_default,
+                                acl.owner.as_ref(),
+                            ) {
+                                errors.push(delete_error(&denied, key.to_string()));
+                                continue;
+                            }
                         }
-                    }
-                    Err(err) => {
-                        let err: StorageError = err.into();
-                        if !matches!(err, StorageError::NoSuchKey(_)) {
-                            errors.push(delete_error(&map_backend_error(err), key.to_string()));
-                            continue;
+                        Err(err) => {
+                            let err: StorageError = err.into();
+                            if !matches!(err, StorageError::NoSuchKey(_)) {
+                                errors.push(delete_error(
+                                    &map_backend_error(err),
+                                    key.to_string(),
+                                ));
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1057,38 +1060,20 @@ impl<S: Storage> S3Backend<S> {
         // anonymous special ID for an unsigned request). No-identity
         // mode keeps the Task 5 defaults.
         #[cfg(feature = "acl")]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
-            && self.identity.is_some()
-        {
-            let owner = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            // The canned expansion references the destination bucket's
-            // owner (review A6), resolved lazily from the row.
-            let bucket_owner = self.row_owner(
-                self.storage
-                    .get_bucket_acl(&dst_bucket)
-                    .await
-                    .map_err(map_backend_error)?
-                    .owner
-                    .as_ref(),
-            );
-            let acl = object_write_acl(
-                &owner,
-                &bucket_owner,
+        let write_acl = self
+            .write_acl_for(
+                req.credentials.as_ref(),
+                &dst_bucket,
                 req.input.acl.as_ref().map(|c| c.as_str()),
-                &grant_headers(
+                grant_headers(
                     req.input.grant_full_control.as_deref(),
                     req.input.grant_read.as_deref(),
                     req.input.grant_read_acp.as_deref(),
                     None,
                     req.input.grant_write_acp.as_deref(),
                 ),
-            )?;
-            Some((owner, acl))
-        } else {
-            None
-        };
+            )
+            .await?;
         #[cfg(not(feature = "acl"))]
         let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
 

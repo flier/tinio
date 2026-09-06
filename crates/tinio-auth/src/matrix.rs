@@ -90,24 +90,19 @@ pub fn rule_for(op: &str) -> OpRule {
         // Root-level: any signed principal.
         "ListBuckets" | "CreateBucket" => rule(Authenticated, false, false, false),
         // Policy-only bucket permissions: owner only (tinio's
-        // equivalent of the AWS "policy-only" class).
-        "GetBucketLocation"
-        | "GetBucketTagging"
-        | "PutBucketTagging"
-        | "DeleteBucketTagging"
-        | "DeleteBucket" => rule(OwnerOnly, false, false, false),
-        // Upload-scoped rows: creator-or-bucket-owner.
-        "ListParts" | "UploadPart" | "AbortMultipartUpload" => {
+        // equivalent of the AWS "policy-only" class — the resolved
+        // owner-only rows the `_` fallback also returns, listed here for
+        // the record).
+        //
+        // Creator-or-bucket-owner / object-or-bucket-owner rows:
+        // upload-scoped (creator of the upload row), delete parity
+        // (DeleteObject), and the default-A tagging/attributes class.
+        "ListParts" | "UploadPart" | "AbortMultipartUpload" | "DeleteObject"
+        | "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging" | "GetObjectAttributes" => {
             rule(ObjectOrBucketOwner, false, false, false)
         }
         "UploadPartCopy" => rule(ObjectOrBucketOwner, true, false, false),
         "CompleteMultipartUpload" => rule(ObjectOrBucketOwner, false, false, true),
-        // Delete/new-key overwrite parity: object or bucket owner.
-        "DeleteObject" => rule(ObjectOrBucketOwner, false, false, false),
-        // Object-owner-or-bucket-owner rows.
-        "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging" | "GetObjectAttributes" => {
-            rule(ObjectOrBucketOwner, false, false, false)
-        }
         // CopyObject: source READ base, source READ + destination bucket
         // WRITE overlays, destination-key existence dispatch.
         "CopyObject" => rule(ObjectRead, true, true, true),

@@ -130,6 +130,13 @@ const CHECKSUM_SPEC_CACHE_CAP: usize = 8192;
 #[cfg(feature = "multipart")]
 use std::{collections::HashMap, sync::Mutex};
 
+#[cfg(feature = "acl")]
+use crate::_auth::canned::GrantHeaders;
+#[cfg(feature = "acl")]
+use crate::_auth::identity::Identity;
+#[cfg(feature = "acl")]
+use self::acls::object_write_acl;
+
 pub(crate) use conditions::{
     ConditionalHeaders, DeleteConditions, check_write_shape, checked_if_match_size, decide_fetch,
     decide_range_error, generation_changed, parse_if_range,
@@ -496,6 +503,7 @@ impl<S: Storage> S3Backend<S> {
     /// acl))` under identity mode with the toggle on, `None` under
     /// no-identity / toggle-off (the caller records the empty owner wire
     /// and the private default — review B4 rule 3). The bucket owner is
+    /// + the private default — review B4 rule 3). The bucket owner is
     /// resolved lazily from the bucket row — only a canned
     /// `bucket-owner-*` expansion needs it (review A6).
     #[cfg(feature = "acl")]

@@ -32,27 +32,50 @@ impl User {
     }
 }
 
-/// The identity map: access key → user, plus the default owner element
-/// (the config defaults; the lazy owner for rows without one).
+/// The identity map: access key → user, the default owner element (the
+/// config defaults; the lazy owner for rows without one), and the
+/// canonical-ID → display-name inverse (the O(1) owner resolution of
+/// listing pages and the ACL ops — built once at construction).
 #[derive(Debug)]
 pub struct Identity {
     pub users: HashMap<String, User>,
     pub default_owner: OwnerId,
     pub default_display_name: String,
+    /// canonical ID → display name (the inverse of `users`).
+    display_names: HashMap<OwnerId, String>,
 }
 
 impl Identity {
+    /// The identity over the given user map and the default owner
+    /// element.
+    pub fn new(
+        users: HashMap<String, User>,
+        default_owner: OwnerId,
+        default_display_name: String,
+    ) -> Self {
+        let display_names = users
+            .values()
+            .map(|u| (u.canonical_id.clone(), u.display_name.clone()))
+            .collect();
+        Self {
+            users,
+            default_owner,
+            default_display_name,
+            display_names,
+        }
+    }
+
     /// A default-shaped identity over the given users: the default owner
     /// element is the built-in `hex(SHA-256("tinio"))` / `"tinio"` pair.
     pub fn test(users: Vec<User>) -> Self {
-        Self {
-            users: users
+        Self::new(
+            users
                 .into_iter()
                 .map(|u| (u.access_key.clone(), u))
                 .collect(),
-            default_owner: default_owner_id(),
-            default_display_name: DEFAULT_OWNER_DISPLAY_NAME.into(),
-        }
+            default_owner_id(),
+            DEFAULT_OWNER_DISPLAY_NAME.into(),
+        )
     }
 
     /// The requester's canonical ID: the authenticated user's, or
@@ -80,13 +103,10 @@ impl Identity {
         let (id, display_name) = match id {
             Some(id) => {
                 let display_name = self
-                    .users
-                    .values()
-                    .find(|u| u.canonical_id == *id)
-                    .map(|u| u.display_name.clone())
-                    .or_else(|| {
-                        (id == &self.default_owner).then(|| self.default_display_name.clone())
-                    });
+                    .display_names
+                    .get(id)
+                    .cloned()
+                    .or_else(|| (id == &self.default_owner).then(|| self.default_display_name.clone()));
                 (Some(id.clone()), display_name)
             }
             None => (

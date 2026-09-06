@@ -29,6 +29,19 @@ pub struct GrantHeaders<'a> {
     pub write_acp: Option<&'a str>,
 }
 
+impl GrantHeaders<'_> {
+    /// Whether any grant header is present (canned ACLs and grant
+    /// headers are mutually exclusive — a request carrying both is a
+    /// 400 `InvalidArgument`).
+    pub fn requested(&self) -> bool {
+        self.full_control.is_some()
+            || self.read.is_some()
+            || self.read_acp.is_some()
+            || self.write.is_some()
+            || self.write_acp.is_some()
+    }
+}
+
 /// The grants of a canned bucket ACL: the owner's `FULL_CONTROL` plus
 /// the canned expansion. `bucket-owner-read`/`bucket-owner-full-control`
 /// are ignored on buckets (private, per AWS); `aws-exec-read` is
@@ -141,24 +154,25 @@ pub fn grants_from_headers(owner: &OwnerId, hs: &GrantHeaders<'_>) -> Result<Acl
 /// header is a 400 `InvalidArgument`. The returned row carries
 /// `owner: None`; the caller passes the owner element separately (the
 /// storage row keeps owner and grants apart).
+///
+/// `bucket_owner` is `Some` on the object write surface (the
+/// `bucket-owner-*` canned ACLs reference it) and `None` on the bucket
+/// write surface (those names are ignored there — private, per AWS).
 pub fn expand_acl(
     owner: &OwnerId,
-    bucket_owner: &OwnerId,
+    bucket_owner: Option<&OwnerId>,
     canned: Option<&str>,
     hs: GrantHeaders<'_>,
 ) -> Result<Acl, S3Error> {
-    // The object write-surface composer; a bucket write surface
-    // composes `canned_bucket_grants`/`grants_from_headers` directly —
-    // the bucket-owner-* canned ACLs are ignored there.
     let grants = match canned {
         Some(canned) => {
-            if headers_requested(&hs) {
+            if hs.requested() {
                 return Err(s3_error!(
                     InvalidArgument,
                     "cannot combine a canned ACL with x-amz-grant-* headers"
                 ));
             }
-            canned_object_grants(owner, bucket_owner, canned)?
+            canned_grants(owner, bucket_owner, canned)?
         }
         None => grants_from_headers(owner, &hs)?,
     };
@@ -166,14 +180,6 @@ pub fn expand_acl(
         owner: None,
         grants,
     })
-}
-
-fn headers_requested(hs: &GrantHeaders<'_>) -> bool {
-    hs.full_control.is_some()
-        || hs.read.is_some()
-        || hs.read_acp.is_some()
-        || hs.write.is_some()
-        || hs.write_acp.is_some()
 }
 
 fn grantee_from_atom(atom: &str) -> Result<Grantee, S3Error> {
@@ -481,7 +487,7 @@ mod tests {
     #[test]
     fn expand_acl_carries_grants_only_and_keeps_the_owner_on_the_caller() {
         let (o, bo) = (owner(), bucket_owner());
-        let acl = expand_acl(&o, &bo, Some("public-read"), GrantHeaders::default()).unwrap();
+        let acl = expand_acl(&o, Some(&bo), Some("public-read"), GrantHeaders::default()).unwrap();
         assert_eq!(acl.owner, None); // the caller passes the owner element separately
         assert_eq!(
             acl.grants,
@@ -490,14 +496,14 @@ mod tests {
                 group(GROUP_ALL_USERS, Permission::Read),
             ]
         );
-        let acl = expand_acl(&o, &bo, None, GrantHeaders::default()).unwrap();
+        let acl = expand_acl(&o, Some(&bo), None, GrantHeaders::default()).unwrap();
         assert_eq!(acl.owner, None);
         assert_eq!(acl.grants, Acl::default_private(Some(o.clone())).grants);
         let hs = GrantHeaders {
             read: Some(r#"uri="http://acs.amazonaws.com/groups/global/AllUsers""#),
             ..GrantHeaders::default()
         };
-        let acl = expand_acl(&o, &bo, None, hs).unwrap();
+        let acl = expand_acl(&o, Some(&bo), None, hs).unwrap();
         assert_eq!(
             acl.grants,
             vec![
@@ -506,7 +512,7 @@ mod tests {
             ]
         );
         // Bucket-owner-* on the object surface references the bucket owner.
-        let acl = expand_acl(&o, &bo, Some("bucket-owner-read"), GrantHeaders::default()).unwrap();
+        let acl = expand_acl(&o, Some(&bo), Some("bucket-owner-read"), GrantHeaders::default()).unwrap();
         assert_eq!(
             acl.grants,
             vec![
@@ -523,6 +529,6 @@ mod tests {
             read: Some(r#"uri="http://acs.amazonaws.com/groups/global/AllUsers""#),
             ..GrantHeaders::default()
         };
-        asserting_invalid(&expand_acl(&o, &bo, Some("public-read"), hs).unwrap_err());
+        asserting_invalid(&expand_acl(&o, Some(&bo), Some("public-read"), hs).unwrap_err());
     }
 }

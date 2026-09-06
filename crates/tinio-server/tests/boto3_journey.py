@@ -160,7 +160,7 @@ ROOT_OWNER_ID = "d16b7e8c0bb9728d01e3bf9c30940a32622195f821325af577a87bd6284ac30
 
 # public-read upload -> anonymous GET works (urllib — the boto3 venv
 # carries no `requests`; stdlib keeps the leg dependency-free).
-s3.create_bucket(Bucket="boto3-acl")
+s3.create_bucket(Bucket="boto3-acl", ACL="public-read")
 s3.put_object(Bucket="boto3-acl", Key="pub.txt", Body=b"public", ACL="public-read")
 with urllib.request.urlopen(f"http://{endpoint}/boto3-acl/pub.txt") as resp:
     assert resp.read() == b"public", "anonymous GET of a public-read object"

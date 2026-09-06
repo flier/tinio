@@ -289,7 +289,10 @@ impl Acl {
             return Err(AclError::GrantsOverflow);
         }
         // Canonical: sort by the same `grantee_wire,PERMISSION` key the
-        // encoder emits, and dedupe exact duplicates.
+        // encoder emits, and dedupe exact duplicates. The canonical
+        // encoder is the only writer — the read path (every ACL row
+        // decode) verifies the order+dedupe in one linear pass and
+        // skips the sort for the canonical rows it wrote.
         let mut keyed: Vec<(String, Grant)> = grants
             .into_iter()
             .filter_map(|g| {
@@ -303,8 +306,10 @@ impl Acl {
                 ))
             })
             .collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        keyed.dedup_by(|a, b| a.0 == b.0);
+        if !keyed.windows(2).all(|w| w[0].0 < w[1].0) {
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            keyed.dedup_by(|a, b| a.0 == b.0);
+        }
         Ok(Self {
             owner: None,
             grants: keyed.into_iter().map(|(_, g)| g).collect(),

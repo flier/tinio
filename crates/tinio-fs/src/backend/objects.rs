@@ -1203,6 +1203,8 @@ mod tests {
     // it unused while the unix build cannot resolve the trait methods.
     #[cfg(unix)]
     use crate::_core::storage::MultipartOps;
+    #[cfg(unix)]
+    use crate::FsOptions;
     use crate::{
         _core::{
             acl, object,
@@ -2619,7 +2621,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn fs_chown_failure_after_rename_removes_file_and_errors() {
-        use std::os::unix::fs::MetadataExt;
         if crate::testutil::euid() == 0 {
             eprintln!("skipped: the fail-closed test needs an UNPRIVILEGED process");
             return;

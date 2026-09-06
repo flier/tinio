@@ -185,16 +185,22 @@ impl<S: Storage> AclAccess<S> {
             Ok(upload) => upload,
             Err(err) => return self.missing_tiers(&bucket_name, &err.into(), request).await,
         };
-        let creator = upload
-            .owner
-            .as_ref()
-            .unwrap_or(&self.identity.default_owner);
+        // creator-or-bucket-owner (the single-key rule's one home —
+        // [`can_delete`], see [`object_or_bucket_owner`]: the upload
+        // row's raw owner is the object leg, the bucket row supplies the
+        // bucket leg).
+        let creator = upload.owner.as_ref().unwrap_or(&self.identity.default_owner);
         if creator != &request.principal {
             let bucket_acl = match self.storage.get_bucket_acl(&bucket_name).await {
                 Ok(acl) => acl,
                 Err(err) => return self.missing_tiers(&bucket_name, &err.into(), request).await,
             };
-            if !self.is_owner(&bucket_acl, &request.principal) {
+            if !can_delete(
+                &request.principal,
+                &self.resolved_owner(&bucket_acl),
+                &self.identity.default_owner,
+                upload.owner.as_ref(),
+            ) {
                 return Err(denied());
             }
         }
@@ -389,7 +395,8 @@ impl<S: Storage> AclAccess<S> {
 
     /// An existing destination's owner-parity gate (B1): P == O
     /// (destination object) or P == O(destination bucket) — no grant
-    /// satisfies it.
+    /// satisfies it (the single-key rule's one home —
+    /// [`can_delete`], see [`object_or_bucket_owner`]).
     async fn destination_owner_parity(
         &self,
         bucket_name: &bucket::Name,
@@ -403,10 +410,16 @@ impl<S: Storage> AclAccess<S> {
             Ok(acl) => acl,
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
-        if self.is_owner(&bucket_acl, &request.principal) {
-            return Ok(());
+        if can_delete(
+            &request.principal,
+            &self.resolved_owner(&bucket_acl),
+            &self.identity.default_owner,
+            dst_acl.owner.as_ref(),
+        ) {
+            Ok(())
+        } else {
+            Err(denied())
         }
-        Err(denied())
     }
 
     /// A bucket-resource gate: owner bypass, then grant evaluation over

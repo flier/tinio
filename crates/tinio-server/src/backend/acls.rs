@@ -87,7 +87,7 @@ fn single_source(
     headers: &GrantHeaders<'_>,
     policy: Option<&[dto::Grant]>,
 ) -> S3Result<()> {
-    let sources = canned.is_some() as u8 + headers_requested(headers) as u8 + policy.is_some() as u8;
+    let sources = canned.is_some() as u8 + headers.requested() as u8 + policy.is_some() as u8;
     match sources {
         0 => Err(s3_error!(
             InvalidArgument,
@@ -99,14 +99,6 @@ fn single_source(
             "a canned ACL, x-amz-grant-* headers and a policy body are mutually exclusive"
         )),
     }
-}
-
-fn headers_requested(headers: &GrantHeaders<'_>) -> bool {
-    headers.full_control.is_some()
-        || headers.read.is_some()
-        || headers.read_acp.is_some()
-        || headers.write.is_some()
-        || headers.write_acp.is_some()
 }
 
 /// The grant set of a `PutBucketAcl` request: exactly one of the canned
@@ -123,7 +115,7 @@ pub(crate) fn bucket_acl_grants(
     if let Some(canned) = canned {
         return canned_bucket_grants(owner, canned);
     }
-    if headers_requested(headers) {
+    if headers.requested() {
         return grants_from_headers(owner, headers);
     }
     grants_from_policy(policy.unwrap_or_default())
@@ -144,7 +136,7 @@ pub(crate) fn object_acl_grants(
     if let Some(canned) = canned {
         return canned_object_grants(owner, bucket_owner, canned);
     }
-    if headers_requested(headers) {
+    if headers.requested() {
         return grants_from_headers(owner, headers);
     }
     grants_from_policy(policy.unwrap_or_default())
@@ -292,42 +284,28 @@ pub(crate) fn grant_headers<'a>(
 
 /// The write-path ACL of an OBJECT surface (PutObject, CopyObject,
 /// CreateMultipartUpload): canned expansion or grant-header parse via
-/// [`expand_acl`] — the shared object-flavored composer (the
-/// `bucket-owner-*` names reference the bucket owner; canned + grant
-/// headers → 400; strict request-level validation). A write with
-/// neither header records the owner's private default — the write-path
-/// rule, NOT the put-ACL ops' exactly-one-source 400. The returned row
-/// is grants-only (`owner: None`); the caller passes the owner element
-/// separately.
+/// [`expand_acl`] with the bucket owner (`Some`) — the
+/// `bucket-owner-*` names reference it; canned + grant headers → 400;
+/// strict request-level validation. A write with neither header records
+/// the owner's private default — the write-path rule, NOT the put-ACL
+/// ops' exactly-one-source 400. The returned row is grants-only
+/// (`owner: None`); the caller passes the owner element separately.
 pub(crate) fn object_write_acl(
     owner: &OwnerId,
     bucket_owner: &OwnerId,
     canned: Option<&str>,
     headers: &GrantHeaders<'_>,
 ) -> S3Result<Acl> {
-    expand_acl(owner, bucket_owner, canned, *headers)
+    expand_acl(owner, Some(bucket_owner), canned, *headers)
 }
 
-/// The write-path ACL of a BUCKET surface (CreateBucket): like
-/// [`object_write_acl`], but composed through [`canned_bucket_grants`]
-/// DIRECTLY — [`expand_acl`] is object-flavored, and the
+/// The write-path ACL of a BUCKET surface (CreateBucket) — the
+/// [`expand_acl`] bucket flavor (`bucket_owner: None`): the
 /// `bucket-owner-*` names are ignored on buckets (private, per AWS).
 pub(crate) fn bucket_write_acl(
     owner: &OwnerId,
     canned: Option<&str>,
     headers: &GrantHeaders<'_>,
 ) -> S3Result<Acl> {
-    let grants = match canned {
-        Some(canned) => {
-            if headers_requested(headers) {
-                return Err(s3_error!(
-                    InvalidArgument,
-                    "cannot combine a canned ACL with x-amz-grant-* headers"
-                ));
-            }
-            canned_bucket_grants(owner, canned)?
-        }
-        None => grants_from_headers(owner, headers)?,
-    };
-    Ok(Acl { owner: None, grants })
+    expand_acl(owner, None, canned, *headers)
 }
