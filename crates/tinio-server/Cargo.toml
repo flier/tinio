@@ -31,6 +31,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 prometheus.workspace = true
 rayon = { workspace = true, optional = true }
 s3s.workspace = true
+secrecy.workspace = true
 thiserror.workspace = true
 thread-priority.workspace = true
 time.workspace = true
@@ -73,7 +74,6 @@ http.workspace = true
 http-body-util.workspace = true
 md-5.workspace = true
 predicates.workspace = true
-secrecy.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }

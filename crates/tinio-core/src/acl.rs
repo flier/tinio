@@ -72,6 +72,15 @@ pub fn default_owner_id() -> OwnerId {
     OwnerId::new(hex::encode(digest)).expect("sha256 hex is 64 lowercase hex digits")
 }
 
+/// `hex(SHA-256(access_key))` — the canonical ID for a `[[users]]` entry
+/// whose config omits one, and the user-test fixture basis. ONE home:
+/// tinio-config (the derived-ID uniqueness default) and the identity
+/// assembly (tinio-auth re-exports it) share the derivation.
+pub fn derive_canonical_id(access_key: &str) -> OwnerId {
+    let digest = Sha256::digest(access_key.as_bytes());
+    OwnerId::new(hex::encode(digest)).expect("sha256 hex is 64 lowercase hex digits")
+}
+
 /// The single-key delete/overwrite parity rule (spec review B2): `P ==
 /// O(object) or P == O(bucket)` — grants never satisfy it. The ONE home
 /// for the rule, shared by the server's handler-side per-key DeleteObjects
@@ -459,6 +468,16 @@ mod tests {
             "d16b7e8c0bb9728d01e3bf9c30940a32622195f821325af577a87bd6284ac306"
         );
         assert_eq!(DEFAULT_OWNER_DISPLAY_NAME, "tinio");
+    }
+
+    #[test]
+    fn derive_canonical_id_is_hex_sha256() {
+        // hex(SHA-256("AKID")) — pinned so the derivation (the [[users]]
+        // canonical-id default, one home here) cannot drift.
+        assert_eq!(
+            derive_canonical_id("AKID").as_str(),
+            "2c8a2a08ad81dddf7e7830cbc75310f731a1381431bb29afb55a76ee07e81721"
+        );
     }
 
     #[test]

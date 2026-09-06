@@ -6,17 +6,9 @@ use s3s::{
     auth::{Credentials, SecretKey},
     dto::Owner,
 };
-use sha2::{Digest, Sha256};
 
-pub use crate::_core::acl::ANONYMOUS_CANONICAL_ID;
+pub use crate::_core::acl::{ANONYMOUS_CANONICAL_ID, derive_canonical_id};
 use crate::_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, OwnerId, default_owner_id};
-
-/// `hex(SHA-256(access_key))` — the canonical ID for a user whose config
-/// omits one, and the test-fixture basis.
-pub fn derive_canonical_id(access_key: &str) -> OwnerId {
-    let digest = Sha256::digest(access_key.as_bytes());
-    OwnerId::new(hex::encode(digest)).expect("sha256 hex is 64 lowercase hex digits")
-}
 
 /// One configured SigV4 principal: the access key and secret, the
 /// canonical grant/owner ID, and the presentation display name.
@@ -115,15 +107,6 @@ mod tests {
 
     fn user1_canonical_id() -> OwnerId {
         derive_canonical_id("AKID")
-    }
-
-    #[test]
-    fn derive_canonical_id_is_hex_sha256() {
-        // hex(SHA-256("AKID")) — pinned so the derivation cannot drift.
-        assert_eq!(
-            user1_canonical_id().as_str(),
-            "2c8a2a08ad81dddf7e7830cbc75310f731a1381431bb29afb55a76ee07e81721"
-        );
     }
 
     #[test]

@@ -1,12 +1,19 @@
-use std::{collections::BTreeSet, fs::read_to_string, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::read_to_string,
+    path::Path,
+};
 
 use garde::Validate;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 use toml::Deserializer;
 
-use super::{api, auth, log, pipeline, s3, scanner, server, storage, telemetry};
-use crate::{Error, error};
+use super::{api, auth, log, owner, pipeline, s3, scanner, server, storage, telemetry, users};
+use crate::{
+    _core::acl::{OwnerId, derive_canonical_id},
+    Error, error,
+};
 
 /// Config format version (currently only `1`).
 ///
@@ -57,6 +64,7 @@ pub struct Version(
 /// assert!(!config.s3.as_ref().unwrap().capabilities.multipart);
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
+#[garde(custom(validate_owner_and_users))]
 pub struct Config {
     /// Config format version.
     #[serde(default)]
@@ -96,6 +104,15 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
     pub api: Option<api::Config>,
+    /// The root owner element (`[owner]`; absent = the core defaults
+    /// `hex(SHA-256("tinio"))` / `"tinio"`, no local mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(dive)]
+    pub owner: Option<owner::Config>,
+    /// Additional configured users (`[[users]]`; absent = root only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(dive)]
+    pub users: Option<Vec<users::Config>>,
     /// OpenTelemetry export (opt-in; requires the `otel` feature).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
@@ -149,6 +166,73 @@ impl Config {
     pub fn to_toml(&self) -> Result<String, Error> {
         toml::to_string(self).map_err(|e| error::parse(Path::new("(serialization)"), e.to_string()))
     }
+
+    /// The effective `[owner]` element: the configured section, or the
+    /// core defaults when absent (spec §6).
+    pub fn owner(&self) -> owner::Config {
+        self.owner.clone().unwrap_or_default()
+    }
+
+    /// The configured `[[users]]` entries (empty when absent).
+    pub fn users(&self) -> &[users::Config] {
+        self.users.as_deref().unwrap_or_default()
+    }
+}
+
+/// Spec §6 uniqueness rules: unique access keys and unique canonical IDs,
+/// with the root `[auth]` credential and the root `[owner]` element in the
+/// set — a user access key equal to the root credential would shadow it
+/// (the access-key map keys by access key), and a canonical ID equal to
+/// the root owner's would make the user root.
+fn validate_owner_and_users(config: &Config, _context: &()) -> garde::Result {
+    if let Some(auth) = &config.auth
+        && let Some((i, user)) = config
+            .users()
+            .iter()
+            .enumerate()
+            .find(|(_, user)| user.access_key == auth.access_key)
+    {
+        return Err(garde::Error::new(format!(
+            "users[{i}].access_key: duplicate access key `{}` — a configured user may not shadow the root [auth] credential",
+            user.access_key
+        )));
+    }
+    let mut first_index = BTreeMap::<&str, usize>::new();
+    for (i, user) in config.users().iter().enumerate() {
+        if let Some(first) = first_index.insert(user.access_key.as_str(), i) {
+            return Err(garde::Error::new(format!(
+                "users[{i}].access_key: duplicate access key `{}` (first at users[{first}])",
+                user.access_key
+            )));
+        }
+    }
+    // Invalid canonical IDs (the anon ID included) are the per-field
+    // rules' report — skip them here and let the dive surface the
+    // path-keyed error.
+    let Ok(owner_id) = OwnerId::new(config.owner().canonical_id.clone()) else {
+        return Ok(());
+    };
+    let mut first_index = BTreeMap::<String, usize>::new();
+    for (i, user) in config.users().iter().enumerate() {
+        let Ok(id) = (match &user.canonical_id {
+            Some(id) => OwnerId::new(id.clone()),
+            None => Ok(derive_canonical_id(&user.access_key)),
+        }) else {
+            continue;
+        };
+        let id_str = id.as_str();
+        if id == owner_id {
+            return Err(garde::Error::new(format!(
+                "users[{i}].canonical_id: duplicate canonical ID `{id_str}` — a user with the root [owner] element would become root"
+            )));
+        }
+        if let Some(first) = first_index.insert(id_str.to_string(), i) {
+            return Err(garde::Error::new(format!(
+                "users[{i}].canonical_id: duplicate canonical ID `{id_str}` (first at users[{first}])"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The ignored key paths as one comma-separated message — the `BTreeSet`
@@ -564,5 +648,104 @@ mod tests {
         assert!(AccessFormat::Combined.as_str().contains("$remote_addr"));
         assert!(AccessFormat::Common.as_str().contains("$body_bytes_sent"));
         assert_eq!(AccessFormat::Custom("$request".into()).as_str(), "$request");
+    }
+
+    #[test]
+    fn owner_and_users_accessors_return_defaults_when_absent() {
+        // Spec §6: the effective [owner] element is the core default when
+        // the section is absent; users is empty without [[users]].
+        let config = Config::parse("version = 1").unwrap();
+        assert_eq!(
+            config.owner().canonical_id,
+            "d16b7e8c0bb9728d01e3bf9c30940a32622195f821325af577a87bd6284ac306"
+        );
+        assert_eq!(config.owner().display_name, "tinio");
+        assert!(config.users().is_empty());
+    }
+
+    #[test]
+    fn owner_and_users_round_trip() {
+        let config = Config::parse(
+            "version = 1\n[owner]\ncanonical_id = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ndisplay_name = \"ops\"\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"sk\"\n",
+        )
+        .unwrap();
+        let again = Config::parse(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(config, again);
+    }
+
+    #[test]
+    fn users_reject_duplicate_access_keys_and_ids() {
+        // Spec §6: unique access keys and unique canonical IDs, the root
+        // [auth]/[owner] elements included — a collision makes one
+        // principal shadow (access key) or be (canonical ID) the other.
+        let err = Config::parse(
+            "version = 1\n[[users]]\naccess_key = \"ak\"\nsecret_key = \"sk\"\n[[users]]\naccess_key = \"ak\"\nsecret_key = \"sk2\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("duplicate access key"), "{err}");
+
+        // A user access key colliding with the root [auth] credential.
+        let err = Config::parse(
+            "version = 1\n[auth]\naccess_key = \"root\"\nsecret_key = \"sk-root\"\n[[users]]\naccess_key = \"root\"\nsecret_key = \"sk\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("duplicate access key"), "{err}");
+
+        // A user canonical ID colliding with another user's derived ID.
+        let err = Config::parse(
+            "version = 1\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"sk\"\n[[users]]\naccess_key = \"OTHER\"\nsecret_key = \"sk2\"\ncanonical_id = \"2c8a2a08ad81dddf7e7830cbc75310f731a1381431bb29afb55a76ee07e81721\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("duplicate canonical ID"), "{err}");
+
+        // A user canonical ID colliding with the root [owner] element.
+        let err = Config::parse(
+            "version = 1\n[[users]]\naccess_key = \"u\"\nsecret_key = \"sk\"\ncanonical_id = \"d16b7e8c0bb9728d01e3bf9c30940a32622195f821325af577a87bd6284ac306\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("duplicate canonical ID"), "{err}");
+    }
+
+    #[test]
+    fn owner_and_users_parse_local_uid() {
+        // Spec §6: local_uid maps a principal to an OS uid (unix-only; the
+        // Windows rejection is the cfg(windows) test below).
+        #[cfg(unix)]
+        {
+            let config = Config::parse(
+                "version = 1\n[owner]\nlocal_uid = 1000\n[[users]]\naccess_key = \"ak\"\nsecret_key = \"sk\"\nlocal_uid = 1001\n",
+            )
+            .unwrap();
+            assert_eq!(config.owner().local_uid, Some(1000));
+            assert_eq!(config.users()[0].local_uid, Some(1001));
+        }
+        // Unset → None everywhere.
+        let config = Config::parse(
+            "version = 1\n[owner]\n[[users]]\naccess_key = \"ak\"\nsecret_key = \"sk\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.owner().local_uid, None);
+        assert_eq!(config.users()[0].local_uid, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_uid_rejected_on_windows() {
+        // Spec §6: fail fast — Windows has no uid/chown mapping; any
+        // local_uid key is a validation error at parse.
+        let err = Config::parse("version = 1\n[owner]\nlocal_uid = 1000").unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("local_uid"), "{err}");
+        assert!(err.to_string().contains("Windows"), "{err}");
+        let err = Config::parse(
+            "version = 1\n[[users]]\naccess_key = \"ak\"\nsecret_key = \"sk\"\nlocal_uid = 1000\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        assert!(err.to_string().contains("local_uid"), "{err}");
     }
 }

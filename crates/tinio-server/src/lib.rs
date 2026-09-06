@@ -32,6 +32,7 @@ pub mod backend;
 
 mod data;
 mod error;
+pub mod identity;
 pub mod log;
 pub mod metrics;
 pub mod pipeline;

@@ -26,7 +26,8 @@ pub mod schema;
 pub mod sources;
 
 pub use schema::{
-    Config, Version, api, auth, log, pipeline, s3, scanner, server, storage, telemetry,
+    Config, Version, api, auth, log, owner, pipeline, s3, scanner, server, storage, telemetry,
+    users,
 };
 
 pub use self::error::Error;
