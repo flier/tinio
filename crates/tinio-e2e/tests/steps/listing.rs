@@ -3,6 +3,15 @@
 //! continuation-token pagination loop.
 
 use cucumber::{given, then, when};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// Unreserved + `/` left alone (list query values).
+const UNRESERVED_SLASH: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/');
 
 /// The last list request's parameters, for the pagination step to resume.
 #[derive(Debug, Clone, Default)]
@@ -68,9 +77,12 @@ fn list_v2_path(
     delimiter: Option<&str>,
     max_keys: Option<u64>,
 ) -> String {
-    let mut path = format!("/{bucket}?list-type=2&prefix={}", url_encode(prefix));
+    let mut path = format!(
+        "/{bucket}?list-type=2&prefix={}",
+        utf8_percent_encode(prefix, UNRESERVED_SLASH)
+    );
     if let Some(d) = delimiter {
-        path += &format!("&delimiter={}", url_encode(d));
+        path += &format!("&delimiter={}", utf8_percent_encode(d, UNRESERVED_SLASH));
     }
     if let Some(m) = max_keys {
         path += &format!("&max-keys={m}");
@@ -104,9 +116,9 @@ async fn do_list_v1(world: &mut super::World, key: &str, marker: &str, delimiter
     let (bucket, prefix) = split_key(key);
     let path = format!(
         "/{bucket}?prefix={}&marker={}&delimiter={}",
-        url_encode(&prefix),
-        url_encode(marker),
-        url_encode(delimiter)
+        utf8_percent_encode(&prefix, UNRESERVED_SLASH),
+        utf8_percent_encode(marker, UNRESERVED_SLASH),
+        utf8_percent_encode(delimiter, UNRESERVED_SLASH)
     );
     world.last = world.client.request("GET", &path, &[], &[]).await;
     world.last_listing = ListingState {
@@ -200,7 +212,10 @@ async fn truncated_resumes(world: &mut super::World) {
             !token.is_empty(),
             "truncated page without a continuation token"
         );
-        let path = format!("{base}&continuation-token={}", url_encode(&token));
+        let path = format!(
+            "{base}&continuation-token={}",
+            utf8_percent_encode(&token, UNRESERVED_SLASH)
+        );
         let resp = world.client.request("GET", &path, &[], &[]).await;
         pages.push(String::from_utf8_lossy(&resp.body).into_owned());
     }
@@ -241,21 +256,6 @@ fn collect_between(text: &str, open: &str, close: &str) -> Vec<String> {
         };
         out.push(rest[from..from + end_rel].to_string());
         rest = &rest[from + end_rel + close.len()..];
-    }
-    out
-}
-
-/// Percent-encode a query-string value (unreserved + `/` pass through) —
-/// ported verbatim from the old test.
-fn url_encode(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                out.push(b as char);
-            }
-            _ => out += &format!("%{b:02X}"),
-        }
     }
     out
 }

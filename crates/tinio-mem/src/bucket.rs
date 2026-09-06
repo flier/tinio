@@ -136,7 +136,7 @@ impl BucketOps for MemoryStorage {
     async fn put_bucket_tags(&self, name: &Name, tags: &object::Tags) -> Result<(), Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`).
-        if !self.rewrite_bucket_element(name, Some(&tags.to_wire()), None).await? {
+        if !self.rewrite_bucket_element(name, &tags.to_wire()).await? {
             return Err(no_such_bucket(name));
         }
         Ok(())
@@ -147,34 +147,37 @@ impl BucketOps for MemoryStorage {
         // contract's delete leniency, mirroring the fs backend's
         // row-only clear). A live row keeps its creation time and loses
         // its tags; a row-less bucket has nothing to clear.
-        self.rewrite_bucket_element(name, Some(""), None).await?;
+        self.rewrite_bucket_element(name, "").await?;
         Ok(())
     }
 
-    async fn get_bucket_cors(&self, name: &Name) -> Result<Option<cors::CorsConfig>, Error> {
+    async fn get_bucket_cors(&self, name: &Name) -> Result<Option<cors::Config>, Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`). The configuration comes from the
-        // row's CORS element, None when it is the `''` wire (a bucket
+        // table's CORS accessor, None when it is the `''` wire (a bucket
         // that was cleared or never configured) or domain-invalid
-        // (self-healing, the store's `decode_cors_wire`).
+        // (self-healing).
         self.db.read(|txn| {
-            let buckets = bucket::Table::open_readonly(txn)?;
-            let Some(row) = buckets.row(name.as_ref().as_str())? else {
-                return Err(no_such_bucket(name));
-            };
-            Ok(bucket::decode_cors_wire(&row.cors))
+            bucket::Table::open_readonly(txn)?
+                .cors(name.as_ref().as_str())?
+                .ok_or_else(|| no_such_bucket(name))
         })
     }
 
-    async fn put_bucket_cors(&self, name: &Name, config: &cors::CorsConfig) -> Result<(), Error> {
+    async fn put_bucket_cors(&self, name: &Name, config: &cors::Config) -> Result<(), Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`). A zero-rule config normalizes to the
         // `''` wire by the codec itself (op-review G2 — "no
         // configuration").
-        if !self.rewrite_bucket_element(name, None, Some(&config.to_wire())).await? {
-            return Err(no_such_bucket(name));
-        }
-        Ok(())
+        self.db.write(|txn| {
+            if bucket::Table::open(txn)?
+                .put_cors(name.as_ref().as_str(), config)?
+                .is_none()
+            {
+                return Err(no_such_bucket(name));
+            }
+            Ok(())
+        })
     }
 
     async fn delete_bucket_cors(&self, name: &Name) -> Result<(), Error> {
@@ -183,36 +186,35 @@ impl BucketOps for MemoryStorage {
         // CORS spec mandates `NoSuchBucket` for a missing bucket); a
         // bucket that simply has no configuration clears to the same
         // state (idempotent).
-        if !self.rewrite_bucket_element(name, None, Some("")).await? {
-            return Err(no_such_bucket(name));
-        }
-        Ok(())
+        self.db.write(|txn| {
+            if bucket::Table::open(txn)?
+                .clear_cors(name.as_ref().as_str())?
+                .is_none()
+            {
+                return Err(no_such_bucket(name));
+            }
+            Ok(())
+        })
     }
 }
 
 impl MemoryStorage {
-    /// The wire-element write transaction of the bucket trio — the shared
-    /// body of the tags and CORS put/delete operations: one
-    /// read-modify-write transaction replaces the tagged elements with
-    /// the given wires (`None` = keep the row's value verbatim) and sets
-    /// every other element verbatim. Returns whether the row existed (the
-    /// caller maps to the per-operation missing-bucket semantics).
-    async fn rewrite_bucket_element(
-        &self,
-        name: &Name,
-        tags_wire: Option<&str>,
-        cors_wire: Option<&str>,
-    ) -> Result<bool, Error> {
+    /// The tags-element write transaction: one read-modify-write
+    /// replaces the tags wire and keeps every other element verbatim.
+    /// Returns whether the row existed (the caller maps to the
+    /// per-operation missing-bucket semantics).
+    async fn rewrite_bucket_element(&self, name: &Name, tags_wire: &str) -> Result<bool, Error> {
         self.db.write(|txn| {
             let mut buckets = bucket::Table::open(txn)?;
             let Some(row) = buckets.row(name.as_ref().as_str())? else {
                 return Ok(false);
             };
-            let tags = tags_wire.map(str::to_string).unwrap_or(row.tags);
-            let cors = cors_wire.map(str::to_string).unwrap_or(row.cors);
             buckets.put_full(
                 name.as_ref().as_str(),
-                &bucket::BucketRow { tags, cors, ..row },
+                &bucket::BucketRow {
+                    tags: tags_wire.to_string(),
+                    ..row
+                },
             )?;
             Ok(true)
         })
@@ -404,9 +406,9 @@ mod tests {
             "an unconfigured bucket answers None"
         );
 
-        let config = cors::CorsConfig {
+        let config = cors::Config {
             rules: vec![
-                cors::CorsRule {
+                cors::Rule {
                     id: Some("one".into()),
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["*".into()],
@@ -414,7 +416,7 @@ mod tests {
                     expose_headers: Some(vec!["ETag".into()]),
                     max_age_seconds: Some(60),
                 },
-                cors::CorsRule {
+                cors::Rule {
                     id: None,
                     allowed_methods: vec!["PUT".into(), "DELETE".into()],
                     allowed_origins: vec!["https://example.com".into()],
@@ -444,7 +446,7 @@ mod tests {
         // op-review G2: a zero-rule config through the whole backend must
         // be indistinguishable from "no configuration".
         storage
-            .put_bucket_cors(&b, &cors::CorsConfig::default())
+            .put_bucket_cors(&b, &cors::Config::default())
             .await
             .unwrap();
         assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);

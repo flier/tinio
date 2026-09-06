@@ -7,7 +7,7 @@
 //! on any violation) — the storage codec's self-heal applies to rows,
 //! never input — and enforces the Content-MD5 header three-state.
 //! The browser preflight is a CUSTOM ROUTE on the data plane
-//! ([`CorsPreflightRoute`]): OPTIONS with Origin + Access-Control-Request-
+//! ([`PreflightRoute`]): OPTIONS with Origin + Access-Control-Request-
 //! Method is answered before s3s's op dispatch, anonymously (browsers
 //! cannot sign it), with the rule's allow-list and the echoed request.
 
@@ -20,10 +20,7 @@ use s3s::{Body, S3Error, S3Request, S3Response, S3Result, dto, route::S3Route, s
 use crate::{
     _core::{
         bucket,
-        cors::{
-            CORS_CONFIG_BYTES_MAX, CORS_METHODS, CORS_RULE_ID_MAX, CORS_RULES_MAX, CorsConfig,
-            CorsRule,
-        },
+        cors::{self, CORS_CONFIG_BYTES_MAX, CORS_METHODS, CORS_RULE_ID_MAX, CORS_RULES_MAX},
         storage::Storage,
     },
     backend::{S3Backend, map_backend_error},
@@ -43,7 +40,7 @@ impl<S: Storage> S3Backend<S> {
             .map_err(map_backend_error)?
         {
             Some(config) => Ok(S3Response::new(dto::GetBucketCorsOutput {
-                cors_rules: Some(cors_rules_to_dto(&config)),
+                cors_rules: Some(cors_rules_to_dto(config)),
             })),
             None => Err(s3_error!(
                 NoSuchCORSConfiguration,
@@ -59,7 +56,7 @@ impl<S: Storage> S3Backend<S> {
         Self::require_cap(self.caps.cors, "PutBucketCors")?;
         let bucket = self.bucket(req.input.bucket)?;
         validate_content_md5(req.input.content_md5.as_deref())?;
-        let config = cors_config_from_dto(&req.input.cors_configuration)?;
+        let config = cors_config_from_dto(req.input.cors_configuration)?;
         self.storage
             .put_bucket_cors(&bucket, &config)
             .await
@@ -86,34 +83,34 @@ impl<S: Storage> S3Backend<S> {
 /// `#[async_trait]` REQUIRED: a native async-fn-in-trait is not
 /// dyn-compatible on stable Rust (E0038); the same pattern the storage
 /// traits use. The erased method's call sites: the route resolves it
-/// statically (concrete `CorsConfigs`), the data-plane decoration
+/// statically (concrete `Configs`), the data-plane decoration
 /// dispatches through `dyn` (Task 10).
 #[async_trait::async_trait]
-pub(crate) trait CorsLookup: Send + Sync {
+pub(crate) trait Lookup: Send + Sync {
     /// The bucket's CORS configuration — `None` on ANY resolution
     /// failure (missing bucket, invalid name, codec self-heal), which the
     /// route maps to the single "CORS is not enabled" message (N1 — the
     /// existence-oracle closure).
-    async fn get(&self, bucket: &str) -> Option<CorsConfig>;
+    async fn get(&self, bucket: &str) -> Option<cors::Config>;
 }
 
-/// The `CorsLookup` adapter over the storage handle shared with the
+/// The `Lookup` adapter over the storage handle shared with the
 /// backend: `get` resolves through the contract's three-state accessor and
 /// keeps every non-resolution as `None` (callers never see the backend
 /// error — the route's denial is the only answer).
-pub(crate) struct CorsConfigs<S: Storage> {
+pub(crate) struct Configs<S: Storage> {
     storage: Arc<S>,
 }
 
-impl<S: Storage> CorsConfigs<S> {
+impl<S: Storage> Configs<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self { storage }
     }
 }
 
 #[async_trait::async_trait]
-impl<S: Storage> CorsLookup for CorsConfigs<S> {
-    async fn get(&self, bucket: &str) -> Option<CorsConfig> {
+impl<S: Storage> Lookup for Configs<S> {
+    async fn get(&self, bucket: &str) -> Option<cors::Config> {
         match bucket::name(bucket) {
             Ok(name) => self.storage.get_bucket_cors(&name).await.ok().flatten(),
             Err(_) => None,
@@ -126,14 +123,14 @@ impl<S: Storage> CorsLookup for CorsConfigs<S> {
 /// the rule's allow-list (Q9), the echoed request headers, and the
 /// `Vary` trio (Q4). Bare OPTIONS falls through to s3s (501, as today) —
 /// `is_match` decides what a preflight is. Holds the erased lookup — the
-/// same `Arc<dyn CorsLookup>` the data-plane decorator uses.
+/// same `Arc<dyn Lookup>` the data-plane decorator uses.
 #[derive(Clone)]
-pub(crate) struct CorsPreflightRoute {
-    configs: Arc<dyn CorsLookup>,
+pub(crate) struct PreflightRoute {
+    configs: Arc<dyn Lookup>,
 }
 
-impl CorsPreflightRoute {
-    pub fn new(configs: Arc<dyn CorsLookup>) -> Self {
+impl PreflightRoute {
+    pub fn new(configs: Arc<dyn Lookup>) -> Self {
         Self { configs }
     }
 }
@@ -169,7 +166,7 @@ fn cors_denied_err_at(message: &str) -> S3Error {
 }
 
 #[async_trait::async_trait]
-impl S3Route for CorsPreflightRoute {
+impl S3Route for PreflightRoute {
     fn is_match(
         &self,
         method: &Method,
@@ -205,7 +202,7 @@ impl S3Route for CorsPreflightRoute {
             .get(header::ACCESS_CONTROL_REQUEST_METHOD)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| cors_denied_err_at(CORS_DENIED_MISMATCH_MSG))?;
-        let requested_headers: Vec<String> = req
+        let requested_headers: Vec<&str> = req
             .headers
             .get_all(header::ACCESS_CONTROL_REQUEST_HEADERS)
             .iter()
@@ -213,7 +210,6 @@ impl S3Route for CorsPreflightRoute {
             .flat_map(|v| v.split(','))
             .map(str::trim)
             .filter(|h| !h.is_empty())
-            .map(str::to_string)
             .collect();
         // op-review C1 (precision): `prepare` validated the DECODED path
         // already — a bad name is a 400 before the route matches — while
@@ -230,7 +226,7 @@ impl S3Route for CorsPreflightRoute {
         };
 
         let mut resp = S3Response::new(Body::empty());
-        apply_cors_headers(&mut resp.headers, &matched.rule, &matched.origin);
+        apply_cors_headers(&mut resp.headers, matched.rule, matched.origin);
         // The request's own names (case/spelling verbatim — the codec
         // stores the request's values), echoed as one list.
         if !matched.requested_headers.is_empty() {
@@ -255,7 +251,7 @@ impl S3Route for CorsPreflightRoute {
 }
 
 /// Whether the rule's origins contain a bare `*` (grilling Q11).
-fn star_rule_origin(rule: &CorsRule) -> bool {
+fn star_rule_origin(rule: &cors::Rule) -> bool {
     rule.allowed_origins.iter().any(|o| o == "*")
 }
 
@@ -268,7 +264,7 @@ fn star_rule_origin(rule: &CorsRule) -> bool {
 /// present and non-empty), and the `Vary` trio APPENDED (Q4/G3 — merge,
 /// never replace). op-review S1: every value is constructed fallibly —
 /// a value that cannot be a header is SKIPPED, never unwrap/panicked.
-pub(crate) fn apply_cors_headers(headers: &mut HeaderMap, rule: &CorsRule, origin: &str) {
+pub(crate) fn apply_cors_headers(headers: &mut HeaderMap, rule: &cors::Rule, origin: &str) {
     // The literals are not request data — built once (`from_static` panics
     // only on an invalid literal; these are constants). Request/config data
     // passes `from_str`+skip.
@@ -342,7 +338,7 @@ fn has_control_bytes(s: &str) -> bool {
 /// Decoded config size in bytes (op-review P1 — bounds the per-Origin
 /// decode/scan amplification; the put body is otherwise limited only by
 /// s3s's 20 MB XML cap).
-fn config_bytes(config: &CorsConfig) -> usize {
+fn config_bytes(config: &cors::Config) -> usize {
     config
         .rules
         .iter()
@@ -363,8 +359,8 @@ fn config_bytes(config: &CorsConfig) -> usize {
 /// dto → core conversion with request-level validation (400 InvalidRequest on
 /// malformed configs; the storage codec's self-heal applies to rows, never
 /// input).
-fn cors_config_from_dto(xml: &dto::CORSConfiguration) -> S3Result<CorsConfig> {
-    let rules = &xml.cors_rules;
+fn cors_config_from_dto(xml: dto::CORSConfiguration) -> S3Result<cors::Config> {
+    let rules = xml.cors_rules;
     if rules.is_empty() {
         return Err(s3_error!(
             InvalidRequest,
@@ -377,95 +373,97 @@ fn cors_config_from_dto(xml: &dto::CORSConfiguration) -> S3Result<CorsConfig> {
             "The CORS configuration must have at most {CORS_RULES_MAX} rules"
         ));
     }
-    let mut out = Vec::with_capacity(rules.len());
-    for r in rules {
-        if let Some(id) = &r.id
-            && id.chars().count() > CORS_RULE_ID_MAX
-        {
-            return Err(s3_error!(
-                InvalidRequest,
-                "The rule ID must be at most {CORS_RULE_ID_MAX} characters"
-            ));
-        }
-        // F5: the dto Vecs are non-Option but can be EMPTY from an XML body
-        // with zero such elements — every rule must name ≥1 method and ≥1
-        // origin.
-        if r.allowed_methods.is_empty() {
-            return Err(s3_error!(
-                InvalidRequest,
-                "Each CORS rule must have at least one AllowedMethod"
-            ));
-        }
-        if r.allowed_origins.is_empty() {
-            return Err(s3_error!(
-                InvalidRequest,
-                "Each CORS rule must have at least one AllowedOrigin"
-            ));
-        }
-        for m in &r.allowed_methods {
-            if !CORS_METHODS.iter().any(|v| v.eq_ignore_ascii_case(m)) {
-                return Err(s3_error!(InvalidRequest, "Invalid AllowedMethod: {m}"));
-            }
-        }
-        // grilling Q6 = (b): ≤1 `*` per pattern; op-review S1: no control
-        // bytes; F1: no `,` in any list item (an unescaped `,` would split
-        // the 6-field wire record).
-        for (what, patterns) in [
-            ("AllowedOrigin", Some(&r.allowed_origins)),
-            ("AllowedHeader", r.allowed_headers.as_ref()),
-        ] {
-            if let Some(patterns) = patterns
-                && patterns.iter().any(|p| {
-                    p.bytes().filter(|b| *b == b'*').count() > 1
-                        || has_control_bytes(p)
-                        || p.contains(',')
-                })
+    let rules = rules
+        .into_iter()
+        .map(|r| {
+            if let Some(id) = &r.id
+                && id.chars().count() > CORS_RULE_ID_MAX
             {
                 return Err(s3_error!(
                     InvalidRequest,
-                    "Invalid {what} pattern in the CORS configuration"
+                    "The rule ID must be at most {CORS_RULE_ID_MAX} characters"
                 ));
             }
-        }
-        if let Some(expose) = &r.expose_headers
-            && expose
-                .iter()
-                .any(|e| has_control_bytes(e) || e.contains(','))
-        {
-            return Err(s3_error!(
-                InvalidRequest,
-                "Invalid ExposeHeader in the CORS configuration"
-            ));
-        }
-        if r.id
-            .as_ref()
-            .is_some_and(|id| has_control_bytes(id) || id.contains(','))
-        {
-            return Err(s3_error!(
-                InvalidRequest,
-                "Invalid rule ID in the CORS configuration"
-            ));
-        }
-        if r.max_age_seconds.is_some_and(|m| m < 0) {
-            return Err(s3_error!(
-                InvalidRequest,
-                "MaxAgeSeconds must be non-negative"
-            ));
-        }
-        out.push(CorsRule {
-            id: r.id.clone(),
-            allowed_methods: r
-                .allowed_methods
-                .iter()
-                .map(|m| m.to_ascii_uppercase())
-                .collect(),
-            allowed_origins: r.allowed_origins.clone(),
-            allowed_headers: r.allowed_headers.clone(),
-            expose_headers: r.expose_headers.clone(),
-            max_age_seconds: r.max_age_seconds,
-        });
-    }
-    let config = CorsConfig { rules: out };
+            // F5: the dto Vecs are non-Option but can be EMPTY from an XML body
+            // with zero such elements — every rule must name ≥1 method and ≥1
+            // origin.
+            if r.allowed_methods.is_empty() {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "Each CORS rule must have at least one AllowedMethod"
+                ));
+            }
+            if r.allowed_origins.is_empty() {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "Each CORS rule must have at least one AllowedOrigin"
+                ));
+            }
+            for m in &r.allowed_methods {
+                if !CORS_METHODS.iter().any(|v| v.eq_ignore_ascii_case(m)) {
+                    return Err(s3_error!(InvalidRequest, "Invalid AllowedMethod: {m}"));
+                }
+            }
+            // grilling Q6 = (b): ≤1 `*` per pattern; op-review S1: no control
+            // bytes; F1: no `,` in any list item (an unescaped `,` would split
+            // the 6-field wire record).
+            for (what, patterns) in [
+                ("AllowedOrigin", Some(&r.allowed_origins)),
+                ("AllowedHeader", r.allowed_headers.as_ref()),
+            ] {
+                if let Some(patterns) = patterns
+                    && patterns.iter().any(|p| {
+                        p.bytes().filter(|b| *b == b'*').count() > 1
+                            || has_control_bytes(p)
+                            || p.contains(',')
+                    })
+                {
+                    return Err(s3_error!(
+                        InvalidRequest,
+                        "Invalid {what} pattern in the CORS configuration"
+                    ));
+                }
+            }
+            if let Some(expose) = &r.expose_headers
+                && expose
+                    .iter()
+                    .any(|e| has_control_bytes(e) || e.contains(','))
+            {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "Invalid ExposeHeader in the CORS configuration"
+                ));
+            }
+            if r.id
+                .as_ref()
+                .is_some_and(|id| has_control_bytes(id) || id.contains(','))
+            {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "Invalid rule ID in the CORS configuration"
+                ));
+            }
+            if r.max_age_seconds.is_some_and(|m| m < 0) {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "MaxAgeSeconds must be non-negative"
+                ));
+            }
+            let mut allowed_methods = r.allowed_methods;
+            for m in &mut allowed_methods {
+                m.make_ascii_uppercase();
+            }
+            Ok(cors::Rule {
+                id: r.id,
+                allowed_methods,
+                allowed_origins: r.allowed_origins,
+                allowed_headers: r.allowed_headers,
+                expose_headers: r.expose_headers,
+                max_age_seconds: r.max_age_seconds,
+            })
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    let config = cors::Config { rules };
     if config_bytes(&config) > CORS_CONFIG_BYTES_MAX {
         return Err(s3_error!(
             InvalidRequest,
@@ -475,17 +473,17 @@ fn cors_config_from_dto(xml: &dto::CORSConfiguration) -> S3Result<CorsConfig> {
     Ok(config)
 }
 
-/// Core config into a dto `CorsRules` (GetBucketCors output).
-fn cors_rules_to_dto(config: &CorsConfig) -> dto::CORSRules {
+/// Core config into a dto `Rules` (GetBucketCors output).
+fn cors_rules_to_dto(config: cors::Config) -> dto::CORSRules {
     config
         .rules
-        .iter()
+        .into_iter()
         .map(|r| dto::CORSRule {
-            id: r.id.clone(),
-            allowed_methods: r.allowed_methods.clone(),
-            allowed_origins: r.allowed_origins.clone(),
-            allowed_headers: r.allowed_headers.clone(),
-            expose_headers: r.expose_headers.clone(),
+            id: r.id,
+            allowed_methods: r.allowed_methods,
+            allowed_origins: r.allowed_origins,
+            allowed_headers: r.allowed_headers,
+            expose_headers: r.expose_headers,
             max_age_seconds: r.max_age_seconds,
         })
         .collect()
@@ -499,15 +497,11 @@ mod tests {
     use s3s::{Body, S3, S3Request, dto, route::S3Route};
 
     use super::{
-        CORS_DENIED_MISMATCH_MSG, CORS_NO_CONFIG_MSG, CorsConfigs, CorsLookup,
-        CorsPreflightRoute, bucket_from_uri,
+        CORS_DENIED_MISMATCH_MSG, CORS_NO_CONFIG_MSG, Configs, Lookup, PreflightRoute,
+        bucket_from_uri,
     };
     use crate::{
-        _core::{
-            bucket,
-            cors::{CorsConfig, CorsRule},
-            storage::BucketOps,
-        },
+        _core::{bucket, cors, storage::BucketOps},
         _mem::MemoryStorage,
         backend::{
             Capabilities,
@@ -811,12 +805,12 @@ mod tests {
     /// The preflight route over a fresh MemoryStorage seeded with `config`
     /// for the bucket "data" (created first — mem's CORS trio answers
     /// NoSuchBucket for a missing row).
-    async fn test_route(config: CorsConfig) -> CorsPreflightRoute {
+    async fn test_route(config: cors::Config) -> PreflightRoute {
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         storage.put_bucket_cors(&name, &config).await.unwrap();
-        CorsPreflightRoute::new(Arc::new(CorsConfigs::new(storage)) as Arc<dyn CorsLookup>)
+        PreflightRoute::new(Arc::new(Configs::new(storage)) as Arc<dyn Lookup>)
     }
 
     /// A browser preflight: anonymous OPTIONS `<path>` with Origin +
@@ -854,8 +848,8 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_matches_allowed_origin_and_answers_headers() {
-        let route = test_route(CorsConfig {
-            rules: vec![CorsRule {
+        let route = test_route(cors::Config {
+            rules: vec![cors::Rule {
                 id: Some("allow-example".into()),
                 allowed_methods: vec!["GET".into(), "PUT".into()],
                 allowed_origins: vec!["https://example.com".into()],
@@ -920,8 +914,8 @@ mod tests {
     async fn preflight_bare_star_rule_answers_literal_star_without_credentials() {
         // grilling Q11: origin rule = "*" → ACAO literal "*", Allow-
         // Credentials OMITTED (the two are incompatible).
-        let route = test_route(CorsConfig {
-            rules: vec![CorsRule {
+        let route = test_route(cors::Config {
+            rules: vec![cors::Rule {
                 id: None,
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["*".into()],
@@ -952,8 +946,8 @@ mod tests {
     async fn preflight_disallowed_and_no_config_answer_403_with_aws_messages() {
         // grilling Q10: a rule mismatch → 403 AccessDenied with the
         // verbatim AWS message (the "evalution" typo is AWS's own).
-        let route = test_route(CorsConfig {
-            rules: vec![CorsRule {
+        let route = test_route(cors::Config {
+            rules: vec![cors::Rule {
                 id: None,
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["https://example.com".into()],
@@ -982,7 +976,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
-        let route = CorsPreflightRoute::new(Arc::new(CorsConfigs::new(storage)) as Arc<dyn CorsLookup>);
+        let route = PreflightRoute::new(Arc::new(Configs::new(storage)) as Arc<dyn Lookup>);
         let err = route
             .call(preflight_req(
                 "/data/key",
@@ -1000,12 +994,12 @@ mod tests {
     #[tokio::test]
     async fn preflight_missing_bucket_uses_the_same_no_config_message() {
         // N1 / existence-oracle closure: a well-formed but MISSING bucket
-        // resolves to `CorsConfigs::get → None` — the route answers the
+        // resolves to `Configs::get → None` — the route answers the
         // SAME "CORS is not enabled for this bucket." message as the
         // no-config case: a probe cannot distinguish "bucket exists, no
         // CORS" from "bucket missing".
         let storage = Arc::new(MemoryStorage::new().unwrap());
-        let route = CorsPreflightRoute::new(Arc::new(CorsConfigs::new(storage)) as Arc<dyn CorsLookup>);
+        let route = PreflightRoute::new(Arc::new(Configs::new(storage)) as Arc<dyn Lookup>);
         let err = route
             .call(preflight_req(
                 "/missing/key",
@@ -1024,8 +1018,8 @@ mod tests {
         // Ruling 1: preflight is anonymous by definition — browsers cannot
         // sign OPTIONS — the default `S3Route::check_access` ("Signature is
         // required") is overridden to Ok.
-        let route = test_route(CorsConfig {
-            rules: vec![CorsRule {
+        let route = test_route(cors::Config {
+            rules: vec![cors::Rule {
                 id: None,
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["*".into()],

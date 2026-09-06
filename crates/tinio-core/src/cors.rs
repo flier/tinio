@@ -3,9 +3,18 @@
 //!
 //! Rules are ORDER-PRESERVING and first-origin-match (AWS
 //! select-first-origin-rule semantics): the wire codec never sorts or dedupes
-//! rules, and [`CorsConfig::preflight`]/[`CorsConfig::rule_for`] select the
+//! rules, and [`Config::preflight`]/[`Config::rule_for`] select the
 //! first rule whose ORIGIN matches, then validate method (and, for preflight,
 //! headers) within that rule only — never falling through to a later rule.
+
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+
+/// RFC 3986 unreserved left alone for the CORS stored wire.
+const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// Maximum number of rules per configuration (AWS: 100).
 pub const CORS_RULES_MAX: usize = 100;
@@ -17,7 +26,7 @@ pub const CORS_CONFIG_BYTES_MAX: usize = 64 * 1024;
 pub const CORS_METHODS: [&str; 5] = ["GET", "PUT", "HEAD", "POST", "DELETE"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CorsRule {
+pub struct Rule {
     pub id: Option<String>,
     pub allowed_methods: Vec<String>,
     pub allowed_origins: Vec<String>,
@@ -26,7 +35,7 @@ pub struct CorsRule {
     pub max_age_seconds: Option<i32>,
 }
 
-impl CorsRule {
+impl Rule {
     /// Whether `origin` matches any allowed-origin pattern: exact match,
     /// a bare `*`, or a single `*` wildcard (e.g. `https://*.example.net`).
     pub fn origin_matches(&self, origin: &str) -> bool {
@@ -46,7 +55,7 @@ impl CorsRule {
     /// (`*`-wildcards; HTTP header names are case-insensitive) or, when
     /// no `allowed_headers` is set, none. No allocation — the comparison
     /// is byte-wise case-insensitive.
-    pub fn headers_allow(&self, requested: &[String]) -> bool {
+    pub fn headers_allow(&self, requested: &[&str]) -> bool {
         match &self.allowed_headers {
             None => requested.is_empty(),
             Some(patterns) => requested.iter().all(|h| {
@@ -59,46 +68,46 @@ impl CorsRule {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CorsConfig {
-    pub rules: Vec<CorsRule>,
+pub struct Config {
+    pub rules: Vec<Rule>,
 }
 
 /// A preflight decision: the winning rule plus the echoed request values.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreflightMatch {
-    pub rule: CorsRule,
-    pub origin: String,
-    pub method: String,
-    pub requested_headers: Vec<String>,
+pub struct PreflightMatch<'a> {
+    pub rule: &'a Rule,
+    pub origin: &'a str,
+    pub method: &'a str,
+    pub requested_headers: &'a [&'a str],
 }
 
-impl CorsConfig {
+impl Config {
     /// First-origin-match semantics (AWS select-first-rule): iterate rules in
     /// stored order, select the FIRST rule whose `origin` matches, then
     /// validate method AND headers WITHIN that rule only — a rule that
     /// matches origin but fails method/headers returns `None` (deny) and
     /// never falls through to a later rule (see the matching-rules note).
-    pub fn preflight(
-        &self,
-        origin: &str,
-        method: &str,
-        requested_headers: &[String],
-    ) -> Option<PreflightMatch> {
+    pub fn preflight<'a>(
+        &'a self,
+        origin: &'a str,
+        method: &'a str,
+        requested_headers: &'a [&'a str],
+    ) -> Option<PreflightMatch<'a>> {
         let rule = self
             .rule_for(origin, method)
             .filter(|r| r.headers_allow(requested_headers))?;
         Some(PreflightMatch {
-            rule: rule.clone(),
-            origin: origin.to_string(),
-            method: method.to_string(),
-            requested_headers: requested_headers.to_vec(),
+            rule,
+            origin,
+            method,
+            requested_headers,
         })
     }
 
     /// The decoration lookup for actual (non-OPTIONS) responses: the first
     /// origin-matching rule, then method validated within THAT rule only (no
     /// fall-through past an origin-match/method-mismatch rule).
-    pub fn rule_for(&self, origin: &str, method: &str) -> Option<&CorsRule> {
+    pub fn rule_for(&self, origin: &str, method: &str) -> Option<&Rule> {
         self.rules
             .iter()
             .find(|r| r.origin_matches(origin))
@@ -109,19 +118,24 @@ impl CorsConfig {
         self.rules
             .iter()
             .map(|r| {
-                let methods = encode(&r.allowed_methods.join(","));
-                let origins = encode(&r.allowed_origins.join(","));
+                let methods =
+                    utf8_percent_encode(&r.allowed_methods.join(","), UNRESERVED).to_string();
+                let origins =
+                    utf8_percent_encode(&r.allowed_origins.join(","), UNRESERVED).to_string();
                 let headers = r
                     .allowed_headers
                     .as_ref()
-                    .map(|v| encode(&v.join(",")))
+                    .map(|v| utf8_percent_encode(&v.join(","), UNRESERVED).to_string())
                     .unwrap_or_default();
                 let expose = r
                     .expose_headers
                     .as_ref()
-                    .map(|v| encode(&v.join(",")))
+                    .map(|v| utf8_percent_encode(&v.join(","), UNRESERVED).to_string())
                     .unwrap_or_default();
-                let id = r.id.as_deref().map(encode).unwrap_or_default();
+                let id =
+                    r.id.as_deref()
+                        .map(|s| utf8_percent_encode(s, UNRESERVED).to_string())
+                        .unwrap_or_default();
                 let max_age = r.max_age_seconds.map(|s| s.to_string()).unwrap_or_default();
                 [methods, origins, headers, expose, id, max_age].join(",")
             })
@@ -139,16 +153,28 @@ impl CorsConfig {
         let mut rules = Vec::new();
         for record in s.split('&').filter(|r| !r.is_empty()) {
             let mut it = record.splitn(6, ',');
-            let methods = decode(it.next()?)?;
-            let origins = decode(it.next()?)?;
-            let headers = decode(it.next()?)?;
-            let expose = decode(it.next()?)?;
-            let id = decode(it.next()?)?;
-            let max_age = decode(it.next()?)?;
+            let methods = percent_decode_str(it.next()?)
+                .decode_utf8_lossy()
+                .into_owned();
+            let origins = percent_decode_str(it.next()?)
+                .decode_utf8_lossy()
+                .into_owned();
+            let headers = percent_decode_str(it.next()?)
+                .decode_utf8_lossy()
+                .into_owned();
+            let expose = percent_decode_str(it.next()?)
+                .decode_utf8_lossy()
+                .into_owned();
+            let id = percent_decode_str(it.next()?)
+                .decode_utf8_lossy()
+                .into_owned();
+            let max_age = percent_decode_str(it.next()?)
+                .decode_utf8_lossy()
+                .into_owned();
             if rules.len() >= CORS_RULES_MAX {
                 return None;
             }
-            rules.push(CorsRule {
+            rules.push(Rule {
                 id: if id.is_empty() { None } else { Some(id) },
                 allowed_methods: split_list(&methods),
                 allowed_origins: split_list(&origins),
@@ -207,64 +233,12 @@ fn pattern_matches_ci(pattern: &[u8], value: &[u8]) -> bool {
     }
 }
 
-// Percent encode/decode. NOTE: the full unreserved-set rule here is
-// REQUIRED for the wire grammar (raw `,`/`&`/control bytes would
-// mis-frame the 6-field record or smuggle header values — op-review
-// C2/S1). The object.rs tags codec escapes only `% = & + space` and must
-// NOT be copied as-is; when the ACL plan lands `crate::percent`, its
-// encode must adopt this set (one-line coordination point).
-const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => {
-                out.push('%');
-                out.push(HEX[(b >> 4) as usize] as char);
-                out.push(HEX[(b & 0x0f) as usize] as char);
-            }
-        }
-    }
-    out
-}
-
-fn decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = hex(bytes.get(i + 1)?)?;
-            let lo = hex(bytes.get(i + 2)?)?;
-            out.push(hi << 4 | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn hex(b: &u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rule() -> CorsRule {
-        CorsRule {
+    fn rule() -> Rule {
+        Rule {
             id: Some("allow-example".into()),
             allowed_methods: vec!["GET".into(), "PUT".into()],
             allowed_origins: vec!["https://example.com".into(), "https://*.example.net".into()],
@@ -276,10 +250,10 @@ mod tests {
 
     #[test]
     fn wire_round_trip_preserves_order_and_fields() {
-        let cfg = CorsConfig {
+        let cfg = Config {
             rules: vec![
                 rule(),
-                CorsRule {
+                Rule {
                     id: None,
                     allowed_methods: vec!["DELETE".into()],
                     allowed_origins: vec!["*".into()],
@@ -290,16 +264,16 @@ mod tests {
             ],
         };
         let wire = cfg.to_wire();
-        let back = CorsConfig::from_wire(&wire);
+        let back = Config::from_wire(&wire);
         assert_eq!(back, cfg, "{wire}");
     }
 
     #[test]
     fn wire_keeps_rule_order_first_match_semantics() {
         // Rules must NOT be sorted or deduped — the wire preserves stored order.
-        let cfg = CorsConfig {
+        let cfg = Config {
             rules: vec![
-                CorsRule {
+                Rule {
                     id: None,
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["https://example.com".into()],
@@ -307,7 +281,7 @@ mod tests {
                     expose_headers: None,
                     max_age_seconds: None,
                 },
-                CorsRule {
+                Rule {
                     id: Some("second".into()),
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["*".into()],
@@ -317,26 +291,23 @@ mod tests {
                 },
             ],
         };
-        let back = CorsConfig::from_wire(&cfg.to_wire());
+        let back = Config::from_wire(&cfg.to_wire());
         assert_eq!(back.rules[0].id, None); // the tighter rule stayed first
         assert_eq!(back.rules[1].id.as_deref(), Some("second"));
     }
 
     #[test]
     fn wire_self_heals_to_empty_on_garbage() {
-        assert_eq!(CorsConfig::from_wire("garbage!%"), CorsConfig::default());
-        assert_eq!(CorsConfig::from_wire("a,b,c"), CorsConfig::default()); // wrong field count
-        assert_eq!(
-            CorsConfig::from_wire("a,b,*,*,*,abc"),
-            CorsConfig::default()
-        ); // bad max_age
-        assert_eq!(CorsConfig::from_wire(""), CorsConfig::default());
+        assert_eq!(Config::from_wire("garbage!%"), Config::default());
+        assert_eq!(Config::from_wire("a,b,c"), Config::default()); // wrong field count
+        assert_eq!(Config::from_wire("a,b,*,*,*,abc"), Config::default()); // bad max_age
+        assert_eq!(Config::from_wire(""), Config::default());
     }
 
     #[test]
     fn wire_escapes_field_separators_inside_values() {
-        let cfg = CorsConfig {
-            rules: vec![CorsRule {
+        let cfg = Config {
+            rules: vec![Rule {
                 id: Some("a&b,c;d".into()),
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["https://a.example.com/?x=1&y;z".into()],
@@ -348,15 +319,15 @@ mod tests {
         let wire = cfg.to_wire();
         assert!(!wire.contains("&,c"), "{wire}"); // the id's ',' must be encoded
         assert!(!wire.contains(';'), "{wire}"); // so must ';' — a tags-style narrow escape set would leak it raw
-        assert_eq!(CorsConfig::from_wire(&wire), cfg);
+        assert_eq!(Config::from_wire(&wire), cfg);
     }
 
     #[test]
     fn wire_round_trips_percent_in_value() {
         // The escape CHARACTER itself must round-trip (`%` → `%25`) —
         // the one byte the encode/decode pair never passes through raw.
-        let cfg = CorsConfig {
-            rules: vec![CorsRule {
+        let cfg = Config {
+            rules: vec![Rule {
                 id: Some("a%b".into()),
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["https://a.example.com/?x=%2F&y=1%".into()],
@@ -367,14 +338,16 @@ mod tests {
         };
         let wire = cfg.to_wire();
         assert!(wire.contains("%25"), "{wire}");
-        assert_eq!(CorsConfig::from_wire(&wire), cfg, "{wire}");
+        assert_eq!(Config::from_wire(&wire), cfg, "{wire}");
     }
 
     #[test]
     fn origin_matching_is_case_sensitive() {
         // Byte-exact origins (design §9): header NAMES are case-insensitive;
         // origins are not — the scheme host path must match exactly.
-        let cfg = CorsConfig { rules: vec![rule()] };
+        let cfg = Config {
+            rules: vec![rule()],
+        };
         assert!(cfg.preflight("https://example.com", "GET", &[]).is_some());
         assert!(
             cfg.preflight("https://EXAMPLE.com", "GET", &[]).is_none(),
@@ -387,8 +360,8 @@ mod tests {
         // op-review S1/C2: control bytes inside a value must be encoded away
         // (the tags codec's `% = & + space`-only escaping cannot do this —
         // the full unreserved-set rule is required by the wire grammar).
-        let cfg = CorsConfig {
-            rules: vec![CorsRule {
+        let cfg = Config {
+            rules: vec![Rule {
                 id: Some("id\t\r\nx".into()),
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["https://a.example.com".into()],
@@ -399,7 +372,7 @@ mod tests {
         };
         let wire = cfg.to_wire();
         assert_eq!(
-            CorsConfig::from_wire(&wire),
+            Config::from_wire(&wire),
             cfg,
             "control bytes must round-trip, {wire}"
         );
@@ -410,7 +383,7 @@ mod tests {
         // The put layer rejects >1 `*` (400); a stored row with one
         // (e.g. from a legacy/corrupt row) must never panic — and must
         // not match a plain value.
-        let rule = CorsRule {
+        let rule = Rule {
             id: None,
             allowed_methods: vec!["GET".into()],
             allowed_origins: vec!["a*b*c".into()],
@@ -424,7 +397,7 @@ mod tests {
     #[test]
     fn origin_patterns_exact_wildcard_and_dot_wildcard() {
         assert!(
-            CorsConfig {
+            Config {
                 rules: vec![rule()]
             }
             .preflight("https://a.example.net", "GET", &[])
@@ -432,14 +405,14 @@ mod tests {
             "https://*.example.net suffix match"
         );
         assert!(
-            CorsConfig {
+            Config {
                 rules: vec![rule()]
             }
             .preflight("https://example.com", "GET", &[])
             .is_some()
         );
         assert!(
-            CorsConfig {
+            Config {
                 rules: vec![rule()]
             }
             .preflight("https://example.net", "GET", &[])
@@ -447,8 +420,8 @@ mod tests {
             "bare '*.example.net' must not match the apex (no subdomain dot)"
         );
         assert!(
-            CorsConfig {
-                rules: vec![CorsRule {
+            Config {
+                rules: vec![Rule {
                     id: None,
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["*".into()],
@@ -465,15 +438,15 @@ mod tests {
 
     #[test]
     fn preflight_matches_first_rule_with_origin_method_and_headers() {
-        let cfg = CorsConfig {
+        let cfg = Config {
             rules: vec![rule()],
         };
         let hit = cfg
-            .preflight("https://example.com", "PUT", &["x-amz-foo".into()])
+            .preflight("https://example.com", "PUT", &["x-amz-foo"])
             .unwrap();
         assert_eq!(hit.origin, "https://example.com"); // echoed
         assert_eq!(hit.method, "PUT"); // echoed
-        assert_eq!(hit.requested_headers, vec!["x-amz-foo".to_string()]);
+        assert_eq!(hit.requested_headers, &["x-amz-foo"][..]);
         // method not allowed by any rule → no match
         assert!(
             cfg.preflight("https://example.com", "DELETE", &[])
@@ -481,21 +454,21 @@ mod tests {
         );
         // unknown header → no match; `*` header pattern → match
         assert!(
-            cfg.preflight("https://example.com", "GET", &["x-evil".into()])
+            cfg.preflight("https://example.com", "GET", &["x-evil"])
                 .is_none()
         );
         assert!(
-            cfg.preflight("https://example.com", "GET", &["x-amz-anything".into()])
+            cfg.preflight("https://example.com", "GET", &["x-amz-anything"])
                 .is_some()
         );
         // header matching is case-insensitive (HTTP header names)
         assert!(
-            cfg.preflight("https://example.com", "GET", &["X-AmZ-Foo".into()])
+            cfg.preflight("https://example.com", "GET", &["X-AmZ-Foo"])
                 .is_some()
         );
         // no AllowedHeaders = no headers allowed
-        let strict = CorsConfig {
-            rules: vec![CorsRule {
+        let strict = Config {
+            rules: vec![Rule {
                 id: None,
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["*".into()],
@@ -506,7 +479,7 @@ mod tests {
         };
         assert!(
             strict
-                .preflight("https://example.com", "GET", &["a".into()])
+                .preflight("https://example.com", "GET", &["a"])
                 .is_none()
         );
         assert!(
@@ -518,8 +491,8 @@ mod tests {
 
     #[test]
     fn rule_for_returns_first_origin_and_method_match() {
-        let cfg = CorsConfig {
-            rules: vec![CorsRule {
+        let cfg = Config {
+            rules: vec![Rule {
                 id: Some("who".into()),
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["*".into()],
@@ -549,9 +522,9 @@ mod tests {
         // First-origin-match (AWS): rule1 matches the origin but not the
         // method; rule2 matches everything. AWS DENIES — rule2 must NOT be
         // consulted once rule1 claims the origin.
-        let cfg = CorsConfig {
+        let cfg = Config {
             rules: vec![
-                CorsRule {
+                Rule {
                     id: Some("r1".into()),
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["https://example.com".into()],
@@ -559,7 +532,7 @@ mod tests {
                     expose_headers: None,
                     max_age_seconds: None,
                 },
-                CorsRule {
+                Rule {
                     id: Some("r2".into()),
                     allowed_methods: vec!["PUT".into()],
                     allowed_origins: vec!["*".into()],

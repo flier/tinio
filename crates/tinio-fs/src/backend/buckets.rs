@@ -221,10 +221,7 @@ impl BucketOps for FsStorage {
         self.bucket_store.clear_tags(name).await
     }
 
-    async fn get_bucket_cors(
-        &self,
-        name: &bucket::Name,
-    ) -> Result<Option<cors::CorsConfig>, Error> {
+    async fn get_bucket_cors(&self, name: &bucket::Name) -> Result<Option<cors::Config>, Error> {
         // Existence is the bucket directory (`NoSuchBucket` when missing —
         // mirroring `get_bucket_tags`); the configuration comes from the
         // `BUCKETS` row, None when the bucket has no configuration (`''`
@@ -233,11 +230,7 @@ impl BucketOps for FsStorage {
         self.bucket_store.cors(name).await
     }
 
-    async fn put_bucket_cors(
-        &self,
-        name: &bucket::Name,
-        cors: &cors::CorsConfig,
-    ) -> Result<(), Error> {
+    async fn put_bucket_cors(&self, name: &bucket::Name, cors: &cors::Config) -> Result<(), Error> {
         self.ensure_bucket(name).await?;
         self.bucket_store.set_cors(name, cors).await
     }
@@ -848,9 +841,9 @@ mod tests {
             "an unconfigured bucket answers None"
         );
 
-        let config = cors::CorsConfig {
+        let config = cors::Config {
             rules: vec![
-                cors::CorsRule {
+                cors::Rule {
                     id: Some("one".into()),
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["*".into()],
@@ -858,7 +851,7 @@ mod tests {
                     expose_headers: Some(vec!["ETag".into()]),
                     max_age_seconds: Some(60),
                 },
-                cors::CorsRule {
+                cors::Rule {
                     id: None,
                     allowed_methods: vec!["PUT".into(), "DELETE".into()],
                     allowed_origins: vec!["https://example.com".into()],
@@ -878,7 +871,7 @@ mod tests {
         // op-review G2: a zero-rule config through the whole backend must
         // be indistinguishable from "no configuration".
         storage
-            .put_bucket_cors(&b, &cors::CorsConfig::default())
+            .put_bucket_cors(&b, &cors::Config::default())
             .await
             .unwrap();
         assert_eq!(storage.get_bucket_cors(&b).await.unwrap(), None);

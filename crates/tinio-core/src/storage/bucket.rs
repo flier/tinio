@@ -5,8 +5,7 @@ use async_trait::async_trait;
 use super::Storage;
 use crate::{
     bucket::{self, Bucket},
-    cors,
-    object,
+    cors, object,
 };
 
 /// Parameters of a [`BucketOps::list_buckets`] call — the S3 listing
@@ -144,7 +143,7 @@ pub trait BucketOps: Send + Sync + 'static {
     async fn get_bucket_cors(
         &self,
         name: &bucket::Name,
-    ) -> Result<Option<cors::CorsConfig>, <Self as Storage>::Error>
+    ) -> Result<Option<cors::Config>, <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -155,7 +154,7 @@ pub trait BucketOps: Send + Sync + 'static {
     async fn put_bucket_cors(
         &self,
         name: &bucket::Name,
-        cors: &cors::CorsConfig,
+        cors: &cors::Config,
     ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;

@@ -11,13 +11,15 @@ use std::time::{Duration, SystemTime};
 use redb::{Database, TableDefinition};
 use tinio_core::{
     checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Value},
+    cors,
     etag::ETag,
     object::{self, Tags},
 };
 use tinio_store::{
     bucket::{self, BucketRow},
     ensure_all, meta, object_part, objects, part, part_checksum, part_data, part_meta, state,
-    store::Handle, upload, upload_checksum,
+    store::Handle,
+    upload, upload_checksum,
 };
 
 /// A ready store handle over a fresh in-memory redb database — the
@@ -125,6 +127,62 @@ fn bucket_iterates_in_name_order_and_remove_is_idempotent() {
         })
         .unwrap();
     assert_eq!(names, ["alpha", "zeta"]);
+}
+
+#[test]
+fn bucket_cors_accessors_round_trip_and_self_heal() {
+    let h = handle();
+    let now = SystemTime::UNIX_EPOCH;
+    let cfg = cors::Config {
+        rules: vec![cors::Rule {
+            id: Some("one".into()),
+            allowed_methods: vec!["GET".into()],
+            allowed_origins: vec!["*".into()],
+            allowed_headers: None,
+            expose_headers: None,
+            max_age_seconds: None,
+        }],
+    };
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = bucket::Table::open(txn)?;
+        // Missing row: outer None; writes are no-ops.
+        assert!(t.cors("data")?.is_none());
+        assert!(t.put_cors("data", &cfg)?.is_none());
+        assert!(t.clear_cors("data")?.is_none());
+        t.put("data", now)?;
+        // Fresh row: present, no configuration.
+        assert_eq!(t.cors("data")?, Some(None));
+        assert_eq!(t.put_cors("data", &cfg)?, Some(true));
+        assert_eq!(t.cors("data")?, Some(Some(cfg.clone())));
+        // Identical put skips the write.
+        assert_eq!(t.put_cors("data", &cfg)?, Some(false));
+        // Empty rules normalize to "no configuration".
+        assert_eq!(t.put_cors("data", &cors::Config::default())?, Some(true));
+        assert_eq!(t.cors("data")?, Some(None));
+        t.put_cors("data", &cfg)?;
+        assert_eq!(t.clear_cors("data")?, Some(true));
+        assert_eq!(t.cors("data")?, Some(None));
+        assert_eq!(t.clear_cors("data")?, Some(false));
+        Ok(())
+    })
+    .unwrap();
+    // A garbage CORS wire self-heals on the table accessor.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        bucket::Table::open(txn)?
+            .insert("data", (0u64, "", "", "", "a,b,c"))
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert_eq!(
+            bucket::Table::open_readonly(txn)?.cors("data")?,
+            Some(None),
+            "a corrupt CORS wire is no configuration"
+        );
+        Ok(())
+    })
+    .unwrap();
 }
 
 /// The on-disk format guard (final-review F2, no-migration ruling): a

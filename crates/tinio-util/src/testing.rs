@@ -52,8 +52,7 @@ use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
     ListPartsParams, ListUploadsParams, MultipartOps, Storage, bucket,
     checksum::{self, Algorithm, Type},
-    cors::{CorsConfig, CorsRule},
-    multipart, object, storage,
+    cors, multipart, object, storage,
     storage::Error::*,
 };
 
@@ -586,11 +585,11 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.delete_bucket_tags(&missing).await.unwrap(); // idempotent
 
     // Bucket CORS: put/get round-trip, re-put replaces, delete clears —
-    // with the zero-rule normalization (a `CorsConfig::default()` through
+    // with the zero-rule normalization (a `cors::Config::default()` through
     // the storage layer is "no config", op-review G2) and the
     // missing-bucket get semantics.
-    let config = CorsConfig {
-        rules: vec![CorsRule {
+    let config = cors::Config {
+        rules: vec![cors::Rule {
             id: Some("one".into()),
             allowed_methods: vec!["GET".into()],
             allowed_origins: vec!["*".into()],
@@ -605,7 +604,10 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
         got == Some(config.clone()),
         "bucket CORS config must round-trip",
     );
-    storage.put_bucket_cors(b, &CorsConfig::default()).await.unwrap();
+    storage
+        .put_bucket_cors(b, &cors::Config::default())
+        .await
+        .unwrap();
     let got = storage.get_bucket_cors(b).await.unwrap();
     check(
         got.is_none(),

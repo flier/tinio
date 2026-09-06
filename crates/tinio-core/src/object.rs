@@ -4,12 +4,16 @@ use std::{collections::BTreeMap, time::SystemTime};
 
 use derive_more::{AsRef, Deref, Display, Into};
 use garde::Error as GardeError;
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{
     ETag, checksum,
     storage::{self, Error::*},
 };
+
+/// Tagging wire: `%`, `=`, `&`, `+`, space (and C0 controls).
+const TAGS_WIRE: &AsciiSet = &CONTROLS.add(b' ').add(b'%').add(b'&').add(b'+').add(b'=');
 
 /// The reserved state-directory segment: never a bucket, never part of a
 /// key (FR-020). The fs backend's state dir is named after this constant.
@@ -240,7 +244,10 @@ impl Tags {
                     key: pair.to_string(),
                 });
             };
-            pairs.push((percent_decode(k), percent_decode(v)));
+            pairs.push((
+                percent_decode_str(k).decode_utf8_lossy().into_owned(),
+                percent_decode_str(v).decode_utf8_lossy().into_owned(),
+            ));
         }
         Self::from_pairs_limited(pairs, limit)
     }
@@ -254,9 +261,9 @@ impl Tags {
             if i > 0 {
                 out.push('&');
             }
-            out.push_str(&percent_encode(k));
+            out.push_str(&utf8_percent_encode(k, TAGS_WIRE).to_string());
             out.push('=');
-            out.push_str(&percent_encode(v));
+            out.push_str(&utf8_percent_encode(v, TAGS_WIRE).to_string());
         }
         out
     }
@@ -303,55 +310,6 @@ fn valid_key(s: &str) -> bool {
 /// A tag value: 0..=256 UTF-16 units (empty values are legal).
 fn valid_value(s: &str) -> bool {
     s.encode_utf16().count() <= 256 && valid_tag_part(s)
-}
-
-/// The hex digits of the wire `%XX` encoding (percent_encode's
-/// per-byte lookup).
-const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-
-/// Percent-encode the wire-reserved characters (`%`, `=`, `&`, `+`,
-/// space). Everything else — the Unicode charset included — passes
-/// through untouched.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '%' | '=' | '&' | '+' | ' ' => {
-                out.push('%');
-                out.push(HEX_DIGITS[(c as u32 >> 4) as usize] as char);
-                out.push(HEX_DIGITS[(c as u32 & 0xF) as usize] as char);
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Percent-decode `%XX` sequences (`+` stays literal). The two hex
-/// bytes are read as raw bytes — never sliced out of the `&str` — so a
-/// `%` followed by a raw non-ASCII char cannot hit a mid-char boundary
-/// and panic: the bytes fail UTF-8 or hex validation and the `%` passes
-/// through, leaving the charset check in `from_pairs` to reject the
-/// input.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|h| u8::from_str_radix(h, 16).ok());
-            if let Some(byte) = hex {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

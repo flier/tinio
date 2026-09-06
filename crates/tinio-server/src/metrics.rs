@@ -979,10 +979,12 @@ mod tests {
                 content_md5: None,
                 expected_bucket_owner: None,
             })));
-            let _ = rt.block_on(backend.delete_bucket_cors(request(dto::DeleteBucketCorsInput {
-                bucket: "b".into(),
-                expected_bucket_owner: None,
-            })));
+            let _ = rt.block_on(
+                backend.delete_bucket_cors(request(dto::DeleteBucketCorsInput {
+                    bucket: "b".into(),
+                    expected_bucket_owner: None,
+                })),
+            );
         }
         let expected: Vec<&str> = {
             let base = [

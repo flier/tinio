@@ -6,7 +6,7 @@
 use std::time::SystemTime;
 
 use redb::{ReadableTable, TableDefinition};
-use tinio_core::{cors::CorsConfig, from_nanos, to_nanos};
+use tinio_core::{cors, from_nanos, to_nanos};
 
 use crate::{
     error::Error,
@@ -30,7 +30,7 @@ pub type Table<'txn, T = redb::Table<'txn, <Def as TableDef>::Key, <Def as Table
 
 /// The stored bucket row, bundled so the wire elements are accessed by
 /// name. The redb VALUE stays the pinned 5-tuple — the conversion lives
-/// in [`BucketRow::from_value`]/[`BucketRow::to_value`], the only place
+/// in `BucketRow::from_value`/`BucketRow::to_value`, the only place
 /// that touches element positions (the arity/order pins in the store
 /// tests guard the tuple itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,13 +79,11 @@ impl BucketRow {
 /// Self-healing decode of the stored CORS wire: an empty or corrupt wire
 /// is "no configuration" (`None`; the `''` wire = 404 on get), a
 /// decodable wire is the config (`Some`). The G2 normalization stops
-/// here — callers never filter empty rule sets themselves.
-///
-/// Consumed by the store CORS accessors (`tinio-fs`/`tinio-mem` read
-/// paths, through the `_store::bucket` alias) — the encode half is
-/// [`CorsConfig::to_wire`].
-pub fn decode_cors_wire(wire: &str) -> Option<CorsConfig> {
-    let config = CorsConfig::from_wire(wire);
+/// here — callers never filter empty rule sets themselves. The encode
+/// half is [`cors::Config::to_wire`]; both ride [`Table::cors`] /
+/// [`Table::put_cors`].
+fn decode_cors_wire(wire: &str) -> Option<cors::Config> {
+    let config = cors::Config::from_wire(wire);
     (!config.rules.is_empty()).then_some(config)
 }
 
@@ -106,7 +104,10 @@ where
     /// The stored row of `name` (owned; the guard cannot outlive the
     /// closure).
     pub fn row(&self, name: &str) -> Result<Option<BucketRow>, Error> {
-        Ok(self.0.get(name)?.map(|guard| BucketRow::from_value(guard.value())))
+        Ok(self
+            .0
+            .get(name)?
+            .map(|guard| BucketRow::from_value(guard.value())))
     }
 
     /// Visit every recorded bucket in name order.
@@ -119,6 +120,13 @@ where
             visit(k.value(), from_nanos(v.value().0))?;
         }
         Ok(())
+    }
+
+    /// The stored CORS configuration of `name`. Outer `None` is a missing
+    /// row (the caller maps that to `NoSuchBucket` or "no configuration"
+    /// per backend); inner `None` is the `''`/corrupt wire (self-healing).
+    pub fn cors(&self, name: &str) -> Result<Option<Option<cors::Config>>, Error> {
+        Ok(self.row(name)?.map(|row| decode_cors_wire(&row.cors)))
     }
 }
 
@@ -156,5 +164,35 @@ impl<'txn> table::Table<'txn, Def> {
     pub fn remove(&mut self, name: &str) -> Result<(), Error> {
         self.0.remove(name)?;
         Ok(())
+    }
+
+    /// Replace the CORS configuration of `name` (empty rules → `''` wire
+    /// by the codec). `Ok(None)` = no row; `Ok(Some(false))` = identical
+    /// wire (no write); `Ok(Some(true))` = rewritten.
+    pub fn put_cors(&mut self, name: &str, config: &cors::Config) -> Result<Option<bool>, Error> {
+        self.rewrite_cors(name, &config.to_wire())
+    }
+
+    /// Clear the CORS configuration of `name` (`''` wire). Same
+    /// presence/change outcome as [`Self::put_cors`].
+    pub fn clear_cors(&mut self, name: &str) -> Result<Option<bool>, Error> {
+        self.rewrite_cors(name, "")
+    }
+
+    fn rewrite_cors(&mut self, name: &str, wire: &str) -> Result<Option<bool>, Error> {
+        let Some(row) = self.row(name)? else {
+            return Ok(None);
+        };
+        if row.cors == wire {
+            return Ok(Some(false));
+        }
+        self.put_full(
+            name,
+            &BucketRow {
+                cors: wire.to_string(),
+                ..row
+            },
+        )?;
+        Ok(Some(true))
     }
 }

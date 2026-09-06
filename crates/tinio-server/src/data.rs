@@ -52,9 +52,7 @@ use tower::Service as TowerService;
 use tracing::Level;
 
 #[cfg(feature = "cors")]
-use crate::backend::cors::{
-    apply_cors_headers, bucket_from_uri, CorsConfigs, CorsLookup, CorsPreflightRoute,
-};
+use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
 use crate::{
     _core::storage::Storage,
     backend::{Capabilities, S3Backend},
@@ -122,7 +120,7 @@ impl DataPlane {
             // on the service either way (None with the capability off — no
             // route, no decoration).
             if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
-                builder.set_route(CorsPreflightRoute::new(Arc::clone(&lookup)));
+                builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
             Self::from_service(builder.build(), None)
@@ -154,7 +152,7 @@ impl DataPlane {
         #[cfg(feature = "cors")]
         {
             if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
-                builder.set_route(CorsPreflightRoute::new(Arc::clone(&lookup)));
+                builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
             Self::from_service(builder.build(), None)
@@ -169,9 +167,9 @@ impl DataPlane {
     fn cors_lookup<S: Storage>(
         storage: &Arc<S>,
         caps: &Capabilities,
-    ) -> Option<Arc<dyn CorsLookup>> {
-        let configs = Arc::new(CorsConfigs::new(Arc::clone(storage)));
-        caps.cors.then_some(configs as Arc<dyn CorsLookup>)
+    ) -> Option<Arc<dyn cors::Lookup>> {
+        let configs = Arc::new(cors::Configs::new(Arc::clone(storage)));
+        caps.cors.then_some(configs as Arc<dyn cors::Lookup>)
     }
 
     /// Attach the scrape-time metrics refresh (F10): the `/metrics`
@@ -187,7 +185,7 @@ impl DataPlane {
     }
 
     #[cfg(feature = "cors")]
-    fn from_service(service: S3Service, cors: Option<Arc<dyn CorsLookup>>) -> Self {
+    fn from_service(service: S3Service, cors: Option<Arc<dyn cors::Lookup>>) -> Self {
         Self {
             service: Arc::new(DataPlaneService::new(service, cors)),
         }
@@ -302,7 +300,7 @@ pub struct DataPlaneService {
     /// when the preflight route is not armed) — read by the Task-10
     /// decoration on every non-preflight response.
     #[cfg(feature = "cors")]
-    cors: Option<Arc<dyn CorsLookup>>,
+    cors: Option<Arc<dyn cors::Lookup>>,
 }
 
 /// Decrements `HTTP_IN_FLIGHT` when dropped — on request completion and
@@ -318,7 +316,7 @@ impl Drop for InFlightGauge {
 
 impl DataPlaneService {
     #[cfg(feature = "cors")]
-    fn new(inner: S3Service, cors: Option<Arc<dyn CorsLookup>>) -> Self {
+    fn new(inner: S3Service, cors: Option<Arc<dyn cors::Lookup>>) -> Self {
         Self {
             inner,
             metrics: Arc::new(|| {}),
@@ -639,11 +637,11 @@ mod tests {
     };
 
     use super::*;
+    #[cfg(feature = "cors")]
+    use crate::_core::cors;
     use crate::{
         _core::{
-            bucket,
-            cors::{CorsConfig, CorsRule},
-            object,
+            bucket, object,
             pipeline::Stats,
             storage::{BucketOps, ObjectOps},
         },
@@ -964,6 +962,7 @@ mod tests {
         shutdown.send(true).unwrap();
     }
 
+    #[cfg(feature = "cors")]
     #[tokio::test]
     async fn options_preflight_answered_on_the_plane() {
         // The preflight route on the real data plane: seed the mem storage
@@ -978,8 +977,8 @@ mod tests {
         storage
             .put_bucket_cors(
                 &name,
-                &CorsConfig {
-                    rules: vec![CorsRule {
+                &cors::Config {
+                    rules: vec![cors::Rule {
                         id: Some("allow".into()),
                         allowed_methods: vec!["PUT".into()],
                         allowed_origins: vec!["https://example.com".into()],
@@ -1049,8 +1048,9 @@ mod tests {
     /// A plane over a fresh MemoryStorage seeded with the bucket "data"
     /// (plus the object "key" carrying "payload") and the CORS config,
     /// served on an ephemeral port with the cors capability on.
+    #[cfg(feature = "cors")]
     async fn seeded_cors_plane(
-        config: CorsConfig,
+        config: cors::Config,
     ) -> (SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
@@ -1072,6 +1072,7 @@ mod tests {
         (addr, shutdown, handle)
     }
 
+    #[cfg(feature = "cors")]
     #[tokio::test]
     async fn get_with_matching_origin_is_decorated() {
         // The first plane's config is ONE concrete rule (GET +
@@ -1079,8 +1080,8 @@ mod tests {
         // full header set, a foreign origin and a no-Origin request see
         // NONE, and a 404 (missing object) is still decorated (s3s encodes
         // op errors as Ok(Response) bodies — matches AWS).
-        let (addr, shutdown, handle) = seeded_cors_plane(CorsConfig {
-            rules: vec![CorsRule {
+        let (addr, shutdown, handle) = seeded_cors_plane(cors::Config {
+            rules: vec![cors::Rule {
                 id: Some("allow-example".into()),
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["https://example.com".into()],
@@ -1160,8 +1161,8 @@ mod tests {
 
         // Q11: a bare-"*"-origin rule decorates with ACAO "*" and OMITS
         // Allow-Credentials.
-        let (addr, shutdown, handle) = seeded_cors_plane(CorsConfig {
-            rules: vec![CorsRule {
+        let (addr, shutdown, handle) = seeded_cors_plane(cors::Config {
+            rules: vec![cors::Rule {
                 id: None,
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["*".into()],
@@ -1184,6 +1185,7 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[cfg(feature = "cors")]
     #[tokio::test]
     async fn get_with_origin_match_but_method_mismatch_is_not_decorated() {
         // B5/S3 pin — first-origin-match applies to the DECORATION too:
@@ -1191,9 +1193,9 @@ mod tests {
         // origin must NOT be decorated — rule1's origin matches, its
         // method check fails, and the decorator never falls through to
         // rule2 (which allows PUT for "*").
-        let (addr, shutdown, handle) = seeded_cors_plane(CorsConfig {
+        let (addr, shutdown, handle) = seeded_cors_plane(cors::Config {
             rules: vec![
-                CorsRule {
+                cors::Rule {
                     id: Some("r1".into()),
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["https://example.com".into()],
@@ -1201,7 +1203,7 @@ mod tests {
                     expose_headers: None,
                     max_age_seconds: None,
                 },
-                CorsRule {
+                cors::Rule {
                     id: Some("r2".into()),
                     allowed_methods: vec!["PUT".into()],
                     allowed_origins: vec!["*".into()],

@@ -157,16 +157,12 @@ impl Store {
     /// The bucket's CORS configuration, in stored order — `None` when
     /// the bucket has no CORS configuration: no state record (a bucket
     /// never seen through the API), the `''` wire (the cleared or
-    /// zero-rule state), or a corrupt wire (self-healing, like the store
-    /// [`bucket::decode_cors_wire`]).
-    pub async fn cors(&self, name: &Name) -> Result<Option<cors::CorsConfig>, Error> {
+    /// zero-rule state), or a corrupt wire (self-healing, the table's
+    /// CORS accessor).
+    pub async fn cors(&self, name: &Name) -> Result<Option<cors::Config>, Error> {
         let name = name.clone();
         self.handle
-            .read(move |txn| {
-                let table = bucket::Table::open_readonly(txn)?;
-                let row = table.row(&name)?;
-                Ok(row.and_then(|row| bucket::decode_cors_wire(&row.cors)))
-            })
+            .read(move |txn| Ok(bucket::Table::open_readonly(txn)?.cors(&name)?.flatten()))
             .map_err(Into::into)
     }
 
@@ -175,45 +171,38 @@ impl Store {
     /// without a state record answers `NoSuchBucket`. The empty rule set
     /// normalizes to the `''` wire by the codec itself (op-review G2 — a
     /// zero-rule config is "no configuration", never a non-empty row).
-    pub async fn set_cors(&self, name: &Name, config: &cors::CorsConfig) -> Result<(), Error> {
-        self.rewrite_cors(name, &config.to_wire()).await
+    pub async fn set_cors(&self, name: &Name, config: &cors::Config) -> Result<(), Error> {
+        self.rewrite_cors(name, Some(config.clone())).await
     }
 
     /// Remove the bucket's CORS configuration, preserving the creation
     /// time and the other wire elements (`''` = "no configuration").
     /// A bucket without a state record answers `NoSuchBucket`.
     pub async fn clear_cors(&self, name: &Name) -> Result<(), Error> {
-        self.rewrite_cors(name, "").await
+        self.rewrite_cors(name, None).await
     }
 
-    /// The shared CORS row rewrite: set or clear the CORS wire,
-    /// preserving the other elements. An identical wire is a clean no-op
-    /// (`write_if`'s `Ok(None)` abort — no commit, no fsync).
-    /// `None` cuts two ways: the unchanged-wire abort and the row-miss
-    /// (`NoSuchBucket`) — one read breaks the tie (the write_if
-    /// closure's error type is the database error, not the storage
-    /// error, so the miss cannot ride the `Err` arm).
-    async fn rewrite_cors(&self, name: &Name, wire: &str) -> Result<(), Error> {
+    /// The shared CORS row rewrite: set or clear through the table
+    /// accessors, preserving the other elements. An identical wire is a
+    /// clean no-op (`write_if`'s `Ok(None)` abort — no commit, no
+    /// fsync). `None` cuts two ways: the unchanged-wire abort and the
+    /// row-miss (`NoSuchBucket`) — one read breaks the tie (the
+    /// write_if closure's error type is the database error, not the
+    /// storage error, so the miss cannot ride the `Err` arm).
+    async fn rewrite_cors(&self, name: &Name, config: Option<cors::Config>) -> Result<(), Error> {
         let row_name = name.clone();
-        let wire = wire.to_string();
         let changed = self
             .handle
             .write_if(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let Some(row) = table.row(&row_name)? else {
-                    return Ok(None);
+                let outcome = match &config {
+                    Some(config) => table.put_cors(&row_name, config)?,
+                    None => table.clear_cors(&row_name)?,
                 };
-                if wire == row.cors {
-                    return Ok(None);
-                }
-                table.put_full(
-                    &row_name,
-                    &bucket::BucketRow {
-                        cors: wire,
-                        ..row
-                    },
-                )?;
-                Ok(Some(()))
+                Ok(match outcome {
+                    Some(true) => Some(()),
+                    _ => None,
+                })
             })
             .await?
             .is_some();
@@ -420,9 +409,9 @@ mod tests {
             None,
             "an unconfigured bucket answers None"
         );
-        let cfg = cors::CorsConfig {
+        let cfg = cors::Config {
             rules: vec![
-                cors::CorsRule {
+                cors::Rule {
                     id: Some("one".into()),
                     allowed_methods: vec!["GET".into()],
                     allowed_origins: vec!["*".into()],
@@ -430,7 +419,7 @@ mod tests {
                     expose_headers: Some(vec!["ETag".into()]),
                     max_age_seconds: Some(60),
                 },
-                cors::CorsRule {
+                cors::Rule {
                     id: None,
                     allowed_methods: vec!["PUT".into(), "DELETE".into()],
                     allowed_origins: vec!["https://example.com".into()],
@@ -457,7 +446,7 @@ mod tests {
         let name = bucket::name("data").unwrap();
         store.record(&name, t(100)).await.unwrap();
         store
-            .set_cors(&name, &cors::CorsConfig::default())
+            .set_cors(&name, &cors::Config::default())
             .await
             .unwrap();
         assert_eq!(store.cors(&name).await.unwrap(), None);
@@ -474,8 +463,8 @@ mod tests {
         let name = bucket::name("data").unwrap();
         store.record(&name, t(100)).await.unwrap();
         store.remove(&name).await.unwrap();
-        let cfg = cors::CorsConfig {
-            rules: vec![cors::CorsRule {
+        let cfg = cors::Config {
+            rules: vec![cors::Rule {
                 id: None,
                 allowed_methods: vec!["GET".into()],
                 allowed_origins: vec!["*".into()],
