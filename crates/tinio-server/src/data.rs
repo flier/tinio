@@ -53,6 +53,8 @@ use tracing::Level;
 
 #[cfg(feature = "cors")]
 use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
+#[cfg(feature = "acl")]
+use crate::_auth::{AclAccess, ConfigAuth, Identity};
 use crate::{
     _core::storage::Storage,
     backend::{Capabilities, S3Backend},
@@ -170,6 +172,42 @@ impl DataPlane {
     ) -> Option<Arc<dyn cors::Lookup>> {
         let configs = Arc::new(cors::Configs::new(Arc::clone(storage)));
         caps.cors.then_some(configs as Arc<dyn cors::Lookup>)
+    }
+
+    /// Build the data plane with the identity-backed authn/authz stack
+    /// (feature `acl`): [`ConfigAuth`] serves the configured users'
+    /// secrets, [`AclAccess`] runs the pre-route authorization pipeline.
+    /// `DataPlane::new` (legacy) and `new_with_auth` remain feature-off
+    /// constructions — no identity, no enforced behavior.
+    ///
+    /// The enforced-mode condition: `new_with_acl` is selected exactly
+    /// when the feature is compiled on AND `caps.acl` runs — the same
+    /// condition that gates every handler-side enforced check (Tasks
+    /// 10-12), so a wired identity never exists without `AclAccess`.
+    #[cfg(feature = "acl")]
+    pub fn new_with_acl<S: Storage>(
+        storage: S,
+        caps: Capabilities,
+        identity: Arc<Identity>,
+    ) -> Self {
+        let storage = Arc::new(storage);
+        let backend = MetricS3::new(
+            S3Backend::new_shared(Arc::clone(&storage), caps)
+                .with_identity(Arc::clone(&identity)),
+        );
+        let mut builder = S3ServiceBuilder::new(backend);
+        builder.set_auth(ConfigAuth::new(Arc::clone(&identity)));
+        builder.set_access(AclAccess::new(Arc::clone(&storage), identity));
+        #[cfg(feature = "cors")]
+        {
+            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
+                builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
+                return Self::from_service(builder.build(), Some(lookup));
+            }
+            Self::from_service(builder.build(), None)
+        }
+        #[cfg(not(feature = "cors"))]
+        Self::from_service(builder.build())
     }
 
     /// Attach the scrape-time metrics refresh (F10): the `/metrics`
@@ -973,7 +1011,10 @@ mod tests {
         // through to s3s: 501 unknown operation (the old behavior).
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage
+            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .put_bucket_cors(
                 &name,
@@ -1054,7 +1095,10 @@ mod tests {
     ) -> (SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage
+            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .put_object(&name, &object::key("key").unwrap(), body(b"payload"))
             .await
@@ -1253,6 +1297,270 @@ mod tests {
         assert!(text.contains("access-control-allow-methods: put"), "{text}");
         shutdown.send(true).unwrap();
         handle.await.unwrap();
+    }
+
+    #[cfg(feature = "acl")]
+    mod acl {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use futures::stream;
+        use sha2::{Digest, Sha256};
+        use time::OffsetDateTime;
+
+        use super::*;
+        use crate::{
+            _auth::identity::{Identity, User},
+            _core::{
+                acl::{Acl, GROUP_ALL_USERS, Grant, Grantee, GroupUri, OwnerId, Permission},
+                bucket,
+                object,
+                storage::{BucketOps, ObjectOps},
+            },
+            _mem::MemoryStorage,
+        };
+
+        /// RFC 2104 HMAC-SHA256 (SigV4's derivation needs it; the test
+        /// signer skips dedicating the `hmac` crate).
+        fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+            let mut key_vec = key.to_vec();
+            if key_vec.len() > 64 {
+                key_vec = Sha256::digest(&key_vec).to_vec();
+            }
+            key_vec.resize(64, 0);
+            let mut inner = Vec::with_capacity(64);
+            let mut outer = Vec::with_capacity(64);
+            for byte in &key_vec {
+                inner.push(byte ^ 0x36);
+                outer.push(byte ^ 0x5c);
+            }
+            let inner_hash = Sha256::digest([inner.as_slice(), data].concat());
+            Sha256::digest([outer.as_slice(), inner_hash.as_slice()].concat()).into()
+        }
+
+        /// An `AuthorizationV4` header over an empty-body request
+        /// (S3-specific: `x-amz-content-sha256` is required and computes
+        /// over the payload). Mirrors the canonicalization s3s verifies
+        /// in `ops/signature.rs`.
+        fn authorization(
+            access_key: &str,
+            secret: &str,
+            method: &str,
+            path: &str,
+            host: &str,
+            date8: &str,
+            amz_date: &str,
+            payload_hash: &str,
+        ) -> String {
+            let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+            let canonical_request = format!(
+                "{method}\n{path}\n\nhost:{host}\n\
+                 x-amz-content-sha256:{payload_hash}\n\
+                 x-amz-date:{amz_date}\n\n\
+                 {signed_headers}\n\
+                 {payload_hash}"
+            );
+            let string_to_sign = format!(
+                "AWS4-HMAC-SHA256\n{amz_date}\n{date8}/us-east-1/s3/aws4_request\n{}",
+                hex::encode(Sha256::digest(canonical_request.as_bytes()))
+            );
+            let mut key = b"AWS4".to_vec();
+            key.extend_from_slice(secret.as_bytes());
+            for part in [date8.as_bytes(), b"us-east-1", b"s3", b"aws4_request"] {
+                key = hmac_sha256(&key, part).to_vec();
+            }
+            let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key}/{date8}/us-east-1/s3/aws4_request, \
+                 SignedHeaders={signed_headers}, Signature={signature}"
+            )
+        }
+
+        /// A signed raw request (header-auth SigV4, empty body).
+        async fn signed_raw_request(
+            addr: SocketAddr,
+            method: &str,
+            path: &str,
+            access_key: &str,
+            secret: &str,
+        ) -> (u16, Vec<u8>) {
+            let now = OffsetDateTime::now_utc();
+            let date8 = format!(
+                "{:04}{:02}{:02}",
+                now.year(),
+                u8::from(now.month()),
+                now.day()
+            );
+            let amz_date = format!(
+                "{date8}T{:02}{:02}{:02}Z",
+                now.hour(),
+                now.minute(),
+                now.second()
+            );
+            let payload_hash = hex::encode(Sha256::digest(b""));
+            let host = "localhost";
+            let auth = authorization(
+                access_key,
+                secret,
+                method,
+                path,
+                host,
+                &date8,
+                &amz_date,
+                &payload_hash,
+            );
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: {host}\r\n\
+                 x-amz-date: {amz_date}\r\n\
+                 x-amz-content-sha256: {payload_hash}\r\n\
+                 Authorization: {auth}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            raw_request(addr, &request).await
+        }
+
+        /// The two-user fixture: alice (the owner) and bob (the grantee).
+        fn identity_pair() -> (Identity, OwnerId, OwnerId) {
+            let alice_id = crate::_auth::derive_canonical_id("AKID");
+            let bob_id = crate::_auth::derive_canonical_id("BKID");
+            (
+                Identity::test(vec![
+                    User::test("AKID", "alice-secret", "alice"),
+                    User::test("BKID", "bob-secret", "bob"),
+                ]),
+                alice_id,
+                bob_id,
+            )
+        }
+
+        /// One 4-byte body object in the fixture bucket.
+        async fn put(storage: &MemoryStorage, key: &str, owner: &OwnerId, acl: &Acl) {
+            let b = bucket::name("data").unwrap();
+            let k = object::key(key).unwrap();
+            let staged = storage
+                .stage_body(
+                    &b,
+                    &k,
+                    Box::pin(stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(
+                        b"data",
+                    ))])),
+                    None,
+                )
+                .await
+                .unwrap();
+            storage
+                .commit_object(&b, &k, staged, object::Tags::empty(), Some(owner), acl)
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn acl_plane_two_user_access_control() {
+            // The enforced-mode equivalence (controller carry; Task 11's
+            // same condition): the access layer and the handler-side
+            // checks are wired together under `caps.acl ∧ identity` —
+            // unsigned GET passes a public-read object, 403s a private
+            // one; a signed user's grants apply through the real plane.
+            let storage = MemoryStorage::new().unwrap();
+            let b = bucket::name("data").unwrap();
+            let (identity, alice_id, bob_id) = identity_pair();
+            storage
+                .create_bucket(
+                    &b,
+                    Some(&alice_id),
+                    &Acl::default_private(Some(alice_id.clone())),
+                )
+                .await
+                .unwrap();
+            let public = Acl {
+                owner: Some(alice_id.clone()),
+                grants: vec![Grant {
+                    grantee: Grantee::Group(GroupUri(GROUP_ALL_USERS.to_string())),
+                    permission: Permission::Read,
+                }],
+            };
+            put(&storage, "public.txt", &alice_id, &public).await;
+            put(
+                &storage,
+                "private.txt",
+                &alice_id,
+                &Acl::default_private(Some(alice_id.clone())),
+            )
+            .await;
+            put(
+                &storage,
+                "bob-granted.txt",
+                &alice_id,
+                &Acl {
+                    owner: Some(alice_id.clone()),
+                    grants: vec![Grant {
+                        grantee: Grantee::Canonical(bob_id.clone()),
+                        permission: Permission::Read,
+                    }],
+                },
+            )
+            .await;
+
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (shutdown, rx) = watch::channel(false);
+            let plane = DataPlane::new_with_acl(storage, Capabilities::default(), Arc::new(identity));
+            tokio::spawn(async move {
+                plane.serve(listener, rx).await.unwrap();
+            });
+
+            // Unsigned: the public-read grant applies, the private one 403s.
+            let (status, _) = raw_request(
+                addr,
+                "GET /data/public.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            assert_eq!(status, 200, "unsigned GET on the public object must succeed");
+            let (status, body) = raw_request(
+                addr,
+                "GET /data/private.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            assert_eq!(status, 403, "unsigned GET on the private object must be denied");
+            assert!(
+                String::from_utf8_lossy(&body).contains("AccessDenied"),
+                "{body:?}"
+            );
+
+            // Signed bob: his grants apply (and only his).
+            let (status, _) = signed_raw_request(
+                addr,
+                "GET",
+                "/data/bob-granted.txt",
+                "BKID",
+                "bob-secret",
+            )
+            .await;
+            assert_eq!(status, 200, "signed bob's READ grant must apply");
+            let (status, _) = signed_raw_request(
+                addr,
+                "GET",
+                "/data/private.txt",
+                "BKID",
+                "bob-secret",
+            )
+            .await;
+            assert_eq!(status, 403, "signed bob must not read a grant-less object");
+            // The owner bypass holds for alice.
+            let (status, _) = signed_raw_request(
+                addr,
+                "GET",
+                "/data/private.txt",
+                "AKID",
+                "alice-secret",
+            )
+            .await;
+            assert_eq!(status, 200, "the object owner bypasses the ACL");
+
+            shutdown.send(true).unwrap();
+        }
     }
 
     #[test]

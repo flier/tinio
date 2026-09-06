@@ -41,3 +41,5 @@ pub use self::{
     data::DataPlane,
     error::Error,
 };
+#[cfg(feature = "acl")]
+pub use self::_auth::{Identity, User};

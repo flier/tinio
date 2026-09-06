@@ -267,7 +267,9 @@ impl<S: Storage> S3Backend<S> {
     ///
     /// UNGATED: it exists in every build (feature-off builds keep a
     /// constructor via [`S3Backend::new`], per spec §5); only the cors
-    /// wiring is `#[cfg(feature = "cors")]`.
+    /// wiring is `#[cfg(feature = "cors")]`. The feature `acl` plane
+    /// wires the same `Arc<S>` into both the mapping and the
+    /// authorization pipeline — one backend, one share.
     pub fn new_shared(storage: Arc<S>, caps: Capabilities) -> Self {
         Self {
             storage,

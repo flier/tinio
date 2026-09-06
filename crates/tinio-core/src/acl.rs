@@ -72,6 +72,23 @@ pub fn default_owner_id() -> OwnerId {
     OwnerId::new(hex::encode(digest)).expect("sha256 hex is 64 lowercase hex digits")
 }
 
+/// The single-key delete/overwrite parity rule (spec review B2): `P ==
+/// O(object) or P == O(bucket)` — grants never satisfy it. The ONE home
+/// for the rule, shared by the server's handler-side per-key DeleteObjects
+/// check and tinio-auth's `ObjectOrBucketOwner` gate.
+///
+/// `object_owner` is the RAW row element — `None` (the empty wire,
+/// review B4) resolves to `lazy_default`, NOT to the bucket owner: an
+/// empty-wire object is owned by the configured lazy default.
+pub fn can_delete(
+    principal: &OwnerId,
+    bucket_owner: &OwnerId,
+    lazy_default: &OwnerId,
+    object_owner: Option<&OwnerId>,
+) -> bool {
+    principal == object_owner.unwrap_or(lazy_default) || principal == bucket_owner
+}
+
 /// An ACL permission (the AWS grant permission strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
@@ -442,5 +459,26 @@ mod tests {
             "d16b7e8c0bb9728d01e3bf9c30940a32622195f821325af577a87bd6284ac306"
         );
         assert_eq!(DEFAULT_OWNER_DISPLAY_NAME, "tinio");
+    }
+
+    #[test]
+    fn can_delete_owner_parity_with_lazy_default() {
+        // The one truth table of the single-key delete rule. The empty
+        // wire (B4) resolves to the lazy default — never the bucket
+        // owner: a non-default principal whose object row is empty is
+        // NOT its owner even when it owns the bucket.
+        let alice = id("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
+        let bob = id("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
+        let lazy = default_owner_id();
+        // P == O(object).
+        assert!(can_delete(&alice, &bob, &lazy, Some(&alice)));
+        // P == O(bucket).
+        assert!(can_delete(&bob, &bob, &lazy, None));
+        // P == the lazy default of an empty-wire object (NOT the bucket
+        // owner — bob owns the bucket, the empty row is the lazy's).
+        assert!(can_delete(&lazy, &bob, &lazy, None));
+        // Neither side matches (a third principal with no grant).
+        assert!(!can_delete(&bob, &alice, &lazy, Some(&alice)));
+        assert!(!can_delete(&lazy, &bob, &lazy, Some(&alice)));
     }
 }

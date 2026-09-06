@@ -10,13 +10,18 @@
 //! Auth: s3s rejects signed requests when no auth provider is configured,
 //! and real S3 clients always sign — so the harness accepts the fixed
 //! MinIO-convention pair `minioadmin` / `minioadmin` (unsigned requests are
-//! rejected). Config-based auth lands in US3 (T082/T083).
+//! rejected). With feature `acl` and `[s3] acl = true` the plane runs the
+//! identity-backed authn/authz stack instead: the root user is the
+//! `[auth]` credential pair presenting the default-owner element
+//! (`root_identity` — Task 14 assembles the full `[users]` map).
 
 use std::{
-    env, error::Error, fs, net::SocketAddr, path::PathBuf, process, sync::Arc, time::Duration,
+    collections::HashMap, env, error::Error, fs, net::SocketAddr, path::PathBuf, process,
+    sync::Arc, time::Duration,
 };
 
 use futures::StreamExt;
+use secrecy::ExposeSecret;
 use sweep::{Options, Sweeper};
 use tinio_config::{
     Config,
@@ -24,6 +29,7 @@ use tinio_config::{
     pipeline,
 };
 use tinio_core::{
+    acl,
     cleanup::{Cleanup, CleanupOptions, RepairKind},
     pipeline::Runner,
     storage::{
@@ -40,6 +46,12 @@ use tinio_server::{
 };
 use tokio::{net::TcpListener, sync::watch};
 use tracing::subscriber;
+#[cfg(feature = "acl")]
+use {
+    s3s::auth::SecretKey,
+    tinio_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, default_owner_id},
+    tinio_server::{Identity, User},
+};
 
 fn usage() -> ! {
     eprintln!("usage: serve <root> [--port N] [--address HOST:PORT] [--config <config.toml>]");
@@ -70,6 +82,65 @@ fn capabilities_for(config: &Option<Config>) -> Capabilities {
         Some(s3) => Capabilities::from(s3),
         None => Capabilities::default(),
     }
+}
+
+/// The root credential pair: the configured `[auth]` keys, or the US1
+/// interop convention pair (`minioadmin`/`minioadmin`) when no `[auth]`
+/// section is present — the harness's default, kept verbatim.
+fn auth_pair(config: &Option<Config>) -> (String, String) {
+    match config.as_ref().and_then(|c| c.auth.as_ref()) {
+        Some(auth) => (
+            auth.access_key.clone(),
+            auth.secret_key.expose_secret().to_string(),
+        ),
+        None => ("minioadmin".into(), "minioadmin".into()),
+    }
+}
+
+/// The root-only identity map (Task 13 stopgap): the root user is the
+/// `[auth]` credential pair presenting the default `[owner]` element
+/// (core defaults — canonical `default_owner_id()`, display
+/// `DEFAULT_OWNER_DISPLAY_NAME`; the explicit `[owner]`/`[[users]]`
+/// assembly is Task 14's `Identity::from_config`). ONE place to swap —
+/// Task 14 replaces this helper wholesale.
+#[cfg(feature = "acl")]
+fn root_identity(config: &Option<Config>) -> Arc<Identity> {
+    let (access_key, secret) = auth_pair(config);
+    let user = User {
+        access_key,
+        canonical_id: default_owner_id(),
+        display_name: DEFAULT_OWNER_DISPLAY_NAME.to_string(),
+        secret: SecretKey::from(secret),
+    };
+    Arc::new(Identity {
+        users: std::iter::once(user)
+            .map(|u| (u.access_key.clone(), u))
+            .collect(),
+        default_owner: default_owner_id(),
+        default_display_name: DEFAULT_OWNER_DISPLAY_NAME.into(),
+    })
+}
+
+/// The fs store's owner→uid map (unix chown on write): config-supplied
+/// only, never request-derived. Task 14 fills it from `[owner]` /
+/// `[[users]] local_uid`; the empty map here = no chown, every object
+/// stays server-user-owned (the hardened default).
+fn owner_uids_for(_config: &Option<Config>) -> HashMap<acl::OwnerId, u32> {
+    HashMap::new()
+}
+
+/// The plane constructor selection (same-condition rule, Tasks 10-12):
+/// feature `acl` compiled on AND `caps.acl` on → the identity-backed
+/// plane (`new_with_acl` — ConfigAuth + AclAccess, every enforced
+/// behavior wired together); else today's `new_with_auth` (no
+/// identity, no enforced behavior).
+fn plane_for(storage: FsStorage, caps: Capabilities, config: &Option<Config>) -> DataPlane {
+    #[cfg(feature = "acl")]
+    if caps.acl {
+        return DataPlane::new_with_acl(storage, caps, root_identity(config));
+    }
+    let (access_key, secret) = auth_pair(config);
+    DataPlane::new_with_auth(storage, caps, &access_key, &secret)
 }
 
 #[tokio::main]
@@ -145,9 +216,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             io_pipeline: pipelines.io(),
             remove_pipeline: pipelines.remove(),
             db_pipeline: pipelines.db(),
-            // No owner-to-uid mapping — every object stays
-            // server-user-owned (the hardened default).
-            owner_uids: std::collections::HashMap::new(),
+            owner_uids: owner_uids_for(&config),
         },
     )?;
     // `[s3] max_concurrent_uploads` caps in-progress multipart uploads
@@ -223,7 +292,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let metrics_storage = storage.clone();
     let metrics_io = pipelines.io();
     let metrics_db = pipelines.db();
-    let plane = DataPlane::new_with_auth(storage, caps, "minioadmin", "minioadmin").with_metrics(
+    let plane = plane_for(storage, caps, &config).with_metrics(
         Arc::new(move || {
             metrics::refresh(
                 metrics_io.stats(),
@@ -270,5 +339,37 @@ mod tests {
     #[test]
     fn capabilities_for_defaults_without_s3_section() {
         assert_eq!(capabilities_for(&None), Capabilities::default());
+    }
+
+    #[cfg(feature = "acl")]
+    #[test]
+    fn root_identity_uses_the_auth_pair_with_the_default_owner_element() {
+        let config =
+            Config::parse("version = 1\n[auth]\naccess_key = \"ak-root\"\nsecret_key = \"sk-root\"\n")
+                .unwrap();
+        let identity = root_identity(&Some(config));
+        let user = identity.users.get("ak-root").unwrap();
+        assert_eq!(user.canonical_id, default_owner_id());
+        assert_eq!(user.display_name, DEFAULT_OWNER_DISPLAY_NAME);
+        assert_eq!(user.secret.expose(), "sk-root");
+        assert_eq!(identity.default_owner, default_owner_id());
+        assert_eq!(identity.default_display_name, DEFAULT_OWNER_DISPLAY_NAME);
+    }
+
+    #[cfg(feature = "acl")]
+    #[test]
+    fn root_identity_falls_back_to_the_minioadmin_pair() {
+        let identity = root_identity(&None);
+        assert!(
+            identity.users.contains_key("minioadmin"),
+            "the US1 interop pair must stay accepted without a config"
+        );
+    }
+
+    #[test]
+    fn owner_uids_map_starts_empty() {
+        // No-chown default: the empty map keeps every object
+        // server-user-owned (the hardened mode). Task 14 fills it.
+        assert!(owner_uids_for(&None).is_empty());
     }
 }

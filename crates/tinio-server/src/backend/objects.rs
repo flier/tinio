@@ -61,8 +61,8 @@ use crate::{
 use crate::{
     _auth::canned::GrantHeaders,
     backend::acls::{
-        can_delete, grant_headers, grants_dto, object_acl_grants, object_write_acl,
-        policy_owner_matches, require_content_md5,
+        grant_headers, grants_dto, object_acl_grants, object_write_acl, policy_owner_matches,
+        require_content_md5,
     },
 };
 
@@ -793,8 +793,11 @@ impl<S: Storage> S3Backend<S> {
             if let Some((principal, bucket_owner)) = gate.as_ref() {
                 match self.storage.get_object_acl(&bucket, &key).await {
                     Ok(acl) => {
-                        let object_owner = self.row_owner(acl.owner.as_ref());
-                        if !can_delete(principal, bucket_owner, &object_owner) {
+                        // The one-home rule (`_core::acl::can_delete`);
+                        // the empty wire's lazy default resolves here
+                        // (review B4 — the same `row_owner(None)`).
+                        let lazy_default = self.row_owner(None);
+                        if !acl::can_delete(principal, bucket_owner, &lazy_default, acl.owner.as_ref()) {
                             errors.push(delete_error(&denied, key.to_string()));
                             continue;
                         }

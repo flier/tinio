@@ -68,10 +68,13 @@ criterion = { workspace = true, features = [
     "cargo_bench_support",
 ] }
 futures.workspace = true
+hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 md-5.workspace = true
 predicates.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 

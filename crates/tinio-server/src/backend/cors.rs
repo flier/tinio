@@ -808,7 +808,10 @@ mod tests {
     async fn test_route(config: cors::Config) -> PreflightRoute {
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage
+            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage.put_bucket_cors(&name, &config).await.unwrap();
         PreflightRoute::new(Arc::new(Configs::new(storage)) as Arc<dyn Lookup>)
     }
@@ -975,7 +978,10 @@ mod tests {
         // the no-config message.
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name).await.unwrap();
+        storage
+            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let route = PreflightRoute::new(Arc::new(Configs::new(storage)) as Arc<dyn Lookup>);
         let err = route
             .call(preflight_req(

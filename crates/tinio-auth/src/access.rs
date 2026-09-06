@@ -17,6 +17,7 @@ use s3s::{
 use crate::_core::{
     acl::{
         Acl, GROUP_ALL_USERS, GROUP_AUTHENTICATED_USERS, Grantee, GroupUri, OwnerId, Permission,
+        can_delete,
     },
     bucket, object, percent,
     storage::{self, Storage},
@@ -452,7 +453,9 @@ impl<S: Storage> AclAccess<S> {
     }
 
     /// Object-owner-or-bucket-owner parity (delete/overwrite parity, the
-    /// default-A class): no grant satisfies the gate.
+    /// default-A class): no grant satisfies the gate. The single-key
+    /// rule's ONE home is [`can_delete`] (`tinio_core::acl` — the
+    /// handler-side per-key DeleteObjects check runs the same helper).
     async fn object_or_bucket_owner(
         &self,
         bucket_name: &bucket::Name,
@@ -463,17 +466,20 @@ impl<S: Storage> AclAccess<S> {
             Ok(acl) => acl,
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
-        if self.is_owner(&object_acl, &request.principal) {
-            return Ok(());
-        }
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
-        if self.is_owner(&bucket_acl, &request.principal) {
-            return Ok(());
+        if can_delete(
+            &request.principal,
+            &self.resolved_owner(&bucket_acl),
+            &self.identity.default_owner,
+            object_acl.owner.as_ref(),
+        ) {
+            Ok(())
+        } else {
+            Err(denied())
         }
-        Err(denied())
     }
 
     /// Owner-only gates (policy-only bucket ops, unmapped ops — default
