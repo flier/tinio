@@ -866,6 +866,37 @@ mod tests {
         call!(list_parts, dto::ListPartsInput);
         #[cfg(feature = "multipart")]
         call!(list_multipart_uploads, dto::ListMultipartUploadsInput);
+        // `SelectObjectContentInput` has no Default (its request carries
+        // required fields) — built explicitly like the tagging input above.
+        #[cfg(feature = "select")]
+        {
+            let _ = rt.block_on(backend.select_object_content(request(
+                dto::SelectObjectContentInput {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    expected_bucket_owner: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    request: dto::SelectObjectContentRequest {
+                        expression: "SELECT * FROM S3Object s".into(),
+                        expression_type: dto::ExpressionType::from("SQL".to_string()),
+                        input_serialization: dto::InputSerialization {
+                            csv: Some(dto::CSVInput::default()),
+                            json: None,
+                            parquet: None,
+                            compression_type: None,
+                        },
+                        output_serialization: dto::OutputSerialization {
+                            csv: Some(dto::CSVOutput::default()),
+                            json: None,
+                        },
+                        request_progress: None,
+                        scan_range: None,
+                    },
+                },
+            )));
+        }
         // These three inputs have required fields (no Default) — built
         // explicitly with every field.
         #[cfg(feature = "copy")]
@@ -1394,6 +1425,19 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         self.record(
             "ListMultipartUploads",
             self.inner.list_multipart_uploads(req),
+        )
+        .await
+    }
+
+    // --- select (spec 2026-09-04) ---
+    #[cfg(feature = "select")]
+    async fn select_object_content(
+        &self,
+        req: S3Request<dto::SelectObjectContentInput>,
+    ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
+        self.record(
+            "SelectObjectContent",
+            self.inner.select_object_content(req),
         )
         .await
     }

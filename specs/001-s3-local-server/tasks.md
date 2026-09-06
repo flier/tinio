@@ -249,6 +249,7 @@ Incremental surface work implemented on top of the original plan (FR-030/FR-031/
 - [X] T125 [US1] Cucumber scenarios: `tagging.feature` +7, `conditions.feature` RenameObject block +5, `objects.feature` GetObjectAttributes block +3 (167 scenarios total) — FR-030/FR-031/FR-032 (scenarios left untagged until T126 assigns the spec IDs)
 - [X] T126 [US1] Specs & docs: FR-030/FR-031/FR-032 written into `contracts/s3-surface.md`, task entries here, checklist items in `checklists/compatibility.md`, the feature scenarios tagged with the new IDs, the `steps/mod.rs` dangling "spec §Tagging" comment resolved — FR-030/FR-031/FR-032
 
+<<<<<<< HEAD
 ### Addendum 2026-09-05 — bucket CORS surface (design `docs/superpowers/specs/2026-09-05-s3-cors-design.md`, plan `docs/superpowers/plans/2026-09-05-s3-bucket-cors.md`)
 
 Incremental surface work closing gap-analysis Tier A#2 (FR-033, added to `contracts/s3-surface.md`; executed as the sdd plan's Tasks 1-11). `STATE_VERSION` stays 1 — the `cors_wire` BUCKETS element is appended last (user ruling 2026-09-02; corrected 2026-09-06 — "no bump" covers only the version number: redb 4.2 binds the value type at the `TableDefinition`, so a state dir written under the pre-CORS row arity refuses to open with `TableTypeMismatch` — loud failure, no migration, recovery = delete the state dir). The cucumber scenarios carry `@FR-033` per-scenario tags (the features host no pre-existing keep-legs); the `@cors-off` scenario also pins FR-021.
@@ -263,6 +264,12 @@ Incremental surface work closing gap-analysis Tier A#2 (FR-033, added to `contra
 - [X] T134 [US1] Preflight route in `crates/tinio-server/src/backend/cors.rs`: over s3s 0.15's `S3Route` seam (OPTIONS + `Origin` + `Access-Control-Request-Method`, anonymous `check_access`), the shared-handle `CorsConfigs` lookup, the AWS-verbatim 403 messages (no-config/existence-oracle-closed, evalution mismatch), the allow-list answer headers (`Access-Control-*`, `Vary` append, `Content-Length: 0`) — FR-033
 - [X] T135 [US1] Response decoration in `crates/tinio-server/src/data.rs`: first-origin-matching-rule decoration of `Ok` responses (4xx/5xx included), bare-`*` ACAO/credentials split, `Vary` append, fallible header construction — FR-033
 - [X] T136 [US1] Acceptance + docs: `cors.feature` (6 scenarios, `@FR-033`), e2e `@cors-off` step wiring, boto3-journey CORS legs (config trio + raw OPTIONS preflight — the Origin-bearing decoration is covered by the cucumber and data-plane suites, not the journey), FR-033 written into `contracts/s3-surface.md`, `[s3] cors` into `contracts/config.md`, task entries here, gap-analysis Tier A#2 status note — FR-033
+
+### Addendum 2026-09-06 — S3 Select surface (design `docs/superpowers/specs/2026-09-04-select-object-content-design.md`, plan `docs/superpowers/plans/2026-09-04-select-object-content.md`)
+
+Incremental surface work implemented on top of the original plan (FR-034, added to `contracts/s3-surface.md`; executed as the sdd plan's Tasks 1-15); `STATE_VERSION` stays 1 — the engine reads objects through the existing read path, nothing is stored.
+
+- [X] T137 [US1] Specs, docs & cucumber: FR-034 (SelectObjectContent) written into `contracts/s3-surface.md` (bullet + automated-coverage row), checklist item CHK053 in `checklists/compatibility.md`, `select.feature` + step wiring per `docs/tests.md` (CSV filter by column position, count(*) over JSON lines, LIMIT, gzip-compressed CSV), task entry here — FR-034
 
 ---
 

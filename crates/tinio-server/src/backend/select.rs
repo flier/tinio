@@ -518,7 +518,7 @@ fn json_output_params(json: &dto::JSONOutput) -> S3Result<JsonOutputParams> {
 /// or underflowing window errors 400 instead of wrapping or panicking (the
 /// `end`-only `size - end` is guarded by `end ≤ size`).
 fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<(u64, Option<u64>)> {
-    let window = match (scan.start, scan.end) {
+    match (scan.start, scan.end) {
         // "must not be empty" (AWS).
         (None, None) => Err(s3_error!(
             InvalidRequestParameter,
@@ -576,8 +576,7 @@ fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<(u64, Option
                 Ok((start as u64, Some(end as u64)))
             }
         }
-    };
-    window
+    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ pub mod listing;
 pub mod multipart;
 pub mod objects;
 pub mod reserved_paths;
+pub mod select;
 
 use std::collections::HashMap;
 
