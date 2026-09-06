@@ -1,0 +1,151 @@
+# Design: S3 Select over objects (tinio-select)
+
+**Date**: 2026-09-04
+**Status**: draft — brainstorming 2026-09-04 (Q1 gate placement = tinio-server, Q2 SQL scope = full AWS subset sans scalar-function library, Q3 JSON scope = LINES + DOCUMENT + `FROM S3Object[*].path` traversal, Q4 parquet = feature-gated off, follow-up: `select` default ON); approach A (self-written streaming pipeline) approved; grilling 2026-09-04 (Q1–Q10, see Decisions + Resolved notes); external review 2026-09-05 — findings applied: explicit sync engine/async bridge execution model (§1.1), parquet memory bound, error-table timing alignment, `SELECT *` matrix, precise BytesProcessed measurement, e2e traceability step; follow-up review 2026-09-05b — residual-consistency fixes applied (s3s `S3Error`/`Custom` API facts, record-boundary events wording, ScanRange size source, GZIP/BZIP2 multi-member decode; each marked "(review 2026-09-05b)")
+**Scope**: a new workspace crate `tinio-select` hosts the streaming SELECT engine (parse → validate → record readers → evaluate → serialize → event chunking); `tinio-server` gains the `select_object_content` op (`backend/select.rs`), the `select` cargo feature (default ON), the `select-parquet` feature (default OFF, forwards `tinio-select/parquet`), and a runtime `Capabilities.select` toggle. Not touched: the `Storage` contract, `tinio-mem`/`tinio-fs` backends, other ops, request authn/z.
+
+## Background
+
+S3 Select (`POST /{Key}?select&select-type=2`, per [API_SelectObjectContent](https://docs.aws.amazon.com/AmazonS3/latest/API/API_SelectObjectContent.html)) filters an object server-side with a SQL statement, streaming results as an event sequence (Records / Progress / Stats / Cont / End). Facts that shape this design:
+
+- **SQL**: only `SELECT list FROM S3Object [AS alias] [WHERE expr] [LIMIT n]` exists. No JOIN, subquery, GROUP BY/HAVING, ORDER BY, DISTINCT, UNION. Aggregates `COUNT/SUM/AVG/MIN/MAX` run without GROUP BY. JSON-only `FROM S3Object[*].path` traversal with wildcards (`.*`, `[*]`, `['name']`, `[index]`) and `MISSING` semantics (wildcards emit at least one record; aggregates skip MISSING; MISSING serializes as an empty record).
+- **Input**: CSV (`FileHeaderInfo` USE|IGNORE|NONE, `RecordDelimiter`, `FieldDelimiter`, `QuoteCharacter`, `QuoteEscapeCharacter`, `Comments`, `AllowQuotedRecordDelimiter`), JSON (`Type` LINES|DOCUMENT), Parquet (input only). `CompressionType` NONE|GZIP|BZIP2; Parquet requires NONE. GZIP/BZIP2 decode with flate2's `MultiGzDecoder` / bzip2's `MultiBzDecoder` — concatenated member streams (what `gzip`/`bzip2` emit) are read to EOF, as AWS reads them; the single-member `GzDecoder` would silently stop at the first member (review 2026-09-05b). Output: CSV or JSON only (never Parquet).
+- **CSV access**: positional `_1.._N` (start at 1) always; header names when `FileHeaderInfo=USE`.
+- **Identifiers**: unquoted = case-insensitive; `"double-quoted"` = case-sensitive; ambiguity with case-insensitive matching is an error (`AmbiguousFieldName`).
+- **Streaming**: response is `Transfer-Encoding: chunked`; each Records event payload ≤ ~1 MB. **This design emits events at record boundaries and never splits a record across events** (AWS's own doc permits splitting, but an over-1 MB record is an error here — a `Custom("S3QueryError")` runtime failure (the one stream code of §3, distinguished by detail message) — which matches AWS's own "query fails" behavior; review 2026-09-05 #10, deviation from the "may split" wording; review 2026-09-05b: the `TooLarge` named here earlier is **not** an s3s variant — nearest first-class codes are `OverMaxRecordSize` (s3s doc: "The length of a record in the input or result is greater than the maxCharsPerRecord limit of 1 MB", HTTP 400) and `EntityTooLarge`/`MaxMessageLengthExceeded` (400, but for object-upload / request-message size) — none adopted, keeping the one-runtime-code decision of §3). **Both input and output records are capped at 1 MB** — a larger CSV row/JSON line errors the stream out (defuses decompression-bomb amplification; review 2026-09-05 #3). Stats/Progress carry `BytesProcessed`/`BytesReturned`/`BytesScanned`.
+- **ScanRange**: only records whose first byte falls in `[start, end]` of the stored object are processed. `end`-only means "last N bytes" (requires the object size — no separate `head_object` round trip: the read path returns it as `GetObjectResult.info.size`, on the same call that delivers the body; see §2; review 2026-09-05b). Note (review 2026-09-05): with JSON `Type=DOCUMENT` the whole object is one record starting at byte 0, so `start > 0` yields **zero records** — correct behavior, documented so an implementer doesn't "fix" it.
+- s3s 0.15 already provides `SelectObjectContentEventStream::new(stream)` (XML event framing, base64 payload encoding) and `SelectObjectContentEvent::{Records, Progress, Stats, Cont, End}`. Error codes (verified against s3s source): `S3ErrorCode::AmbiguousFieldName` **exists as a first-class variant** (HTTP 400); `S3QueryParsingError` and `MissingHeaderName` do **not** exist and must use `S3ErrorCode::Custom(ByteString)` — and `Custom`'s `as_str()` returns the bytes verbatim **but `status_code()` is `None`, which s3s serializes as HTTP 500** (`error/generated.rs:2686` — `Self::Custom(_) => None`; `ops/mod.rs:113` `serialize_error` line 114 defaults to `StatusCode::INTERNAL_SERVER_ERROR`); **every request-level `Custom` error must call `set_status_code(StatusCode::BAD_REQUEST)` (`error/mod.rs:107`)**, else bad queries surface as 500s (review 2026-09-05 #2/#11).
+- tinio-server ops are inherent methods on `S3Backend<S: Storage>` (`backend/*.rs`), compile-time strippable via cargo features and runtime-disableable via `Capabilities` (FR-021). An object's byte stream is already reachable through the storage contract's read path — the engine needs nothing else from a backend.
+
+## Goal
+
+1. **`tinio-select`**: a pure, dependency-light streaming pipeline — decompress → read records → evaluate → serialize → event chunking — with no `tinio-core` dependency (object bytes in, event items out). Every stage is independently unit-testable.
+2. **tinio-server op**: `select_object_content` behind `feature = "select"`, forward to the engine, with request-level validation before streaming starts.
+3. **AWS-documented semantics** for the covered subset: `_N` columns, header names, MISSING, wildcard traversal, aggregates, LIMIT, LIKE/IN/BETWEEN/IS NULL, compression, ScanRange.
+
+## Non-goals
+
+- **No scalar-function library in v1**: only comparison/logical/arithmetic operators, `LIKE [ESCAPE]`, `IN`, `BETWEEN`, `IS NULL`, `IS [NOT] MISSING`. CAST, SUBSTRING, UPPER/string functions, date/time functions are later work.
+- **No JSON path traversal beyond the documented forms** and no `GROUP BY`/`HAVING`/`ORDER BY`/`DISTINCT`/JOIN/subquery/UNION — validated and rejected, matching AWS's own surface.
+- **No output Parquet**, no whole-object compression for Parquet input.
+- **No multi-byte delimiters** (AWS limits are single characters; `csv` crate terminators are `u8`).
+- **No backend or Storage-contract changes** — the op runs over the existing read path on any backend.
+- **No authz changes** — the existing object-access path (and its errors, e.g. `NoSuchKey`) applies unchanged.
+
+## Decisions (locked 2026-09-04)
+
+- **Approach A: self-written streaming pipeline** (user pick; vs DataFusion = heavyweight w/ dynamic-schema conflict; vs materialize = OOM risk).
+- **Gate in tinio-server** (user pick): `select` default ON; `select-parquet` default OFF. Backends untouched.
+- **SQL scope: full AWS subset sans scalar-function library** (user pick).
+- **JSON scope: LINES + DOCUMENT + path traversal** (user pick) — traversal is its own implementation phase, flagged as the riskiest piece.
+- **ScanRange + compressed object → 400 `InvalidRequestParameter`** (AWS semantics for that combination are ambiguous; refuse rather than guess).
+- **Request-level validation → 400 before any streaming** — incl. SQL parse/grammar: `select_iter` receives a pre-built `QueryPlan`, so parse/rejected-grammar errors use the §3 row-1 request code, not the in-stream channel (review 2026-09-05b splits the 2026-09-04 "row/language" wording: the parse half is request-level; only runtime row/eval errors are in-stream); runtime row/eval errors → s3s error-item channel inside the 200 response.
+- **Stats semantics** (precise measurement points, review 2026-09-05): `BytesScanned` = uncompressed input bytes consumed by the record reader (post-decompression; AWS's billing basis); `BytesProcessed` = sum of the raw byte lengths of the decoded record payloads as handed to the engine (record payload = row bytes before serialization); `BytesReturned` = total serialized output bytes. Each counter increments at exactly one call site, named in the plan. (AWS's own paragraph for BytesProcessed is ambiguous between "scanned" and "processed"; the above is the documented internal contract, with a note in §4 testing if a divergence appears against a live AWS check.)
+- **Grilling Q1 LIKE** — standard-SQL case-sensitive (`%`, `_`, optional `ESCAPE`); verified against MinIO at implementation time.
+- **Grilling Q2 Progress cadence** — every 1 s or every 1 MB advanced, whichever first, when `RequestProgress.Enabled` is true.
+- **Grilling Q3 Continuation events** — send `Cont` after 5 s of idle **and** after N records (default 4096); the policy is a `SelectConfig` field pair (Option-enabled), tinio-server uses defaults.
+- **Grilling Q4 numeric spine = `rust_decimal`** (28 significant digits). **User refinement 2026-09-04**: prefer `rust_decimal`; a value whose precision exceeds 28 digits raises an **in-stream error** (never a silently wrong number). Lazy parse: field values stay raw string until a numeric operator consumes them; `SELECT *` passes raw text through untouched. Documented deviation: AWS claims 38-digit precision.
+- **Grilling Q5 Parquet types** — full range: int/float/string/bool/timestamp (→ ISO string)/decimal (→ rust_decimal; arrow precision > 28 digits → error)/nested. Nested values project fine in JSON output; a nested value with **CSV output is an in-stream error** ("nested column not supported for CSV output").
+- **Grilling Q6 JSON output keys** — plain field refs use the field name; aliases win; a projection expression **without** an alias is rejected at request level (400, see §3) rather than guessing a key.
+- **Grilling Q7 bench** — a criterion benchmark is in scope (see §4).
+- **Review 2026-09-05 execution model** — `tinio-select` is a **synchronous** pipeline; the async→sync bridge lives in **tinio-server** (§1.1). CPU-bound sync work never runs on a tokio worker.
+- **Review 2026-09-05 parquet memory bound** — Parquet input is fully buffered into memory (the storage read path is a one-shot stream with no seek, and `ParquetRecordBatchReaderBuilder` needs a `ChunkReader`); objects above the bound are refused **request-level** (400) since the size is known before streaming. CSV/JSON/GZIP/BZIP2 remain fully streaming; the "no materialization" claim applies to those formats only.
+- **Review 2026-09-05 error timing** — header-dependent errors (`AmbiguousFieldName`/`MissingHeaderName`) are **in-stream**, not request-level (§3): they depend on CSV header content only known after reading begins.
+
+## Design
+
+### §1 The shared crate: `tinio-select`
+
+New workspace member `crates/tinio-select`; deps `sqlparser`, `csv`, `serde_json` (features `arbitrary_precision` **and `preserve_order`** — encounter-order key preservation is part of the SELECT\* matrix), `rust_decimal`, `flate2`, `bzip2` (0.6.x — pure-Rust `libbz2-rs-sys` default, no native-toolchain requirement), `thiserror`; optional `parquet` (arrow-rs) behind `feature = "parquet"`. **No tokio, no bytes, no futures** — the crate is synchronous and dependency-light (review 2026-09-05: the async bridge is the server's job). `[lints.rust] unsafe_code = "forbid"`, description "Streaming SQL SELECT engine for S3 objects (S3 Select)".
+
+Modules (data flows left to right; each is a pure stage with its own tests):
+
+- `sql.rs` — parse + validate. sqlparser `GenericDialect`; a **FROM-clause pre-processor** handles the custom grammar: the object starts as `S3Object` or `S3Object[*].path` (segments `.name`, `['name']`, `[index]`, `.*`, `[*]`) with optional `AS alias`; the segment list is extracted and the statement handed to sqlparser with the FROM item substituted to a parseable stand-in. sqlparser 0.57's `Expr` (62 variants) has no `IsMissing`, so `GenericDialect` cannot parse `IS [NOT] MISSING` at all — only IsNull/IsNotNull/IsTrue/IsFalse/IsDistinctFrom exist — so the same quote-aware token pre-pass rewrites the predicate into a parseable sentinel form that the validator/AST-mapper maps back to MISSING semantics (review 2026-09-05b). The validator then rejects anything but `SELECT list FROM <stand-in> [WHERE] [LIMIT]` (no joins/subquery/GROUP BY/ORDER BY/DISTINCT/UNION), and requires `ExpressionType = SQL`.
+- `row.rs` — `Value` enum (`Null | Bool | Int(i64) | Decimal(rust_decimal::Decimal) | RawNumber(String) | String | Json(Box<serde_json::Value>)`) plus MISSING as a distinct sentinel. `RawNumber` carries a JSON number token verbatim; `Json` carries nested parquet/JSON values (JSON output renders natively; CSV output → error, grilling Q10). Numeric coercion rule (grilling Q4 + refinement 2026-09-04): a field value is parsed to `Decimal` lazily, only when a numeric operator consumes it; unparseable → comparison yields false, aggregates skip (AWS: CSV fields are strings until compared with literals); precision exceeds 28 digits → in-stream error. `SELECT *` never *parses values* — but it does re-frame: **"raw passthrough" is scoped to record values**; delimiters/quotes are always re-applied per the output config (review 2026-09-05: exact byte passthrough is impossible once the output delimiter/quote differ from the input).
+- **`SELECT *` matrix** (review 2026-09-05, previously unspecified):
+  - CSV→CSV: values untouched (unparsed strings), framed by output config; columns ordered as input.
+  - CSV→JSON: keys = header names when `FileHeaderInfo=USE`, else `_1.._N`.
+  - JSON→CSV: columns = the record's top-level keys **in encounter order** (`serde_json` `preserve_order` feature); nested/array values → compact JSON in that cell; per-record missing keys → empty cells.
+  - JSON→JSON: the record re-emitted in encounter order with number tokens verbatim (`RawNumber`), strings/objects/arrays as-is.
+- `record.rs` — `RecordReader` trait (`fn next(&mut self) -> Result<Option<Row>, SelectError>`), three impls; **every reader enforces the 1 MB input-record cap** (bytes consumed per record; exceeding → in-stream `Format` error — review 2026-09-05 #3):
+  - `CsvReader`: `csv` crate reader with FileHeaderInfo USE/IGNORE/NONE, single-char delimiters/characters, `Comments`, `AllowQuotedRecordDelimiter`, header map + `_N` aliasing.
+  - `JsonReader`: LINES (serde_json per line) and DOCUMENT (whole object is one record); path traversal expands each object per the segment list (Cartesian on wildcards; zero-match wildcard emits exactly one MISSING row; name/index miss emits MISSING).
+  - `ParquetReader` (`#[cfg(feature = "parquet")]`): the storage read path is a one-shot stream (no seek), and `ParquetRecordBatchReaderBuilder` needs random access (`ChunkReader`, footer at file end) — the whole object is buffered into memory first (review 2026-09-05; bounded by the 400-level `max_parquet_bytes` default 256 MiB, size known before streaming from the read path's own metadata — `GetObjectResult.info.size`, §2; review 2026-09-05b replaces the earlier `head_object`). Reads with `with_projection` pruning to the columns referenced by SELECT/WHERE; batch rows converted to `Row` — primitives + decimal (→ rust_decimal; arrow decimals above 28 digits hit the same overflow error) + timestamp (→ ISO string) + nested (→ JSON value; grilling Q5: nested projects in JSON output, errors with CSV output).
+- `engine.rs` — plan + evaluate: WHERE filter (TRUE only, MISSING → not TRUE), SELECT projection (expression eval, aliases, `*`), aggregates via scan-accumulate (MISSING/Null skipped), LIMIT on output rows.
+- `events.rs` — the event adapter: drives the engine as the **synchronous** `impl Iterator<Item = Result<SelectEvent, SelectError>>` that `select_iter` returns (no Stream/async here — the crate is sync; review 2026-09-05b) with a **format-agnostic** event model (`Records(Vec<u8>) | Progress{..} | Stats{..} | Cont | End`) so `tinio-select` stays free of s3s (the server maps `SelectEvent` → `s3s::dto::SelectObjectContentEvent`). Packs **whole serialized records** into Records events up to 1 MB at record boundaries (Background) — a record never spans events; a near-1 MB record occupies its own event; a record that does not fit the current event's remaining budget starts the next event; a serialized record > 1 MB is the §3 record-size error, never an event. Emits Progress every 1 s / 1 MB (grilling Q2), `Cont` after 5 s idle and after N records (grilling Q3, `SelectConfig`-configurable), final Stats + End always; carries the three counters.
+- `output.rs` — output serializers: csv-writer (delimiters/quote/`QuoteFields` ASNEEDED|ALWAYS — **default ASNEEDED**, grilling plan-Q4) and JSON writer (`{"k":v,...}` per record, MISSING → `{}`, `RecordDelimiter` default `\n`). JSON keys (grilling Q6): alias when present; plain field ref → field name; expression without alias → rejected at request level.
+
+Crate API surface — **synchronous** (review 2026-09-05: the sync/async bridge is the server's job, see §1.1):
+
+```rust
+pub struct SelectConfig { /* input serialization mode + params, output mode + params, scan_range, request_progress, cont policy, max_parquet_bytes */ }
+/// `input` is a blocking reader over the stored object (cf. `std::io::Read`);
+/// GZIP/BZIP2 decompression happens inside (flate2/bzip2, streaming);
+/// the engine, serializers, and 1 MB chunking all run synchronously on the
+/// calling thread — which must be a blocking thread, never a tokio worker.
+pub fn select_iter(plan: QueryPlan, config: SelectConfig, input: Box<dyn std::io::Read + Send>)
+    -> impl Iterator<Item = Result<SelectEvent, SelectError>>;
+```
+
+### §1.1 Execution model (review 2026-09-05)
+
+The object bytes arrive as an async stream (`futures::Stream<Item = io::Result<Bytes>>` from `Storage::get_object`); every pipeline stage is synchronous (`csv`/`flate2`/`bzip2` are `std::io::Read`-based). The bridge lives in **tinio-server** (it owns tokio):
+
+1. A forwarder task (`tokio::spawn`) pumps the body stream into a **bounded** `tokio::sync::mpsc` (capacity 4) — backpressure on the storage read, bounded memory.
+2. The engine runs on `tokio::task::spawn_blocking`: a small `ChannelReader` implements `std::io::Read` over the mpsc receiver (`blocking_recv`; EOF when the sender drops); `select_iter` is pulled to completion there.
+3. Output events flow out over a second bounded mpsc; the s3s stream (`SelectObjectContentEventStream`, which wants a `futures::Stream<Item = S3Result<SelectObjectContentEvent>>`) is fed by a small hand-rolled adapter implementing `futures::Stream` over `tokio::sync::mpsc::Receiver::poll_recv` — tinio-server has no `tokio-stream` dependency today and none is required (review 2026-09-05b) — mapping `SelectEvent` → `dto::SelectObjectContentEvent` and `Err(SelectError)` → `Err(S3Error::with_message(S3ErrorCode::Custom("S3QueryError".into()), e.to_string()))`. (review 2026-09-05b: `S3Error::new` takes only the code — the message form is `with_message`; and `Custom`'s payload is a `bytestring::ByteString` (a `&str`-backed type), so a `b".."` byte literal does **not** coerce — write `"..".into()` or `ByteString::from_static("..")`.)
+4. CPU-bound sync work (decompress + parse + eval) **never runs on a tokio worker**; cancellation unwinds through the channel topology with no cancellation flags: the s3s stream is dropped → the output mpsc receiver drops → the engine's next `blocking_send` on the output channel fails and it exits → dropping the engine drops its input `ChannelReader` (the input mpsc receiver) → the forwarder's next `send` fails → the forwarder task ends (dropping the body stream cancels the storage read). No in-flight work is left on live memory — each stage may run a tick longer, which is acceptable and documented.
+5. Timing caveat (known deviation, review 2026-09-05): the stream is pull-driven — the 1 s Progress / 5 s Cont cadence is checked at poll instants; a client that reads slowly sees those events arrive less promptly than AWS's active push. Accepted for a local server; documented in §4 tests.
+
+### §2 tinio-server integration
+
+- `backend/select.rs`: `op_select_object_content(req)` —
+  1. Validate — request-level 400 for every failure below, before any streaming (review 2026-09-05); the checks that need the object size run after step 2's fetch, against the `GetObjectResult.info.size` it returns, still before a body byte is consumed (review 2026-09-05b: the earlier `head_object` round trip is gone): `ExpressionType == SQL` and the SQL parses + grammar-validates against the covered grammar (`sql.rs`, run here request-level — `select_iter` receives the pre-built `QueryPlan`; rejected constructs map to the §3 row-1 code); exactly one of CSV/JSON/Parquet in InputSerialization; exactly one of CSV/JSON in OutputSerialization; Parquet ⇒ `CompressionType == NONE`; Parquet ⇒ no `ScanRange` (row-group positions are meaningless for it; review 2026-09-05 #6); `ScanRange` ⇒ `CompressionType == NONE` and fully checked: `Start`/`End` non-negative; `Start`-only ⇒ `[Start, size-1]`; both given ⇒ `Start ≤ End` and `End < size`; `End`-only ⇒ the trailing bytes `[size-End, size-1]`, requiring `End ≥ 1` and `End ≤ size` — all size arithmetic is checked, so an out-of-range or underflowing window (e.g. `End > size`) errors 400 instead of wrapping or panicking; delimiter/quote characters single-byte; Parquet ⇒ object size ≤ `max_parquet_bytes` (default 256 MiB, `SelectConfig`-configurable; same size source as the ScanRange checks); expression ≤ 256 KiB (AWS's documented expression limit; review 2026-09-05 #5); **alias rule scoped to JSON output only** (grilling Q6, review 2026-09-05): a bare-expression projection needs an alias when `OutputSerialization = JSON`; CSV output allows it (columns are positional). Known deviation (#7): `AllowQuotedRecordDelimiter = false` is **not enforced** — the `csv` crate cannot distinguish record delimiters inside quotes, so the permissive (AWS `true`) behavior applies in both cases, documented rather than silently guessed.
+  1b. **Concurrency cap** (review 2026-09-05 #4): the op takes a `tokio::sync::Semaphore` (default 4, documented constant) — a pile of concurrent selects cannot saturate tokio workers on top of the `spawn_blocking` isolation.
+  2. Fetch the object stream via the existing read path (same helper `op_get_object` uses; `NoSuchKey` etc. map as today) — `GetObjectResult.info` also carries the object `size` (u64), the single source for step 1's deferred size checks; one storage round trip total, no `head_object`.
+  3. Build `SelectConfig` from the dto; run the §1.1 bridge; return `SelectObjectContentEventStream::new(...)`.
+  4. Header-dependent checks (`AmbiguousFieldName`/`MissingHeaderName`) are **not** in this list — they surface as in-stream errors once the CSV header row is known (§3).
+- `s3.rs`: `#[cfg(feature = "select")] async fn select_object_content(...)` forwarding, next to the other gated impls.
+- `Cargo.toml`: `default = ["multipart", "copy", "list-v1", "list-v2", "select"]`; `select = ["dep:tinio-select"]`; `select-parquet = ["select", "tinio-select/parquet"]`.
+- `Capabilities` (`tinio-config/src/schema/s3.rs`): `select: bool`, default true; runtime off answers `NotImplemented` like the other groups.
+
+### §3 Errors
+
+| Failure | Where | Code |
+|---|---|---|
+| Expression parse error / rejected grammar / expression > 256 KiB | request | `S3QueryParsingError` (`Custom`, **`set_status_code(BAD_REQUEST)` — see Background**; review 2026-09-05 #2) |
+| bad serialization combination, delimiter/quote not single-byte, ScanRange violations, Parquet constraints, Parquet size bound exceeded, expressions ≠ SQL | request | `InvalidRequestParameter` (real variant, 400) |
+| projection expression missing an alias (JSON output only) | request | `InvalidRequestParameter` |
+| object missing / access | request | existing mapping (`NoSuchKey`, …) |
+| case-insensitive ambiguity | stream | `S3ErrorCode::AmbiguousFieldName` (real variant; status is fixed 200 in-stream) |
+| missing header | stream | `Custom("MissingHeaderName")` (no real s3s variant — review 2026-09-05b: the earlier muddled two-name phrasing fixed) |
+| malformed record, row-eval failure, nested value with CSV output, **input or output record > 1 MB** (review 2026-09-05 #3), precision overflow, LIKE/expression runtime limits | stream | `Custom("S3QueryError")` with detail message (grilling plan-Q2) |
+
+### §4 Testing
+
+- `tinio-select` unit tests per stage: parser accept/reject corpus (incl. JOIN/GROUP BY/subquery rejection); CSV reader edge cases (headers USE/IGNORE/NONE, comments, quoted-record-delimiter, `AllowQuotedRecordDelimiter`); JSON LINES/DOCUMENT; traversal incl. wildcard/missing/MISSING; engine (comparisons, LIKE with `%`/`_`/ESCAPE, IN, BETWEEN, IS NULL/MISSING, aggregates, LIMIT); events (1 MB record-boundary packing — whole records per event, never split, a near-1 MB record fills its own event; Progress cadence, Stats counters, empty input); compression round-trips (GZIP/BZIP2, incl. concatenated multi-member streams); ScanRange (start/end/both, record-boundary semantics).
+- tinio-server integration: `testutil` `S3Backend<MemoryStorage>` fixtures — assert the event sequence (payload bytes, Stats, End) for a set of queries; feature-combination builds (`no-default-features`, `select-parquet` builds the parquet modules).
+- cucumber e2e: new `select.feature`, `@fs` + `@mem`, queries from the AWS docs (`SELECT s._1, s._2 FROM S3Object s WHERE s._3 > 100`; `SELECT s.country, s.city FROM S3Object s WHERE s.city = 'Seattle'`; `SELECT count(*) FROM S3Object s`; GZIP CSV; LIMIT; parquet case tagged `@parquet` optionally). **Traceability**: `crates/tinio-e2e/tests/traceability.rs` cross-checks spec IDs ↔ feature tags — a new requirement ID (next FR number) must be registered in `specs/001-s3-local-server` contracts/checklists and mapped before `select.feature` lands, or the suite goes red (review 2026-09-05).
+- Known-deviation tests (review 2026-09-05): assert Progress/Cont cadence only at emit-point granularity (pull-driven — a slow consumer delays them; no wall-clock promises); parquet-over-bound → 400; `SELECT *` matrix rows (CSV→JSON keys, JSON→CSV encounter order via `preserve_order`, JSON→JSON `RawNumber` verbatim).
+- Bench (in scope, grilling Q7): a `criterion` benchmark in `tinio-select` over a ~100k-row CSV — full scan vs filtered scan, to validate the streaming path's throughput claim.
+
+## Implementation phases (plan detail follows)
+
+1. `sql.rs` parse/validate + engine skeleton (SELECT */WHERE/LIMIT over CSV).
+2. CSV input/output full options.
+3. JSON LINES + DOCUMENT.
+4. Aggregates; MISSING/empty-record semantics.
+5. `FROM S3Object[*].path` traversal (riskiest, isolated).
+6. GZIP/BZIP2 streaming decompression + ScanRange.
+7. `select-parquet` (projection pruning).
+8. tinio-server op + features + e2e + benches.
+
+## Resolved during grilling (2026-09-04)
+
+1. **LIKE case sensitivity** — grilling Q1: standard-SQL case-sensitive; MinIO cross-check is an implementation-time task, not a spec risk.
+2. **Progress cadence** — grilling Q2: 1 s / 1 MB, whichever first.
+3. **Stats/compression parity** — verified against AWS semantics: counters measure **uncompressed** bytes (decompression happens before evaluation; same basis as AWS Select billing).
+4. **s3s Custom-code emission** — verified in s3s `error/mod.rs`: `S3ErrorCode::as_str()` returns the `Custom` bytes verbatim, so `S3QueryError` / `AmbiguousFieldName` / `MissingHeaderName` appear exactly as desired in the XML code field.
+5. **Numeric precision** — grilling Q4 + user refinement 2026-09-04: `rust_decimal` (28-digit), precision-exceeded → in-stream error. Documented deviation vs AWS's 38-digit contract.
+6. **Parquet nested + CSV output** — grilling Q10: in-stream error.
+7. **Cont policy surface** — grilling Q9: `SelectConfig`-level knobs only; server default 5 s idle / 4096 records.
