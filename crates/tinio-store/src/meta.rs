@@ -6,9 +6,9 @@
 //! read paths never derive it.
 
 use redb::{ReadableTable, TableDefinition};
-use tinio_core::{checksum, etag::ETag, object};
 
 use crate::{
+    _core::{checksum, etag::ETag, object},
     error::Error,
     scan::{drain_pair, for_each_pair},
     table::{self, TableDef},
@@ -141,6 +141,44 @@ impl<'txn> table::Table<'txn, Def> {
             ),
         )?;
         Ok(())
+    }
+
+    /// Replace `key`'s tags element, preserving the row's other
+    /// elements. `Ok(None)` = no row; `Ok(Some(false))` = identical set
+    /// (no write); `Ok(Some(true))` = rewritten.
+    pub fn put_tags(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        tags: &object::Tags,
+    ) -> Result<Option<bool>, Error> {
+        self.rewrite_tags(bucket, key, tags)
+    }
+
+    /// Clear `key`'s tags element (idempotent). Same presence/change
+    /// outcome as [`Self::put_tags`].
+    pub fn clear_tags(&mut self, bucket: &str, key: &str) -> Result<Option<bool>, Error> {
+        self.rewrite_tags(bucket, key, &object::Tags::empty())
+    }
+
+    /// The object-row tags rewrite: fetch (self-healing), compare the
+    /// sets, and re-put the whole row with the new element — the other
+    /// elements ride untouched, and nothing is created for a missing row.
+    fn rewrite_tags(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        tags: &object::Tags,
+    ) -> Result<Option<bool>, Error> {
+        let Some(mut stored) = self.get(bucket, key)? else {
+            return Ok(None);
+        };
+        if stored.tags == *tags {
+            return Ok(Some(false));
+        }
+        stored.tags = tags.clone();
+        self.put(bucket, key, &stored)?;
+        Ok(Some(true))
     }
 
     /// Remove the entry for `key` (idempotent).

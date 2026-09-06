@@ -1070,7 +1070,7 @@ mod tests {
             storage::{BucketOps, MultipartOps, ObjectOps},
         },
         _mem::MemoryStorage,
-        _util::testing::body,
+        _util::testing::{body, tags},
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},
@@ -1972,7 +1972,7 @@ mod tests {
             .head_object(&bucket::name(&b).unwrap(), &object::key("big.bin").unwrap())
             .await
             .unwrap();
-        assert_eq!(head.tags.to_wire(), "env=prod&z=1");
+        assert_eq!(head.tags, tags! { env => prod, z => 1 });
     }
 
     #[tokio::test]

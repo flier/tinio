@@ -1929,3 +1929,61 @@ impl io::Write for SharedBuf {
         Ok(())
     }
 }
+
+/// Trusted-literal tag set (panics on invalid tags — tests and fixtures).
+///
+/// Ident keys/values stringify (`env => prod` → `env=prod`); a literal
+/// value keeps its spelling (`z => 1`, `env => "a-b"`).
+///
+/// # Examples
+///
+/// ```
+/// use tinio_util::testing::tags;
+///
+/// let t = tags! { env => prod };
+/// assert_eq!(t.iter().collect::<Vec<_>>(), [("env", "prod")]);
+/// let t = tags! { env => prod, z => 1 };
+/// assert_eq!(t.iter().collect::<Vec<_>>(), [("env", "prod"), ("z", "1")]);
+/// ```
+#[macro_export]
+macro_rules! tags {
+    () => {
+        $crate::_core::object::Tags::empty()
+    };
+    ($($key:ident => $value:tt),+ $(,)?) => {
+        $crate::_core::object::Tags::from_pairs([
+            $((
+                ::core::stringify!($key).to_string(),
+                $crate::tags!(@val $value),
+            )),+
+        ])
+        .expect("tags!: valid S3 tag set")
+    };
+    (@val $v:ident) => {
+        ::core::stringify!($v).to_string()
+    };
+    (@val $v:literal) => {
+        ::std::string::ToString::to_string(&$v)
+    };
+}
+pub use tags;
+
+#[cfg(test)]
+mod tags_tests {
+    use crate::_core::object::Tags;
+
+    /// The three arms: the empty set, ident stringification, and a
+    /// literal value keeping its spelling (the doc example covers idents
+    /// only — the quoted-literal arm is the one that breaks without the
+    /// `@val` two-arm split).
+    #[test]
+    fn builds_a_set_from_idents_literals_and_quoted_values() {
+        assert_eq!(tags! {}, Tags::empty());
+        assert_eq!(
+            tags! { env => prod, z => 1, label => "a-b" }
+                .iter()
+                .collect::<Vec<_>>(),
+            [("env", "prod"), ("label", "a-b"), ("z", "1")]
+        );
+    }
+}

@@ -5,6 +5,7 @@
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
+    _core::checksum,
     error::Error,
     scan::drain_pair,
     table::{self, TableDef},
@@ -30,27 +31,30 @@ impl<'txn, T> table::Table<'txn, Def, T>
 where
     T: ReadableTable<<Def as TableDef>::Key, <Def as TableDef>::Value>,
 {
-    /// The stored row: `(algorithm wire name, checksum-type wire name or
-    /// "")` (owned — the guard cannot outlive the closure).
-    pub fn get(&self, bucket: &str, upload_id: &str) -> Result<Option<(String, String)>, Error> {
+    /// The stored create-time spec. `None` is a missing row or a
+    /// domain-invalid wire (self-healing — the upload is served without
+    /// a spec, F07).
+    pub fn get(&self, bucket: &str, upload_id: &str) -> Result<Option<checksum::Upload>, Error> {
         Ok(self
             .0
             .get((bucket, upload_id))?
-            .map(|v| (v.value().0.to_string(), v.value().1.to_string())))
+            .and_then(|v| checksum::Upload::from_wire_opt(v.value().0, v.value().1)))
     }
 }
 
 impl<'txn> table::Table<'txn, Def> {
-    /// Insert or replace the upload's checksum spec.
+    /// Insert or replace the upload's checksum spec (encoded here).
     pub fn put(
         &mut self,
         bucket: &str,
         upload_id: &str,
-        algorithm: &str,
-        checksum_type: &str,
+        spec: &checksum::Upload,
     ) -> Result<(), Error> {
-        self.0
-            .insert((bucket, upload_id), (algorithm, checksum_type))?;
+        let (algorithm, checksum_type) = spec.to_wire();
+        self.0.insert(
+            (bucket, upload_id),
+            (algorithm.as_str(), checksum_type.as_str()),
+        )?;
         Ok(())
     }
 

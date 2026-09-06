@@ -1,7 +1,7 @@
-//! The shared-layer contract tests: the row self-heal rule, the state
-//! version/marker protocol, and the read-path decode — pinned here over a
-//! plain in-memory redb database (no tempdir, no `Handle`, no tokio), the
-//! home of the rules both backends share.
+//! The shared-layer contract tests: the row self-heal rule and the state
+//! version/marker protocol — pinned here over a plain in-memory redb
+//! database (no tempdir, no `Handle`, no tokio), the home of the rules
+//! both backends share.
 
 use redb::{Database, ReadableDatabase};
 
@@ -37,15 +37,6 @@ fn meta_validate_self_heals_every_element_independently() {
     .expect("the etag is valid, the row is served");
     assert!(healed.tags.is_empty());
     assert!(healed.checksum.is_none());
-}
-
-#[test]
-fn tags_from_wire_limited_self_heals() {
-    use tinio_core::object::Tags;
-    assert!(Tags::from_wire_limited("team=%zz&", 10).is_empty());
-    assert_eq!(Tags::from_wire_limited("a=b&c=d", 10).to_wire(), "a=b&c=d");
-    // The cap is enforced (the parse error self-heals to empty too).
-    assert!(Tags::from_wire_limited("k=1&k=2&k=3&k=4&k=5&k=6", 5).is_empty());
 }
 
 #[test]

@@ -7,6 +7,9 @@
 //! codecs — the parse-display-derived names). See
 //! `docs/superpowers/specs/2026-09-03-shared-store-table-layer-design.md`.
 
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+
 pub mod bucket;
 pub mod error;
 pub mod meta;

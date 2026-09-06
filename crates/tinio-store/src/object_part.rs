@@ -9,6 +9,7 @@
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
+    _core::checksum,
     error::Error,
     scan::drain_triple,
     table::{self, TableDef},
@@ -30,14 +31,28 @@ impl TableDef for Def {
 pub type Table<'txn, T = redb::Table<'txn, <Def as TableDef>::Key, <Def as TableDef>::Value>> =
     table::Table<'txn, Def, T>;
 
+/// One retained part of a completed object: part number, size, and the
+/// stored per-part checksum (`None` = none was computed, or the stored
+/// wire is domain-invalid — self-healing, F07).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// Part number (`1..=10000` at the API; the table stores `u32`).
+    pub part_number: u32,
+    /// Part size in bytes.
+    pub size: u64,
+    /// The stored per-part checksum (`None` when none, or when the stored
+    /// wire is domain-invalid — self-healing like the etag).
+    pub checksum: Option<checksum::Part>,
+}
+
 impl<'txn, T> table::Table<'txn, Def, T>
 where
     T: ReadableTable<<Def as TableDef>::Key, <Def as TableDef>::Value>,
 {
-    /// The key's rows in part-number order: `(part number, size,
-    /// algorithm wire name, base64 checksum value)` (owned — the guard
-    /// cannot outlive the closure).
-    pub fn list(&self, bucket: &str, key: &str) -> Result<Vec<(u32, u64, String, String)>, Error> {
+    /// The key's rows in part-number order (owned — the guard cannot
+    /// outlive the closure). A domain-invalid checksum wire self-heals
+    /// to `checksum: None` (F07 — the part is still listed).
+    pub fn list(&self, bucket: &str, key: &str) -> Result<Vec<Stored>, Error> {
         let mut out = Vec::new();
         for item in self.0.range((bucket, key, 0)..)? {
             let (k, v) = item?;
@@ -46,25 +61,27 @@ where
                 break;
             }
             let (size, algorithm, value) = v.value();
-            out.push((n, size, algorithm.to_string(), value.to_string()));
+            out.push(Stored {
+                part_number: n,
+                size,
+                checksum: checksum::Part::from_wire_opt(algorithm, value),
+            });
         }
         Ok(out)
     }
 }
 
 impl<'txn> table::Table<'txn, Def> {
-    /// Upsert one part row.
-    pub fn put(
-        &mut self,
-        bucket: &str,
-        key: &str,
-        part_number: u32,
-        size: u64,
-        algorithm: &str,
-        value: &str,
-    ) -> Result<(), Error> {
-        self.0
-            .insert((bucket, key, part_number), (size, algorithm, value))?;
+    /// Upsert one part row (encoded here).
+    pub fn put(&mut self, bucket: &str, key: &str, part: &Stored) -> Result<(), Error> {
+        let (algorithm, value) = match part.checksum.as_ref() {
+            Some(p) => p.to_wire(),
+            None => ("", ""),
+        };
+        self.0.insert(
+            (bucket, key, part.part_number),
+            (part.size, algorithm, value),
+        )?;
         Ok(())
     }
 

@@ -54,10 +54,10 @@ use crate::{
             group_and_paginate_unordered, uploads_order,
         },
     },
-    _store::{part, part_checksum, table::TableDef, upload, upload_checksum},
+    _store::{object_part, part, part_checksum, table::TableDef, upload, upload_checksum},
     _util::lockmap::{Guard, Map},
     Error,
-    database::{self, Handle, OBJECT_TAGS_MAX},
+    database::{self, Handle},
     fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
@@ -74,11 +74,11 @@ fn part_path(dir: &Path, n: u32) -> PathBuf {
 type PartLocks = Map<(String, String)>;
 
 /// One assembled part of a completed upload, as [`Store::complete`]
-/// returns it: `(part number, size, checksum row)` — the checksum row is
-/// the part's stored `PART_CHECKSUMS` row (`None` when the part was
-/// uploaded without one). The caller persists these into `OBJECT_PARTS`
-/// (spec 2026-08-31).
-pub(crate) type CompletedPartRow = (u32, u64, Option<(String, String)>);
+/// returns it: the [`object_part::Stored`] row — part number, size, and
+/// the stored per-part checksum (`None` when the part was uploaded
+/// without one, or the stored wire is domain-invalid). The caller
+/// persists these into `OBJECT_PARTS` (spec 2026-08-31).
+pub(crate) type CompletedPartRow = object_part::Stored;
 
 /// Delete one upload's `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/
 /// `PART_CHECKSUMS` rows in the caller's write transaction (`complete`
@@ -155,16 +155,16 @@ fn sort_uploads(uploads: &mut [MultipartUpload]) {
 /// Build a `MultipartUpload` from a stored `UPLOADS` row plus the
 /// `UPLOAD_CHECKSUMS` row (`None` = no checksum spec). Domain-invalid
 /// rows are skipped (`None` — self-healing; `list_uploads`/`walk_uploads`
-/// share this conversion); a domain-invalid tags wire heals to the empty
-/// set (the row's tags were validated before writing — garbage is
-/// treated as missing, like the invalid etag rows).
+/// share this conversion); a domain-invalid checksum wire heals to
+/// `None` at the checksum table (F07); a domain-invalid tags wire heals
+/// to the empty set at the uploads table.
 fn upload_from_row(
     bucket: &bucket::Name,
     upload_id: &str,
     key: &str,
     initiated_at: u64,
-    tags_wire: &str,
-    checksum_row: Option<(String, String)>,
+    tags: object::Tags,
+    checksum: Option<checksum::Upload>,
 ) -> Result<Option<MultipartUpload>, storage::Error> {
     let Ok(key) = object::key(key) else {
         return Ok(None);
@@ -177,24 +177,20 @@ fn upload_from_row(
         bucket: bucket.clone(),
         key,
         initiated_at: from_nanos(initiated_at),
-        // A domain-invalid checksum row self-heals: the upload is served
-        // without a spec (F07) — the invalid ETag rows are skipped the
-        // same way, and a hard error here would also kill the multipart
-        // sweep (walk_uploads) forever.
-        checksum: checksum_row.and_then(|(algo, ty)| checksum::Upload::from_wire_opt(&algo, &ty)),
-        tags: object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
+        checksum,
+        tags,
     }))
 }
 
 /// One materialized upload row of the listings: `(bucket, upload_id,
-/// key, initiated_at, tags wire, checksum_row)`.
+/// key, initiated_at, tags, checksum)`.
 type UploadRow = (
     bucket::Name,
     String,
     String,
     u64,
-    String,
-    Option<(String, String)>,
+    object::Tags,
+    Option<checksum::Upload>,
 );
 
 /// The bucket's raw `UPLOADS` rows joined with each upload's checksum row
@@ -218,14 +214,14 @@ fn materialize_upload_rows(
     let mut rows = Vec::new();
     table.for_bucket(
         bucket.as_ref().as_str(),
-        |upload_id, (key, initiated_at, tags_wire)| {
+        |upload_id, (key, initiated_at, tags)| {
             let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id)?;
             rows.push((
                 bucket.clone(),
                 upload_id.to_string(),
                 key.to_string(),
                 initiated_at,
-                tags_wire.to_string(),
+                tags,
                 checksum_row,
             ));
             Ok(())
@@ -239,15 +235,8 @@ fn materialize_upload_rows(
 fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, storage::Error> {
     rows.into_iter()
         .map(
-            |(bucket, upload_id, key, initiated_at, tags_wire, checksum_row)| {
-                upload_from_row(
-                    &bucket,
-                    &upload_id,
-                    &key,
-                    initiated_at,
-                    &tags_wire,
-                    checksum_row,
-                )
+            |(bucket, upload_id, key, initiated_at, tags, checksum_row)| {
+                upload_from_row(&bucket, &upload_id, &key, initiated_at, tags, checksum_row)
             },
         )
         .collect::<Result<Vec<_>, _>>()
@@ -400,22 +389,13 @@ impl Store {
         let key = key.clone();
         let upload_id = upload.upload_id.clone();
         let initiated_at = upload.initiated_at;
-        // The wire names are owned into the closure (a `&'static str` row
-        // needs owned strings); `""` marks a checksum type that was never
-        // fixed; the tags wire is the canonical `to_wire` form.
-        let checksum_row = checksum.map(|c| c.to_wire());
-        let tags_wire = tags.to_wire();
+        let tags = tags.clone();
+        let checksum = checksum.clone();
         self.handle
             .write(move |txn| {
-                upload::Table::open(txn)?.put(
-                    &bucket,
-                    &upload_id,
-                    &key,
-                    initiated_at,
-                    &tags_wire,
-                )?;
-                if let Some((algo, ty)) = checksum_row {
-                    upload_checksum::Table::open(txn)?.put(&bucket, &upload_id, &algo, &ty)?;
+                upload::Table::open(txn)?.put(&bucket, &upload_id, &key, initiated_at, &tags)?;
+                if let Some(spec) = &checksum {
+                    upload_checksum::Table::open(txn)?.put(&bucket, &upload_id, spec)?;
                 }
                 Ok(())
             })
@@ -440,24 +420,24 @@ impl Store {
             .read(move |txn| {
                 let uploads = upload::Table::open_readonly(txn)?;
                 // One lookup: the row, present only when it records `key`.
-                let Some((stored_key, initiated_at, tags_wire)) =
+                let Some((stored_key, initiated_at, tags)) =
                     uploads.get_matching(&bucket_txn, &key, &upload_id_owned)?
                 else {
                     return Ok(None);
                 };
                 let checksum_row = upload_checksum::Table::open_readonly(txn)?
                     .get(bucket_txn.as_ref().as_str(), &upload_id_owned)?;
-                Ok(Some((stored_key, initiated_at, tags_wire, checksum_row)))
+                Ok(Some((stored_key, initiated_at, tags, checksum_row)))
             })
             .map_err(Error::from)?;
-        let (stored_key, initiated_at, tags_wire, checksum_row) =
+        let (stored_key, initiated_at, tags, checksum_row) =
             found.ok_or_else(|| storage::no_such_upload(upload_id))?;
         upload_from_row(
             bucket,
             upload_id,
             &stored_key,
             initiated_at,
-            &tags_wire,
+            tags,
             checksum_row,
         )?
         .ok_or_else(|| storage::no_such_upload(upload_id).into())
@@ -589,20 +569,12 @@ impl Store {
                 // previous upload of this part number (it would corrupt
                 // the Complete composition).
                 let mut checksums = part_checksum::Table::open(txn)?;
-                match checksum_txn.as_ref().and_then(|c| c.digest.get()) {
-                    Some(part) => {
-                        checksums.put(
-                            &bucket,
-                            &upload_id_owned,
-                            n,
-                            &part.algorithm.to_string(),
-                            part.value.as_str(),
-                        )?;
-                    }
-                    None => {
-                        checksums.remove(&bucket, &upload_id_owned, n)?;
-                    }
-                }
+                checksums.set(
+                    &bucket,
+                    &upload_id_owned,
+                    n,
+                    checksum_txn.as_ref().and_then(|c| c.digest.get()),
+                )?;
                 Ok(true)
             })
             .await
@@ -686,12 +658,11 @@ impl Store {
                 };
                 let (recorded, truncated) = part::Table::open_readonly(txn)?
                     .list_from(bucket, upload_id, start, max_parts)?;
-                // Join the `PART_CHECKSUMS` row of each part (raw
-                // `(algorithm, value)` wire names; pass 2 parses them).
-                // Probed once per page: an upload with no checksum rows
-                // at all (the checksum feature off ⇒ the table is
-                // guaranteed empty) skips the per-part point reads —
-                // one probe read instead of one per part (F03).
+                // Join the `PART_CHECKSUMS` row of each part. Probed once
+                // per page: an upload with no checksum rows at all (the
+                // checksum feature off ⇒ the table is guaranteed empty)
+                // skips the per-part point reads — one probe read instead
+                // of one per part (F03).
                 let checksums = part_checksum::Table::open_readonly(txn)?;
                 let checksums = part_checksum::Table::has_upload(
                     &checksums,
@@ -724,7 +695,7 @@ impl Store {
         let raw_last = page.last().map(|(n, _, _)| *n);
         // Pass 2: size/mtime from the part files of this page only.
         let mut parts = Vec::with_capacity(page.len());
-        for (n, hex, checksum_row) in page {
+        for (n, hex, checksum) in page {
             let Ok(etag) = ETag::new(&hex) else {
                 continue;
             };
@@ -736,11 +707,6 @@ impl Store {
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
-            // A domain-invalid checksum row self-heals: the part is
-            // listed without a checksum (F07 — the invalid ETag rows are
-            // skipped the same way).
-            let checksum =
-                checksum_row.and_then(|(algo, value)| checksum::Part::from_wire_opt(&algo, value));
             parts.push(PartInfo {
                 part_number: n.into(),
                 size: metadata.len(),
@@ -905,11 +871,11 @@ impl Store {
             // and the joined checksum row (the upload's drain removes the
             // `PART_CHECKSUMS` rows at completion — the retained list
             // must be captured before that).
-            part_rows.push((
-                n,
-                metadata.len(),
-                records.get(&n).and_then(|(_, c)| c.clone()),
-            ));
+            part_rows.push(object_part::Stored {
+                part_number: n,
+                size: metadata.len(),
+                checksum: records.get(&n).and_then(|(_, c)| c.clone()),
+            });
         }
         // Assemble before consuming the upload (part files stay readable
         // until the delete). The bytes copied are hashed in the same
@@ -1215,7 +1181,7 @@ impl Store {
                 let table = upload::Table::open_readonly(txn)?;
                 let checksums = upload_checksum::Table::open_readonly(txn)?;
                 let mut rows = Vec::new();
-                table.for_each(|b, upload_id, key, initiated_at, tags_wire| {
+                table.for_each(|b, upload_id, key, initiated_at, tags| {
                     let Ok(bucket) = bucket::name(b) else {
                         return Ok(());
                     };
@@ -1225,7 +1191,7 @@ impl Store {
                         upload_id.to_string(),
                         key.to_string(),
                         initiated_at,
-                        tags_wire.to_string(),
+                        tags,
                         checksum_row,
                     ));
                     Ok(())
@@ -1249,6 +1215,8 @@ impl Store {
             .read(|txn| {
                 let table = upload::Table::open_readonly(txn)?;
                 let mut ids = HashSet::new();
+                // Membership only: tags/key are ignored — a live upload
+                // whose stored key fails validation must still count.
                 table.for_each(|bucket, upload_id, _, _, _| {
                     ids.insert((bucket.to_string(), upload_id.to_string()));
                     Ok(())
@@ -1605,74 +1573,6 @@ mod tests {
         assert!(
             upload_row.is_none() && part_row.is_none(),
             "abort must drain the checksum rows, got {upload_row:?} / {part_row:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn corrupt_checksum_spec_rows_self_heal() {
-        // F07: a domain-invalid UPLOAD_CHECKSUMS row must not fail the
-        // read paths — the upload still answers (checksum dropped),
-        // listings still list it, and the sweep keeps walking.
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store
-            .create(&b, &k, None, object::Tags::empty())
-            .await
-            .unwrap();
-        let b2 = b.clone();
-        let id = upload.upload_id.clone();
-        store
-            .handle
-            .write(move |txn| {
-                upload_checksum::Table::open(txn)?.put(&b2, &id, "BLAKE3", "")?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let got = store.get_upload(&b, &k, &upload.upload_id).await.unwrap();
-        assert!(got.checksum.is_none(), "get_upload drops the corrupt spec");
-        let listed = store.list_uploads(&b).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert!(listed[0].checksum.is_none());
-        let walked = store.walk_uploads().await.unwrap();
-        assert_eq!(walked.len(), 1, "the sweep keeps walking");
-    }
-
-    #[tokio::test]
-    async fn corrupt_part_checksum_rows_self_heal() {
-        // F07: a domain-invalid PART_CHECKSUMS row must not fail the
-        // listing — the part is listed without a checksum (the invalid
-        // ETag rows are skipped the same way).
-        let (_, store) = fixture();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("big.bin").unwrap();
-        let upload = store
-            .create(&b, &k, None, object::Tags::empty())
-            .await
-            .unwrap();
-        store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
-            .await
-            .unwrap();
-        let b2 = b.clone();
-        let id = upload.upload_id.clone();
-        store
-            .handle
-            .write(move |txn| {
-                part_checksum::Table::open(txn)?.put(&b2, &id, 1, "BLAKE3", "AAAA")?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let (parts, _, _) = store
-            .list_parts(&b, &k, &upload.upload_id, None, 10)
-            .await
-            .unwrap();
-        assert_eq!(parts.len(), 1);
-        assert!(
-            parts[0].checksum.is_none(),
-            "the corrupt row is dropped, the part is listed"
         );
     }
 

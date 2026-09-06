@@ -852,8 +852,8 @@ impl ObjectOps for FsStorage {
                     // another key's range delete in one transaction.
                     parts.remove_key(&bucket, &dst)?;
                     parts.remove_key(&bucket, &src)?;
-                    for (n, part_size, algorithm, value) in rows {
-                        parts.put(&bucket, &dst, n, part_size, &algorithm, &value)?;
+                    for row in rows {
+                        parts.put(&bucket, &dst, &row)?;
                     }
                     Ok(Some((row.etag, row.tags, row.checksum)))
                 })
@@ -1020,13 +1020,10 @@ impl ObjectOps for FsStorage {
             .map_err(Error::from)?;
         let parts = rows
             .into_iter()
-            .map(|(part_number, size, algorithm, value)| ObjectPart {
-                part_number: part_number.into(),
-                size,
-                // A domain-invalid checksum row self-heals: the part is
-                // served without a checksum (F07 — the `""` algorithm of
-                // a checksum-less part parses to `None` the same way).
-                checksum: checksum::Part::from_wire_opt(&algorithm, value),
+            .map(|row| ObjectPart {
+                part_number: row.part_number.into(),
+                size: row.size,
+                checksum: row.checksum,
             })
             .collect();
         Ok(parts)

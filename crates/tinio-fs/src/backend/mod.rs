@@ -617,11 +617,11 @@ impl FsStorage {
     /// entry (with the completion's `tags` and the interface-computed
     /// composite `checksum` — the backends never hash, spec 2026-08-31),
     /// and persist the assembled parts into `OBJECT_PARTS` — the
-    /// completed object's retained part list, each row `(part number,
-    /// size, algorithm wire, base64 checksum value)`; `parts` is
-    /// `Store::complete`'s assembled rows (in part-number order), and
-    /// any stale rows of the key are replaced (an overwriting completion
-    /// leaves only its own parts). ONE write transaction
+    /// completed object's retained part list (`object_part::Stored`);
+    /// `parts` is `Store::complete`'s assembled rows (in part-number
+    /// order), and any stale rows of the key are replaced (an
+    /// overwriting completion leaves only its own parts). ONE write
+    /// transaction
     /// (meta-redb-spec §5.3 — rename, then a single all-or-nothing state
     /// transaction). Idempotent: on a retry after a crash before this
     /// call the records are still there and get deleted; a concurrent
@@ -658,11 +658,9 @@ impl FsStorage {
                 // garbage wire self-heals to the empty set.
                 let tags = {
                     let uploads = upload::Table::open(txn)?;
-                    let tags_wire = uploads
-                        .get_matching(&bucket, &key, &upload_id)?
-                        .map_or_else(String::new, |(_, _, wire)| wire);
-                    object::Tags::parse_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
-                        .unwrap_or_default()
+                    uploads
+                        .tags(&bucket, &key, &upload_id)?
+                        .unwrap_or_else(object::Tags::empty)
                 };
                 drain_upload(txn, &bucket, &upload_id)?;
                 {
@@ -686,12 +684,8 @@ impl FsStorage {
                     // re-completed key must not accumulate rows).
                     let mut parts_table = object_part::Table::open(txn)?;
                     parts_table.remove_key(&bucket, &key)?;
-                    for (n, part_size, checksum_row) in &parts {
-                        let (algorithm, value) = match checksum_row {
-                            Some((algorithm, value)) => (algorithm.as_str(), value.as_str()),
-                            None => ("", ""),
-                        };
-                        parts_table.put(&bucket, &key, *n, *part_size, algorithm, value)?;
+                    for part in parts {
+                        parts_table.put(&bucket, &key, &part)?;
                     }
                 }
                 Ok(tags)

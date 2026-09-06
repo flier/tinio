@@ -214,19 +214,25 @@ impl PartChecksum {
 }
 
 impl Part {
+    /// The persisted row: `(algorithm wire name, base64 value)`.
+    pub fn to_wire(&self) -> (&str, &str) {
+        (self.algorithm.wire_name(), self.value.as_str())
+    }
+
     /// Parse a persisted part-checksum row: the algorithm wire name and
-    /// the base64 value (the backends store the wire strings untouched).
-    pub fn from_wire(algo: &str, value: String) -> Result<Self, storage::Error> {
+    /// the base64 value (the store tables persist the wire strings
+    /// untouched).
+    pub fn from_wire(algo: &str, value: &str) -> Result<Self, storage::Error> {
         Ok(Self {
             algorithm: algorithm(algo)?,
-            value: Value(value),
+            value: Value(value.to_string()),
         })
     }
 
     /// The row-decode form of a read path (F07): a domain-invalid row
     /// self-heals (`None` — the part is served without a checksum, like
     /// the invalid ETag rows) instead of failing the listing.
-    pub fn from_wire_opt(algo: &str, value: String) -> Option<Self> {
+    pub fn from_wire_opt(algo: &str, value: &str) -> Option<Self> {
         Self::from_wire(algo, value).ok()
     }
 }
@@ -280,7 +286,7 @@ impl Recorded {
         let (algorithm, rest) = wire.split_once(':')?;
         let (value, kind) = rest.split_once(':')?;
         Some(Self {
-            part: Part::from_wire_opt(algorithm, value.to_string())?,
+            part: Part::from_wire_opt(algorithm, value)?,
             kind: kind.parse().ok()?,
         })
     }
@@ -317,6 +323,18 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+
+    #[test]
+    fn part_wire_round_trips() {
+        let part = Part {
+            algorithm: Algorithm::Crc32,
+            value: Value("AA==".into()),
+        };
+        let (algo, value) = part.to_wire();
+        assert_eq!(Part::from_wire_opt(algo, value), Some(part));
+        assert!(Part::from_wire_opt("", "").is_none());
+        assert!(Part::from_wire_opt("BLAKE3", "AAAA").is_none());
+    }
 
     #[test]
     fn recorded_wire_round_trips() {

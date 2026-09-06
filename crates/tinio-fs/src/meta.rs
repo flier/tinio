@@ -569,20 +569,10 @@ impl Store {
         let tags = tags.clone();
         self.handle
             .write_if(move |txn| {
-                let mut table = meta::Table::open(txn)?;
-                let Some(row) = table.get(&bucket, &key)? else {
-                    // Nothing to change — no commit (no fsync).
-                    return Ok(None);
-                };
-                table.put(
-                    &bucket,
-                    &key,
-                    &meta::Stored {
-                        tags: tags.clone(),
-                        ..row
-                    },
-                )?;
-                Ok(Some(()))
+                Ok(meta::Table::open(txn)?
+                    .put_tags(&bucket, &key, &tags)?
+                    .is_some()
+                    .then_some(()))
             })
             .await
             .map(|wrote| wrote.is_some())
@@ -642,29 +632,17 @@ impl Store {
     }
 
     /// Clear the stored tag set of `key`, preserving the row's other
-    /// elements (idempotent — a missing row is a no-op).
+    /// elements (idempotent — a missing row is a no-op, and an
+    /// already-empty set commits nothing).
     pub async fn clear_tags(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
         let bucket = bucket.clone();
         let key = key.clone();
         self.handle
             .write_if(move |txn| {
-                let mut table = meta::Table::open(txn)?;
-                let Some(row) = table.get(&bucket, &key)? else {
-                    // Nothing to change — no commit (no fsync).
-                    return Ok(None);
-                };
-                if row.tags.is_empty() {
-                    return Ok(None);
-                }
-                table.put(
-                    &bucket,
-                    &key,
-                    &meta::Stored {
-                        tags: object::Tags::empty(),
-                        ..row
-                    },
-                )?;
-                Ok(Some(()))
+                Ok(meta::Table::open(txn)?
+                    .clear_tags(&bucket, &key)?
+                    .unwrap_or(false)
+                    .then_some(()))
             })
             .await
             .map(|_| ())
@@ -1053,6 +1031,78 @@ mod tests {
             store.etag_matching(&b, &k, 10, mtime(42), 0).await.unwrap(),
             Some(e)
         );
+    }
+
+    #[tokio::test]
+    async fn set_tags_rewrites_the_element_and_reports_no_update_on_missing() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        // A missing row: no update — the caller heals the row first
+        // (ensure_tags) and the bool answers "row was not updated".
+        assert!(!store.set_tags(&b, &k, &tags).await.unwrap());
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                3,
+                mtime(1),
+                7,
+            )
+            .await
+            .unwrap();
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+        assert_eq!(store.tags(&b, &k).await.unwrap(), tags);
+        // The row's other elements ride the rewrite.
+        let row = store
+            .load_entries(&b, [k.clone()].iter())
+            .await
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        assert_eq!(row.size, 3);
+        assert_eq!(row.file_identity, 7);
+        // An identical set still reports an update: the bool is the
+        // "row exists" probe of [`Self::ensure_tags`] (it short-circuits
+        // the hash-heal), and the table's change-detection already
+        // skipped the row write.
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_tags_is_idempotent_and_preserves_the_row() {
+        let state = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        // A missing row: no-op.
+        store.clear_tags(&b, &k).await.unwrap();
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        store
+            .set(
+                &b,
+                &k,
+                &etag("d41d8cd98f00b204e9800998ecf8427e"),
+                3,
+                mtime(1),
+                7,
+            )
+            .await
+            .unwrap();
+        store.set_tags(&b, &k, &tags).await.unwrap();
+        store.clear_tags(&b, &k).await.unwrap();
+        assert!(store.tags(&b, &k).await.unwrap().is_empty());
+        let row = store
+            .load_entries(&b, [k.clone()].iter())
+            .await
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        assert_eq!(row.size, 3, "the clear keeps the row's other elements");
+        store.clear_tags(&b, &k).await.unwrap(); // idempotent
     }
 
     #[tokio::test]

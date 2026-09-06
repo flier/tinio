@@ -1,9 +1,9 @@
 //! `(bucket, upload_id, part_number)` → etag hex.
 
 use redb::{ReadableTable, TableDefinition};
-use tinio_core::etag::ETag;
 
 use crate::{
+    _core::etag::ETag,
     error::Error,
     scan::drain_triple,
     table::{self, TableDef},

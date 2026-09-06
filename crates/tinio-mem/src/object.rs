@@ -39,32 +39,20 @@ pub struct StagedBody {
 impl MemoryStorage {
     /// The tag-write transaction of the object trio — the shared body of
     /// `put_object_tags` and `delete_object_tags` (the bucket and key
-    /// gates stay in the ops): one read-modify-write transaction
-    /// replaces the row's tags element with `tags_wire`, keeping the
-    /// row's other elements (etag, size, mtime, recorded checksum)
-    /// verbatim. Returns whether the row existed (a missing row commits
-    /// nothing — nothing changed).
+    /// gates stay in the ops): the table accessor replaces the row's
+    /// tags element, keeping the row's other elements (etag, size,
+    /// mtime, recorded checksum) verbatim. Returns whether the row
+    /// existed (a missing row commits nothing — nothing changed).
     async fn rewrite_tags_element(
         &self,
         bucket: &Name,
         key: &object::Key,
-        tags_wire: &str,
+        tags: &object::Tags,
     ) -> Result<bool, Error> {
         self.db.write(|txn| -> Result<bool, Error> {
-            let mut meta = meta::Table::open(txn)?;
-            let Some(stored) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
-                return Ok(false);
-            };
-            // The row's other elements (etag, size, mtime, file identity,
-            // recorded checksum) survive the tag write verbatim; only the
-            // tags element is replaced. The row re-encodes canonically
-            // via the shared `meta::Stored` codecs — the caller's tags wire
-            // is interface-written (canonical), and a domain-invalid wire
-            // self-heals to empty, like every read path.
-            let mut stored = stored;
-            stored.tags = object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX);
-            meta.put(bucket.as_ref().as_str(), key.as_ref().as_str(), &stored)?;
-            Ok(true)
+            Ok(meta::Table::open(txn)?
+                .put_tags(bucket.as_ref().as_str(), key.as_ref().as_str(), tags)?
+                .is_some())
         })
     }
 
@@ -463,8 +451,8 @@ impl ObjectOps for MemoryStorage {
                 // range delete in one transaction.
                 parts.remove_key(b, dst_key)?;
                 parts.remove_key(b, src_key)?;
-                for (n, part_size, algorithm, value) in rows {
-                    parts.put(b, dst_key, n, part_size, &algorithm, &value)?;
+                for row in rows {
+                    parts.put(b, dst_key, &row)?;
                 }
             }
             Ok(object::Info {
@@ -521,10 +509,7 @@ impl ObjectOps for MemoryStorage {
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
-        if !self
-            .rewrite_tags_element(bucket, key, &tags.to_wire())
-            .await?
-        {
+        if !self.rewrite_tags_element(bucket, key, tags).await? {
             return Err(no_such_key(key));
         }
         Ok(())
@@ -537,7 +522,8 @@ impl ObjectOps for MemoryStorage {
         if !self.has_bucket(bucket)? {
             return Err(no_such_bucket(bucket));
         }
-        self.rewrite_tags_element(bucket, key, "").await?;
+        self.rewrite_tags_element(bucket, key, &object::Tags::empty())
+            .await?;
         Ok(())
     }
 
@@ -569,13 +555,10 @@ impl ObjectOps for MemoryStorage {
             let out = parts
                 .list(bucket.as_ref().as_str(), key.as_ref().as_str())?
                 .into_iter()
-                .map(|(part_number, size, algorithm, value)| ObjectPart {
-                    part_number: part_number.into(),
-                    size,
-                    // A domain-invalid checksum row self-heals: the part is
-                    // served without a checksum (the `""` algorithm of a
-                    // checksum-less part parses to `None` the same way).
-                    checksum: checksum::Part::from_wire_opt(&algorithm, value),
+                .map(|row| ObjectPart {
+                    part_number: row.part_number.into(),
+                    size: row.size,
+                    checksum: row.checksum,
                 })
                 .collect();
             Ok(out)
@@ -1089,65 +1072,6 @@ mod tests {
             .await
             .unwrap();
         assert!(head.checksum.is_none());
-    }
-
-    #[tokio::test]
-    async fn mem_garbage_meta_elements_self_heal() {
-        // The read-side tolerance ruling: a stored row whose tags /
-        // checksum elements are domain-invalid serves empty / `None`
-        // (mirroring the fs `parse_wire_limited` discipline) — the row is
-        // still served. Rows are API-written; the garbage below is a
-        // direct database write (tampering).
-        let (storage, b) = with_bucket().await;
-        let k = object::key("g.txt").unwrap();
-        {
-            let mut txn = storage.db.db().begin_write().unwrap();
-            let bucket_str = b.as_ref().as_str();
-            let key_str = k.as_ref().as_str();
-            let etag = ETag::from_content(b"x");
-            let etag_str = etag.as_str();
-            // The 6-tuple row decodes through the shared `meta::validate`
-            // with the self-heal semantics (garbage tags/checksum →
-            // empty/None; file identity carried as 0).
-            let decoded = meta::validate((
-                etag_str.as_str(),
-                1u64,
-                0u64,
-                0u64,
-                "env=%zz",
-                "CRC32:AA==:NOPE",
-            ))
-            .unwrap();
-            assert!(decoded.tags.is_empty());
-            assert!(decoded.checksum.is_none());
-            meta::Table::open(&mut txn)
-                .unwrap()
-                .insert(
-                    (bucket_str, key_str),
-                    (
-                        etag_str.as_str(),
-                        1u64,
-                        crate::_core::now_nanos(),
-                        0u64,
-                        "env=%zz",
-                        "CRC32:AA==:NOPE",
-                    ),
-                )
-                .unwrap();
-            objects::Table::open(&mut txn)
-                .unwrap()
-                .put(bucket_str, key_str, b"x")
-                .unwrap();
-            txn.commit().unwrap();
-        }
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(head.size, 1);
-        assert!(head.tags.is_empty(), "garbage tags wire serves empty");
-        assert!(head.checksum.is_none(), "garbage checksum wire serves None");
-        assert!(storage.get_object_tags(&b, &k).await.unwrap().is_empty());
-        let get = storage.get_object(&b, &k, None).await.unwrap();
-        assert!(get.info.tags.is_empty());
-        assert!(get.info.checksum.is_none());
     }
 
     #[tokio::test]

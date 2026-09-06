@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use redb::{Database, TableDefinition};
 use tinio_core::{
-    checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Value},
+    checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Upload, Value},
     cors,
     etag::ETag,
     object::{self, Tags},
@@ -185,6 +185,78 @@ fn bucket_cors_accessors_round_trip_and_self_heal() {
     .unwrap();
 }
 
+#[test]
+fn bucket_tags_accessors_round_trip_and_self_heal() {
+    let h = handle();
+    let now = SystemTime::UNIX_EPOCH;
+    let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = bucket::Table::open(txn)?;
+        // Missing row: None; writes are no-ops.
+        assert!(t.tags("data")?.is_none());
+        assert!(t.put_tags("data", &tags)?.is_none());
+        assert!(t.clear_tags("data")?.is_none());
+        t.put("data", now)?;
+        // Fresh row: present, empty set.
+        assert_eq!(t.tags("data")?, Some(Tags::empty()));
+        assert_eq!(t.put_tags("data", &tags)?, Some(true));
+        assert_eq!(t.tags("data")?, Some(tags.clone()));
+        // Identical put skips the write.
+        assert_eq!(t.put_tags("data", &tags)?, Some(false));
+        // Empty set normalizes to the '' wire.
+        assert_eq!(t.put_tags("data", &Tags::empty())?, Some(true));
+        assert_eq!(t.tags("data")?, Some(Tags::empty()));
+        t.put_tags("data", &tags)?;
+        assert_eq!(t.clear_tags("data")?, Some(true));
+        assert_eq!(t.tags("data")?, Some(Tags::empty()));
+        assert_eq!(t.clear_tags("data")?, Some(false));
+        Ok(())
+    })
+    .unwrap();
+    // A garbage tags wire self-heals on the table accessor.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        bucket::Table::open(txn)?
+            .insert("data", (0u64, "team=%zz&", "", "", ""))
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert_eq!(
+            bucket::Table::open_readonly(txn)?.tags("data")?,
+            Some(Tags::empty()),
+            "a corrupt tags wire is the empty set"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn bucket_put_tags_or_create_records_the_first_sight_row() {
+    let h = handle();
+    let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    let zero = SystemTime::UNIX_EPOCH;
+    let later = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = bucket::Table::open(txn)?;
+        // Row-miss: ONE upsert records the creation time AND the tags
+        // (the fs first-sight policy, replacing the old put + re-rewrite).
+        assert!(t.put_tags_or_create("data", &tags, zero)?);
+        assert_eq!(t.get("data")?, Some(zero));
+        assert_eq!(t.tags("data")?, Some(tags.clone()));
+        // Existing row: tags replaced, the recorded creation time kept.
+        let new_tags = Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        assert!(t.put_tags_or_create("data", &new_tags, later)?);
+        assert_eq!(t.get("data")?, Some(zero));
+        assert_eq!(t.tags("data")?, Some(new_tags.clone()));
+        // Identical set: no write.
+        assert!(!t.put_tags_or_create("data", &new_tags, later)?);
+        Ok(())
+    })
+    .unwrap();
+}
+
 /// The on-disk format guard (final-review F2, no-migration ruling): a
 /// `buckets` table written under a LEGACY tuple arity must NOT open under
 /// the current 5-tuple definition. redb binds the key/value type names at
@@ -284,6 +356,42 @@ fn object_meta_put_round_trips_all_elements() {
 }
 
 #[test]
+fn object_meta_get_self_heals_garbage_tags_and_checksum() {
+    let h = handle();
+    let key = object::key("g.txt").unwrap();
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        meta::Table::open(txn)?
+            .insert(
+                ("data", key.as_ref().as_str()),
+                (
+                    "d41d8cd98f00b204e9800998ecf8427e",
+                    1u64,
+                    0u64,
+                    0u64,
+                    "env=%zz",
+                    "CRC32:AA==:NOPE",
+                ),
+            )
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        let got = meta::Table::open_readonly(txn)?
+            .get("data", &key)?
+            .expect("a valid etag keeps the row");
+        assert!(got.tags.is_empty(), "a corrupt tags wire is the empty set");
+        assert!(
+            got.checksum.is_none(),
+            "a corrupt checksum wire is no checksum"
+        );
+        assert_eq!(got.size, 1);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn object_meta_walk_self_heals_a_corrupt_etag_row() {
     let h = handle();
     let valid = meta::Stored {
@@ -328,6 +436,87 @@ fn object_meta_walk_self_heals_a_corrupt_etag_row() {
 }
 
 #[test]
+fn object_meta_tag_accessors_rewrite_only_the_element() {
+    let h = handle();
+    let key = object::key("a.txt").unwrap();
+    let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    let stored = meta::Stored {
+        etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+        size: 3,
+        mtime: 1,
+        file_identity: 2,
+        tags: Tags::empty(),
+        checksum: None,
+    };
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = meta::Table::open(txn)?;
+        // Missing row: no presence outcome, nothing created.
+        assert!(t.put_tags("data", &key, &tags)?.is_none());
+        assert!(t.clear_tags("data", &key)?.is_none());
+        t.put("data", &key, &stored)?;
+        // Set rewrites the tags element, the row's other elements ride.
+        assert_eq!(t.put_tags("data", &key, &tags)?, Some(true));
+        let got = t.get("data", &key)?.unwrap();
+        assert_eq!(got.tags, tags);
+        assert_eq!(got.size, 3);
+        assert_eq!(got.etag, stored.etag);
+        // Identical set: no write.
+        assert_eq!(t.put_tags("data", &key, &tags)?, Some(false));
+        // Clear: true once, then the already-empty no-write.
+        assert_eq!(t.clear_tags("data", &key)?, Some(true));
+        assert_eq!(t.clear_tags("data", &key)?, Some(false));
+        assert!(t.get("data", &key)?.unwrap().tags.is_empty());
+        Ok(())
+    })
+    .unwrap();
+    // A corrupt tags wire self-heals on the read AND the put heals the
+    // row back to a clean wire (the row's etag stays valid throughout).
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = meta::Table::open(txn)?;
+        t.insert(
+            ("data", "a.txt"),
+            (
+                "d41d8cd98f00b204e9800998ecf8427e",
+                3u64,
+                1u64,
+                2u64,
+                "team=%zz&",
+                "",
+            ),
+        )
+        .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert!(
+            meta::Table::open_readonly(txn)?
+                .get("data", &key)?
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+        Ok(())
+    })
+    .unwrap();
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        assert_eq!(
+            meta::Table::open(txn)?.put_tags("data", &key, &tags)?,
+            Some(true)
+        );
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        let got = meta::Table::open_readonly(txn)?.get("data", &key)?.unwrap();
+        assert_eq!(got.tags, tags, "the rewrite normalized the corrupt wire");
+        assert_eq!(got.size, 3, "the other elements survived the heal");
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn objects_put_get_remove_and_has_bucket() {
     let h = handle();
     h.write(|txn| -> Result<(), tinio_store::Error> {
@@ -355,12 +544,13 @@ fn objects_put_get_remove_and_has_bucket() {
 fn upload_rows_key_match_bucket_scan_and_for_each() {
     let h = handle();
     let key = object::key("big.bin").unwrap();
+    let tags = Tags::from_pairs([("k".into(), "v".into())]).unwrap();
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = upload::Table::open(txn)?;
         assert!(!t.has_bucket("data")?);
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "k=v")?;
-        t.put("data", "u2", &key, SystemTime::UNIX_EPOCH, "")?;
-        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, "")?;
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags)?;
+        t.put("data", "u2", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
+        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
         assert!(t.has_bucket("data")?);
         Ok(())
     })
@@ -371,10 +561,10 @@ fn upload_rows_key_match_bucket_scan_and_for_each() {
         assert!(t.key_matches("data", &key, "u1")?);
         assert!(!t.key_matches("data", "wrong-key", "u1")?);
         assert!(!t.key_matches("data", &key, "u5")?);
-        let (got_key, initiated, tags) = t.get_matching("data", &key, "u1")?.unwrap();
+        let (got_key, initiated, got_tags) = t.get_matching("data", &key, "u1")?.unwrap();
         assert_eq!(got_key, &*key);
         assert_eq!(initiated, 0);
-        assert_eq!(tags, "k=v");
+        assert_eq!(got_tags, tags);
         assert!(t.get_matching("data", &key, "u5")?.is_none());
         // The bucket scan visits only this bucket's uploads, in key order.
         let mut ids = Vec::new();
@@ -403,6 +593,95 @@ fn upload_rows_key_match_bucket_scan_and_for_each() {
 }
 
 #[test]
+fn upload_tags_accessors_round_trip_and_self_heal() {
+    let h = handle();
+    let key = object::key("big.bin").unwrap();
+    let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = upload::Table::open(txn)?;
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags)?;
+        let (_, _, got) = t.get_matching("data", &key, "u1")?.unwrap();
+        assert_eq!(got, tags);
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
+        let (_, _, got) = t.get_matching("data", &key, "u1")?.unwrap();
+        assert!(got.is_empty());
+        Ok(())
+    })
+    .unwrap();
+    // A garbage tags wire self-heals on the table accessor.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        upload::Table::open(txn)?
+            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&"))
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        let t = upload::Table::open_readonly(txn)?;
+        let (_, _, tags) = t.get_matching("data", &key, "u1")?.unwrap();
+        assert!(
+            tags.is_empty(),
+            "a corrupt upload tags wire is the empty set"
+        );
+        t.for_bucket("data", |_, (_, _, tags)| {
+            assert!(tags.is_empty(), "the bucket scan self-heals the same way");
+            Ok(())
+        })?;
+        t.for_each(|_, _, _, _, tags| {
+            assert!(
+                tags.is_empty(),
+                "the whole-table walk self-heals the same way"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn upload_tags_accessor_answers_the_identity_check() {
+    let h = handle();
+    let key = object::key("big.bin").unwrap();
+    let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = upload::Table::open(txn)?;
+        // Missing row: None.
+        assert!(t.tags("data", &key, "u1")?.is_none());
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags)?;
+        // S3 identity is (bucket, key, uploadId): a matching key answers
+        // the tags, a mismatched key or upload id answers None (the
+        // caller's NoSuchUpload arm).
+        assert_eq!(t.tags("data", &key, "u1")?, Some(tags.clone()));
+        assert!(
+            t.tags("data", &object::key("other.bin").unwrap(), "u1")?
+                .is_none()
+        );
+        assert!(t.tags("data", &key, "u2")?.is_none());
+        Ok(())
+    })
+    .unwrap();
+    // A corrupt tags wire still answers Some (the upload exists) with the
+    // self-healed empty set.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        upload::Table::open(txn)?
+            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&"))
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert_eq!(
+            upload::Table::open_readonly(txn)?.tags("data", &key, "u1")?,
+            Some(Tags::empty()),
+            "a corrupt upload tags wire is the empty set"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn upload_drain_bucket_removes_only_the_bucket() {
     let h = handle();
     let key = object::key("k").unwrap();
@@ -410,8 +689,8 @@ fn upload_drain_bucket_removes_only_the_bucket() {
     // insert in the same txn trips a redb page-manager assertion).
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = upload::Table::open(txn)?;
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "")?;
-        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, "")?;
+        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
+        t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, &Tags::empty())?;
         Ok(())
     })
     .unwrap();
@@ -468,10 +747,52 @@ fn object_part_rows_list_in_order_and_remove_key() {
     let h = handle();
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = object_part::Table::open(txn)?;
-        t.put("data", "big.bin", 1, 100, "CRC32", "AA==")?;
-        t.put("data", "big.bin", 2, 200, "", "")?;
-        t.put("data", "big.bin", 3, 50, "SHA256", "BB==")?;
-        t.put("data", "other.bin", 1, 1, "", "")?;
+        t.put(
+            "data",
+            "big.bin",
+            &object_part::Stored {
+                part_number: 1,
+                size: 100,
+                checksum: Some(Part {
+                    algorithm: Algorithm::Crc32,
+                    value: Value("AA==".into()),
+                }),
+            },
+        )?;
+        t.put(
+            "data",
+            "big.bin",
+            &object_part::Stored {
+                part_number: 2,
+                size: 200,
+                checksum: None,
+            },
+        )?;
+        t.put(
+            "data",
+            "big.bin",
+            &object_part::Stored {
+                part_number: 3,
+                size: 50,
+                checksum: Some(Part {
+                    algorithm: Algorithm::Sha256,
+                    value: Value("BB==".into()),
+                }),
+            },
+        )?;
+        t.put(
+            "data",
+            "other.bin",
+            &object_part::Stored {
+                part_number: 1,
+                size: 1,
+                checksum: None,
+            },
+        )?;
+        // A garbage checksum wire self-heals: the part is listed without
+        // a checksum (F07).
+        t.insert(("data", "big.bin", 4), (10u64, "BLAKE3", "AA=="))
+            .map_err(tinio_store::Error::from)?;
         Ok(())
     })
     .unwrap();
@@ -481,9 +802,32 @@ fn object_part_rows_list_in_order_and_remove_key() {
         assert_eq!(
             rows,
             vec![
-                (1, 100, "CRC32".to_string(), "AA==".to_string()),
-                (2, 200, "".to_string(), "".to_string()),
-                (3, 50, "SHA256".to_string(), "BB==".to_string()),
+                object_part::Stored {
+                    part_number: 1,
+                    size: 100,
+                    checksum: Some(Part {
+                        algorithm: Algorithm::Crc32,
+                        value: Value("AA==".into()),
+                    }),
+                },
+                object_part::Stored {
+                    part_number: 2,
+                    size: 200,
+                    checksum: None,
+                },
+                object_part::Stored {
+                    part_number: 3,
+                    size: 50,
+                    checksum: Some(Part {
+                        algorithm: Algorithm::Sha256,
+                        value: Value("BB==".into()),
+                    }),
+                },
+                object_part::Stored {
+                    part_number: 4,
+                    size: 10,
+                    checksum: None,
+                },
             ]
         );
         // A different key's rows do not bleed in.
@@ -510,27 +854,84 @@ fn upload_checksum_and_part_checksum_rows() {
         {
             let mut uc = upload_checksum::Table::open(txn)?;
             assert!(uc.get("data", "u1")?.is_none());
-            uc.put("data", "u1", "CRC32", "FULL_OBJECT")?;
-            uc.put("data", "u1", "CRC32", "")?; // upsert replaces the type
+            uc.put(
+                "data",
+                "u1",
+                &Upload {
+                    algorithm: Algorithm::Crc32,
+                    r#type: Some(ChecksumType::FullObject),
+                },
+            )?;
+            uc.put(
+                "data",
+                "u1",
+                &Upload {
+                    algorithm: Algorithm::Crc32,
+                    r#type: None,
+                },
+            )?; // upsert replaces the type
         }
         let mut pc = part_checksum::Table::open(txn)?;
         assert!(!pc.has_upload("data", "u1")?);
-        pc.put("data", "u1", 1, "CRC32", "NhCmhg==")?;
-        pc.put("data", "u1", 2, "SHA256", "BB==")?;
+        pc.put(
+            "data",
+            "u1",
+            1,
+            &Part {
+                algorithm: Algorithm::Crc32,
+                value: Value("NhCmhg==".into()),
+            },
+        )?;
+        pc.put(
+            "data",
+            "u1",
+            2,
+            &Part {
+                algorithm: Algorithm::Sha256,
+                value: Value("BB==".into()),
+            },
+        )?;
         Ok(())
     })
     .unwrap();
     h.read(|txn| -> Result<(), tinio_store::Error> {
         let uc = upload_checksum::Table::open_readonly(txn)?;
-        assert_eq!(uc.get("data", "u1")?, Some(("CRC32".into(), "".into())));
+        assert_eq!(
+            uc.get("data", "u1")?,
+            Some(Upload {
+                algorithm: Algorithm::Crc32,
+                r#type: None,
+            })
+        );
         let pc = part_checksum::Table::open_readonly(txn)?;
         assert!(pc.has_upload("data", "u1")?);
         assert!(!pc.has_upload("data", "u2")?);
         assert_eq!(
             pc.get("data", "u1", 1)?,
-            Some(("CRC32".into(), "NhCmhg==".into()))
+            Some(Part {
+                algorithm: Algorithm::Crc32,
+                value: Value("NhCmhg==".into()),
+            })
         );
         assert!(pc.get("data", "u1", 3)?.is_none());
+        Ok(())
+    })
+    .unwrap();
+    // A garbage part-checksum wire self-heals on the table accessor.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        part_checksum::Table::open(txn)?
+            .insert(("data", "u1", 1), ("BLAKE3", "AAAA"))
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        let pc = part_checksum::Table::open_readonly(txn)?;
+        assert!(
+            pc.get("data", "u1", 1)?.is_none(),
+            "a corrupt part checksum wire is no checksum"
+        );
+        assert!(pc.has_upload("data", "u1")?, "the row itself remains");
         Ok(())
     })
     .unwrap();
@@ -545,6 +946,110 @@ fn upload_checksum_and_part_checksum_rows() {
         !h.read(|txn| part_checksum::Table::open_readonly(txn)?.has_upload("data", "u1"))
             .unwrap()
     );
+}
+
+#[test]
+fn part_checksum_set_replaces_and_clears_the_slot() {
+    let h = handle();
+    let part = Part {
+        algorithm: Algorithm::Crc32,
+        value: Value("NhCmhg==".into()),
+    };
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut pc = part_checksum::Table::open(txn)?;
+        // None on a missing row: a no-op (the part carried no checksum).
+        pc.set("data", "u1", 1, None)?;
+        // Some writes the digest.
+        pc.set("data", "u1", 1, Some(&part))?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert_eq!(
+            part_checksum::Table::open_readonly(txn)?.get("data", "u1", 1)?,
+            Some(part.clone())
+        );
+        Ok(())
+    })
+    .unwrap();
+    // The None arm clears the stale row from a previous upload of this
+    // part number (the digest-slot discipline, F-spec 2026-08-31).
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        part_checksum::Table::open(txn)?.set("data", "u1", 1, None)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        let pc = part_checksum::Table::open_readonly(txn)?;
+        assert!(pc.get("data", "u1", 1)?.is_none());
+        assert!(!pc.has_upload("data", "u1")?);
+        Ok(())
+    })
+    .unwrap();
+    // And the Some arm re-writes after the clear.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        part_checksum::Table::open(txn)?.set("data", "u1", 1, Some(&part))?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert_eq!(
+            part_checksum::Table::open_readonly(txn)?.get("data", "u1", 1)?,
+            Some(part)
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn upload_checksum_accessors_round_trip_and_self_heal() {
+    let h = handle();
+    let spec = Upload {
+        algorithm: Algorithm::Sha256,
+        r#type: Some(ChecksumType::FullObject),
+    };
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        let mut t = upload_checksum::Table::open(txn)?;
+        assert!(t.get("data", "u1")?.is_none());
+        t.put("data", "u1", &spec)?;
+        assert_eq!(t.get("data", "u1")?, Some(spec.clone()));
+        t.put(
+            "data",
+            "u1",
+            &Upload {
+                algorithm: Algorithm::Sha256,
+                r#type: None,
+            },
+        )?;
+        assert_eq!(
+            t.get("data", "u1")?,
+            Some(Upload {
+                algorithm: Algorithm::Sha256,
+                r#type: None,
+            })
+        );
+        Ok(())
+    })
+    .unwrap();
+    // A garbage spec wire self-heals on the table accessor.
+    h.write(|txn| -> Result<(), tinio_store::Error> {
+        upload_checksum::Table::open(txn)?
+            .insert(("data", "u1"), ("BLAKE3", ""))
+            .map_err(tinio_store::Error::from)?;
+        Ok(())
+    })
+    .unwrap();
+    h.read(|txn| -> Result<(), tinio_store::Error> {
+        assert!(
+            upload_checksum::Table::open_readonly(txn)?
+                .get("data", "u1")?
+                .is_none(),
+            "a corrupt upload checksum wire is no spec"
+        );
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]

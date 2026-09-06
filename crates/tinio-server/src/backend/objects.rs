@@ -1031,7 +1031,7 @@ mod tests {
     use crate::{
         _core::{bucket, checksum, storage::ObjectOps},
         _mem::MemoryStorage,
-        _util::testing::{body, read_body},
+        _util::testing::{body, read_body, tags},
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},
@@ -2416,7 +2416,7 @@ mod tests {
         // recorded checksum into the destination.
         copy("dst1.txt", None, None).await.unwrap();
         let info = head_object(&backend, &b, "dst1.txt").await;
-        assert_eq!(info.tags.to_wire(), "env=prod");
+        assert_eq!(info.tags, tags! { env => prod });
         let recorded = info.checksum.unwrap();
         assert_eq!(recorded.part.value.as_str(), "NhCmhg==");
         assert_eq!(recorded.kind, checksum::Type::FullObject);
@@ -2430,7 +2430,7 @@ mod tests {
         .await
         .unwrap();
         let info = head_object(&backend, &b, "dst2.txt").await;
-        assert_eq!(info.tags.to_wire(), "env=dev");
+        assert_eq!(info.tags, tags! { env => dev });
         assert_eq!(
             info.checksum.unwrap().part.value.as_str(),
             "NhCmhg==",

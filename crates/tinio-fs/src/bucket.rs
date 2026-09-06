@@ -19,7 +19,7 @@ use crate::{
     _core::{cors, object, storage::no_such_bucket},
     _store::bucket,
     Error,
-    database::{self, BUCKET_TAGS_MAX, Handle},
+    database::{self, Handle},
 };
 
 /// Bucket-name → creation-time store (`BUCKETS` table).
@@ -73,51 +73,27 @@ impl Store {
         let name = name.clone();
         self.handle
             .read(move |txn| {
-                let table = bucket::Table::open_readonly(txn)?;
-                let row = table.row(&name)?;
-                Ok(row.map_or_else(object::Tags::empty, |row| {
-                    object::Tags::from_wire_limited(&row.tags, BUCKET_TAGS_MAX)
-                }))
+                Ok(bucket::Table::open_readonly(txn)?
+                    .tags(&name)?
+                    .unwrap_or_else(object::Tags::empty))
             })
             .map_err(Into::into)
     }
 
     /// Replace the bucket's tag set, preserving the creation time and the
     /// other wire elements — one read-modify-write transaction (the row's
-    /// created-at is kept; a missing row is lazily recorded with `now`,
-    /// the first-sight policy of [`Self::get_or_record`]). The caller
-    /// answers `NoSuchBucket` for a missing bucket directory before
-    /// calling.
+    /// created-at is kept; a missing row is lazily recorded with `now`
+    /// AND the tag set, the first-sight policy of [`Self::get_or_record`]
+    /// in one write). The caller answers `NoSuchBucket` for a missing
+    /// bucket directory before calling.
     pub async fn set_tags(&self, name: &Name, tags: &object::Tags) -> Result<(), Error> {
         let name = name.clone();
         let tags = tags.clone();
-        let tags_wire = tags.to_wire();
         self.handle
             .write_if(move |txn| {
-                let mut table = bucket::Table::open(txn)?;
-                let Some(row) = table.row(&name)? else {
-                    // No row yet — the lazy first-sight record (a real
-                    // change: it creates the entry).
-                    table.put_full(
-                        &name,
-                        &bucket::BucketRow {
-                            tags: tags_wire,
-                            ..bucket::BucketRow::at(SystemTime::now())
-                        },
-                    )?;
-                    return Ok(Some(()));
-                };
-                if row.tags == tags_wire {
-                    return Ok(None);
-                }
-                table.put_full(
-                    &name,
-                    &bucket::BucketRow {
-                        tags: tags_wire,
-                        ..row
-                    },
-                )?;
-                Ok(Some(()))
+                Ok(bucket::Table::open(txn)?
+                    .put_tags_or_create(&name, &tags, SystemTime::now())?
+                    .then_some(()))
             })
             .await
             .map(|_| ())
@@ -132,22 +108,10 @@ impl Store {
         let name = name.clone();
         self.handle
             .write_if(move |txn| {
-                let mut table = bucket::Table::open(txn)?;
-                let Some(row) = table.row(&name)? else {
-                    // Nothing to change — no commit (no fsync).
-                    return Ok(None);
-                };
-                if row.tags.is_empty() {
-                    return Ok(None);
-                }
-                table.put_full(
-                    &name,
-                    &bucket::BucketRow {
-                        tags: String::new(),
-                        ..row
-                    },
-                )?;
-                Ok(Some(()))
+                Ok(match bucket::Table::open(txn)?.clear_tags(&name)? {
+                    Some(true) => Some(()),
+                    _ => None,
+                })
             })
             .await
             .map(|_| ())
@@ -438,21 +402,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fs_store_cors_empty_config_normalizes_to_no_config() {
-        // op-review G2: a zero-rule config stored through the backend must
-        // be indistinguishable from "no configuration" ('' wire → get → None).
-        let state = tempfile::tempdir().unwrap();
-        let store = bucket::store(state.path()).unwrap();
-        let name = bucket::name("data").unwrap();
-        store.record(&name, t(100)).await.unwrap();
-        store
-            .set_cors(&name, &cors::Config::default())
-            .await
-            .unwrap();
-        assert_eq!(store.cors(&name).await.unwrap(), None);
-    }
-
-    #[tokio::test]
     async fn fs_store_cors_missing_row_is_no_such_bucket_for_writes() {
         // The write accessors answer NoSuchBucket when the state row is
         // absent (a bucket that is not recorded cannot be configured); the
@@ -486,6 +435,73 @@ mod tests {
         // The read probe: no record = no configuration (a bucket without a
         // state row has no CORS configuration, never an error).
         assert_eq!(store.cors(&name).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn fs_store_set_tags_lazily_records_the_first_sight_row() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        // A pre-existing-but-unrecorded bucket: set_tags records the row
+        // WITH the tags in one write (the lazy first-sight policy).
+        store.set_tags(&name, &tags).await.unwrap();
+        assert_eq!(store.tags(&name).await.unwrap(), tags);
+        let created = store.created_at(&name).await.unwrap().unwrap();
+        assert!(created <= SystemTime::now());
+        // A later set replaces the tags; the recorded creation time rides.
+        let replaced = object::Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        store.set_tags(&name, &replaced).await.unwrap();
+        assert_eq!(store.tags(&name).await.unwrap(), replaced);
+        assert_eq!(store.created_at(&name).await.unwrap(), Some(created));
+    }
+
+    #[tokio::test]
+    async fn fs_store_clear_tags_is_idempotent_and_preserves_the_row() {
+        let state = tempfile::tempdir().unwrap();
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        // A row-less bucket: no-op (nothing to clear, nothing created).
+        store.clear_tags(&name).await.unwrap();
+        assert!(store.tags(&name).await.unwrap().is_empty());
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        store.set_tags(&name, &tags).await.unwrap();
+        let created = store.created_at(&name).await.unwrap().unwrap();
+        store.clear_tags(&name).await.unwrap();
+        assert!(store.tags(&name).await.unwrap().is_empty());
+        assert_eq!(
+            store.created_at(&name).await.unwrap(),
+            Some(created),
+            "the clear keeps the recorded creation time"
+        );
+        store.clear_tags(&name).await.unwrap(); // idempotent
+    }
+
+    #[tokio::test]
+    async fn fs_store_tags_self_heal_a_corrupt_wire() {
+        // The read-side tolerance ruling: a bucket row whose tags element
+        // is domain-invalid serves the empty set (mirroring the fs
+        // cap-50 `parse_wire_limited` discipline). Rows are API-written;
+        // the garbage below is a direct database write (tampering). The
+        // injection opens the file itself, so it runs before the store's
+        // exclusive handle.
+        let state = tempfile::tempdir().unwrap();
+        {
+            let db = database::open(state.path()).unwrap().db;
+            let mut txn = db.begin_write().unwrap();
+            {
+                let mut table = crate::_store::bucket::Table::open(&mut txn).unwrap();
+                table
+                    .insert("data", (1u64, "team=%zz&", "", "", ""))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = bucket::store(state.path()).unwrap();
+        let name = bucket::name("data").unwrap();
+        assert!(store.tags(&name).await.unwrap().is_empty());
+        // The row itself survives (the created time is still answered).
+        assert!(store.created_at(&name).await.unwrap().is_some());
     }
 
     #[tokio::test]

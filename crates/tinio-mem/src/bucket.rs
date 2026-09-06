@@ -119,27 +119,28 @@ impl BucketOps for MemoryStorage {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`; the row IS the bucket in mem, written
         // at create, so the fs backend's row-less pre-existing bucket has
-        // no mem equivalent). The tags come from the row's tags element,
-        // empty when the wire is domain-invalid (self-healing, cap 50).
+        // no mem equivalent). The tags come from the table's tags
+        // accessor, empty when the wire is domain-invalid (self-healing,
+        // cap 50).
         self.db.read(|txn| {
-            let buckets = bucket::Table::open_readonly(txn)?;
-            let Some(row) = buckets.row(name.as_ref().as_str())? else {
-                return Err(no_such_bucket(name));
-            };
-            Ok(object::Tags::from_wire_limited(
-                &row.tags,
-                object::BUCKET_TAGS_MAX,
-            ))
+            bucket::Table::open_readonly(txn)?
+                .tags(name.as_ref().as_str())?
+                .ok_or_else(|| no_such_bucket(name))
         })
     }
 
     async fn put_bucket_tags(&self, name: &Name, tags: &object::Tags) -> Result<(), Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`).
-        if !self.rewrite_bucket_element(name, &tags.to_wire()).await? {
-            return Err(no_such_bucket(name));
-        }
-        Ok(())
+        self.db.write(|txn| {
+            if bucket::Table::open(txn)?
+                .put_tags(name.as_ref().as_str(), tags)?
+                .is_none()
+            {
+                return Err(no_such_bucket(name));
+            }
+            Ok(())
+        })
     }
 
     async fn delete_bucket_tags(&self, name: &Name) -> Result<(), Error> {
@@ -147,8 +148,10 @@ impl BucketOps for MemoryStorage {
         // contract's delete leniency, mirroring the fs backend's
         // row-only clear). A live row keeps its creation time and loses
         // its tags; a row-less bucket has nothing to clear.
-        self.rewrite_bucket_element(name, "").await?;
-        Ok(())
+        self.db.write(|txn| {
+            bucket::Table::open(txn)?.clear_tags(name.as_ref().as_str())?;
+            Ok(())
+        })
     }
 
     async fn get_bucket_cors(&self, name: &Name) -> Result<Option<cors::Config>, Error> {
@@ -198,36 +201,8 @@ impl BucketOps for MemoryStorage {
     }
 }
 
-impl MemoryStorage {
-    /// The tags-element write transaction: one read-modify-write
-    /// replaces the tags wire and keeps every other element verbatim.
-    /// Returns whether the row existed (the caller maps to the
-    /// per-operation missing-bucket semantics).
-    async fn rewrite_bucket_element(&self, name: &Name, tags_wire: &str) -> Result<bool, Error> {
-        self.db.write(|txn| {
-            let mut buckets = bucket::Table::open(txn)?;
-            let Some(row) = buckets.row(name.as_ref().as_str())? else {
-                return Ok(false);
-            };
-            buckets.put_full(
-                name.as_ref().as_str(),
-                &bucket::BucketRow {
-                    tags: tags_wire.to_string(),
-                    ..row
-                },
-            )?;
-            Ok(true)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    // Raw-transaction test calls (`db().begin_read`) take the trait; the
-    // `super::*` glob shadows the import name.
-    #[allow(unused_imports)]
-    use redb::ReadableDatabase;
-
     use super::*;
     use crate::{
         _core::{MultipartOps, ObjectOps, object, storage::Error::*},
@@ -377,26 +352,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mem_garbage_bucket_tags_self_heal() {
-        // The read-side tolerance ruling: a bucket row whose tags element
-        // is domain-invalid serves the empty set (mirroring the fs
-        // cap-50 `parse_wire_limited` discipline). Rows are API-written; the
-        // garbage below is a direct database write (tampering).
-        let storage = MemoryStorage::new().unwrap();
-        let b = name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
-        {
-            let mut txn = storage.db.db().begin_write().unwrap();
-            bucket::Table::open(&mut txn)
-                .unwrap()
-                .insert(b.as_ref().as_str(), (1u64, "team=%zz&", "", "", ""))
-                .unwrap();
-            txn.commit().unwrap();
-        }
-        assert!(storage.get_bucket_tags(&b).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn mem_bucket_cors_round_trip_and_replace() {
         let storage = MemoryStorage::new().unwrap();
         let b = name("data").unwrap();
@@ -478,25 +433,5 @@ mod tests {
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
         let err: Error = storage.delete_bucket_cors(&ghost).await.unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
-    }
-
-    #[tokio::test]
-    async fn mem_garbage_bucket_cors_self_heal() {
-        // The read-side tolerance ruling: a bucket row whose CORS element
-        // is domain-invalid serves "no configuration" (mirroring the fs
-        // store's self-healing decode). Rows are API-written; the garbage
-        // below is a direct database write (tampering).
-        let storage = MemoryStorage::new().unwrap();
-        let b = name("data").unwrap();
-        storage.create_bucket(&b).await.unwrap();
-        {
-            let mut txn = storage.db.db().begin_write().unwrap();
-            bucket::Table::open(&mut txn)
-                .unwrap()
-                .insert(b.as_ref().as_str(), (1u64, "", "", "", "a,b,c"))
-                .unwrap();
-            txn.commit().unwrap();
-        }
-        assert!(storage.get_bucket_cors(&b).await.unwrap().is_none());
     }
 }

@@ -269,6 +269,9 @@ impl Tags {
     }
 }
 
+// The trusted-literal `tags!` fixture DSL lives in tinio-util's testing
+// module (tests and fixtures only, never on the contract surface).
+
 /// The allowed tag charset — Unicode letters, numbers, and separators
 /// plus `+ - = . _ : / @` (the S3 Control regex `[\p{L}\p{Z}\p{N}_.:/=+\-@]`,
 /// a superset of the EC2 cross-service ASCII restriction). Matched by
@@ -549,5 +552,14 @@ mod tests {
             20
         );
         assert!(Tags::parse_wire_limited(&many, OBJECT_TAGS_MAX).is_err());
+    }
+
+    #[test]
+    fn tags_from_wire_limited_self_heals() {
+        // The read-path form: a domain-invalid wire is the empty set
+        // (never a hard error — rows are API-written).
+        assert!(Tags::from_wire_limited("team=%zz&", 10).is_empty());
+        assert_eq!(Tags::from_wire_limited("a=b&c=d", 10).to_wire(), "a=b&c=d");
+        assert!(Tags::from_wire_limited("k=1&k=2&k=3&k=4&k=5&k=6", 5).is_empty());
     }
 }

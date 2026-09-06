@@ -4,6 +4,7 @@
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
+    _core::checksum,
     error::Error,
     scan::{drain_triple, has_prefix_triple},
     table::{self, TableDef},
@@ -29,18 +30,19 @@ impl<'txn, T> table::Table<'txn, Def, T>
 where
     T: ReadableTable<<Def as TableDef>::Key, <Def as TableDef>::Value>,
 {
-    /// The stored row: `(algorithm wire name, base64 value)` (owned —
-    /// the guard cannot outlive the closure).
+    /// The stored per-part checksum. `None` is a missing row or a
+    /// domain-invalid wire (self-healing — the part is listed without a
+    /// checksum, F07).
     pub fn get(
         &self,
         bucket: &str,
         upload_id: &str,
         part_number: u32,
-    ) -> Result<Option<(String, String)>, Error> {
+    ) -> Result<Option<checksum::Part>, Error> {
         Ok(self
             .0
             .get((bucket, upload_id, part_number))?
-            .map(|v| (v.value().0.to_string(), v.value().1.to_string())))
+            .and_then(|v| checksum::Part::from_wire_opt(v.value().0, v.value().1)))
     }
 
     /// Whether `upload_id` has any checksum row (the list-parts "rows may
@@ -53,18 +55,34 @@ where
 }
 
 impl<'txn> table::Table<'txn, Def> {
-    /// Insert or replace the part's checksum.
+    /// Insert or replace the part's checksum (encoded here).
     pub fn put(
         &mut self,
         bucket: &str,
         upload_id: &str,
         part_number: u32,
-        algorithm: &str,
-        value: &str,
+        part: &checksum::Part,
     ) -> Result<(), Error> {
+        let (algorithm, value) = part.to_wire();
         self.0
             .insert((bucket, upload_id, part_number), (algorithm, value))?;
         Ok(())
+    }
+
+    /// The digest-slot write of a part upload: put the tee's digest, or
+    /// remove a stale row from a previous upload of this part number (it
+    /// would corrupt the Complete composition).
+    pub fn set(
+        &mut self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u32,
+        part: Option<&checksum::Part>,
+    ) -> Result<(), Error> {
+        match part {
+            Some(part) => self.put(bucket, upload_id, part_number, part),
+            None => self.remove(bucket, upload_id, part_number),
+        }
     }
 
     /// Remove the part's checksum row (idempotent — re-upload clears the

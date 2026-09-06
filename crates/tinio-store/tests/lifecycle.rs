@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use redb::Database;
 use tinio_core::{
-    checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Value},
+    checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Upload, Value},
     etag::ETag,
     object::{self, Tags},
 };
@@ -32,6 +32,7 @@ fn object_lifecycle_across_all_row_tables() {
     let now = SystemTime::UNIX_EPOCH;
     let key = object::key("big.bin").unwrap();
     let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+    let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
 
     // 1. Create the bucket.
     h.write(|txn| -> Result<(), tinio_store::Error> {
@@ -46,11 +47,18 @@ fn object_lifecycle_across_all_row_tables() {
     h.write(|txn| -> Result<(), tinio_store::Error> {
         {
             let mut u = upload::Table::open(txn)?;
-            u.put("demo", "u1", &key, now, "env=prod")?;
+            u.put("demo", "u1", &key, now, &tags)?;
         }
         {
             let mut uc = upload_checksum::Table::open(txn)?;
-            uc.put("demo", "u1", "SHA256", "FULL_OBJECT")?;
+            uc.put(
+                "demo",
+                "u1",
+                &Upload {
+                    algorithm: Algorithm::Sha256,
+                    r#type: Some(ChecksumType::FullObject),
+                },
+            )?;
         }
         {
             let mut p = part::Table::open(txn)?;
@@ -58,7 +66,15 @@ fn object_lifecycle_across_all_row_tables() {
         }
         {
             let mut pc = part_checksum::Table::open(txn)?;
-            pc.put("demo", "u1", 1, "SHA256", "QjI0Ng==")?;
+            pc.put(
+                "demo",
+                "u1",
+                1,
+                &Part {
+                    algorithm: Algorithm::Sha256,
+                    value: Value("QjI0Ng==".into()),
+                },
+            )?;
         }
         {
             let mut pd = part_data::Table::open(txn)?;
@@ -79,7 +95,7 @@ fn object_lifecycle_across_all_row_tables() {
         size: 3,
         mtime: 0,
         file_identity: 0,
-        tags: Tags::from_pairs([("env".into(), "prod".into())]).unwrap(),
+        tags: tags.clone(),
         checksum: Some(Recorded {
             part: Part {
                 algorithm: Algorithm::Sha256,
@@ -95,7 +111,18 @@ fn object_lifecycle_across_all_row_tables() {
         }
         {
             let mut op = object_part::Table::open(txn)?;
-            op.put("demo", &key, 1, 3, "SHA256", "QjI0Ng==")?;
+            op.put(
+                "demo",
+                &key,
+                &object_part::Stored {
+                    part_number: 1,
+                    size: 3,
+                    checksum: Some(Part {
+                        algorithm: Algorithm::Sha256,
+                        value: Value("QjI0Ng==".into()),
+                    }),
+                },
+            )?;
         }
         Ok(())
     })
@@ -108,16 +135,16 @@ fn object_lifecycle_across_all_row_tables() {
 
         let u = upload::Table::open_readonly(txn)?;
         assert!(u.key_matches("demo", &key, "u1")?);
-        let (got_key, _, tags) = u.get_matching("demo", &key, "u1")?.unwrap();
-        assert_eq!(
-            (got_key, tags),
-            ("big.bin".to_string(), "env=prod".to_string())
-        );
+        let (got_key, _, got_tags) = u.get_matching("demo", &key, "u1")?.unwrap();
+        assert_eq!((got_key, got_tags), ("big.bin".to_string(), tags.clone()));
 
         let uc = upload_checksum::Table::open_readonly(txn)?;
         assert_eq!(
             uc.get("demo", "u1")?,
-            Some(("SHA256".into(), "FULL_OBJECT".into()))
+            Some(Upload {
+                algorithm: Algorithm::Sha256,
+                r#type: Some(ChecksumType::FullObject),
+            })
         );
 
         let p = part::Table::open_readonly(txn)?;
@@ -135,7 +162,14 @@ fn object_lifecycle_across_all_row_tables() {
         let op = object_part::Table::open_readonly(txn)?;
         assert_eq!(
             op.list("demo", &key)?,
-            vec![(1, 3, "SHA256".into(), "QjI0Ng==".into())]
+            vec![object_part::Stored {
+                part_number: 1,
+                size: 3,
+                checksum: Some(Part {
+                    algorithm: Algorithm::Sha256,
+                    value: Value("QjI0Ng==".into()),
+                }),
+            }]
         );
         Ok(())
     })

@@ -40,6 +40,5 @@ pub use handle::{Handle, WriteLockSnapshot};
 pub use open::{Integrity, Open, check_integrity, open};
 pub(crate) use tables::for_bucket_strict;
 
-pub(crate) use crate::_core::object::{BUCKET_TAGS_MAX, OBJECT_TAGS_MAX};
 #[cfg(test)]
 pub(crate) use crate::_store::state::Table as StateTable;

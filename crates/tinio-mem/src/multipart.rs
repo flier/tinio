@@ -82,20 +82,14 @@ impl MultipartOps for MemoryStorage {
             }
             let b = upload.bucket.as_ref().as_str();
             let k = upload.key.as_ref().as_str();
-            // The create-time tags wire rides in the UPLOADS row —
-            // `(bucket, upload_id) → (key, initiated, tags)` (spec
-            // 2026-08-31 — applied to the completed object).
-            let tags_wire = tags.to_wire();
             {
                 let mut uploads = upload::Table::open(txn)?;
-                uploads.put(b, &upload.upload_id, k, initiated_at, tags_wire.as_str())?;
+                uploads.put(b, &upload.upload_id, k, initiated_at, &tags)?;
             }
             // The create-time checksum spec, persisted alongside the
             // UPLOADS row (spec 2026-08-31).
-            if let Some(c) = checksum {
-                let mut cs = upload_checksum::Table::open(txn)?;
-                let (algo, ty) = c.to_wire();
-                cs.put(b, &upload.upload_id, algo.as_str(), ty.as_str())?;
+            if let Some(ref spec) = checksum {
+                upload_checksum::Table::open(txn)?.put(b, &upload.upload_id, spec)?;
             }
             Ok(upload)
         })
@@ -121,23 +115,20 @@ impl MultipartOps for MemoryStorage {
             // element self-heals on a domain-invalid wire (empty — like the
             // checksum spec below).
             let uploads = upload::Table::open_readonly(txn)?;
-            let Some((_stored_key, initiated, tags_wire)) =
+            let Some((_stored_key, initiated, tags)) =
                 uploads.get_matching(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id)?
             else {
                 return Err(no_such_upload(upload_id));
             };
             let checksums = upload_checksum::Table::open_readonly(txn)?;
-            let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id)?;
+            let checksum = checksums.get(bucket.as_ref().as_str(), upload_id)?;
             Ok(MultipartUpload {
                 upload_id: upload_id.to_string(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 initiated_at: from_nanos(initiated),
-                // A domain-invalid checksum row self-heals: the upload is
-                // served without a spec (F07 — the fs backend skips the
-                // same way).
-                checksum: checksum_row.and_then(|(a, t)| checksum::Upload::from_wire_opt(&a, &t)),
-                tags: object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX),
+                checksum,
+                tags,
             })
         })
     }
@@ -207,20 +198,7 @@ impl MultipartOps for MemoryStorage {
             // Complete composition).
             {
                 let mut checksums = part_checksum::Table::open(txn)?;
-                match checksum.as_ref().and_then(|c| c.digest.get()) {
-                    Some(part) => {
-                        checksums.put(
-                            b,
-                            upload_id,
-                            n,
-                            part.algorithm.wire_name(),
-                            part.value.as_str(),
-                        )?;
-                    }
-                    None => {
-                        checksums.remove(b, upload_id, n)?;
-                    }
-                }
+                checksums.set(b, upload_id, n, checksum.as_ref().and_then(|c| c.digest.get()))?;
             }
             Ok(delta)
         })
@@ -322,16 +300,11 @@ impl MultipartOps for MemoryStorage {
                     continue;
                 }
                 meta_cursor = None;
-                let checksum_row = checksums
+                let checksum = checksums
                     .as_ref()
                     .map(|table| table.get(b, id, n))
                     .transpose()?
                     .flatten();
-                // A domain-invalid checksum row self-heals: the part is
-                // listed without a checksum (F07 — the fs backend skips
-                // the same way).
-                let checksum =
-                    checksum_row.and_then(|(a, value)| checksum::Part::from_wire_opt(&a, value));
                 parts_out.push(PartInfo {
                     part_number: n.into(),
                     size,
@@ -374,17 +347,15 @@ impl MultipartOps for MemoryStorage {
             // is the identity check on the shared `(bucket, upload_id)` key
             // (the stored key must equal the requested key) and the row fetch
             // in one lookup. A garbage wire self-heals to the empty set (the
-            // read-path discipline).
+            // table's read-path discipline).
             let b = bucket.as_ref().as_str();
             let k = key.as_ref().as_str();
             let tags = {
                 let uploads = upload::Table::open(txn)?;
-                let Some((_stored_key, _initiated, tags_wire)) =
-                    uploads.get_matching(b, k, upload_id)?
-                else {
+                let Some(tags) = uploads.tags(b, k, upload_id)? else {
                     return Err(no_such_upload(upload_id));
                 };
-                object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
+                tags
             };
             let (data, etag, now) = {
                 // The retained OBJECT_PARTS rows: each listed part's size and
@@ -425,7 +396,7 @@ impl MultipartOps for MemoryStorage {
                             })
                             .collect::<Result<Vec<_>, Error>>()?
                     };
-                    let checksum_rows: Vec<Option<(String, String)>> = {
+                    let checksum_rows: Vec<Option<checksum::Part>> = {
                         let stored_checksums = part_checksum::Table::open(txn)?;
                         parts
                             .iter()
@@ -438,7 +409,7 @@ impl MultipartOps for MemoryStorage {
                     };
                     let mut data = Vec::new();
                     let mut infos: Vec<PartInfo> = Vec::new();
-                    let mut retained: Vec<(u32, u64, Option<(String, String)>)> = Vec::new();
+                    let mut retained: Vec<object_part::Stored> = Vec::new();
                     let mut prev = 0u32;
                     let part_data = part_data::Table::open(txn)?;
                     let mut part_rows = part_data
@@ -492,7 +463,11 @@ impl MultipartOps for MemoryStorage {
                         if !found {
                             return Err(invalid_part(n));
                         }
-                        retained.push((n, size, checksum_rows[index].clone()));
+                        retained.push(object_part::Stored {
+                            part_number: n,
+                            size,
+                            checksum: checksum_rows[index].clone(),
+                        });
                     }
                     let etag =
                         ETag::composed_from_parts(&infos).expect("parts checked non-empty above");
@@ -554,13 +529,8 @@ impl MultipartOps for MemoryStorage {
                     // key must not accumulate rows).
                     let mut parts_table = object_part::Table::open(txn)?;
                     parts_table.remove_key(b, k)?;
-                    for (n, part_size, checksum_row) in retained {
-                        let (algorithm, value) = match checksum_row {
-                            Some((algorithm, value)) => (algorithm, value),
-                            // `""` marks a part stored without a checksum.
-                            None => (String::new(), String::new()),
-                        };
-                        parts_table.put(b, k, n, part_size, &algorithm, &value)?;
+                    for part in retained {
+                        parts_table.put(b, k, &part)?;
                     }
                 }
                 (data, etag, now)
@@ -663,26 +633,19 @@ impl MultipartOps for MemoryStorage {
             // are owned copies, and the redb read txn is MVCC — no lock is
             // held).
             let mut rows: Vec<UploadRow> = Vec::new();
-            uploads.for_bucket(b, |upload_id, (key, initiated_at, tags_wire)| {
+            uploads.for_bucket(b, |upload_id, (key, initiated_at, tags)| {
                 if !key.starts_with(&params.prefix) {
                     return Ok(());
                 }
                 let Ok(key) = object::key(key) else {
                     return Ok(()); // tampered row — skipped like list_objects
                 };
-                let checksum_row = checksums.get(b, upload_id)?;
-                // A domain-invalid checksum row self-heals: the upload is
-                // listed without a spec (F07 — the fs backend skips the
-                // same way; a hard error here would fail the whole listing
-                // for one bad row). The create-time tags element self-heals
-                // the same way (empty — the wire is API-written).
-                let checksum =
-                    checksum_row.and_then(|(a, t)| checksum::Upload::from_wire_opt(&a, &t));
+                let checksum = checksums.get(b, upload_id)?;
                 rows.push(UploadRow {
                     key,
                     upload_id: upload_id.to_string(),
                     initiated_at,
-                    tags: object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                    tags,
                     checksum,
                 });
                 Ok(())
@@ -731,11 +694,6 @@ impl MultipartOps for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    // Raw-transaction test calls (`db().begin_read`) take the trait; the
-    // `super::*` glob shadows the import name.
-    #[allow(unused_imports)]
-    use redb::ReadableDatabase;
-
     use super::*;
     use crate::{
         _core::{
@@ -744,7 +702,6 @@ mod tests {
             object,
             storage::Error::*,
         },
-        _store::{part_checksum, upload_checksum},
         _util::testing::{body, read_body},
         MemoryOptions,
         testutil::checksum_tee,
@@ -762,76 +719,6 @@ mod tests {
         let name = bucket::name("data").unwrap();
         storage.create_bucket(&name).await.unwrap();
         (storage, name)
-    }
-
-    #[tokio::test]
-    async fn corrupt_checksum_rows_self_heal() {
-        // F07: domain-invalid UPLOAD_CHECKSUMS/PART_CHECKSUMS rows must
-        // not fail the read paths — the upload/part still answers with
-        // the checksum dropped (the fs backend self-heals the same way).
-        let (storage, name) = with_bucket().await;
-        let key = object::key("big.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty())
-            .await
-            .unwrap();
-        storage
-            .upload_part(
-                &name,
-                &key,
-                &upload.upload_id,
-                part_number(1).unwrap(),
-                body(b"x"),
-                None,
-            )
-            .await
-            .unwrap();
-        let bucket_str = name.as_ref().as_str();
-        {
-            let mut txn = storage.db.db().begin_write().unwrap();
-            upload_checksum::Table::open(&mut txn)
-                .unwrap()
-                .insert((bucket_str, upload.upload_id.as_str()), ("BLAKE3", ""))
-                .unwrap();
-            part_checksum::Table::open(&mut txn)
-                .unwrap()
-                .insert(
-                    (bucket_str, upload.upload_id.as_str(), 1),
-                    ("BLAKE3", "AAAA"),
-                )
-                .unwrap();
-            txn.commit().unwrap();
-        }
-        let got = storage
-            .get_multipart_upload(&name, &key, &upload.upload_id)
-            .await
-            .unwrap();
-        assert!(got.checksum.is_none(), "get drops the corrupt spec");
-        let page = storage
-            .list_parts(ListPartsParams {
-                bucket: name.clone(),
-                key: key.clone(),
-                upload_id: upload.upload_id.clone(),
-                max_parts: 1000,
-                part_number_marker: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(page.parts.len(), 1);
-        assert!(page.parts[0].checksum.is_none());
-        let listed = storage
-            .list_multipart_uploads(ListUploadsParams {
-                bucket: name,
-                prefix: String::new(),
-                delimiter: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: 1000,
-            })
-            .await
-            .unwrap();
-        assert_eq!(listed.uploads.len(), 1, "the listing still answers");
-        assert!(listed.uploads[0].checksum.is_none());
     }
 
     #[tokio::test]
