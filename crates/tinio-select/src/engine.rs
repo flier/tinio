@@ -340,26 +340,35 @@ fn accumulate_extrema(
 
 /// The first-contributor typing probe for MIN/MAX: a value that parses
 /// numerically opens the numeric spine; a plain non-numeric string opens
-/// the string spine. A number that exceeds the 28-digit spine is a hard
-/// error — the precision contract, never a silent string-column demotion
-/// (a 29-digit "9…9" must not lexicographically lose to "2").
+/// the string spine. A number the spine cannot hold is a hard error — the
+/// precision contract, never a silent string-column demotion (a 29-digit
+/// "9…9" or an exponent form like `1e30` must not answer lexicographically
+/// against "2"). One flow through `parse_number` (no duplicated digit
+/// guard): its error is propagated for a numeric-shaped token and ignored
+/// for plain text; `NaN`/`inf` are not finite as `f64` — not numeric-
+/// shaped — so they stay a string column.
 fn first_contrib_spine(v: &Value) -> Result<Option<Decimal>, SelectError> {
     match v {
         Value::Decimal(d) => Ok(Some(*d)),
         Value::Int(i) => Ok(Some(Decimal::from(*i))),
-        Value::String(s) | Value::RawNumber(s) => {
-            // Mirrors `parse_number`'s digit guard (row.rs) — the probe runs
-            // before it so the precision error can be separated from the
-            // plain non-numeric fall-through to string mode.
-            if s.chars().filter(char::is_ascii_digit).count() > 28 {
-                return Err(SelectError::Value(format!(
-                    "numeric value exceeds 28-digit precision: {s}"
-                )));
-            }
-            Ok(parse_number(s).ok())
-        }
+        Value::String(s) | Value::RawNumber(s) => match parse_number(s) {
+            Ok(d) => Ok(Some(d)),
+            // A numeric-shaped token the spine cannot hold — the precision
+            // error surfaces now, never a demotion to string mode.
+            Err(e) if numeric_shaped(s) => Err(e),
+            // Plain text: string column, strict lexicographic.
+            Err(_) => Ok(None),
+        },
         _ => Ok(None),
     }
+}
+
+/// A numeric-shaped token: readable as `f64` and finite. Covers exponent
+/// forms (`1e30` — few digits, so the digit guard never fires — that
+/// exceed the 96-bit spine); `NaN`/`inf` parse as non-finite and stay
+/// non-numeric.
+fn numeric_shaped(s: &str) -> bool {
+    s.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 /// One aggregate column's finished value: COUNT → Int; SUM/AVG/MIN/MAX with
@@ -2034,6 +2043,36 @@ mod tests {
             }
             other => panic!("expected precision error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn min_max_exponent_first_contributor_is_a_value_error() {
+        // `1e30` is numeric-shaped (a finite f64) but exceeds the 96-bit
+        // spine: the parse error surfaces on the spot — never a demotion to
+        // a lexicographic column, which would silently answer "1e30" (a
+        // string min loses to "2" lexicographically).
+        let mut engine = Engine::new(parse("SELECT min(s._1) FROM S3Object s").unwrap());
+        match engine.next(csv(&["1e30"], &["_1"])) {
+            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: 1e30"),
+            other => panic!("expected value error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_max_nan_inf_stay_string_columns() {
+        // NaN/inf parse as f64 but are not finite — not numeric-shaped, so
+        // the column stays strict-lexicographic (no precision error, no
+        // cast failure, and "20" ranks as text: "2" < "N" < "i").
+        let row = run_agg(
+            "SELECT min(s._1), max(s._1) FROM S3Object s",
+            vec![
+                csv(&["NaN"], &["_1"]),
+                csv(&["inf"], &["_1"]),
+                csv(&["20"], &["_1"]),
+            ],
+        );
+        assert_eq!(row.keys, vec!["min(s._1)", "max(s._1)"]);
+        assert_eq!(row.vals, vec![s("20"), s("inf")]);
     }
 
     #[test]

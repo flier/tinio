@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 arrow = { version = "56", default-features = false, optional = true } # parquet 56's ChunkReader has no Cursor impl — arrow types are the reader's output types
 bzip2.workspace = true
-bytes.workspace = true # parquet 56's ChunkReader is implemented for bytes::Bytes only (no AsRef blanket)
+bytes = { workspace = true, optional = true } # parquet 56's ChunkReader is implemented for bytes::Bytes only (no AsRef blanket)
 csv.workspace = true
 flate2.workspace = true
 parquet = { workspace = true, optional = true } # review 2026-09-05b: declared optional here (not in workspace.dependencies, RFC 2906) so [features] parquet = ["dep:parquet"] resolves
@@ -27,7 +27,7 @@ harness = false
 
 [features]
 default = []
-parquet = ["dep:parquet", "dep:arrow"]
+parquet = ["dep:parquet", "dep:arrow", "dep:bytes"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -48,12 +48,14 @@ async fn gzip_object_with_content(
     put_object(world, &key, &gz).await;
 }
 
-/// The docstring value, minus its delimiter newlines: the gherkin parser
+/// The docstring value, its delimiter newlines trimmed: the gherkin parser
 /// keeps the newline that closes the opening `"""` and the one before the
 /// closing delimiter, so a fixture's first content byte would be `\n`
 /// (harmless for CSV — an empty record — but a JSON LINES reader errors on
-/// the empty first line). The closing `"""` dedent is preserved by the
-/// parser, so only the two delimiter newlines are trimmed.
+/// the empty first line). `trim_matches('\n')` strips every leading and
+/// trailing newline — the two delimiter ones plus any intentional blank
+/// edge lines; a fixture whose content itself begins or ends with a
+/// meaningful newline cannot express it.
 fn fixture_bytes(step: &cucumber::gherkin::Step) -> Vec<u8> {
     step.docstring()
         .map(|s| s.trim_matches('\n').as_bytes().to_vec())

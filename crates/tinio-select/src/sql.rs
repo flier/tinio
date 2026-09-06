@@ -12,7 +12,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::SelectError;
 
@@ -79,7 +79,7 @@ pub fn parse(sql: &str) -> Result<QueryPlan, SelectError> {
         return Err(SelectError::Parse("expression exceeds 256 KiB".into()));
     }
     let (from, rewritten) = preprocess_from(sql)?;
-    let rewritten = rewrite_is_missing(&rewritten);
+    let rewritten = rewrite_is_missing(&rewritten)?;
     let stmts = Parser::parse_sql(&GenericDialect, &rewritten)
         .map_err(|e| SelectError::Parse(format!("syntax error: {e}")))?;
     let stmt = match stmts.as_slice() {
@@ -134,6 +134,14 @@ pub fn parse(sql: &str) -> Result<QueryPlan, SelectError> {
         }
     };
     validate_from(select, &from)?;
+    // Aggregates are projection-derived (`plan.aggregates` below); a WHERE
+    // aggregate would surface in-stream as an internal engine error instead
+    // of a request-level parse error — refused here (review 2026-09-05b).
+    if let Some(where_expr) = &select.selection
+        && contains_aggregate(where_expr)
+    {
+        return Err(SelectError::Parse("aggregates not allowed in WHERE".into()));
+    }
     let mut projections = Vec::with_capacity(select.projection.len());
     let mut aggregates = false;
     for item in &select.projection {
@@ -260,64 +268,104 @@ fn preprocess_from(sql: &str) -> Result<(FromClause, String), SelectError> {
     Ok((clause, rewritten))
 }
 
-/// Quote-aware scan for the first `FROM` keyword (byte scanner toggling on
-/// `'` strings and `"` quoted identifiers).
+/// Shared byte-scan state for the FROM scanners: quotes (`'`/`"` with
+/// doubled-quote escapes) and comments (`--` line, `/* */` block) are
+/// invisible to the word lookups — a comment or string containing `from`,
+/// `join` or a clause keyword can never misdirect the FROM scan.
+#[derive(Default)]
+struct ScanState {
+    in_string: bool,
+    in_ident: bool,
+    in_block: bool,
+}
+
+impl ScanState {
+    /// Advance the scanner over one byte at `i`; returns the next index to
+    /// examine and whether `i` was a plain top-level byte (outside quotes
+    /// and comments — a word start may sit there).
+    fn step(&mut self, bytes: &[u8], i: usize) -> (usize, bool) {
+        if self.in_block {
+            if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                self.in_block = false;
+                (i + 2, false)
+            } else {
+                (i + 1, false)
+            }
+        } else if self.in_string {
+            if bytes[i] == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                (i + 2, false) // doubled quote inside a string
+            } else {
+                let closing = bytes[i] == b'\'';
+                if closing {
+                    self.in_string = false;
+                }
+                (i + 1, false)
+            }
+        } else if self.in_ident {
+            if bytes[i] == b'"' && bytes.get(i + 1) == Some(&b'"') {
+                (i + 2, false)
+            } else {
+                let closing = bytes[i] == b'"';
+                if closing {
+                    self.in_ident = false;
+                }
+                (i + 1, false)
+            }
+        } else {
+            match bytes[i] {
+                b'\'' => {
+                    self.in_string = true;
+                    (i + 1, false)
+                }
+                b'"' => {
+                    self.in_ident = true;
+                    (i + 1, false)
+                }
+                b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                    // Line comment: everything to the newline, or the end.
+                    let mut j = i + 2;
+                    while j < bytes.len() && bytes[j] != b'\n' {
+                        j += 1;
+                    }
+                    if j < bytes.len() { (j + 1, false) } else { (j, false) }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    self.in_block = true;
+                    (i + 2, false)
+                }
+                _ => (i + 1, true),
+            }
+        }
+    }
+}
+
+/// Scan for the first top-level `FROM` keyword — quote- and comment-aware
+/// (a `-- from` comment before the real FROM never misdirects the scan).
 fn find_from_keyword(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut in_string = false;
-    let mut in_ident = false;
+    let mut state = ScanState::default();
     let mut i = 0;
     while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                if in_string && bytes.get(i + 1) == Some(&b'\'') {
-                    i += 1; // escaped quote inside a string
-                } else {
-                    in_string = !in_string;
-                }
-            }
-            b'"' => {
-                if in_ident && bytes.get(i + 1) == Some(&b'"') {
-                    i += 1;
-                } else {
-                    in_ident = !in_ident;
-                }
-            }
-            _ if !in_string && !in_ident && (bytes[i] == b'f' || bytes[i] == b'F')
-                && word_at(bytes, i, "from") =>
-            {
-                return Some((i, i + 4));
-            }
-            _ => {}
+        let (next, plain) = state.step(bytes, i);
+        if plain && (bytes[i] == b'f' || bytes[i] == b'F') && word_at(bytes, i, "from") {
+            return Some((i, i + 4));
         }
-        i += 1;
+        i = next;
     }
     None
 }
 
 /// End of the FROM clause: first top-level clause keyword or `;`.
 fn from_clause_end(bytes: &[u8], start: usize) -> usize {
+    let mut state = ScanState::default();
     let mut i = start;
-    let mut in_string = false;
-    let mut in_ident = false;
     let mut candidate = Vec::new();
     while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                if in_string && bytes.get(i + 1) == Some(&b'\'') {
-                    i += 1;
-                } else {
-                    in_string = !in_string;
-                }
+        let (next, plain) = state.step(bytes, i);
+        if plain {
+            if bytes[i] == b';' {
+                return i;
             }
-            b'"' => {
-                if in_ident && bytes.get(i + 1) == Some(&b'"') {
-                    i += 1;
-                } else {
-                    in_ident = !in_ident;
-                }
-            }
-            b';' if !in_string && !in_ident => return i,
-            _ if !in_string && !in_ident && is_ascii_ident_start(bytes[i]) => {
+            if is_ascii_ident_start(bytes[i]) {
                 candidate.clear();
                 let mut k = i;
                 while k < bytes.len() && is_ident_byte(bytes[k]) {
@@ -334,40 +382,24 @@ fn from_clause_end(bytes: &[u8], start: usize) -> usize {
                 i = k;
                 continue;
             }
-            _ => {}
         }
-        i += 1;
+        i = next;
     }
     bytes.len()
 }
 
-/// Quote-aware JOIN detection inside the FROM clause (the whole clause is
-/// rejected up front so `FROM a JOIN b` reports JOIN rather than a path
-/// error).
+/// Join detection inside the FROM clause (the whole clause is rejected up
+/// front so `FROM a JOIN b` reports JOIN rather than a path error).
 fn clause_has_join(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut state = ScanState::default();
     let mut i = start;
-    let mut in_string = false;
-    let mut in_ident = false;
     while i < end {
-        match bytes[i] {
-            b'\'' => {
-                if in_string && bytes.get(i + 1) == Some(&b'\'') {
-                    i += 1;
-                } else {
-                    in_string = !in_string;
-                }
-            }
-            b'"' => {
-                if in_ident && bytes.get(i + 1) == Some(&b'"') {
-                    i += 1;
-                } else {
-                    in_ident = !in_ident;
-                }
-            }
-            _ if !in_string && !in_ident && word_at(bytes, i, "join") => return true,
-            _ => {}
+        let (next, plain) = state.step(bytes, i);
+        if plain && word_at(bytes, i, "join") {
+            return true;
         }
-        i += 1;
+        // A quote/comment span may run past `end` — clamp and stop.
+        i = next.min(end);
     }
     false
 }
@@ -560,15 +592,34 @@ fn word_at(bytes: &[u8], i: usize, word: &str) -> bool {
 /// `__s3_is_missing(X)` / `__s3_is_not_missing(X)` — sqlparser 0.57 has no
 /// `IsMissing` variant, and `IS NULL` substitution would be wrong (a
 /// present-but-null field must not satisfy MISSING). Token-based, so
-/// strings, quoted identifiers and comments are never entered.
-fn rewrite_is_missing(sql: &str) -> String {
+/// strings, quoted identifiers and comments are never entered. A chained
+/// `X IS [NOT] MISSING IS MISSING` is not valid SQL: the second operand's
+/// walk-back runs past the first rewrite's span — refused (Parse) rather
+/// than splicing an overlapping range (an index-out-of-range panic on
+/// untrusted request input).
+fn rewrite_is_missing(sql: &str) -> Result<String, SelectError> {
     let mut tokenizer = Tokenizer::new(&GenericDialect, sql);
     let Ok(tokens) = tokenizer.tokenize_with_location() else {
-        return sql.to_string(); // unterminated literal etc: let the parser report
+        return Ok(sql.to_string()); // unterminated literal etc: let the parser report
     };
     let pos = positions(sql);
     let mut found: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut prev_missing_end = 0;
     let mut i = 0;
+    // `positions` carries every char boundary, so a lookup can only miss on
+    // a tokenizer/offset divergence — refuse instead of indexing the
+    // HashMap (same panic-on-untrusted-input shape as the splice overlap).
+    let offset = |t: &TokenWithSpan| -> Result<(usize, usize), SelectError> {
+        let start = pos
+            .get(&token_start(t))
+            .copied()
+            .ok_or_else(|| SelectError::Parse("invalid IS MISSING expression".into()))?;
+        let end = pos
+            .get(&token_end(t))
+            .copied()
+            .ok_or_else(|| SelectError::Parse("invalid IS MISSING expression".into()))?;
+        Ok((start, end))
+    };
     while i < tokens.len() {
         if !is_word(&tokens[i], "is") {
             i += 1;
@@ -625,14 +676,20 @@ fn rewrite_is_missing(sql: &str) -> String {
         ) {
             operand_token += 1;
         }
-        let operand_start = pos[&token_start(&tokens[operand_token])];
-        let is_start = pos[&token_start(&tokens[i])];
-        let missing_end = pos[&token_end(&tokens[j])];
+        let (operand_start, _) = offset(&tokens[operand_token])?;
+        let (is_start, _) = offset(&tokens[i])?;
+        let (_, missing_end) = offset(&tokens[j])?;
+        if operand_start < prev_missing_end {
+            // `x IS [NOT] MISSING IS MISSING` — the walk-back ran past the
+            // previous match's span; the chained form is invalid SQL.
+            return Err(SelectError::Parse("invalid IS MISSING expression".into()));
+        }
         found.push((operand_start, is_start, missing_end, negated));
+        prev_missing_end = missing_end;
         i = j + 1;
     }
     if found.is_empty() {
-        return sql.to_string();
+        return Ok(sql.to_string());
     }
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
@@ -644,7 +701,7 @@ fn rewrite_is_missing(sql: &str) -> String {
         last = missing_end;
     }
     out.push_str(&sql[last..]);
-    out
+    Ok(out)
 }
 
 fn is_word(t: &sqlparser::tokenizer::TokenWithSpan, word: &str) -> bool {
@@ -866,9 +923,12 @@ pub fn referenced_columns(plan: &QueryPlan) -> Vec<String> {
 }
 
 /// Column-name collector: a plain identifier names its column; a compound
-/// identifier's last part names it. Access chains (`s.a.b`) are not column
-/// references on flat records (the engine resolves them as a literal name
-/// that matches none) — omitted rather than guessed.
+/// identifier (dot chain, `s.a.b` included — sqlparser folds a plain
+/// identifier chain into `CompoundIdentifier`) names its last part. Only
+/// bracket/subscript access chains (`s.projects[0].name`, the
+/// `CompoundFieldAccess` shape) are not flat-record column references (the
+/// engine resolves them as a literal name that matches none) — omitted
+/// rather than guessed.
 struct Columns<'a>(&'a mut Vec<String>);
 
 impl Visitor for Columns<'_> {
@@ -1121,6 +1181,21 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_in_where_are_parse_errors() {
+        // The engine's aggregate channel derives from projections only
+        // (`plan.aggregates`); a WHERE aggregate would fail in-stream as an
+        // internal error — refused request-level.
+        rej(
+            "SELECT s.a FROM S3Object s WHERE count(*) > 1",
+            "aggregates not allowed in WHERE",
+        );
+        rej(
+            "SELECT s.a FROM S3Object s WHERE sum(s.x) > 0",
+            "aggregates not allowed in WHERE",
+        );
+    }
+
+    #[test]
     fn aggregate_bare_forms_parse() {
         let q = ok(
             "SELECT count(*), count(s._1) AS c, sum(s._2), avg(s._2), min(s._2), max(s._2) \
@@ -1152,6 +1227,27 @@ mod tests {
     fn is_missing_rewrite_quote_aware() {
         let q = ok("SELECT s.x FROM S3Object s WHERE s.x = 'x IS MISSING y'");
         assert!(matches!(q.where_expr, Some(Expr::BinaryOp { .. })));
+    }
+
+    #[test]
+    fn is_missing_chained_forms_are_parse_errors() {
+        // `x IS MISSING IS MISSING`: the second operand's walk-back would
+        // overlap the first match's span — a splice panic (index out of
+        // range) on untrusted input; the chained form is invalid SQL.
+        rej(
+            "SELECT s.x FROM S3Object s WHERE s.x IS MISSING IS MISSING",
+            "invalid IS MISSING expression",
+        );
+        rej(
+            "SELECT s.x FROM S3Object s WHERE s.x IS NOT MISSING IS MISSING",
+            "invalid IS MISSING expression",
+        );
+        // The legit single form still rewrites.
+        let q = ok("SELECT s.x FROM S3Object s WHERE s.x IS MISSING");
+        match q.where_expr {
+            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), "__s3_is_missing"),
+            other => panic!("expected missing sentinel, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1194,6 +1290,34 @@ mod tests {
             Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), "__s3_is_missing"),
             other => panic!("expected missing sentinel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_scan_is_comment_aware() {
+        // A `-- from` line comment before the real FROM must not misdirect
+        // the byte scanner (the comment-blind scan parsed the comment's
+        // `from` as the FROM clause and reported a bogus path error).
+        let q = ok("SELECT x -- from table\nFROM S3Object s");
+        assert_eq!(q.projections.len(), 1);
+        // A newline inside a block comment puts `from` at a word boundary —
+        // the comment-blind scanner matched there too.
+        let q = ok("SELECT x /*\nfrom\n*/ FROM S3Object s");
+        assert_eq!(q.projections.len(), 1);
+        // A JOIN word inside a comment in a non-S3Object FROM clause is not
+        // a JOIN — the path error stands, never the JOIN channel.
+        rej("SELECT x FROM other -- join\nx", "invalid FROM: expected S3Object");
+    }
+
+    #[test]
+    fn bare_column_from_before_from_is_a_parse_error() {
+        // A bare column named `from` is a reserved word — the byte scanner
+        // cannot distinguish it from the real FROM (full tokenization would
+        // be needed); the honest outcome is the same Parse-error family,
+        // never a panic or an Unsupported channel.
+        rej(
+            "SELECT from FROM S3Object s",
+            "invalid FROM: expected S3Object",
+        );
     }
 
     // ------------------------------------------------------------------

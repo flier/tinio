@@ -13,9 +13,10 @@
 //! timing: a slow consumer delays them; spec §1.1, accepted deviation).
 //! `Cont` fires after `every_n` records and/or `idle` since the last
 //! emitted event, checked at the same flush points. `Stats` + `End` are
-//! always emitted at EOF, after an aggregate finish row lands in the
-//! buffer. No async anywhere — the async bridge is tinio-server's job
-//! (spec §1.1).
+//! emitted at EOF, after an aggregate finish row lands in the buffer —
+//! except when the finish row itself serializes over 1 MB: the stream
+//! errors `TooLarge` instead and no `Stats`/`End` follow. No async
+//! anywhere — the async bridge is tinio-server's job (spec §1.1).
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -358,7 +359,9 @@ impl SelectIter {
     }
 
     /// EOF: close the open span, flush the aggregate finish row with the
-    /// same buffer rules, then `Stats` + `End` — always, exactly once.
+    /// same buffer rules, then `Stats` + `End` — exactly once, unless the
+    /// finish row's flush errors `TooLarge` (1 MB) first, after which the
+    /// stream stops on that error.
     /// `at` is the offset captured at the final pull: the past-window record's
     /// start when `RangeFilter` stopped the stream, else the last yielded
     /// record's own start — close at `at` in the first case (the consumed

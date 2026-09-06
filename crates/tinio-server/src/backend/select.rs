@@ -351,6 +351,16 @@ fn build_config(
             "ScanRange does not support compressed input"
         ));
     }
+    // Parquet input is compile-time stripped (FR-021): with `select` but
+    // without `select-parquet` the engine has no parquet reader — refuse
+    // request-level (501) instead of failing in-stream after the 200.
+    #[cfg(not(feature = "select-parquet"))]
+    if parquet {
+        return Err(s3_error!(
+            NotImplemented,
+            "Parquet input requires the select-parquet feature"
+        ));
+    }
 
     let input_format = if let Some(csv) = request.input_serialization.csv.as_ref() {
         InputFormat::Csv(csv_input_params(csv)?)
@@ -390,9 +400,18 @@ fn build_config(
             input_format,
             output,
             compression: match compression {
+                dto::CompressionType::NONE => Compression::None_,
                 dto::CompressionType::GZIP => Compression::Gzip,
                 dto::CompressionType::BZIP2 => Compression::Bzip2,
-                _ => Compression::None_,
+                // The wire enum is closed (AWS): an unknown value never
+                // silently becomes NONE — that would transparently read
+                // compressed input as plain bytes.
+                other => {
+                    return Err(s3_error!(
+                        InvalidRequestParameter,
+                        "unknown CompressionType: {other}"
+                    ));
+                }
             },
             // Resolved by the op against the fetched object size.
             scan_range: None,
@@ -450,15 +469,19 @@ fn single_char_opt(value: &Option<String>, default: u8, name: &str) -> S3Result<
 /// dto `CSVInput` → engine params (unset fields take the AWS documented
 /// defaults: `,`, `\n`, `"`, `"`, `#`, `NONE`).
 fn csv_input_params(csv: &dto::CSVInput) -> S3Result<CsvParams> {
-    let header = match csv.file_header_info.as_ref() {
+    let header = match csv.file_header_info.as_ref().map(|i| i.as_str()) {
         None => CsvHeader::None_,
-        Some(info) => match info.as_str() {
-            dto::FileHeaderInfo::USE => CsvHeader::Use,
-            dto::FileHeaderInfo::IGNORE => CsvHeader::Ignore,
-            // AWS accepts NONE (also the catch-all for an unrecognized
-            // value — the wire enum is closed).
-            _ => CsvHeader::None_,
-        },
+        Some(dto::FileHeaderInfo::USE) => CsvHeader::Use,
+        Some(dto::FileHeaderInfo::IGNORE) => CsvHeader::Ignore,
+        Some(dto::FileHeaderInfo::NONE) => CsvHeader::None_,
+        // The wire enum is closed (AWS): an unrecognized value is refused,
+        // never defaulted.
+        Some(other) => {
+            return Err(s3_error!(
+                InvalidRequestParameter,
+                "unknown FileHeaderInfo: {other}"
+            ));
+        }
     };
     Ok(CsvParams {
         field_delimiter: single_char(&csv.field_delimiter, b',', "FieldDelimiter")?,
@@ -476,12 +499,16 @@ fn csv_input_params(csv: &dto::CSVInput) -> S3Result<CsvParams> {
 
 /// dto `JSONInput` → engine params (unset type = `LINES`).
 fn json_input_params(json: &dto::JSONInput) -> S3Result<JsonParams> {
-    let ty = match json.type_.as_ref() {
+    let ty = match json.type_.as_ref().map(|t| t.as_str()) {
         None => JsonType::Lines,
-        Some(t) => match t.as_str() {
-            dto::JSONType::DOCUMENT => JsonType::Document,
-            _ => JsonType::Lines,
-        },
+        Some(dto::JSONType::DOCUMENT) => JsonType::Document,
+        Some(dto::JSONType::LINES) => JsonType::Lines,
+        Some(other) => {
+            return Err(s3_error!(
+                InvalidRequestParameter,
+                "unknown JSONType: {other}"
+            ));
+        }
     };
     Ok(JsonParams { ty })
 }
@@ -494,12 +521,16 @@ fn csv_output_params(csv: &dto::CSVOutput) -> S3Result<CsvOutputParams> {
         record_delimiter: single_char(&csv.record_delimiter, b'\n', "RecordDelimiter")?,
         quote: single_char(&csv.quote_character, b'"', "QuoteCharacter")?,
         escape: single_char(&csv.quote_escape_character, b'"', "QuoteEscapeCharacter")?,
-        quote_fields: match csv.quote_fields.as_ref() {
+        quote_fields: match csv.quote_fields.as_ref().map(|q| q.as_str()) {
             None => QuoteFields::AsNeeded,
-            Some(q) => match q.as_str() {
-                dto::QuoteFields::ALWAYS => QuoteFields::Always,
-                _ => QuoteFields::AsNeeded,
-            },
+            Some(dto::QuoteFields::ALWAYS) => QuoteFields::Always,
+            Some(dto::QuoteFields::ASNEEDED) => QuoteFields::AsNeeded,
+            Some(other) => {
+                return Err(s3_error!(
+                    InvalidRequestParameter,
+                    "unknown QuoteFields: {other}"
+                ));
+            }
         },
     })
 }
@@ -945,10 +976,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "select-parquet")]
     async fn select_parquet_over_max_bytes_is_400() {
         let (backend, b) = setup_name().await;
         // Any bytes: the size check runs before a body byte is read (the
-        // key must be the `select` helper's "data.csv").
+        // key must be the `select` helper's "data.csv"). Only reachable with
+        // the parquet feature — without it the request-level feature gate
+        // (501) fires before the fetch.
         put(&backend, &b, "data.csv", &vec![0; 256 * 1024 * 1024 + 1]).await;
         let mut req = request("SELECT * FROM S3Object s");
         req.input_serialization = dto::InputSerialization {
@@ -1154,5 +1188,72 @@ mod tests {
         let err = build_config(&req).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
         assert_eq!(err.status_code().unwrap().as_u16(), 400, "{err:?}");
+    }
+
+    #[test]
+    fn select_config_rejects_unknown_wire_enum_values() {
+        // The wire enums are closed (AWS): an unknown value is refused, never
+        // silently defaulted (unknown compression must not read compressed
+        // input as plain bytes; unknown header/json/quote values must not
+        // silently pick the default mode).
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization.compression_type =
+            Some(dto::CompressionType::from_static("LZO"));
+        let err = build_config(&req).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
+        assert_eq!(err.status_code().unwrap().as_u16(), 400, "{err:?}");
+        assert!(err.message().unwrap().contains("CompressionType"), "{err:?}");
+
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization.csv = Some(dto::CSVInput {
+            file_header_info: Some(dto::FileHeaderInfo::from_static("WEIRD")),
+            ..Default::default()
+        });
+        let err = build_config(&req).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
+        assert!(err.message().unwrap().contains("FileHeaderInfo"), "{err:?}");
+
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization = dto::InputSerialization {
+            json: Some(dto::JSONInput {
+                type_: Some(dto::JSONType::from_static("WILD")),
+            }),
+            ..Default::default()
+        };
+        let err = build_config(&req).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
+        assert!(err.message().unwrap().contains("JSONType"), "{err:?}");
+
+        let mut req = request("SELECT * FROM S3Object s");
+        req.output_serialization = dto::OutputSerialization {
+            csv: Some(dto::CSVOutput {
+                quote_fields: Some(dto::QuoteFields::from_static("WILD")),
+                ..Default::default()
+            }),
+            json: None,
+        };
+        let err = build_config(&req).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
+        assert!(err.message().unwrap().contains("QuoteFields"), "{err:?}");
+    }
+
+    #[test]
+    #[cfg(not(feature = "select-parquet"))]
+    fn select_config_rejects_parquet_without_parquet_feature() {
+        // Compile-time strip (FR-021): on a `select`-only build a parquet
+        // request is a request-level 501 — never an in-stream failure after
+        // the 200 has begun (the engine has no parquet reader).
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization = dto::InputSerialization {
+            parquet: Some(dto::ParquetInput {}),
+            ..Default::default()
+        };
+        let err = build_config(&req).unwrap_err();
+        assert_eq!(err.code().as_str(), "NotImplemented", "{err:?}");
+        assert_eq!(err.status_code().unwrap().as_u16(), 501, "{err:?}");
+        assert!(
+            err.message().unwrap().contains("select-parquet"),
+            "{err:?}"
+        );
     }
 }
