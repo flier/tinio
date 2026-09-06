@@ -79,6 +79,21 @@ pub(crate) fn policy_owner_matches(policy_owner: Option<&dto::Owner>, row_owner:
     }
 }
 
+/// The single-key delete rule (spec 2026-09-05, review B2): P ==
+/// O(object) or P == O(bucket) — the access layer's `ObjectOrBucketOwner`
+/// gate for DeleteObject, mirrored for the handler-side per-key check of
+/// DeleteObjects (the op-level coarse gate, owner-or-any-grantee, runs
+/// separately — grants are irrelevant to this rule). Both owners arrive
+/// RESOLVED (an empty owner wire's lazy default, review B4 — callers
+/// resolve via [`S3Backend::row_owner`] before calling).
+pub(crate) fn can_delete(
+    principal: &OwnerId,
+    bucket_owner: &OwnerId,
+    object_owner: &OwnerId,
+) -> bool {
+    principal == object_owner || principal == bucket_owner
+}
+
 /// Exactly one ACL grant source per request (AWS's put-ACL source rule:
 /// the canned ACL, the `x-amz-grant-*` header set, or the policy body
 /// are mutually exclusive; none is equally invalid).

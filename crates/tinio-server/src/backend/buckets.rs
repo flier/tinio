@@ -180,18 +180,33 @@ impl<S: Storage> S3Backend<S> {
         // default (a cap of 5 clamps the no-parameter request to 5).
         let requested = max_buckets.unwrap_or(DEFAULT_MAX_BUCKETS) as usize;
         let effective = clamp_page_size(requested, self.caps.max_buckets);
+        // The enforced-mode owner filter (spec 2026-09-05): under the
+        // active rewrite (feature + `caps.acl` + identity) the listing
+        // yields only the requester's buckets — the contract-level
+        // filter runs DURING the walk, before pagination, so the
+        // continuation-token math applies to the filtered set (review
+        // P2#4). Rows without a recorded owner element (the legacy
+        // empty wire, review B4) match no principal's recorded owner —
+        // they stay out of every filtered listing. Feature-off /
+        // toggle-off / no-identity modes keep the unfiltered legacy
+        // listing (`None`).
+        #[cfg(feature = "acl")]
+        let owner: Option<acl::OwnerId> = if self.caps.acl && self.identity.is_some() {
+            self.owner_for(req.credentials.as_ref())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "acl"))]
+        let owner: Option<acl::OwnerId> = None;
         let listing = self
             .storage
-            // Mechanical contract adaptation (Task 5 of the acl-owner plan): no owner
-            // filter yet — the legacy listing — Task 11 wires the
-            // auth layer's owner here.
             .list_buckets(
                 ListBucketsParams {
                     prefix: prefix.clone().unwrap_or_default(),
                     start_after,
                     max_buckets: effective,
                 },
-                None,
+                owner.as_ref(),
             )
             .await
             .map_err(map_backend_error)?;
@@ -207,14 +222,21 @@ impl<S: Storage> S3Backend<S> {
         // `ContinuationToken` presence is the truncation signal (s3s
         // 0.15 has no `IsTruncated` on this wire); the engine returns
         // the resume marker only when truncated. `Prefix` is echoed iff
-        // the client sent one (AWS).
+        // the client sent one (AWS). The output `Owner` element is the
+        // filtered listing's single owner — the requester — display
+        // resolved via the identity map; `None` on the unfiltered
+        // legacy paths, gated identically to the filter above.
+        #[cfg(feature = "acl")]
+        let owner = owner.as_ref().map(|id| self.acl_owner(Some(id)));
+        #[cfg(not(feature = "acl"))]
+        let owner: Option<s3s::dto::Owner> = None;
         Ok(S3Response::new(ListBucketsOutput {
             buckets: Some(buckets),
             continuation_token: listing
                 .next_start_after
                 .map(|name| URL_SAFE_NO_PAD.encode(name.as_bytes())),
+            owner,
             prefix,
-            ..Default::default()
         }))
     }
 
@@ -388,7 +410,7 @@ mod tests {
         },
     };
     #[cfg(feature = "acl")]
-    use crate::backend::testutil::{acl_backend, signed_request, user_id};
+    use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -955,6 +977,153 @@ mod tests {
             .filter_map(|b| b.name)
             .collect();
         assert_eq!(names, ["beta"]);
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn list_buckets_filters_by_requester() {
+        // The enforced-mode owner filter (spec 2026-09-05): the
+        // contract-level filter runs during the walk, before pagination
+        // (review P2#4), so the continuation-token math applies to the
+        // filtered set. Each principal sees only the buckets whose
+        // recorded owner is theirs; a legacy row (empty owner wire —
+        // the lazy default owner, review B4) matches no recorded-owner
+        // comparison and stays out of every principal's filtered
+        // listing. The output Owner element is the requester's, display
+        // resolved via the identity map.
+        let backend = acl_backend();
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        let bob = user_id("BKID");
+        for (bn, owner) in [
+            ("alpha-a", Some(&alice)),
+            ("alpha-b", Some(&alice)),
+            ("beta-b", Some(&bob)),
+        ] {
+            let owner = owner.cloned();
+            storage
+                .create_bucket(
+                    &bucket::name(bn).unwrap(),
+                    owner.as_ref(),
+                    &acl::Acl::default_private(owner.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        // A legacy-shape bucket: no owner element ever recorded.
+        storage
+            .create_bucket(
+                &bucket::name("legacy").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        async fn list_owned(
+            backend: &S3Backend<MemoryStorage>,
+            access_key: &str,
+            max_buckets: Option<i32>,
+            continuation_token: Option<String>,
+        ) -> ListBucketsOutput {
+            let mut req = s3_request(ListBucketsInput {
+                max_buckets,
+                continuation_token,
+                ..Default::default()
+            });
+            req.credentials = Some(credentials_for(access_key));
+            backend.list_buckets(req).await.unwrap().output
+        }
+        let alice_list = list_owned(&backend, "AKID", None, None).await;
+        let names: Vec<&str> = alice_list
+            .buckets
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.name.as_deref())
+            .collect();
+        assert_eq!(names, ["alpha-a", "alpha-b"]);
+        let owner = alice_list.owner.as_ref().unwrap();
+        assert_eq!(owner.id.as_deref(), Some(alice.as_str()));
+        assert_eq!(owner.display_name.as_deref(), Some("alice"));
+        let bob_list = list_owned(&backend, "BKID", None, None).await;
+        let names: Vec<&str> = bob_list
+            .buckets
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.name.as_deref())
+            .collect();
+        assert_eq!(names, ["beta-b"]);
+        assert_eq!(
+            bob_list.owner.as_ref().unwrap().display_name.as_deref(),
+            Some("bob")
+        );
+        // The continuation tokens count the FILTERED set: a page of 1
+        // over alice's walk yields exactly her two buckets across two
+        // pages — bob's and the legacy bucket never leak in.
+        let page1 = list_owned(&backend, "AKID", Some(1), None).await;
+        assert_eq!(page1.buckets.as_ref().unwrap().len(), 1);
+        let resume = page1.continuation_token.clone();
+        assert!(
+            resume.is_some(),
+            "a truncated page must carry a resume marker"
+        );
+        let page2 = list_owned(&backend, "AKID", Some(1), resume).await;
+        assert_eq!(page2.buckets.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            page2.buckets.as_ref().unwrap()[0].name.as_deref(),
+            Some("alpha-b")
+        );
+        assert!(page2.continuation_token.is_none());
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn list_buckets_toggle_off_keeps_the_unfiltered_listing() {
+        // The toggle-off mode (accept-and-drop): `caps.acl = false`
+        // keeps the unfiltered legacy listing — every bucket, no Owner
+        // element — even with the identity attached.
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                acl: false,
+                ..Default::default()
+            },
+        )
+        .with_identity(crate::backend::testutil::acl_identity());
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        storage
+            .create_bucket(
+                &bucket::name("alpha").unwrap(),
+                Some(&alice),
+                &acl::Acl::default_private(Some(alice.clone())),
+            )
+            .await
+            .unwrap();
+        storage
+            .create_bucket(
+                &bucket::name("beta").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let mut req = s3_request(ListBucketsInput::default());
+        req.credentials = Some(credentials_for("BKID"));
+        let out = backend.list_buckets(req).await.unwrap().output;
+        let names: Vec<&str> = out
+            .buckets
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.name.as_deref())
+            .collect();
+        assert_eq!(names, ["alpha", "beta"]);
+        assert!(
+            out.owner.is_none(),
+            "the toggle-off listing carries no Owner element"
+        );
     }
 
     #[tokio::test]

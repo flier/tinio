@@ -61,8 +61,8 @@ use crate::{
 use crate::{
     _auth::canned::GrantHeaders,
     backend::acls::{
-        grant_headers, grants_dto, object_acl_grants, object_write_acl, policy_owner_matches,
-        require_content_md5,
+        can_delete, grant_headers, grants_dto, object_acl_grants, object_write_acl,
+        policy_owner_matches, require_content_md5,
     },
 };
 
@@ -744,6 +744,35 @@ impl<S: Storage> S3Backend<S> {
         Self::require_cap(self.caps.delete_objects, "DeleteObjects")?;
         let bucket = self.bucket(req.input.bucket)?;
         let quiet = req.input.delete.quiet.unwrap_or(false);
+        // The enforced-mode per-key check (spec 2026-09-05, review B2):
+        // the op-level coarse gate — bucket owner or any bucket-ACL
+        // grant to P — is the access layer's (whole-op 403); here each
+        // key is gated by the single-key delete rule (P == O(object) or
+        // P == O(bucket)) BEFORE the delete, and a denied key answers a
+        // per-key AccessDenied Error entry in the 200 response —
+        // AWS-style mixed results. The bucket owner element resolves
+        // once; the grants are irrelevant to this rule.
+        #[cfg(feature = "acl")]
+        let gate: Option<(acl::OwnerId, acl::OwnerId)> = if self.caps.acl
+            && self.identity.is_some()
+        {
+            let principal = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            let bucket_owner = self.row_owner(
+                self.storage
+                    .get_bucket_acl(&bucket)
+                    .await
+                    .map_err(map_backend_error)?
+                    .owner
+                    .as_ref(),
+            );
+            Some((principal, bucket_owner))
+        } else {
+            None
+        };
+        #[cfg(feature = "acl")]
+        let denied = s3_error!(AccessDenied, "Access Denied");
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for id in req.input.delete.objects {
@@ -754,6 +783,31 @@ impl<S: Storage> S3Backend<S> {
                     continue;
                 }
             };
+            // The per-key authorization, before the delete. A missing
+            // object has no owner to gate — the idempotent delete
+            // proceeds (the access layer's missing-object tiers pass
+            // bucket owners and READ grantees through; the whole-op
+            // coarse gate holds elsewhere); any other ACL-read failure
+            // is a per-key entry like a delete failure.
+            #[cfg(feature = "acl")]
+            if let Some((principal, bucket_owner)) = gate.as_ref() {
+                match self.storage.get_object_acl(&bucket, &key).await {
+                    Ok(acl) => {
+                        let object_owner = self.row_owner(acl.owner.as_ref());
+                        if !can_delete(principal, bucket_owner, &object_owner) {
+                            errors.push(delete_error(&denied, key.to_string()));
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        let err: StorageError = err.into();
+                        if !matches!(err, StorageError::NoSuchKey(_)) {
+                            errors.push(delete_error(&map_backend_error(err), key.to_string()));
+                            continue;
+                        }
+                    }
+                }
+            }
             // Per-key write lock, as in `op_delete_object`.
             let _guard = self.lock_object(&bucket, &key).await;
             match self.storage.delete_object(&bucket, &key).await {
@@ -1932,6 +1986,197 @@ mod tests {
             .unwrap(),
             b"b"
         );
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn delete_objects_reports_denied_keys_per_key() {
+        // The handler-side per-key check (spec 2026-09-05, review B2):
+        // the op-level coarse gate (bucket owner or any bucket-ACL
+        // grantee) is the access layer's; here each key is gated by the
+        // single-key delete rule — P == O(object) or P == O(bucket),
+        // grants irrelevant. A denied key answers a per-key AccessDenied
+        // Error entry in the 200 response (AWS-style mixed results);
+        // allowed keys are deleted. A READ-only grantee deletes their
+        // own keys without any bucket WRITE.
+        let backend = acl_backend();
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        let bob = user_id("BKID");
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(
+                &b,
+                Some(&alice),
+                &acl::Acl {
+                    owner: Some(alice.clone()),
+                    grants: vec![
+                        grant_to(&alice, acl::Permission::FullControl),
+                        group_grant(acl::GROUP_ALL_USERS, acl::Permission::Read),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        async fn commit(
+            storage: &MemoryStorage,
+            b: &bucket::Name,
+            key: &str,
+            owner: &acl::OwnerId,
+        ) {
+            let k = object::key(key).unwrap();
+            storage
+                .commit_object(
+                    b,
+                    &k,
+                    storage
+                        .stage_body(b, &k, body(format!("{key}")), None)
+                        .await
+                        .unwrap(),
+                    object::Tags::empty(),
+                    Some(owner),
+                    &acl::Acl::default_private(Some(owner.clone())),
+                )
+                .await
+                .unwrap();
+        }
+        commit(storage, &b, "alice.txt", &alice).await;
+        commit(storage, &b, "bob.txt", &bob).await;
+        async fn batch_delete(
+            backend: &S3Backend<MemoryStorage>,
+            access_key: &str,
+            keys: Vec<&str>,
+            quiet: bool,
+        ) -> dto::DeleteObjectsOutput {
+            let mut req = s3_request(dto::DeleteObjectsInput {
+                bucket: "data".into(),
+                bypass_governance_retention: None,
+                checksum_algorithm: None,
+                delete: dto::Delete {
+                    objects: keys
+                        .into_iter()
+                        .map(|key| dto::ObjectIdentifier {
+                            key: key.into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    quiet: Some(quiet),
+                },
+                expected_bucket_owner: None,
+                mfa: None,
+                request_payer: None,
+            });
+            req.credentials = Some(credentials_for(access_key));
+            backend.delete_objects(req).await.unwrap().output
+        }
+
+        // Bob (a READ grantee only) deletes across owned + not: his key
+        // is deleted, alice's key is a per-key AccessDenied, and a
+        // missing key deletes idempotently (no owner to gate).
+        let out = batch_delete(
+            &backend,
+            "BKID",
+            vec!["bob.txt", "alice.txt", "missing.txt"],
+            false,
+        )
+        .await;
+        let deleted: Vec<&str> = out
+            .deleted
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d.key.as_deref())
+            .collect();
+        assert_eq!(deleted, ["bob.txt", "missing.txt"]);
+        let errors = out.errors.as_ref().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key.as_deref(), Some("alice.txt"));
+        assert_eq!(errors[0].code.as_deref(), Some("AccessDenied"));
+        // bob.txt is gone; alice's object survived the denied key.
+        assert!(matches!(
+            storage
+                .head_object(&b, &object::key("bob.txt").unwrap())
+                .await
+                .unwrap_err(),
+            _mem::Error::Storage(StorageError::NoSuchKey(_))
+        ));
+        storage
+            .head_object(&b, &object::key("alice.txt").unwrap())
+            .await
+            .unwrap();
+
+        // Quiet mode: the denied key is still an Error entry; a
+        // successful delete emits no Deleted entry.
+        let out = batch_delete(&backend, "BKID", vec!["missing.txt"], true).await;
+        assert!(out.deleted.is_none());
+        assert!(out.errors.is_none());
+
+        // The bucket owner: everything is deletable.
+        let out = batch_delete(&backend, "AKID", vec!["alice.txt"], false).await;
+        assert_eq!(out.deleted.as_ref().unwrap().len(), 1);
+        assert!(out.errors.is_none());
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn delete_objects_toggle_off_keeps_no_per_key_checks() {
+        // The toggle-off mode (accept-and-drop): no per-key checks — a
+        // non-owner deletes the owner's key with a plain Deleted entry
+        // (today's behavior; the access layer is the enforcement
+        // surface when wired).
+        let backend = S3Backend::new(
+            MemoryStorage::new().unwrap(),
+            Capabilities {
+                acl: false,
+                ..Default::default()
+            },
+        )
+        .with_identity(crate::backend::testutil::acl_identity());
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(
+                &b,
+                Some(&alice),
+                &acl::Acl::default_private(Some(alice.clone())),
+            )
+            .await
+            .unwrap();
+        let k = object::key("alice.txt").unwrap();
+        storage
+            .commit_object(
+                &b,
+                &k,
+                storage
+                    .stage_body(&b, &k, body(b"a"), None)
+                    .await
+                    .unwrap(),
+                object::Tags::empty(),
+                Some(&alice),
+                &acl::Acl::default_private(Some(alice.clone())),
+            )
+            .await
+            .unwrap();
+        let mut req = s3_request(dto::DeleteObjectsInput {
+            bucket: "data".into(),
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            delete: dto::Delete {
+                objects: vec![dto::ObjectIdentifier {
+                    key: "alice.txt".into(),
+                    ..Default::default()
+                }],
+                quiet: None,
+            },
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
+        });
+        req.credentials = Some(credentials_for("BKID"));
+        let out = backend.delete_objects(req).await.unwrap().output;
+        assert_eq!(out.deleted.as_ref().unwrap().len(), 1);
+        assert!(out.errors.is_none());
     }
 
     #[cfg(feature = "copy")]

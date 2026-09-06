@@ -89,6 +89,17 @@ impl<S: Storage> S3Backend<S> {
                     key: Some(String::from(o.key)),
                     last_modified: Some(Self::last_modified(o.last_modified)),
                     size: Some(o.size as i64),
+                    // The entry Owner element (spec 2026-09-05): from
+                    // the row owner (`Info.owner`), the display resolved
+                    // via the identity map; a row without a recorded
+                    // owner resolves to the lazy default owner (review
+                    // B4). `caps.acl` off keeps the legacy owner-less
+                    // entries (accept-and-drop).
+                    #[cfg(feature = "acl")]
+                    owner: self
+                        .caps
+                        .acl
+                        .then(|| self.acl_owner(o.owner.as_ref())),
                     ..Default::default()
                 })
                 .collect(),
@@ -185,6 +196,8 @@ mod tests {
             testutil::{s3_request, setup as base_setup},
         },
     };
+    #[cfg(feature = "acl")]
+    use crate::backend::testutil::{acl_backend, credentials_for, user_id};
 
     async fn setup() -> (S3Backend<MemoryStorage>, String) {
         let (backend, b) = base_setup().await;
@@ -433,6 +446,79 @@ mod tests {
         );
         assert_eq!(out.is_truncated, Some(true));
         assert_eq!(out.contents.as_ref().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "acl")]
+    #[cfg(feature = "list-v1")]
+    #[tokio::test]
+    async fn v1_entries_carry_the_lazy_resolved_row_owner() {
+        // The enforced-mode owner surface (spec 2026-09-05): each list
+        // entry's Owner element comes from the row owner (`Info.owner`),
+        // the display name resolved via the identity map; a legacy row
+        // with no owner element resolves to the identity's default owner
+        // (review B4, the uniform lazy semantics).
+        let backend = acl_backend();
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, Some(&alice), &acl::Acl::default_private(Some(alice.clone())))
+            .await
+            .unwrap();
+        async fn commit(
+            storage: &MemoryStorage,
+            b: &bucket::Name,
+            key: &str,
+            owner: Option<&acl::OwnerId>,
+        ) {
+            let k = object::key(key).unwrap();
+            storage
+                .commit_object(
+                    b,
+                    &k,
+                    storage
+                        .stage_body(b, &k, body(format!("{key}")), None)
+                        .await
+                        .unwrap(),
+                    object::Tags::empty(),
+                    owner,
+                    &owner
+                        .map(|o| acl::Acl::default_private(Some(o.clone())))
+                        .unwrap_or_else(|| acl::Acl::default_private(None)),
+                )
+                .await
+                .unwrap();
+        }
+        commit(storage, &b, "a.txt", Some(&alice)).await;
+        commit(storage, &b, "legacy.txt", None).await;
+        let mut req = s3_request(dto::ListObjectsInput {
+            bucket: b.to_string(),
+            ..Default::default()
+        });
+        req.credentials = Some(credentials_for("AKID"));
+        let out = backend.list_objects(req).await.unwrap().output;
+        let contents = out.contents.as_ref().unwrap();
+        assert_eq!(contents.len(), 2);
+        let a = contents
+            .iter()
+            .find(|o| o.key.as_deref() == Some("a.txt"))
+            .unwrap();
+        let owner = a.owner.as_ref().unwrap();
+        assert_eq!(owner.id.as_deref(), Some(alice.as_str()));
+        assert_eq!(owner.display_name.as_deref(), Some("alice"));
+        let legacy = contents
+            .iter()
+            .find(|o| o.key.as_deref() == Some("legacy.txt"))
+            .unwrap();
+        let owner = legacy.owner.as_ref().unwrap();
+        assert_eq!(
+            owner.id.as_deref(),
+            Some(acl::default_owner_id().as_str())
+        );
+        assert_eq!(
+            owner.display_name.as_deref(),
+            Some(acl::DEFAULT_OWNER_DISPLAY_NAME)
+        );
     }
 
     #[cfg(feature = "list-v2")]
