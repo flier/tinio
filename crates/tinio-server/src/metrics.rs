@@ -1062,6 +1062,8 @@ mod tests {
         assert_eq!(s3_counter("ListObjects", 501), 1);
         #[cfg(feature = "list-v2")]
         assert_eq!(s3_counter("ListObjectsV2", 501), 1);
+        #[cfg(feature = "select")]
+        assert_eq!(s3_counter("SelectObjectContent", 501), 1);
     }
 }
 
