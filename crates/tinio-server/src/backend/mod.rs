@@ -133,6 +133,8 @@ use std::{collections::HashMap, sync::Mutex};
 #[cfg(feature = "acl")]
 use crate::_auth::canned::GrantHeaders;
 #[cfg(feature = "acl")]
+use crate::_core::acl;
+#[cfg(feature = "acl")]
 use crate::_auth::identity::Identity;
 #[cfg(feature = "acl")]
 use self::acls::object_write_acl;
@@ -170,14 +172,6 @@ use crate::{
     },
     _util::lockmap::{self, Map},
 };
-#[cfg(feature = "acl")]
-use crate::_auth::canned::GrantHeaders;
-#[cfg(feature = "acl")]
-use crate::_core::acl;
-#[cfg(feature = "acl")]
-use crate::_auth::identity::Identity;
-#[cfg(feature = "acl")]
-use self::acls::object_write_acl;
 
 /// The S3 mapping over one [`Storage`] backend.
 ///
@@ -311,6 +305,15 @@ impl<S: Storage> S3Backend<S> {
             #[cfg(feature = "acl")]
             identity: None,
         }
+    }
+
+    /// Attach the identity map (feature `acl`): the ACL ops' `Owner`
+    /// elements and (Task 11) the write-path owner recording resolve
+    /// through it. `None` (the default) is the legacy/no-identity mode.
+    #[cfg(feature = "acl")]
+    pub fn with_identity(mut self, identity: Arc<Identity>) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// The storage backend (for direct contract access in tests/harness).
@@ -503,7 +506,6 @@ impl<S: Storage> S3Backend<S> {
     /// acl))` under identity mode with the toggle on, `None` under
     /// no-identity / toggle-off (the caller records the empty owner wire
     /// and the private default — review B4 rule 3). The bucket owner is
-    /// + the private default — review B4 rule 3). The bucket owner is
     /// resolved lazily from the bucket row — only a canned
     /// `bucket-owner-*` expansion needs it (review A6).
     #[cfg(feature = "acl")]
