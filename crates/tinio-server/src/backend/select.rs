@@ -5,12 +5,13 @@
 //! The op validates the request (expression, serialization combinations,
 //! single-byte delimiters, ScanRange, JSON-output alias rule), fetches the
 //! object through the read path, and bridges the synchronous
-//! [`tinio_select::events::select_iter`] onto s3s (spec §1.1): a forwarder
-//! task pumps the storage body stream into a bounded channel, `spawn_blocking`
-//! drives the engine over a [`ChannelReader`], and the response is a
-//! hand-rolled `futures::Stream` over a second channel (`Receiver::poll_recv`
+//! [`select_iter`] onto s3s (spec §1.1): a forwarder
+//! task pumps the storage body stream into a bounded channel, a pre-sized
+//! rayon pool (16 MiB stacks — parquet schema recursion is unbounded
+//! upstream, X3) drives the engine over a [`ChannelReader`], and the response
+//! is a hand-rolled `futures::Stream` over a second channel (`Receiver::poll_recv`
 //! — no `tokio-stream`) mapping [`SelectEvent`] → `dto` events and
-//! [`SelectError`] → `S3Error` items. CPU-bound work never runs on a tokio
+//! [`Error`] → `S3Error` items. CPU-bound work never runs on a tokio
 //! worker; cancellation unwinds the channel topology (the s3s stream drop
 //! ends each stage).
 //!
@@ -24,26 +25,30 @@
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
+use cfg_if::cfg_if;
 use futures::{Stream, StreamExt};
 use http::StatusCode;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto, s3_error};
-use tinio_select::{
-    SelectError,
-    events::{ContPolicy, InputFormat, JsonParams, ParquetParams, SelectConfig, SelectEvent},
-    json::JsonType,
-    output::{CsvOutputParams, JsonOutputParams, OutputMode, QuoteFields},
-    record::{Compression, CsvHeader, CsvParams},
-    sql,
-};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::{
     _core::storage::{GetObjectResult, Storage},
+    _select::{
+        Error, csv,
+        events::{
+            ByteCounters, ContPolicy, InputFormat, MAX_PARQUET_BYTES, ParquetParams,
+            SelectConfig, SelectEvent, select_iter,
+        },
+        json,
+        output::{CsvOutputParams, JsonOutputParams, OutputMode, QuoteFields},
+        record::{Compression, ScanRange},
+        sql,
+    },
     backend::{S3Backend, map_backend_error},
 };
 
@@ -51,19 +56,36 @@ use crate::{
 /// the storage read, bounded memory mid-pipeline.
 const CHANNEL_CAP: usize = 4;
 
-/// Concurrency cap on streaming select jobs (review 2026-09-05 #4): at most
-/// [`SELECT_CONCURRENCY`] responses stream at once, so a pile of concurrent
-/// selects cannot saturate tokio workers on top of `spawn_blocking`. The
-/// permit is held for the whole response (dropped on stream end/cancel).
-const SELECT_CONCURRENCY: usize = 4;
+/// Stream-send deadline (X5): a client that stopped reading must not pin a
+/// concurrency permit forever. After [`SEND_TIMEOUT`] of a full out channel
+/// the engine gives up and unwinds — the drop unwinds the whole topology.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The select concurrency cap, shared across backend instances (one process
-/// serves one cluster).
-fn select_semaphore() -> Arc<Semaphore> {
-    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(SELECT_CONCURRENCY)))
-        .clone()
+/// `try_send` with a wall-clock deadline: a `Full` channel hands the item
+/// back for the retry (never cloned); `false` = client gone (closed) or
+/// deadline hit — the caller unwinds so the permit is released.
+fn send_or_unwind(
+    tx: &mpsc::Sender<Result<SelectEvent, Error>>,
+    mut item: Result<SelectEvent, Error>,
+) -> bool {
+    let deadline = std::time::Instant::now() + SEND_TIMEOUT;
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(buf)) => {
+                item = buf;
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(SEND_POLL);
+            }
+        }
+    }
 }
+
+/// The retry interval of [`send_or_unwind`].
+const SEND_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The sync bridge input (spec §1.1): `std::io::Read` over the forwarder's
 /// bounded channel — `blocking_recv` blocks the calling thread, so this
@@ -109,7 +131,7 @@ impl io::Read for ChannelReader {
 /// drops it — which unwinds the pipeline (the engine's next send fails, its
 /// output drops the `ChannelReader`, the forwarder stops).
 struct EventStream {
-    rx: StdMutex<mpsc::Receiver<Result<SelectEvent, SelectError>>>,
+    rx: StdMutex<mpsc::Receiver<Result<SelectEvent, Error>>>,
     permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -137,30 +159,39 @@ impl Stream for EventStream {
 
 /// [`SelectEvent`] → s3s event (spec §1.1 mapping).
 fn map_event(event: SelectEvent) -> dto::SelectObjectContentEvent {
+    // The three counters as the dto's `Option<i64>` fields — the
+    // `Progress`/`Stats` detail structs carry the same trio.
+    let count = |c: ByteCounters| {
+        (
+            Some(c.bytes_scanned as i64),
+            Some(c.bytes_processed as i64),
+            Some(c.bytes_returned as i64),
+        )
+    };
     match event {
         SelectEvent::Records(bytes) => dto::SelectObjectContentEvent::Records(dto::RecordsEvent {
             payload: Some(dto::Body::from(bytes)),
         }),
-        SelectEvent::Progress {
-            bytes_scanned,
-            bytes_processed,
-            bytes_returned,
-        } => dto::SelectObjectContentEvent::Progress(dto::ProgressEvent {
-            details: Some(dto::Progress {
-                bytes_scanned: Some(bytes_scanned as i64),
-                bytes_processed: Some(bytes_processed as i64),
-                bytes_returned: Some(bytes_returned as i64),
-            }),
-        }),
-        SelectEvent::Stats {
-            bytes_scanned,
-            bytes_processed,
-            bytes_returned,
-        } => dto::SelectObjectContentEvent::Stats(dto::StatsEvent {
-            details: Some(dto::Stats {
-                bytes_scanned: Some(bytes_scanned as i64),
-                bytes_processed: Some(bytes_processed as i64),
-                bytes_returned: Some(bytes_returned as i64),
+        SelectEvent::Progress(counters) => {
+            dto::SelectObjectContentEvent::Progress(dto::ProgressEvent {
+                details: Some({
+                    let (bytes_scanned, bytes_processed, bytes_returned) = count(counters);
+                    dto::Progress {
+                        bytes_scanned,
+                        bytes_processed,
+                        bytes_returned,
+                    }
+                }),
+            })
+        }
+        SelectEvent::Stats(counters) => dto::SelectObjectContentEvent::Stats(dto::StatsEvent {
+            details: Some({
+                let (bytes_scanned, bytes_processed, bytes_returned) = count(counters);
+                dto::Stats {
+                    bytes_scanned,
+                    bytes_processed,
+                    bytes_returned,
+                }
             }),
         }),
         SelectEvent::Cont => dto::SelectObjectContentEvent::Cont(dto::ContinuationEvent {}),
@@ -168,14 +199,23 @@ fn map_event(event: SelectEvent) -> dto::SelectObjectContentEvent {
     }
 }
 
-/// [`SelectError`] → in-stream s3s error (design §3). These items sit inside
+/// [`Error`] → in-stream s3s error (design §3). These items sit inside
 /// the 200 event stream — no status override (a `Custom` status only matters
 /// for request-level errors, which must be set explicitly, below).
-fn map_stream_error(e: SelectError) -> S3Error {
+fn map_stream_error(e: Error) -> S3Error {
     match e {
-        SelectError::Ambiguous(m) => S3Error::with_message(S3ErrorCode::AmbiguousFieldName, m),
-        SelectError::MissingHeader(m) => {
+        Error::Ambiguous(m) => S3Error::with_message(S3ErrorCode::AmbiguousFieldName, m),
+        Error::MissingHeader(m) => {
             S3Error::with_message(S3ErrorCode::Custom("MissingHeaderName".into()), m)
+        }
+        // X9: `Io` details can embed on-disk paths — the wire sees a fixed
+        // message, the detail is logged server-side.
+        Error::Io(err) => {
+            tracing::warn!("select stream io error: {err}");
+            S3Error::with_message(
+                S3ErrorCode::Custom("S3QueryError".into()),
+                "S3 select: io error",
+            )
         }
         e => S3Error::with_message(S3ErrorCode::Custom("S3QueryError".into()), e.to_string()),
     }
@@ -185,9 +225,9 @@ fn map_stream_error(e: SelectError) -> S3Error {
 /// not exist as an s3s variant — a `Custom` whose default status is HTTP 500
 /// (`Custom.status_code() == None` → 500 on serialize) — so every one of
 /// these MUST set BAD_REQUEST explicitly (review 2026-09-05 #2/#11).
-fn query_parsing_error(e: SelectError) -> S3Error {
+fn query_parsing_error(e: Error) -> S3Error {
     let message = match e {
-        SelectError::Parse(m) | SelectError::Unsupported(m) => m,
+        Error::Parse(m) | Error::Unsupported(m) => m,
         e => e.to_string(),
     };
     let mut err = S3Error::with_message(S3ErrorCode::Custom("S3QueryParsingError".into()), message);
@@ -210,13 +250,16 @@ impl<S: Storage> S3Backend<S> {
         req: S3Request<dto::SelectObjectContentInput>,
     ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
         Self::require_cap(self.caps.select, "SelectObjectContent")?;
-        let permit = select_semaphore()
-            .acquire_owned()
-            .await
-            .map_err(|_| s3_error!(InternalError, "select semaphore closed"))?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        let (plan, mut config, raw_scan) = build_config(&req.input.request)?;
+        // X6: the parse+validate is CPU-bound — a 256 KiB adversarial
+        // expression (token walk, positions table) must not run unbounded
+        // on a tokio worker; the §1.1 "CPU never on a worker" rule applies
+        // here too.
+        let (plan, mut config, raw_scan) =
+            tokio::task::spawn_blocking(move || build_config(req.input.request))
+                .await
+                .map_err(|_| s3_error!(InternalError, "select request build task panicked"))??;
 
         let fetched = self
             .storage
@@ -238,11 +281,19 @@ impl<S: Storage> S3Backend<S> {
                 config.max_parquet_bytes
             ));
         }
-        config.size = Some(size);
+
+        // Admit only after every request-level check (review 2026-09-06b R9):
+        // invalid / oversize requests must not hold slots. The permit rides
+        // the response stream for the job's lifetime.
+        let permit = Arc::clone(&self.select_semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| s3_error!(InternalError, "select semaphore closed"))?;
 
         // The bridge (spec §1.1): a forwarder feeds the body stream into a
-        // bounded channel; `spawn_blocking` runs the synchronous engine over
-        // the ChannelReader; results flow out over a second bounded channel.
+        // bounded channel; the pre-sized select rayon pool runs the sync
+        // engine over the ChannelReader; results flow out over a second
+        // bounded channel.
         let GetObjectResult { body, .. } = fetched;
         let (in_tx, in_rx) = mpsc::channel::<io::Result<Bytes>>(CHANNEL_CAP);
         tokio::spawn(async move {
@@ -255,17 +306,35 @@ impl<S: Storage> S3Backend<S> {
             }
             // The sender drops here — the ChannelReader sees EOF.
         });
-        let (out_tx, out_rx) = mpsc::channel::<Result<SelectEvent, SelectError>>(CHANNEL_CAP);
-        tokio::task::spawn_blocking(move || {
+        let (out_tx, out_rx) = mpsc::channel::<Result<SelectEvent, Error>>(CHANNEL_CAP);
+        // X3: pool threads carry a 16 MiB stack — parquet footer schema
+        // recursion (upstream parquet 59.3, unbounded) and our own
+        // `arrow_json` can nest thousands of levels, and a stack overflow is
+        // NOT a panic: `catch_unwind` cannot hold it and the process would
+        // abort. Width matches the admission semaphore so jobs wait outside
+        // the pool (R9) rather than stacking unbounded in rayon.
+        self.select_pool.spawn(move || {
             let input = Box::new(ChannelReader {
                 rx: in_rx,
                 pending: None,
             });
-            for item in tinio_select::events::select_iter(plan, config, input) {
-                if out_tx.blocking_send(item).is_err() {
-                    // The response stream dropped: the client is gone.
-                    break;
+            // Review 2026-09-06b R8: without this, a panic in the engine
+            // ends the stream silently — no error item, no Stats/End.
+            // Unwind-capture and surface it as an in-stream S3QueryError.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for item in select_iter(plan, config, input) {
+                    if !send_or_unwind(&out_tx, item) {
+                        // X5: client gone (closed channel) or stalled
+                        // past the deadline — unwind the topology.
+                        return;
+                    }
                 }
+            }));
+            if result.is_err() {
+                let _ = send_or_unwind(
+                    &out_tx,
+                    Err(Error::Value("internal: select engine panicked".into())),
+                );
             }
         });
 
@@ -280,91 +349,75 @@ impl<S: Storage> S3Backend<S> {
 
 /// The request's static validation + `SelectConfig` build. `scan_range` is
 /// returned unresolved — the op resolves it against the fetched object size —
-/// and `config.scan_range`/`config.size` are left for the op.
+/// and `config.scan_range` is left for the op.
 fn build_config(
-    request: &dto::SelectObjectContentRequest,
-) -> S3Result<(
-    tinio_select::sql::QueryPlan,
-    SelectConfig,
-    Option<dto::ScanRange>,
-)> {
-    // ExpressionType: only SQL exists.
-    if request.expression_type.as_str() != dto::ExpressionType::SQL {
-        return Err(s3_error!(
-            InvalidRequestParameter,
-            "ExpressionType must be SQL"
-        ));
-    }
-    // The expression parse + grammar gate runs here, request-level — the
-    // engine receives the pre-built plan (rejected constructs → §3 row 1).
-    let plan = sql::parse(&request.expression).map_err(query_parsing_error)?;
+    request: dto::SelectObjectContentRequest,
+) -> S3Result<(sql::QueryPlan, SelectConfig, Option<dto::ScanRange>)> {
+    let dto::SelectObjectContentRequest {
+        expression,
+        expression_type,
+        input_serialization,
+        output_serialization,
+        request_progress,
+        scan_range,
+    } = request;
 
-    // Exactly one input serialization (CSV/JSON/Parquet).
-    let inputs = [
-        request.input_serialization.csv.is_some(),
-        request.input_serialization.json.is_some(),
-        request.input_serialization.parquet.is_some(),
-    ]
-    .into_iter()
-    .filter(|present| *present)
-    .count();
-    if inputs != 1 {
-        return Err(s3_error!(
-            InvalidRequestParameter,
-            "exactly one of CSV, JSON, or Parquet input serialization must be specified"
-        ));
-    }
-    // Exactly one output serialization (CSV/JSON).
-    if request.output_serialization.csv.is_some() == request.output_serialization.json.is_some() {
-        return Err(s3_error!(
-            InvalidRequestParameter,
-            "exactly one of CSV or JSON output serialization must be specified"
-        ));
+    // ExpressionType: only SQL exists on the wire.
+    require_expression_type_sql(&expression_type)?;
+
+    // Exactly one input (CSV/JSON/Parquet) and one output (CSV/JSON).
+    require_one_input(&input_serialization)?;
+    require_one_output(&output_serialization)?;
+
+    // Unset / wire `NONE` → no codec; unknown values refused (never silently
+    // become none — that would transparently read compressed input as plain).
+    let compression = parse_compression(&input_serialization.compression_type)?;
+
+    // Parquet ⇒ feature gate (FR-021), no compression (engine reads raw),
+    // no ScanRange (row-group positions are meaningless for it).
+    if input_serialization.parquet.is_some() {
+        // Compile-time stripped: with `select` but without `select-parquet`
+        // the engine has no parquet reader — refuse request-level (501)
+        // instead of failing in-stream after the 200.
+        cfg_if! {
+            if #[cfg(feature = "select-parquet")] {
+                if compression.is_some() {
+                    return Err(s3_error!(
+                        InvalidRequestParameter,
+                        "Parquet input must not be compressed"
+                    ));
+                }
+                if scan_range.is_some() {
+                    return Err(s3_error!(
+                        InvalidRequestParameter,
+                        "ScanRange is not supported for Parquet input"
+                    ));
+                }
+            } else {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "Parquet input requires the select-parquet feature"
+                ));
+            }
+        }
     }
 
-    let compression = request
-        .input_serialization
-        .compression_type
-        .as_ref()
-        .map(|c| c.as_str())
-        .unwrap_or(dto::CompressionType::NONE);
-    let parquet = request.input_serialization.parquet.is_some();
-    // Parquet ⇒ no compression (the engine reads parquet out of the raw
-    // stream), and no ScanRange (row-group positions are meaningless for it).
-    if parquet && compression != dto::CompressionType::NONE {
-        return Err(s3_error!(
-            InvalidRequestParameter,
-            "Parquet input must not be compressed"
-        ));
-    }
-    if parquet && request.scan_range.is_some() {
-        return Err(s3_error!(
-            InvalidRequestParameter,
-            "ScanRange is not supported for Parquet input"
-        ));
-    }
     // ScanRange ⇒ no compression (AWS semantics for the combination are
     // ambiguous; refuse rather than guess).
-    if request.scan_range.is_some() && compression != dto::CompressionType::NONE {
+    if scan_range.is_some() && compression.is_some() {
         return Err(s3_error!(
             InvalidRequestParameter,
             "ScanRange does not support compressed input"
         ));
     }
-    // Parquet input is compile-time stripped (FR-021): with `select` but
-    // without `select-parquet` the engine has no parquet reader — refuse
-    // request-level (501) instead of failing in-stream after the 200.
-    #[cfg(not(feature = "select-parquet"))]
-    if parquet {
-        return Err(s3_error!(
-            NotImplemented,
-            "Parquet input requires the select-parquet feature"
-        ));
-    }
 
-    let input_format = if let Some(csv) = request.input_serialization.csv.as_ref() {
+    // The expression parse + grammar gate runs here, request-level — the
+    // engine receives the pre-built plan (rejected constructs → §3 row 1).
+    let plan = sql::parse(&expression).map_err(query_parsing_error)?;
+
+    let input_format = if let Some(csv) = input_serialization.csv {
         InputFormat::Csv(csv_input_params(csv)?)
-    } else if let Some(json) = request.input_serialization.json.as_ref() {
+    } else if let Some(json) = input_serialization.json.as_ref() {
         InputFormat::Json(json_input_params(json)?)
     } else {
         // Parquet: project down to the columns the plan references.
@@ -372,7 +425,7 @@ fn build_config(
             projection: sql::referenced_columns(&plan),
         })
     };
-    let output = if let Some(csv) = request.output_serialization.csv.as_ref() {
+    let output = if let Some(csv) = output_serialization.csv {
         OutputMode::Csv(csv_output_params(csv)?)
     } else {
         // JSON output names its columns from aliases / plain field names
@@ -386,11 +439,7 @@ fn build_config(
             ));
         }
         OutputMode::Json(json_output_params(
-            request
-                .output_serialization
-                .json
-                .as_ref()
-                .expect("checked above"),
+            output_serialization.json.as_ref().expect("checked above"),
         )?)
     };
 
@@ -399,33 +448,73 @@ fn build_config(
         SelectConfig {
             input_format,
             output,
-            compression: match compression {
-                dto::CompressionType::NONE => Compression::None_,
-                dto::CompressionType::GZIP => Compression::Gzip,
-                dto::CompressionType::BZIP2 => Compression::Bzip2,
-                // The wire enum is closed (AWS): an unknown value never
-                // silently becomes NONE — that would transparently read
-                // compressed input as plain bytes.
-                other => {
-                    return Err(s3_error!(
-                        InvalidRequestParameter,
-                        "unknown CompressionType: {other}"
-                    ));
-                }
-            },
+            compression,
             // Resolved by the op against the fetched object size.
             scan_range: None,
-            request_progress: request
-                .request_progress
-                .as_ref()
-                .and_then(|p| p.enabled)
-                .unwrap_or(false),
+            request_progress: request_progress.and_then(|p| p.enabled).unwrap_or(false),
             cont: ContPolicy::default(),
-            size: None,
-            max_parquet_bytes: tinio_select::events::MAX_PARQUET_BYTES,
+            max_parquet_bytes: MAX_PARQUET_BYTES,
         },
-        request.scan_range.clone(),
+        scan_range,
     ))
+}
+
+/// ExpressionType: only SQL exists on the wire.
+fn require_expression_type_sql(ty: &dto::ExpressionType) -> S3Result<()> {
+    if ty.as_str() != dto::ExpressionType::SQL {
+        return Err(s3_error!(
+            InvalidRequestParameter,
+            "ExpressionType must be SQL"
+        ));
+    }
+    Ok(())
+}
+
+/// Exactly one of CSV / JSON / Parquet in `InputSerialization`.
+fn require_one_input(input: &dto::InputSerialization) -> S3Result<()> {
+    let n = [
+        input.csv.is_some(),
+        input.json.is_some(),
+        input.parquet.is_some(),
+    ]
+    .into_iter()
+    .filter(|&present| present)
+    .count();
+    if n != 1 {
+        return Err(s3_error!(
+            InvalidRequestParameter,
+            "exactly one of CSV, JSON, or Parquet input serialization must be specified"
+        ));
+    }
+    Ok(())
+}
+
+/// Exactly one of CSV / JSON in `OutputSerialization`.
+fn require_one_output(output: &dto::OutputSerialization) -> S3Result<()> {
+    if output.csv.is_some() == output.json.is_some() {
+        return Err(s3_error!(
+            InvalidRequestParameter,
+            "exactly one of CSV or JSON output serialization must be specified"
+        ));
+    }
+    Ok(())
+}
+
+/// Unset / wire `NONE` → `None`; known codec → `Some`; unknown → 400.
+fn parse_compression(value: &Option<dto::CompressionType>) -> S3Result<Option<Compression>> {
+    Ok(value
+        .as_ref()
+        .map(|c| {
+            Compression::from_wire(c.as_str()).map_err(|_| {
+                s3_error!(
+                    InvalidRequestParameter,
+                    "unknown CompressionType: {}",
+                    c.as_str()
+                )
+            })
+        })
+        .transpose()?
+        .flatten())
 }
 
 /// A single-character wire parameter: one byte after the checks, else the
@@ -447,62 +536,95 @@ fn single_char(value: &Option<String>, default: u8, name: &str) -> S3Result<u8> 
     }
 }
 
-/// The comment character: AWS default `#` (the engine's own default —
-/// [`SelectConfig`] — is None, the crate's raw-pipeline pick; the wire
-/// default is what the op applies).
-fn single_char_opt(value: &Option<String>, default: u8, name: &str) -> S3Result<Option<u8>> {
-    match value {
-        None => Ok(Some(default)),
-        Some(text) => {
-            let bytes = text.as_bytes();
-            if bytes.len() != 1 {
-                return Err(s3_error!(
-                    InvalidRequestParameter,
-                    "{name} must be a single character"
-                ));
-            }
-            Ok(Some(bytes[0]))
+/// Quote/escape characters equal to a delimiter are ambiguous (X10): the
+/// `csv` crate would silently tolerate the clash — refused request-level,
+/// dotted names per parameter so the message names the conflict.
+fn validate_quote_escape(
+    field_delimiter: &u8,
+    record_delimiter: &u8,
+    quote: &u8,
+    escape: &u8,
+) -> S3Result<()> {
+    for (name, ch) in [
+        ("QuoteCharacter", *quote),
+        ("QuoteEscapeCharacter", *escape),
+    ] {
+        if ch == *field_delimiter {
+            return Err(s3_error!(
+                InvalidRequestParameter,
+                "{name} must differ from FieldDelimiter"
+            ));
+        }
+        if ch == *record_delimiter {
+            return Err(s3_error!(
+                InvalidRequestParameter,
+                "{name} must differ from RecordDelimiter"
+            ));
         }
     }
+    Ok(())
+}
+
+/// The comment character: AWS default `#` (the engine's own default —
+/// [`SelectConfig`] — is None, the crate's raw-pipeline pick; the wire
+/// default is what the op applies). The byte check is `single_char`'s;
+/// `None` takes the default. (review 2026-09-06 simplify: one validator.)
+fn single_char_opt(value: &Option<String>, default: u8, name: &str) -> S3Result<Option<u8>> {
+    Ok(Some(single_char(value, default, name)?))
 }
 
 /// dto `CSVInput` → engine params (unset fields take the AWS documented
 /// defaults: `,`, `\n`, `"`, `"`, `#`, `NONE`).
-fn csv_input_params(csv: &dto::CSVInput) -> S3Result<CsvParams> {
-    let header = match csv.file_header_info.as_ref().map(|i| i.as_str()) {
-        None => CsvHeader::None_,
-        Some(dto::FileHeaderInfo::USE) => CsvHeader::Use,
-        Some(dto::FileHeaderInfo::IGNORE) => CsvHeader::Ignore,
-        Some(dto::FileHeaderInfo::NONE) => CsvHeader::None_,
+fn csv_input_params(
+    dto::CSVInput {
+        file_header_info,
+        field_delimiter,
+        record_delimiter,
+        quote_character,
+        quote_escape_character,
+        comments,
+        allow_quoted_record_delimiter,
+    }: dto::CSVInput,
+) -> S3Result<csv::Params> {
+    let header = match file_header_info.as_ref() {
+        None => None,
+        // Wire `NONE` is absence — not a header-mode variant.
+        Some(i) if i.as_str() == dto::FileHeaderInfo::NONE => None,
         // The wire enum is closed (AWS): an unrecognized value is refused,
         // never defaulted.
-        Some(other) => {
-            return Err(s3_error!(
+        Some(i) => Some(i.as_str().parse().map_err(|_| {
+            s3_error!(
                 InvalidRequestParameter,
-                "unknown FileHeaderInfo: {other}"
-            ));
-        }
+                "unknown FileHeaderInfo: {}",
+                i.as_str()
+            )
+        })?),
     };
-    Ok(CsvParams {
-        field_delimiter: single_char(&csv.field_delimiter, b',', "FieldDelimiter")?,
-        record_delimiter: single_char(&csv.record_delimiter, b'\n', "RecordDelimiter")?,
-        quote: single_char(&csv.quote_character, b'"', "QuoteCharacter")?,
-        escape: single_char(&csv.quote_escape_character, b'"', "QuoteEscapeCharacter")?,
-        comments: single_char_opt(&csv.comments, b'#', "Comments")?,
+    let field_delimiter = single_char(&field_delimiter, b',', "FieldDelimiter")?;
+    let record_delimiter = single_char(&record_delimiter, b'\n', "RecordDelimiter")?;
+    let quote = single_char(&quote_character, b'"', "QuoteCharacter")?;
+    let escape = single_char(&quote_escape_character, b'"', "QuoteEscapeCharacter")?;
+    validate_quote_escape(&field_delimiter, &record_delimiter, &quote, &escape)?;
+    Ok(csv::Params {
+        field_delimiter,
+        record_delimiter,
+        quote,
+        escape,
+        comments: single_char_opt(&comments, b'#', "Comments")?,
         header,
         // Known deviation (#7): the flag is not enforced by the engine —
         // permissive (AWS true) behavior applies either way; documented and
         // pinned by the tinio-select tests, never silently ignored.
-        allow_quoted_record_delimiter: csv.allow_quoted_record_delimiter.unwrap_or(true),
+        allow_quoted_record_delimiter: allow_quoted_record_delimiter.unwrap_or(true),
     })
 }
 
 /// dto `JSONInput` → engine params (unset type = `LINES`).
-fn json_input_params(json: &dto::JSONInput) -> S3Result<JsonParams> {
-    let ty = match json.type_.as_ref().map(|t| t.as_str()) {
-        None => JsonType::Lines,
-        Some(dto::JSONType::DOCUMENT) => JsonType::Document,
-        Some(dto::JSONType::LINES) => JsonType::Lines,
+fn json_input_params(input: &dto::JSONInput) -> S3Result<json::Params> {
+    let ty = match input.type_.as_ref().map(|t| t.as_str()) {
+        None => json::Type::Lines,
+        Some(dto::JSONType::DOCUMENT) => json::Type::Document,
+        Some(dto::JSONType::LINES) => json::Type::Lines,
         Some(other) => {
             return Err(s3_error!(
                 InvalidRequestParameter,
@@ -510,18 +632,31 @@ fn json_input_params(json: &dto::JSONInput) -> S3Result<JsonParams> {
             ));
         }
     };
-    Ok(JsonParams { ty })
+    Ok(json::Params { ty })
 }
 
 /// dto `CSVOutput` → engine params (unset fields take the AWS documented
 /// defaults: `,`, `\n`, `"`, `"`, `ASNEEDED`).
-fn csv_output_params(csv: &dto::CSVOutput) -> S3Result<CsvOutputParams> {
+fn csv_output_params(
+    dto::CSVOutput {
+        field_delimiter,
+        record_delimiter,
+        quote_character,
+        quote_escape_character,
+        quote_fields,
+    }: dto::CSVOutput,
+) -> S3Result<CsvOutputParams> {
+    let field_delimiter = single_char(&field_delimiter, b',', "FieldDelimiter")?;
+    let record_delimiter = single_char(&record_delimiter, b'\n', "RecordDelimiter")?;
+    let quote = single_char(&quote_character, b'"', "QuoteCharacter")?;
+    let escape = single_char(&quote_escape_character, b'"', "QuoteEscapeCharacter")?;
+    validate_quote_escape(&field_delimiter, &record_delimiter, &quote, &escape)?;
     Ok(CsvOutputParams {
-        field_delimiter: single_char(&csv.field_delimiter, b',', "FieldDelimiter")?,
-        record_delimiter: single_char(&csv.record_delimiter, b'\n', "RecordDelimiter")?,
-        quote: single_char(&csv.quote_character, b'"', "QuoteCharacter")?,
-        escape: single_char(&csv.quote_escape_character, b'"', "QuoteEscapeCharacter")?,
-        quote_fields: match csv.quote_fields.as_ref().map(|q| q.as_str()) {
+        field_delimiter,
+        record_delimiter,
+        quote,
+        escape,
+        quote_fields: match quote_fields.as_ref().map(|q| q.as_str()) {
             None => QuoteFields::AsNeeded,
             Some(dto::QuoteFields::ALWAYS) => QuoteFields::Always,
             Some(dto::QuoteFields::ASNEEDED) => QuoteFields::AsNeeded,
@@ -548,7 +683,7 @@ fn json_output_params(json: &dto::JSONOutput) -> S3Result<JsonOutputParams> {
 /// `[size-end, size-1]`. Every arithmetic path is checked — an out-of-range
 /// or underflowing window errors 400 instead of wrapping or panicking (the
 /// `end`-only `size - end` is guarded by `end ≤ size`).
-fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<(u64, Option<u64>)> {
+fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<ScanRange> {
     match (scan.start, scan.end) {
         // "must not be empty" (AWS).
         (None, None) => Err(s3_error!(
@@ -567,7 +702,10 @@ fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<(u64, Option
                     "ScanRange start is beyond the object size"
                 ))
             } else {
-                Ok((start as u64, None))
+                Ok(ScanRange {
+                    start: start as u64,
+                    end: None,
+                })
             }
         }
         (None, Some(end)) => {
@@ -584,7 +722,10 @@ fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<(u64, Option
             } else {
                 // The trailing window; `size - end` cannot underflow (checked
                 // above), `size - 1` needs size ≥ 1 (end ≥ 1 ≤ size).
-                Ok((size - end as u64, Some(size - 1)))
+                Ok(ScanRange {
+                    start: size - end as u64,
+                    end: Some(size - 1),
+                })
             }
         }
         (Some(start), Some(end)) => {
@@ -604,7 +745,10 @@ fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<(u64, Option
                     "ScanRange end is beyond the object size"
                 ))
             } else {
-                Ok((start as u64, Some(end as u64)))
+                Ok(ScanRange {
+                    start: start as u64,
+                    end: Some(end as u64),
+                })
             }
         }
     }
@@ -615,12 +759,12 @@ mod tests {
     use std::time::Duration;
 
     use s3s::S3;
-    use tinio_select::{events::ContPolicy, output::CsvOutputParams};
 
     use super::*;
     use crate::{
-        _core::{bucket, storage::ObjectOps},
+        _core::{bucket, object, storage::ObjectOps},
         _mem::MemoryStorage,
+        _select::{events::ContPolicy, output::CsvOutputParams},
         _util::testing::body,
         backend::{
             Capabilities,
@@ -700,8 +844,8 @@ mod tests {
             .unwrap();
     }
 
-    fn object_key(key: &str) -> crate::_core::object::Key {
-        crate::_core::object::key(key).unwrap()
+    fn object_key(key: &str) -> object::Key {
+        object::key(key).unwrap()
     }
 
     #[tokio::test]
@@ -1084,22 +1228,23 @@ mod tests {
     async fn select_concurrency_cap_waits_and_releases_at_stream_end() {
         let (backend, b) = setup_name().await;
         put(&backend, &b, "data.csv", b"1\n2\n3\n").await;
-        // Hold four live responses (the permit rides the response stream).
+        let cap = backend.capabilities().select_concurrency as usize;
+        // Hold `cap` live responses (the permit rides the response stream).
         let mut held = Vec::new();
-        for _ in 0..SELECT_CONCURRENCY {
+        for _ in 0..cap {
             held.push(
                 select(&backend, &b, request("SELECT * FROM S3Object s"))
                     .await
                     .unwrap(),
             );
         }
-        // The fifth must wait for the cap.
-        let fifth = select(&backend, &b, request("SELECT * FROM S3Object s"));
+        // The next must wait for the cap.
+        let waiting = select(&backend, &b, request("SELECT * FROM S3Object s"));
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), fifth)
+            tokio::time::timeout(Duration::from_millis(200), waiting)
                 .await
                 .is_err(),
-            "the fifth select must wait for the concurrency cap"
+            "the next select must wait for the concurrency cap"
         );
         // Draining one response to its stream end releases its permit.
         let _ = collect_records(held.remove(0).output.payload.unwrap()).await;
@@ -1121,7 +1266,7 @@ mod tests {
         // `"`, `"`, ASNEEDED; JSON output `\n`; no compression; no
         // ScanRange; no request progress; the default Cont policy; the
         // 256 MiB parquet bound.
-        let (_, config, raw_scan) = build_config(&request("SELECT * FROM S3Object s")).unwrap();
+        let (_, config, raw_scan) = build_config(request("SELECT * FROM S3Object s")).unwrap();
         let InputFormat::Csv(csv) = config.input_format else {
             panic!("default input must be CSV");
         };
@@ -1130,7 +1275,7 @@ mod tests {
         assert_eq!(csv.quote, b'"');
         assert_eq!(csv.escape, b'"');
         assert_eq!(csv.comments, Some(b'#'));
-        assert_eq!(csv.header, CsvHeader::None_);
+        assert_eq!(csv.header, None);
         assert!(csv.allow_quoted_record_delimiter);
         let OutputMode::Csv(out) = config.output else {
             panic!("default output must be CSV");
@@ -1144,9 +1289,8 @@ mod tests {
         );
         assert!(!config.request_progress);
         assert_eq!(config.cont, ContPolicy::default());
-        assert_eq!(config.compression, Compression::None_);
+        assert_eq!(config.compression, None);
         assert_eq!(config.scan_range, None);
-        assert_eq!(config.size, None);
         assert_eq!(config.max_parquet_bytes, 256 * 1024 * 1024);
         assert_eq!(raw_scan, None);
 
@@ -1160,11 +1304,11 @@ mod tests {
             json: Some(dto::JSONOutput::default()),
             ..Default::default()
         };
-        let (_, config, _) = build_config(&json).unwrap();
+        let (_, config, _) = build_config(json).unwrap();
         assert_eq!(
             config.input_format,
-            InputFormat::Json(JsonParams {
-                ty: JsonType::Lines
+            InputFormat::Json(json::Params {
+                ty: json::Type::Lines
             })
         );
         assert_eq!(
@@ -1172,6 +1316,78 @@ mod tests {
             OutputMode::Json(JsonOutputParams {
                 record_delimiter: b'\n',
             })
+        );
+    }
+
+    #[test]
+    fn select_config_maps_gzip_and_bzip2_compression() {
+        // The dto compression type lands in the config as the engine's
+        // enum (NONE stays None, the Option carries it).
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization.compression_type = Some(dto::CompressionType::from_static(
+            dto::CompressionType::GZIP,
+        ));
+        let (_, config, _) = build_config(req.clone()).unwrap();
+        assert_eq!(config.compression, Some(Compression::Gzip));
+
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization.compression_type = Some(dto::CompressionType::from_static(
+            dto::CompressionType::BZIP2,
+        ));
+        let (_, config, _) = build_config(req).unwrap();
+        assert_eq!(config.compression, Some(Compression::Bzip2));
+    }
+
+    #[test]
+    fn stream_io_error_is_fixed_message() {
+        // X9: Io errors can embed on-disk paths — the wire sees a fixed
+        // message, the detail is logged server-side.
+        let err = map_stream_error(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/srv/secret/object.csv",
+        )));
+        assert_eq!(err.code().as_str(), "S3QueryError", "{err:?}");
+        assert_eq!(err.message().unwrap(), "S3 select: io error", "{err:?}");
+    }
+
+    #[test]
+    fn send_or_unwind_closed_channel_returns_false() {
+        // X5: a dropped receiver (client gone) is detected by try_send —
+        // no retry loop, immediate unwind.
+        let (tx, rx) = mpsc::channel::<Result<SelectEvent, Error>>(CHANNEL_CAP);
+        drop(rx);
+        assert!(!send_or_unwind(
+            &tx,
+            Err(Error::Value("boom".into()))
+        ));
+    }
+
+    #[test]
+    fn select_config_rejects_quote_escape_delimiter_conflicts() {
+        // X10: a quote/escape character equal to a delimiter is ambiguous —
+        // the csv crate would tolerate it silently; refused request-level.
+        let mut req = request("SELECT * FROM S3Object s");
+        req.input_serialization.csv = Some(dto::CSVInput {
+            quote_character: Some(",".into()),
+            ..Default::default()
+        });
+        let err = build_config(req).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
+        assert!(err.message().unwrap().contains("QuoteCharacter"), "{err:?}");
+
+        let mut req = request("SELECT * FROM S3Object s");
+        req.output_serialization = dto::OutputSerialization {
+            csv: Some(dto::CSVOutput {
+                quote_escape_character: Some("\n".into()),
+                ..Default::default()
+            }),
+            json: None,
+        };
+        let err = build_config(req).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
+        assert!(
+            err.message().unwrap().contains("QuoteEscapeCharacter"),
+            "{err:?}"
         );
     }
 
@@ -1185,7 +1401,7 @@ mod tests {
             field_delimiter: Some("é".into()),
             ..Default::default()
         });
-        let err = build_config(&req).unwrap_err();
+        let err = build_config(req).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
         assert_eq!(err.status_code().unwrap().as_u16(), 400, "{err:?}");
     }
@@ -1197,19 +1413,21 @@ mod tests {
         // input as plain bytes; unknown header/json/quote values must not
         // silently pick the default mode).
         let mut req = request("SELECT * FROM S3Object s");
-        req.input_serialization.compression_type =
-            Some(dto::CompressionType::from_static("LZO"));
-        let err = build_config(&req).unwrap_err();
+        req.input_serialization.compression_type = Some(dto::CompressionType::from_static("LZO"));
+        let err = build_config(req).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
         assert_eq!(err.status_code().unwrap().as_u16(), 400, "{err:?}");
-        assert!(err.message().unwrap().contains("CompressionType"), "{err:?}");
+        assert!(
+            err.message().unwrap().contains("CompressionType"),
+            "{err:?}"
+        );
 
         let mut req = request("SELECT * FROM S3Object s");
         req.input_serialization.csv = Some(dto::CSVInput {
             file_header_info: Some(dto::FileHeaderInfo::from_static("WEIRD")),
             ..Default::default()
         });
-        let err = build_config(&req).unwrap_err();
+        let err = build_config(req).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
         assert!(err.message().unwrap().contains("FileHeaderInfo"), "{err:?}");
 
@@ -1220,7 +1438,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = build_config(&req).unwrap_err();
+        let err = build_config(req).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
         assert!(err.message().unwrap().contains("JSONType"), "{err:?}");
 
@@ -1232,7 +1450,7 @@ mod tests {
             }),
             json: None,
         };
-        let err = build_config(&req).unwrap_err();
+        let err = build_config(req).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequestParameter", "{err:?}");
         assert!(err.message().unwrap().contains("QuoteFields"), "{err:?}");
     }
@@ -1248,12 +1466,9 @@ mod tests {
             parquet: Some(dto::ParquetInput {}),
             ..Default::default()
         };
-        let err = build_config(&req).unwrap_err();
+        let err = build_config(req).unwrap_err();
         assert_eq!(err.code().as_str(), "NotImplemented", "{err:?}");
         assert_eq!(err.status_code().unwrap().as_u16(), 501, "{err:?}");
-        assert!(
-            err.message().unwrap().contains("select-parquet"),
-            "{err:?}"
-        );
+        assert!(err.message().unwrap().contains("select-parquet"), "{err:?}");
     }
 }

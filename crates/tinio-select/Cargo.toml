@@ -6,17 +6,21 @@ description = "Streaming SQL SELECT engine for S3 objects (S3 Select)"
 publish = false
 
 [dependencies]
-arrow = { version = "56", default-features = false, optional = true } # parquet 56's ChunkReader has no Cursor impl — arrow types are the reader's output types
+arrow = { workspace = true, optional = true }
 bzip2.workspace = true
-bytes = { workspace = true, optional = true } # parquet 56's ChunkReader is implemented for bytes::Bytes only (no AsRef blanket)
+bytes = { workspace = true, optional = true }
 csv.workspace = true
 flate2.workspace = true
-parquet = { workspace = true, optional = true } # review 2026-09-05b: declared optional here (not in workspace.dependencies, RFC 2906) so [features] parquet = ["dep:parquet"] resolves
+parse-display.workspace = true
+parquet = { workspace = true, optional = true }
 rust_decimal.workspace = true
-serde_json = { workspace = true, features = ["arbitrary_precision", "preserve_order"] }
-sqlparser = { workspace = true, features = ["visitor"] } # referenced_columns walks Expr via the generated visitor
+serde_json = { workspace = true, features = [
+    "arbitrary_precision",
+    "preserve_order",
+] }
+sqlparser = { workspace = true, features = ["visitor"] }
 thiserror.workspace = true
-time = { workspace = true, features = ["formatting"] } # RFC 3339 timestamp output (time 0.3.55: formatting is opt-in)
+time = { workspace = true, features = ["formatting"] }
 
 [dev-dependencies]
 criterion.workspace = true

@@ -9,22 +9,25 @@
 //! missing column to `Value::Null`, and the three MISSING-sensitive spots
 //! (`IS NULL`[...], the `__s3_is_missing` sentinels) resolve their operand
 //! at the `Field` level first so a present-but-null value stays distinct
-//! from an absent field.
+//! from an absent field. The `IsNot*` forms are the pure negations of their
+//! cousins, so a MISSING operand answers `true` there (pinned, review
+//! 2026-09-06b R12).
 
 use std::cmp::Ordering;
 
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
-use sqlparser::ast::Value as AstValue;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript, UnaryOperator,
+    Value as AstValue, ValueWithSpan,
 };
 
-use crate::SelectError;
-use crate::json::to_value;
-use crate::row::{Field, Record, Value, display, parse_number};
-use crate::sql::{Projection, QueryPlan, contains_aggregate};
+use crate::{
+    error::Error,
+    json::{json_lookup, to_value},
+    row::{Field, NameStyle, Record, Value, display, parse_number},
+    sql::{Projection, QueryPlan, contains_aggregate},
+};
 
 /// One output row: keys (alias > plain field name > the record's names) and
 /// the projected values (a filtered row never reaches here).
@@ -46,6 +49,11 @@ pub struct Engine {
     /// the parse layer already guarantees the bare-call shape, so this
     /// memo is also the engine's defense.
     agg_kinds: Option<Vec<AggKind>>,
+    /// Precomputed `Item` projection keys (alias, else plain field name,
+    /// else the expression text). The expression-text fallback re-renders
+    /// the whole AST, so building it per row was pure waste (review
+    /// 2026-09-06 simplify); `None` at `Wild` slots.
+    item_keys: Vec<Option<String>>,
 }
 
 /// One projection item's aggregate form.
@@ -89,7 +97,7 @@ enum ExtremaMode {
 }
 
 /// What an expression in flight sees: the record under test plus the FROM
-/// alias (the JSON/parquet arms of `column_value` need it; CSV does not).
+/// alias (the JSON path/access arms need the alias; flat lookups do not).
 struct RowCtx<'a> {
     record: &'a Record,
     alias: &'a Option<String>,
@@ -101,18 +109,29 @@ impl Engine {
             count: 0,
             per_col: vec![AggCol::default(); plan.projections.len()],
         });
+        let item_keys = plan
+            .projections
+            .iter()
+            .map(|item| match item {
+                Projection::Item { expr, alias } => {
+                    Some(alias.clone().unwrap_or_else(|| plain_key(expr)))
+                }
+                Projection::Wild => None,
+            })
+            .collect();
         Self {
             plan,
             emitted: 0,
             agg_state,
             agg_kinds: None,
+            item_keys,
         }
     }
 
     /// One record through the plan. `Ok(None)` = filtered, or LIMIT reached;
     /// in aggregate mode it always accumulates and returns `Ok(None)` (the
     /// single row is live in `finish`).
-    pub fn next(&mut self, rec: Record) -> Result<Option<OutRow>, SelectError> {
+    pub fn next(&mut self, rec: Record) -> Result<Option<OutRow>, Error> {
         if self.agg_state.is_some() {
             return self.aggregate_next(rec);
         }
@@ -123,11 +142,7 @@ impl Engine {
             record: &rec,
             alias: &self.plan.from.alias,
         };
-        let passes = match &self.plan.where_expr {
-            Some(expr) => eval(expr, &ctx)? == Value::Bool(true),
-            None => true,
-        };
-        if !passes {
+        if !self.passes(&ctx)? {
             return Ok(None);
         }
         let row = self.project(&ctx)?;
@@ -139,7 +154,7 @@ impl Engine {
     /// row flow. Aggregate mode (Task 7): the caller loops `next` to EOF,
     /// then `finish` produces the single aggregate row; a repeated call
     /// returns `Ok(None)` (the state is consumed).
-    pub fn finish(&mut self) -> Result<Option<OutRow>, SelectError> {
+    pub fn finish(&mut self) -> Result<Option<OutRow>, Error> {
         let Some(state) = self.agg_state.take() else {
             return Ok(None);
         };
@@ -165,17 +180,13 @@ impl Engine {
     /// Aggregate mode: WHERE-filter, then accumulate for the row. A filtered
     /// record contributes nothing; LIMIT applies to the single output row
     /// (never a positive bound) and is not consulted here.
-    fn aggregate_next(&mut self, rec: Record) -> Result<Option<OutRow>, SelectError> {
+    fn aggregate_next(&mut self, rec: Record) -> Result<Option<OutRow>, Error> {
         self.classified()?;
         let ctx = RowCtx {
             record: &rec,
             alias: &self.plan.from.alias,
         };
-        let passes = match &self.plan.where_expr {
-            Some(expr) => eval(expr, &ctx)? == Value::Bool(true),
-            None => true,
-        };
-        if passes {
+        if self.passes(&ctx)? {
             let kinds = self.agg_kinds.as_deref().expect("classified above");
             let state = self.agg_state.as_mut().expect("aggregate mode");
             accumulate(kinds, state, &ctx)?;
@@ -183,9 +194,25 @@ impl Engine {
         Ok(None)
     }
 
+    /// WHERE filter: a record passes only when the predicate evaluates to
+    /// TRUE (SQL 3VL — Null/MISSING and non-boolean do not pass).
+    fn passes(&self, ctx: &RowCtx) -> Result<bool, Error> {
+        Ok(match &self.plan.where_expr {
+            Some(expr) => eval(expr, ctx)? == Value::Bool(true),
+            None => true,
+        })
+    }
+
+    /// LIMIT reached (X1): the adapter stops pulling records — the old
+    /// `Ok(None)` was indistinguishable from "filtered", so a limit-bodied
+    /// query scrolled the whole object. Aggregate plans never consult it.
+    pub fn limit_reached(&self) -> bool {
+        !self.agg_state.is_some() && self.plan.limit.is_some_and(|n| self.emitted >= n)
+    }
+
     /// Classify the projection list once (defense: the parse layer already
     /// guarantees every item is a bare aggregate call).
-    fn classified(&mut self) -> Result<(), SelectError> {
+    fn classified(&mut self) -> Result<(), Error> {
         if self.agg_kinds.is_none() {
             let mut kinds = Vec::with_capacity(self.plan.projections.len());
             for item in &self.plan.projections {
@@ -202,15 +229,15 @@ impl Engine {
     /// rows project the `Field` itself so a MISSING column serializes as
     /// `{}` (AWS: MISSING → empty record) rather than a present NULL; CSV
     /// keeps the eval-level collapse.
-    fn project(&self, ctx: &RowCtx) -> Result<OutRow, SelectError> {
+    fn project(&self, ctx: &RowCtx) -> Result<OutRow, Error> {
         let mut keys = Vec::new();
         let mut vals = Vec::new();
-        for item in &self.plan.projections {
+        for (i, item) in self.plan.projections.iter().enumerate() {
             match item {
                 Projection::Wild => match ctx.record {
-                    Record::Csv(fields, names) | Record::Parquet(fields, names) => {
-                        keys.extend(names.iter().cloned());
-                        vals.extend(fields.iter().cloned());
+                    Record::Csv(cols) | Record::Parquet(cols) => {
+                        keys.extend(cols.names.iter().cloned());
+                        vals.extend(cols.fields.iter().cloned());
                     }
                     // JSON: the top-level keys in encounter order (objects);
                     // a scalar/array/MISSING row has no columns.
@@ -222,16 +249,18 @@ impl Engine {
                     }
                     Record::Json(_) => {}
                 },
-                Projection::Item { expr, alias } => {
+                Projection::Item { expr, .. } => {
                     let field = match ctx.record {
                         Record::Json(_) => eval_field(expr, ctx)?,
                         _ => Field::Present(eval(expr, ctx)?),
                     };
                     vals.push(field);
-                    keys.push(match alias {
-                        Some(a) => a.clone(),
-                        None => plain_key(expr),
-                    });
+                    keys.push(
+                        self.item_keys[i]
+                            .as_ref()
+                            .expect("Item projection key precomputed")
+                            .clone(),
+                    );
                 }
             }
         }
@@ -240,11 +269,7 @@ impl Engine {
 }
 
 /// One passing record through every aggregate in the projection list.
-fn accumulate(
-    kinds: &[AggKind],
-    state: &mut AggState,
-    ctx: &RowCtx,
-) -> Result<(), SelectError> {
+fn accumulate(kinds: &[AggKind], state: &mut AggState, ctx: &RowCtx) -> Result<(), Error> {
     state.count += 1;
     for (kind, col) in kinds.iter().zip(state.per_col.iter_mut()) {
         match kind {
@@ -273,7 +298,7 @@ fn accumulate(
 
 /// The operand as a present non-NULL value (`eval_field` keeps MISSING);
 /// every aggregate skips Missing and Null alike.
-fn present_value(expr: &Expr, ctx: &RowCtx) -> Result<Option<Value>, SelectError> {
+fn present_value(expr: &Expr, ctx: &RowCtx) -> Result<Option<Value>, Error> {
     Ok(match eval_field(expr, ctx)? {
         Field::Present(Value::Null) | Field::Missing => None,
         Field::Present(v) => Some(v),
@@ -292,7 +317,7 @@ fn accumulate_extrema(
     is_min: bool,
     col: &mut AggCol,
     ctx: &RowCtx,
-) -> Result<(), SelectError> {
+) -> Result<(), Error> {
     let Some(v) = present_value(expr, ctx)? else {
         return Ok(());
     };
@@ -317,7 +342,11 @@ fn accumulate_extrema(
                 None => true,
                 Some(c) => {
                     let current = display(c);
-                    if is_min { text < current } else { text > current }
+                    if is_min {
+                        text < current
+                    } else {
+                        text > current
+                    }
                 }
             };
             if better {
@@ -347,7 +376,7 @@ fn accumulate_extrema(
 /// guard): its error is propagated for a numeric-shaped token and ignored
 /// for plain text; `NaN`/`inf` are not finite as `f64` — not numeric-
 /// shaped — so they stay a string column.
-fn first_contrib_spine(v: &Value) -> Result<Option<Decimal>, SelectError> {
+fn first_contrib_spine(v: &Value) -> Result<Option<Decimal>, Error> {
     match v {
         Value::Decimal(d) => Ok(Some(*d)),
         Value::Int(i) => Ok(Some(Decimal::from(*i))),
@@ -373,7 +402,7 @@ fn numeric_shaped(s: &str) -> bool {
 
 /// One aggregate column's finished value: COUNT → Int; SUM/AVG/MIN/MAX with
 /// zero contributing values → Null; AVG → Decimal scale 10.
-fn finish_value(kind: &AggKind, state: &AggState, col: &AggCol) -> Result<Value, SelectError> {
+fn finish_value(kind: &AggKind, state: &AggState, col: &AggCol) -> Result<Value, Error> {
     Ok(match kind {
         AggKind::CountStar => Value::Int(state.count as i64),
         AggKind::Count(_) => Value::Int(col.count as i64),
@@ -398,10 +427,8 @@ fn finish_value(kind: &AggKind, state: &AggState, col: &AggCol) -> Result<Value,
 /// Classify one projection item as the aggregate it must be — the shape the
 /// accumulation dispatches on; the parse layer rejects anything else, so
 /// the two error arms below are defense-in-depth.
-fn aggregate_kind(item: &Projection) -> Result<AggKind, SelectError> {
-    let not_aggregate = || {
-        SelectError::Parse("non-aggregate expression in aggregate select list".into())
-    };
+fn aggregate_kind(item: &Projection) -> Result<AggKind, Error> {
+    let not_aggregate = || Error::Parse("non-aggregate expression in aggregate select list".into());
     let Projection::Item { expr, .. } = item else {
         return Err(not_aggregate());
     };
@@ -415,7 +442,7 @@ fn aggregate_kind(item: &Projection) -> Result<AggKind, SelectError> {
         return Err(not_aggregate());
     };
     if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
-        return Err(SelectError::Parse("distinct not supported".into()));
+        return Err(Error::Parse("distinct not supported".into()));
     }
     match (name.as_str(), list.args.as_slice()) {
         ("count", [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok(AggKind::CountStar),
@@ -445,8 +472,8 @@ fn single_part_name(name: &ObjectName) -> Option<String> {
 }
 
 /// The shared 28-digit overflow error (same surface as arithmetic).
-fn precision_overflow() -> SelectError {
-    SelectError::Value("numeric value exceeds 28-digit precision".into())
+fn precision_overflow() -> Error {
+    Error::Value("numeric value exceeds 28-digit precision".into())
 }
 
 /// The projection key of an expression without an alias: a path access is
@@ -492,17 +519,11 @@ fn access_key(root: &Expr, chain: &[AccessExpr]) -> String {
 /// `MissingHeader`, headerless modes fall through to MISSING. JSON: the
 /// attribute rules below. Parquet: the CSV spine minus MissingHeader (a
 /// name matching no projected column is MISSING — see `parquet_field`).
-fn column_value(
-    rec: &Record,
-    name: &str,
-    alias: &Option<String>,
-    quoted: bool,
-) -> Result<Option<Field>, SelectError> {
-    let _ = alias; // unused by flat-record lookups (JSON paths use it)
+fn column_value(rec: &Record, name: &str, style: NameStyle) -> Result<Option<Field>, Error> {
     match rec {
-        Record::Csv(fields, names) => Ok(csv_field(fields, names, name, quoted)?),
-        Record::Json(v) => Ok(Some(json_column(v.as_ref(), name, quoted)?)),
-        Record::Parquet(fields, names) => parquet_field(fields, names, name, quoted),
+        Record::Csv(cols) => Ok(csv_field(&cols.fields, &cols.names, name, style)?),
+        Record::Json(v) => Ok(Some(json_column(v.as_ref(), name, style)?)),
+        Record::Parquet(cols) => parquet_field(&cols.fields, &cols.names, name, style),
     }
 }
 
@@ -514,42 +535,18 @@ fn column_value(
 fn json_column(
     value: Option<&serde_json::Value>,
     name: &str,
-    quoted: bool,
-) -> Result<Field, SelectError> {
-    let Some(v) = value else { return Ok(Field::Missing) };
+    style: NameStyle,
+) -> Result<Field, Error> {
+    let Some(v) = value else {
+        return Ok(Field::Missing);
+    };
     match v {
-        serde_json::Value::Object(map) => match json_lookup(map, name, quoted)? {
+        serde_json::Value::Object(map) => match json_lookup(map, name, style)? {
             None if name == "_1" => Ok(Field::Present(to_value(v))),
             Some(field) => Ok(Field::Present(to_value(field))),
             None => Ok(Field::Missing),
         },
         _ => Ok(Field::Present(to_value(v))),
-    }
-}
-
-/// Object key lookup: case-insensitive when unquoted, exact when quoted;
-/// a case-folded duplicate is ambiguous (AWS: two attrs differing only in
-/// case → `AmbiguousFieldName`).
-fn json_lookup<'a>(
-    map: &'a serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    quoted: bool,
-) -> Result<Option<&'a serde_json::Value>, SelectError> {
-    let mut found: Vec<&serde_json::Value> = Vec::new();
-    for (key, value) in map {
-        let matches = if quoted {
-            key == name
-        } else {
-            key.eq_ignore_ascii_case(name)
-        };
-        if matches {
-            found.push(value);
-        }
-    }
-    match found.as_slice() {
-        [] => Ok(None),
-        [value] => Ok(Some(*value)),
-        _ => Err(SelectError::Ambiguous(name.into())),
     }
 }
 
@@ -560,25 +557,25 @@ fn json_path(
     record: Option<&serde_json::Value>,
     parts: &[Ident],
     alias: &Option<String>,
-) -> Result<Field, SelectError> {
-    let (first, rest) = parts.split_first().expect("compound identifier is non-empty");
-    let mut field = match first.value.as_str() {
-        "_1" => json_row_ref(record, first.quote_style.is_some())?,
-        name if alias.as_deref() == Some(name) => json_row_value(record),
-        name => json_column(record, name, first.quote_style.is_some())?,
-    };
+) -> Result<Field, Error> {
+    let (first, rest) = parts
+        .split_first()
+        .expect("compound identifier is non-empty");
+    let mut field = json_root_field(record, &first.value, ident_style(first), alias)?;
     for part in rest {
-        field = json_dot_step(field, &part.value, part.quote_style.is_some())?;
+        field = json_dot_step(field, &part.value, ident_style(part))?;
     }
     Ok(field)
 }
 
 /// The row itself under `_1` — the whole record value unless the object
 /// carries a key matching `_1` (field wins).
-fn json_row_ref(record: Option<&serde_json::Value>, quoted: bool) -> Result<Field, SelectError> {
-    let Some(v) = record else { return Ok(Field::Missing) };
+fn json_row_ref(record: Option<&serde_json::Value>, style: NameStyle) -> Result<Field, Error> {
+    let Some(v) = record else {
+        return Ok(Field::Missing);
+    };
     if let serde_json::Value::Object(map) = v
-        && let Some(field) = json_lookup(map, "_1", quoted)?
+        && let Some(field) = json_lookup(map, "_1", style)?
     {
         return Ok(Field::Present(to_value(field)));
     }
@@ -593,22 +590,39 @@ fn json_row_value(record: Option<&serde_json::Value>) -> Field {
     }
 }
 
+/// The record-root resolution of a JSON identifier, shared by
+/// `CompoundIdentifier` (`json_path`) and `CompoundFieldAccess`
+/// (`json_access`): `_1` → the row (a matching field wins), the FROM alias →
+/// the whole record value, any other name → a field.
+fn json_root_field(
+    record: Option<&serde_json::Value>,
+    name: &str,
+    style: NameStyle,
+    alias: &Option<String>,
+) -> Result<Field, Error> {
+    match name {
+        "_1" => json_row_ref(record, style),
+        name if alias.as_deref() == Some(name) => Ok(json_row_value(record)),
+        name => json_column(record, name, style),
+    }
+}
+
 /// One dot step: an object key lookup (CI/exact per the part's quote);
 /// anything else is MISSING.
-fn json_dot_step(field: Field, name: &str, quoted: bool) -> Result<Field, SelectError> {
+fn json_dot_step(field: Field, name: &str, style: NameStyle) -> Result<Field, Error> {
     match field {
         Field::Missing => Ok(Field::Missing),
-        Field::Present(Value::Json(j)) => json_dot(j, name, quoted),
+        Field::Present(Value::Json(j)) => json_dot(j, name, style),
         Field::Present(_) => Ok(Field::Missing),
     }
 }
 
 /// One dot look up on a boxed JSON value.
-fn json_dot(j: Box<serde_json::Value>, name: &str, quoted: bool) -> Result<Field, SelectError> {
+fn json_dot(j: Box<serde_json::Value>, name: &str, style: NameStyle) -> Result<Field, Error> {
     let serde_json::Value::Object(map) = j.as_ref() else {
         return Ok(Field::Missing);
     };
-    match json_lookup(map, name, quoted)? {
+    match json_lookup(map, name, style)? {
         Some(v) => Ok(Field::Present(to_value(v))),
         None => Ok(Field::Missing),
     }
@@ -623,13 +637,9 @@ fn json_access(
     root: &Expr,
     chain: &[AccessExpr],
     alias: &Option<String>,
-) -> Result<Field, SelectError> {
+) -> Result<Field, Error> {
     let mut field = match root {
-        Expr::Identifier(id) if id.value == "_1" => json_row_ref(record, id.quote_style.is_some())?,
-        Expr::Identifier(id) if alias.as_deref() == Some(id.value.as_str()) => {
-            json_row_value(record)
-        }
-        Expr::Identifier(id) => json_column(record, &id.value, id.quote_style.is_some())?,
+        Expr::Identifier(id) => json_root_field(record, &id.value, ident_style(id), alias)?,
         // A non-identifier root has no path into the record.
         _ => Field::Missing,
     };
@@ -640,11 +650,11 @@ fn json_access(
 }
 
 /// One access-chain step.
-fn json_step(field: Field, step: &AccessExpr) -> Result<Field, SelectError> {
+fn json_step(field: Field, step: &AccessExpr) -> Result<Field, Error> {
     match (field, step) {
         (Field::Missing, _) => Ok(Field::Missing),
         (Field::Present(Value::Json(j)), AccessExpr::Dot(Expr::Identifier(id))) => {
-            json_dot(j, &id.value, id.quote_style.is_some())
+            json_dot(j, &id.value, ident_style(id))
         }
         (Field::Present(Value::Json(_)), AccessExpr::Dot(_)) => Ok(Field::Missing),
         (Field::Present(Value::Json(j)), AccessExpr::Subscript(s)) => json_subscript(j, s),
@@ -655,7 +665,7 @@ fn json_step(field: Field, step: &AccessExpr) -> Result<Field, SelectError> {
 /// One bracket subscript: a literal non-negative integer indexes an array
 /// (out-of-range / not-an-array → MISSING); a literal string names an
 /// object key exactly; anything else → MISSING.
-fn json_subscript(j: Box<serde_json::Value>, s: &Subscript) -> Result<Field, SelectError> {
+fn json_subscript(j: Box<serde_json::Value>, s: &Subscript) -> Result<Field, Error> {
     let Subscript::Index { index } = s else {
         return Ok(Field::Missing);
     };
@@ -707,43 +717,42 @@ fn csv_field(
     fields: &[Field],
     names: &[String],
     name: &str,
-    quoted: bool,
-) -> Result<Option<Field>, SelectError> {
+    style: NameStyle,
+) -> Result<Option<Field>, Error> {
     // `_N` positional notation wins over headers.
     if let Some(index) = positional(name) {
         return Ok(Some(fields.get(index).cloned().unwrap_or(Field::Missing)));
     }
     // Header lookup: exact-case when quoted, case-insensitive otherwise.
     // A duplicate (case-folded for unquoted, literal for quoted) is
-    // ambiguous; the later index is kept for the lookup candidate.
-    let mut seen: Vec<usize> = Vec::new();
+    // ambiguous — found by early-exit count, no per-lookup Vec (X8).
+    let mut index: Option<usize> = None;
     for (i, header) in names.iter().enumerate() {
-        let matches = if quoted {
+        let matches = if style.exact() {
             header == name
         } else {
             header.eq_ignore_ascii_case(name)
         };
         if matches {
-            seen.push(i);
+            if index.is_some() {
+                return Err(Error::Ambiguous(name.into()));
+            }
+            index = Some(i);
         }
     }
-    match seen.as_slice() {
-        [index] => Ok(fields
-            .get(*index)
-            .cloned()
-            .map_or(Some(Field::Missing), Some)),
-        [] => {
+    match index {
+        Some(i) => Ok(Some(fields.get(i).cloned().unwrap_or(Field::Missing))),
+        None => {
             // USE-mode headers are the record's names; a named ref matching
             // none of them is a missing-header error. Headerless modes
             // (names are the positional `_1..` alias set) fall through to
             // MISSING.
-            if default_names(names) {
+            if is_positional_names(names) {
                 Ok(Some(Field::Missing))
             } else {
-                Err(SelectError::MissingHeader(name.into()))
+                Err(Error::MissingHeader(name.into()))
             }
         }
-        _ => Err(SelectError::Ambiguous(name.into())),
     }
 }
 
@@ -756,12 +765,21 @@ fn parquet_field(
     fields: &[Field],
     names: &[String],
     name: &str,
-    quoted: bool,
-) -> Result<Option<Field>, SelectError> {
-    match csv_field(fields, names, name, quoted) {
+    style: NameStyle,
+) -> Result<Option<Field>, Error> {
+    match csv_field(fields, names, name, style) {
         Ok(field) => Ok(field),
-        Err(SelectError::MissingHeader(_)) => Ok(Some(Field::Missing)),
+        Err(Error::MissingHeader(_)) => Ok(Some(Field::Missing)),
         Err(e) => Err(e),
+    }
+}
+
+/// An identifier's spelling: sqlparser carries the quote bit on the ident.
+fn ident_style(id: &Ident) -> NameStyle {
+    if id.quote_style.is_some() {
+        NameStyle::Quoted
+    } else {
+        NameStyle::Bare
     }
 }
 
@@ -780,33 +798,38 @@ pub(crate) fn positional(name: &str) -> Option<usize> {
 /// The headerless alias set `_1.._n` (NONE/IGNORE rows carry it; USE rows
 /// carry the header names) — the only signal the record offers for whether
 /// a plain named ref may fall through to MISSING.
-fn default_names(names: &[String]) -> bool {
-    names
-        .iter()
-        .enumerate()
-        .all(|(i, n)| n == &format!("_{}", i + 1))
+fn is_positional_names(names: &[String]) -> bool {
+    // No `format!` per name (X8): strip `_`, parse the digits.
+    names.iter().enumerate().all(|(i, n)| {
+        let Some(digits) = n.strip_prefix('_') else {
+            return false;
+        };
+        !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && digits.parse::<usize>().ok() == Some(i + 1)
+    })
 }
 
 /// Missing-aware resolution of an operand: column references go through
 /// `column_value` (an absent field stays `Field::Missing`); any other
 /// expression produces a value and is never MISSING.
-fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, SelectError> {
+fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, Error> {
     match expr {
-        Expr::Identifier(id) => column_field(ctx, &id.value, id.quote_style.is_some()),
+        Expr::Identifier(id) => column_field(ctx, &id.value, ident_style(id)),
         Expr::CompoundIdentifier(parts) => match ctx.record {
             Record::Json(v) => json_path(v.as_ref(), parts, ctx.alias),
             _ => {
                 let last = parts.last().expect("compound identifier is non-empty");
-                column_field(ctx, &last.value, last.quote_style.is_some())
+                column_field(ctx, &last.value, ident_style(last))
             }
         },
         // Path access on flat CSV is not meaningful — the full text never
         // matches a header → MISSING; JSON resolves the real access chain.
         Expr::CompoundFieldAccess { root, access_chain } => match ctx.record {
             Record::Json(v) => json_access(v.as_ref(), root, access_chain, ctx.alias),
-            _ => column_field(ctx, &expr.to_string(), false),
+            _ => column_field(ctx, &expr.to_string(), NameStyle::Bare),
         },
-        Expr::JsonAccess { .. } => column_field(ctx, &expr.to_string(), false),
+        Expr::JsonAccess { .. } => column_field(ctx, &expr.to_string(), NameStyle::Bare),
         // `(x) IS NULL` ≡ `x IS NULL`: parenthesized columns stay MISSING
         // rather than collapsing through `eval` into a present NULL.
         Expr::Nested(e) => eval_field(e, ctx),
@@ -814,38 +837,38 @@ fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, SelectError> {
     }
 }
 
-fn column_field(ctx: &RowCtx, name: &str, quoted: bool) -> Result<Field, SelectError> {
-    Ok(column_value(ctx.record, name, ctx.alias, quoted)?.unwrap_or(Field::Missing))
+fn column_field(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Field, Error> {
+    Ok(column_value(ctx.record, name, style)?.unwrap_or(Field::Missing))
 }
 
 /// The single expression argument Task 3's `IS [NOT] MISSING` rewrite emits.
-fn sentinel_operand(f: &Function) -> Result<Expr, SelectError> {
+fn sentinel_operand(f: &Function) -> Result<Expr, Error> {
     match &f.args {
         FunctionArguments::List(list) => match list.args.as_slice() {
             [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))] => Ok(e.clone()),
-            _ => Err(SelectError::Value(
-                "internal: unexpected aggregate call".into(),
-            )),
+            _ => Err(Error::Value("internal: unexpected aggregate call".into())),
         },
-        _ => Err(SelectError::Value(
-            "internal: unexpected aggregate call".into(),
-        )),
+        _ => Err(Error::Value("internal: unexpected aggregate call".into())),
     }
 }
 
-/// The last identifier of a function name — `__s3_is_missing`.
-fn last_name(name: &ObjectName) -> String {
-    match name.0.last() {
-        Some(ObjectNamePart::Identifier(i)) => i.value.clone(),
-        _ => String::new(),
-    }
+/// The MISSING sentinels are single-part UNQUOTED identifiers — the rewrite
+/// always inserts them so (review 2026-09-06b R15). A qualified or quoted
+/// user-authored call must not adopt MISSING semantics (the parse guard
+/// rejects the unquoted forms request-level; this is the engine's own
+/// defense).
+fn is_sentinel_call(name: &ObjectName, sentinel: &str) -> bool {
+    let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else {
+        return false;
+    };
+    part.quote_style.is_none() && part.value.eq_ignore_ascii_case(sentinel)
 }
 
 /// Evaluate a parsed expression tree to a scalar. `eval` runs no code of
 /// its own — the `Expr` is sqlparser's AST and every arithmetic/comparison
 /// rule below is data-driven; a missing column collapses to `Value::Null`
 /// here (`eval_field` is the MISSING-aware path).
-fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError> {
+fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error> {
     match expr {
         Expr::Value(v) => literal(&v.value),
         Expr::Identifier(_)
@@ -868,10 +891,22 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError> {
             UnaryOperator::Minus => unary_minus(eval(expr, ctx)?),
             // `+` is the identity in our arithmetic.
             UnaryOperator::Plus => eval(expr, ctx),
-            other => Err(SelectError::Unsupported(other.to_string())),
+            other => Err(Error::Unsupported(other.to_string())),
         },
         Expr::BinaryOp { left, op, right } => {
             let l = eval(left, ctx)?;
+            // Short-circuit (review 2026-09-06b R11): `false AND x` and
+            // `true OR x` are known without examining x — the dead arm's
+            // errors (division by zero, cast failure) must not fire.
+            match op {
+                BinaryOperator::And if matches!(l, Value::Bool(false)) => {
+                    return Ok(Value::Bool(false));
+                }
+                BinaryOperator::Or if matches!(l, Value::Bool(true)) => {
+                    return Ok(Value::Bool(true));
+                }
+                _ => {}
+            }
             let r = eval(right, ctx)?;
             match op {
                 BinaryOperator::And => Ok(value_and(l, r)),
@@ -887,7 +922,7 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError> {
                 | BinaryOperator::Multiply
                 | BinaryOperator::Divide
                 | BinaryOperator::Modulo => arith(op, l, r),
-                other => Err(SelectError::Unsupported(other.to_string())),
+                other => Err(Error::Unsupported(other.to_string())),
             }
         }
         Expr::InList {
@@ -901,51 +936,39 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError> {
             low,
             high,
         } => eval_between(expr, low, high, *negated, ctx),
-        Expr::IsNull(e) => Ok(Value::Bool(matches!(
-            eval_field(e, ctx)?,
-            Field::Present(Value::Null)
-        ))),
-        Expr::IsNotNull(e) => Ok(Value::Bool(!matches!(
-            eval_field(e, ctx)?,
-            Field::Present(Value::Null)
-        ))),
-        Expr::IsTrue(e) => Ok(Value::Bool(matches!(
-            eval_field(e, ctx)?,
-            Field::Present(Value::Bool(true))
-        ))),
-        Expr::IsNotTrue(e) => Ok(Value::Bool(!matches!(
-            eval_field(e, ctx)?,
-            Field::Present(Value::Bool(true))
-        ))),
-        Expr::IsFalse(e) => Ok(Value::Bool(matches!(
-            eval_field(e, ctx)?,
-            Field::Present(Value::Bool(false))
-        ))),
-        Expr::IsNotFalse(e) => Ok(Value::Bool(!matches!(
-            eval_field(e, ctx)?,
-            Field::Present(Value::Bool(false))
-        ))),
+        // The IsNot* forms are the pure negations of their cousins (R12):
+        // one hit-predicate per pair, flipped by the negated arm.
+        Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            let hit = matches!(eval_field(e, ctx)?, Field::Present(Value::Null));
+            Ok(Value::Bool(hit != matches!(expr, Expr::IsNotNull(_))))
+        }
+        Expr::IsTrue(e) | Expr::IsNotTrue(e) => {
+            let hit = matches!(eval_field(e, ctx)?, Field::Present(Value::Bool(true)));
+            Ok(Value::Bool(hit != matches!(expr, Expr::IsNotTrue(_))))
+        }
+        Expr::IsFalse(e) | Expr::IsNotFalse(e) => {
+            let hit = matches!(eval_field(e, ctx)?, Field::Present(Value::Bool(false)));
+            Ok(Value::Bool(hit != matches!(expr, Expr::IsNotFalse(_))))
+        }
         Expr::Function(f) => {
-            // Task 3's `IS [NOT] MISSING` rewrite (sqlparser 0.57 has no
+            // Task 3's `IS [NOT] MISSING` rewrite (sqlparser 0.62 has no
             // IsMissing variant) is the only function form over a
             // non-aggregate plan; anything else is an aggregate guard.
-            if last_name(&f.name).eq_ignore_ascii_case("__s3_is_missing") {
+            if is_sentinel_call(&f.name, "__s3_is_missing") {
                 let operand = sentinel_operand(f)?;
                 return Ok(Value::Bool(matches!(
                     eval_field(&operand, ctx)?,
                     Field::Missing
                 )));
             }
-            if last_name(&f.name).eq_ignore_ascii_case("__s3_is_not_missing") {
+            if is_sentinel_call(&f.name, "__s3_is_not_missing") {
                 let operand = sentinel_operand(f)?;
                 return Ok(Value::Bool(!matches!(
                     eval_field(&operand, ctx)?,
                     Field::Missing
                 )));
             }
-            Err(SelectError::Value(
-                "internal: unexpected aggregate call".into(),
-            ))
+            Err(Error::Value("internal: unexpected aggregate call".into()))
         }
         Expr::Like {
             negated,
@@ -954,13 +977,13 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError> {
             pattern,
             escape_char,
         } => eval_like(expr, pattern, escape_char, *any, *negated, ctx),
-        Expr::ILike { .. } => Err(SelectError::Unsupported("ILIKE".into())),
-        other => Err(SelectError::Unsupported(other.to_string())),
+        Expr::ILike { .. } => Err(Error::Unsupported("ILIKE".into())),
+        other => Err(Error::Unsupported(other.to_string())),
     }
 }
 
 /// SQL literals: numbers → `Int` when they fit, else `Decimal`.
-fn literal(v: &AstValue) -> Result<Value, SelectError> {
+fn literal(v: &AstValue) -> Result<Value, Error> {
     match v {
         AstValue::Number(n, _) => match n.parse::<i64>() {
             Ok(i) => Ok(Value::Int(i)),
@@ -969,12 +992,12 @@ fn literal(v: &AstValue) -> Result<Value, SelectError> {
         AstValue::SingleQuotedString(s) => Ok(Value::String(s.clone())),
         AstValue::Boolean(b) => Ok(Value::Bool(*b)),
         AstValue::Null => Ok(Value::Null),
-        other => Err(SelectError::Unsupported(other.to_string())),
+        other => Err(Error::Unsupported(other.to_string())),
     }
 }
 
 /// Unary minus: numeric negation with Int overflow promoted to Decimal.
-fn unary_minus(v: Value) -> Result<Value, SelectError> {
+fn unary_minus(v: Value) -> Result<Value, Error> {
     match v {
         Value::Null => Ok(Value::Null),
         Value::Int(i) => match i.checked_neg() {
@@ -1011,7 +1034,7 @@ fn value_or(a: Value, b: Value) -> Value {
 
 /// `IN` with the `negated` flag; a Null subject or element yields an
 /// UNKNOWN that negated forms do not flip to TRUE.
-fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &RowCtx) -> Result<Value, SelectError> {
+fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &RowCtx) -> Result<Value, Error> {
     let subject = eval(expr, ctx)?;
     let mut found = false;
     let mut unknown = matches!(subject, Value::Null);
@@ -1039,7 +1062,7 @@ fn eval_between(
     high: &Expr,
     negated: bool,
     ctx: &RowCtx,
-) -> Result<Value, SelectError> {
+) -> Result<Value, Error> {
     let subject = eval(expr, ctx)?;
     let lo = eval(low, ctx)?;
     let hi = eval(high, ctx)?;
@@ -1072,68 +1095,131 @@ enum LikeTok {
 fn eval_like(
     expr: &Expr,
     pattern: &Expr,
-    escape_char: &Option<String>,
+    escape_char: &Option<ValueWithSpan>,
     any: bool,
     negated: bool,
     ctx: &RowCtx,
-) -> Result<Value, SelectError> {
+) -> Result<Value, Error> {
     // Snowflake's `LIKE ANY` is outside the AWS surface and the covered
     // grammar: refuse rather than silently run plain LIKE semantics.
     if any {
-        return Err(SelectError::Unsupported("LIKE ANY".into()));
+        return Err(Error::Unsupported("LIKE ANY".into()));
     }
     let escape = like_escape(escape_char)?;
     let subject = eval(expr, ctx)?;
     let pattern = eval(pattern, ctx)?;
     let matched = match (&subject, &pattern) {
         (Value::String(_), Value::String(_)) => {
-            like_match(&display(&subject), &display(&pattern), escape)
+            Some(like_match(&display(&subject), &display(&pattern), escape)?)
         }
-        _ => false,
+        _ => None,
     };
-    Ok(Value::Bool(if negated { !matched } else { matched }))
+    // Non-string operands are FALSE for the whole LIKE family — a negated
+    // form must not flip the mismatch to true (review 2026-09-06b R13;
+    // plan: "non-string operands → false").
+    Ok(Value::Bool(match matched {
+        Some(m) if negated => !m,
+        Some(m) => m,
+        None => false,
+    }))
 }
 
-/// The ESCAPE operand: exactly one character. sqlparser 0.57 parses any
-/// literal string here without validating the width, so a bad one is a
-/// value error.
-fn like_escape(v: &Option<String>) -> Result<Option<char>, SelectError> {
+/// The ESCAPE operand: exactly one character. sqlparser 0.62 carries it as
+/// a `ValueWithSpan` (a single-quoted literal), validated here — the
+/// parser accepts any literal string, so a bad one is a value error.
+fn like_escape(v: &Option<ValueWithSpan>) -> Result<Option<char>, Error> {
     match v {
         None => Ok(None),
-        Some(s) => {
+        Some(w) => {
+            let sqlparser::ast::Value::SingleQuotedString(s) = &w.value else {
+                return Err(Error::Value("ESCAPE must be a single character".into()));
+            };
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) => Ok(Some(c)),
-                _ => Err(SelectError::Value(
-                    "ESCAPE must be a single character".into(),
-                )),
+                _ => Err(Error::Value("ESCAPE must be a single character".into())),
             }
         }
     }
 }
 
-/// O(n·m) wildcard DP — no backtracking, so `%`-heavy patterns stay
-/// polynomial under the expression and record caps (review 2026-09-05 #5).
-fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
-    let text: Vec<char> = text.chars().collect();
-    let toks = like_tokens(pattern, escape);
-    let m = text.len();
-    let mut prev = vec![false; m + 1];
-    let mut cur = vec![false; m + 1];
-    prev[0] = true;
-    for tok in &toks {
-        // `%` may match the empty prefix; nothing else may.
-        cur[0] = matches!(tok, LikeTok::Star) && prev[0];
-        for j in 1..=m {
-            cur[j] = match tok {
-                LikeTok::Star => prev[j] || cur[j - 1],
-                LikeTok::Single => prev[j - 1],
-                LikeTok::Char(c) => prev[j - 1] && text[j - 1] == *c,
-            };
+/// The DP-cell ceiling of one LIKE pair (review 2026-09-06b R7): 256 KiB
+/// pattern × 1 MB record ≈ 2.6×10⁸ cells would pin a spawn_blocking worker
+/// for seconds-to-minutes on a hostile query — a pair past the cap is
+/// refused with a value error, not run. 10⁷ cells is high-end single-digit
+/// milliseconds.
+const LIKE_CELL_CAP: u64 = 10_000_000;
+
+// The per-scan LIKE memo (X7): a literal pattern is constant across
+// records — re-deriving its tokens and re-allocating the two DP rows per
+// record was pure waste. One slot (the last pattern) covers the common
+// case; a per-row pattern simply misses and rebuilds. The memo is a pure
+// data cache — `like_match` runs no nested eval under its borrow, so
+// re-entrancy is impossible (the engine is sync, one thread per stream).
+thread_local! {
+    static LIKE_MEMO: std::cell::RefCell<LikeMemo> =
+        const { std::cell::RefCell::new(LikeMemo::new()) };
+}
+
+#[derive(Default)]
+struct LikeMemo {
+    pattern: String,
+    escape: Option<char>,
+    tokens: Vec<LikeTok>,
+    prev: Vec<bool>,
+    cur: Vec<bool>,
+}
+
+impl LikeMemo {
+    const fn new() -> Self {
+        Self {
+            pattern: String::new(),
+            escape: None,
+            tokens: Vec::new(),
+            prev: Vec::new(),
+            cur: Vec::new(),
         }
-        std::mem::swap(&mut prev, &mut cur);
     }
-    prev[m]
+}
+
+/// O(n·m) wildcard DP — no backtracking, so `%`-heavy patterns stay
+/// polynomial under the expression and record caps (review 2026-09-05 #5);
+/// the cell count (pattern tokens × text chars) is capped (R7).
+fn like_match(text: &str, pattern: &str, escape: Option<char>) -> Result<bool, Error> {
+    let text: Vec<char> = text.chars().collect();
+    LIKE_MEMO.with(|slot| {
+        let mut memo = slot.borrow_mut();
+        if memo.pattern != pattern || memo.escape != escape {
+            memo.pattern = pattern.to_string();
+            memo.escape = escape;
+            memo.tokens = like_tokens(pattern, escape);
+        }
+        let m = text.len();
+        if memo.tokens.len() as u64 * (m as u64 + 1) > LIKE_CELL_CAP {
+            return Err(Error::Value("LIKE pattern too large".into()));
+        }
+        let LikeMemo {
+            tokens, prev, cur, ..
+        } = &mut *memo;
+        prev.clear();
+        prev.resize(m + 1, false);
+        cur.clear();
+        cur.resize(m + 1, false);
+        prev[0] = true;
+        for tok in tokens.iter() {
+            // `%` may match the empty prefix; nothing else may.
+            cur[0] = matches!(tok, LikeTok::Star) && prev[0];
+            for j in 1..=m {
+                cur[j] = match tok {
+                    LikeTok::Star => prev[j] || cur[j - 1],
+                    LikeTok::Single => prev[j - 1],
+                    LikeTok::Char(c) => prev[j - 1] && text[j - 1] == *c,
+                };
+            }
+            std::mem::swap(prev, cur);
+        }
+        Ok(prev[m])
+    })
 }
 
 /// ESCAPE resolution to tokens: the escape char literalizes the next
@@ -1209,7 +1295,7 @@ fn numeric(v: &Value) -> Option<Decimal> {
 /// Arithmetic per the plan: Int×Int stays Int with checked overflow
 /// promoted to Decimal; `/` is Decimal scale 10; `%` integral-only;
 /// division by zero is a value error.
-fn arith(op: &BinaryOperator, a: Value, b: Value) -> Result<Value, SelectError> {
+fn arith(op: &BinaryOperator, a: Value, b: Value) -> Result<Value, Error> {
     // Null propagates through arithmetic.
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
@@ -1236,7 +1322,7 @@ fn arith(op: &BinaryOperator, a: Value, b: Value) -> Result<Value, SelectError> 
 /// Strict numeric coercion for arithmetic: numbers direct, strings and
 /// raw numbers parsed (a failure is an error here — only comparisons
 /// tolerate it); booleans and JSON are not numbers.
-fn as_decimal(v: &Value) -> Result<Decimal, SelectError> {
+fn as_decimal(v: &Value) -> Result<Decimal, Error> {
     match v {
         Value::Decimal(d) => Ok(*d),
         Value::Int(i) => Ok(Decimal::from(*i)),
@@ -1247,38 +1333,46 @@ fn as_decimal(v: &Value) -> Result<Decimal, SelectError> {
     }
 }
 
-fn not_numeric(v: &Value) -> SelectError {
-    SelectError::Value(format!("invalid numeric value: {}", display(v)))
+fn not_numeric(v: &Value) -> Error {
+    Error::Value(format!("invalid numeric value: {}", display(v)))
 }
 
 /// Decimal arithmetic: strings/raw numbers parse here (strict — only
 /// comparisons are tolerant of parse failure).
-fn decimal_arith(op: &BinaryOperator, x: Decimal, y: Decimal) -> Result<Value, SelectError> {
-    let overflow = || SelectError::Value("numeric value exceeds 28-digit precision".into());
+fn decimal_arith(op: &BinaryOperator, x: Decimal, y: Decimal) -> Result<Value, Error> {
     match op {
-        BinaryOperator::Plus => x.checked_add(y).map(Value::Decimal).ok_or_else(overflow),
-        BinaryOperator::Minus => x.checked_sub(y).map(Value::Decimal).ok_or_else(overflow),
-        BinaryOperator::Multiply => x.checked_mul(y).map(Value::Decimal).ok_or_else(overflow),
+        BinaryOperator::Plus => x
+            .checked_add(y)
+            .map(Value::Decimal)
+            .ok_or_else(precision_overflow),
+        BinaryOperator::Minus => x
+            .checked_sub(y)
+            .map(Value::Decimal)
+            .ok_or_else(precision_overflow),
+        BinaryOperator::Multiply => x
+            .checked_mul(y)
+            .map(Value::Decimal)
+            .ok_or_else(precision_overflow),
         BinaryOperator::Divide => {
             if y.is_zero() {
-                return Err(SelectError::Value("division by zero".into()));
+                return Err(Error::Value("division by zero".into()));
             }
             x.checked_div(y)
                 .map(|d| Value::Decimal(d.round_dp(10)))
-                .ok_or_else(overflow)
+                .ok_or_else(precision_overflow)
         }
         BinaryOperator::Modulo => modulo(&Value::Decimal(x), &Value::Decimal(y)),
-        other => Err(SelectError::Unsupported(other.to_string())),
+        other => Err(Error::Unsupported(other.to_string())),
     }
 }
 
 /// `%` is integral-only: operands must be whole numbers; the result is
 /// Int (checked; the MIN % -1 corner promotes to a Decimal remainder).
-fn modulo(a: &Value, b: &Value) -> Result<Value, SelectError> {
+fn modulo(a: &Value, b: &Value) -> Result<Value, Error> {
     let x = integral(a).ok_or_else(|| not_numeric(a))?;
     let y = integral(b).ok_or_else(|| not_numeric(b))?;
     if y == 0 {
-        return Err(SelectError::Value("division by zero".into()));
+        return Err(Error::Value("division by zero".into()));
     }
     Ok(match x.checked_rem(y) {
         Some(r) => Value::Int(r),
@@ -1305,19 +1399,20 @@ fn integral(v: &Value) -> Option<i64> {
 mod tests {
     use rust_decimal::Decimal;
 
-    use crate::row::Value;
-    use crate::sql::parse;
-
     use super::*;
+    use crate::{
+        row::{Columns, Value},
+        sql::parse,
+    };
 
     fn csv(fields: &[&str], names: &[&str]) -> Record {
-        Record::Csv(
+        Record::Csv(Columns::from_names(
             fields
                 .iter()
                 .map(|f| Field::Present(Value::String(f.to_string())))
                 .collect(),
             names.iter().map(|n| n.to_string()).collect(),
-        )
+        ))
     }
 
     fn s(v: &str) -> Field {
@@ -1520,10 +1615,10 @@ mod tests {
     #[test]
     fn is_missing_distinguishes_null_from_missing() {
         let rec = || {
-            Record::Csv(
+            Record::Csv(Columns::from_names(
                 vec![Field::Present(Value::Null), Field::Missing],
                 vec!["a".into(), "b".into()],
-            )
+            ))
         };
         let rows = run("SELECT * FROM S3Object s WHERE s.a IS MISSING", vec![rec()]);
         assert_eq!(rows.len(), 0);
@@ -1545,9 +1640,67 @@ mod tests {
         );
         assert_eq!(rows.len(), 0);
         // A present NULL is IS NULL true.
-        let rec = Record::Csv(vec![Field::Present(Value::Null)], vec!["a".into()]);
+        let rec = Record::Csv(Columns::from_names(
+            vec![Field::Present(Value::Null)],
+            vec!["a".into()],
+        ));
         let rows = run("SELECT * FROM S3Object s WHERE s.a IS NULL", vec![rec]);
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn and_or_short_circuit_skips_dead_arm_errors() {
+        // R11: `false AND x` / `true OR x` never evaluate x — a division by
+        // zero on the dead arm must not raise; the record is filtered/passes
+        // instead.
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE false AND s._1 / 0 = 0",
+            vec![csv(&["1"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 0);
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE true OR s._1 / 0 = 0",
+            vec![csv(&["1"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 1);
+        // The other arms still need the right side's truth value — a live
+        // error there is unchanged.
+        let mut engine =
+            Engine::new(parse("SELECT * FROM S3Object s WHERE NULL AND s._1 / 0 = 0").unwrap());
+        assert!(engine.next(csv(&["1"], &["_1"])).is_err());
+    }
+
+    #[test]
+    fn is_not_family_missing_semantics() {
+        // R12: the IsNot* arms are the pure negations of the IsNull/IsTrue/
+        // IsFalse cousins — a MISSING operand answers the positive form
+        // false, so the negated forms are true (pinned; MISSING stays
+        // distinct from Null through the dedicated sentinel operators).
+        let missing = csv(&["1", "2"], &["_1", "_2"]); // `_5` is past the width
+        for sql in [
+            "SELECT * FROM S3Object s WHERE s._5 IS NOT NULL",
+            "SELECT * FROM S3Object s WHERE s._5 IS NOT TRUE",
+            "SELECT * FROM S3Object s WHERE s._5 IS NOT FALSE",
+        ] {
+            assert_eq!(run(sql, vec![missing.clone()]).len(), 1, "{sql}");
+        }
+        // A present NULL: IS NOT NULL false; IS NOT TRUE true.
+        let null = Record::Csv(Columns::from_names(
+            vec![Field::Present(Value::Null)],
+            vec!["a".into()],
+        ));
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a IS NOT NULL",
+                vec![null.clone()]
+            )
+            .len(),
+            0
+        );
+        assert_eq!(
+            run("SELECT * FROM S3Object s WHERE s.a IS NOT TRUE", vec![null]).len(),
+            1
+        );
     }
 
     #[test]
@@ -1569,8 +1722,14 @@ mod tests {
 
     #[test]
     fn is_true_false_family() {
-        let t = Record::Csv(vec![Field::Present(Value::Bool(true))], vec!["a".into()]);
-        let f = Record::Csv(vec![Field::Present(Value::Bool(false))], vec!["a".into()]);
+        let t = Record::Csv(Columns::from_names(
+            vec![Field::Present(Value::Bool(true))],
+            vec!["a".into()],
+        ));
+        let f = Record::Csv(Columns::from_names(
+            vec![Field::Present(Value::Bool(false))],
+            vec!["a".into()],
+        ));
         assert_eq!(
             run(
                 "SELECT * FROM S3Object s WHERE s.a IS TRUE",
@@ -1754,13 +1913,13 @@ mod tests {
 
     #[test]
     fn like_escape_must_be_one_char() {
-        // sqlparser 0.57 parses any literal string after ESCAPE; standard
+        // sqlparser 0.62 parses any literal string after ESCAPE; standard
         // SQL takes exactly one character.
         let mut engine = Engine::new(
             parse("SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\%b' ESCAPE '\\%'").unwrap(),
         );
         match engine.next(csv(&["a%b"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
+            Err(Error::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
             other => panic!("expected one-char escape error, got {other:?}"),
         }
     }
@@ -1813,7 +1972,9 @@ mod tests {
 
     #[test]
     fn like_non_string_operands_are_false() {
-        // Numbers, bools and NULL never match — no coercion.
+        // Numbers, bools and NULL never match — no coercion, and the
+        // negated forms stay false too (R13: the negation must not flip the
+        // non-string mismatch to true).
         let rows = run(
             "SELECT * FROM S3Object s WHERE 5 LIKE '5%'",
             vec![csv(&["x"], &["_1"])],
@@ -1826,6 +1987,16 @@ mod tests {
         assert_eq!(rows.len(), 0);
         let rows = run(
             "SELECT * FROM S3Object s WHERE NULL LIKE 'x%'",
+            vec![csv(&["x"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 0);
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE 5 NOT LIKE '5%'",
+            vec![csv(&["x"], &["_1"])],
+        );
+        assert_eq!(rows.len(), 0);
+        let rows = run(
+            "SELECT * FROM S3Object s WHERE NULL NOT LIKE 'x%'",
             vec![csv(&["x"], &["_1"])],
         );
         assert_eq!(rows.len(), 0);
@@ -1847,18 +2018,36 @@ mod tests {
         // (%a)×300 vs 600 chars ≈ 3.6·10^5 DP cells; a backtracking matcher
         // would wander 2^300 paths (review 2026-09-05 #5).
         let pattern = "%a".repeat(300);
-        assert!(like_match(
-            &format!("{}{}", "b".repeat(300), "a".repeat(300)),
-            &pattern,
-            None
-        ));
+        assert!(
+            like_match(
+                &format!("{}{}", "b".repeat(300), "a".repeat(300)),
+                &pattern,
+                None
+            )
+            .unwrap()
+        );
         // The trailing `b`s cannot be absorbed: no star follows the last
         // literal `a`.
-        assert!(!like_match(
-            &format!("{}{}", "a".repeat(300), "b".repeat(300)),
-            &pattern,
-            None
-        ));
+        assert!(
+            !like_match(
+                &format!("{}{}", "a".repeat(300), "b".repeat(300)),
+                &pattern,
+                None
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn like_cell_cap_refuses_huge_patterns() {
+        // R7: the 10⁷-cell ceiling — a 100k-token pattern × 200-char text
+        // (2×10⁷ cells) is refused with a value error instead of pinning a
+        // spawn_blocking worker for seconds-to-minutes.
+        let pattern = "%a".repeat(50_000);
+        match like_match(&"a".repeat(200), &pattern, None) {
+            Err(Error::Value(m)) => assert_eq!(m, "LIKE pattern too large"),
+            other => panic!("expected cell-cap error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1868,7 +2057,7 @@ mod tests {
         let mut engine =
             Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 LIKE ANY 'x%'").unwrap());
         match engine.next(csv(&["x"], &["_1"])) {
-            Err(SelectError::Unsupported(m)) => assert_eq!(m, "LIKE ANY"),
+            Err(Error::Unsupported(m)) => assert_eq!(m, "LIKE ANY"),
             other => panic!("expected LIKE ANY unsupported, got {other:?}"),
         }
     }
@@ -1880,7 +2069,7 @@ mod tests {
         let mut engine =
             Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 ILIKE 'X'").unwrap());
         match engine.next(csv(&["x"], &["_1"])) {
-            Err(SelectError::Unsupported(m)) => assert_eq!(m, "ILIKE"),
+            Err(Error::Unsupported(m)) => assert_eq!(m, "ILIKE"),
             other => panic!("expected ILIKE unsupported, got {other:?}"),
         }
     }
@@ -1892,7 +2081,7 @@ mod tests {
         // unreachable shape — guard, not a real result.
         let mut engine = Engine::new(parse("SELECT unknown_fn(s._1) FROM S3Object s").unwrap());
         match engine.next(csv(&["1"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "internal: unexpected aggregate call"),
+            Err(Error::Value(m)) => assert_eq!(m, "internal: unexpected aggregate call"),
             other => panic!("expected aggregate guard, got {other:?}"),
         }
     }
@@ -1922,7 +2111,10 @@ mod tests {
         );
         assert_eq!(row.vals, vec![Field::Present(Value::Int(0))]);
         // A present NULL does not count either.
-        let rec = Record::Csv(vec![Field::Present(Value::Null)], vec!["a".into()]);
+        let rec = Record::Csv(Columns::from_names(
+            vec![Field::Present(Value::Null)],
+            vec!["a".into()],
+        ));
         let row = run_agg("SELECT count(s.a) FROM S3Object s", vec![rec]);
         assert_eq!(row.vals, vec![Field::Present(Value::Int(0))]);
     }
@@ -1947,9 +2139,14 @@ mod tests {
         // AWS cast-fails: a non-numeric contributor in a SUM is a value
         // error, never a silent skip (controller ruling, Task 7).
         let mut engine = Engine::new(parse("SELECT sum(s._3) FROM S3Object s").unwrap());
-        assert_eq!(engine.next(csv(&["1", "x", "10"], &["_1", "_2", "_3"])).unwrap(), None);
+        assert_eq!(
+            engine
+                .next(csv(&["1", "x", "10"], &["_1", "_2", "_3"]))
+                .unwrap(),
+            None
+        );
         match engine.next(csv(&["2", "y", "x"], &["_1", "_2", "_3"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
+            Err(Error::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
             other => panic!("expected invalid numeric error, got {other:?}"),
         }
     }
@@ -1959,10 +2156,7 @@ mod tests {
         // Exact average: 1.5.
         let row = run_agg(
             "SELECT avg(s._1) FROM S3Object s",
-            vec![
-                csv(&["1"], &["_1"]),
-                csv(&["2"], &["_1"]),
-            ],
+            vec![csv(&["1"], &["_1"]), csv(&["2"], &["_1"])],
         );
         assert_eq!(
             row.vals,
@@ -1979,7 +2173,10 @@ mod tests {
         );
         assert_eq!(
             row.vals,
-            vec![Field::Present(Value::Decimal(Decimal::new(16666666667, 10)))]
+            vec![Field::Present(Value::Decimal(Decimal::new(
+                16666666667,
+                10
+            )))]
         );
     }
 
@@ -1989,10 +2186,7 @@ mod tests {
         // parsed Decimals, so ['10','2'] → min 2, max 10 (not "10").
         let row = run_agg(
             "SELECT min(s._1), max(s._1) FROM S3Object s",
-            vec![
-                csv(&["10"], &["_1"]),
-                csv(&["2"], &["_1"]),
-            ],
+            vec![csv(&["10"], &["_1"]), csv(&["2"], &["_1"])],
         );
         assert_eq!(
             row.vals,
@@ -2025,7 +2219,7 @@ mod tests {
         let mut engine = Engine::new(parse("SELECT min(s._1) FROM S3Object s").unwrap());
         assert_eq!(engine.next(csv(&["10"], &["_1"])).unwrap(), None);
         match engine.next(csv(&["x"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
+            Err(Error::Value(m)) => assert_eq!(m, "invalid numeric value: x"),
             other => panic!("expected invalid numeric error, got {other:?}"),
         }
     }
@@ -2038,8 +2232,11 @@ mod tests {
         let big = "9".repeat(29);
         let mut engine = Engine::new(parse("SELECT min(s._1) FROM S3Object s").unwrap());
         match engine.next(csv(&[big.as_str()], &["_1"])) {
-            Err(SelectError::Value(m)) => {
-                assert_eq!(m, format!("numeric value exceeds 28-digit precision: {big}"))
+            Err(Error::Value(m)) => {
+                assert_eq!(
+                    m,
+                    format!("numeric value exceeds 28-digit precision: {big}")
+                )
             }
             other => panic!("expected precision error, got {other:?}"),
         }
@@ -2053,7 +2250,7 @@ mod tests {
         // string min loses to "2" lexicographically).
         let mut engine = Engine::new(parse("SELECT min(s._1) FROM S3Object s").unwrap());
         match engine.next(csv(&["1e30"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: 1e30"),
+            Err(Error::Value(m)) => assert_eq!(m, "invalid numeric value: 1e30"),
             other => panic!("expected value error, got {other:?}"),
         }
     }
@@ -2098,10 +2295,10 @@ mod tests {
     fn all_null_row_aggregates() {
         // One all-NULL row: COUNT(*) = 1 (a row), COUNT(expr) = 0, extrema
         // and sums stay NULL.
-        let rec = Record::Csv(
+        let rec = Record::Csv(Columns::from_names(
             vec![Field::Present(Value::Null), Field::Present(Value::Null)],
             vec!["a".into(), "b".into()],
-        );
+        ));
         let row = run_agg(
             "SELECT count(*), count(s.a), sum(s.b), avg(s.b), min(s.a), max(s.a) FROM S3Object s",
             vec![rec],
@@ -2175,7 +2372,13 @@ mod tests {
         );
         assert_eq!(
             row.keys,
-            vec!["count(*)", "count(s._1)", "sum(s._3)", "avg(s._3)", "min(s._2)"]
+            vec![
+                "count(*)",
+                "count(s._1)",
+                "sum(s._3)",
+                "avg(s._3)",
+                "min(s._2)"
+            ]
         );
         assert_eq!(
             row.vals,
@@ -2193,7 +2396,7 @@ mod tests {
     fn division_by_zero_exact_message() {
         let mut engine = Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 / 0 > 1").unwrap());
         match engine.next(csv(&["1"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "division by zero"),
+            Err(Error::Value(m)) => assert_eq!(m, "division by zero"),
             other => panic!("expected division by zero, got {other:?}"),
         }
     }
@@ -2240,7 +2443,7 @@ mod tests {
         // Decimal operands are rejected: `%` is integral-only.
         let mut engine = Engine::new(parse("SELECT 5.5 % 2 FROM S3Object s").unwrap());
         match engine.next(csv(&["x"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: 5.5"),
+            Err(Error::Value(m)) => assert_eq!(m, "invalid numeric value: 5.5"),
             other => panic!("expected integral-only modulo error, got {other:?}"),
         }
     }
@@ -2250,7 +2453,7 @@ mod tests {
         let mut engine =
             Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 + 1 > 10").unwrap());
         match engine.next(csv(&["abc"], &["_1"])) {
-            Err(SelectError::Value(m)) => assert_eq!(m, "invalid numeric value: abc"),
+            Err(Error::Value(m)) => assert_eq!(m, "invalid numeric value: abc"),
             other => panic!("expected arithmetic value error, got {other:?}"),
         }
     }
@@ -2275,7 +2478,7 @@ mod tests {
     fn use_mode_missing_header_errors() {
         let mut engine = Engine::new(parse("SELECT * FROM S3Object s WHERE s.nope = 'x'").unwrap());
         match engine.next(csv(&["1", "alice"], &["Id", "Name"])) {
-            Err(SelectError::MissingHeader(m)) => assert_eq!(m, "nope"),
+            Err(Error::MissingHeader(m)) => assert_eq!(m, "nope"),
             other => panic!("expected missing header, got {other:?}"),
         }
     }
@@ -2284,7 +2487,7 @@ mod tests {
     fn case_insensitive_duplicate_header_is_ambiguous() {
         let mut engine = Engine::new(parse("SELECT * FROM S3Object s WHERE s.x = '1'").unwrap());
         match engine.next(csv(&["1"], &["X", "x"])) {
-            Err(SelectError::Ambiguous(m)) => assert_eq!(m, "x"),
+            Err(Error::Ambiguous(m)) => assert_eq!(m, "x"),
             other => panic!("expected ambiguous, got {other:?}"),
         }
     }
@@ -2303,7 +2506,10 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn parquet(fields: Vec<Field>, names: &[&str]) -> Record {
-        Record::Parquet(fields, names.iter().map(|n| n.to_string()).collect())
+        Record::Parquet(Columns::from_names(
+            fields,
+            names.iter().map(|n| n.to_string()).collect(),
+        ))
     }
 
     #[test]
@@ -2318,35 +2524,32 @@ mod tests {
         );
         // Unquoted names are case-insensitive per the identifier rules.
         assert_eq!(
-            column_value(&rec, "ID", &None, false).unwrap(),
+            column_value(&rec, "ID", NameStyle::Bare).unwrap(),
             Some(Field::Present(Value::Int(1)))
         );
         assert_eq!(
-            column_value(&rec, "price", &None, false).unwrap(),
+            column_value(&rec, "price", NameStyle::Bare).unwrap(),
             Some(Field::Present(Value::Decimal(Decimal::new(1234, 2))))
         );
         // `_N` positional spine works like CSV.
         assert_eq!(
-            column_value(&rec, "_2", &None, false).unwrap(),
+            column_value(&rec, "_2", NameStyle::Bare).unwrap(),
             Some(Field::Present(Value::Decimal(Decimal::new(1234, 2))))
         );
     }
 
     #[test]
     fn parquet_lookup_pruned_or_unknown_is_missing() {
-        let rec = parquet(
-            vec![Field::Present(Value::Int(1))],
-            &["id"],
-        );
+        let rec = parquet(vec![Field::Present(Value::Int(1))], &["id"]);
         // A schema column dropped by projection pruning, and a name that
         // never existed, both resolve MISSING — never MissingHeader (that
         // code is CSV-header-specific; pruning must not error the stream).
         assert_eq!(
-            column_value(&rec, "score", &None, false).unwrap(),
+            column_value(&rec, "score", NameStyle::Bare).unwrap(),
             Some(Field::Missing)
         );
         assert_eq!(
-            column_value(&rec, "nope", &None, false).unwrap(),
+            column_value(&rec, "nope", NameStyle::Bare).unwrap(),
             Some(Field::Missing)
         );
     }
@@ -2357,14 +2560,307 @@ mod tests {
             vec![Field::Present(Value::Int(1)), Field::Present(Value::Int(2))],
             &["a", "A"],
         );
-        match column_value(&rec, "a", &None, false) {
-            Err(SelectError::Ambiguous(n)) => assert_eq!(n, "a"),
+        match column_value(&rec, "a", NameStyle::Bare) {
+            Err(Error::Ambiguous(n)) => assert_eq!(n, "a"),
             other => panic!("expected ambiguous, got {other:?}"),
         }
         // Quoted: exact case, no ambiguity.
         assert_eq!(
-            column_value(&rec, "A", &None, true).unwrap(),
+            column_value(&rec, "A", NameStyle::Quoted).unwrap(),
             Some(Field::Present(Value::Int(2)))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage round (2026-09-06): numeric / boolean / null edges not
+    // reached by the main suite.
+    // ------------------------------------------------------------------
+
+    /// A one-column record whose value is an explicit `Value` (CSV fields
+    /// are strings; these shim the numeric/bool/null typing directly).
+    fn cell(v: Value) -> Record {
+        Record::Csv(Columns::from_names(
+            vec![Field::Present(v)],
+            vec!["a".into()],
+        ))
+    }
+
+    fn str_cell(s: &str) -> Record {
+        cell(Value::String(s.to_string()))
+    }
+
+    #[test]
+    fn unary_minus_value_shapes() {
+        // Int negation stays Int (checked_neg).
+        let rows = run("SELECT -s.a FROM S3Object s", vec![cell(Value::Int(-5))]);
+        assert_eq!(rows[0].vals[0], Field::Present(Value::Int(5)));
+        // i64::MIN overflows Int negation -> Decimal.
+        let rows = run(
+            "SELECT -s.a FROM S3Object s",
+            vec![cell(Value::Int(i64::MIN))],
+        );
+        assert_eq!(
+            rows[0].vals[0],
+            Field::Present(Value::Decimal(Decimal::from(9223372036854775808u64)))
+        );
+        // Decimal negation keeps the sign flip.
+        let rows = run(
+            "SELECT -s.a FROM S3Object s",
+            vec![cell(Value::Decimal(Decimal::new(-25, 1)))],
+        );
+        assert_eq!(
+            rows[0].vals[0],
+            Field::Present(Value::Decimal(Decimal::new(25, 1)))
+        );
+        // A bool is not a number -> value error. Only strings/raw numbers
+        // parse lazily; bool/JSON never do.
+        let mut engine = Engine::new(parse("SELECT -s.a FROM S3Object s").unwrap());
+        match engine.next(cell(Value::Bool(true))) {
+            Err(Error::Value(m)) => assert!(m.starts_with("invalid numeric value"), "{m}"),
+            other => panic!("expected invalid numeric value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_boolean_propagation() {
+        // OR: true dominates; NULL-with-false is UNKNOWN, dropped.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a = 'x' OR NULL",
+                vec![str_cell("x")]
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a = 'x' OR NULL",
+                vec![str_cell("y")]
+            )
+            .len(),
+            0
+        );
+        // AND: false dominates even over NULL.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE false AND NULL",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+        // A non-boolean operand in boolean position is FALSE.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE 1 AND true",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn null_and_bool_comparisons() {
+        // Null on either side is incomparable -> equality false, even NULL=NULL.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a = NULL",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE NULL = NULL",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+        // `!=` over an incomparable pair is false too (not flipped true).
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a != NULL",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+        // Booleans compare by value (the only ordering defined for them).
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE true = true",
+                vec![str_cell("x")]
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE true = false",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn in_list_null_element_is_unknown() {
+        // A present match wins over a NULL element.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a IN ('x', NULL)",
+                vec![str_cell("x")]
+            )
+            .len(),
+            1
+        );
+        // No match but a NULL element -> UNKNOWN (dropped), not false.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a IN ('y', NULL)",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+        // Negated NULL stays UNKNOWN (never flipped to a match).
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a NOT IN ('y', NULL)",
+                vec![str_cell("x")]
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn between_null_bound_is_unknown() {
+        // A NULL bound makes the whole comparison incomparable -> UNKNOWN.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a BETWEEN NULL AND 5",
+                vec![str_cell("3")]
+            )
+            .len(),
+            0
+        );
+        // Comparable bounds match normally.
+        assert_eq!(
+            run(
+                "SELECT * FROM S3Object s WHERE s.a BETWEEN 1 AND 5",
+                vec![str_cell("3")]
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn modulo_string_operand_and_zero() {
+        // `%` parses a whole-number String operand via integral().
+        let rows = run("SELECT s.a % 2 FROM S3Object s", vec![str_cell("6")]);
+        assert_eq!(rows[0].vals[0], Field::Present(Value::Int(0)));
+        // Modulo by zero is a value error, same as division.
+        let mut engine = Engine::new(parse("SELECT * FROM S3Object s WHERE s.a % 0 = 1").unwrap());
+        match engine.next(str_cell("6")) {
+            Err(Error::Value(m)) => assert_eq!(m, "division by zero"),
+            other => panic!("expected division by zero, got {other:?}"),
+        }
+    }
+
+    /// A two-column record (the `cell` helper is single-column).
+    fn pair(a: Value, b: Value) -> Record {
+        Record::Csv(Columns::from_names(
+            vec![Field::Present(a), Field::Present(b)],
+            vec!["a".into(), "b".into()],
+        ))
+    }
+
+    #[test]
+    fn int_arithmetic_fast_path() {
+        // Int+Int stays Int for all three ops.
+        let rows = run(
+            "SELECT s.a + s.b FROM S3Object s",
+            vec![pair(Value::Int(2), Value::Int(3))],
+        );
+        assert_eq!(rows[0].vals[0], Field::Present(Value::Int(5)));
+        let rows = run(
+            "SELECT s.a - s.b FROM S3Object s",
+            vec![pair(Value::Int(5), Value::Int(3))],
+        );
+        assert_eq!(rows[0].vals[0], Field::Present(Value::Int(2)));
+        let rows = run(
+            "SELECT s.a * s.b FROM S3Object s",
+            vec![pair(Value::Int(3), Value::Int(2))],
+        );
+        assert_eq!(rows[0].vals[0], Field::Present(Value::Int(6)));
+        // i64::MIN - 1 overflows Int -> promotes to Decimal.
+        let rows = run(
+            "SELECT s.a - s.b FROM S3Object s",
+            vec![pair(Value::Int(i64::MIN), Value::Int(1))],
+        );
+        assert_eq!(
+            rows[0].vals[0],
+            Field::Present(Value::Decimal(Decimal::from(i64::MIN) - Decimal::from(1)))
+        );
+    }
+
+    #[test]
+    fn decimal_arithmetic() {
+        // Decimal - and * stay Decimal.
+        let rows = run(
+            "SELECT s.a - 0.5 FROM S3Object s",
+            vec![cell(Value::Decimal(Decimal::from(3)))],
+        );
+        assert_eq!(
+            rows[0].vals[0],
+            Field::Present(Value::Decimal(Decimal::new(25, 1)))
+        );
+        let rows = run(
+            "SELECT s.a * 0.5 FROM S3Object s",
+            vec![cell(Value::Decimal(Decimal::from(3)))],
+        );
+        assert_eq!(
+            rows[0].vals[0],
+            Field::Present(Value::Decimal(Decimal::new(15, 1)))
+        );
+    }
+
+    #[test]
+    fn unary_minus_string_parses() {
+        // A String field negates via lazy numeric parse.
+        let rows = run("SELECT -s.a FROM S3Object s", vec![str_cell("7")]);
+        assert_eq!(
+            rows[0].vals[0],
+            Field::Present(Value::Decimal(Decimal::from(-7)))
+        );
+    }
+
+    #[test]
+    fn as_decimal_rejects_bool() {
+        // A Bool operand in arithmetic is a value error (only comparisons
+        // tolerate a non-numeric operand).
+        let mut engine = Engine::new(parse("SELECT s.a + 1 FROM S3Object s").unwrap());
+        match engine.next(cell(Value::Bool(true))) {
+            Err(Error::Value(m)) => assert!(m.starts_with("invalid numeric value"), "{m}"),
+            other => panic!("expected invalid numeric value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn like_escape_non_string_rejected() {
+        // A non-string ESCAPE operand (a numeric literal) is refused — the
+        // `else` arm of the single-quoted-string match.
+        let mut engine =
+            Engine::new(parse("SELECT * FROM S3Object s WHERE s.a LIKE 'h%' ESCAPE 5").unwrap());
+        match engine.next(str_cell("hello")) {
+            Err(Error::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
+            other => panic!("expected escape error, got {other:?}"),
+        }
     }
 }

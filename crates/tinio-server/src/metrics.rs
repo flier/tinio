@@ -1437,10 +1437,7 @@ impl<T: S3 + Send + Sync> S3 for MetricS3<T> {
         &self,
         req: S3Request<dto::SelectObjectContentInput>,
     ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
-        self.record(
-            "SelectObjectContent",
-            self.inner.select_object_content(req),
-        )
-        .await
+        self.record("SelectObjectContent", self.inner.select_object_content(req))
+            .await
     }
 }

@@ -9,11 +9,14 @@
 //! A JSON value under CSV output is the SELECT * matrix cell: compact JSON
 //! text in that cell (`display`) — CSV quoting/escaping applies to the cell.
 
-use csv::{QuoteStyle, Terminator, WriterBuilder};
+use _csv::{QuoteStyle, Terminator, WriterBuilder};
 
-use crate::SelectError;
-use crate::engine::OutRow;
-use crate::row::{Field, Value, display};
+use crate::{
+    csv::map_error,
+    engine::OutRow,
+    error::Error,
+    row::{Field, Value, display},
+};
 
 /// Output serialization mode (S3 Select `OutputSerialization`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +71,7 @@ impl Default for JsonOutputParams {
 }
 
 /// One `OutRow` in `mode`, ready to pack into an event.
-pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, SelectError> {
+pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, Error> {
     match mode {
         OutputMode::Csv(params) => serialize_csv(params, row),
         OutputMode::Json(params) => Ok(serialize_json(params, row)),
@@ -82,7 +85,7 @@ pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, SelectE
 /// cell's own `"` are escaped per the params).
 /// Double-quoting is off so the configured escape actually prefixes quote
 /// chars — with the default escape==quote the bytes equal doubling.
-fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, SelectError> {
+fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, Error> {
     let mut b = WriterBuilder::new();
     b.delimiter(params.field_delimiter)
         .terminator(Terminator::Any(params.record_delimiter))
@@ -94,13 +97,17 @@ fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, Sele
             QuoteFields::Always => QuoteStyle::Always,
         });
     let mut wtr = b.from_writer(Vec::new());
-    let fields = row.keys.iter().enumerate().map(|(i, _)| match row.vals.get(i) {
-        Some(Field::Present(v)) => display(v),
-        _ => String::new(),
-    });
-    wtr.write_record(fields).map_err(from_csv)?;
-    wtr.into_inner()
-        .map_err(|e| SelectError::Io(e.into_error()))
+    let fields = row
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, _)| match row.vals.get(i) {
+            Some(Field::Present(v)) => display(v),
+            _ => String::new(),
+        });
+    wtr.write_record(fields)
+        .map_err(|e| map_error(e, "output"))?;
+    wtr.into_inner().map_err(|e| Error::Io(e.into_error()))
 }
 
 /// JSON row: `{"k": v, ...}`, MISSING omits the key (zip stops at the shorter
@@ -150,16 +157,6 @@ fn json_value(out: &mut Vec<u8>, v: &Value) {
     }
 }
 
-/// `csv` writer error mapping: I/O passes through; the rest is a format
-/// error — practically unreachable for `&str` fields into a `Vec`.
-fn from_csv(e: csv::Error) -> SelectError {
-    let msg = format!("csv output: {e}");
-    match e.into_kind() {
-        csv::ErrorKind::Io(io) => SelectError::Io(io),
-        _ => SelectError::Format(msg),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
@@ -195,7 +192,10 @@ mod tests {
                 present(Value::String("c\"d".into())),
             ],
         );
-        assert_eq!(serialize_row(&csv_mode(), &row).unwrap(), &b"\"a,b\",\"c\"\"d\"\n"[..]);
+        assert_eq!(
+            serialize_row(&csv_mode(), &row).unwrap(),
+            &b"\"a,b\",\"c\"\"d\"\n"[..]
+        );
     }
 
     #[test]
@@ -262,10 +262,7 @@ mod tests {
             ..Default::default()
         });
         let row = row(vec!["a"], vec![present(Value::String("a\"b".into()))]);
-        assert_eq!(
-            serialize_row(&mode, &row).unwrap(),
-            &b"\"a\\\"b\"\n"[..]
-        );
+        assert_eq!(serialize_row(&mode, &row).unwrap(), &b"\"a\\\"b\"\n"[..]);
     }
 
     #[test]
@@ -279,7 +276,10 @@ mod tests {
 
     #[test]
     fn json_decimal_normalizes_before_emitting() {
-        let row = row(vec!["k"], vec![present(Value::Decimal(Decimal::new(150, 2)))]);
+        let row = row(
+            vec!["k"],
+            vec![present(Value::Decimal(Decimal::new(150, 2)))],
+        );
         assert_eq!(
             serialize_row(&json_mode(), &row).unwrap(),
             &b"{\"k\":1.5}\n"[..]
@@ -298,10 +298,7 @@ mod tests {
     #[test]
     fn json_all_missing_is_empty_object() {
         let row = row(vec!["a", "b"], vec![Field::Missing, Field::Missing]);
-        assert_eq!(
-            serialize_row(&json_mode(), &row).unwrap(),
-            &b"{}\n"[..]
-        );
+        assert_eq!(serialize_row(&json_mode(), &row).unwrap(), &b"{}\n"[..]);
     }
 
     #[test]
@@ -319,7 +316,10 @@ mod tests {
     #[test]
     fn json_null_is_null() {
         let row = row(vec!["k"], vec![present(Value::Null)]);
-        assert_eq!(serialize_row(&json_mode(), &row).unwrap(), &b"{\"k\":null}\n"[..]);
+        assert_eq!(
+            serialize_row(&json_mode(), &row).unwrap(),
+            &b"{\"k\":null}\n"[..]
+        );
     }
 
     #[test]

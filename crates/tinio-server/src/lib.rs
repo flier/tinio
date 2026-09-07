@@ -19,6 +19,9 @@ pub extern crate tinio_core as _core;
 extern crate tinio_fs as _fs;
 #[cfg(test)]
 extern crate tinio_mem as _mem;
+#[cfg(feature = "select")]
+#[doc(hidden)]
+pub extern crate tinio_select as _select;
 #[doc(hidden)]
 pub extern crate tinio_util as _util;
 

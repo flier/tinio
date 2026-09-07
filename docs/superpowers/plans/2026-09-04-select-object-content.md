@@ -16,7 +16,7 @@
 - `tinio-select` must not depend on `tinio-core`, `s3s`, or any backend crate; the event model is `SelectEvent` (s3s-free), mapped by the server. **The crate is synchronous** (`std::io::Read` in, `Iterator` out; no tokio/bytes/futures deps) — the async→sync bridge lives in tinio-server (review 2026-09-05, spec §1.1): bounded `tokio::sync::mpsc` (capacity 4) + `ChannelReader` (std `Read` over `blocking_recv`) + `spawn_blocking` engine + output mapped through a hand-rolled `futures::Stream` over `Receiver::poll_recv` (no `tokio-stream` dep — review 2026-09-05b); CPU-bound work never runs on a tokio worker; cancellation = channel drop.
 - Numeric spine = `rust_decimal`; precision > 28 significant digits → error, **only when a numeric operator consumes the value** (grilling Q3): a `SELECT *` passes the raw token text through untouched. `Value::RawNumber(String)` carries JSON number tokens verbatim; CSV fields stay `Value::String`.
 - **`SELECT *` matrix** (review 2026-09-05): CSV→CSV values untouched (framed by output config); CSV→JSON keys = USE headers else `_1.._N`; JSON→CSV columns = top-level keys in encounter order (`serde_json` `preserve_order`), nested → compact JSON cell; JSON→JSON re-emits the record in encounter order with `RawNumber` tokens verbatim.
-- Request-level errors map: 400 `S3QueryParsingError` (via `Custom`), `InvalidRequestParameter` for config combos incl. Parquet size bound. **Header-dependent checks (`AmbiguousFieldName`/`MissingHeaderName`) are in-stream** (they need the CSV header row — cannot be 400 before any read; review 2026-09-05). Other in-stream errors: one code `Custom("S3QueryError")` with a detail message (grilling Q2). `SelectError` gains `Ambiguous(String)`/`MissingHeader(String)` variants for the mapping.
+- Request-level errors map: 400 `S3QueryParsingError` (via `Custom`), `InvalidRequestParameter` for config combos incl. Parquet size bound. **Header-dependent checks (`AmbiguousFieldName`/`MissingHeaderName`) are in-stream** (they need the CSV header row — cannot be 400 before any read; review 2026-09-05). Other in-stream errors: one code `Custom("S3QueryError")` with a detail message (grilling Q2). `Error` gains `Ambiguous(String)`/`MissingHeader(String)` variants for the mapping.
 - **Parquet memory bound** (review 2026-09-05): the parquet reader buffers the whole object (no seek in the storage path); `SelectConfig.max_parquet_bytes` (default 256 MiB); server rejects over-bound objects **request-level 400** (the size is known from the read path's own `GetObjectResult.info.size` before any body byte streams — no `head_object` round trip; review 2026-09-05b). CSV/JSON/GZIP/BZIP2 fully streaming.
 - **Alias rule scoped to JSON output** (review 2026-09-05): a bare-expression projection needs an alias only when `OutputSerialization = JSON`; CSV output allows it. `sql.rs` accepts; the server op enforces per output mode.
 - **Input-record cap 1 MB** (review 2026-09-05 #3): every reader (CSV row, JSON line) tracks bytes consumed per record; exceeding → in-stream `Format("input record exceeds 1 MB")` — bounds memory and defuses decompression bombs. Output side keeps `TooLarge`.
@@ -26,7 +26,7 @@
 - **Records are never split across events** (review 2026-09-05 #10): the adapter flushes at record boundaries; a record that would exceed 1 MB → `TooLarge`. No split test.
 - **Request-level `Custom` errors must set HTTP 400 explicitly** (review 2026-09-05 #2; 2026-09-05b: `S3Error::new` takes only the code — the code+message constructor is `S3Error::with_message(code, msg)`): a `Custom`-coded error built as `S3Error::with_message(S3ErrorCode::Custom("...".into()), msg)` alone serializes as **500** (s3s `Custom.status_code() = None` → `unwrap_or(500)`); call `.set_status_code(StatusCode::BAD_REQUEST)`. `Custom`'s payload is a `bytestring::ByteString`, so pass `"...".into()` — a `b".."` byte literal does not coerce (review 2026-09-05b). Use the real `S3ErrorCode::AmbiguousFieldName` variant (exists, 400) instead of a Custom code for ambiguity (#11); only `S3QueryParsingError`/`MissingHeaderName`/`S3QueryError` use `Custom`.
 - **Concurrency cap** (review 2026-09-05 #4): the op guards with a `tokio::sync::Semaphore` (default 4, documented constant; `acquire_owned` and drop-releases).
-- **sqlparser 0.57 AST vocabulary** (review 2026-09-05 #9 — the plan's original names don't exist): aggregates are `Expr::Function` (name in `count`/`sum`/`avg`/`min`/`max`; `count(*)` = `FunctionArg::Wildcard`), **not** `Expr::AggregateExpr`; `CompoundFieldAccess` is the struct variant `{ root: Box<Expr>, access_chain: Vec<AccessExpr> }` — chain elements are `AccessExpr::Subscript` (bracket `[i]`) or `AccessExpr::Ident` (dot access); a plain dotted name (`a.b.c`) stays `CompoundIdentifier` — none of these are `Expr::Subscript` (review 2026-09-05b: corrected tuple→struct shape); LIKE is `Expr::Like`/`ILike` — verify the exact names against the pinned version at implementation (the rest of the match arms must be written against the real 0.57 AST).
+- **sqlparser 0.62 AST vocabulary** (review 2026-09-05 #9 — the plan's original names don't exist; pinned 0.62 + arrow/parquet 59 as of 2026-09-06, upgraded from 0.57/56): aggregates are `Expr::Function` (name in `count`/`sum`/`avg`/`min`/`max`; `count(*)` = `FunctionArg::Wildcard`), **not** `Expr::AggregateExpr`; `CompoundFieldAccess` is the struct variant `{ root: Box<Expr>, access_chain: Vec<AccessExpr> }` — chain elements are `AccessExpr::Subscript` (bracket `[i]`) or `AccessExpr::Ident` (dot access); a plain dotted name (`a.b.c`) stays `CompoundIdentifier` — none of these are `Expr::Subscript` (review 2026-09-05b: corrected tuple→struct shape); LIKE is `Expr::Like`/`ILike` (`escape_char` is a `ValueWithSpan` in 0.62 — the engine unwraps the single-quoted literal); `SelectItem::ExprWithAliases` (Spark `AS (a,b)`) and `ObjectNamePart::Function` are 0.62 additions, both refused request-level (review 2026-09-06b upgrade adaptation).
 - Feature wiring: `select = ["dep:tinio-select"]`; `select-parquet = ["select", "tinio-select/parquet"]`; `default += "select"`. Runtime `Capabilities.select` (in `tinio-config/src/schema/s3.rs`, default true). The s3s output stream is a hand-rolled `futures::Stream` over `tokio::sync::mpsc::Receiver::poll_recv` — tinio-server keeps no `tokio-stream` dependency (review 2026-09-05b, spec §1.1).
 - Non-goals rejected at parse time: JOIN, subquery, GROUP BY/HAVING, ORDER BY, DISTINCT, UNION.
 - ScanRange only with `CompressionType::NONE`; Parquet only with `CompressionType::NONE`; output never Parquet; delimiters single-byte; **CSV output `QuoteFields` default = `ASNEEDED`** (grilling Q4); JSON output `RecordDelimiter` default `\n`; ScanRange+JSON DOCUMENT → start>0 yields zero records (documented, not a bug).
@@ -36,7 +36,7 @@
 - Commit per task (grilling Q5): convention style messages; per repo CLAUDE.md, git writes need an explicit user approval — each task's commit step asks the user first.
 - s3s DTO facts (verified against s3s 0.15.0 source): `InputSerialization { csv, compression_type, json, parquet }`; `CSVInput { allow_quoted_record_delimiter: Option<AllowQuotedRecordDelimiter> /* bool */, comments: Option<String>, field_delimiter: Option<String>, file_header_info: Option<FileHeaderInfo /* String */>, quote_character: Option<String>, quote_escape_character: Option<String>, record_delimiter: Option<String> }`; `JSONInput { type_: Option<JSONType /* String */> }`; `OutputSerialization { csv: Option<CSVOutput>, json: Option<JSONOutput> }`; `ScanRange { start: Option<Start /* i64 */>, end: Option<End /* i64 */> }`; `RequestProgress { enabled: Option<EnableRequestProgress /* bool */> }`; `CompressionType` consts `NONE`/`GZIP`/`BZIP2`; `JSONType` consts `DOCUMENT`/`LINES`; `FileHeaderInfo` consts `NONE`/`IGNORE`/`USE`. Use the `From<&'static str>`/const access style shown in `crates/tinio-server/src/backend/*.rs`.
 - `S3Backend` fields (backend/mod.rs:188): `storage: Arc<S>`, `caps: Capabilities`; read path: `self.storage.get_object(&bucket, &key, range)`; runtime toggle idiom: `Self::require_cap(self.caps.list_objects_v1, "ListObjects")?` (listing.rs:110).
-- Executor facts to confirm at implementation (not design): exact `testutil.rs` fixture helper names (`setup_name`-style), e2e step wiring location, `parquet` crate's current 56.x line, `dto::CSVInput`/`CSVOutput` `Default` impls.
+- Executor facts to confirm at implementation (not design): exact `testutil.rs` fixture helper names (`setup_name`-style), e2e step wiring location, `parquet` crate's current 59.x line, `dto::CSVInput`/`CSVOutput` `Default` impls.
 
 ---
 
@@ -46,7 +46,7 @@
 crates/tinio-select/
   Cargo.toml            new — manifest; feature parquet (off); criterion dev-dep
   src/lib.rs            new — root, re-exports
-  src/error.rs          new — SelectError (Parse/Unsupported/Value/Format/Io/TooLarge/NestedCsv)
+  src/error.rs          new — Error (Parse/Unsupported/Value/Ambiguous/MissingHeader/Format/Io/TooLarge/NestedCsv/ParquetTooLarge)
   src/row.rs            new — Value, Field (MISSING), Record
   src/sql.rs            new — FROM preprocessor + parse/validate → QueryPlan
   src/record.rs         new — RecordReader trait + CsvReader + compression/scan-range wrappers
@@ -63,7 +63,7 @@ crates/tinio-server/
   Cargo.toml            modify — features + dep
 crates/tinio-config/src/schema/s3.rs  modify — Capabilities.select
 crates/tinio-e2e/tests/features/select.feature  new
-Cargo.toml (workspace)  modify — add sqlparser, csv, rust_decimal, flate2, bzip2, parquet workspace deps (parquet gated via the crate's own optional dep — RFC 2906)
+Cargo.toml (workspace)  modify — add arrow, bytes, bzip2, csv, flate2, parquet, rust_decimal, sqlparser workspace deps (arrow pinned once here per docs/cargo.md "pin once"; parquet gated via the crate's own optional dep — RFC 2906)
 ```
 
 ---
@@ -75,19 +75,22 @@ Cargo.toml (workspace)  modify — add sqlparser, csv, rust_decimal, flate2, bzi
 - Create: `crates/tinio-select/Cargo.toml`, `crates/tinio-select/src/lib.rs`, `crates/tinio-select/src/error.rs`
 
 **Interfaces:**
-- Produces: `tinio_select::SelectError`; crate name `tinio_select`, library only.
+- Produces: `tinio_select::Error`; crate name `tinio_select`, library only.
 
 - [x] **Step 1: Add workspace deps** (alphabetical, like the existing list):
 
 ```toml
-bzip2 = "0.6.1"
+arrow = { version = "56", default-features = false }
+bytes = "1"
+bzip2 = "0.6"
 csv = "1.3"
 flate2 = "1.0"
-# parquet: `optional` is forbidden in [workspace.dependencies] (RFC 2906) — the crate marks it optional (review 2026-09-05b)
 parquet = "56"
 rust_decimal = "1"
-sqlparser = "0.57"
+sqlparser = "0.62"
 ```
+
+(parquet: `optional` is forbidden in [workspace.dependencies] (RFC 2906) — the crate marks it optional, review 2026-09-05b; `arrow` is pinned here with `default-features = false` per docs/cargo.md "pin once", the crate re-declares it as `optional`.)
 
 - [x] **Step 2: Create the crate manifest** `crates/tinio-select/Cargo.toml`:
 
@@ -100,10 +103,12 @@ description = "Streaming SQL SELECT engine for S3 objects (S3 Select)"
 publish = false
 
 [dependencies]
+arrow = { workspace = true, optional = true }
 bzip2.workspace = true
+bytes = { workspace = true, optional = true }
 csv.workspace = true
 flate2.workspace = true
-parquet = { workspace = true, optional = true } # review 2026-09-05b: declared optional here (not in workspace.dependencies, RFC 2906) so [features] parquet = ["dep:parquet"] resolves
+parquet = { workspace = true, optional = true }
 rust_decimal.workspace = true
 serde_json = { workspace = true, features = ["arbitrary_precision", "preserve_order"] }
 sqlparser.workspace = true
@@ -119,13 +124,13 @@ harness = false
 
 [features]
 default = []
-parquet = ["dep:parquet"]
+parquet = ["dep:parquet", "dep:arrow", "dep:bytes"]
 
 [lints.rust]
 unsafe_code = "forbid"
 ```
 
-(No async deps — the crate is synchronous per the execution model; fixtures are in-memory `Cursor`s, no `tempfile`.)
+(`arrow`/`bytes` are optional, parquet-only — see Task 11's ChunkReader rationale; review 2026-09-05. No async deps — the crate is synchronous per the execution model; fixtures are in-memory `Cursor`s, no `tempfile`. No `Cargo.toml` comments per docs/cargo.md.)
 
 - [x] **Step 3: Create `src/error.rs`**:
 
@@ -137,7 +142,7 @@ use thiserror::Error;
 /// the rest surface as error items inside the 200 event stream
 /// (spec §3) under `Custom("S3QueryError")` (grilling Q2).
 #[derive(Debug, Error)]
-pub enum SelectError {
+pub enum Error {
     #[error("S3 select: {0}")]
     Parse(String),
     #[error("S3 select: unsupported: {0}")]
@@ -161,7 +166,7 @@ pub enum SelectError {
 }
 ```
 
-- [x] **Step 4: `src/lib.rs`** — `pub mod error;` + `pub use error::SelectError;` + module doc comment pointing at the spec.
+- [x] **Step 4: `src/lib.rs`** — `mod error;` (private per `docs/style.md`) + root re-export `pub use self::error::Error;` + module doc comment pointing at the spec.
 
 - [x] **Step 5: Verify** — `cargo check -p tinio-select` succeeds; `cargo test -p tinio-select` green (empty suite).
 
@@ -176,10 +181,10 @@ pub enum SelectError {
 
 **Interfaces:**
 - Produces:
-  - `pub enum Value { Null, Bool(bool), Int(i64), Decimal(rust_decimal::Decimal), RawNumber(String), String(String), Json(Box<serde_json::Value>) }` — `RawNumber` carries a JSON number token verbatim (grilling Q3); `Json` carries nested parquet/JSON structures (populated from Task 10/11, rendered by the JSON serializer; CSV output → `NestedCsv`).
+  - `pub enum Value { Null, Bool(bool), Int(i64), Decimal(rust_decimal::Decimal), RawNumber(String), String(String), Json(Box<serde_json::Value>) }` — `RawNumber` carries a JSON number token verbatim (grilling Q3); `Json` carries nested parquet/JSON structures (populated from Task 10/11, rendered by the JSON serializer; under CSV output the two inputs differ — JSON nested renders as a compact cell, parquet nested is `NestedCsv`; decision 2026-09-05 review, grilling Q10).
   - `pub enum Field { Present(Value), Missing }`
-  - `pub enum Record { Csv(Vec<Field>, Vec<String>), Json(serde_json::Value), Parquet(Vec<Field>, Vec<String>) }` — `Vec<String>` is the name map (`_N`/headers for CSV; column names for Parquet).
-  - `pub fn parse_number(s: &str) -> Result<Decimal, SelectError>` — lazy parse; digit count > 28 → `Value("numeric value exceeds 28-digit precision: {s}")`, else any parse error → `Value("invalid numeric value: {s}")`.
+  - `pub enum Record { Csv(Vec<Field>, Vec<String>), Json(Option<serde_json::Value>), Parquet(Vec<Field>, Vec<String>) }` — `Vec<String>` is the name map (`_N`/headers for CSV; column names for Parquet); `Json(None)` is a path-traversal MISSING row (a wildcard/path step that matched nothing), distinct from a present `null` value.
+  - `pub fn parse_number(s: &str) -> Result<Decimal, Error>` — lazy parse; digit count > 28 → `Value("numeric value exceeds 28-digit precision: {s}")`, else any parse error → `Value("invalid numeric value: {s}")`.
   - `pub fn display(v: &Value) -> String` — serializer text form: `Normalize` the Decimal, raw `RawNumber` text back out, `Json` → `serde_json::to_string`.
 
 Tests:
@@ -203,18 +208,18 @@ Tests:
 **Interfaces:**
 - Produces:
   - `pub enum PathSeg { Name(String), Index(usize), Wild }`
-  - `pub struct FromClause { pub traversed: bool, pub segments: Vec<PathSeg>, pub alias: Option<String> }`
+  - `pub struct FromClause { pub segments: Vec<PathSeg>, pub alias: Option<String> }` — `segments` is the whole traversal state (an empty list = non-traversed; the derived `traversed` flag was removed in the 2026-09-06 cleanup).
   - `pub enum Projection { Wild, Item { expr: sqlparser::ast::Expr, alias: Option<String> } }`
   - `pub struct QueryPlan { pub from: FromClause, pub projections: Vec<Projection>, pub where_expr: Option<Expr>, pub limit: Option<usize>, pub aggregates: bool }`
-  - `pub fn parse(sql: &str) -> Result<QueryPlan, SelectError>`
+  - `pub fn parse(sql: &str) -> Result<QueryPlan, Error>` — also refuses, request-level: expression-position subqueries (`IN (SELECT …)`, `EXISTS`, bare `(SELECT …)` — the top-level `SetExpr::Query` arm catches only the statement shape; review 2026-09-06b R4), and user-authored `__s3_is_missing`/`__s3_is_not_missing` calls (R15 — the names are the rewrite's MISSING sentinels; rejected on the pre-rewrite text, quote/comment-aware).
 
 Preprocessor algorithm (spec §1 sql.rs):
 1. `preprocess_from(sql)`: find `FROM` with a small byte scanner that toggles on `'` (string) and `"` (quoted identifier); read the object clause: `S3Object` followed by zero+ segments ((`.` name | `[` int `]` | `.` `*` | `[` `*` `]` | `[` `'` name `'` `]`)) and an optional `AS? alias`; record `(segments, alias)`; rewrite the clause's object text to `S3Object` (strip segments) for sqlparser.
-2. **`IS [NOT] MISSING` rewrite** (review 2026-09-05b): sqlparser 0.57's `Expr` has no `IsMissing` variant, so `GenericDialect` cannot parse `IS [NOT] MISSING` at all (only IsNull/IsNotNull/IsTrue/IsFalse/IsDistinctFrom exist) — the same quote-aware pass rewrites each `X IS [NOT] MISSING` into the sentinel function calls `__s3_is_missing(X)` / `__s3_is_not_missing(X)`, which `eval` maps back to MISSING semantics (Task 5). A plain `IS [NOT] NULL` substitution would be wrong: a present-but-null field must not satisfy `IS MISSING`.
+2. **`IS [NOT] MISSING` rewrite** (review 2026-09-05b): sqlparser 0.62's `Expr` has no `IsMissing` variant, so `GenericDialect` cannot parse `IS [NOT] MISSING` at all (only IsNull/IsNotNull/IsTrue/IsFalse/IsDistinctFrom exist) — the same quote-aware pass rewrites each `X IS [NOT] MISSING` into the sentinel function calls `__s3_is_missing(X)` / `__s3_is_not_missing(X)`, which `eval` maps back to MISSING semantics (Task 5). A plain `IS [NOT] NULL` substitution would be wrong: a present-but-null field must not satisfy `IS MISSING`.
 3. Parse with `sqlparser::Parser::parse_sql(&GenericDialect, &rewritten)`.
 4. Validate AST: one `Statement::Query`; `set_expr` is `SetExpr::Select` (reject UNION/subquery); reject `GROUP BY`/`HAVING`/`ORDER BY`/`DISTINCT`; `LIMIT` must be a positive integer literal; any `join` → `Unsupported("JOIN")`; `FROM` = the single `S3Object` factor with the recorded alias.
 5. SELECT list → projections: bare `*` → `Wild`; `SelectItem::UnnamedExpr(e)` → `Item { expr: e, alias: None }`; `SelectItem::ExprWithAlias` → alias. **No alias rejection here** (review 2026-09-05b): a bare-expression projection without an alias is *accepted* — `Projection::Item.alias` records whatever was written (or `None`); the alias rule (JSON output only) is enforced by the server op (Global Constraints; Task 13).
-6. `aggregates` = any `Expr::Function` in the list whose name is `count`/`sum`/`avg`/`min`/`max` (**sqlparser 0.57 AST — there is no `Expr::AggregateExpr`; `count(*)` is a `Function` whose args contain `FunctionArg::Wildcard`**; review 2026-09-05 #9). Also reject an expression string longer than 256 KiB (`Parse("expression exceeds 256 KiB")`, review 2026-09-05 #5). **If `aggregates`, `Wild` → `Parse("aggregates require an explicit select list")`.**
+6. `aggregates` = any `Expr::Function` in the list whose name is `count`/`sum`/`avg`/`min`/`max` (**sqlparser 0.62 AST — there is no `Expr::AggregateExpr`; `count(*)` is a `Function` whose args contain `FunctionArg::Wildcard`**; review 2026-09-05 #9). Also reject an expression string longer than 256 KiB (`Parse("expression exceeds 256 KiB")`, review 2026-09-05 #5). **If `aggregates`, `Wild` → `Parse("aggregates require an explicit select list")`.**
 
 Tests:
 - Accept: `SELECT * FROM S3Object s WHERE s._3 > 100 LIMIT 5`; `SELECT s.Id, s.Name AS n FROM S3Object s`; `SELECT price FROM S3Object[*].books[*].price`; `SELECT s.projects[0].project_name FROM S3Object s`; `SELECT count(*) FROM S3Object s`; `SELECT s.x+1 FROM S3Object s` (bare expression, no alias — parse accepts; the alias rule is the server's, JSON output only, Task 13; review 2026-09-05b).
@@ -225,9 +230,9 @@ Tests:
 - [x] **Step 3: Implement** `sql.rs`:
 
 ```rust
-fn preprocess_from(sql: &str) -> Result<(FromClause, String), SelectError> // (clause, rewritten)
+fn preprocess_from(sql: &str) -> Result<(FromClause, String), Error> // (clause, rewritten)
 fn rewrite_is_missing(sql: &str) -> String                                // quote-aware IS [NOT] MISSING -> sentinel form (review 2026-09-05b)
-fn parse_object_clause(s: &str) -> Result<FromClause, SelectError>
+fn parse_object_clause(s: &str) -> Result<FromClause, Error>
 ```
 
 `parse_object_clause` consumes `S3Object`, then segments:
@@ -250,11 +255,10 @@ A segment without a leading `[*]` on the first step (`S3Object.name`) → `Parse
 
 **Interfaces:**
 - Produces:
-  - `pub trait RecordReader { fn next(&mut self) -> Result<Option<Record>, SelectError>; }`
+  - `pub trait RecordReader { fn next(&mut self) -> Result<Option<Record>, Error>; }`
   - `pub struct CsvParams { pub field_delimiter: u8, pub record_delimiter: u8, pub quote: u8, pub escape: u8, pub comments: Option<u8>, pub header: CsvHeader, pub allow_quoted_record_delimiter: bool }`
   - `pub enum CsvHeader { Use, Ignore, None_ }`
-  - `pub struct CsvReader<R: Read>` with `new(reader: R, params: CsvParams) -> Self`
-  - `pub fn name_index(names: &[String]) -> HashMap<String, usize>` — lowercase keys for case-insensitive lookup (duplicates noted by the engine at lookup time).
+  - `pub struct CsvReader<R: Read>` with `new(reader: R, params: CsvParams) -> Self` — the reader runs over a byte-counting `CappedRead` wrapper (review 2026-09-06b R5): the own 1 MB span check is post-hoc (the `csv` crate buffers a whole record first), so the wrapper bounds the in-flight memory — a gzip bomb expanding into one giant field errors mid-read at `MAX_RECORD` + a read-ahead allowance (the csv internal buffer prefetches across record boundaries; the span check stays the exact per-record authority).
 - CSV → `Record::Csv(fields, names)`: `Use` → first line = header names (subsequent rows use them); `Ignore` → first line skipped, names `_1.._n`; `None_` → no skip, names `_1.._n` (per row width, ragged rows allowed via `flexible(true)`).
 
 Builder:
@@ -296,10 +300,10 @@ Tests:
 
 **Interfaces:**
 - Produces:
-  - `pub struct Engine { plan: QueryPlan }` — `pub fn new(plan: QueryPlan) -> Self`, `pub fn next(&mut self, rec: Record) -> Result<Option<OutRow>, SelectError>` (None = row filtered), `pub fn finish(&mut self) -> Result<Option<OutRow>, SelectError>` (aggregate row, live in Task 7 — this task implements the non-aggregate paths and leaves `finish` returning Ok(None)).
+  - `pub struct Engine { plan: QueryPlan }` — `pub fn new(plan: QueryPlan) -> Self`, `pub fn next(&mut self, rec: Record) -> Result<Option<OutRow>, Error>` (None = row filtered), `pub fn finish(&mut self) -> Result<Option<OutRow>, Error>` (aggregate row, live in Task 7 — this task implements the non-aggregate paths and leaves `finish` returning Ok(None)).
   - `pub struct OutRow { pub keys: Vec<String>, pub vals: Vec<Field> }` — keys: alias > plain field name > `_1..` (Wild).
-  - `fn column_value(rec: &Record, name: &str, alias: &Option<String>, quoted: bool) -> Result<Option<Field>, SelectError>` — CSV: `_N` → index N−1 (out-of-range → `Some(Field::Missing)`); header map (lowercased unless `quoted`); case-insensitive duplicate → `Ambiguous(name)`; USE-mode named ref that doesn't match any header → `MissingHeader(name)`; NONE/IGNORE named refs fall through to positional `_N` only. JSON/Parquet arms: `Ok(None)` → treated as Missing until Tasks 9/11 replace them (each task replaces only its arm — they never share code paths).
-  - `fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, SelectError>` — literals; Identifier/CompoundIdentifier/`CompoundFieldAccess` via `column_value`; BinaryOp (`Eq`, `NotEq`, `Lt`, `LtEq`, `Gt`, `GtEq`, `And`, `Or`, `Plus`, `Minus`, `Multiply`, `Divide`, `Modulo`); `InList`/`Between` honoring their `negated` flag (`NOT IN` / `NOT BETWEEN` — review 2026-09-05b); `UnaryOp::Not`; `UnaryOp::Minus`/`Plus` over numeric literals (sqlparser parses `-1` as `UnaryOp::Minus(Value(Number("1")))` — fold it, so `WHERE s._3 > -100` works — review 2026-09-05b); `IsNull`/`IsNotNull`/`IsTrue`/`IsNotTrue`/`IsFalse`/`IsNotFalse` (review 2026-09-05b); the `__s3_is_missing(X)`/`__s3_is_not_missing(X)` sentinels from Task 3's `IS [NOT] MISSING` rewrite (sqlparser 0.57 has no `IsMissing` variant) → `Value::Bool` of "the operand is `Field::Missing`" (a present-but-null value is NOT missing — review 2026-09-05b); `Like` → `Unsupported("LIKE")` and `ILike` → `Unsupported("ILIKE")` (Task 6 implements `Like` only — AWS has no ILIKE); aggregate `Expr::Function` arms (beyond the two MISSING sentinels) are unreachable when `plan.aggregates` is false (guaranteed by sql.rs) — the arm returns `Value("internal: unexpected aggregate call")` as a guard (review 2026-09-05 #9: Function-based detection, not `Expr::AggregateExpr`).
+  - `fn column_value(rec: &Record, name: &str, alias: &Option<String>, quoted: bool) -> Result<Option<Field>, Error>` — CSV: `_N` → index N−1 (out-of-range → `Some(Field::Missing)`); header map (lowercased unless `quoted`); case-insensitive duplicate → `Ambiguous(name)`; USE-mode named ref that doesn't match any header → `MissingHeader(name)`; NONE/IGNORE named refs fall through to positional `_N` only. JSON/Parquet arms: `Ok(None)` → treated as Missing until Tasks 9/11 replace them (each task replaces only its arm — they never share code paths).
+  - `fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error>` — literals; Identifier/CompoundIdentifier/`CompoundFieldAccess` via `column_value`; BinaryOp (`Eq`, `NotEq`, `Lt`, `LtEq`, `Gt`, `GtEq`, `And`, `Or`, `Plus`, `Minus`, `Multiply`, `Divide`, `Modulo`); `InList`/`Between` honoring their `negated` flag (`NOT IN` / `NOT BETWEEN` — review 2026-09-05b); `UnaryOp::Not`; `UnaryOp::Minus`/`Plus` over numeric literals (sqlparser parses `-1` as `UnaryOp::Minus(Value(Number("1")))` — fold it, so `WHERE s._3 > -100` works — review 2026-09-05b); `IsNull`/`IsNotNull`/`IsTrue`/`IsNotTrue`/`IsFalse`/`IsNotFalse` (review 2026-09-05b) — the `IsNot*` forms are the pure negations of their cousins, so a MISSING operand answers `true` there (pinned, review 2026-09-06b R12); the `__s3_is_missing(X)`/`__s3_is_not_missing(X)` sentinels from Task 3's `IS [NOT] MISSING` rewrite (sqlparser 0.62 has no `IsMissing` variant) → `Value::Bool` of "the operand is `Field::Missing`" (a present-but-null value is NOT missing — review 2026-09-05b; recognized as single-part UNQUOTED identifiers only, review 2026-09-06b R15); `And`/`Or` short-circuit (`false AND x`, `true OR x` never evaluate x — the dead arm's errors must not fire; review 2026-09-06b R11); `Like` → `Unsupported("LIKE")` and `ILike` → `Unsupported("ILIKE")` (Task 6 implements `Like` only — AWS has no ILIKE); aggregate `Expr::Function` arms (beyond the two MISSING sentinels) are unreachable when `plan.aggregates` is false (guaranteed by sql.rs) — the arm returns `Value("internal: unexpected aggregate call")` as a guard (review 2026-09-05 #9: Function-based detection, not `Expr::AggregateExpr`).
 - Comparison rules (spec §1 row.rs): Decimal↔Decimal, Int↔Int, Int↔Decimal promote; String↔String; String vs numeric → lazy `parse_number` (parse failure → comparison false); Bool only `=`/`!=`; `Null`/`Missing` in comparisons → false except under `IS NULL`/`IS [NOT] MISSING` (the MISSING tests reach eval as Task 3's sentinel functions), which distinguish a present Null from an absent field.
 - Arithmetic: Int×Int stays Int with checked overflow → promote to Decimal; `/` → Decimal scale 10; `%` Int-only; division by zero → `Value("division by zero")`.
 - `WHERE` = `eval(...) == Value::Bool(true)` only; `LIMIT` counts passing rows; `projections`: `Wild` → all record fields (keys: header names / `_1..`); `Item` → eval the expression (alias key) — JSON scalar-row semantics land in Task 9.
@@ -323,7 +327,7 @@ Tests (CSV fixtures):
 
 **Files:** `engine.rs` + tests (LIKE only; `finish` stays `Ok(None)`)
 
-- Implement `Expr::Like` in `eval`: case-sensitive (grilling Q1), `%` any sequence, `_` one char, optional `ESCAPE 'c'`; the `negated` flag is honored (`NOT LIKE` — review 2026-09-05b); pattern and subject coerced via `display()`; non-string operands → false. `Expr::ILike` → `Unsupported("ILIKE")` (review 2026-09-05b): AWS S3 Select has no case-insensitive LIKE, so it must not silently behave as a case-sensitive LIKE. **The matcher must be O(n·m) dynamic-programming (or a bounded two-pointer greedy)** — no backtracking (review 2026-09-05 #5: naive recursion is exponential on `%`-heavy patterns; with the 256 KiB expression cap and the 1 MB record cap, DP keeps the worst case bounded).
+- Implement `Expr::Like` in `eval`: case-sensitive (grilling Q1), `%` any sequence, `_` one char, optional `ESCAPE 'c'`; the `negated` flag is honored (`NOT LIKE` — review 2026-09-05b); pattern and subject coerced via `display()`; non-string operands → false — **including under `NOT LIKE`** (review 2026-09-06b R13: the negation must not flip the non-string mismatch to true). `Expr::ILike` → `Unsupported("ILIKE")` (review 2026-09-05b): AWS S3 Select has no case-insensitive LIKE, so it must not silently behave as a case-sensitive LIKE. **The matcher is O(n·m) dynamic-programming** — no backtracking (review 2026-09-05 #5: naive recursion is exponential on `%`-heavy patterns; with the 256 KiB expression cap and the 1 MB record cap, DP keeps the worst case bounded) — **capped at 10⁷ DP cells** (pattern tokens × text chars; review 2026-09-06b R7: 256 KiB pattern × 1 MB record ≈ 2.6×10⁸ cells would pin a spawn_blocking worker for seconds-to-minutes — past the cap is a `Value("LIKE pattern too large")` error, not a run).
 - Tests: `'hello' LIKE 'h%'` true; `'hello' LIKE 'h_llo'` true; `'hello' LIKE '%llo'` true; `'HELLO' LIKE 'h%'` false (case); `'hello' LIKE '%'` true; `_` matches exactly one char; `'a%b' LIKE 'a\%b' ESCAPE '\'` true; pattern with no `%`/`_` is exact equality; subject `Missing` → false; `NOT LIKE` negates (`'abc' NOT LIKE 'd%'` true); `'x' ILIKE 'X'` → `Unsupported("ILIKE")` (review 2026-09-05b).
 
 - [x] **Step 1: Failing tests** → **Step 2: run fail** → **Step 3: implement** → **Step 4: pass** → **Step 5: commit** (ask user) — `feat(select): like matching`
@@ -352,12 +356,12 @@ Tests: `count(*)` → 2 on 2 rows; `count(s._5)` (Missing) → 0; `sum(s._3)` pe
 
 **Interfaces:**
 - `pub enum OutputMode { Csv(CsvOutputParams), Json(JsonOutputParams) }`; `CsvOutputParams { field_delimiter: u8, record_delimiter: u8, quote: u8, escape: u8, quote_fields: QuoteFields }`; `pub enum QuoteFields { AsNeeded, Always }`; `JsonOutputParams { record_delimiter: u8 }`.
-- `pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, SelectError>`
+- `pub fn serialize_row(mode: &OutputMode, row: &OutRow) -> Result<Vec<u8>, Error>`
 - CSV: csv `WriterBuilder` with `QuoteStyle::Necessary` (ASNEEDED, the **default** — grilling Q4) or `QuoteStyle::Always`; fields via `display()`; `Field::Missing` → empty string.
 - JSON: `{"k": v, ...}` — key via `serde_json::to_string`; values: `Null`→`null`, `Bool`→bool, `Int`→int, `Decimal`→normalize-then-string via `row::display()` (`1.50` → `1.5`; still a valid JSON number — review 2026-09-05b), `RawNumber`→raw text verbatim, `String`→quoted, `Json`→nested JSON natively; `Field::Missing` → omit key; all keys missing → `{}` (spec: MISSING serializes as empty record). JSON record delimiter default `\n`.
-- `Field::Present(Value::Json(..))` + `OutputMode::Csv` → `NestedCsv` (grilling Q10).
+- `Field::Present(Value::Json(..))` + `OutputMode::Csv` — scoped per input (decision 2026-09-05, grilling Q10): **parquet-input** nested (list/struct) is the `NestedCsv` error — checked by `events.rs::step` (the parquet row has no JSON matrix equivalent); **JSON-input** nested stays a cell: compact JSON text in the cell via `display()` (`{"a":1}`), the SELECT * matrix row (this serializer only; the `NestedCsv` error is never raised here).
 
-Tests: CSV round (embedded delimiter/quote), `Always` quotes everything; JSON `{"id":"1"}` exact; `Decimal` `1.50` → `1.5`; `RawNumber("1e309")` → `1e309` unquoted; all-missing → `{}`; one missing key omitted; `Null` → `null`; JSON `\n` delimiter; nested + CSV → `NestedCsv` error.
+Tests: CSV round (embedded delimiter/quote), `Always` quotes everything; JSON `{"id":"1"}` exact; `Decimal` `1.50` → `1.5`; `RawNumber("1e309")` → `1e309` unquoted; all-missing → `{}`; one missing key omitted; `Null` → `null`; JSON `\n` delimiter; JSON nested + CSV → compact cell; parquet nested + CSV → `NestedCsv` (the step-level check, Task 12).
 
 - [x] **Step 1: Failing tests** → **Step 2: run fail** → **Step 3: implement** → **Step 4: pass** → **Step 5: commit** (ask user) — `feat(select): output serializers`
 
@@ -370,8 +374,8 @@ Tests: CSV round (embedded delimiter/quote), `Always` quotes everything; JSON `{
 **Interfaces:**
 - `pub enum JsonType { Lines, Document }`
 - `pub struct JsonReader<R: Read>` — `new(reader: R, ty: JsonType, from: &FromClause) -> Self`; yields `Record::Json(element)`. LINES buffers per line with the **1 MB input-record cap** (review 2026-09-05 #3: line length past 1 MB → `Format("input record exceeds 1 MB")`); DOCUMENT parses the whole stream once — the record is byte-0-anchored but still capped at 1 MB.
-- Traversal (spec): `S3Object[*]` = document as an array of root values (DOCUMENT root = one element; LINES root = per line). Per segment: `.name` → field of each element (absent → MISSING step); `[i]` → index i; `.*`/`[*]` → iterate values (zero matches → emit exactly one MISSING row); `['name']` → field. Final segment value(s) become the yielded element (already-deep part of the path ends inside `segments`).
-- Engine JSON lookup (replaces the CSV-only arm): scalar element (`Value` not an object) → any unqualified ref resolves to the scalar; object → case-insensitive field when unquoted, exact when quoted; `_1` → whole record (unless record has a `_1` key — field wins); `[i]`/`['k']` subscripts via `CompoundFieldAccess`/`AccessExpr::Subscript` and `JsonAccess` (sqlparser 0.57 AST — no `Expr::Subscript`; review 2026-09-05 #9); missing → `Field::Missing`.
+- Traversal (spec): `S3Object[*]` = document as an array of root values (DOCUMENT root = one element; LINES root = per line). Per segment: `.name` → field of each element (absent → MISSING step); `[i]` → index i; `.*`/`[*]` → iterate values (zero matches → emit exactly one MISSING row); `['name']` → field. Final segment value(s) become the yielded element (already-deep part of the path ends inside `segments`). A case-folded duplicate key in a `.name` segment is `Ambiguous` — the same rule as the engine's select-side lookup (review 2026-09-06b R10).
+- Engine JSON lookup (replaces the CSV-only arm): scalar element (`Value` not an object) → any unqualified ref resolves to the scalar; object → case-insensitive field when unquoted, exact when quoted; `_1` → whole record (unless record has a `_1` key — field wins); `[i]`/`['k']` subscripts via `CompoundFieldAccess`/`AccessExpr::Subscript` and `JsonAccess` (sqlparser 0.62 AST — no `Expr::Subscript`; review 2026-09-05 #9); missing → `Field::Missing`.
 - JSON number tokens → `Value::RawNumber(n.to_string())` (arbitrary_precision — verbatim token, grilling Q3); JSON `null` → `Value::Null`; strings/bools/ints → their variants.
 
 Tests: LINES 2 objects; DOCUMENT 1 object (multi-line); traversal `S3Object[*].Rules[*].id` per the AWS doc example (2 roots → 4 rows incl. `{}` empty records; `WHERE id IS NOT MISSING` variant omits them); `[0]` index; `['name']`; `. *` zero-match → one empty record; DOCUMENT root array; `SELECT _1.dir_name, _1.owner FROM S3Object[*]` whole-row refs; `SELECT price FROM S3Object[*].books[*].price` scalar-row semantics; raw-number passthrough `SELECT x FROM S3Object s` with `{"x": 1e309}` → `{"x":1e309}` (no decimal parse).
@@ -387,8 +391,8 @@ Tests: LINES 2 objects; DOCUMENT 1 object (multi-line); traversal `S3Object[*].R
 **Interfaces:**
 - `pub enum Compression { None_, Gzip, Bzip2 }`
 - `pub fn decompressed(compression: Compression, r: Box<dyn std::io::Read + Send>) -> Box<dyn std::io::Read + Send>` — sync wrappers (review 2026-09-05: no async in the crate): `Box::new(flate2::read::MultiGzDecoder::new(r))` / `Box::new(bzip2::read::BzDecoder::new(r))` (bzip2: single-stream `BzDecoder`; multi-member gzip via `MultiGzDecoder`).
-- `pub struct RangeFilter<R: RecordReader>` — wraps a reader, tracks the uncompressed byte position of each record's first byte; yields the record only when its start ∈ [start, end]; drops pre-range records; returns `Ok(None)` after a record whose start > end (documents the JSON DOCUMENT case: whole object = record at byte 0, so `start > 0` yields nothing — correct, not a bug). `end`-only: `start = size - end`, requires `size` (below).
-- `SelectConfig.size: Option<u64>` is a field of the struct defined in **Task 12** — this task specifies the semantics (end-only ScanRange needs the object size so `start = size - end`), the field lands with Task 12.
+- `pub struct RangeFilter<R: RecordReader>` — wraps a reader, tracks the uncompressed byte position of each record's first byte; yields the record only when its start ∈ [start, end]; drops pre-range records; returns `Ok(None)` after a record whose start > end (documents the JSON DOCUMENT case: whole object = record at byte 0, so `start > 0` yields nothing — correct, not a bug). `end`-only: `start = size - end`; the *server* resolves the window against the fetched object size (Task 13; review 2026-09-05: the read path returns `info.size` on the same call, no `head_object`).
+- `ScanRange { start: u64, end: Option<u64> }` is the named window type (review 2026-09-05, Data Clumps); `SelectConfig.scan_range: Option<ScanRange>` carries the *resolved* window (Task 12) — there is no `SelectConfig.size` (removed in the review: write-only, the server resolves against `info.size`).
 - Validation (from spec; enforced by the server in Task 13): ScanRange ⇒ `Compression::None_`.
 
 Tests: 4 records at known byte offsets — `start=10` drops the partial first record; both bounds; nothing in range → `Ok(None)` immediately; end-only via `size`; gzip round-trip (flate2 write→read via `std::io::Cursor`); bzip2 round-trip (`bzip2::write::BzEncoder`); DOCUMENT + `start>0` → no records.
@@ -402,9 +406,9 @@ Tests: 4 records at known byte offsets — `start=10` drops the partial first re
 **Files:** Create `crates/tinio-select/src/parquet.rs` + tests; modify `src/lib.rs` (`#[cfg(feature = "parquet")] pub mod parquet;`), `record.rs` (arm), `output.rs`'s `Json` path (already supported), `row.rs` (already defined)
 
 **Interfaces:**
-- Memory bound (review 2026-09-05): the storage path has no seek, so the reader buffers the whole parquet object into a `Vec<u8>` first, handed over as `std::io::Cursor<Vec<u8>>` — `ParquetRecordBatchReaderBuilder::try_new` needs a `ChunkReader`, which `Cursor<Vec<u8>>` satisfies via `AsRef<[u8]>`; a bare `R: Read` does not, and tinio-select forbids `bytes`, so the *server* buffers the bound-checked object and the reader never touches the async body (review 2026-09-05b). The bound check is the server's 400 before streaming, `SelectConfig.max_parquet_bytes`, default 256 MiB; the reader errors `ParquetTooLarge` if the buffered input exceeds the bound (defense in depth).
+- Memory bound (review 2026-09-05): the storage path has no seek, so the crate buffers the whole parquet object into a `Vec<u8>` first (events.rs `build_reader`) — `ParquetRecordBatchReaderBuilder::try_new` needs a `ChunkReader`, and a bare `R: Read` does not satisfy it. parquet 59 implements `ChunkReader` for `File` and `bytes::Bytes` **only** (no `AsRef<[u8]>` blanket exists — verified against the 59.3.0 source, review 2026-09-05), so the buffered `Cursor<Vec<u8>>` moves into a zero-copy `bytes::Bytes` via the crate's **optional** `bytes` dep (`arrow`/`bytes` are optional, parquet-only; the 2026-09-05b "no bytes" line is superseded by review 2026-09-05). The bound check is the server's 400 before streaming, `SelectConfig.max_parquet_bytes`, default 256 MiB; the reader errors `ParquetTooLarge` if the buffered input exceeds the bound (defense in depth).
 - `pub struct ParquetReader` — `new(input: std::io::Cursor<Vec<u8>>, projection: Vec<String>, max_bytes: u64)` via `parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(input)` + `with_projection(ProjectionMask::columns(schema, projector))`; rows → `Record::Parquet(fields, names)`. (review 2026-09-05b: no generic `R: Read` — `try_new` takes a `ChunkReader`.)
-- Type mapping: Int64/Int32→Int; Float/Double→Decimal (via the value's canonical string); Boolean→Bool; Utf8→String; Decimal→Decimal (arrow precision > 28 → `Value("parquet decimal precision exceeds 28 digits")`); Timestamp→string ISO via `time::OffsetDateTime::from_unix_timestamp(...)` → `format(&Rfc3339)` (workspace `time` dep, add to manifest); List/Struct→`Value::Json` (arrow nested → `serde_json::Value`; render native in JSON output, `NestedCsv` for CSV output — handled by Task 8).
+- Type mapping: Int64/Int32→Int; Float/Double→`RawNumber` carrier (review 2026-09-06b R6: finite floats render verbatim through SELECT * and parse lazily on the 28-digit spine only when a numeric operator consumes them — the CSV/JSON lazy rule; NaN/inf stay a row-build `Value` error, never a silently wrong number); Boolean→Bool; Utf8→String; Decimal→Decimal (arrow precision > 28 → `Value("parquet decimal precision exceeds 28 digits")`); Timestamp→string ISO via `time::OffsetDateTime::from_unix_timestamp(...)` → `format(&Rfc3339)` (workspace `time` dep, add to manifest); List/Struct→`Value::Json` (arrow nested → `serde_json::Value`; render native in JSON output, `NestedCsv` for CSV output — the parquet arm of grilling Q10, checked by Task 12).
 - Projection = the set of column names referenced by SELECT/WHERE (extracted in Task 3's plan; add a `pub fn referenced_columns(plan: &QueryPlan) -> Vec<String>` to sql.rs).
 
 Tests (`#[cfg(feature = "parquet")]`, run with `cargo test -p tinio-select --features parquet`): write a fixture with the `parquet`'s arrow writer (int/float/string/decimal(≤28)/timestamp/nested), read back per mapping; decimal precision 29 → error; projection prunes (schema fields unselected read as 0 — assert via the wrong-name lookup → Missing).
@@ -418,11 +422,11 @@ Tests (`#[cfg(feature = "parquet")]`, run with `cargo test -p tinio-select --fea
 **Files:** Create `crates/tinio-select/src/events.rs` + tests; modify `src/lib.rs` (export)
 
 **Interfaces:**
-- `pub enum SelectEvent { Records(Vec<u8>), Progress { bytes_scanned: u64, bytes_processed: u64, bytes_returned: u64 }, Stats { bytes_scanned: u64, bytes_processed: u64, bytes_returned: u64 }, Cont, End }`
+- `pub enum SelectEvent { Records(Vec<u8>), Progress(ByteCounters), Stats(ByteCounters), Cont, End }` — `ByteCounters { bytes_scanned: u64, bytes_processed: u64, bytes_returned: u64 }` is the named counter triple (review 2026-09-05, Data Clumps refactor).
 - `pub enum InputFormat { Csv(CsvParams), Json(JsonParams), Parquet(ParquetParams /* projection */) }`
-- `pub struct SelectConfig { pub input_format: InputFormat, pub output: OutputMode, pub compression: Compression, pub scan_range: Option<(u64, Option<u64>)>, pub request_progress: bool, pub cont: ContPolicy, pub size: Option<u64>, pub max_parquet_bytes: u64 }` — `max_parquet_bytes` default 256 MiB (review 2026-09-05).
+- `pub struct SelectConfig { pub input_format: InputFormat, pub output: OutputMode, pub compression: Compression, pub scan_range: Option<ScanRange>, pub request_progress: bool, pub cont: ContPolicy, pub max_parquet_bytes: u64 }` — `scan_range` is the **resolved** window (`end`-only `start = size - end` is the server's job, Task 13); no `size` field (removed in the review 2026-09-05 — write-only, the op resolves against `info.size`); `max_parquet_bytes` default 256 MiB (review 2026-09-05).
 - `pub struct ContPolicy { pub idle: Option<Duration>, pub every_n: Option<usize> }` — defaults `Some(5s)`, `Some(4096)` (grilling Q3 spec).
-- `pub fn select_iter(plan: QueryPlan, config: SelectConfig, input: Box<dyn std::io::Read + Send>) -> impl Iterator<Item = Result<SelectEvent, SelectError>>` — a hand-written state-machine `Iterator`; **no async anywhere in the crate** (review 2026-09-05). Pipeline per `next()` pull: `decompressed` → `RangeFilter` → per-format reader → engine next/finish → serialize → buffer:
+- `pub fn select_iter(plan: QueryPlan, config: SelectConfig, input: Box<dyn std::io::Read + Send>) -> impl Iterator<Item = Result<SelectEvent, Error>>` — a hand-written state-machine `Iterator`; **no async anywhere in the crate** (review 2026-09-05). Pipeline per `next()` pull: `decompressed` → `RangeFilter` → per-format reader → engine next/finish → serialize → buffer — the parquet arm's whole-object slurp checks `max_parquet_bytes` *while* reading (`Read::take(max+1)`, review 2026-09-06b R14: a plain `read_to_end` slurps the object before the check, defense in name only):
   - Flush `Records` when buffer ≥ 1 MB, or when appending a record would push past 1 MB (flush first, single record > 1 MB → `TooLarge`).
   - Counters at named call sites (spec Decisions, review 2026-09-05): `bytes_scanned` += bytes consumed from the reader; `bytes_processed` += raw record payload byte length handed to the engine; `bytes_returned` += serialized bytes. Progress when `request_progress` and ≥1s elapsed or ≥1MB scanned since the last Progress (grilling Q2) — checked at emit points only (pull-driven timing, documented deviation).
   - Cont: every `every_n` records, and if ≥`idle` (5s) since the last emitted event.
@@ -501,7 +505,8 @@ pub(crate) async fn op_select_object_content(
 ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
     Self::require_cap(self.caps.select, "SelectObjectContent")?;
     // Concurrency cap (review 2026-09-05 #4): admission via a Semaphore (default 4; the permit is
-    // held for the whole streaming response — acquire_owned, drop on stream end).
+    // held for the whole streaming response — acquire_owned, drop on stream end). Acquired AFTER
+    // `build_config` (review 2026-09-06b R9): invalid requests must not momentarily hold slots.
     let permit = SELECT_SEMAPHORE.clone().acquire_owned().await.map_err(...)?;
     let bucket = self.bucket(req.input.bucket)?;
     let key = self.key(req.input.key)?;
@@ -526,7 +531,9 @@ pub(crate) async fn op_select_object_content(
     //    tokio::spawn(async move { pump body stream into tx (drop on stream end) });  // forwarder, backpressure
     //    let input = Box::new(ChannelReader { rx });           // std::io::Read over rx.blocking_recv() (blocking thread only)
     //    let engine = async move { ... };                       // see select_iter signature
-    //    tokio::task::spawn_blocking(move || tinio_select::events::select_iter(plan, config, input))  // CPU off the workers
+    //    tokio::task::spawn_blocking(move || { catch_unwind(assert || select_iter(plan, config, input)
+    //        blocking_send loop) ... })   // CPU off the workers; a panic maps to an in-stream
+    //                                     // S3QueryError item, never a silent stream end (review 2026-09-06b R8)
     //    -> results flow into a second mpsc
     // 4. s3s stream = hand-rolled futures::Stream over Receiver::poll_recv (spec §1.1 — no
     //    tokio-stream; review 2026-09-05b), .map(event-mapper).map_err(error-mapper):
@@ -534,8 +541,8 @@ pub(crate) async fn op_select_object_content(
     //    Progress/Stats               -> dto::{ProgressEvent, StatsEvent} from the counters
     //    Cont                         -> dto::SelectObjectContentEvent::Cont(dto::ContinuationEvent)
     //    End                          -> dto::SelectObjectContentEvent::End(dto::EndEvent)
-    //    Err(SelectError::Ambiguous(m))     -> S3Error::with_message(S3ErrorCode::AmbiguousFieldName, m) (real variant, #11)
-    //    Err(SelectError::MissingHeader(m)) -> S3Error::with_message(S3ErrorCode::Custom("MissingHeaderName".into()), m) (in-stream)
+    //    Err(Error::Ambiguous(m))     -> S3Error::with_message(S3ErrorCode::AmbiguousFieldName, m) (real variant, #11)
+    //    Err(Error::MissingHeader(m)) -> S3Error::with_message(S3ErrorCode::Custom("MissingHeaderName".into()), m) (in-stream)
     //    Err(e)                             -> S3Error::with_message(S3ErrorCode::Custom("S3QueryError".into()), e.to_string())
     //    (review 2026-09-05b: S3Error::new takes only the code — the message form is with_message;
     //    Custom's payload is a ByteString, so "..".into() — a b".." byte literal does not coerce)
@@ -632,7 +639,7 @@ Feature: S3 Select over objects
 
 - **Spec coverage:** §1 crate/modules ↔ Tasks 1–12; §2 server ↔ Task 13; §3 errors ↔ Task 3 (parse) + 5–7 (runtime) + 13 (mapping); §4 tests ↔ per-task + 14/15; phases ↔ task order (readers → engine → serializers → assembly, respecting dependencies: `events` assembly sits after all reader tasks per grilling Q1).
 - **Grilling (plan round):** Q1 reorder ✓ (Task 12 after all readers), Q2 in-stream unified `Custom("S3QueryError")` ✓ (Global Constraints + Task 13), Q3 `RawNumber` passthrough ✓ (Task 2 enum + Task 9 raw-number test + Task 8 render), Q4 ASNEEDED default ✓ (Task 8), Q5 per-task commits ✓.
-- **External review 2026-09-05 applied (full report):** #1 sync/async bridge ✓ (§1.1 + Tasks 1/10/12/13, `ChannelReader`/`spawn_blocking`/bounded mpsc, cross-chunk regression in Task 13 stream tests), #2 Custom→500 ✓ (`set_status_code(BAD_REQUEST)`, Task 13), #3 input-record 1 MB cap ✓ (Tasks 4/9/12 + `Format` message), #4 worker starvation ✓ (`spawn_blocking` + semaphore cap, Task 13), #5 LIKE O(n·m) ✓ (Task 6 + 256 KiB expression cap, Task 3), #6 ScanRange validation set ✓ (Task 13 + parquet+scan rejection), #7 defaults + AllowQuoted deviation ✓ (Global Constraints/Tasks 4/13), #8 header errors in-stream ✓ (spec §3, Task 13 mapping), #9 sqlparser 0.57 AST vocabulary ✓ (Tasks 3/5/9 + Global Constraints), #10 split-record test contradiction ✓ (Task 12 tests), #11 real `AmbiguousFieldName` variant ✓ (Global Constraints + Task 13), #12 BigDecimal leftover ✓ (spec Grilling Q5), #13 `time` dep + Task 10 rewording ✓ (Task 1 manifest, Task 10), #14 `preserve_order` + JSON key order ✓ (Task 1 manifest, spec `SELECT *` matrix).
-- **External review 2026-09-05b applied:** manifest/feature wiring (workspace-dep `optional` removed per RFC 2906; the crate declares `parquet = { workspace = true, optional = true }` — Task 1), alias-rule placement (parse accepts bare-expression projections; the server enforces for JSON output only — Tasks 3/13), `IS [NOT] MISSING` pre-processor rewrite + MISSING eval arms (Tasks 3/5/9), parquet `ChunkReader` signature (`Cursor<Vec<u8>>`, no `bytes` — Task 11), `S3Error` constructor (`with_message`, `ByteString` payloads — Tasks 1/13), sqlparser AST shape (`CompoundFieldAccess { root, access_chain }` — Global Constraints), size source (`GetObjectResult.info.size`, one round trip, no `head_object` — Global Constraints/Task 13), tokio-stream removal (hand-rolled `futures::Stream` — Global Constraints/Task 13), eval coverage nits (IsNot* arms, negated flags, numeric unary minus/plus, ILIKE unsupported, Decimal JSON rendering, `AggCol` field fix — Tasks 5–8).
-- **Placeholders:** none — the soft spots flagged are executor facts ("confirm at implementation" in Global Constraints): exact `testutil` helper names, e2e step wiring, `parquet` 56.x pin, `dto` Default impls. They are lookup tasks, not design gaps.
-- **Type consistency:** `SelectError`/`SelectEvent`/`SelectConfig`/`OutRow`/`Record`/`Value` names consistent across every task; engine API `next`/`finish` consistent with the events adapter; `Compression`/`InputFormat` enum names consistent between Tasks 10/12; `Value::Json` defined once (Task 2), populated (Task 11), rendered/errored (Task 8); `select_iter` name consistent between spec §1 and Tasks 12/13; `ChannelReader`/bridge terms consistent across spec §1.1 and Task 13.
+- **External review 2026-09-05 applied (full report):** #1 sync/async bridge ✓ (§1.1 + Tasks 1/10/12/13, `ChannelReader`/`spawn_blocking`/bounded mpsc, cross-chunk regression in Task 13 stream tests), #2 Custom→500 ✓ (`set_status_code(BAD_REQUEST)`, Task 13), #3 input-record 1 MB cap ✓ (Tasks 4/9/12 + `Format` message), #4 worker starvation ✓ (`spawn_blocking` + semaphore cap, Task 13), #5 LIKE O(n·m) ✓ (Task 6 + 256 KiB expression cap, Task 3), #6 ScanRange validation set ✓ (Task 13 + parquet+scan rejection), #7 defaults + AllowQuoted deviation ✓ (Global Constraints/Tasks 4/13), #8 header errors in-stream ✓ (spec §3, Task 13 mapping), #9 sqlparser 0.62 AST vocabulary ✓ (Tasks 3/5/9 + Global Constraints), #10 split-record test contradiction ✓ (Task 12 tests), #11 real `AmbiguousFieldName` variant ✓ (Global Constraints + Task 13), #12 BigDecimal leftover ✓ (spec Grilling Q5), #13 `time` dep + Task 10 rewording ✓ (Task 1 manifest, Task 10), #14 `preserve_order` + JSON key order ✓ (Task 1 manifest, spec `SELECT *` matrix).
+- **External review 2026-09-05b applied:** manifest/feature wiring (workspace-dep `optional` removed per RFC 2906; the crate declares `parquet = { workspace = true, optional = true }` — Task 1), alias-rule placement (parse accepts bare-expression projections; the server enforces for JSON output only — Tasks 3/13), `IS [NOT] MISSING` pre-processor rewrite + MISSING eval arms (Tasks 3/5/9), parquet `ChunkReader` signature (`Cursor<Vec<u8>>`; `bytes` optional, parquet-only — Task 11, superseded by review 2026-09-05), `S3Error` constructor (`with_message`, `ByteString` payloads — Tasks 1/13), sqlparser AST shape (`CompoundFieldAccess { root, access_chain }` — Global Constraints), size source (`GetObjectResult.info.size`, one round trip, no `head_object` — Global Constraints/Task 13), tokio-stream removal (hand-rolled `futures::Stream` — Global Constraints/Task 13), eval coverage nits (IsNot* arms, negated flags, numeric unary minus/plus, ILIKE unsupported, Decimal JSON rendering, `AggCol` field fix — Tasks 5–8).
+- **Placeholders:** none — the soft spots flagged are executor facts ("confirm at implementation" in Global Constraints): exact `testutil` helper names, e2e step wiring, `parquet` 59.x pin, `dto` Default impls. They are lookup tasks, not design gaps.
+- **Type consistency:** `Error`/`SelectEvent`/`SelectConfig`/`OutRow`/`Record`/`Value` names consistent across every task; engine API `next`/`finish` consistent with the events adapter; `Compression`/`InputFormat` enum names consistent between Tasks 10/12; `Value::Json` defined once (Task 2), populated (Task 11), rendered/errored (Task 8); `select_iter` name consistent between spec §1 and Tasks 12/13; `ChannelReader`/bridge terms consistent across spec §1.1 and Task 13.

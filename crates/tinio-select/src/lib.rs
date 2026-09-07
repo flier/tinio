@@ -5,11 +5,14 @@
 //! events capped at 1 MB (the async bridge lives in tinio-server).
 //! `Parse`/`Unsupported` are request-level errors the server maps to 400
 //! before streaming; the rest surface as in-stream error items — see
-//! `error::SelectError` and
+//! `error::Error` and
 //! `docs/superpowers/specs/2026-09-04-select-object-content-design.md`.
 
+extern crate csv as _csv;
+
+pub mod csv;
 pub mod engine;
-pub mod error;
+mod error;
 pub mod events;
 pub mod json;
 pub mod output;
@@ -19,4 +22,4 @@ pub mod record;
 pub mod row;
 pub mod sql;
 
-pub use error::SelectError;
+pub use self::error::Error;

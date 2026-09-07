@@ -18,29 +18,38 @@
 //! errors `TooLarge` instead and no `Stats`/`End` follow. No async
 //! anywhere — the async bridge is tinio-server's job (spec §1.1).
 
-use std::cell::Cell;
-use std::collections::VecDeque;
-use std::io::Read;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
-
 #[cfg(feature = "parquet")]
 use std::io::Cursor;
-
-use crate::engine::Engine;
-use crate::json::{JsonReader, JsonType};
-use crate::output::{serialize_row, OutputMode};
-use crate::record::{
-    decompressed, Compression, CsvHeader, CsvParams, CsvReader, RangeFilter, RecordReader,
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    io::Read,
+    rc::Rc,
+    time::{Duration, Instant},
 };
-use crate::row::{display, Field, Record};
-use crate::sql::QueryPlan;
-use crate::SelectError;
 
 #[cfg(feature = "parquet")]
 use crate::parquet::ParquetReader;
 #[cfg(feature = "parquet")]
 use crate::sql::referenced_columns;
+use crate::{
+    csv,
+    engine::Engine,
+    error::Error,
+    json,
+    output::{OutputMode, serialize_row},
+    record::{Compression, RangeFilter, RecordReader, ScanRange, decompressed},
+    row::{Field, Record, Value, display},
+    sql::QueryPlan,
+};
+
+/// The three stream counters carried by `Progress` and `Stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteCounters {
+    pub bytes_scanned: u64,
+    pub bytes_processed: u64,
+    pub bytes_returned: u64,
+}
 
 /// One stream item, format-agnostic — the server maps these to s3s events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,17 +57,9 @@ pub enum SelectEvent {
     /// Whole serialized output records packed at record boundaries (≤ 1 MB).
     Records(Vec<u8>),
     /// Cadence report; only when `request_progress` was set.
-    Progress {
-        bytes_scanned: u64,
-        bytes_processed: u64,
-        bytes_returned: u64,
-    },
+    Progress(ByteCounters),
     /// EOF summary; always emitted exactly once.
-    Stats {
-        bytes_scanned: u64,
-        bytes_processed: u64,
-        bytes_returned: u64,
-    },
+    Stats(ByteCounters),
     /// Connection keepalive per the `ContPolicy`.
     Cont,
     /// Last item, always after `Stats`.
@@ -68,15 +69,9 @@ pub enum SelectEvent {
 /// Input framing (spec §1: CSV / JSON / parquet).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputFormat {
-    Csv(CsvParams),
-    Json(JsonParams),
+    Csv(csv::Params),
+    Json(json::Params),
     Parquet(ParquetParams),
-}
-
-/// JSON input options (S3 Select `InputSerialization.JSON`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JsonParams {
-    pub ty: JsonType,
 }
 
 /// Parquet input options: the SELECT/WHERE column name set for projection
@@ -114,17 +109,14 @@ pub const MAX_PARQUET_BYTES: u64 = 256 * 1024 * 1024;
 pub struct SelectConfig {
     pub input_format: InputFormat,
     pub output: OutputMode,
-    pub compression: Compression,
+    pub compression: Option<Compression>,
     /// ScanRange window (resolved, validated by the server): a record counts
-    /// when its first byte falls in `[start, end]`; inner `None` = no upper
-    /// bound. `end`-only resolution (`start = size - end`) is the caller's
-    /// (it owns the object size, R3 — this tuple is the resolved window).
-    pub scan_range: Option<(u64, Option<u64>)>,
+    /// when its first byte falls in `[start, end]`; `end = None` = no upper
+    /// bound. `end`-only resolution (`start = size - end`) is the caller's.
+    pub scan_range: Option<ScanRange>,
     /// RequestProgress — `Progress` cadence 1 s / 1 MB (grilling Q2).
     pub request_progress: bool,
     pub cont: ContPolicy,
-    /// Stored-object size — the caller's source for ScanRange arithmetic.
-    pub size: Option<u64>,
     pub max_parquet_bytes: u64,
 }
 
@@ -132,21 +124,20 @@ impl Default for SelectConfig {
     fn default() -> Self {
         Self {
             // AWS documented defaults for unset input fields (review 2026-09-05).
-            input_format: InputFormat::Csv(CsvParams {
+            input_format: InputFormat::Csv(csv::Params {
                 field_delimiter: b',',
                 record_delimiter: b'\n',
                 quote: b'"',
                 escape: b'"',
                 comments: None,
-                header: CsvHeader::None_,
+                header: None,
                 allow_quoted_record_delimiter: true,
             }),
             output: OutputMode::Csv(Default::default()),
-            compression: Compression::None_,
+            compression: None,
             scan_range: None,
             request_progress: false,
             cont: ContPolicy::default(),
-            size: None,
             max_parquet_bytes: MAX_PARQUET_BYTES,
         }
     }
@@ -161,7 +152,7 @@ pub fn select_iter(
     plan: QueryPlan,
     config: SelectConfig,
     input: Box<dyn Read + Send>,
-) -> impl Iterator<Item = Result<SelectEvent, SelectError>> {
+) -> impl Iterator<Item = Result<SelectEvent, Error>> {
     SelectIter::new(plan, config, input)
 }
 
@@ -187,62 +178,240 @@ impl<R: Read> Read for CountingRead<R> {
     }
 }
 
-/// The adapter's state machine. `next()` pumps records into the 1 MB output
-/// buffer and drains an internal queue of events to emit; every event is
-/// delivered in order: `Progress` (cadence) → `Records` → `Cont` (policy).
-struct SelectIter {
-    reader: Option<Box<dyn RecordReader>>,
-    engine: Engine,
-    mode: OutputMode,
-    buffer: Vec<u8>,
+/// How `processed` advances: closed uncompressed record spans (CSV/JSON)
+/// or decoded field-text totals (parquet — its reader has no offsets).
+enum CountMode {
+    Spans { open: Option<u64> },
+    RowText,
+}
+
+/// The three stream counters plus payload accounting (`Progress` / `Stats`).
+struct Tally {
     scanned: Scanned,
     processed: u64,
     returned: u64,
-    /// Uncompressed start of the record whose payload span is still open.
-    open_start: Option<u64>,
-    /// Record-span counting applies to CSV/JSON; parquet rows count
-    /// per-row text instead (its reader has no offsets).
-    use_spans: bool,
+    mode: CountMode,
+}
+
+impl Tally {
+    fn new(scanned: Scanned, spans: bool) -> Self {
+        Self {
+            scanned,
+            processed: 0,
+            returned: 0,
+            mode: if spans {
+                CountMode::Spans { open: None }
+            } else {
+                CountMode::RowText
+            },
+        }
+    }
+
+    fn snapshot(&self) -> ByteCounters {
+        ByteCounters {
+            bytes_scanned: self.scanned.get(),
+            bytes_processed: self.processed,
+            bytes_returned: self.returned,
+        }
+    }
+
+    fn scanned(&self) -> u64 {
+        self.scanned.get()
+    }
+
+    fn spans(&self) -> bool {
+        matches!(self.mode, CountMode::Spans { .. })
+    }
+
+    /// Close the previous record's span at `at` (CSV/JSON) or add the
+    /// parquet row's decoded text; dropped pre-range records sit before
+    /// the first open start and never become processed.
+    fn account(&mut self, at: u64, rec: &Record) {
+        match (&mut self.mode, rec) {
+            (CountMode::Spans { open }, _) => match *open {
+                Some(prev) => {
+                    self.processed += at.saturating_sub(prev);
+                    *open = Some(at);
+                }
+                None => *open = Some(at),
+            },
+            (CountMode::RowText, Record::Parquet(cols)) => {
+                self.processed += cols
+                    .fields
+                    .iter()
+                    .map(|f| match f {
+                        Field::Present(v) => display(v).len() as u64,
+                        Field::Missing => 0,
+                    })
+                    .sum::<u64>();
+            }
+            (CountMode::RowText, _) => {}
+        }
+    }
+
+    /// EOF close: the past-window stop record's start when `at` is past
+    /// the open span, else the consumed total (full scan / window to EOF).
+    fn close(&mut self, at: u64) {
+        let CountMode::Spans { open } = &mut self.mode else {
+            return;
+        };
+        let Some(start) = open.take() else {
+            return;
+        };
+        let end = if at > start { at } else { self.scanned.get() };
+        self.processed += end.saturating_sub(start);
+    }
+
+    fn add_returned(&mut self, n: u64) {
+        self.returned += n;
+    }
+}
+
+/// Progress (1 s / 1 MB), Cont (`ContPolicy`), silent-scan keepalive (X4).
+struct Cadence {
+    request_progress: bool,
+    last_progress_at: Instant,
+    last_progress_scan: u64,
+    last_keepalive: u64,
     every_n: Option<usize>,
     n_since_cont: usize,
     cont_due: bool,
     idle: Option<Duration>,
-    request_progress: bool,
-    last_progress_at: Instant,
-    last_progress_scan: u64,
     last_emit: Instant,
+}
+
+impl Cadence {
+    fn new(request_progress: bool, cont: ContPolicy, now: Instant) -> Self {
+        Self {
+            request_progress,
+            last_progress_at: now,
+            last_progress_scan: 0,
+            last_keepalive: 0,
+            every_n: cont.every_n,
+            n_since_cont: 0,
+            cont_due: false,
+            idle: cont.idle,
+            last_emit: now,
+        }
+    }
+
+    fn on_record(&mut self) {
+        self.n_since_cont += 1;
+        if let Some(n) = self.every_n
+            && self.n_since_cont >= n
+        {
+            self.n_since_cont = 0;
+            self.cont_due = true;
+        }
+    }
+
+    fn take_progress(&mut self, scanned: u64) -> bool {
+        if !self.request_progress {
+            return false;
+        }
+        if scanned.saturating_sub(self.last_progress_scan) < EVENT_CAP
+            && self.last_progress_at.elapsed() < Duration::from_secs(1)
+        {
+            return false;
+        }
+        self.last_progress_scan = scanned;
+        self.last_progress_at = Instant::now();
+        true
+    }
+
+    fn take_cont(&mut self) -> bool {
+        if self.cont_due {
+            self.cont_due = false;
+            true
+        } else if let Some(idle) = self.idle
+            && self.last_emit.elapsed() >= idle
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Silent-scan 1 MB keepalive. `Some(progress)` = emit Cont, and
+    /// Progress iff the bool is set.
+    fn take_keepalive(&mut self, scanned: u64, quiet: bool) -> Option<bool> {
+        if !quiet || scanned.saturating_sub(self.last_keepalive) < EVENT_CAP {
+            return None;
+        }
+        self.last_keepalive = scanned;
+        let progress = self.request_progress;
+        if progress {
+            self.last_progress_scan = scanned;
+            self.last_progress_at = Instant::now();
+        }
+        Some(progress)
+    }
+
+    fn on_emit(&mut self) {
+        self.last_emit = Instant::now();
+    }
+}
+
+/// Frames yielded by `Packer::stage` — at most two (pending-then-cap).
+struct Staged {
+    frames: Vec<Vec<u8>>,
+    too_large: bool,
+}
+
+/// Whole-record packing into ≤ 1 MB frames. A record never splits.
+struct Packer {
+    buf: Vec<u8>,
+}
+
+impl Packer {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Stage one serialized record. Frames that must leave now come first;
+    /// `too_large` after any pending flush (review 2026-09-05 #10).
+    fn stage(&mut self, bytes: Vec<u8>) -> Staged {
+        let mut staged = Staged {
+            frames: Vec::new(),
+            too_large: false,
+        };
+        if bytes.len() as u64 > EVENT_CAP {
+            if !self.buf.is_empty() {
+                staged.frames.push(std::mem::take(&mut self.buf));
+            }
+            staged.too_large = true;
+            return staged;
+        }
+        if bytes.len() as u64 + self.buf.len() as u64 > EVENT_CAP {
+            staged.frames.push(std::mem::take(&mut self.buf));
+        }
+        self.buf.extend_from_slice(&bytes);
+        if self.buf.len() as u64 >= EVENT_CAP {
+            staged.frames.push(std::mem::take(&mut self.buf));
+        }
+        staged
+    }
+
+    fn take(&mut self) -> Option<Vec<u8>> {
+        (!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf))
+    }
+}
+
+/// Delivery queue + stream lifecycle (error / completed / done).
+struct Outbox {
     queue: VecDeque<SelectEvent>,
-    error: Option<SelectError>,
+    error: Option<Error>,
     completed: bool,
     done: bool,
 }
 
-impl SelectIter {
-    fn new(plan: QueryPlan, config: SelectConfig, input: Box<dyn Read + Send>) -> Self {
-        let scanned = Rc::new(Cell::new(0));
-        let (reader, error) = match build_reader(&plan, &config, input, scanned.clone()) {
-            Ok(reader) => (Some(reader), None),
-            Err(e) => (None, Some(e)),
-        };
-        let now = Instant::now();
+impl Outbox {
+    fn new(error: Option<Error>) -> Self {
         Self {
-            reader,
-            engine: Engine::new(plan),
-            mode: config.output,
-            buffer: Vec::new(),
-            scanned,
-            processed: 0,
-            returned: 0,
-            open_start: None,
-            use_spans: !matches!(config.input_format, InputFormat::Parquet(_)),
-            every_n: config.cont.every_n,
-            n_since_cont: 0,
-            cont_due: false,
-            idle: config.cont.idle,
-            request_progress: config.request_progress,
-            last_progress_at: now,
-            last_progress_scan: 0,
-            last_emit: now,
             queue: VecDeque::new(),
             error,
             completed: false,
@@ -250,59 +419,162 @@ impl SelectIter {
         }
     }
 
+    fn push(&mut self, ev: SelectEvent) {
+        self.queue.push_back(ev);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn fail(&mut self, e: Error) {
+        self.error = Some(e);
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    fn is_completed(&self) -> bool {
+        self.completed
+    }
+
+    fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn needs_pump(&self) -> bool {
+        !self.done && self.queue.is_empty() && self.error.is_none() && !self.completed
+    }
+
+    fn pop(&mut self) -> Option<SelectEvent> {
+        self.queue.pop_front()
+    }
+
+    fn take_error(&mut self) -> Option<Error> {
+        let e = self.error.take()?;
+        self.done = true;
+        Some(e)
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+    }
+}
+
+/// The adapter's state machine. Pipeline (reader / engine / mode) plus
+/// composed helpers: payload `Tally`, emit `Cadence`, record `Packer`,
+/// delivery `Outbox`. `next()` pumps records into the packer and drains
+/// the outbox; every event is delivered in order: `Progress` (cadence) →
+/// `Records` → `Cont` (policy).
+struct SelectIter {
+    reader: Option<Box<dyn RecordReader>>,
+    engine: Engine,
+    mode: OutputMode,
+    tally: Tally,
+    cadence: Cadence,
+    packer: Packer,
+    outbox: Outbox,
+}
+
+impl SelectIter {
+    fn new(plan: QueryPlan, config: SelectConfig, input: Box<dyn Read + Send>) -> Self {
+        let SelectConfig {
+            input_format,
+            output,
+            compression,
+            scan_range,
+            request_progress,
+            cont,
+            max_parquet_bytes,
+        } = config;
+        let use_spans = !matches!(input_format, InputFormat::Parquet(_));
+        let scanned = Rc::new(Cell::new(0));
+        let (reader, error) = match build_reader(
+            &plan,
+            input_format,
+            compression,
+            scan_range,
+            max_parquet_bytes,
+            input,
+            scanned.clone(),
+        ) {
+            Ok(reader) => (Some(reader), None),
+            Err(e) => (None, Some(e)),
+        };
+        let now = Instant::now();
+        Self {
+            reader,
+            engine: Engine::new(plan),
+            mode: output,
+            tally: Tally::new(scanned, use_spans),
+            cadence: Cadence::new(request_progress, cont, now),
+            packer: Packer::new(),
+            outbox: Outbox::new(error),
+        }
+    }
+
     fn pump(&mut self) {
-        if self.error.is_some() || self.completed {
+        if self.outbox.has_error() || self.outbox.is_completed() {
             return;
         }
         if let Err(e) = self.step() {
-            self.error = Some(e);
+            self.outbox.fail(e);
         }
     }
 
     /// One record cycle: pull a record, account its payload, evaluate,
-    /// serialize into the buffer, flush at the 1 MB boundary.
-    fn step(&mut self) -> Result<(), SelectError> {
+    /// serialize into the packer, flush at the 1 MB boundary.
+    fn step(&mut self) -> Result<(), Error> {
+        // X1: a reached LIMIT stops the scan NOW (jump to the eof path) —
+        // pulling `Ok(None)` as if filtered would scroll the whole object.
+        if self.engine.limit_reached() {
+            return self.eof(0);
+        }
         let (item, at) = {
             let reader = self.reader.as_mut().expect("reader present");
             (reader.next()?, reader.last_record_start())
         };
         match item {
             Some(rec) => {
-                // Payload spans close when the next record's start advances;
-                // the final span closes in `eof`. Dropped pre-range records
-                // sit before `open_start` — counted as scanned only, never
-                // processed; the past-window stop record is excluded by the
-                // `at`-close in `eof`.
-                if self.use_spans {
-                    match self.open_start {
-                        Some(prev) => {
-                            self.processed += at.saturating_sub(prev);
-                            self.open_start = Some(at);
-                        }
-                        None => self.open_start = Some(at),
-                    }
-                }
-                if let Record::Parquet(fields, _) = &rec {
-                    // "row bytes before serialization" = the decoded field
-                    // text total — parquet readers carry no offsets.
-                    self.processed += fields
-                        .iter()
-                        .map(|f| match f {
-                            Field::Present(v) => display(v).len() as u64,
-                            Field::Missing => 0,
-                        })
-                        .sum::<u64>();
-                }
-                self.n_since_cont += 1;
-                if let Some(n) = self.every_n
-                    && self.n_since_cont >= n
-                {
-                    self.n_since_cont = 0;
-                    self.cont_due = true;
-                }
+                self.tally.account(at, &rec);
+                self.cadence.on_record();
                 if let Some(row) = self.engine.next(rec)? {
+                    // Parquet nested (list/struct → `Value::Json`) under CSV
+                    // output is the nested-column error (grilling Q10); JSON
+                    // nested renders as the compact-cell (SELECT * matrix).
+                    if !self.tally.spans()
+                        && matches!(self.mode, OutputMode::Csv(_))
+                        && row
+                            .vals
+                            .iter()
+                            .any(|f| matches!(f, Field::Present(Value::Json(_))))
+                    {
+                        return Err(Error::NestedCsv);
+                    }
                     let bytes = serialize_row(&self.mode, &row)?;
                     self.buffer_row(bytes)?;
+                }
+                // X4: a scan that matches nothing streams nothing — the
+                // client sees a silent connection and (since `blocking_send`
+                // is the only cancellation probe) a disconnect goes unnoticed
+                // until EOF. A keepalive cadence fires every scanned MB even
+                // with an empty buffer — the client gets early frames and
+                // the producer probes the out channel. Gated on both queues
+                // being empty so it never interleaves with a real flush.
+                if let Some(progress) = self.cadence.take_keepalive(
+                    self.tally.scanned(),
+                    self.packer.is_empty() && self.outbox.is_empty(),
+                ) {
+                    if progress {
+                        self.outbox
+                            .push(SelectEvent::Progress(self.tally.snapshot()));
+                    }
+                    self.outbox.push(SelectEvent::Cont);
                 }
                 Ok(())
             }
@@ -310,51 +582,31 @@ impl SelectIter {
         }
     }
 
-    /// One serialized row into the buffer. Flush ordering (review
+    /// One serialized row into the packer. Flush ordering (review
     /// 2026-09-05 #10): the pending buffer flushes before an over-cap record
     /// errors `TooLarge` — records never split, never span events.
-    fn buffer_row(&mut self, bytes: Vec<u8>) -> Result<(), SelectError> {
-        if bytes.len() as u64 > EVENT_CAP {
-            if !self.buffer.is_empty() {
-                self.flush();
-            }
-            return Err(SelectError::TooLarge);
+    fn buffer_row(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
+        let staged = self.packer.stage(bytes);
+        for frame in staged.frames {
+            self.flush_frame(frame);
         }
-        if bytes.len() as u64 + self.buffer.len() as u64 > EVENT_CAP {
-            self.flush();
+        if staged.too_large {
+            Err(Error::TooLarge)
+        } else {
+            Ok(())
         }
-        self.buffer.extend_from_slice(&bytes);
-        if self.buffer.len() as u64 >= EVENT_CAP {
-            self.flush();
-        }
-        Ok(())
     }
 
     /// Emit-point flush: gather cadence events around the `Records` event.
-    fn flush(&mut self) {
-        let bytes = std::mem::take(&mut self.buffer);
-        self.returned += bytes.len() as u64;
-        let scanned = self.scanned.get();
-        if self.request_progress
-            && (scanned.saturating_sub(self.last_progress_scan) >= EVENT_CAP
-                || self.last_progress_at.elapsed() >= Duration::from_secs(1))
-        {
-            self.queue.push_back(SelectEvent::Progress {
-                bytes_scanned: scanned,
-                bytes_processed: self.processed,
-                bytes_returned: self.returned,
-            });
-            self.last_progress_scan = scanned;
-            self.last_progress_at = Instant::now();
+    fn flush_frame(&mut self, bytes: Vec<u8>) {
+        self.tally.add_returned(bytes.len() as u64);
+        if self.cadence.take_progress(self.tally.scanned()) {
+            self.outbox
+                .push(SelectEvent::Progress(self.tally.snapshot()));
         }
-        self.queue.push_back(SelectEvent::Records(bytes));
-        if self.cont_due {
-            self.cont_due = false;
-            self.queue.push_back(SelectEvent::Cont);
-        } else if let Some(idle) = self.idle
-            && self.last_emit.elapsed() >= idle
-        {
-            self.queue.push_back(SelectEvent::Cont);
+        self.outbox.push(SelectEvent::Records(bytes));
+        if self.cadence.take_cont() {
+            self.outbox.push(SelectEvent::Cont);
         }
     }
 
@@ -367,51 +619,42 @@ impl SelectIter {
     /// record's own start — close at `at` in the first case (the consumed
     /// total would include the stop record), at the consumed total otherwise
     /// (full scan / window run to EOF: the span ends at the consumed end).
-    fn eof(&mut self, at: u64) -> Result<(), SelectError> {
-        self.completed = true;
-        if self.use_spans
-            && let Some(start) = self.open_start.take()
-        {
-            let end = if at > start { at } else { self.scanned.get() };
-            self.processed += end.saturating_sub(start);
-        }
+    fn eof(&mut self, at: u64) -> Result<(), Error> {
+        self.outbox.complete();
+        self.tally.close(at);
         if let Some(row) = self.engine.finish()? {
             let bytes = serialize_row(&self.mode, &row)?;
             self.buffer_row(bytes)?;
         }
-        if !self.buffer.is_empty() {
-            self.flush();
+        if let Some(bytes) = self.packer.take() {
+            self.flush_frame(bytes);
         }
-        self.queue.push_back(SelectEvent::Stats {
-            bytes_scanned: self.scanned.get(),
-            bytes_processed: self.processed,
-            bytes_returned: self.returned,
-        });
-        self.queue.push_back(SelectEvent::End);
+        self.outbox
+            .push(SelectEvent::Stats(self.tally.snapshot()));
+        self.outbox.push(SelectEvent::End);
         Ok(())
     }
 }
 
 impl Iterator for SelectIter {
-    type Item = Result<SelectEvent, SelectError>;
+    type Item = Result<SelectEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.outbox.is_done() {
             return None;
         }
-        while self.queue.is_empty() && self.error.is_none() && !self.completed {
+        while self.outbox.needs_pump() {
             self.pump();
         }
-        if let Some(ev) = self.queue.pop_front() {
+        if let Some(ev) = self.outbox.pop() {
             // Clock of the last delivered event — the `Cont` idle window.
-            self.last_emit = Instant::now();
+            self.cadence.on_emit();
             return Some(Ok(ev));
         }
-        if let Some(e) = self.error.take() {
-            self.done = true;
+        if let Some(e) = self.outbox.take_error() {
             return Some(Err(e));
         }
-        self.done = true;
+        self.outbox.finish();
         None
     }
 }
@@ -421,56 +664,66 @@ impl Iterator for SelectIter {
 /// source sits between the decoder and the reader.
 fn build_reader(
     plan: &QueryPlan,
-    config: &SelectConfig,
+    input_format: InputFormat,
+    compression: Option<Compression>,
+    scan_range: Option<ScanRange>,
+    max_parquet_bytes: u64,
     input: Box<dyn Read + Send>,
     scanned: Scanned,
-) -> Result<Box<dyn RecordReader>, SelectError> {
-    fn count(inner: Box<dyn Read + Send>, scanned: &Scanned) -> CountingRead<Box<dyn Read + Send>> {
+) -> Result<Box<dyn RecordReader>, Error> {
+    fn count(inner: Box<dyn Read + Send>, scanned: Scanned) -> CountingRead<Box<dyn Read + Send>> {
         CountingRead {
             inner,
-            count: scanned.clone(),
+            count: scanned,
         }
     }
-    let base: Box<dyn RecordReader> = match &config.input_format {
-        InputFormat::Csv(params) => Box::new(CsvReader::new(
-            count(decompressed(config.compression, input), &scanned),
-            params.clone(),
+    let base: Box<dyn RecordReader> = match input_format {
+        InputFormat::Csv(params) => Box::new(csv::Reader::new(
+            count(decompressed(compression, input), scanned),
+            params,
         )),
-        InputFormat::Json(params) => Box::new(JsonReader::new(
-            count(decompressed(config.compression, input), &scanned),
-            params.ty,
+        InputFormat::Json(params) => Box::new(json::Reader::new(
+            count(decompressed(compression, input), scanned),
+            params,
             &plan.from,
         )),
         #[cfg(feature = "parquet")]
         InputFormat::Parquet(params) => {
             // Parquet: whole-object slurp — no seek in the storage path; the
             // bound is checked request-level by the server and again here.
-            let mut source = count(input, &scanned);
+            // R14: the check runs WHILE reading (`take` caps at max+1) — a
+            // plain `read_to_end` would slurp the whole object before the
+            // bound, defense in name only (the server's 400 stays the real
+            // guard, this is depth).
+            let source = count(input, scanned);
             let mut buf = Vec::new();
-            source.read_to_end(&mut buf)?;
-            if buf.len() as u64 > config.max_parquet_bytes {
-                return Err(SelectError::ParquetTooLarge);
+            source
+                .take(max_parquet_bytes + 1)
+                .read_to_end(&mut buf)?;
+            if buf.len() as u64 > max_parquet_bytes {
+                return Err(Error::ParquetTooLarge);
             }
             let projection = if params.projection.is_empty() {
                 referenced_columns(plan)
             } else {
-                params.projection.clone()
+                params.projection
             };
             Box::new(ParquetReader::new(
                 Cursor::new(buf),
                 projection,
-                config.max_parquet_bytes,
+                max_parquet_bytes,
             )?)
         }
         #[cfg(not(feature = "parquet"))]
         InputFormat::Parquet(_) => {
-            return Err(SelectError::Unsupported(
+            let _ = max_parquet_bytes;
+            return Err(Error::Unsupported(
                 "parquet input requires the parquet feature".into(),
             ));
         }
     };
-    Ok(match config.scan_range {
-        Some((start, end)) => Box::new(RangeFilter::new(base, start, end)),
+    Ok(match scan_range {
+        Some(range) => Box::new(RangeFilter::new(base, range)),
         None => base,
     })
 }
@@ -479,17 +732,18 @@ fn build_reader(
 mod tests {
     use std::io::Cursor;
 
-    use crate::json::JsonType;
-    use crate::output::JsonOutputParams;
-    use crate::record::CsvHeader;
-    use crate::sql::parse;
-
     use super::*;
+    use std::io::Write as _;
+    use crate::{
+        csv::{Header, Params},
+        output::JsonOutputParams,
+        sql::parse,
+    };
 
-    /// AWS-ish CSV params (`,`/`\n`/`"`/`"`, no comments) — the record.rs
+    /// AWS-ish CSV params (`,`/`\n`/`"`/`"`, no comments) — the csv
     /// test-helper shape for the given header mode.
-    fn params(header: CsvHeader) -> CsvParams {
-        CsvParams {
+    fn params(header: Option<Header>) -> Params {
+        Params {
             field_delimiter: b',',
             record_delimiter: b'\n',
             quote: b'"',
@@ -501,7 +755,7 @@ mod tests {
     }
 
     /// The whole event item list for `sql` over `input`.
-    fn run(sql: &str, config: SelectConfig, input: &[u8]) -> Vec<Result<SelectEvent, SelectError>> {
+    fn run(sql: &str, config: SelectConfig, input: &[u8]) -> Vec<Result<SelectEvent, Error>> {
         let plan = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         select_iter(plan, config, Box::new(Cursor::new(input.to_vec()))).collect()
     }
@@ -516,19 +770,23 @@ mod tests {
     #[test]
     fn three_rows_streams_records_stats_end() {
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             ..Default::default()
         };
-        let events = run("SELECT * FROM S3Object", config, b"1,alice\n2,bob\n3,carol\n");
+        let events = run(
+            "SELECT * FROM S3Object",
+            config,
+            b"1,alice\n2,bob\n3,carol\n",
+        );
         assert_eq!(
             events,
             vec![
                 Ok(SelectEvent::Records(b"1,alice\n2,bob\n3,carol\n".to_vec())),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 22,
                     bytes_processed: 22,
                     bytes_returned: 22,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -537,18 +795,18 @@ mod tests {
     #[test]
     fn empty_input_stats_zeros_then_end() {
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             ..Default::default()
         };
         let events = run("SELECT * FROM S3Object", config, b"");
         assert_eq!(
             events,
             vec![
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 0,
                     bytes_processed: 0,
                     bytes_returned: 0,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -557,19 +815,23 @@ mod tests {
     #[test]
     fn aggregate_finish_row_lands_before_stats() {
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             ..Default::default()
         };
-        let events = run("SELECT count(*) FROM S3Object s", config, b"1,alice\n2,bob\n3,carol\n");
+        let events = run(
+            "SELECT count(*) FROM S3Object s",
+            config,
+            b"1,alice\n2,bob\n3,carol\n",
+        );
         assert_eq!(
             events,
             vec![
                 Ok(SelectEvent::Records(b"3\n".to_vec())),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 22,
                     bytes_processed: 22,
                     bytes_returned: 2,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -582,12 +844,12 @@ mod tests {
         let mut input = vec![b'a'; 1024 * 1024 - 2];
         input.push(b'\n');
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             output: OutputMode::Json(JsonOutputParams::default()),
             ..Default::default()
         };
         let events = run("SELECT * FROM S3Object", config, &input);
-        assert_eq!(events, vec![Err(SelectError::TooLarge)]);
+        assert_eq!(events, vec![Err(Error::TooLarge)]);
     }
 
     #[test]
@@ -598,7 +860,7 @@ mod tests {
         input.extend_from_slice(&[b'a'; 1024 * 1024 - 2]);
         input.push(b'\n');
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             output: OutputMode::Json(JsonOutputParams::default()),
             ..Default::default()
         };
@@ -608,7 +870,7 @@ mod tests {
             it.next(),
             Some(Ok(SelectEvent::Records(b"{\"_1\":\"x\"}\n".to_vec())))
         );
-        assert_eq!(it.next(), Some(Err(SelectError::TooLarge)));
+        assert_eq!(it.next(), Some(Err(Error::TooLarge)));
         assert_eq!(it.next(), None);
     }
 
@@ -619,13 +881,13 @@ mod tests {
         let mut input = vec![b'a'; 1024 * 1024];
         input.push(b'\n');
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             ..Default::default()
         };
         let events = run("SELECT * FROM S3Object", config, &input);
         assert_eq!(
             events,
-            vec![Err(SelectError::Format("input record exceeds 1 MB".into()))]
+            vec![Err(Error::Format("input record exceeds 1 MB".into()))]
         );
     }
 
@@ -637,7 +899,7 @@ mod tests {
         input.push(b'\n');
         input.extend_from_slice(b"x\n");
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             ..Default::default()
         };
         let events = run("SELECT * FROM S3Object", config, &input);
@@ -646,11 +908,11 @@ mod tests {
         assert_eq!(events[1], Ok(SelectEvent::Records(b"x\n".to_vec())));
         assert_eq!(
             events[2],
-            Ok(SelectEvent::Stats {
+            Ok(SelectEvent::Stats(ByteCounters {
                 bytes_scanned: 1_048_577,
                 bytes_processed: 1_048_577,
                 bytes_returned: 1_048_577,
-            })
+            }))
         );
         assert_eq!(events[3], Ok(SelectEvent::End));
     }
@@ -666,7 +928,7 @@ mod tests {
             input.push(b'\n');
         }
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             cont: ContPolicy {
                 idle: None,
                 every_n: Some(2),
@@ -681,11 +943,11 @@ mod tests {
                 Ok(SelectEvent::Cont),
                 Ok(SelectEvent::Records(row(600_000))),
                 Ok(SelectEvent::Records(row(600_000))),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 1_800_003,
                     bytes_processed: 1_800_003,
                     bytes_returned: 1_800_003,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -694,7 +956,7 @@ mod tests {
     #[test]
     fn cont_after_idle_emits_following_records() {
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             cont: ContPolicy {
                 idle: Some(Duration::ZERO),
                 every_n: None,
@@ -707,11 +969,11 @@ mod tests {
             vec![
                 Ok(SelectEvent::Records(b"1,alice\n2,bob\n".to_vec())),
                 Ok(SelectEvent::Cont),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 14,
                     bytes_processed: 14,
                     bytes_returned: 14,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -728,7 +990,7 @@ mod tests {
             input.push(b'\n');
         }
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
+            input_format: InputFormat::Csv(params(None)),
             request_progress: true,
             ..Default::default()
         };
@@ -741,18 +1003,18 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                Ok(SelectEvent::Progress {
+                Ok(SelectEvent::Progress(ByteCounters {
                     bytes_scanned: 1_200_003,
                     bytes_processed: 800_002,
                     bytes_returned: 800_002,
-                }),
+                })),
                 Ok(SelectEvent::Records(two)),
                 Ok(SelectEvent::Records(row(400_000))),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 1_200_003,
                     bytes_processed: 1_200_003,
                     bytes_returned: 1_200_003,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -761,7 +1023,9 @@ mod tests {
     #[test]
     fn json_lines_streams_records_stats_end() {
         let config = SelectConfig {
-            input_format: InputFormat::Json(JsonParams { ty: JsonType::Lines }),
+            input_format: InputFormat::Json(json::Params {
+                ty: json::Type::Lines,
+            }),
             output: OutputMode::Json(JsonOutputParams::default()),
             ..Default::default()
         };
@@ -774,11 +1038,152 @@ mod tests {
             events,
             vec![
                 Ok(SelectEvent::Records(b"{\"a\":1}\n{\"b\":2}\n".to_vec())),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 18,
                     bytes_processed: 18,
                     bytes_returned: 16,
-                }),
+                })),
+                Ok(SelectEvent::End),
+            ]
+        );
+    }
+
+    #[test]
+    fn limit_stops_the_scan_before_late_errors() {
+        // X1: LIMIT is an early stop — a record past it (here: one over the
+        // 1 MB input cap) is never pulled, so the stream ends cleanly with
+        // Stats+End instead of erroring on the tail.
+        let mut input = b"1\n".to_vec();
+        input.extend_from_slice(&[b'a'; 1024 * 1024]);
+        input.push(b'\n');
+        let config = SelectConfig {
+            input_format: InputFormat::Csv(params(None)),
+            ..Default::default()
+        };
+        let events = run("SELECT * FROM S3Object s LIMIT 1", config, &input);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], Ok(SelectEvent::Records(b"1\n".to_vec())));
+        assert!(
+            matches!(&events[1], Ok(SelectEvent::Stats(_))),
+            "{events:?}"
+        );
+        assert_eq!(events[2], Ok(SelectEvent::End));
+    }
+
+    #[test]
+    fn silent_scan_emits_keepalive_cont_per_megabyte() {
+        // X4: WHERE matches nothing — the stream still emits a Cont every
+        // scanned MB (gated on both queues empty) so the client is never
+        // silent and the producer probes the out channel mid-scan.
+        let mut input = Vec::new();
+        while input.len() < 1536 * 1024 {
+            input.extend_from_slice(b"0\n");
+        }
+        let config = SelectConfig {
+            input_format: InputFormat::Csv(params(None)),
+            ..Default::default()
+        };
+        let events = run("SELECT * FROM S3Object s WHERE s._1 = '1'", config, &input);
+        let conts = events
+            .iter()
+            .filter(|e| matches!(e, Ok(SelectEvent::Cont)))
+            .count();
+        assert_eq!(conts, 1, "{events:?}");
+        assert_eq!(events.last(), Some(&Ok(SelectEvent::End)));
+    }
+
+    #[test]
+    fn silent_scan_with_progress_emits_progress_then_cont() {
+        // X4 + request_progress: a silent scan emits a Progress frame (first,
+        // per the ordering rule) alongside the Cont every scanned MB.
+        let mut input = Vec::new();
+        while input.len() < 1536 * 1024 {
+            input.extend_from_slice(b"0
+");
+        }
+        let config = SelectConfig {
+            input_format: InputFormat::Csv(params(None)),
+            request_progress: true,
+            ..Default::default()
+        };
+        let events = run("SELECT * FROM S3Object s WHERE s._1 = '1'", config, &input);
+        let progress = events
+            .iter()
+            .filter(|e| matches!(e, Ok(SelectEvent::Progress(_))))
+            .count();
+        let cont = events
+            .iter()
+            .filter(|e| matches!(e, Ok(SelectEvent::Cont)))
+            .count();
+        assert_eq!(progress, 1, "{events:?}");
+        assert_eq!(cont, 1, "{events:?}");
+        let first_extra = events
+            .iter()
+            .find(|e| matches!(e, Ok(SelectEvent::Progress(_) | SelectEvent::Cont)));
+        assert!(
+            matches!(first_extra, Some(Ok(SelectEvent::Progress(_)))),
+            "Progress must precede Cont: {events:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_with_limit_still_emits_one_row() {
+        // Aggregate plans never consult LIMIT (the row is produced at
+        // finish; a positive limit caps the single row, not the input scan).
+        let config = SelectConfig {
+            input_format: InputFormat::Csv(params(None)),
+            ..Default::default()
+        };
+        let events = run("SELECT count(*) FROM S3Object s LIMIT 2", config, b"1
+2
+3
+");
+        assert_eq!(
+            events,
+            vec![
+                Ok(SelectEvent::Records(b"3
+".to_vec())),
+                Ok(SelectEvent::Stats(ByteCounters {
+                    bytes_scanned: 6,
+                    bytes_processed: 6,
+                    bytes_returned: 2,
+                })),
+                Ok(SelectEvent::End),
+            ]
+        );
+    }
+
+    #[test]
+    fn bzip2_json_lines_round_trip() {
+        // Compression x JSON-LINES combination: the JSON reader sits above
+        // the same decoder as CSV.
+        let payload = b"{\"a\": 1}
+{\"b\": 2}
+".to_vec();
+        let mut enc =
+            bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        enc.write_all(&payload).unwrap();
+        let bz = enc.finish().unwrap();
+        let config = SelectConfig {
+            input_format: InputFormat::Json(json::Params {
+                ty: json::Type::Lines,
+            }),
+            output: OutputMode::Json(JsonOutputParams::default()),
+            compression: Some(Compression::Bzip2),
+            ..Default::default()
+        };
+        let events = run("SELECT * FROM S3Object", config, &bz);
+        assert_eq!(
+            events,
+            vec![
+                Ok(SelectEvent::Records(b"{\"a\":1}
+{\"b\":2}
+".to_vec())),
+                Ok(SelectEvent::Stats(ByteCounters {
+                    bytes_scanned: 18,
+                    bytes_processed: 18,
+                    bytes_returned: 16,
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -790,8 +1195,11 @@ mod tests {
         // stops the stream. `bytes_processed` closes the last span at the
         // stop record's start (3 + 3 = 6), never at the consumed total (22).
         let config = SelectConfig {
-            input_format: InputFormat::Csv(params(CsvHeader::None_)),
-            scan_range: Some((13, Some(16))),
+            input_format: InputFormat::Csv(params(None)),
+            scan_range: Some(ScanRange {
+                start: 13,
+                end: Some(16),
+            }),
             ..Default::default()
         };
         let events = run(
@@ -803,11 +1211,11 @@ mod tests {
             events,
             vec![
                 Ok(SelectEvent::Records(b"r1\nr2\n".to_vec())),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 22,
                     bytes_processed: 6,
                     bytes_returned: 6,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
@@ -818,15 +1226,13 @@ mod tests {
     fn parquet_streams_records_stats_end() {
         use std::sync::Arc;
 
-        use arrow::array::{ArrayRef, RecordBatch, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::{
+            array::{ArrayRef, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
         use parquet::arrow::ArrowWriter;
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "name",
-            DataType::Utf8,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from(vec!["alice", "bob"])) as ArrayRef],
@@ -848,14 +1254,99 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                Ok(SelectEvent::Records(b"{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n".to_vec())),
-                Ok(SelectEvent::Stats {
+                Ok(SelectEvent::Records(
+                    b"{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n".to_vec()
+                )),
+                Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: buf.len() as u64,
                     bytes_processed: 8, // "alice" + "bob" row text
                     bytes_returned: 32,
-                }),
+                })),
                 Ok(SelectEvent::End),
             ]
         );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn parquet_over_bound_fires_while_slurping() {
+        // R14: the in-crate bound fires during the buffered read (bounded
+        // memory), not after the whole object is slurped.
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["alice"])) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let config = SelectConfig {
+            input_format: InputFormat::Parquet(ParquetParams {
+                projection: Vec::new(),
+            }),
+            max_parquet_bytes: 1,
+            ..Default::default()
+        };
+        let events = run("SELECT name FROM S3Object s", config, &buf);
+        assert_eq!(events, vec![Err(Error::ParquetTooLarge)]);
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn parquet_nested_under_csv_output_is_nested_csv_error() {
+        // Decision A: a parquet list/struct cell is `Value::Json`, and CSV
+        // output cannot render it — `NestedCsv` (grilling Q10). JSON-input
+        // nested is the other half of the matrix (compact cell, output.rs);
+        // this test pins the parquet arm through the whole event pipeline.
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, ListArray, RecordBatch, StringArray},
+            buffer::OffsetBuffer,
+            datatypes::{DataType, Field as ArrowField, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "tags",
+            DataType::List(Arc::new(ArrowField::new("element", DataType::Utf8, true))),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ListArray::new(
+                Arc::new(ArrowField::new("element", DataType::Utf8, true)),
+                OffsetBuffer::new(vec![0_i32, 2, 2].into()),
+                Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+                None,
+            )) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let config = SelectConfig {
+            input_format: InputFormat::Parquet(ParquetParams {
+                projection: Vec::new(),
+            }),
+            // Default output is CSV: the nested cell must error the stream,
+            // never render compact JSON under CSV.
+            ..Default::default()
+        };
+        let events = run("SELECT tags FROM S3Object s", config, &buf);
+        assert_eq!(events, vec![Err(Error::NestedCsv)]);
     }
 }

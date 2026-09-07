@@ -19,13 +19,17 @@
 //! reports it as MiB/s. `Cont`/`Stats`/`End` events use the default
 //! `SelectConfig` (the server's `ContPolicy`).
 
-use std::hint::black_box;
-use std::io::{Cursor, Read};
-use std::time::Duration;
+use std::{
+    hint::black_box,
+    io::{Cursor, Read},
+    time::Duration,
+};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use tinio_select::events::{SelectConfig, SelectEvent, select_iter};
-use tinio_select::sql::{QueryPlan, parse};
+use tinio_select::{
+    events::{SelectConfig, SelectEvent, select_iter},
+    sql::{QueryPlan, parse},
+};
 
 /// Fixture rows (plan Task 15: 100k-row CSV).
 const ROWS: usize = 100_000;
@@ -52,8 +56,8 @@ fn drain(plan: QueryPlan, config: SelectConfig, input: Box<dyn Read + Send>) -> 
     let mut scanned = 0u64;
     for ev in select_iter(plan, config, input) {
         let ev = black_box(ev.unwrap_or_else(|e| panic!("select stream error: {e}")));
-        if let SelectEvent::Stats { bytes_scanned, .. } = ev {
-            scanned = bytes_scanned;
+        if let SelectEvent::Stats(counters) = ev {
+            scanned = counters.bytes_scanned;
         }
     }
     scanned

@@ -8,6 +8,12 @@ use smart_default::SmartDefault;
 /// wire-level validation references it instead of re-defining it.
 pub const MAX_BUCKETS: u32 = 10_000;
 
+/// Default select-engine thread stack (X3): parquet 59.3 footer schema
+/// recursion and `arrow_json` can nest unboundedly — a stack overflow is
+/// not a catchable panic. One home for the byte count used by
+/// [`Capabilities::select_stack_bytes`]'s default.
+pub const DEFAULT_SELECT_STACK_BYTES: u32 = 16 * 1024 * 1024;
+
 /// Runtime capability toggles of the `[s3]` section (FR-021). Disabled
 /// groups return `NotImplemented`. Flattened into [`Config`] so the TOML
 /// keys stay at `[s3]` (not a nested `[s3.capabilities]` table).
@@ -94,6 +100,25 @@ pub struct Capabilities {
     #[serde(default = "select")]
     #[default = true]
     pub select: bool,
+
+    /// Cap on concurrently streaming SelectObjectContent responses
+    /// (default 4): each job owns a body forwarder and a seat on the
+    /// select rayon pool — without a cap, concurrent selects exhaust
+    /// threads and memory. Held for the whole response (dropped on stream
+    /// end/cancel).
+    #[serde(default = "select_concurrency")]
+    #[default = 4]
+    #[garde(range(min = 1))]
+    pub select_concurrency: u32,
+
+    /// Stack size (bytes) of each select rayon worker (default
+    /// [`DEFAULT_SELECT_STACK_BYTES`] = 16 MiB). X3: parquet/arrow deep
+    /// recursion needs more than the OS default; a stack overflow aborts
+    /// the process.
+    #[serde(default = "select_stack_bytes")]
+    #[default(DEFAULT_SELECT_STACK_BYTES)]
+    #[garde(range(min = 1024 * 1024))]
+    pub select_stack_bytes: u32,
 }
 
 /// S3 section (`[s3]`; runtime level, FR-021). Disabled capability groups
@@ -176,6 +201,14 @@ fn cors() -> bool {
 
 fn select() -> bool {
     Capabilities::default().select
+}
+
+fn select_concurrency() -> u32 {
+    Capabilities::default().select_concurrency
+}
+
+fn select_stack_bytes() -> u32 {
+    Capabilities::default().select_stack_bytes
 }
 
 impl From<&Config> for Capabilities {
@@ -336,10 +369,28 @@ mod tests {
         // The default config has select enabled (FR-021 parity).
         let caps = Capabilities::default();
         assert!(caps.select);
+        assert_eq!(caps.select_concurrency, 4);
+        assert_eq!(caps.select_stack_bytes, DEFAULT_SELECT_STACK_BYTES);
         // A config with select: false round-trips.
         let toml = "select = false";
         let caps: Capabilities = toml::from_str(toml).unwrap();
         assert!(!caps.select);
+    }
+
+    #[test]
+    fn select_concurrency_parses_and_rejects_zero() {
+        let caps: Capabilities = toml::from_str("select_concurrency = 2").unwrap();
+        assert_eq!(caps.select_concurrency, 2);
+        let err = RootConfig::parse("version = 1\n[s3]\nselect_concurrency = 0").unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+    }
+
+    #[test]
+    fn select_stack_bytes_parses_and_rejects_undersize() {
+        let caps: Capabilities = toml::from_str("select_stack_bytes = 33554432").unwrap();
+        assert_eq!(caps.select_stack_bytes, 32 * 1024 * 1024);
+        let err = RootConfig::parse("version = 1\n[s3]\nselect_stack_bytes = 1024").unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
     }
 
     #[test]

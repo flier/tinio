@@ -1,4 +1,4 @@
-//! Select step definitions (FR-033): SelectObjectContent over objects —
+//! Select step definitions (FR-034): SelectObjectContent over objects —
 //! fixtures (plain and gzip-compressed docstrings) built by the steps, the
 //! request driven through the shared raw client like every other surface.
 //! Each scenario gets its own in-process server, so the fixed bucket name
@@ -11,16 +11,10 @@ use std::io::Write as _;
 use cucumber::{given, then, when};
 
 /// The bucket every select scenario uses (one per scenario's server).
+/// Creation is the shared `I create bucket {string}` step (buckets.rs) —
+/// the select module keeps only the object-docstring fixtures, which no
+/// other step module carries (2026-09-06 review S10).
 const BUCKET: &str = "select";
-
-#[given("a bucket")]
-async fn given_bucket(world: &mut super::World) {
-    world.last = world
-        .client
-        .request("PUT", &format!("/{BUCKET}"), &[], &[])
-        .await;
-    assert_eq!(world.last.status, 200, "bucket create failed");
-}
 
 /// An object whose body is the step's `"""`-delimited docstring.
 #[given(regex = r#"an object "([^"]+)" with content"#)]
@@ -34,7 +28,7 @@ async fn object_with_content(
 }
 
 /// Same, but the object's body is the docstring gzip-compressed (the GZIP
-/// input leg of FR-033).
+/// input leg of FR-034).
 #[given(regex = r#"a gzip-compressed object "([^"]+)" with content"#)]
 async fn gzip_object_with_content(
     world: &mut super::World,
@@ -46,6 +40,20 @@ async fn gzip_object_with_content(
     enc.write_all(&content).expect("gzip: write");
     let gz = enc.finish().expect("gzip: finish");
     put_object(world, &key, &gz).await;
+}
+
+/// Same, but the object's body is the docstring bzip2-compressed.
+#[given(regex = r#"a bzip2-compressed object "([^"]+)" with content"#)]
+async fn bzip2_object_with_content(
+    world: &mut super::World,
+    key: String,
+    step: &cucumber::gherkin::Step,
+) {
+    let content = fixture_bytes(step);
+    let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    enc.write_all(&content).expect("bzip2: write");
+    let bz = enc.finish().expect("bzip2: finish");
+    put_object(world, &key, &bz).await;
 }
 
 /// The docstring value, its delimiter newlines trimmed: the gherkin parser
@@ -68,24 +76,16 @@ async fn put_object(world: &mut super::World, key: &str, content: &[u8]) {
         .request("PUT", &format!("/{BUCKET}/{key}"), &[], content)
         .await;
     assert_eq!(
-        world.last.status, 200,
+        world.last.status,
+        200,
         "object put failed: {}",
         String::from_utf8_lossy(&world.last.body)
     );
 }
 
-#[when(regex = r#"I select over object "([^"]+)" with query "([^"]+)""#)]
+#[when(regex = r#"^I select over object "([^"]+)" with query "([^"]+)"$"#)]
 async fn select_over_object(world: &mut super::World, key: String, query: String) {
-    let body = format!(
-        "<SelectObjectContentRequest>\
-         <Expression>{}</Expression>\
-         <ExpressionType>SQL</ExpressionType>\
-         <InputSerialization>{}</InputSerialization>\
-         <OutputSerialization><CSV/></OutputSerialization>\
-         </SelectObjectContentRequest>",
-        xml_escape(&query),
-        input_serialization(&key),
-    );
+    let body = select_body(&key, &query, false, None);
     world.last = world
         .client
         .request(
@@ -96,23 +96,212 @@ async fn select_over_object(world: &mut super::World, key: String, query: String
         )
         .await;
     assert_eq!(
-        world.last.status, 200,
+        world.last.status,
+        200,
         "select failed: {}",
         String::from_utf8_lossy(&world.last.body)
     );
 }
 
-/// The input serialization chosen from the fixture's suffix: `.jsonl` ⇒
-/// JSON LINES, `.gz` ⇒ CSV with GZIP compression, anything else ⇒ CSV.
-/// Output is always CSV (positional — the projections the feature uses
-/// never need the JSON alias gate).
-fn input_serialization(key: &str) -> &'static str {
-    if key.ends_with(".jsonl") {
+#[when(regex = r#"^I select over object "([^"]+)" with query "([^"]+)" as JSON output$"#)]
+async fn select_as_json(world: &mut super::World, key: String, query: String) {
+    let body = select_body(&key, &query, true, None);
+    world.last = world
+        .client
+        .request(
+            "POST",
+            &format!("/{BUCKET}/{key}?select&select-type=2"),
+            &[("Content-Type", "application/xml")],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(
+        world.last.status,
+        200,
+        "select failed: {}",
+        String::from_utf8_lossy(&world.last.body)
+    );
+}
+
+#[when(
+    regex = r#"^I select over object "([^"]+)" with query "([^"]+)" within scan range "(\d+)" to "(\d+)"$"#
+)]
+async fn select_in_scan_range(
+    world: &mut super::World,
+    key: String,
+    query: String,
+    start: String,
+    end: String,
+) {
+    let body = select_body(&key, &query, false, Some((Some(start), Some(end))));
+    world.last = world
+        .client
+        .request(
+            "POST",
+            &format!("/{BUCKET}/{key}?select&select-type=2"),
+            &[("Content-Type", "application/xml")],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(
+        world.last.status,
+        200,
+        "select failed: {}",
+        String::from_utf8_lossy(&world.last.body)
+    );
+}
+
+/// Start-only ScanRange: from the byte offset to the end of the object.
+#[when(regex = r#"^I select over object "([^"]+)" with query "([^"]+)" from scan range "(\d+)"$"#)]
+async fn select_in_scan_start(
+    world: &mut super::World,
+    key: String,
+    query: String,
+    start: String,
+) {
+    let body = select_body(&key, &query, false, Some((Some(start), None)));
+    world.last = world
+        .client
+        .request(
+            "POST",
+            &format!("/{BUCKET}/{key}?select&select-type=2"),
+            &[("Content-Type", "application/xml")],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(
+        world.last.status,
+        200,
+        "select failed: {}",
+        String::from_utf8_lossy(&world.last.body)
+    );
+}
+
+/// End-only ScanRange: the last N bytes of the object (AWS "last N").
+#[when(regex = r#"^I select over object "([^"]+)" with query "([^"]+)" over the last "(\d+)" bytes$"#)]
+async fn select_over_last_bytes(
+    world: &mut super::World,
+    key: String,
+    query: String,
+    end: String,
+) {
+    let body = select_body(&key, &query, false, Some((None, Some(end))));
+    world.last = world
+        .client
+        .request(
+            "POST",
+            &format!("/{BUCKET}/{key}?select&select-type=2"),
+            &[("Content-Type", "application/xml")],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(
+        world.last.status,
+        200,
+        "select failed: {}",
+        String::from_utf8_lossy(&world.last.body)
+    );
+}
+
+/// The failure-leg of the select step: records the response without the
+/// 200 assertion, so a request-level error scenario can pin its status.
+#[when(regex = r#"^I try select over object "([^"]+)" with query "([^"]+)"$"#)]
+async fn try_select_over_object(world: &mut super::World, key: String, query: String) {
+    let body = select_body(&key, &query, false, None);
+    world.last = world
+        .client
+        .request(
+            "POST",
+            &format!("/{BUCKET}/{key}?select&select-type=2"),
+            &[("Content-Type", "application/xml")],
+            body.as_bytes(),
+        )
+        .await;
+}
+
+#[then(regex = r#"^the select fails with HTTP (\d+) and code "([^"]+)""#)]
+async fn select_fails_with(world: &mut super::World, status: String, code: String) {
+    assert_eq!(
+        world.last.status,
+        status.parse::<u16>().unwrap(),
+        "{world:?}"
+    );
+    let text = String::from_utf8_lossy(&world.last.body).into_owned();
+    assert!(
+        text.contains(&code),
+        "expected code {code:?} in response: {text:?}"
+    );
+}
+
+/// The zero-record assertion (empty input, nothing matching).
+#[then("the select results are empty")]
+async fn results_empty(world: &mut super::World) {
+    let body = record_payloads(&world.last.body);
+    assert!(
+        body.is_empty(),
+        "expected no record payloads, got {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// The one request builder: the input serialization follows the fixture
+/// suffix, the step phrases pick output mode and ScanRange.
+fn select_body(
+    key: &str,
+    query: &str,
+    json_out: bool,
+    scan: Option<(Option<String>, Option<String>)>,
+) -> String {
+    let scan = scan
+        .map(|(start, end)| {
+            let start = start
+                .map(|s| format!("<Start>{s}</Start>"))
+                .unwrap_or_default();
+            let end = end.map(|e| format!("<End>{e}</End>")).unwrap_or_default();
+            format!("<ScanRange>{start}{end}</ScanRange>")
+        })
+        .unwrap_or_default();
+    let output = if json_out { "<JSON/>" } else { "<CSV/>" };
+    format!(
+        "<SelectObjectContentRequest>\
+         <Expression>{}</Expression>\
+         <ExpressionType>SQL</ExpressionType>\
+         <InputSerialization>{}</InputSerialization>\
+         <OutputSerialization>{output}</OutputSerialization>\
+         {scan}\
+         </SelectObjectContentRequest>",
+        xml_escape(query),
+        input_serialization(key),
+    )
+}
+
+/// The input serialization chosen from the fixture's suffix, layered:
+/// `.gz`/`.bz2` strip to the compression type, the stem's `.jsonl` ⇒ JSON
+/// LINES, `.jsond` ⇒ JSON DOCUMENT, `.csvh` ⇒ CSV with `FileHeaderInfo USE`
+/// (the AWS doc sample's named columns), anything else ⇒ CSV. Every
+/// combination is expressible: `data.csv.gz`, `people.jsonl.bz2`, …
+fn input_serialization(key: &str) -> String {
+    let (stem, compression) = if let Some(stem) = key.strip_suffix(".bz2") {
+        (stem, Some("BZIP2"))
+    } else if let Some(stem) = key.strip_suffix(".gz") {
+        (stem, Some("GZIP"))
+    } else {
+        (key, None)
+    };
+    let format = if stem.ends_with(".jsonl") {
         "<JSON><Type>LINES</Type></JSON>"
-    } else if key.ends_with(".gz") {
-        "<CSV/><CompressionType>GZIP</CompressionType>"
+    } else if stem.ends_with(".jsond") {
+        "<JSON><Type>DOCUMENT</Type></JSON>"
+    } else if stem.ends_with(".csvh") {
+        "<CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV>"
+    } else if stem.ends_with(".csvi") {
+        "<CSV><FileHeaderInfo>IGNORE</FileHeaderInfo></CSV>"
     } else {
         "<CSV/>"
+    };
+    match compression {
+        None => format.to_string(),
+        Some(c) => format!("{format}<CompressionType>{c}</CompressionType>"),
     }
 }
 
@@ -130,15 +319,38 @@ async fn results_contain(world: &mut super::World, needle: String) {
     );
 }
 
+#[then(regex = r#"^the select results contain "([^"]+)" and "([^"]+)"$"#)]
+async fn results_contain_and(world: &mut super::World, a: String, b: String) {
+    let text = record_text(&world.last.body);
+    for needle in [&a, &b] {
+        assert!(
+            text.contains(needle),
+            "results missing {needle:?}: {text:?}"
+        );
+    }
+}
+
 #[then(regex = r#"^the select results contain "([^"]+)" and "([^"]+)" but not "([^"]+)"$"#)]
 async fn results_contain_but_not(world: &mut super::World, a: String, b: String, c: String) {
     let text = record_text(&world.last.body);
     for needle in [&a, &b] {
-        assert!(text.contains(needle), "results missing {needle:?}: {text:?}");
+        assert!(
+            text.contains(needle),
+            "results missing {needle:?}: {text:?}"
+        );
     }
     assert!(
         !text.contains(&c),
         "results unexpectedly contain {c:?}: {text:?}"
+    );
+}
+
+#[then(regex = r#"^the select results do not contain "([^"]+)"$"#)]
+async fn results_not_contain(world: &mut super::World, needle: String) {
+    let text = record_text(&world.last.body);
+    assert!(
+        !text.contains(&needle),
+        "results unexpectedly contain {needle:?}: {text:?}"
     );
 }
 
@@ -204,5 +416,7 @@ fn record_payloads(body: &[u8]) -> Vec<u8> {
 /// Minimal XML text escape for the expression (the feature's queries carry
 /// nothing but `'`, `*`, `=`, spaces — only `&`, `<`, `>` need care).
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

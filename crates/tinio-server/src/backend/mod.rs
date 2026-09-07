@@ -126,6 +126,8 @@ pub(crate) use conditions::{parse_etag_condition_header, parse_etag_condition_va
 pub(crate) use errors::map_backend_error;
 use futures::{TryStreamExt, stream};
 use mime_guess;
+#[cfg(feature = "select")]
+use rayon::ThreadPool;
 #[cfg(feature = "copy")]
 use s3s::dto::CopySource;
 use s3s::{
@@ -133,6 +135,8 @@ use s3s::{
     dto::{self, ETag as WireETag, LastModified, Range, StreamingBlob},
     s3_error,
 };
+#[cfg(feature = "select")]
+use tokio::sync::Semaphore;
 
 pub use crate::_config::s3::Capabilities;
 #[cfg(feature = "multipart")]
@@ -217,6 +221,20 @@ pub struct S3Backend<S: Storage> {
     /// otherwise live forever.
     #[cfg(feature = "multipart")]
     pub(crate) checksum_specs: Arc<Mutex<HashMap<String, Option<Arc<core_checksum::Upload>>>>>,
+    /// Cap on concurrently streaming select responses
+    /// ([`Capabilities::select_concurrency`]): gates admission of the
+    /// whole job (forwarder + channels + response). One semaphore per
+    /// backend instance — not process-global. The permit rides the
+    /// response stream (dropped on end or cancel).
+    #[cfg(feature = "select")]
+    pub(crate) select_semaphore: Arc<Semaphore>,
+    /// Pre-sized rayon pool for the sync select engine (same width as
+    /// [`Self::select_semaphore`], stack
+    /// [`Capabilities::select_stack_bytes`] — X3 parquet/arrow recursion).
+    /// Reuses threads across jobs instead of `thread::Builder::spawn` per
+    /// request.
+    #[cfg(feature = "select")]
+    pub(crate) select_pool: Arc<ThreadPool>,
 }
 
 impl<S: Storage> S3Backend<S> {
@@ -240,6 +258,17 @@ impl<S: Storage> S3Backend<S> {
             conditional_put_locks: Map::new(),
             #[cfg(feature = "multipart")]
             checksum_specs: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "select")]
+            select_semaphore: Arc::new(Semaphore::new(caps.select_concurrency as usize)),
+            #[cfg(feature = "select")]
+            select_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(caps.select_concurrency as usize)
+                    .stack_size(caps.select_stack_bytes as usize)
+                    .thread_name(|i| format!("tinio-select-{i}"))
+                    .build()
+                    .expect("select rayon pool"),
+            ),
         }
     }
 

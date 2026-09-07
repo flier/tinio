@@ -9,6 +9,7 @@ publish = false
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
+cfg-if = { workspace = true, optional = true }
 derive_more = { workspace = true, features = ["deref", "display"] }
 futures.workspace = true
 http.workspace = true
@@ -28,6 +29,7 @@ opentelemetry-otlp = { workspace = true, optional = true, features = [
 ] }
 opentelemetry_sdk = { workspace = true, optional = true }
 prometheus.workspace = true
+rayon = { workspace = true, optional = true }
 s3s.workspace = true
 thiserror.workspace = true
 thread-priority.workspace = true
@@ -95,7 +97,7 @@ copy = []
 list-v1 = []
 list-v2 = []
 cors = []
-select = ["dep:tinio-select"]
+select = ["dep:tinio-select", "dep:cfg-if", "dep:rayon"]
 select-parquet = ["select", "tinio-select/parquet"]
 api = ["dep:tinio-api"]
 otel = [

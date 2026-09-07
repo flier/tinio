@@ -307,6 +307,13 @@ jobs:
       - name: feature-matrix check (tinio)
         run: cargo hack check --package tinio --each-feature --no-dev-deps --profile ci
 
+      # SelectObjectContent's feature combinations (P3): `select` and
+      # `select-parquet` live on tinio-server (the facade passes nothing
+      # through), so the facade matrix above never sees them — checked here
+      # with the same no-dev-deps cargo-hack isolation.
+      - name: feature-matrix check (tinio-server)
+        run: cargo hack check --package tinio-server --each-feature --no-dev-deps --profile ci
+
   e2e:
     name: E2E (cucumber fs/mem + traceability)
     # Ubuntu cucumber legs chain behind the ubuntu test job: they compile

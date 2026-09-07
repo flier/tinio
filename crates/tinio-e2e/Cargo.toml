@@ -17,6 +17,7 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+bzip2 = { workspace = true }
 cucumber = { workspace = true, features = ["output-json", "tracing"] }
 flate2 = { workspace = true }
 futures = { workspace = true }
