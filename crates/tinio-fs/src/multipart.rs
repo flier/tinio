@@ -161,6 +161,7 @@ fn sort_uploads(uploads: &mut [MultipartUpload]) {
 /// share this conversion); a domain-invalid checksum wire heals to
 /// `None` at the checksum table (F07); a domain-invalid tags wire heals
 /// to the empty set at the uploads table.
+#[allow(clippy::too_many_arguments)]
 fn upload_from_row(
     bucket: &bucket::Name,
     upload_id: &str,
@@ -263,6 +264,7 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
 ///
 /// ```rust
 /// use tinio_core::{
+///     acl,
 ///     bucket,
 ///     multipart::{CompletedPart, part_number},
 ///     object,
@@ -277,7 +279,14 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
 /// let key = object::key("big.bin").unwrap();
 /// Runtime::new().unwrap().block_on(async {
 ///     let upload = store
-///         .create(&bucket, &key, None, object::Tags::empty())
+///         .create(
+///             &bucket,
+///             &key,
+///             None,
+///             object::Tags::empty(),
+///             None,
+///             &acl::Acl::default_private(None),
+///         )
 ///         .await
 ///         .unwrap();
 ///     let part = store

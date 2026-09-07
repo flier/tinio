@@ -15,15 +15,6 @@ pub(crate) fn other_owner_id() -> acl::OwnerId {
     acl::OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap()
 }
 
-/// A group-read grant over the documented AllUsers URI — the standard
-/// test grant (same shape as the fs suite's helper).
-pub(crate) fn all_users_read_grant() -> acl::Grant {
-    acl::Grant {
-        grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
-        permission: acl::Permission::Read,
-    }
-}
-
 /// A preset server tee slot (spec 2026-08-31): the digest cell already
 /// holds `algorithm`/`base64_value`, so a staged body commits it as the
 /// object's recorded checksum and an uploaded part retains it. The

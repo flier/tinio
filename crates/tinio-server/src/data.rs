@@ -49,7 +49,6 @@ use s3s::{
 use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
 use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
-use tracing::Level;
 
 #[cfg(feature = "cors")]
 use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
@@ -383,7 +382,7 @@ impl DataPlaneService {
         // on the `tinio::access` target — tracing would filter the event,
         // but the strings (and the `nginx_time` clock read) would still be
         // allocated on every request (T052).
-        let access_log = tracing::enabled!(target: ACCESS_TARGET, Level::INFO).then(|| {
+        let access_log = access_log_enabled().then(|| {
             let request = request_line(&method, req.uri());
             let user_agent = req
                 .headers()
@@ -521,6 +520,35 @@ impl DataPlaneService {
             result
         })
     }
+}
+
+/// The static callsite of the access-log gate — see
+/// [`access_log_enabled`]. A dedicated callsite (via the hidden
+/// [`tracing::callsite!`] macro) because [`tracing::enabled!`]'s
+/// static-callsite interest is cached process-globally on the FIRST
+/// appraisal, which freezes it to "never" when a request is served
+/// before any listener (exactly the pipeline tests' WARN-filtered
+/// global): the gate must follow the LIVE dispatcher, not the process's
+/// first appraisal.
+static ACCESS_LOG_CALLSITE: std::sync::LazyLock<&'static tracing::callsite::DefaultCallsite> =
+    std::sync::LazyLock::new(|| {
+        tracing::callsite! {
+            name: "tinio_access_log_gate",
+            kind: tracing::metadata::Kind::EVENT,
+            target: ACCESS_TARGET,
+            level: tracing::Level::INFO,
+            fields: (),
+        }
+    });
+
+/// Whether any subscriber listens on the access target — the T052
+/// allocation gate, checked against the CURRENT dispatcher (thread-local
+/// included), immune to the frozen callsite-interest of the
+/// [`tracing::enabled!`] macro (see [`ACCESS_LOG_CALLSITE`]).
+#[inline]
+fn access_log_enabled() -> bool {
+    use tracing::Callsite;
+    tracing::dispatcher::get_default(|d| d.enabled(ACCESS_LOG_CALLSITE.metadata()))
 }
 
 /// Which direction a counting body streams (the metric recorded at the
@@ -664,7 +692,6 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
-        runtime::Runtime,
         task::JoinHandle,
         time::sleep,
     };
@@ -1574,10 +1601,23 @@ mod tests {
         // The connection is served INLINE on the block_on thread (a
         // `tokio::spawn`ed task would not inherit the `with_default`
         // thread-local dispatcher); the raw client runs on a std thread.
+        //
+        // CURRENT-THREAD runtimes on both sides: a multi-thread runtime
+        // can move the hyper connection task off the block_on thread
+        // (the platform work-steals it to a worker), which would emit
+        // the access-log event where the thread-local dispatch of
+        // `with_default` does not reach — the capture then comes back
+        // empty under parallel load. The current-thread executor pins
+        // every task to the capture thread (same rationale as the INLINE
+        // comment above).
         let capture = CaptureSubscriber::default();
         let capture2 = capture.clone();
         with_default(capture, || {
-            Runtime::new().unwrap().block_on(async {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap()
+                .block_on(async {
                 let storage = MemoryStorage::new().unwrap();
                 let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
                     .await
@@ -1586,7 +1626,11 @@ mod tests {
                 let plane = DataPlane::new(storage, Capabilities::default());
 
                 let client = thread::spawn(move || {
-                    Runtime::new().unwrap().block_on(raw_request(
+                    tokio::runtime::Builder::new_current_thread()
+                            .enable_io()
+                            .build()
+                            .unwrap()
+                            .block_on(raw_request(
                         addr,
                         "GET /missing-bucket/key HTTP/1.1\r\nHost: localhost\r\nUser-Agent: test-agent/1.0\r\nReferer: https://example.com/x?token=secret\r\nConnection: close\r\n\r\n",
                     ))

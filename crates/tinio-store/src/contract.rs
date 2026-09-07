@@ -98,25 +98,33 @@ fn state_round_trips_version_and_compact_marker() {
 // and the equality assertions would fail on a stray element.
 
 #[test]
-fn bucket_row_round_trips_the_four_element_shape() {
+fn bucket_row_round_trips_the_five_element_shape() {
     let db = mem_db();
     let created_at = SystemTime::UNIX_EPOCH + Duration::from_nanos(7);
     {
         let mut txn = db.begin_write().unwrap();
         let mut table = bucket::Table::open(&mut txn).unwrap();
         table
-            .put_full("data", created_at, "a=b", OWNER, GRANTS)
+            .put_full(
+                "data",
+                &bucket::BucketRow {
+                    tags: "a=b".into(),
+                    owner: OWNER.into(),
+                    acl: GRANTS.into(),
+                    ..bucket::BucketRow::at(created_at)
+                },
+            )
             .unwrap();
         drop(table);
         txn.commit().unwrap();
     }
     let txn = db.begin_read().unwrap();
     let table = bucket::Table::open_readonly(&txn).unwrap();
-    let (created, tags, owner_wire, acl_wire) = table.row("data").unwrap().unwrap();
-    assert_eq!(created, created_at);
-    assert_eq!(tags, "a=b");
-    assert_eq!(owner_wire, OWNER);
-    assert_eq!(acl_wire, GRANTS);
+    let row = table.row("data").unwrap().unwrap();
+    assert_eq!(row.created, created_at);
+    assert_eq!(row.tags, "a=b");
+    assert_eq!(row.owner, OWNER);
+    assert_eq!(row.acl, GRANTS);
 }
 
 #[test]

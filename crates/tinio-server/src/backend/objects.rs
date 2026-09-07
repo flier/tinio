@@ -235,11 +235,14 @@ impl<S: Storage> S3Backend<S> {
             .await?;
         #[cfg(not(feature = "acl"))]
         let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
-        if let Some((owner, _)) = &write_acl {
-            if req.method == Method::POST {
-                self.post_object_destination_head(&bucket, &key, owner)
-                    .await?;
-            }
+        // The delegated PostObject B1 head runs only under identity mode
+        // (the access layer saw only the bucket path there).
+        #[cfg(feature = "acl")]
+        if let Some((owner, _)) = &write_acl
+            && req.method == Method::POST
+        {
+            self.post_object_destination_head(&bucket, &key, owner)
+                .await?;
         }
         // The PUT checksum tee (spec 2026-08-31 — the `upload_part`
         // pattern): parse the request spec and wrap the body BEFORE any

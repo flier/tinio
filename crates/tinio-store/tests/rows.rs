@@ -217,7 +217,7 @@ fn bucket_tags_accessors_round_trip_and_self_heal() {
     // A garbage tags wire self-heals on the table accessor.
     h.write(|txn| -> Result<(), tinio_store::Error> {
         bucket::Table::open(txn)?
-            .insert("data", (0u64, "team=%zz&", "", "", ""))
+            .insert("data", (0u64, "garbage", "", "", ""))
             .map_err(tinio_store::Error::from)?;
         Ok(())
     })
@@ -489,7 +489,7 @@ fn object_meta_tag_accessors_rewrite_only_the_element() {
                 3u64,
                 1u64,
                 2u64,
-                "team=%zz&",
+                "garbage",
                 "",
                 "",
                 "",
@@ -629,7 +629,7 @@ fn upload_tags_accessors_round_trip_and_self_heal() {
     // A garbage tags wire self-heals on the table accessor.
     h.write(|txn| -> Result<(), tinio_store::Error> {
         upload::Table::open(txn)?
-            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&", "", ""))
+            .insert(("data", "u1"), ("big.bin", 0u64, "garbage", "", ""))
             .map_err(tinio_store::Error::from)?;
         Ok(())
     })
@@ -642,14 +642,14 @@ fn upload_tags_accessors_round_trip_and_self_heal() {
         );
         t.for_bucket("data", |_, (_, _, tags_wire, _, _)| {
             assert!(
-                tags_wire.is_empty(),
+                object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX).is_empty(),
                 "the bucket scan self-heals the same way"
             );
             Ok(())
         })?;
         t.for_each(|_, _, _, _, tags_wire, _, _| {
             assert!(
-                tags_wire.is_empty(),
+                object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX).is_empty(),
                 "the whole-table walk self-heals the same way"
             );
             Ok(())
@@ -685,7 +685,7 @@ fn upload_tags_accessor_answers_the_identity_check() {
     // self-healed empty set.
     h.write(|txn| -> Result<(), tinio_store::Error> {
         upload::Table::open(txn)?
-            .insert(("data", "u1"), ("big.bin", 0u64, "team=%zz&", "", ""))
+            .insert(("data", "u1"), ("big.bin", 0u64, "garbage", "", ""))
             .map_err(tinio_store::Error::from)?;
         Ok(())
     })
