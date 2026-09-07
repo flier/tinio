@@ -995,6 +995,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "select-parquet")]
     async fn select_parquet_constraints_are_400() {
         let (backend, b) = setup_name().await;
         // Parquet + GZIP.
