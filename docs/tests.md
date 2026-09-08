@@ -10,6 +10,25 @@
 - `.github/actions/run-test-leg` — its `run:` lines are the exact unit/doc commands (modes default / no-default / doc): nextest `--cargo-profile ci --profile ci` (`.config/nextest.toml` = runner profile: fail-fast false, retries 2), doctests via `cargo test --doc --profile ci` (nextest can't run them), rustdoc `-D warnings`.
 - Local equivalents keep `cargo test` (canonical above; cucumber sections) — the CI nextest profile is for the runners.
 
+## Standard acceptance (pre-push gate)
+
+Mirror the CI legs locally before push; every leg must be green. The unix-only legs (the `#[cfg(unix)]` clippy/tests) run under WSL2 — see
+[Platform-gated verification](#platform-gated-verification-wsl2).
+
+```
+cargo +nightly fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+```
+
+### rustdoc
+
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` is the doc gate; `-D rustdoc::broken-intra-doc-links` and `-D rustdoc::private-intra-doc-links` are on (CI's rustdoc leg). **`cargo test --doc` runs doctests but is not this gate** — a green `cargo test` does not guarantee green docs, so the doc build is a separate acceptance leg.
+- Public docs (crate/module `//!` or a `pub` item) must not link a private item: `[`foo`]` where `foo` is `pub(crate)`/private → `private-intra-doc-links`. Link a public item only, or write the name as a plain code span `` `foo` `` (drop the brackets).
+- A bare `[0]`/`parts[0]` (array or field index) in prose is parsed as a link → `broken-intra-doc-links`; wrap it in backticks (`` `parts[0]` ``) or escape `\[0\]`.
+- Re-verify by re-running the doc gate after fixing — not just `cargo test`.
+
 ## Cucumber (tinio-e2e)
 
 Layout: `tests/features/`, `tests/steps/`. Tag taxonomy / FR-025 / WSL2: `crates/tinio-e2e/README.md`.

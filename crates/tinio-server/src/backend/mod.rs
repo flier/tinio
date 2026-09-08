@@ -19,7 +19,7 @@
 //! from the filesystem backend, or the symlink-policy refusal (the
 //! `follow_symlinks = false` answer) — the last two reach the same S3
 //! code through [`Storage`] contract `Error::AccessDenied`, which
-//! [`errors::map_backend_error`] maps onto `AccessDenied` and logs the
+//! `errors::map_backend_error` maps onto `AccessDenied` and logs the
 //! storage source at debug. The wire cannot distinguish the cases;
 //! debug-level logs are the only forensic tool. **`/metrics` stays
 //! outside the ACL check** (grilling ruling): the reserved

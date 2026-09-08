@@ -3,7 +3,7 @@
 //! [`encode`] and [`decode`] are the pair the tags wire used before the
 //! dev merge moved it onto the `percent-encoding` crate (extracted from
 //! the object module — the tags wire is byte-identical). The ACL grants
-//! wire uses [`decode`] too, and [`encode_uri`] for its `uri=` grantee
+//! wire uses [`decode`] too, and `encode_uri` for its `uri=` grantee
 //! elements, which carry the RFC 3986 encoding of a full group URI.
 
 /// The hex digits of the wire `%XX` encoding (encode's per-byte lookup).

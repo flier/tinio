@@ -967,7 +967,7 @@ pub fn projection_needs_alias(item: &Projection) -> bool {
 }
 
 /// Flat-record semantics mirror `eval_field` (single identifier → its
-/// column; compound identifier → the last part, parts[0] is the FROM
+/// column; compound identifier → the last part, `parts[0]` is the FROM
 /// alias). A `Wild` projection reads everything — the empty set, which the
 /// reader treats as "all columns". Names pass as written; the reader
 /// matches them against the schema case-insensitively (identifier rules).
