@@ -17,9 +17,10 @@ pub enum AccessDecision {
 
 /// Contract error → decision mapping per the spec (fail-closed). The
 /// [`StorageError::NoSuchBucket`]/[`StorageError::NoSuchKey`] cases reach
-/// [`AccessDecision::PassThroughMissing`] only when the caller proved the
-/// requester is the bucket owner (or a bucket reader) — `access.rs`
-/// implements the proof; here the error is just classified.
+/// [`AccessDecision::PassThroughMissing`]; `access.rs` then proves the
+/// ownership/read tier over the bucket row — and passes a genuinely
+/// missing bucket straight through to the handler's `NoSuchBucket`
+/// (AWS + contract FR-005). Here the error is just classified.
 pub fn classify(err: &StorageError) -> AccessDecision {
     match err {
         StorageError::NoSuchBucket(_) => AccessDecision::PassThroughMissing,

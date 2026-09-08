@@ -18,7 +18,7 @@ pub fn decode_owner_wire(wire: &str) -> Option<OwnerId> {
 }
 
 /// Decode one stored ACL wire element — an empty or domain-invalid wire
-/// self-heals to [`Acl::default_private(None)`] (a row with no ACL is
+/// self-heals to [`Acl::default_private`] with no owner (a row with no ACL is
 /// private with no owner, the `from_grants_wire` discipline; an empty
 /// wire parses to exactly that, so no special case).
 pub fn decode_acl_wire(wire: &str) -> Acl {

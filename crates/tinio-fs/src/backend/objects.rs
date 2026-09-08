@@ -573,11 +573,11 @@ impl FsStorage {
             // rename). An unmapped owner stays server-user-owned, still
             // `0600`.
             #[cfg(unix)]
-            if let Some(uid) = self.owner_uid(owner) {
-                if let Err(err) = fsutil::chown_file(&target, uid).await {
-                    let _ = fs::remove_file(&target).await;
-                    return Err(err.into());
-                }
+            if let Some(uid) = self.owner_uid(owner)
+                && let Err(err) = fsutil::chown_file(&target, uid).await
+            {
+                let _ = fs::remove_file(&target).await;
+                return Err(err.into());
             }
             // The object is committed — a meta-write failure (full
             // state dir) must not fail the PUT: the entry is recomputed

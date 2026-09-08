@@ -534,10 +534,13 @@ impl<S: Storage> AclAccess<S> {
         }
     }
 
-    /// The deny-first `NoSuch*` three tiers (review B3): the bucket
-    /// owner → pass through (the handler's 404/204); a bucket-READ
-    /// grantee → pass through; otherwise 403 (no existence leak). Every
-    /// other storage error fails closed.
+    /// The deny-first `NoSuch*` tiers (review B3): the bucket owner
+    /// → pass through (the handler's 404/204); a bucket-READ
+    /// grantee → pass through; a genuinely missing bucket (its own
+    /// row read answers `NoSuchBucket`) → pass through to the
+    /// handler's `NoSuchBucket` (AWS + contract FR-005); otherwise
+    /// 403 (no existence leak for an absent row on an existing
+    /// resource). Every other storage error fails closed.
     async fn missing_tiers(
         &self,
         bucket_name: &bucket::Name,
@@ -549,9 +552,15 @@ impl<S: Storage> AclAccess<S> {
         }
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
-            // The tier proof itself needs the bucket row — a missing
-            // bucket makes tiers 1 and 2 unprovable → 403.
-            Err(_) => return Err(denied()),
+            // A genuinely missing bucket (the tier proof's own read
+            // answers NoSuchBucket) passes through — the handler answers
+            // NoSuchBucket, AWS + contract FR-005 (the existence oracle
+            // the B3 never-reveal tiers closed). Any other storage
+            // failure still fails closed.
+            Err(probe) => match probe.into() {
+                storage::Error::NoSuchBucket(_) => return Ok(()),
+                _ => return Err(denied()),
+            },
         };
         if self.is_owner(&bucket_acl, &request.principal) {
             return Ok(());
@@ -912,6 +921,22 @@ mod tests {
         assert_allowed(&access, &req(owner.clone(), true, "GetObject", &path)).await;
         assert_allowed(&access, &req(bob(), true, "GetObject", &path)).await;
         assert_denied(&access, &req(anon(), false, "GetObject", &path)).await;
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_passes_through_for_any_principal() {
+        // The B3 tiers prove owner/grant over the bucket row; a genuinely
+        // missing bucket has none, so the access check passes through and
+        // the handler answers NoSuchBucket — AWS + contract FR-005, for
+        // every principal (there is no owner to prove).
+        let storage = MemoryStorage::new().unwrap();
+        let access = AclAccess::new(Arc::new(storage), identity());
+        let path = S3Path::bucket("ghost");
+        assert_allowed(&access, &req(uid(), true, "ListObjectsV2", &path)).await;
+        assert_allowed(&access, &req(anon(), false, "ListObjectsV2", &path)).await;
+        // DeleteBucket's owner-only gate on a missing bucket passes
+        // through too (the handler enforces existence → NoSuchBucket).
+        assert_allowed(&access, &req(uid(), true, "DeleteBucket", &path)).await;
     }
 
     #[tokio::test]

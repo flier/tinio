@@ -108,11 +108,11 @@ impl BucketOps for FsStorage {
                 let _ = fs::remove_dir(&dir).await;
                 return Err(err.into());
             }
-            if let Some(uid) = self.owner_uid(owner) {
-                if let Err(err) = crate::fsutil::chown_file(&dir, uid).await {
-                    let _ = fs::remove_dir(&dir).await;
-                    return Err(err.into());
-                }
+            if let Some(uid) = self.owner_uid(owner)
+                && let Err(err) = crate::fsutil::chown_file(&dir, uid).await
+            {
+                let _ = fs::remove_dir(&dir).await;
+                return Err(err.into());
             }
         }
         self.bucket_store

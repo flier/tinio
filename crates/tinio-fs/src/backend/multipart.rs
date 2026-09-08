@@ -288,11 +288,11 @@ impl MultipartOps for FsStorage {
                     ))
                 })
                 .map_err(Error::from)?;
-            if let Some(uid) = self.owner_uid(stored_owner.as_ref()) {
-                if let Err(err) = fsutil::chown_file(&target, uid).await {
-                    let _ = fs::remove_file(&target).await;
-                    return Err(err.into());
-                }
+            if let Some(uid) = self.owner_uid(stored_owner.as_ref())
+                && let Err(err) = fsutil::chown_file(&target, uid).await
+            {
+                let _ = fs::remove_file(&target).await;
+                return Err(err.into());
             }
         }
         let size = metadata.len();
