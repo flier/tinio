@@ -102,11 +102,9 @@ impl Identity {
     pub fn owner(&self, id: Option<&OwnerId>) -> Owner {
         let (id, display_name) = match id {
             Some(id) => {
-                let display_name = self
-                    .display_names
-                    .get(id)
-                    .cloned()
-                    .or_else(|| (id == &self.default_owner).then(|| self.default_display_name.clone()));
+                let display_name = self.display_names.get(id).cloned().or_else(|| {
+                    (id == &self.default_owner).then(|| self.default_display_name.clone())
+                });
                 (Some(id.clone()), display_name)
             }
             None => (

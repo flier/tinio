@@ -8,9 +8,9 @@ use garde::Validate;
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 
-use super::{auth::SecretKey, reject_empty, validate_canonical_id_opt};
 #[cfg(windows)]
 use super::validate_local_uid;
+use super::{auth::SecretKey, reject_empty, validate_canonical_id_opt};
 use crate::_core::acl::{OwnerId, derive_canonical_id};
 
 /// One configured S3 user (`[[users]]`).

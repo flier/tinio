@@ -16,9 +16,7 @@ use crate::{
     _auth::canned::{
         GrantHeaders, canned_bucket_grants, canned_object_grants, expand_acl, grants_from_headers,
     },
-    _core::acl::{
-        ACL_GRANTS_MAX, Acl, AclGrants, Grant, Grantee, GroupUri, OwnerId, Permission,
-    },
+    _core::acl::{ACL_GRANTS_MAX, Acl, AclGrants, Grant, Grantee, GroupUri, OwnerId, Permission},
 };
 
 /// Content-MD5 on the put-ACL ops (spec §5, review A7): required, AWS
@@ -54,7 +52,10 @@ pub(crate) fn require_content_md5(md5: Option<&str>) -> S3Result<()> {
 /// owner (lazy resolved — review B4) answers 400 `InvalidArgument`; a
 /// missing or malformed body Owner is equally invalid — never
 /// self-healed.
-pub(crate) fn policy_owner_matches(policy_owner: Option<&dto::Owner>, row_owner: &OwnerId) -> S3Result<()> {
+pub(crate) fn policy_owner_matches(
+    policy_owner: Option<&dto::Owner>,
+    row_owner: &OwnerId,
+) -> S3Result<()> {
     let Some(policy_owner) = policy_owner else {
         return Err(s3_error!(
             InvalidArgument,
@@ -67,8 +68,12 @@ pub(crate) fn policy_owner_matches(policy_owner: Option<&dto::Owner>, row_owner:
             "the ACL policy body Owner is missing its ID"
         ));
     };
-    let id = OwnerId::new(id)
-        .map_err(|_| s3_error!(InvalidArgument, "invalid canonical ID in ACL policy body: {id}"))?;
+    let id = OwnerId::new(id).map_err(|_| {
+        s3_error!(
+            InvalidArgument,
+            "invalid canonical ID in ACL policy body: {id}"
+        )
+    })?;
     if id == *row_owner {
         Ok(())
     } else {
@@ -151,8 +156,9 @@ pub(crate) fn grants_from_policy(grants: &[dto::Grant]) -> S3Result<AclGrants> {
     let mut out = Vec::new();
     for dto_grant in grants {
         let permission = match dto_grant.permission.as_ref() {
-            Some(p) => Permission::from_wire(p.as_str())
-                .map_err(|_| s3_error!(InvalidArgument, "invalid ACL permission: {}", p.as_str()))?,
+            Some(p) => Permission::from_wire(p.as_str()).map_err(|_| {
+                s3_error!(InvalidArgument, "invalid ACL permission: {}", p.as_str())
+            })?,
             None => {
                 return Err(s3_error!(
                     InvalidArgument,
@@ -165,7 +171,10 @@ pub(crate) fn grants_from_policy(grants: &[dto::Grant]) -> S3Result<AclGrants> {
             .as_ref()
             .ok_or_else(|| s3_error!(InvalidArgument, "an ACL grant is missing its grantee"))
             .and_then(grantee_from_dto)?;
-        out.push(Grant { grantee, permission });
+        out.push(Grant {
+            grantee,
+            permission,
+        });
         if out.len() > ACL_GRANTS_MAX {
             return Err(s3_error!(
                 InvalidArgument,
@@ -195,9 +204,9 @@ fn grantee_from_dto(grantee: &dto::Grantee) -> S3Result<Grantee> {
                     "a canonical-user grantee is missing its ID"
                 ));
             };
-            OwnerId::new(id)
-                .map(Grantee::Canonical)
-                .map_err(|_| s3_error!(InvalidArgument, "invalid canonical ID in ACL grantee: {id}"))
+            OwnerId::new(id).map(Grantee::Canonical).map_err(|_| {
+                s3_error!(InvalidArgument, "invalid canonical ID in ACL grantee: {id}")
+            })
         }
         dto::Type::GROUP => {
             if grantee.email_address.is_some() || grantee.id.is_some() {
@@ -206,12 +215,10 @@ fn grantee_from_dto(grantee: &dto::Grantee) -> S3Result<Grantee> {
                     "a group grantee must carry a URI only"
                 ));
             }
-            let uri = GroupUri(
-                grantee
-                    .uri
-                    .clone()
-                    .ok_or_else(|| s3_error!(InvalidArgument, "a group grantee is missing its URI"))?,
-            );
+            let uri =
+                GroupUri(grantee.uri.clone().ok_or_else(|| {
+                    s3_error!(InvalidArgument, "a group grantee is missing its URI")
+                })?);
             if uri.is_valid() {
                 Ok(Grantee::Group(uri))
             } else {

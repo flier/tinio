@@ -512,7 +512,12 @@ impl Store {
         mtime: SystemTime,
         identity: u64,
     ) -> Result<
-        (object::Tags, Option<checksum::Recorded>, Option<acl::OwnerId>, acl::Acl),
+        (
+            object::Tags,
+            Option<checksum::Recorded>,
+            Option<acl::OwnerId>,
+            acl::Acl,
+        ),
         Error,
     > {
         // The closure runs on the blocking pool (`Handle::write` is
@@ -675,13 +680,13 @@ impl Store {
     /// never had an ACL written) or its wires are domain-invalid
     /// (self-healing).
     pub async fn acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<acl::Acl, Error> {
-        Ok(self
-            .stored_entry(bucket, key)
-            .await?
-            .map_or_else(|| acl::Acl::default_private(None), |row| acl::Acl {
+        Ok(self.stored_entry(bucket, key).await?.map_or_else(
+            || acl::Acl::default_private(None),
+            |row| acl::Acl {
                 owner: row.owner,
                 grants: row.acl.grants,
-            }))
+            },
+        ))
     }
 
     /// Replace the stored grant set of `key` (S3 PutObjectAcl —
@@ -1631,7 +1636,8 @@ mod tests {
     }
 
     fn owner() -> acl::OwnerId {
-        acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap()
+        acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+            .unwrap()
     }
 
     fn group_read_grant() -> acl::Grant {
@@ -1745,7 +1751,10 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("a.txt").unwrap();
         // get_object_acl recombines the owner element with the grants.
-        assert_eq!(store.acl(&b, &k).await.unwrap().owner.as_ref(), Some(&owner));
+        assert_eq!(
+            store.acl(&b, &k).await.unwrap().owner.as_ref(),
+            Some(&owner)
+        );
         // A put replaces the grants and never the owner.
         let grants = vec![group_read_grant()];
         assert!(store.set_acl(&b, &k, &grants).await.unwrap());

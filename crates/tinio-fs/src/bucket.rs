@@ -236,6 +236,22 @@ impl Store {
         Ok(())
     }
 
+    /// The recorded owner element of one bucket (`None` = the row is
+    /// missing, a legacy bucket never sighted through the API — the auth
+    /// layer's lazy default owner; a garbage wire reads `None` too, the
+    /// shared decode self-heal). The one-row form of [`Self::owners`] for
+    /// a single bucket's ownership probe.
+    pub async fn owner(&self, name: &Name) -> Result<Option<acl::OwnerId>, Error> {
+        self.handle
+            .read(|txn| {
+                let table = bucket::Table::open_readonly(txn)?;
+                Ok(table
+                    .row(name)?
+                    .and_then(|row| decode_owner_wire(&row.owner)))
+            })
+            .map_err(Into::into)
+    }
+
     /// The recorded owner element of each `Name`, index-aligned with the
     /// input (`None` = the row is missing, a legacy bucket never sighted
     /// through the API — the auth layer's lazy default owner; a garbage
@@ -248,7 +264,11 @@ impl Store {
                 let table = bucket::Table::open_readonly(txn)?;
                 let mut out = Vec::with_capacity(names.len());
                 for name in names {
-                    out.push(table.row(name)?.and_then(|row| decode_owner_wire(&row.owner)));
+                    out.push(
+                        table
+                            .row(name)?
+                            .and_then(|row| decode_owner_wire(&row.owner)),
+                    );
                 }
                 Ok(out)
             })

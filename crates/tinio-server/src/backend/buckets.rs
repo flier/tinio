@@ -12,6 +12,8 @@
 //! type at the 50-tag bucket cap.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(feature = "acl")]
+use s3s::dto;
 use s3s::{
     S3Request, S3Response, S3Result,
     dto::{
@@ -24,6 +26,14 @@ use s3s::{
     s3_error,
 };
 
+#[cfg(feature = "acl")]
+use crate::{
+    _auth::canned::GrantHeaders,
+    backend::acls::{
+        bucket_acl_grants, bucket_write_acl, grant_headers, grants_dto, policy_owner_matches,
+        require_content_md5,
+    },
+};
 use crate::{
     _config::s3::MAX_BUCKETS,
     _core::{
@@ -35,17 +45,6 @@ use crate::{
         tags::{tag_set_from_tags, tags_from_tag_set},
     },
 };
-
-#[cfg(feature = "acl")]
-use crate::{
-    _auth::canned::GrantHeaders,
-    backend::acls::{
-        bucket_acl_grants, bucket_write_acl, grant_headers, grants_dto, policy_owner_matches,
-        require_content_md5,
-    },
-};
-#[cfg(feature = "acl")]
-use s3s::dto;
 
 /// The ListBuckets default page size when `max-buckets` is absent — the
 /// AWS documented default (2025-03 API), the config's `max_buckets` cap
@@ -67,27 +66,26 @@ impl<S: Storage> S3Backend<S> {
         // private default. No-identity mode keeps the Task 5 defaults
         // (B4 rule 3).
         #[cfg(feature = "acl")]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = if self.caps.acl
-            && self.identity.is_some()
-        {
-            let owner = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            let acl = bucket_write_acl(
-                &owner,
-                req.input.acl.as_ref().map(|c| c.as_str()),
-                &grant_headers(
-                    req.input.grant_full_control.as_deref(),
-                    req.input.grant_read.as_deref(),
-                    req.input.grant_read_acp.as_deref(),
-                    req.input.grant_write.as_deref(),
-                    req.input.grant_write_acp.as_deref(),
-                ),
-            )?;
-            Some((owner, acl))
-        } else {
-            None
-        };
+        let write_acl: Option<(acl::OwnerId, acl::Acl)> =
+            if self.caps.acl && self.identity.is_some() {
+                let owner = self
+                    .owner_for(req.credentials.as_ref())
+                    .expect("identity attached above");
+                let acl = bucket_write_acl(
+                    &owner,
+                    req.input.acl.as_ref().map(|c| c.as_str()),
+                    &grant_headers(
+                        req.input.grant_full_control.as_deref(),
+                        req.input.grant_read.as_deref(),
+                        req.input.grant_read_acp.as_deref(),
+                        req.input.grant_write.as_deref(),
+                        req.input.grant_write_acp.as_deref(),
+                    ),
+                )?;
+                Some((owner, acl))
+            } else {
+                None
+            };
         #[cfg(not(feature = "acl"))]
         let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
         // The no-identity / toggle-off default (Task 5).
@@ -192,23 +190,21 @@ impl<S: Storage> S3Backend<S> {
         // principal. Feature-off / toggle-off / no-identity modes keep
         // the unfiltered legacy listing (`None, None`).
         #[cfg(feature = "acl")]
-        let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = match (
-            self.caps.acl,
-            self.identity.as_ref(),
-        ) {
-            // Fail-closed (fix-round Minor #2): the enforced filter
-            // must never degrade to the unfiltered listing via an
-            // unresolved principal — the identity is present here, so
-            // the resolution cannot fail (the same invariant as the
-            // write paths' `owner_for(...).expect`).
-            (true, Some(identity)) => {
-                let principal = self
-                    .owner_for(req.credentials.as_ref())
-                    .expect("identity attached above");
-                (Some(principal), Some(identity.default_owner.clone()))
-            }
-            _ => (None, None),
-        };
+        let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) =
+            match (self.caps.acl, self.identity.as_ref()) {
+                // Fail-closed (fix-round Minor #2): the enforced filter
+                // must never degrade to the unfiltered listing via an
+                // unresolved principal — the identity is present here, so
+                // the resolution cannot fail (the same invariant as the
+                // write paths' `owner_for(...).expect`).
+                (true, Some(identity)) => {
+                    let principal = self
+                        .owner_for(req.credentials.as_ref())
+                        .expect("identity attached above");
+                    (Some(principal), Some(identity.default_owner.clone()))
+                }
+                _ => (None, None),
+            };
         #[cfg(not(feature = "acl"))]
         let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = (None, None);
         let listing = self
@@ -403,6 +399,9 @@ impl<S: Storage> S3Backend<S> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "acl")]
+    use std::sync::Arc;
+
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use s3s::{S3, dto};
     use tokio::runtime::Runtime;
@@ -411,6 +410,10 @@ mod tests {
         CreateBucketInput, DeleteBucketInput, GetBucketLocationInput, HeadBucketInput,
         ListBucketsInput, ListBucketsOutput, *,
     };
+    #[cfg(feature = "acl")]
+    use crate::_auth::identity::{Identity, User};
+    #[cfg(feature = "acl")]
+    use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
     use crate::{
         _core::{
             acl, bucket,
@@ -423,12 +426,6 @@ mod tests {
             testutil::{s3_request, setup},
         },
     };
-    #[cfg(feature = "acl")]
-    use std::sync::Arc;
-    #[cfg(feature = "acl")]
-    use crate::_auth::identity::{Identity, User};
-    #[cfg(feature = "acl")]
-    use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
 
     fn backend() -> S3Backend<MemoryStorage> {
         S3Backend::new(MemoryStorage::new().unwrap(), Default::default())
@@ -1440,7 +1437,13 @@ mod tests {
             .output;
         assert_eq!(
             out.grants.as_deref(),
-            Some([grant(group_grantee(acl::GROUP_ALL_USERS), dto::Permission::READ)].as_slice())
+            Some(
+                [grant(
+                    group_grantee(acl::GROUP_ALL_USERS),
+                    dto::Permission::READ
+                )]
+                .as_slice()
+            )
         );
     }
 
@@ -1489,7 +1492,10 @@ mod tests {
             .put_bucket_acl(s3_request(dto::PutBucketAclInput {
                 bucket: b.to_string(),
                 acl: Some(dto::BucketCannedACL::from_static("public-read")),
-                grant_read: Some(r#"id="aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#.into()),
+                grant_read: Some(
+                    r#"id="aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#
+                        .into(),
+                ),
                 content_md5: Some(valid_md5()),
                 ..Default::default()
             }))
@@ -1611,10 +1617,9 @@ mod tests {
         assert_eq!(owner.display_name.as_deref(), Some("user1"));
         // An unknown row owner resolves ID-only (AWS's unknown-account
         // shape — no display name).
-        let unknown = acl::OwnerId::new(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        )
-        .unwrap();
+        let unknown =
+            acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+                .unwrap();
         backend
             .storage()
             .create_bucket(

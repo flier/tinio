@@ -14,15 +14,15 @@ use s3s::{
     s3_error,
 };
 
-use crate::_core::{
-    acl::{
-        Acl, GROUP_ALL_USERS, GROUP_AUTHENTICATED_USERS, Grantee, GroupUri, OwnerId, Permission,
-        can_delete,
-    },
-    bucket, object, percent,
-    storage::{self, Storage},
-};
 use crate::{
+    _core::{
+        acl::{
+            Acl, GROUP_ALL_USERS, GROUP_AUTHENTICATED_USERS, Grantee, GroupUri, OwnerId,
+            Permission, can_delete,
+        },
+        bucket, object, percent,
+        storage::{self, Storage},
+    },
     error::{AccessDecision, classify},
     identity::Identity,
     matrix::{OpRule, Requirement, rule_for},
@@ -189,7 +189,10 @@ impl<S: Storage> AclAccess<S> {
         // [`can_delete`], see [`object_or_bucket_owner`]: the upload
         // row's raw owner is the object leg, the bucket row supplies the
         // bucket leg).
-        let creator = upload.owner.as_ref().unwrap_or(&self.identity.default_owner);
+        let creator = upload
+            .owner
+            .as_ref()
+            .unwrap_or(&self.identity.default_owner);
         if creator != &request.principal {
             let bucket_acl = match self.storage.get_bucket_acl(&bucket_name).await {
                 Ok(acl) => acl,
@@ -688,7 +691,6 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use s3s::path::S3Path;
-
     use tinio_mem::MemoryStorage;
 
     use super::{AclAccess, OpRule, Request, Requirement, rule_for};

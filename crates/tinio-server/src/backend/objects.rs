@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use http::HeaderValue;
+#[cfg(feature = "acl")]
+use http::Method;
 use s3s::{
     S3Error, S3Request, S3Response, S3Result,
     dto::{self, DeleteObjectOutput},
@@ -36,6 +38,13 @@ use s3s::{
 use crate::backend::{
     conditions::{ConditionFailure, condition_error},
     parse_etag_condition_header, parse_etag_condition_value,
+};
+#[cfg(feature = "acl")]
+use crate::{
+    _auth::canned::GrantHeaders,
+    backend::acls::{
+        grant_headers, grants_dto, object_acl_grants, policy_owner_matches, require_content_md5,
+    },
 };
 use crate::{
     _core::{
@@ -56,17 +65,6 @@ use crate::{
         tags::{parse_tagging_header, tag_set_from_tags, tags_from_tag_set},
     },
 };
-
-#[cfg(feature = "acl")]
-use crate::{
-    _auth::canned::GrantHeaders,
-    backend::acls::{
-        grant_headers, grants_dto, object_acl_grants, policy_owner_matches, require_content_md5,
-    },
-};
-
-#[cfg(feature = "acl")]
-use http::Method;
 
 /// The destination-conditional protocol (`x-amz-if-match` /
 /// `x-amz-if-none-match`): evaluate against the CURRENT object at
@@ -150,7 +148,12 @@ impl<S: Storage> S3Backend<S> {
                 .owner
                 .as_ref(),
         );
-        if acl::can_delete(principal, &bucket_owner, &self.row_owner(None), info.owner.as_ref()) {
+        if acl::can_delete(
+            principal,
+            &bucket_owner,
+            &self.row_owner(None),
+            info.owner.as_ref(),
+        ) {
             Ok(())
         } else {
             Err(s3_error!(AccessDenied, "Access Denied"))
@@ -746,28 +749,27 @@ impl<S: Storage> S3Backend<S> {
         // AWS-style mixed results. The bucket owner element resolves
         // once; the grants are irrelevant to this rule.
         #[cfg(feature = "acl")]
-        let gate: Option<(acl::OwnerId, acl::OwnerId, acl::OwnerId)> = if self.caps.acl
-            && self.identity.is_some()
-        {
-            let principal = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            let bucket_owner = self.row_owner(
-                self.storage
-                    .get_bucket_acl(&bucket)
-                    .await
-                    .map_err(map_backend_error)?
-                    .owner
-                    .as_ref(),
-            );
-            // The empty wire's lazy default (review B4) resolves once,
-            // above the loop — the per-key `row_owner(None)` of the
-            // original shape is loop-invariant.
-            let lazy_default = self.row_owner(None);
-            Some((principal, bucket_owner, lazy_default))
-        } else {
-            None
-        };
+        let gate: Option<(acl::OwnerId, acl::OwnerId, acl::OwnerId)> =
+            if self.caps.acl && self.identity.is_some() {
+                let principal = self
+                    .owner_for(req.credentials.as_ref())
+                    .expect("identity attached above");
+                let bucket_owner = self.row_owner(
+                    self.storage
+                        .get_bucket_acl(&bucket)
+                        .await
+                        .map_err(map_backend_error)?
+                        .owner
+                        .as_ref(),
+                );
+                // The empty wire's lazy default (review B4) resolves once,
+                // above the loop — the per-key `row_owner(None)` of the
+                // original shape is loop-invariant.
+                let lazy_default = self.row_owner(None);
+                Some((principal, bucket_owner, lazy_default))
+            } else {
+                None
+            };
         #[cfg(feature = "acl")]
         let denied = s3_error!(AccessDenied, "Access Denied");
         let mut deleted = Vec::new();
@@ -811,10 +813,7 @@ impl<S: Storage> S3Backend<S> {
                         Err(err) => {
                             let err: StorageError = err.into();
                             if !matches!(err, StorageError::NoSuchKey(_)) {
-                                errors.push(delete_error(
-                                    &map_backend_error(err),
-                                    key.to_string(),
-                                ));
+                                errors.push(delete_error(&map_backend_error(err), key.to_string()));
                                 continue;
                             }
                         }
@@ -1328,23 +1327,19 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+    #[cfg(feature = "acl")]
     use crate::{
-        _core::{
-            bucket,
-            checksum,
-            storage::ObjectOps,
-        },
+        _core::storage::BucketOps,
+        backend::testutil::{acl_backend, credentials_for, post_request, signed_request, user_id},
+    };
+    use crate::{
+        _core::{bucket, checksum, storage::ObjectOps},
         _mem::MemoryStorage,
         _util::testing::{body, read_body, tags},
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},
         },
-    };
-    #[cfg(feature = "acl")]
-    use crate::{
-        _core::storage::BucketOps,
-        backend::testutil::{acl_backend, credentials_for, post_request, signed_request, user_id},
     };
 
     async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
@@ -2146,10 +2141,7 @@ mod tests {
             .commit_object(
                 &b,
                 &k,
-                storage
-                    .stage_body(&b, &k, body(b"a"), None)
-                    .await
-                    .unwrap(),
+                storage.stage_body(&b, &k, body(b"a"), None).await.unwrap(),
                 object::Tags::empty(),
                 Some(&alice),
                 &acl::Acl::default_private(Some(alice.clone())),
@@ -3524,13 +3516,23 @@ mod tests {
         assert_eq!(err.code().as_str(), "InvalidArgument");
         // The 101st distinct grant exceeds the per-ACL cap.
         let over: Vec<dto::Grant> = (0..101)
-            .map(|i| grant(canonical_grantee(&format!("{i:064x}")), dto::Permission::READ))
+            .map(|i| {
+                grant(
+                    canonical_grantee(&format!("{i:064x}")),
+                    dto::Permission::READ,
+                )
+            })
             .collect();
         let err = put(over).await.unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");
         // The 100-grant boundary itself is accepted.
         let at_cap: Vec<dto::Grant> = (0..100)
-            .map(|i| grant(canonical_grantee(&format!("{i:064x}")), dto::Permission::READ))
+            .map(|i| {
+                grant(
+                    canonical_grantee(&format!("{i:064x}")),
+                    dto::Permission::READ,
+                )
+            })
             .collect();
         put(at_cap).await.unwrap();
     }
@@ -3653,10 +3655,7 @@ mod tests {
             .output;
         let grants = got.grants.unwrap();
         assert_eq!(grants.len(), 2);
-        assert!(grants.contains(&grant(
-            canonical_grantee(other),
-            dto::Permission::READ
-        )));
+        assert!(grants.contains(&grant(canonical_grantee(other), dto::Permission::READ)));
         assert!(grants.contains(&grant(
             canonical_grantee(default_id.as_str()),
             dto::Permission::FULL_CONTROL
@@ -3800,12 +3799,14 @@ mod tests {
             .await
             .unwrap();
         backend
-            .copy_object(signed_request(dto::CopyObjectInput::builder()
-                .bucket(b.to_string())
-                .key("dst.txt".to_string())
-                .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
-                .build()
-                .unwrap()))
+            .copy_object(signed_request(
+                dto::CopyObjectInput::builder()
+                    .bucket(b.to_string())
+                    .key("dst.txt".to_string())
+                    .copy_source(CopySource::parse(&format!("{b}/src.txt")).unwrap())
+                    .build()
+                    .unwrap(),
+            ))
             .await
             .unwrap();
         let row = backend
@@ -3833,27 +3834,31 @@ mod tests {
         let bob = user_id("BKID");
         let (backend, b) = acl_setup(&alice).await;
         let key = object::key("t.txt").unwrap();
-        let put = |key: &str, body: &'static str, canned: Option<&'static str>, credentials: &str| {
-            let mut req = signed_request(dto::PutObjectInput {
-                bucket: b.to_string(),
-                key: key.into(),
-                body: dto_body(body.as_bytes()),
-                acl: canned.map(dto::ObjectCannedACL::from_static),
-                ..Default::default()
-            });
-            req.credentials = Some(credentials_for(credentials));
-            backend.put_object(req)
-        };
-        put("t.txt", "one", Some("public-read"), "AKID").await.unwrap();
+        let put =
+            |key: &str, body: &'static str, canned: Option<&'static str>, credentials: &str| {
+                let mut req = signed_request(dto::PutObjectInput {
+                    bucket: b.to_string(),
+                    key: key.into(),
+                    body: dto_body(body.as_bytes()),
+                    acl: canned.map(dto::ObjectCannedACL::from_static),
+                    ..Default::default()
+                });
+                req.credentials = Some(credentials_for(credentials));
+                backend.put_object(req)
+            };
+        put("t.txt", "one", Some("public-read"), "AKID")
+            .await
+            .unwrap();
         let row = backend.storage().get_object_acl(&b, &key).await.unwrap();
         assert_eq!(
             row.owner.as_ref().map(|o| o.as_str()).unwrap(),
             alice.as_str()
         );
-        assert!(row
-            .grants
-            .iter()
-            .any(|g| matches!(g.grantee, acl::Grantee::Group(_))));
+        assert!(
+            row.grants
+                .iter()
+                .any(|g| matches!(g.grantee, acl::Grantee::Group(_)))
+        );
         // Bob's headered-less overwrite: private default for bob.
         put("t.txt", "two", None, "BKID").await.unwrap();
         let row = backend.storage().get_object_acl(&b, &key).await.unwrap();
@@ -3861,7 +3866,10 @@ mod tests {
             row.owner.as_ref().map(|o| o.as_str()).unwrap(),
             bob.as_str()
         );
-        assert_eq!(row.grants, vec![grant_to(&bob, acl::Permission::FullControl)]);
+        assert_eq!(
+            row.grants,
+            vec![grant_to(&bob, acl::Permission::FullControl)]
+        );
     }
 
     #[tokio::test]
@@ -3913,10 +3921,11 @@ mod tests {
             row.owner.as_ref().map(|o| o.as_str()).unwrap(),
             alice.as_str()
         );
-        assert!(row
-            .grants
-            .iter()
-            .any(|g| matches!(g.grantee, acl::Grantee::Group(_))));
+        assert!(
+            row.grants
+                .iter()
+                .any(|g| matches!(g.grantee, acl::Grantee::Group(_)))
+        );
         assert!(
             matches!(
                 backend.storage().head_object(&b, &src).await.unwrap_err(),

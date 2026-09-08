@@ -8,8 +8,10 @@
 
 use cucumber::{gherkin::Step, given, then, when};
 
-use super::common::{ACL_ROOT, ACL_USER_B};
-use super::errors::table_headers;
+use super::{
+    common::{ACL_ROOT, ACL_USER_B},
+    errors::table_headers,
+};
 
 /// The fixture user whose credentials answer a `signed as "…"` step:
 /// `root` = the configured `[auth]` pair presenting the `[owner]`

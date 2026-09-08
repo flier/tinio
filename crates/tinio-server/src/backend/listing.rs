@@ -96,10 +96,7 @@ impl<S: Storage> S3Backend<S> {
                     // B4). `caps.acl` off keeps the legacy owner-less
                     // entries (accept-and-drop).
                     #[cfg(feature = "acl")]
-                    owner: self
-                        .caps
-                        .acl
-                        .then(|| self.acl_owner(o.owner.as_ref())),
+                    owner: self.caps.acl.then(|| self.acl_owner(o.owner.as_ref())),
                     ..Default::default()
                 })
                 .collect(),
@@ -184,6 +181,8 @@ mod tests {
     use s3s::S3;
 
     use super::*;
+    #[cfg(feature = "acl")]
+    use crate::backend::testutil::{acl_backend, credentials_for, user_id};
     use crate::{
         _core::{
             acl, bucket, object,
@@ -196,8 +195,6 @@ mod tests {
             testutil::{s3_request, setup as base_setup},
         },
     };
-    #[cfg(feature = "acl")]
-    use crate::backend::testutil::{acl_backend, credentials_for, user_id};
 
     async fn setup() -> (S3Backend<MemoryStorage>, String) {
         let (backend, b) = base_setup().await;
@@ -462,7 +459,11 @@ mod tests {
         let alice = user_id("AKID");
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, Some(&alice), &acl::Acl::default_private(Some(alice.clone())))
+            .create_bucket(
+                &b,
+                Some(&alice),
+                &acl::Acl::default_private(Some(alice.clone())),
+            )
             .await
             .unwrap();
         async fn commit(
@@ -511,10 +512,7 @@ mod tests {
             .find(|o| o.key.as_deref() == Some("legacy.txt"))
             .unwrap();
         let owner = legacy.owner.as_ref().unwrap();
-        assert_eq!(
-            owner.id.as_deref(),
-            Some(acl::default_owner_id().as_str())
-        );
+        assert_eq!(owner.id.as_deref(), Some(acl::default_owner_id().as_str()));
         assert_eq!(
             owner.display_name.as_deref(),
             Some(acl::DEFAULT_OWNER_DISPLAY_NAME)

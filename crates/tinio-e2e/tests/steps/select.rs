@@ -153,12 +153,7 @@ async fn select_in_scan_range(
 
 /// Start-only ScanRange: from the byte offset to the end of the object.
 #[when(regex = r#"^I select over object "([^"]+)" with query "([^"]+)" from scan range "(\d+)"$"#)]
-async fn select_in_scan_start(
-    world: &mut super::World,
-    key: String,
-    query: String,
-    start: String,
-) {
+async fn select_in_scan_start(world: &mut super::World, key: String, query: String, start: String) {
     let body = select_body(&key, &query, false, Some((Some(start), None)));
     world.last = world
         .client
@@ -178,13 +173,10 @@ async fn select_in_scan_start(
 }
 
 /// End-only ScanRange: the last N bytes of the object (AWS "last N").
-#[when(regex = r#"^I select over object "([^"]+)" with query "([^"]+)" over the last "(\d+)" bytes$"#)]
-async fn select_over_last_bytes(
-    world: &mut super::World,
-    key: String,
-    query: String,
-    end: String,
-) {
+#[when(
+    regex = r#"^I select over object "([^"]+)" with query "([^"]+)" over the last "(\d+)" bytes$"#
+)]
+async fn select_over_last_bytes(world: &mut super::World, key: String, query: String, end: String) {
     let body = select_body(&key, &query, false, Some((None, Some(end))));
     world.last = world
         .client

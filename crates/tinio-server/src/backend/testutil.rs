@@ -7,12 +7,12 @@ use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::S3Request;
 
 use super::{Capabilities, S3Backend};
+#[cfg(feature = "acl")]
+use crate::_auth::identity::{Identity, User, derive_canonical_id};
 use crate::{
     _core::{acl, bucket, storage::BucketOps},
     _mem::MemoryStorage,
 };
-#[cfg(feature = "acl")]
-use crate::_auth::identity::{Identity, User, derive_canonical_id};
 
 /// A minimal `S3Request` with default headers (tests fill the input).
 pub(crate) fn s3_request<T>(input: T) -> S3Request<T> {

@@ -250,7 +250,14 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
         .map(
             |(bucket, upload_id, key, initiated_at, tags, owner, acl, checksum_row)| {
                 upload_from_row(
-                    &bucket, &upload_id, &key, initiated_at, tags, owner, acl, checksum_row,
+                    &bucket,
+                    &upload_id,
+                    &key,
+                    initiated_at,
+                    tags,
+                    owner,
+                    acl,
+                    checksum_row,
                 )
             },
         )
@@ -264,8 +271,7 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
 ///
 /// ```rust
 /// use tinio_core::{
-///     acl,
-///     bucket,
+///     acl, bucket,
 ///     multipart::{CompletedPart, part_number},
 ///     object,
 /// };
@@ -420,7 +426,9 @@ impl Store {
         let checksum = checksum.clone();
         let owner = owner.cloned();
         let acl = acl.clone();
-        let owner_wire = owner.as_ref().map_or_else(String::new, |o| o.as_str().to_string());
+        let owner_wire = owner
+            .as_ref()
+            .map_or_else(String::new, |o| o.as_str().to_string());
         let acl_wire = acl.to_grants_wire();
         self.handle
             .write(move |txn| {
@@ -1229,23 +1237,25 @@ impl Store {
                 let table = upload::Table::open_readonly(txn)?;
                 let checksums = upload_checksum::Table::open_readonly(txn)?;
                 let mut rows = Vec::new();
-                table.for_each(|b, upload_id, key, initiated_at, tags_wire, owner_wire, acl_wire| {
-                    let Ok(bucket) = bucket::name(b) else {
-                        return Ok(());
-                    };
-                    let checksum_row = checksums.get(b, upload_id)?;
-                    rows.push((
-                        bucket,
-                        upload_id.to_string(),
-                        key.to_string(),
-                        initiated_at,
-                        object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
-                        decode_owner_wire(owner_wire),
-                        decode_acl_wire(acl_wire),
-                        checksum_row,
-                    ));
-                    Ok(())
-                })?;
+                table.for_each(
+                    |b, upload_id, key, initiated_at, tags_wire, owner_wire, acl_wire| {
+                        let Ok(bucket) = bucket::name(b) else {
+                            return Ok(());
+                        };
+                        let checksum_row = checksums.get(b, upload_id)?;
+                        rows.push((
+                            bucket,
+                            upload_id.to_string(),
+                            key.to_string(),
+                            initiated_at,
+                            object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                            decode_owner_wire(owner_wire),
+                            decode_acl_wire(acl_wire),
+                            checksum_row,
+                        ));
+                        Ok(())
+                    },
+                )?;
                 Ok(rows)
             })
             .map_err(Error::from)?;
@@ -1292,7 +1302,10 @@ impl Store {
         self.handle
             .write(move |txn| {
                 upload::Table::open(txn)?
-                    .insert((&*bucket, upload_id.as_str()), (key.as_str(), 0, "", "", ""))
+                    .insert(
+                        (&*bucket, upload_id.as_str()),
+                        (key.as_str(), 0, "", "", ""),
+                    )
                     .map_err(|e| database::Error::Redb(e.into()))?;
                 Ok(())
             })
@@ -1404,12 +1417,26 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
 
         let err = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1435,7 +1462,14 @@ mod tests {
             for _ in 0..(i % 3 + 1) {
                 uploads.push(
                     store
-                        .create(&b, &object::key(*key).unwrap(), None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+                        .create(
+                            &b,
+                            &object::key(*key).unwrap(),
+                            None,
+                            object::Tags::empty(),
+                            None,
+                            &acl::Acl::default_private(None),
+                        )
                         .await
                         .unwrap(),
                 );
@@ -1521,8 +1555,8 @@ mod tests {
                 &object::key("dir/a.txt").unwrap(),
                 None,
                 object::Tags::empty(),
-            None,
-            &acl::Acl::default_private(None),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1532,8 +1566,8 @@ mod tests {
                 &object::key("dir/c.txt").unwrap(),
                 None,
                 object::Tags::empty(),
-            None,
-            &acl::Acl::default_private(None),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1543,8 +1577,8 @@ mod tests {
                 &object::key("z.txt").unwrap(),
                 None,
                 object::Tags::empty(),
-            None,
-            &acl::Acl::default_private(None),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1566,7 +1600,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         assert!(!upload.upload_id.is_empty());
@@ -1601,8 +1642,8 @@ mod tests {
                     r#type: None,
                 }),
                 object::Tags::empty(),
-            None,
-            &acl::Acl::default_private(None),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1642,7 +1683,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let slot = Arc::new(checksum::PartChecksum::default());
@@ -1671,7 +1719,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let part = store
@@ -1708,7 +1763,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // No part dir was ever created; consuming twice is a no-op.
@@ -1723,7 +1785,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let mut completed = Vec::new();
@@ -1775,7 +1844,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let p1 = store
@@ -1806,7 +1882,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store
@@ -1877,11 +1960,25 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("same.bin").unwrap();
         store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let uploads = store.list_uploads(&b).await.unwrap();
@@ -1899,7 +1996,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("a.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store.remove_bucket(&b).await.unwrap();
@@ -1919,8 +2023,8 @@ mod tests {
                 &object::key("a.bin").unwrap(),
                 None,
                 object::Tags::empty(),
-            None,
-            &acl::Acl::default_private(None),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1930,8 +2034,8 @@ mod tests {
                 &object::key("z.bin").unwrap(),
                 None,
                 object::Tags::empty(),
-            None,
-            &acl::Acl::default_private(None),
+                None,
+                &acl::Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1950,7 +2054,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         for n in 1..=4u32 {
@@ -1990,7 +2101,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store
@@ -2014,7 +2132,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let id = upload.upload_id.clone();
@@ -2041,7 +2166,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // Write a part file out-of-band (no PARTS record).
@@ -2071,7 +2203,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // Non-final listed parts must be >= the 5 MiB minimum (the
@@ -2179,7 +2318,14 @@ mod tests {
         // suffice where the small-part original needed eight.
         for _ in 0..4 {
             let upload = store
-                .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+                .create(
+                    &b,
+                    &k,
+                    None,
+                    object::Tags::empty(),
+                    None,
+                    &acl::Acl::default_private(None),
+                )
                 .await
                 .unwrap();
             let mut completed = Vec::new();
@@ -2249,7 +2395,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // A raw row at the boundary (no part file needed — pass 2
@@ -2297,7 +2450,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store
@@ -2322,7 +2482,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store
@@ -2348,7 +2515,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // The first part is non-final in the two-part list — it must be
@@ -2397,7 +2571,14 @@ mod tests {
         let k = object::key("big.bin").unwrap();
         let min = MIN_PART_BYTES as usize;
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let under = store
@@ -2462,7 +2643,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let part = store
@@ -2500,7 +2688,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let part = store
@@ -2536,7 +2731,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         fs::write(state.path().join("tmp"), b"blocked")
@@ -2564,7 +2766,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         fs::create_dir_all(state.path().join("multipart"))
@@ -2603,7 +2812,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = store
-            .create(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         store

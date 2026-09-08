@@ -619,7 +619,15 @@ fn upload_tags_accessors_round_trip_and_self_heal() {
     let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
     h.write(|txn| -> Result<(), tinio_store::Error> {
         let mut t = upload::Table::open(txn)?;
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags.to_wire(), "", "")?;
+        t.put(
+            "data",
+            "u1",
+            &key,
+            SystemTime::UNIX_EPOCH,
+            &tags.to_wire(),
+            "",
+            "",
+        )?;
         assert_eq!(t.tags("data", &key, "u1")?.unwrap(), tags);
         t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
         assert!(t.tags("data", &key, "u1")?.unwrap().is_empty());
@@ -668,7 +676,15 @@ fn upload_tags_accessor_answers_the_identity_check() {
         let mut t = upload::Table::open(txn)?;
         // Missing row: None.
         assert!(t.tags("data", &key, "u1")?.is_none());
-        t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, &tags.to_wire(), "", "")?;
+        t.put(
+            "data",
+            "u1",
+            &key,
+            SystemTime::UNIX_EPOCH,
+            &tags.to_wire(),
+            "",
+            "",
+        )?;
         // S3 identity is (bucket, key, uploadId): a matching key answers
         // the tags, a mismatched key or upload id answers None (the
         // caller's NoSuchUpload arm).

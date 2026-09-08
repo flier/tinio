@@ -37,10 +37,10 @@ pub mod log;
 pub mod metrics;
 pub mod pipeline;
 
+#[cfg(feature = "acl")]
+pub use self::_auth::{Identity, User};
 pub use self::{
     backend::{Capabilities, S3Backend},
     data::DataPlane,
     error::Error,
 };
-#[cfg(feature = "acl")]
-pub use self::_auth::{Identity, User};

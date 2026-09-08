@@ -10,8 +10,10 @@ use redb::{ReadableTable, TableDefinition};
 
 use crate::{
     _core::{
-        checksum, etag::ETag, object,
         acl::{Acl, OwnerId},
+        checksum,
+        etag::ETag,
+        object,
     },
     acl::{decode_acl_wire, decode_owner_wire},
     error::Error,

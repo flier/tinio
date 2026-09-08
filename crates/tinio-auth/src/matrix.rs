@@ -97,10 +97,14 @@ pub fn rule_for(op: &str) -> OpRule {
         // Creator-or-bucket-owner / object-or-bucket-owner rows:
         // upload-scoped (creator of the upload row), delete parity
         // (DeleteObject), and the default-A tagging/attributes class.
-        "ListParts" | "UploadPart" | "AbortMultipartUpload" | "DeleteObject"
-        | "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging" | "GetObjectAttributes" => {
-            rule(ObjectOrBucketOwner, false, false, false)
-        }
+        "ListParts"
+        | "UploadPart"
+        | "AbortMultipartUpload"
+        | "DeleteObject"
+        | "GetObjectTagging"
+        | "PutObjectTagging"
+        | "DeleteObjectTagging"
+        | "GetObjectAttributes" => rule(ObjectOrBucketOwner, false, false, false),
         "UploadPartCopy" => rule(ObjectOrBucketOwner, true, false, false),
         "CompleteMultipartUpload" => rule(ObjectOrBucketOwner, false, false, true),
         // CopyObject: source READ base, source READ + destination bucket

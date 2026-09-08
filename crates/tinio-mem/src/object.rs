@@ -544,11 +544,7 @@ impl ObjectOps for MemoryStorage {
         Ok(())
     }
 
-    async fn get_object_acl(
-        &self,
-        bucket: &Name,
-        key: &object::Key,
-    ) -> Result<acl::Acl, Error> {
+    async fn get_object_acl(&self, bucket: &Name, key: &object::Key) -> Result<acl::Acl, Error> {
         // Existence is the `OBJECT_META` row (`NoSuchKey` when missing);
         // the ACL recombines the stored owner element with the stored
         // grant set (the row form keeps them apart — the shared
@@ -577,28 +573,20 @@ impl ObjectOps for MemoryStorage {
             owner: None,
             grants: grants.clone(),
         };
-        self.db.write(|txn| -> Result<bool, Error> {
-            let mut meta = meta::Table::open(txn)?;
-            let Some(row) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
-                return Ok(false);
-            };
-            meta.put(
-                bucket.as_ref().as_str(),
-                key.as_ref().as_str(),
-                &meta::Stored {
-                    acl: fresh,
-                    ..row
-                },
-            )?;
-            Ok(true)
-        })
-        .map(|found| {
-            if found {
-                Ok(())
-            } else {
-                Err(no_such_key(key))
-            }
-        })?
+        self.db
+            .write(|txn| -> Result<bool, Error> {
+                let mut meta = meta::Table::open(txn)?;
+                let Some(row) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
+                    return Ok(false);
+                };
+                meta.put(
+                    bucket.as_ref().as_str(),
+                    key.as_ref().as_str(),
+                    &meta::Stored { acl: fresh, ..row },
+                )?;
+                Ok(true)
+            })
+            .map(|found| if found { Ok(()) } else { Err(no_such_key(key)) })?
     }
 
     async fn list_object_parts(
@@ -726,7 +714,10 @@ mod tests {
     async fn with_bucket() -> (MemoryStorage, Name) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         (storage, name)
     }
 
@@ -742,7 +733,10 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("big.bin").unwrap();
 
         let err = storage
@@ -777,7 +771,10 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k1 = object::key("a.bin").unwrap();
         let k2 = object::key("b.bin").unwrap();
 
@@ -1022,7 +1019,10 @@ mod tests {
     async fn list_objects_does_not_cross_buckets() {
         let (storage, bucket) = with_bucket().await;
         let other = bucket::name("other").unwrap();
-        storage.create_bucket(&other, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&other, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         put_keys(&storage, &bucket, &["a.txt"]).await;
         put_keys(&storage, &other, &["b.txt"]).await;
         let page = storage
@@ -1094,7 +1094,14 @@ mod tests {
             .await
             .unwrap();
         let info = storage
-            .commit_object(&b, &a, staged, tags.clone(), None, &acl::Acl::default_private(None))
+            .commit_object(
+                &b,
+                &a,
+                staged,
+                tags.clone(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         assert_eq!(info.etag, ETag::from_content(b"hi"));
@@ -1106,7 +1113,16 @@ mod tests {
         let dst = object::key("b.txt").unwrap();
         let copy_tags = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
         storage
-            .copy_object(&b, &a, &b, &dst, copy_tags.clone(), None, &acl::Acl::default_private(None),  None)
+            .copy_object(
+                &b,
+                &a,
+                &b,
+                &dst,
+                copy_tags.clone(),
+                None,
+                &acl::Acl::default_private(None),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(storage.get_object_tags(&b, &dst).await.unwrap(), copy_tags);
@@ -1130,7 +1146,14 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .commit_object(
+                &b,
+                &k,
+                staged,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let head = storage.head_object(&b, &k).await.unwrap();
@@ -1167,7 +1190,14 @@ mod tests {
             .await
             .unwrap();
         storage
-            .commit_object(&b, &k, staged, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .commit_object(
+                &b,
+                &k,
+                staged,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         assert!(
@@ -1195,7 +1225,16 @@ mod tests {
         // (d) copy_object never inherits the source's parts.
         let copy = object::key("copy.bin").unwrap();
         storage
-            .copy_object(&b, &dst, &b, &copy, object::Tags::empty(), None, &acl::Acl::default_private(None),  None)
+            .copy_object(
+                &b,
+                &dst,
+                &b,
+                &copy,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+                None,
+            )
             .await
             .unwrap();
         assert!(

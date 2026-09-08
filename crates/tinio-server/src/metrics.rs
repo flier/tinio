@@ -1045,7 +1045,12 @@ mod tests {
             ]
             .into_iter();
             #[cfg(feature = "acl")]
-            let base = base.chain(["GetBucketAcl", "PutBucketAcl", "GetObjectAcl", "PutObjectAcl"]);
+            let base = base.chain([
+                "GetBucketAcl",
+                "PutBucketAcl",
+                "GetObjectAcl",
+                "PutObjectAcl",
+            ]);
             #[cfg(feature = "multipart")]
             let base = base.chain(["UploadPart", "ListParts", "ListMultipartUploads"]);
             #[cfg(feature = "cors")]

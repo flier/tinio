@@ -283,9 +283,9 @@ impl MultipartOps for FsStorage {
                 .handle
                 .read(|txn| {
                     let uploads = crate::_store::upload::Table::open_readonly(txn)?;
-                    Ok(uploads
-                        .get_matching(bucket, key, upload_id)?
-                        .and_then(|(_, _, _, owner_wire, _)| crate::_store::decode_owner_wire(&owner_wire)))
+                    Ok(uploads.get_matching(bucket, key, upload_id)?.and_then(
+                        |(_, _, _, owner_wire, _)| crate::_store::decode_owner_wire(&owner_wire),
+                    ))
                 })
                 .map_err(Error::from)?;
             if let Some(uid) = self.owner_uid(stored_owner.as_ref()) {
@@ -417,10 +417,20 @@ mod tests {
         // stream the same way) must leave no part file and no PARTS row.
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let err = storage
@@ -462,10 +472,20 @@ mod tests {
     async fn multipart_lifecycle_via_contract() {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let mut parts = Vec::new();
@@ -543,10 +563,20 @@ mod tests {
     async fn part_number_marker_pagination() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         for i in 1..=5u32 {
@@ -597,7 +627,10 @@ mod tests {
     async fn list_multipart_uploads_filters_by_prefix() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .create_multipart_upload(
                 &b,
@@ -643,7 +676,10 @@ mod tests {
     async fn delimiter_rollup_paginates_and_resumes() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
             storage
                 .create_multipart_upload(
@@ -699,14 +735,31 @@ mod tests {
     async fn bare_key_marker_skips_the_whole_key_group() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k = object::key("same.bin").unwrap();
         let u1 = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let page = storage
@@ -728,14 +781,31 @@ mod tests {
     async fn same_key_uploads_paginate_without_skipping() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k = object::key("same.bin").unwrap();
         storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let page1 = storage
@@ -792,7 +862,14 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let part = storage
@@ -842,7 +919,10 @@ mod tests {
         // checksum (the backend never hashes).
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let k = object::key("big.bin").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let upload = storage
@@ -929,7 +1009,14 @@ mod tests {
         // A second completion over the same key replaces the rows (the
         // old completion's parts must not accumulate).
         let upload2 = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let p = storage

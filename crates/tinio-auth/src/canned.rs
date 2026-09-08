@@ -512,7 +512,13 @@ mod tests {
             ]
         );
         // Bucket-owner-* on the object surface references the bucket owner.
-        let acl = expand_acl(&o, Some(&bo), Some("bucket-owner-read"), GrantHeaders::default()).unwrap();
+        let acl = expand_acl(
+            &o,
+            Some(&bo),
+            Some("bucket-owner-read"),
+            GrantHeaders::default(),
+        )
+        .unwrap();
         assert_eq!(
             acl.grants,
             vec![

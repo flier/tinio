@@ -764,7 +764,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .put_object(&b, &"a.txt".into(), body(b"first"))
             .await
@@ -786,7 +789,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let file = root.path().join("data/a.txt");
         storage
             .put_object(&b, &"a.txt".into(), body(b"first!"))
@@ -816,7 +822,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let gone = object::key("gone.txt").unwrap();
         let alive = object::key("alive.txt").unwrap();
         storage.put_object(&b, &gone, body(b"x")).await.unwrap();
@@ -1198,8 +1207,14 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let bad = bucket::name("bad").unwrap();
         let good = bucket::name("good").unwrap();
-        storage.create_bucket(&bad, None, &acl::Acl::default_private(None)).await.unwrap();
-        storage.create_bucket(&good, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&bad, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .create_bucket(&good, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         fs::write(root.path().join("good/a.txt"), b"x")
             .await
             .unwrap();
@@ -1343,7 +1358,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         fs::create_dir(root.path().join("data/dir")).await.unwrap();
         fs::write(root.path().join("data/a.txt"), b"x")
             .await

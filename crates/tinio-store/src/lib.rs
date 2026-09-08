@@ -30,8 +30,10 @@ pub mod upload_checksum;
 #[cfg(test)]
 mod contract;
 
-pub use self::acl::{decode_acl_wire, decode_owner_wire};
-pub use self::error::Error;
+pub use self::{
+    acl::{decode_acl_wire, decode_owner_wire},
+    error::Error,
+};
 
 /// Create the seven shared tables inside a write transaction
 /// (idempotent). Backends create their local tables in the same

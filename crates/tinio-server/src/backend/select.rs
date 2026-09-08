@@ -41,8 +41,8 @@ use crate::{
     _select::{
         Error, csv,
         events::{
-            ByteCounters, ContPolicy, InputFormat, MAX_PARQUET_BYTES, ParquetParams,
-            SelectConfig, SelectEvent, select_iter,
+            ByteCounters, ContPolicy, InputFormat, MAX_PARQUET_BYTES, ParquetParams, SelectConfig,
+            SelectEvent, select_iter,
         },
         json,
         output::{CsvOutputParams, JsonOutputParams, OutputMode, QuoteFields},
@@ -1357,10 +1357,7 @@ mod tests {
         // no retry loop, immediate unwind.
         let (tx, rx) = mpsc::channel::<Result<SelectEvent, Error>>(CHANNEL_CAP);
         drop(rx);
-        assert!(!send_or_unwind(
-            &tx,
-            Err(Error::Value("boom".into()))
-        ));
+        assert!(!send_or_unwind(&tx, Err(Error::Value("boom".into()))));
     }
 
     #[test]

@@ -629,8 +629,7 @@ impl SelectIter {
         if let Some(bytes) = self.packer.take() {
             self.flush_frame(bytes);
         }
-        self.outbox
-            .push(SelectEvent::Stats(self.tally.snapshot()));
+        self.outbox.push(SelectEvent::Stats(self.tally.snapshot()));
         self.outbox.push(SelectEvent::End);
         Ok(())
     }
@@ -697,9 +696,7 @@ fn build_reader(
             // guard, this is depth).
             let source = count(input, scanned);
             let mut buf = Vec::new();
-            source
-                .take(max_parquet_bytes + 1)
-                .read_to_end(&mut buf)?;
+            source.take(max_parquet_bytes + 1).read_to_end(&mut buf)?;
             if buf.len() as u64 > max_parquet_bytes {
                 return Err(Error::ParquetTooLarge);
             }
@@ -730,10 +727,9 @@ fn build_reader(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write as _};
 
     use super::*;
-    use std::io::Write as _;
     use crate::{
         csv::{Header, Params},
         output::JsonOutputParams,
@@ -1098,8 +1094,10 @@ mod tests {
         // per the ordering rule) alongside the Cont every scanned MB.
         let mut input = Vec::new();
         while input.len() < 1536 * 1024 {
-            input.extend_from_slice(b"0
-");
+            input.extend_from_slice(
+                b"0
+",
+            );
         }
         let config = SelectConfig {
             input_format: InputFormat::Csv(params(None)),
@@ -1134,15 +1132,22 @@ mod tests {
             input_format: InputFormat::Csv(params(None)),
             ..Default::default()
         };
-        let events = run("SELECT count(*) FROM S3Object s LIMIT 2", config, b"1
+        let events = run(
+            "SELECT count(*) FROM S3Object s LIMIT 2",
+            config,
+            b"1
 2
 3
-");
+",
+        );
         assert_eq!(
             events,
             vec![
-                Ok(SelectEvent::Records(b"3
-".to_vec())),
+                Ok(SelectEvent::Records(
+                    b"3
+"
+                    .to_vec()
+                )),
                 Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 6,
                     bytes_processed: 6,
@@ -1159,9 +1164,9 @@ mod tests {
         // the same decoder as CSV.
         let payload = b"{\"a\": 1}
 {\"b\": 2}
-".to_vec();
-        let mut enc =
-            bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+"
+        .to_vec();
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
         enc.write_all(&payload).unwrap();
         let bz = enc.finish().unwrap();
         let config = SelectConfig {
@@ -1176,9 +1181,12 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                Ok(SelectEvent::Records(b"{\"a\":1}
+                Ok(SelectEvent::Records(
+                    b"{\"a\":1}
 {\"b\":2}
-".to_vec())),
+"
+                    .to_vec()
+                )),
                 Ok(SelectEvent::Stats(ByteCounters {
                     bytes_scanned: 18,
                     bytes_processed: 18,

@@ -429,8 +429,12 @@ impl FsListing {
         // same row): the producer rewrites preserve the replaced row's
         // elements, so the served page matches what the row holds after
         // the walk.
-        let mut row_meta: Vec<(Tags, Option<checksum::Recorded>, Option<acl::OwnerId>, acl::Acl)> =
-            Vec::with_capacity(page.len());
+        let mut row_meta: Vec<(
+            Tags,
+            Option<checksum::Recorded>,
+            Option<acl::OwnerId>,
+            acl::Acl,
+        )> = Vec::with_capacity(page.len());
         for (i, stored) in gated.into_iter().enumerate() {
             row_meta.push(stored.as_ref().map_or_else(
                 || (Tags::empty(), None, None, acl::Acl::default_private(None)),
@@ -1665,7 +1669,10 @@ mod tests {
             {
                 let mut table = Table::open(&mut txn).unwrap();
                 table
-                    .insert(("data", "f00.txt"), ("not-an-etag", 1, 1, 0, "", "", "", ""))
+                    .insert(
+                        ("data", "f00.txt"),
+                        ("not-an-etag", 1, 1, 0, "", "", "", ""),
+                    )
                     .unwrap();
             }
             txn.commit().unwrap();

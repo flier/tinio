@@ -275,22 +275,23 @@ impl BucketOps for MemoryStorage {
             grants: grants.clone(),
         }
         .to_grants_wire();
-        self.db.write(|txn| -> Result<bool, Error> {
-            let mut buckets = bucket::Table::open(txn)?;
-            let Some(mut row) = buckets.row(name.as_ref().as_str())? else {
-                return Ok(false);
-            };
-            row.acl = grants_wire;
-            buckets.put_full(name.as_ref().as_str(), &row)?;
-            Ok(true)
-        })
-        .map(|found| {
-            if found {
-                Ok(())
-            } else {
-                Err(no_such_bucket(name))
-            }
-        })?
+        self.db
+            .write(|txn| -> Result<bool, Error> {
+                let mut buckets = bucket::Table::open(txn)?;
+                let Some(mut row) = buckets.row(name.as_ref().as_str())? else {
+                    return Ok(false);
+                };
+                row.acl = grants_wire;
+                buckets.put_full(name.as_ref().as_str(), &row)?;
+                Ok(true)
+            })
+            .map(|found| {
+                if found {
+                    Ok(())
+                } else {
+                    Err(no_such_bucket(name))
+                }
+            })?
     }
 }
 
@@ -307,7 +308,10 @@ mod tests {
     async fn list_buckets_is_lexicographic() {
         let storage = MemoryStorage::new().unwrap();
         for n in ["zeta", "alpha", "mu-1"] {
-            storage.create_bucket(&name(n).unwrap(), None, &acl::Acl::default_private(None)).await.unwrap();
+            storage
+                .create_bucket(&name(n).unwrap(), None, &acl::Acl::default_private(None))
+                .await
+                .unwrap();
         }
         let names: Vec<_> = storage
             .list_buckets(
@@ -333,8 +337,14 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let alpha = name("alpha").unwrap();
         let zeta = name("zeta").unwrap();
-        storage.create_bucket(&alpha, None, &acl::Acl::default_private(None)).await.unwrap();
-        storage.create_bucket(&zeta, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&alpha, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .create_bucket(&zeta, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         storage
             .put_object(&zeta, &object::key("a.txt").unwrap(), body(b"x".to_vec()))
             .await
@@ -351,10 +361,20 @@ mod tests {
     async fn delete_bucket_with_in_progress_uploads_is_not_empty() {
         let storage = MemoryStorage::new().unwrap();
         let bucket = name("data").unwrap();
-        storage.create_bucket(&bucket, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("pending.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let part = storage
@@ -415,7 +435,10 @@ mod tests {
     async fn mem_bucket_tags_round_trip_and_replace() {
         let storage = MemoryStorage::new().unwrap();
         let b = name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         assert!(
             storage.get_bucket_tags(&b).await.unwrap().is_empty(),
             "an untagged bucket answers the empty set"
@@ -455,7 +478,10 @@ mod tests {
     async fn mem_bucket_cors_round_trip_and_replace() {
         let storage = MemoryStorage::new().unwrap();
         let b = name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         assert!(
             storage.get_bucket_cors(&b).await.unwrap().is_none(),
             "an unconfigured bucket answers None"
@@ -533,7 +559,6 @@ mod tests {
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
         let err: Error = storage.delete_bucket_cors(&ghost).await.unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
-
     }
 
     #[tokio::test]
@@ -553,7 +578,10 @@ mod tests {
             let mut txn = storage.db.db().begin_write().unwrap();
             bucket::Table::open(&mut txn)
                 .unwrap()
-                .insert(b.as_ref().as_str(), (1u64, "", "##bad-owner", "grants=%zz", ""))
+                .insert(
+                    b.as_ref().as_str(),
+                    (1u64, "", "##bad-owner", "grants=%zz", ""),
+                )
                 .unwrap();
             txn.commit().unwrap();
         }
@@ -630,7 +658,11 @@ mod tests {
         // and nobody else — the expected-owner comparison is on the
         // EFFECTIVE owner.
         storage
-            .create_bucket(&name("legacy").unwrap(), None, &acl::Acl::default_private(None))
+            .create_bucket(
+                &name("legacy").unwrap(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let lazy = storage

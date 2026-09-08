@@ -78,7 +78,7 @@ mod tests {
         );
         // std::io::Error Display wraps the custom message; assert the framing
         // and payload rather than the exact io formatting.
-        let io = Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let io = Error::Io(std::io::Error::other("boom"));
         let msg = io.to_string();
         assert!(msg.starts_with("S3 select: io error:"), "{msg}");
         assert!(msg.contains("boom"), "{msg}");
@@ -105,10 +105,7 @@ mod tests {
             e,
             Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "other"))
         );
-        assert_ne!(
-            e,
-            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "missing"))
-        );
+        assert_ne!(e, Error::Io(std::io::Error::other("missing")));
     }
 
     #[test]

@@ -32,8 +32,7 @@ pub use crate::error::Error;
 pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
 use crate::{
     _core::{
-        ETag,
-        acl,
+        ETag, acl,
         bucket::{Name, name},
         checksum, object, pipeline,
         storage::{

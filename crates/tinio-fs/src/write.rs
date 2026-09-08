@@ -414,11 +414,7 @@ impl AtomicWriter {
             // The temp is the future object file — created at `0600` on
             // unix regardless of the umask (spec 2026-09-05 §5a).
             let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true);
+            options.read(true).write(true).create(true).truncate(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -608,8 +604,7 @@ mod tests {
             .await
             .unwrap();
         let result =
-            AtomicWriter::commit(&temp, &target, Some(&root), fsutil::DirOwnerUid::new(None))
-                .await;
+            AtomicWriter::commit(&temp, &target, Some(&root), fsutil::DirOwnerUid::new(None)).await;
         fs::set_permissions(&root, Permissions::from_mode(0o755))
             .await
             .unwrap();

@@ -23,6 +23,8 @@ use tracing::warn;
 
 #[cfg(feature = "copy")]
 use crate::_core::storage::ByteRange;
+#[cfg(feature = "acl")]
+use crate::backend::acls::grant_headers;
 #[cfg(feature = "copy")]
 use crate::backend::{ConditionalHeaders, byte_range};
 use crate::{
@@ -45,8 +47,6 @@ use crate::{
         tags::parse_tagging_header,
     },
 };
-#[cfg(feature = "acl")]
-use crate::backend::acls::grant_headers;
 
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
@@ -1099,6 +1099,8 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+    #[cfg(feature = "acl")]
+    use crate::backend::testutil::{acl_backend, user_id};
     use crate::{
         _core::{
             acl, bucket,
@@ -1113,8 +1115,6 @@ mod tests {
             testutil::{s3_request, setup, setup_with_caps},
         },
     };
-    #[cfg(feature = "acl")]
-    use crate::backend::testutil::{acl_backend, user_id};
 
     /// A backend with the checksum feature on (the default toggle is
     /// off — the tests must opt in).

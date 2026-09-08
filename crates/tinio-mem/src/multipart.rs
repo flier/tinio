@@ -662,25 +662,28 @@ impl MultipartOps for MemoryStorage {
             // are owned copies, and the redb read txn is MVCC — no lock is
             // held).
             let mut rows: Vec<UploadRow> = Vec::new();
-            uploads.for_bucket(b, |upload_id, (key, initiated_at, tags_wire, owner_wire, acl_wire)| {
-                if !key.starts_with(&params.prefix) {
-                    return Ok(());
-                }
-                let Ok(key) = object::key(key) else {
-                    return Ok(()); // tampered row — skipped like list_objects
-                };
-                let checksum = checksums.get(b, upload_id)?;
-                rows.push(UploadRow {
-                    key,
-                    upload_id: upload_id.to_string(),
-                    initiated_at,
-                    tags: object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
-                    owner: decode_owner_wire(owner_wire),
-                    acl: decode_acl_wire(acl_wire),
-                    checksum,
-                });
-                Ok(())
-            })?;
+            uploads.for_bucket(
+                b,
+                |upload_id, (key, initiated_at, tags_wire, owner_wire, acl_wire)| {
+                    if !key.starts_with(&params.prefix) {
+                        return Ok(());
+                    }
+                    let Ok(key) = object::key(key) else {
+                        return Ok(()); // tampered row — skipped like list_objects
+                    };
+                    let checksum = checksums.get(b, upload_id)?;
+                    rows.push(UploadRow {
+                        key,
+                        upload_id: upload_id.to_string(),
+                        initiated_at,
+                        tags: object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                        owner: decode_owner_wire(owner_wire),
+                        acl: decode_acl_wire(acl_wire),
+                        checksum,
+                    });
+                    Ok(())
+                },
+            )?;
             // The resume marker pairs the key with the upload id, so a page
             // can position inside a same-key group (S3 `upload-id-marker`); a
             // bare key marker skips the whole key group — the conversion has
@@ -750,7 +753,10 @@ mod tests {
     async fn with_bucket() -> (MemoryStorage, Name) {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         (storage, name)
     }
 
@@ -762,10 +768,20 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &name,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
 
@@ -805,10 +821,20 @@ mod tests {
         })
         .unwrap();
         let name = bucket::name("data").unwrap();
-        storage.create_bucket(&name, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let key = object::key("big.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &name,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
 
@@ -859,7 +885,14 @@ mod tests {
 
         // The freed capacity is reusable by a new upload.
         let u2 = storage
-            .create_multipart_upload(&name, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &name,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         storage
@@ -880,11 +913,25 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let a = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let b = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         assert_ne!(a.upload_id, b.upload_id);
@@ -896,7 +943,14 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let key = object::key("a.bin").unwrap();
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         // The listed non-final parts must be >= the 5 MiB minimum (the
@@ -945,7 +999,14 @@ mod tests {
         let key = object::key("a.bin").unwrap();
         let min = MIN_PART_BYTES as usize;
         let upload = storage
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let under = storage
@@ -1021,7 +1082,14 @@ mod tests {
         let k = object::key("big.bin").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &k, None, tags.clone(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                tags.clone(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         assert_eq!(upload.tags, tags, "the create-time tags ride on the upload");
@@ -1117,7 +1185,14 @@ mod tests {
         // A second completion over the same key replaces the rows (the
         // old completion's parts must not accumulate).
         let upload2 = storage
-            .create_multipart_upload(&b, &k, None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let p = storage

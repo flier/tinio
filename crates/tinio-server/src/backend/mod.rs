@@ -26,11 +26,11 @@
 //! management-plane GET is intercepted pre-route in `data.rs` and is not
 //! subject to the access-layer pipeline.
 
+#[cfg(feature = "acl")]
+pub(crate) mod acls;
 mod conditions;
 #[cfg(feature = "cors")]
 pub(crate) mod cors;
-#[cfg(feature = "acl")]
-pub(crate) mod acls;
 mod errors;
 mod locks;
 mod s3;
@@ -130,15 +130,6 @@ const CHECKSUM_SPEC_CACHE_CAP: usize = 8192;
 #[cfg(feature = "multipart")]
 use std::{collections::HashMap, sync::Mutex};
 
-#[cfg(feature = "acl")]
-use crate::_auth::canned::GrantHeaders;
-#[cfg(feature = "acl")]
-use crate::_core::acl;
-#[cfg(feature = "acl")]
-use crate::_auth::identity::Identity;
-#[cfg(feature = "acl")]
-use self::acls::object_write_acl;
-
 pub(crate) use conditions::{
     ConditionalHeaders, DeleteConditions, check_write_shape, checked_if_match_size, decide_fetch,
     decide_range_error, generation_changed, parse_if_range,
@@ -162,7 +153,15 @@ use s3s::{
 #[cfg(feature = "select")]
 use tokio::sync::Semaphore;
 
+#[cfg(feature = "acl")]
+use self::acls::object_write_acl;
+#[cfg(feature = "acl")]
+use crate::_auth::canned::GrantHeaders;
+#[cfg(feature = "acl")]
+use crate::_auth::identity::Identity;
 pub use crate::_config::s3::Capabilities;
+#[cfg(feature = "acl")]
+use crate::_core::acl;
 #[cfg(feature = "multipart")]
 use crate::_core::checksum as core_checksum;
 use crate::{
@@ -522,21 +521,23 @@ impl<S: Storage> S3Backend<S> {
         let owner = self
             .owner_for(credentials)
             .expect("identity attached above");
-        let bucket_owner =
-            if matches!(canned, Some("bucket-owner-read" | "bucket-owner-full-control")) {
-                self.row_owner(
-                    self.storage
-                        .get_bucket_acl(bucket)
-                        .await
-                        .map_err(map_backend_error)?
-                        .owner
-                        .as_ref(),
-                )
-            } else {
-                // The expansion touches the bucket owner only for the
-                // `bucket-owner-*` names — the owner stands in.
-                owner.clone()
-            };
+        let bucket_owner = if matches!(
+            canned,
+            Some("bucket-owner-read" | "bucket-owner-full-control")
+        ) {
+            self.row_owner(
+                self.storage
+                    .get_bucket_acl(bucket)
+                    .await
+                    .map_err(map_backend_error)?
+                    .owner
+                    .as_ref(),
+            )
+        } else {
+            // The expansion touches the bucket owner only for the
+            // `bucket-owner-*` names — the owner stands in.
+            owner.clone()
+        };
         let acl = object_write_acl(&owner, &bucket_owner, canned, &headers)?;
         Ok(Some((owner, acl)))
     }

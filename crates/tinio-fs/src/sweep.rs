@@ -300,9 +300,19 @@ mod tests {
             (root, storage)
         };
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
         storage
-            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .create_multipart_upload(
+                &b,
+                &"big.bin".into(),
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
@@ -342,9 +352,19 @@ mod tests {
         fs::create_dir(state.path().join("tmp")).unwrap();
         fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
         let b = bucket::name("data").unwrap();
-        storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+        storage
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
         let upload = storage
-            .create_multipart_upload(&b, &"big.bin".into(), None, object::Tags::empty(), None, &acl::Acl::default_private(None))
+            .create_multipart_upload(
+                &b,
+                &"big.bin".into(),
+                None,
+                object::Tags::empty(),
+                None,
+                &acl::Acl::default_private(None),
+            )
             .await
             .unwrap();
         storage

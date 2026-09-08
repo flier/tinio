@@ -211,15 +211,13 @@ impl<R: Read> RecordReader for Reader<R> {
         if !self.header_done {
             self.header_done = true;
             match self.mode {
-                Some(Header::Use) => {
+                Some(Header::Use) | Some(Header::Ignore) => {
                     if !self.read_record()? {
                         return Ok(None);
                     }
-                    self.names_header = Rc::new(self.buf.iter().map(|f| f.to_string()).collect());
-                }
-                Some(Header::Ignore) => {
-                    if !self.read_record()? {
-                        return Ok(None);
+                    if self.mode == Some(Header::Use) {
+                        self.names_header =
+                            Rc::new(self.buf.iter().map(|f| f.to_string()).collect());
                     }
                 }
                 None => {}

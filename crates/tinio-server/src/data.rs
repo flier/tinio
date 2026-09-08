@@ -50,10 +50,10 @@ use time::{OffsetDateTime, format_description, format_description::BorrowedForma
 use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
 
-#[cfg(feature = "cors")]
-use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
 #[cfg(feature = "acl")]
 use crate::_auth::{AclAccess, ConfigAuth, Identity};
+#[cfg(feature = "cors")]
+use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
 use crate::{
     _core::storage::Storage,
     backend::{Capabilities, S3Backend},
@@ -191,8 +191,7 @@ impl DataPlane {
     ) -> Self {
         let storage = Arc::new(storage);
         let backend = MetricS3::new(
-            S3Backend::new_shared(Arc::clone(&storage), caps)
-                .with_identity(Arc::clone(&identity)),
+            S3Backend::new_shared(Arc::clone(&storage), caps).with_identity(Arc::clone(&identity)),
         );
         let mut builder = S3ServiceBuilder::new(backend);
         builder.set_auth(ConfigAuth::new(Arc::clone(&identity)));
@@ -1340,8 +1339,7 @@ mod tests {
             _auth::identity::{Identity, User},
             _core::{
                 acl::{Acl, GROUP_ALL_USERS, Grant, Grantee, GroupUri, OwnerId, Permission},
-                bucket,
-                object,
+                bucket, object,
                 storage::{BucketOps, ObjectOps},
             },
             _mem::MemoryStorage,
@@ -1534,7 +1532,8 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
             let (shutdown, rx) = watch::channel(false);
-            let plane = DataPlane::new_with_acl(storage, Capabilities::default(), Arc::new(identity));
+            let plane =
+                DataPlane::new_with_acl(storage, Capabilities::default(), Arc::new(identity));
             tokio::spawn(async move {
                 plane.serve(listener, rx).await.unwrap();
             });
@@ -1545,46 +1544,35 @@ mod tests {
                 "GET /data/public.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             )
             .await;
-            assert_eq!(status, 200, "unsigned GET on the public object must succeed");
+            assert_eq!(
+                status, 200,
+                "unsigned GET on the public object must succeed"
+            );
             let (status, body) = raw_request(
                 addr,
                 "GET /data/private.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             )
             .await;
-            assert_eq!(status, 403, "unsigned GET on the private object must be denied");
+            assert_eq!(
+                status, 403,
+                "unsigned GET on the private object must be denied"
+            );
             assert!(
                 String::from_utf8_lossy(&body).contains("AccessDenied"),
                 "{body:?}"
             );
 
             // Signed bob: his grants apply (and only his).
-            let (status, _) = signed_raw_request(
-                addr,
-                "GET",
-                "/data/bob-granted.txt",
-                "BKID",
-                "bob-secret",
-            )
-            .await;
+            let (status, _) =
+                signed_raw_request(addr, "GET", "/data/bob-granted.txt", "BKID", "bob-secret")
+                    .await;
             assert_eq!(status, 200, "signed bob's READ grant must apply");
-            let (status, _) = signed_raw_request(
-                addr,
-                "GET",
-                "/data/private.txt",
-                "BKID",
-                "bob-secret",
-            )
-            .await;
+            let (status, _) =
+                signed_raw_request(addr, "GET", "/data/private.txt", "BKID", "bob-secret").await;
             assert_eq!(status, 403, "signed bob must not read a grant-less object");
             // The owner bypass holds for alice.
-            let (status, _) = signed_raw_request(
-                addr,
-                "GET",
-                "/data/private.txt",
-                "AKID",
-                "alice-secret",
-            )
-            .await;
+            let (status, _) =
+                signed_raw_request(addr, "GET", "/data/private.txt", "AKID", "alice-secret").await;
             assert_eq!(status, 200, "the object owner bypasses the ACL");
 
             shutdown.send(true).unwrap();

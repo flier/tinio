@@ -282,7 +282,11 @@ mod tests {
     /// All records the reader yields for `sql`'s FROM clause over `input`.
     fn read(sql: &str, ty: Type, input: &str) -> Vec<Record> {
         let plan = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        let mut r = Reader::new(Cursor::new(input.as_bytes().to_vec()), Params { ty }, &plan.from);
+        let mut r = Reader::new(
+            Cursor::new(input.as_bytes().to_vec()),
+            Params { ty },
+            &plan.from,
+        );
         let mut out = Vec::new();
         while let Some(rec) = r.next().unwrap_or_else(|e| panic!("{sql}: {e}")) {
             out.push(rec);
@@ -293,7 +297,11 @@ mod tests {
     /// Engine rows over a JSON input, reader and engine composed.
     fn run(sql: &str, ty: Type, input: &str) -> Vec<OutRow> {
         let plan = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        let mut r = Reader::new(Cursor::new(input.as_bytes().to_vec()), Params { ty }, &plan.from);
+        let mut r = Reader::new(
+            Cursor::new(input.as_bytes().to_vec()),
+            Params { ty },
+            &plan.from,
+        );
         let mut engine = Engine::new(plan);
         let mut rows = Vec::new();
         while let Some(rec) = r.next().unwrap_or_else(|e| panic!("{sql}: {e}")) {
@@ -307,7 +315,11 @@ mod tests {
     /// The engine error for `sql` over `input`, panicking on success.
     fn run_err(sql: &str, ty: Type, input: &str) -> crate::Error {
         let plan = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        let mut r = Reader::new(Cursor::new(input.as_bytes().to_vec()), Params { ty }, &plan.from);
+        let mut r = Reader::new(
+            Cursor::new(input.as_bytes().to_vec()),
+            Params { ty },
+            &plan.from,
+        );
         let mut engine = Engine::new(plan);
         let mut result = None;
         while let Some(rec) = r.next().unwrap_or_else(|e| panic!("{sql}: {e}")) {
@@ -500,10 +512,7 @@ mod tests {
                 Type::Lines,
                 "{\"x\": {\"a\": 1, \"b\": 2}}\n"
             ),
-            vec![
-                Record::Json(Some(json!(1))),
-                Record::Json(Some(json!(2))),
-            ]
+            vec![Record::Json(Some(json!(1))), Record::Json(Some(json!(2))),]
         );
     }
 
@@ -520,7 +529,11 @@ mod tests {
     fn traversal_index_over_non_array_is_missing() {
         // An index step over a scalar (not an array) is zero matches.
         assert_eq!(
-            read("SELECT * FROM S3Object[*].x[0]", Type::Lines, "{\"x\": 5}\n"),
+            read(
+                "SELECT * FROM S3Object[*].x[0]",
+                Type::Lines,
+                "{\"x\": 5}\n"
+            ),
             vec![Record::Json(None)]
         );
     }
@@ -618,11 +631,7 @@ mod tests {
         let filler = "a".repeat(1024 * 1024 - 9);
         let line = format!("{{\"x\":\"{filler}\"}}");
         assert_eq!(line.len() + 1, 1024 * 1024);
-        let recs = read(
-            "SELECT * FROM S3Object",
-            Type::Lines,
-            &format!("{line}\n"),
-        );
+        let recs = read("SELECT * FROM S3Object", Type::Lines, &format!("{line}\n"));
         assert_eq!(
             recs,
             vec![Record::Json(Some(json!({"x": filler})))],
@@ -736,11 +745,7 @@ mod tests {
 
     #[test]
     fn json_null_attribute_is_null_not_missing() {
-        let rows = run(
-            "SELECT id FROM S3Object s",
-            Type::Lines,
-            "{\"id\": null}\n",
-        );
+        let rows = run("SELECT id FROM S3Object s", Type::Lines, "{\"id\": null}\n");
         assert_eq!(rows[0].vals, vec![Field::Present(Value::Null)]);
     }
 
@@ -876,18 +881,10 @@ mod tests {
         // arbitrary-precision scanner rewrites a signless exponent as
         // `e+` — `1e309` becomes `1e+309` — so the token is preserved up
         // to that sign-injection, never re-parsed.
-        let rows = run(
-            "SELECT x FROM S3Object s",
-            Type::Lines,
-            "{\"x\": 1e309}\n",
-        );
+        let rows = run("SELECT x FROM S3Object s", Type::Lines, "{\"x\": 1e309}\n");
         assert_eq!(rows[0].keys, vec!["x"]);
         assert_eq!(rows[0].vals, vec![raw("1e+309")]);
-        let rows = run(
-            "SELECT * FROM S3Object s",
-            Type::Lines,
-            "{\"x\": 1e309}\n",
-        );
+        let rows = run("SELECT * FROM S3Object s", Type::Lines, "{\"x\": 1e309}\n");
         assert_eq!(rows[0].vals, vec![raw("1e+309")]);
         // A plain integer token is verbatim.
         let rows = run(
@@ -948,8 +945,11 @@ mod tests {
         // error (there is no blank-line skip rule in the AWS surface).
         let plan = parse("SELECT * FROM S3Object").unwrap();
         let mut r = Reader::new(
-            Cursor::new(b"
-".to_vec()),
+            Cursor::new(
+                b"
+"
+                .to_vec(),
+            ),
             Params { ty: Type::Lines },
             &plan.from,
         );

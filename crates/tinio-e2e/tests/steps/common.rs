@@ -34,9 +34,7 @@ use crate::{
     _core::storage::Storage,
     _fs::{FsStorage, Scanner, ScannerOptions},
     _mem::MemoryStorage,
-    _server::_config::Config,
-    _server::identity::IdentityFromConfig,
-    _server::{Capabilities, DataPlane, Identity},
+    _server::{_config::Config, Capabilities, DataPlane, Identity, identity::IdentityFromConfig},
 };
 
 /// Repeatable body of length `n`: `(i * 31 + 7) % 256` at position `i`.
@@ -437,15 +435,24 @@ pub async fn request(
             }
             Err(e) => panic!("cannot send request to {addr}: {e}"),
         }
-        // Phase 2 — body and response. Never retried: the head went out,
-        // so the server may have executed the request.
+        // Phase 2 — body and response. The body write is never retried:
+        // the head went out, so the server may already have executed the
+        // request. The response read can still catch the same accept-queue
+        // abort: if the connection dies BEFORE any response byte arrives
+        // the server never executed the request (it was still queued), so
+        // retrying is safe. A read that aborts mid-stream (partial bytes
+        // already received) is never retried — the request ran.
         stream.write_all(body).await.expect("send the request body");
         let mut raw = Vec::new();
-        stream
-            .read_to_end(&mut raw)
-            .await
-            .expect("read the response");
-        return parse_response(&raw);
+        match stream.read_to_end(&mut raw).await {
+            Ok(_) => return parse_response(&raw),
+            Err(e) if raw.is_empty() && retryable(&e) && attempt < 2 => {
+                attempt += 1;
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => panic!("read the response from {addr}: {e}"),
+        }
     }
 }
 
