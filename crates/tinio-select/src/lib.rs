@@ -11,6 +11,7 @@
 extern crate csv as _csv;
 
 pub mod csv;
+mod dialect;
 pub mod engine;
 mod error;
 pub mod events;
@@ -18,6 +19,7 @@ pub mod json;
 pub mod output;
 #[cfg(feature = "parquet")]
 pub mod parquet;
+mod path;
 pub mod record;
 pub mod row;
 pub mod sql;

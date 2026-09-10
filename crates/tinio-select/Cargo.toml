@@ -10,9 +10,12 @@ arrow = { workspace = true, optional = true }
 bzip2.workspace = true
 bytes = { workspace = true, optional = true }
 csv.workspace = true
+delegate.workspace = true
 flate2.workspace = true
 parse-display.workspace = true
 parquet = { workspace = true, optional = true }
+pest.workspace = true
+pest_derive.workspace = true
 rust_decimal.workspace = true
 serde_json = { workspace = true, features = [
     "arbitrary_precision",
@@ -21,6 +24,7 @@ serde_json = { workspace = true, features = [
 sqlparser = { workspace = true, features = ["visitor"] }
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 criterion.workspace = true

@@ -1,0 +1,11 @@
+main = ${ SOI ~ path ~ EOI }
+path = ${ ^"S3Object" ~ (first_seg ~ seg*)? }
+first_seg = { "[" ~ wstar ~ "]" }
+seg = _{ dot_name | dot_wild | bracketed }
+dot_name = { "." ~ name }
+dot_wild = { "." ~ "*" }
+wstar = { "*" }
+bracketed = { "[" ~ (wstar | index | quoted) ~ "]" }
+name = { (ASCII_ALPHANUMERIC | "_" | "$")+ }
+index = { ASCII_DIGIT+ }
+quoted = { "'" ~ (!"'" ~ ANY)* ~ "'" }

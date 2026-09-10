@@ -7,7 +7,7 @@
 //!
 //! MISSING is a `Field` concept, not a `Value` one: `eval` collapses a
 //! missing column to `Value::Null`, and the three MISSING-sensitive spots
-//! (`IS NULL`[...], the `__s3_is_missing` sentinels) resolve their operand
+//! (`IS NULL`[...], the per-request MISSING sentinel) resolve their operand
 //! at the `Field` level first so a present-but-null value stays distinct
 //! from an absent field. The `IsNot*` forms are the pure negations of their
 //! cousins, so a MISSING operand answers `true` there (pinned, review
@@ -54,6 +54,10 @@ pub struct Engine {
     /// the whole AST, so building it per row was pure waste (review
     /// 2026-09-06 simplify); `None` at `Wild` slots.
     item_keys: Vec<Option<String>>,
+    /// This request's MISSING sentinel name, derived once in `new`
+    /// (`SentinelNames::is_missing()` formats a fresh String — paying it
+    /// per row on every Function eval was the waste; review 2026-09-09).
+    missing_name: String,
 }
 
 /// One projection item's aggregate form.
@@ -97,14 +101,19 @@ enum ExtremaMode {
 }
 
 /// What an expression in flight sees: the record under test plus the FROM
-/// alias (the JSON path/access arms need the alias; flat lookups do not).
+/// alias (the JSON path/access arms need the alias; flat lookups do not),
+/// plus this request's MISSING sentinel name (the per-request uuid name —
+/// the dialect hook produced the sentinel call under it; derived once in
+/// `Engine::new`, never per row).
 struct RowCtx<'a> {
     record: &'a Record,
     alias: &'a Option<String>,
+    missing_name: &'a str,
 }
 
 impl Engine {
     pub fn new(plan: QueryPlan) -> Self {
+        let missing_name = plan.missing.is_missing();
         let agg_state = plan.aggregates.then(|| AggState {
             count: 0,
             per_col: vec![AggCol::default(); plan.projections.len()],
@@ -125,6 +134,7 @@ impl Engine {
             agg_state,
             agg_kinds: None,
             item_keys,
+            missing_name,
         }
     }
 
@@ -141,6 +151,7 @@ impl Engine {
         let ctx = RowCtx {
             record: &rec,
             alias: &self.plan.from.alias,
+            missing_name: &self.missing_name,
         };
         if !self.passes(&ctx)? {
             return Ok(None);
@@ -185,6 +196,7 @@ impl Engine {
         let ctx = RowCtx {
             record: &rec,
             alias: &self.plan.from.alias,
+            missing_name: &self.missing_name,
         };
         if self.passes(&ctx)? {
             let kinds = self.agg_kinds.as_deref().expect("classified above");
@@ -841,7 +853,7 @@ fn column_field(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Field, Err
     Ok(column_value(ctx.record, name, style)?.unwrap_or(Field::Missing))
 }
 
-/// The single expression argument Task 3's `IS [NOT] MISSING` rewrite emits.
+/// The single expression argument the `IS [NOT] MISSING` hook emits.
 fn sentinel_operand(f: &Function) -> Result<Expr, Error> {
     match &f.args {
         FunctionArguments::List(list) => match list.args.as_slice() {
@@ -852,12 +864,13 @@ fn sentinel_operand(f: &Function) -> Result<Expr, Error> {
     }
 }
 
-/// The MISSING sentinels are single-part UNQUOTED identifiers — the rewrite
-/// always inserts them so (review 2026-09-06b R15). A qualified or quoted
-/// user-authored call must not adopt MISSING semantics (the parse guard
-/// rejects the unquoted forms request-level; this is the engine's own
-/// defense).
-fn is_sentinel_call(name: &ObjectName, sentinel: &str) -> bool {
+/// The MISSING sentinel is a single-part UNQUOTED identifier — the dialect
+/// hook always inserts it so. A qualified or quoted call must not adopt
+/// MISSING semantics (the engine's own guard; the R15 parse scan is gone —
+/// the per-request uuid name is unguessable, so user text cannot collide).
+/// The dialect's chained-form check (`is_sentinel_expr`) calls this too:
+/// one definition of sentinel identity across both sides.
+pub(crate) fn is_sentinel_call(name: &ObjectName, sentinel: &str) -> bool {
     let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else {
         return false;
     };
@@ -951,19 +964,13 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error> {
             Ok(Value::Bool(hit != matches!(expr, Expr::IsNotFalse(_))))
         }
         Expr::Function(f) => {
-            // Task 3's `IS [NOT] MISSING` rewrite (sqlparser 0.62 has no
-            // IsMissing variant) is the only function form over a
-            // non-aggregate plan; anything else is an aggregate guard.
-            if is_sentinel_call(&f.name, "__s3_is_missing") {
+            // The dialect's parse_infix hook (sqlparser 0.62 has no
+            // IsMissing variant) is the only function-form producer besides
+            // the aggregates; the per-request uuid name is what it emitted
+            // (the name is carried on the ctx — derived once per request).
+            if is_sentinel_call(&f.name, ctx.missing_name) {
                 let operand = sentinel_operand(f)?;
                 return Ok(Value::Bool(matches!(
-                    eval_field(&operand, ctx)?,
-                    Field::Missing
-                )));
-            }
-            if is_sentinel_call(&f.name, "__s3_is_not_missing") {
-                let operand = sentinel_operand(f)?;
-                return Ok(Value::Bool(!matches!(
                     eval_field(&operand, ctx)?,
                     Field::Missing
                 )));

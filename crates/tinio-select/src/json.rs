@@ -20,9 +20,10 @@ use serde_json::Value;
 
 use crate::{
     error::Error,
+    path::PathSeg,
     record::{CAP_MESSAGE, MAX_RECORD, RecordReader},
     row::{NameStyle, Record, Value as RowValue},
-    sql::{FromClause, PathSeg},
+    sql::FromClause,
 };
 
 /// JSON input framing (S3 Select `InputSerialization.JSON.Type`).
@@ -481,6 +482,21 @@ mod tests {
     }
 
     #[test]
+    fn traversal_bracket_name_case_insensitive() {
+        // Q13: `['name']` is a by-name form, not a quoted identifier — the
+        // exact arm is only for SELECT/WHERE quoted attribute access. The
+        // traversal feeder's NameStyle::Bare call site never routes a
+        // bracket segment as quoted, so the bracket spelling resolves
+        // case-insensitively like `.name` above.
+        let recs = read(
+            "SELECT * FROM S3Object[*].files['name']",
+            Type::Lines,
+            "{\"files\": {\"NAME\": \"x\"}}\n",
+        );
+        assert_eq!(recs, vec![Record::Json(Some(json!("x")))]);
+    }
+
+    #[test]
     fn traversal_wild_over_scalar_is_missing() {
         // `[*]` over a scalar (not array/object) is a zero-match step →
         // exactly one MISSING row, never a present null.
@@ -580,6 +596,27 @@ mod tests {
         );
         match r.next() {
             Err(crate::Error::Ambiguous(m)) => assert_eq!(m, "id"),
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn traversal_bracket_name_duplicates_are_ambiguous() {
+        // Q13: case-folded duplicate keys behind the `['name']` spelling are
+        // ambiguous — the same AmbiguousFieldName as `.name` (the R10 test
+        // above); the bracket segment is never routed as quoted-exact.
+        let plan = parse("SELECT * FROM S3Object[*].files['name']").unwrap();
+        let mut r = Reader::new(
+            Cursor::new(
+                "{\"files\": {\"NAME\": \"a\", \"name\": \"b\"}}\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            Params { ty: Type::Lines },
+            &plan.from,
+        );
+        match r.next() {
+            Err(crate::Error::Ambiguous(m)) => assert_eq!(m, "name"),
             other => panic!("expected ambiguous, got {other:?}"),
         }
     }

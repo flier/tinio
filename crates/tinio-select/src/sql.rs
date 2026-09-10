@@ -1,29 +1,21 @@
-//! SQL parse + validate: a FROM-path preprocessor, a quote-aware
-//! `IS [NOT] MISSING` rewrite, then sqlparser + a restrict-grammar
-//! validator producing the engine's `QueryPlan`.
+//! SQL parse + validate: sqlparser through the custom dialect (`parse_statement`
+//! for the custom FROM factor + the `IS [NOT] MISSING` hook) + a
+//! restrict-grammar validator producing the engine's `QueryPlan`.
 
-use std::{collections::HashMap, ops::ControlFlow};
+use std::ops::ControlFlow;
 
 use sqlparser::{
     ast::{
         DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-        LimitClause, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
+        LimitClause, ObjectName, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
+        TableFactor, Value, Visit, Visitor,
     },
-    dialect::GenericDialect,
     parser::Parser,
-    tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
 
-use crate::error::Error;
-
-/// One step of the FROM object path (`S3Object[*].books[0]`); `Index` is
-/// 0-based.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathSeg {
-    Name(String),
-    Index(usize),
-    Wild,
-}
+// Re-export: `FromClause.segments` keeps the public path `sql::PathSeg`.
+pub use crate::path::PathSeg;
+use crate::{dialect::S3SelectDialect, error::Error};
 
 /// The parsed FROM clause: the S3Object path walk plus the optional alias.
 /// The `segments` list is the whole traversal state (a non-traversed clause
@@ -46,6 +38,34 @@ pub enum Projection {
     Item { expr: Expr, alias: Option<String> },
 }
 
+/// Per-request MISSING sentinel. Only the uuid is stored; the full function
+/// name is `__s3_is_missing_<uuid>` (the prefix is a debug/tracing marker —
+/// not a reserved-name attack surface; the unguessable part is the uuid).
+/// `IS NOT MISSING` reuses the same name: `UnaryOp{Not}` wraps the call.
+/// An earlier design held two fixed names (`__s3_is_missing` /
+/// `__s3_is_not_missing`); now one per-request uuid, so user text can
+/// never collide with the sentinel (review R1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentinelNames {
+    /// Private: minted only via `mint()` (review 2026-09-10).
+    uuid: uuid::Uuid,
+}
+
+impl SentinelNames {
+    /// Mint the request's sentinel names.
+    pub fn mint() -> Self {
+        Self {
+            uuid: uuid::Uuid::new_v4(),
+        }
+    }
+
+    /// This request's full sentinel function name — the crate's single
+    /// construction point.
+    pub fn is_missing(&self) -> String {
+        format!("__s3_is_missing_{}", self.uuid.simple())
+    }
+}
+
 /// Validated query plan consumed by the engine (`eval`, `json::Reader`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPlan {
@@ -54,16 +74,39 @@ pub struct QueryPlan {
     pub where_expr: Option<Expr>,
     pub limit: Option<usize>,
     pub aggregates: bool,
+    pub missing: SentinelNames,
 }
 
 /// AWS documented expression limit (review 2026-09-05 #5).
 const MAX_EXPRESSION: usize = 256 * 1024;
 
-const S3_OBJECT: &str = "S3Object";
+/// The FROM factor name, spelled once (the dialect's factor match and AST
+/// construction and the validator all read it here).
+pub(crate) const S3_OBJECT: &str = "S3Object";
+
+/// Not-the-`S3Object` rejection: the dialect's factor match and the
+/// validator's quoted / mismatched-name arms share this literal.
+pub(crate) const EXPECTED_S3OBJECT_MSG: &str = "invalid FROM: expected S3Object";
+
+/// The not-exactly-one-factor rejection: zero or several factors, a
+/// non-table factor, or a non-identifier object-name part.
+pub(crate) const ONE_S3OBJECT_MSG: &str = "FROM must reference exactly one S3Object";
+
+/// The JOIN construct kind, spelled once: the validator's joins arm and the
+/// skeleton's marker → `Error::Unsupported` mapping both read it.
+pub(crate) const JOIN_KIND: &str = "JOIN";
+
+/// The JOIN-family words: `JOIN` plus the keywords that can only appear as
+/// part of a join. Single authority for the dialect's `is_join_keyword`
+/// rejection; a test asserts every entry is also in `CLAUSE_KEYWORDS`.
+pub(crate) const JOIN_KEYWORDS: [&str; 9] = [
+    "join", "left", "right", "inner", "cross", "full", "natural", "on", "using",
+];
 
 /// Keywords that can never serve as the FROM alias (they start the next
-/// clause, or they are join/table operators).
-const CLAUSE_KEYWORDS: &[&str] = &[
+/// clause, or they are join/table operators). Shared with the dialect's
+/// custom-alias parser.
+pub(crate) const CLAUSE_KEYWORDS: &[&str] = &[
     "where",
     "group",
     "order",
@@ -89,24 +132,32 @@ const CLAUSE_KEYWORDS: &[&str] = &[
     "format",
 ];
 
-/// Keywords that terminate an operand walk-back in the `IS [NOT] MISSING`
-/// rewrite: everything that binds looser than `IS`.
-const OPERAND_BOUNDARY_KEYWORDS: &[&str] = &[
-    "and", "or", "not", "where", "select", "from", "limit", "when", "then", "else",
-];
-
 /// Parse + validate one S3 Select expression.
 pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
     if sql.len() > MAX_EXPRESSION {
         return Err(Error::Parse("expression exceeds 256 KiB".into()));
     }
-    // Before the MISSING rewrite (which inserts the sentinel names): a
-    // user-authored sentinel call would silently adopt MISSING semantics.
-    reject_reserved_functions(sql)?;
-    let (from, rewritten) = preprocess_from(sql)?;
-    let rewritten = rewrite_is_missing(&rewritten)?;
-    let stmts = Parser::parse_sql(&GenericDialect, &rewritten)
-        .map_err(|e| Error::Parse(format!("syntax error: {e}")))?;
+    let missing = SentinelNames::mint();
+    // A SELECT carrying an `S3Object[` / `S3Object.` candidate is parsed by
+    // the dialect's parse_statement skeleton (the custom FROM factor);
+    // everything else goes down the stock parse + validate_from path.
+    // `IS MISSING` stays as written — the dialect's parse_infix hook takes it.
+    let dialect = S3SelectDialect::new(missing.clone(), sql);
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(stmts) => stmts,
+        Err(e) => {
+            // The skeleton marks its JOIN-family rejection so it keeps the
+            // old validator's Unsupported channel instead of a Parse
+            // wrapper; every other parser error is an honest syntax error
+            // (LIMIT BY / OFFSET are not marked — the validator's own arms
+            // reject them after a successful parse).
+            return Err(if dialect.take_join_rejected() {
+                Error::Unsupported(JOIN_KIND.into())
+            } else {
+                Error::Parse(format!("syntax error: {e}"))
+            });
+        }
+    };
     let stmt = match stmts.as_slice() {
         [s] => s,
         [] => return Err(Error::Parse("empty expression".into())),
@@ -169,7 +220,11 @@ pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
             return Err(Error::Parse("LIMIT must be a positive integer".into()));
         }
     };
-    validate_from(select, &from)?;
+    // One FromClause construction for both paths: the segments come from
+    // the dialect's captured slot (empty for a non-custom statement), the
+    // alias from the single validated AST factor.
+    let segments = dialect.take_segments().unwrap_or_default();
+    let from = validate_from(select, segments)?;
     // Aggregates are projection-derived (`plan.aggregates` below); a WHERE
     // aggregate would surface in-stream as an internal engine error instead
     // of a request-level parse error — refused here (review 2026-09-05b).
@@ -226,6 +281,7 @@ pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
         where_expr: select.selection.clone(),
         limit,
         aggregates,
+        missing,
     })
 }
 
@@ -233,7 +289,7 @@ pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
 fn positive_limit(limit: &Expr) -> Result<Option<usize>, Error> {
     match limit {
         Expr::Value(v) => match &v.value {
-            sqlparser::ast::Value::Number(n, _) => match n.parse::<usize>() {
+            Value::Number(n, _) => match n.parse::<usize>() {
                 Ok(n) if n > 0 => Ok(Some(n)),
                 _ => Err(Error::Parse("LIMIT must be a positive integer".into())),
             },
@@ -243,622 +299,39 @@ fn positive_limit(limit: &Expr) -> Result<Option<usize>, Error> {
     }
 }
 
-/// The FROM clause must be exactly the single `S3Object` factor (with the
-/// alias the preprocessor recorded).
-fn validate_from(select: &sqlparser::ast::Select, clause: &FromClause) -> Result<(), Error> {
+/// The FROM clause must be exactly the single `S3Object` factor; builds the
+/// `FromClause` from the caller's segments and the factor's own alias — the
+/// single source for both paths (custom-path statements carry the dialect's
+/// captured segments, non-custom ones an empty list; the AST factor is the
+/// same plain `S3Object` + alias shape either way).
+fn validate_from(select: &Select, segments: Vec<PathSeg>) -> Result<FromClause, Error> {
     let twj = match select.from.as_slice() {
         [t] => t,
-        _ => {
-            return Err(Error::Parse(
-                "FROM must reference exactly one S3Object".into(),
-            ));
-        }
+        _ => return Err(Error::Parse(ONE_S3OBJECT_MSG.into())),
     };
     if !twj.joins.is_empty() {
-        return Err(Error::Unsupported("JOIN".into()));
+        return Err(Error::Unsupported(JOIN_KIND.into()));
     }
     let TableFactor::Table { name, alias, .. } = &twj.relation else {
-        return Err(Error::Parse(
-            "FROM must reference exactly one S3Object".into(),
-        ));
+        return Err(Error::Parse(ONE_S3OBJECT_MSG.into()));
     };
-    if name.0.len() != 1 {
-        return Err(Error::Parse(
-            "FROM must reference exactly one S3Object".into(),
-        ));
-    }
-    let sqlparser::ast::ObjectNamePart::Identifier(name_ident) = &name.0[0] else {
+    let [ObjectNamePart::Identifier(name_ident)] = name.0.as_slice() else {
         // sqlparser 0.62 added `ObjectNamePart::Function` (a call in
         // object-name position) — never a valid FROM factor here.
-        return Err(Error::Parse(
-            "FROM must reference exactly one S3Object".into(),
-        ));
+        return Err(Error::Parse(ONE_S3OBJECT_MSG.into()));
     };
+    if name_ident.quote_style.is_some() {
+        // Quoted "S3Object": the old scanner rejected it by accident, the
+        // new grammar rejects it explicitly.
+        return Err(Error::Parse(EXPECTED_S3OBJECT_MSG.into()));
+    }
     if !name_ident.value.eq_ignore_ascii_case(S3_OBJECT) {
-        return Err(Error::Parse(
-            "FROM must reference exactly one S3Object".into(),
-        ));
+        return Err(Error::Parse(EXPECTED_S3OBJECT_MSG.into()));
     }
-    if alias.as_ref().map(|a| a.name.value.as_str()) != clause.alias.as_deref() {
-        return Err(Error::Parse(
-            "FROM must reference exactly one S3Object".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// The MISSING-rewrite sentinel function names: a user-authored call would
-/// silently adopt MISSING semantics (review 2026-09-06b R15) — refused
-/// before the rewrite, which itself inserts the names.
-const SENTINEL_FUNCTIONS: [&str; 2] = ["__s3_is_missing", "__s3_is_not_missing"];
-
-/// Reject a user-authored sentinel function call anywhere in the expression.
-/// Runs on the ORIGINAL text (before `rewrite_is_missing` inserts the
-/// sentinels) and is quote/comment-aware like every other scan: a `__s3_*`
-/// name in call position (identifier followed by `(`) is refused with an
-/// `Unsupported` — the request-level 400 path, never silent sentinel
-/// adoption. The engine adds its own single-part-unquoted guard as defense.
-fn reject_reserved_functions(sql: &str) -> Result<(), Error> {
-    let bytes = sql.as_bytes();
-    let mut state = ScanState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        let (next, top) = state.step(bytes, i);
-        if top {
-            for sentinel in SENTINEL_FUNCTIONS {
-                let end = i + sentinel.len();
-                if bytes
-                    .get(i..end)
-                    .is_some_and(|w| w.eq_ignore_ascii_case(sentinel.as_bytes()))
-                    && (i == 0 || !is_ident_byte(bytes[i - 1]))
-                    && !bytes.get(end).is_some_and(|b| is_ident_byte(*b))
-                    && function_paren(bytes, end)
-                {
-                    return Err(Error::Unsupported(format!(
-                        "reserved function name: {sentinel}"
-                    )));
-                }
-            }
-        }
-        i = next;
-    }
-    Ok(())
-}
-
-/// `(` after optional whitespace — the preceding word is in call position.
-fn function_paren(bytes: &[u8], mut i: usize) -> bool {
-    while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
-        i += 1;
-    }
-    bytes.get(i) == Some(&b'(')
-}
-
-/// Find the first top-level `FROM` keyword (quote-aware) and rewrite the
-/// object clause: segments stripped, object text normalized to `S3Object`.
-fn preprocess_from(sql: &str) -> Result<(FromClause, String), Error> {
-    let bytes = sql.as_bytes();
-    let Some((_, from_end)) = find_from_keyword(bytes) else {
-        // No top-level FROM: leave the text for sqlparser; the validator
-        // rejects (UNION, SELECT-without-FROM).
-        return Ok((
-            FromClause {
-                segments: Vec::new(),
-                alias: None,
-            },
-            sql.to_string(),
-        ));
-    };
-    let mut j = from_end;
-    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    // The object clause is self-terminating (its grammar binds segments
-    // before any clause keyword), so parse the full remainder directly;
-    // only when it is not an S3Object path do we need a roomy FROM-clause
-    // scan to separate JOIN (unsupported) from a malformed object.
-    let (clause, seg_end) = match parse_object_clause(&sql[j..]) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            let clause_end = from_clause_end(bytes, j);
-            if clause_has_join(bytes, j, clause_end) {
-                return Err(Error::Unsupported("JOIN".into()));
-            }
-            return Err(e);
-        }
-    };
-    let rewritten = format!("{}{}{}", &sql[..j], S3_OBJECT, &sql[j + seg_end..]);
-    Ok((clause, rewritten))
-}
-
-/// Shared byte-scan state for the FROM scanners: quotes (`'`/`"` with
-/// doubled-quote escapes) and comments (`--` line, `/* */` block) are
-/// invisible to the word lookups — a comment or string containing `from`,
-/// `join` or a clause keyword can never misdirect the FROM scan.
-#[derive(Default)]
-struct ScanState {
-    in_string: bool,
-    in_ident: bool,
-    in_block: bool,
-}
-
-impl ScanState {
-    /// Advance the scanner over one byte at `i`; returns the next index to
-    /// examine and whether `i` was a plain top-level byte (outside quotes
-    /// and comments — a word start may sit there).
-    fn step(&mut self, bytes: &[u8], i: usize) -> (usize, bool) {
-        if self.in_block {
-            if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                self.in_block = false;
-                (i + 2, false)
-            } else {
-                (i + 1, false)
-            }
-        } else if self.in_string {
-            if bytes[i] == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
-                (i + 2, false) // doubled quote inside a string
-            } else {
-                let closing = bytes[i] == b'\'';
-                if closing {
-                    self.in_string = false;
-                }
-                (i + 1, false)
-            }
-        } else if self.in_ident {
-            if bytes[i] == b'"' && bytes.get(i + 1) == Some(&b'"') {
-                (i + 2, false)
-            } else {
-                let closing = bytes[i] == b'"';
-                if closing {
-                    self.in_ident = false;
-                }
-                (i + 1, false)
-            }
-        } else {
-            match bytes[i] {
-                b'\'' => {
-                    self.in_string = true;
-                    (i + 1, false)
-                }
-                b'"' => {
-                    self.in_ident = true;
-                    (i + 1, false)
-                }
-                b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                    // Line comment: everything to the newline, or the end.
-                    let mut j = i + 2;
-                    while j < bytes.len() && bytes[j] != b'\n' {
-                        j += 1;
-                    }
-                    if j < bytes.len() {
-                        (j + 1, false)
-                    } else {
-                        (j, false)
-                    }
-                }
-                b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                    self.in_block = true;
-                    (i + 2, false)
-                }
-                _ => (i + 1, true),
-            }
-        }
-    }
-}
-
-/// Scan for the first top-level `FROM` keyword — quote- and comment-aware
-/// (a `-- from` comment before the real FROM never misdirects the scan).
-fn find_from_keyword(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut state = ScanState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        let (next, plain) = state.step(bytes, i);
-        if plain && (bytes[i] == b'f' || bytes[i] == b'F') && word_at(bytes, i, "from") {
-            return Some((i, i + 4));
-        }
-        i = next;
-    }
-    None
-}
-
-/// End of the FROM clause: first top-level clause keyword or `;`.
-fn from_clause_end(bytes: &[u8], start: usize) -> usize {
-    let mut state = ScanState::default();
-    let mut i = start;
-    let mut candidate = Vec::new();
-    while i < bytes.len() {
-        let (next, plain) = state.step(bytes, i);
-        if plain {
-            if bytes[i] == b';' {
-                return i;
-            }
-            if is_ascii_ident_start(bytes[i]) {
-                candidate.clear();
-                let mut k = i;
-                while k < bytes.len() && is_ident_byte(bytes[k]) {
-                    candidate.push(bytes[k]);
-                    k += 1;
-                }
-                let word = std::str::from_utf8(&candidate).unwrap_or_default();
-                if [
-                    "where",
-                    "group",
-                    "order",
-                    "having",
-                    "limit",
-                    "union",
-                    "except",
-                    "intersect",
-                ]
-                .iter()
-                .any(|k| k.eq_ignore_ascii_case(word))
-                {
-                    return i;
-                }
-                i = k;
-                continue;
-            }
-        }
-        i = next;
-    }
-    bytes.len()
-}
-
-/// Join detection inside the FROM clause (the whole clause is rejected up
-/// front so `FROM a JOIN b` reports JOIN rather than a path error).
-fn clause_has_join(bytes: &[u8], start: usize, end: usize) -> bool {
-    let mut state = ScanState::default();
-    let mut i = start;
-    while i < end {
-        let (next, plain) = state.step(bytes, i);
-        if plain && word_at(bytes, i, "join") {
-            return true;
-        }
-        // A quote/comment span may run past `end` — clamp and stop.
-        i = next.min(end);
-    }
-    false
-}
-
-/// `S3Object` + zero or more segments (`.` name, `*`, `[N]`, `[*]`, `['n']`)
-/// and an optional `AS? alias`; returns the clause and the byte length of
-/// the segment text (the splice point, the alias stays in the source).
-fn parse_object_clause(s: &str) -> Result<(FromClause, usize), Error> {
-    let bytes = s.as_bytes();
-    let starts = bytes
-        .get(..S3_OBJECT.len())
-        .is_some_and(|b| b.eq_ignore_ascii_case(S3_OBJECT.as_bytes()));
-    if !starts
-        || bytes
-            .get(S3_OBJECT.len())
-            .copied()
-            .is_some_and(is_ident_byte)
-    {
-        return Err(Error::Parse("invalid FROM: expected S3Object".into()));
-    }
-    let mut i = S3_OBJECT.len();
-    let mut segments = Vec::new();
-    while let Some(&b) = bytes.get(i) {
-        match b {
-            b'.' if !segments.is_empty() => {
-                i += 1;
-                match bytes.get(i) {
-                    Some(b'*') => {
-                        segments.push(PathSeg::Wild);
-                        i += 1;
-                    }
-                    Some(_) => {
-                        let start = i;
-                        while bytes.get(i).copied().is_some_and(is_ident_byte) {
-                            i += 1;
-                        }
-                        if i == start {
-                            return Err(Error::Parse("invalid FROM path".into()));
-                        }
-                        segments.push(PathSeg::Name(s[start..i].to_string()));
-                    }
-                    None => return Err(Error::Parse("invalid FROM path".into())),
-                }
-            }
-            b'.' => {
-                return Err(Error::Parse(
-                    "invalid FROM path: must start with S3Object[*]".into(),
-                ));
-            }
-            b'[' if segments.is_empty() && bytes.get(i + 1) != Some(&b'*') => {
-                return Err(Error::Parse(
-                    "invalid FROM path: must start with S3Object[*]".into(),
-                ));
-            }
-            b'[' => {
-                i += 1;
-                match bytes.get(i) {
-                    Some(b'*') => {
-                        i += 1;
-                        expect(bytes, i, b']')?;
-                        i += 1;
-                        segments.push(PathSeg::Wild);
-                    }
-                    Some(n) if n.is_ascii_digit() => {
-                        let start = i;
-                        while bytes.get(i).copied().is_some_and(|n| n.is_ascii_digit()) {
-                            i += 1;
-                        }
-                        let value = s[start..i]
-                            .parse::<usize>()
-                            .map_err(|_| Error::Parse("invalid FROM path".into()))?;
-                        expect(bytes, i, b']')?;
-                        i += 1;
-                        segments.push(PathSeg::Index(value));
-                    }
-                    Some(b'\'') => {
-                        i += 1;
-                        let start = i;
-                        while bytes.get(i) != Some(&b'\'') {
-                            i += 1;
-                            if i >= bytes.len() {
-                                return Err(Error::Parse("invalid FROM path".into()));
-                            }
-                        }
-                        let name = s[start..i].to_string();
-                        expect(bytes, i + 1, b']')?;
-                        i += 2;
-                        segments.push(PathSeg::Name(name));
-                    }
-                    _ => return Err(Error::Parse("invalid FROM path".into())),
-                }
-            }
-            _ => break,
-        }
-    }
-    let seg_end = i;
-    let mut alias = None;
-    let mut j = i;
-    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    if word_at(bytes, j, "as") {
-        j += 2;
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        let w =
-            take_ident(bytes, &mut j).ok_or_else(|| Error::Parse("invalid FROM path".into()))?;
-        if clause_keyword(&w) {
-            return Err(Error::Parse("invalid FROM path".into()));
-        }
-        alias = Some(w);
-    } else if let Some(w) = take_ident(bytes, &mut j).filter(|w| !clause_keyword(w)) {
-        alias = Some(w);
-    }
-    Ok((FromClause { segments, alias }, seg_end))
-}
-
-/// Check whether a bare-word candidate actually starts a clause keyword
-/// (then it is not an alias).
-fn clause_keyword(s: &str) -> bool {
-    CLAUSE_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(s))
-}
-
-/// Consume an identifier (bare or `"quoted"`) at position `*i`.
-fn take_ident(bytes: &[u8], i: &mut usize) -> Option<String> {
-    match bytes.get(*i) {
-        Some(b'"') => {
-            let start = *i + 1;
-            let mut k = start;
-            while k < bytes.len() && bytes[k] != b'"' {
-                k += 1;
-            }
-            if k >= bytes.len() {
-                return None;
-            }
-            *i = k + 1;
-            Some(String::from_utf8_lossy(&bytes[start..k]).into_owned())
-        }
-        Some(b) if is_ident_byte(*b) => {
-            let start = *i;
-            let mut k = start;
-            while k < bytes.len() && is_ident_byte(bytes[k]) {
-                k += 1;
-            }
-            *i = k;
-            Some(String::from_utf8_lossy(&bytes[start..k]).into_owned())
-        }
-        _ => None,
-    }
-}
-
-fn expect(bytes: &[u8], i: usize, b: u8) -> Result<(), Error> {
-    if bytes.get(i) == Some(&b) {
-        Ok(())
-    } else {
-        Err(Error::Parse("invalid FROM path".into()))
-    }
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
-}
-
-fn is_ascii_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-/// Case-insensitive keyword match: the word must sit at statement position
-/// (start, whitespace, `(`, `,` or `;`) — never after `.`/identifier-bytes,
-/// which are field names like `s.from`.
-fn word_at(bytes: &[u8], i: usize, word: &str) -> bool {
-    let end = i + word.len();
-    if end > bytes.len() || !bytes[i..end].eq_ignore_ascii_case(word.as_bytes()) {
-        return false;
-    }
-    let boundary_before = i == 0
-        || matches!(
-            bytes[i - 1],
-            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b',' | b';'
-        );
-    boundary_before && (end == bytes.len() || !is_ident_byte(bytes[end]))
-}
-
-/// Rewrite every top-level `X IS [NOT] MISSING` into the sentinel calls
-/// `__s3_is_missing(X)` / `__s3_is_not_missing(X)` — sqlparser 0.62 has no
-/// `IsMissing` variant, and `IS NULL` substitution would be wrong (a
-/// present-but-null field must not satisfy MISSING). Token-based, so
-/// strings, quoted identifiers and comments are never entered. A chained
-/// `X IS [NOT] MISSING IS MISSING` is not valid SQL: the second operand's
-/// walk-back runs past the first rewrite's span — refused (Parse) rather
-/// than splicing an overlapping range (an index-out-of-range panic on
-/// untrusted request input).
-fn rewrite_is_missing(sql: &str) -> Result<String, Error> {
-    let mut tokenizer = Tokenizer::new(&GenericDialect, sql);
-    let Ok(tokens) = tokenizer.tokenize_with_location() else {
-        return Ok(sql.to_string()); // unterminated literal etc: let the parser report
-    };
-    let pos = positions(sql);
-    let mut found: Vec<(usize, usize, usize, bool)> = Vec::new();
-    let mut prev_missing_end = 0;
-    let mut i = 0;
-    // `positions` carries every char boundary, so a lookup can only miss on
-    // a tokenizer/offset divergence — refuse instead of indexing the
-    // HashMap (same panic-on-untrusted-input shape as the splice overlap).
-    let offset = |t: &TokenWithSpan| -> Result<(usize, usize), Error> {
-        let start = pos
-            .get(&token_start(t))
-            .copied()
-            .ok_or_else(|| Error::Parse("invalid IS MISSING expression".into()))?;
-        let end = pos
-            .get(&token_end(t))
-            .copied()
-            .ok_or_else(|| Error::Parse("invalid IS MISSING expression".into()))?;
-        Ok((start, end))
-    };
-    while i < tokens.len() {
-        if !is_word(&tokens[i], "is") {
-            i += 1;
-            continue;
-        }
-        let mut j = skip_whitespace(&tokens, i + 1);
-        let negated = tokens.get(j).is_some_and(|t| is_word(t, "not"));
-        if negated {
-            j = skip_whitespace(&tokens, j + 1);
-        }
-        if !tokens.get(j).is_some_and(|t| is_word(t, "missing")) {
-            i += 1;
-            continue;
-        }
-        // Walk back over the operand, tracking matching parens; stop at a
-        // top-level token that binds looser than `IS` (a boundary keyword
-        // after a `.` is a field name, e.g. `s.from`, not the keyword).
-        let mut depth = 0usize;
-        let mut k = i as isize - 1;
-        while k >= 0 {
-            match &tokens[k as usize].token {
-                Token::RParen => depth += 1,
-                Token::LParen => {
-                    if depth > 0 {
-                        depth -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                Token::Comma | Token::SemiColon if depth == 0 => break,
-                Token::Word(w)
-                    if depth == 0
-                        && !(k > 0
-                            && matches!(
-                                tokens.get((k - 1) as usize).map(|t| &t.token),
-                                Some(Token::Period)
-                            ))
-                        && OPERAND_BOUNDARY_KEYWORDS
-                            .iter()
-                            .any(|kw| w.value.eq_ignore_ascii_case(kw)) =>
-                {
-                    break;
-                }
-                _ => {}
-            }
-            k -= 1;
-        }
-        // skip whitespace after the boundary token so the splice keeps the
-        // gap that preceded the operand
-        let mut operand_token = (k + 1) as usize;
-        while matches!(
-            tokens.get(operand_token).map(|t| &t.token),
-            Some(Token::Whitespace(_))
-        ) {
-            operand_token += 1;
-        }
-        let (operand_start, _) = offset(&tokens[operand_token])?;
-        let (is_start, _) = offset(&tokens[i])?;
-        let (_, missing_end) = offset(&tokens[j])?;
-        if operand_start < prev_missing_end {
-            // `x IS [NOT] MISSING IS MISSING` — the walk-back ran past the
-            // previous match's span; the chained form is invalid SQL.
-            return Err(Error::Parse("invalid IS MISSING expression".into()));
-        }
-        found.push((operand_start, is_start, missing_end, negated));
-        prev_missing_end = missing_end;
-        i = j + 1;
-    }
-    if found.is_empty() {
-        return Ok(sql.to_string());
-    }
-    let mut out = String::with_capacity(sql.len());
-    let mut last = 0;
-    for (operand_start, is_start, missing_end, negated) in found {
-        out.push_str(&sql[last..operand_start]);
-        out.push_str(if negated {
-            "__s3_is_not_missing("
-        } else {
-            "__s3_is_missing("
-        });
-        out.push_str(&sql[operand_start..is_start]);
-        out.push(')');
-        last = missing_end;
-    }
-    out.push_str(&sql[last..]);
-    Ok(out)
-}
-
-fn is_word(t: &sqlparser::tokenizer::TokenWithSpan, word: &str) -> bool {
-    match &t.token {
-        Token::Word(w) if w.quote_style.is_none() => w.value.eq_ignore_ascii_case(word),
-        _ => false,
-    }
-}
-
-fn skip_whitespace(tokens: &[sqlparser::tokenizer::TokenWithSpan], mut i: usize) -> usize {
-    while matches!(tokens.get(i).map(|t| &t.token), Some(Token::Whitespace(_))) {
-        i += 1;
-    }
-    i
-}
-
-fn token_start(t: &sqlparser::tokenizer::TokenWithSpan) -> (u64, u64) {
-    (t.span.start.line, t.span.start.column)
-}
-
-fn token_end(t: &sqlparser::tokenizer::TokenWithSpan) -> (u64, u64) {
-    (t.span.end.line, t.span.end.column)
-}
-
-/// (line, column) -> byte offset for every char boundary.
-fn positions(sql: &str) -> HashMap<(u64, u64), usize> {
-    let mut map = HashMap::new();
-    let mut line = 1u64;
-    let mut col = 1u64;
-    let mut offset = 0usize;
-    map.insert((line, col), offset);
-    for c in sql.chars() {
-        offset += c.len_utf8();
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-        map.insert((line, col), offset);
-    }
-    map
+    Ok(FromClause {
+        segments,
+        alias: alias.as_ref().map(|a| a.name.value.clone()),
+    })
 }
 
 /// Does the select/list expression tree contain one of the five aggregate
@@ -891,8 +364,8 @@ pub(crate) fn contains_aggregate(expr: &Expr) -> bool {
     guard.0
 }
 
-fn is_aggregate_name(name: &sqlparser::ast::ObjectName) -> bool {
-    let [sqlparser::ast::ObjectNamePart::Identifier(part)] = name.0.as_slice() else {
+fn is_aggregate_name(name: &ObjectName) -> bool {
+    let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else {
         return false;
     };
     ["count", "sum", "avg", "min", "max"]
@@ -929,7 +402,7 @@ fn validate_aggregate_item(expr: &Expr) -> Result<(), Error> {
     if !list.clauses.is_empty() {
         return Err(not_aggregate());
     }
-    let [sqlparser::ast::ObjectNamePart::Identifier(part)] = f.name.0.as_slice() else {
+    let [ObjectNamePart::Identifier(part)] = f.name.0.as_slice() else {
         return Err(not_aggregate());
     };
     let name = part.value.to_ascii_lowercase();
@@ -1056,7 +529,7 @@ fn reject_subqueries(expr: &Expr) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use sqlparser::ast::{
-        AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Subscript,
+        AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Subscript, UnaryOperator,
     };
 
     use super::*;
@@ -1140,6 +613,47 @@ mod tests {
     }
 
     #[test]
+    fn long_custom_path_parses() {
+        // Regression pin (2026-09-10): the FROM-factor span lookup used to
+        // re-walk the input from byte 0 per token, making a long path
+        // quadratic (tens of seconds at the 256 KiB cap). The monotonic
+        // cursor makes this instant — no timing assertion, parsing at all
+        // and with the full segment list is the contract.
+        const SEGMENTS: usize = 4000;
+        let mut sql = String::from("SELECT * FROM S3Object[*]");
+        sql.push_str(&".a".repeat(SEGMENTS));
+        let q = ok(&sql);
+        assert_eq!(q.from.segments.len(), SEGMENTS + 1);
+        assert_eq!(q.from.segments[0], PathSeg::Wild);
+        assert_eq!(q.from.segments[SEGMENTS], PathSeg::Name("a".into()));
+        assert_eq!(q.from.alias, None);
+    }
+
+    #[test]
+    fn custom_path_after_newlines() {
+        // The FROM-factor span cursor walks the whole statement, so the
+        // leading lines (and the comments that carry them) must be accounted
+        // for before the S3Object token. The path itself stays on one line —
+        // the grammar allows no whitespace inside it.
+        let q = ok("SELECT\n  x\nFROM\n  S3Object[*].b AS v");
+        assert_eq!(
+            q.from.segments,
+            vec![PathSeg::Wild, PathSeg::Name("b".into())]
+        );
+        assert_eq!(q.from.alias.as_deref(), Some("v"));
+        let q = ok("SELECT x /*\nfrom\n*/\nFROM S3Object[*].a");
+        assert_eq!(
+            q.from.segments,
+            vec![PathSeg::Wild, PathSeg::Name("a".into())]
+        );
+        let q = ok("SELECT x -- c\nFROM S3Object[*].a");
+        assert_eq!(
+            q.from.segments,
+            vec![PathSeg::Wild, PathSeg::Name("a".into())]
+        );
+    }
+
+    #[test]
     fn bracket_subscript_access() {
         let q = ok("SELECT s.projects[0].project_name FROM S3Object s");
         match item(&q, 0) {
@@ -1220,22 +734,158 @@ mod tests {
 
     #[test]
     fn reject_bare_path_first_segment() {
-        rej("SELECT * FROM S3Object.name", "must start with S3Object[*]");
+        // `.name` without a first `[*]` is a segment the pest grammar refuses
+        // (the path rule needs `[` first); the refused-continuation check
+        // catches the dot → the "invalid FROM path" family.
+        rej("SELECT * FROM S3Object.name", "invalid FROM path");
+    }
+
+    #[test]
+    fn false_positive_projection_trigger_keeps_stock_behavior() {
+        // `s.S3Object.name` in the projection triggers the skeleton; a
+        // pathless factor must behave identically to stock.
+        let q = ok("SELECT s.S3Object.name FROM S3Object s");
+        assert_eq!(q.from.segments, Vec::new());
+        assert_eq!(q.from.alias.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn multi_statement_captured_slot_not_read() {
+        // The second statement would overwrite the slot; the single-statement
+        // rejection fires first, the slot is never read.
+        rej(
+            "SELECT * FROM S3Object[*].a; SELECT * FROM S3Object[*].b",
+            "single statement",
+        );
+    }
+
+    #[test]
+    fn multi_statement_with_custom_path_candidate() {
+        // The candidate check is whole-input by design (FIX A): the path in
+        // statement 2 routes statement 1 (`SELECT 1`, no FROM) through the
+        // skeleton, whose FROM expectation fails first. Multi-statement input
+        // is rejected either way — the single-statement check would fire too
+        // (`multi_statement_captured_slot_not_read`), just later.
+        rej(
+            "SELECT 1; SELECT * FROM S3Object[*].a",
+            "invalid FROM: expected S3Object",
+        );
+        let e = parse("SELECT 1; SELECT * FROM S3Object[*].a").expect_err("must reject");
+        assert!(!e.to_string().contains("single statement"), "{e}");
+    }
+
+    #[test]
+    fn from_path_boundary_alignment_rejects_wider_word_class() {
+        // Tokenizer's Word class is wider than pest `name` (non-ASCII, @, #):
+        // pest stops mid-token, the walk consumes the whole token, and the
+        // end-byte mismatch must reject — never truncate-accept `Name("foo")`.
+        rej("SELECT * FROM S3Object[*].foo#bar", "invalid FROM path");
+        rej("SELECT * FROM S3Object[*].café", "invalid FROM path");
+    }
+
+    #[test]
+    fn s3object_root_index_is_refused() {
+        // AWS: a path must start with `[*]` — the grammar's `first_seg` admits
+        // only the wildcard at the root, so `S3Object[0]` never enters the
+        // path rule and the refused-continuation check rejects the `[`
+        // (end-to-end twin of path.rs's `no_index_first_segment`).
+        rej("SELECT * FROM S3Object[0]", "invalid FROM path");
+    }
+
+    #[test]
+    fn from_path_refused_continuation_family() {
+        rej("SELECT * FROM S3Object.books", "invalid FROM path");
+        rej("SELECT * FROM S3Object[0]", "invalid FROM path");
+        rej("SELECT * FROM S3Object[*]['it''s']", "invalid FROM path");
+        rej("SELECT * FROM S3Object[*].books[0x]", "invalid FROM path");
+    }
+
+    #[test]
+    fn custom_path_into_is_fail_closed() {
+        // INTO is not in the skeleton's clause order (projection → FROM):
+        // the custom-factor statement is rejected closed rather than
+        // silently ignoring the INTO clause (review 2026-09-09).
+        rej(
+            "SELECT s.a INTO t FROM S3Object[*].b s",
+            "invalid FROM: expected S3Object",
+        );
+    }
+
+    #[test]
+    fn from_alias_keyword_rules() {
+        // Clause keyword after AS is rejected (old behavior kept).
+        rej("SELECT * FROM S3Object[*] AS where", "invalid FROM path");
+        // A reserved keyword is never an alias (old pipeline rejected via
+        // the stock tail; the skeleton rejects it itself).
+        rej("SELECT * FROM S3Object[*] AS select", "invalid FROM path");
+        // Quoted and bare aliases still work.
+        let q = ok("SELECT * FROM S3Object[*] AS \"My Alias\"");
+        assert_eq!(q.from.alias.as_deref(), Some("My Alias"));
+        let q = ok("SELECT * FROM S3Object[*] s");
+        assert_eq!(q.from.alias.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn non_custom_alias_surface_is_stock() {
+        // No custom FROM path → stock parse_optional_alias_inner rules apply:
+        // any keyword after AS and quoted strings are aliases (2026-09-09
+        // review; the deleted preprocess rejected these, stock accepts — no
+        // old-behavior compatibility).
+        let q = ok("SELECT * FROM S3Object AS where");
+        assert_eq!(q.from.alias.as_deref(), Some("where"));
+        let q = ok("SELECT * FROM S3Object AS 'x'");
+        assert_eq!(q.from.alias.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn limit_after_custom_factor_binds() {
+        // The hand-rolled LIMIT clause on the custom path (stock's
+        // parse_optional_limit_clause is private) binds like the stock one;
+        // OFFSET and BY are parsed into the clause and rejected by the
+        // validator's Unsupported("OFFSET")/Unsupported("LIMIT BY") arms —
+        // the old pipeline's channel and message, from the one acceptance
+        // gate (2026-09-10 simplify).
+        let q = ok("SELECT s.a FROM S3Object[*] s WHERE s.b > 1 LIMIT 5");
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.from.segments, vec![PathSeg::Wild]);
+        rej(
+            "SELECT s.a FROM S3Object[*] s LIMIT 5 OFFSET 2",
+            "unsupported: OFFSET",
+        );
+        rej(
+            "SELECT s.a FROM S3Object[*] s LIMIT 5 BY s.a",
+            "unsupported: LIMIT BY",
+        );
+    }
+
+    #[test]
+    fn distinct_before_offset_on_custom_path() {
+        // The validator's first matching arm wins, and DISTINCT is checked
+        // before the limit block — the ordering is shared with the stock path
+        // (`reject_distinct` and `reject_offset` pin the same two arms), so
+        // the custom path reports DISTINCT, not OFFSET.
+        rej(
+            "SELECT DISTINCT s.a FROM S3Object[*] s LIMIT 5 OFFSET 2",
+            "unsupported: DISTINCT",
+        );
+        // Same query on the stock path: one validator, one arm order.
+        rej(
+            "SELECT DISTINCT s.a FROM S3Object s LIMIT 5 OFFSET 2",
+            "unsupported: DISTINCT",
+        );
     }
 
     #[test]
     fn is_missing_after_non_ascii_text() {
-        // R16 nit of the `positions()` char-vs-byte worry: sqlparser's
-        // tokenizer columns are character-based (query.chars(), 0.57 and
-        // 0.62 alike), and `positions()` counts chars too — a multi-byte
-        // literal before the predicate must not misalign the IS MISSING
-        // rewrite. Pinned.
+        // A multi-byte literal before the predicate must not misalign the
+        // IS MISSING hook (the tokenizer's columns are character-based).
+        // Pinned.
         let plan = parse("SELECT * FROM S3Object s WHERE s.a = 'ü' OR s.b IS MISSING").unwrap();
         assert!(plan.where_expr.is_some());
-        // The rewrite is not wrapped in an error path: a sentinel call must
-        // be present in the rewritten expression (the engine walks it).
+        // The hook is not wrapped in an error path: a sentinel call must
+        // be present in the expression (the engine walks it).
         let s = plan.where_expr.unwrap().to_string();
-        assert!(s.contains("__s3_is_missing"), "{s}");
+        assert!(s.contains(&plan.missing.is_missing()), "{s}");
     }
 
     #[test]
@@ -1260,21 +910,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_reserved_sentinel_functions() {
-        // R15: user-authored sentinel calls (unqualified, qualified or
-        // quoted) would silently adopt MISSING semantics — refused at parse.
-        rej(
-            "SELECT __s3_is_missing(s.a) FROM S3Object s",
-            "reserved function name: __s3_is_missing",
-        );
-        rej(
-            "SELECT * FROM S3Object s WHERE foo.__s3_is_missing(s.a)",
-            "reserved function name: __s3_is_missing",
-        );
-        rej(
-            "SELECT * FROM S3Object s WHERE s.a IS MISSING OR foo.__s3_is_not_missing(s.b)",
-            "reserved function name: __s3_is_not_missing",
-        );
+    fn user_sentinel_like_call_is_an_unknown_function() {
+        // R15 guard deleted: the sentinel name is a per-request uuid, user
+        // text cannot collide. A fixed-name `__s3_is_missing(x)` call is an
+        // ordinary unknown function — legal at parse time, rejected by the
+        // engine during eval (in-stream error channel, not request-level 400).
+        let q = ok("SELECT __s3_is_missing(s.a) FROM S3Object s");
+        assert!(!q.aggregates);
     }
 
     #[test]
@@ -1352,19 +994,27 @@ mod tests {
     #[test]
     fn is_missing_rewrite() {
         let q = ok("SELECT s.x FROM S3Object s WHERE s.x IS MISSING");
+        let m = q.missing.is_missing();
         match q.where_expr {
-            Some(Expr::Function(f)) => {
-                assert_eq!(f.name.to_string(), "__s3_is_missing");
-            }
+            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), m),
             other => panic!("expected missing sentinel, got {other:?}"),
         }
+        // IS NOT MISSING = UnaryOp{Not} around the same sentinel (no second name).
         let q = ok("SELECT s.x FROM S3Object s WHERE s.x IS NOT MISSING");
+        let m = q.missing.is_missing();
         match q.where_expr {
-            Some(Expr::Function(f)) => {
-                assert_eq!(f.name.to_string(), "__s3_is_not_missing");
-            }
-            other => panic!("expected not-missing sentinel, got {other:?}"),
+            Some(Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            }) => match expr.as_ref() {
+                Expr::Function(f) => assert_eq!(f.name.to_string(), m),
+                other => panic!("expected sentinel under NOT, got {other:?}"),
+            },
+            other => panic!("expected NOT-wrapped sentinel, got {other:?}"),
         }
+        // Lowercase form: the hook compares NOT by keyword, not by text.
+        let q = ok("SELECT s.x FROM S3Object s WHERE s.x is not missing");
+        assert!(matches!(q.where_expr, Some(Expr::UnaryOp { .. })));
     }
 
     #[test]
@@ -1374,10 +1024,39 @@ mod tests {
     }
 
     #[test]
+    fn is_missing_in_projection_is_the_sentinel() {
+        // Spec: IS MISSING in projection position (the other pins cover
+        // WHERE). The projection item's expression is the sentinel Function
+        // (the parse_infix hook runs in every expression position), and
+        // IS NOT MISSING is UnaryOp{Not} wrapping the same sentinel.
+        let q = ok("SELECT s.x IS MISSING FROM S3Object s");
+        let m = q.missing.is_missing();
+        match item(&q, 0) {
+            Expr::Function(f) => {
+                assert_eq!(f.name.to_string(), m);
+            }
+            other => panic!("expected missing sentinel in projection, got {other:?}"),
+        }
+        let q = ok("SELECT s.x IS NOT MISSING FROM S3Object s");
+        let m = q.missing.is_missing();
+        match item(&q, 0) {
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => match expr.as_ref() {
+                Expr::Function(f) => assert_eq!(f.name.to_string(), m),
+                other => panic!("expected sentinel under NOT in projection, got {other:?}"),
+            },
+            other => panic!("expected NOT-wrapped sentinel in projection, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn is_missing_chained_forms_are_parse_errors() {
-        // `x IS MISSING IS MISSING`: the second operand's walk-back would
-        // overlap the first match's span — a splice panic (index out of
-        // range) on untrusted input; the chained form is invalid SQL.
+        // `x IS MISSING IS MISSING`: the hook's chained check sees the first
+        // sentinel — bare Function, its own UnaryOp{Not} wrapper, or the
+        // Nested (parenthesized) wrapper — and refuses; the chained form is
+        // invalid SQL.
         rej(
             "SELECT s.x FROM S3Object s WHERE s.x IS MISSING IS MISSING",
             "invalid IS MISSING expression",
@@ -1386,21 +1065,37 @@ mod tests {
             "SELECT s.x FROM S3Object s WHERE s.x IS NOT MISSING IS MISSING",
             "invalid IS MISSING expression",
         );
+        // Parenthesized chains: the inner hook production is wrapped in our
+        // own Expr::Nested — the chained check recurses through it and
+        // refuses (never wrapping Nested(sentinel) into a second call).
+        rej(
+            "SELECT s.x FROM S3Object s WHERE (s.x IS MISSING) IS MISSING",
+            "invalid IS MISSING expression",
+        );
+        rej(
+            "SELECT s.x FROM S3Object s WHERE (s.x IS MISSING) IS NOT MISSING",
+            "invalid IS MISSING expression",
+        );
         // The legit single form still rewrites.
         let q = ok("SELECT s.x FROM S3Object s WHERE s.x IS MISSING");
+        let m = q.missing.is_missing();
         match q.where_expr {
-            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), "__s3_is_missing"),
+            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), m),
             other => panic!("expected missing sentinel, got {other:?}"),
         }
     }
 
     #[test]
     fn traversal_plus_missing_rewrite() {
+        // The custom skeleton's parse_expr (WHERE clause) runs the dialect's
+        // parse_infix hook, so the IS MISSING sentinel is produced on the
+        // custom path exactly as on the stock path.
         let q = ok("SELECT s.x FROM S3Object[*].books[*].price s WHERE s.x IS MISSING");
         assert_eq!(q.from.segments.last(), Some(&PathSeg::Name("price".into())));
+        let m = q.missing.is_missing();
         match q.where_expr {
             Some(Expr::Function(f)) => {
-                assert_eq!(f.name.to_string(), "__s3_is_missing");
+                assert_eq!(f.name.to_string(), m);
             }
             other => panic!("expected missing sentinel, got {other:?}"),
         }
@@ -1416,6 +1111,43 @@ mod tests {
             "SELECT * FROM S3Object LIMIT 0",
             "LIMIT must be a positive integer",
         );
+    }
+
+    #[test]
+    fn delegation_drift_surface() {
+        // Drift-sensitive: these validator messages appear only after a successful
+        // stock parse — a missed supports_* delegation makes the parse stage fail
+        // with a different error, so the assert fails red. Channel-only asserts are
+        // vacuous (both states Err).
+        rej(
+            "SELECT * FROM S3Object s LIMIT 3, 5",
+            "LIMIT must be a positive integer", // supports_limit_comma → OffsetCommaLimit arm
+        );
+        rej(
+            "SELECT * FROM S3Object s LIMIT 5 BY s.a",
+            "unsupported: LIMIT BY", // supports_limit_by → LimitOffset limit_by arm
+        );
+        rej(
+            "SELECT s.a FROM S3Object s GROUP BY GROUPING SETS ((s.a))",
+            "unsupported: GROUP BY", // supports_group_by_expr true arm consumes GROUPING SETS
+        );
+        // supports_select_wildcard_except: the EXCEPT parses into the
+        // Wildcard item's options, which the projection loop's Wildcard
+        // arm drops — the plan is the plain `*` (the pre-refactor
+        // validator's Wildcard arm behaved identically: same channel Ok).
+        // A delegation miss makes the stock parse fail at EXCEPT → red.
+        let q = ok("SELECT * EXCEPT (a) FROM S3Object s");
+        assert_eq!(q.projections, vec![Projection::Wild]);
+        // supports_parens_around_table_factor: with the argument true the
+        // stock factor parser unwraps `(S3Object s)` into the plain factor
+        // (+alias); false would parse a derived table and fail the
+        // validator's Table arm. The old byte scanner rejected the parens
+        // pre-parse ("invalid FROM: expected S3Object" — old channel
+        // Parse), so this row is documented drift: old Parse, new Ok.
+        let q = ok("SELECT * FROM (S3Object s)");
+        assert_eq!(q.from.segments, Vec::<PathSeg>::new());
+        assert_eq!(q.from.alias.as_deref(), Some("s"));
+        ok("SELECT * FROM S3Object s WHERE s.x = 1"); // stock baseline
     }
 
     #[test]
@@ -1442,8 +1174,9 @@ mod tests {
         // A field named `from` is a field, and its MISSING operand is exact.
         let q = ok("SELECT s.from FROM S3Object s WHERE s.from IS MISSING");
         assert_eq!(q.projections.len(), 1);
+        let m = q.missing.is_missing();
         match q.where_expr {
-            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), "__s3_is_missing"),
+            Some(Expr::Function(f)) => assert_eq!(f.name.to_string(), m),
             other => panic!("expected missing sentinel, got {other:?}"),
         }
     }
@@ -1451,12 +1184,13 @@ mod tests {
     #[test]
     fn from_scan_is_comment_aware() {
         // A `-- from` line comment before the real FROM must not misdirect
-        // the byte scanner (the comment-blind scan parsed the comment's
-        // `from` as the FROM clause and reported a bogus path error).
+        // the custom-path probe (peek_nth_token skips whitespace, comments
+        // included): the comment's `from` never looks like the FROM factor
+        // and the statement goes down the stock path.
         let q = ok("SELECT x -- from table\nFROM S3Object s");
         assert_eq!(q.projections.len(), 1);
         // A newline inside a block comment puts `from` at a word boundary —
-        // the comment-blind scanner matched there too.
+        // the probe skips the comment there too.
         let q = ok("SELECT x /*\nfrom\n*/ FROM S3Object s");
         assert_eq!(q.projections.len(), 1);
         // A JOIN word inside a comment in a non-S3Object FROM clause is not
@@ -1469,14 +1203,23 @@ mod tests {
 
     #[test]
     fn bare_column_from_before_from_is_a_parse_error() {
-        // A bare column named `from` is a reserved word — the byte scanner
-        // cannot distinguish it from the real FROM (full tokenization would
-        // be needed); the honest outcome is the same Parse-error family,
-        // never a panic or an Unsupported channel.
-        rej(
-            "SELECT from FROM S3Object s",
-            "invalid FROM: expected S3Object",
-        );
+        // Stock 0.62 never parses `from` here as a bare column: GenericDialect
+        // supports_empty_projections matches peek_keyword(FROM), so the word
+        // after SELECT is consumed as the FROM keyword, the next word
+        // becomes the table factor, and `s` is left over — a stock
+        // end-of-statement error. The honest rejection is a syntax error
+        // (never the old byte scanner's "invalid FROM: expected S3Object",
+        // never a panic or an Unsupported channel). The honest ways to name
+        // a column `from` are `s.from` and `"from"`.
+        rej("SELECT from FROM S3Object s", "end of statement");
+        // Custom-path variant: the skeleton calls parse_projection()
+        // directly, so stock parse_select's empty-projection arm (which
+        // lives in parse_select — peek_keyword(FROM) before parse_projection,
+        // parser/mod.rs:14743) never fires; the rejection is
+        // parse_projection's own "Expected an expression" for the `from`
+        // word. Same Parse channel as the no-path variant, different
+        // message — on purpose (arm location, review R4).
+        rej("SELECT from FROM S3Object[*].a", "Expected an expression");
     }
 
     // ------------------------------------------------------------------
@@ -1609,8 +1352,8 @@ mod tests {
     #[test]
     fn reject_join_on_valid_object() {
         // A valid single S3Object factor carrying a JOIN reaches the
-        // validator's JOIN arm (the other JOIN path goes through the
-        // prepass clause scan when the object clause itself is invalid).
+        // validator's JOIN arm (no custom probe hit: the path never
+        // declines stock parsing with a JOIN behind a plain factor).
         rej(
             "SELECT * FROM S3Object s JOIN t ON s.x = t.x",
             "unsupported: JOIN",
@@ -1618,9 +1361,46 @@ mod tests {
     }
 
     #[test]
+    fn custom_path_join_family_pre_rejected() {
+        // Every word in is_join_keyword's list, placed as the token right
+        // after the custom factor's alias — exactly where the skeleton's
+        // check peeks. The old pipeline surfaced a join behind the custom
+        // factor as Unsupported("JOIN") (splice → stock parse → validator);
+        // the skeleton rejects with the same channel and message (restored
+        // 2026-09-10 through the unsupported marker). ON/USING need no
+        // preceding join context: the check peeks the immediate next token,
+        // so `… s ON t` is caught the same way.
+        for kw in [
+            "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "NATURAL", "ON", "USING",
+        ] {
+            let sql = format!("SELECT s.a FROM S3Object[*].b s {kw} t");
+            rej(&sql, "unsupported: JOIN");
+            let e = parse(&sql).expect_err("custom-path JOIN-family must reject");
+            assert!(
+                matches!(&e, Error::Unsupported(k) if k == "JOIN"),
+                "{sql}: got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_keywords_are_clause_keywords() {
+        // Drift guard: the dialect's JOIN-family rejection list and the alias
+        // clause-keyword set share one authority — every JOIN keyword must
+        // also be a clause keyword (both refuse a word in alias position).
+        for kw in JOIN_KEYWORDS {
+            assert!(
+                CLAUSE_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(kw)),
+                "{kw} missing from CLAUSE_KEYWORDS"
+            );
+        }
+    }
+
+    #[test]
     fn quoted_ident_doubling_survives_scan() {
-        // ScanState handles `"`/`'` doubling; a comment or quoted string
-        // containing a `from` word must not misdirect the FROM preprocessor.
+        // Quoted identifiers and strings tokenize cleanly down the stock
+        // path — a `from` word inside a quote must not look like the FROM
+        // factor (the tokenizer owns quote state, not the probe).
         let q = ok("SELECT s.\"a\"\"b\" FROM S3Object s");
         assert_eq!(q.projections.len(), 1);
         // Doubled single-quote escape inside a literal before `from`.
@@ -1644,7 +1424,13 @@ mod tests {
 
     #[test]
     fn unterminated_quoted_segment_is_invalid_from_path() {
-        rej("SELECT * FROM S3Object[*].'books", "invalid FROM path");
+        // The unterminated quote dies in parse_sql's upfront tokenization
+        // (before any statement hook runs); the rejection channel is the
+        // tokenizer's, not the pest one — pinned here.
+        rej(
+            "SELECT * FROM S3Object[*].'books",
+            "Unterminated string literal",
+        );
     }
 
     #[test]
@@ -1669,5 +1455,332 @@ mod tests {
         assert!(projection_needs_alias(&q.projections[0]));
         let q = ok("SELECT count(*) FROM S3Object s");
         assert!(projection_needs_alias(&q.projections[0]));
+    }
+
+    // ------------------------------------------------------------------
+    // Parity harness (review R7). The OLD pipeline — git show
+    // HEAD:crates/tinio-select/src/sql.rs at 03109b2 — ran
+    // reject_reserved_functions → preprocess_from (byte-scanner FROM
+    // splice) → rewrite_is_missing (text splice) → stock GenericDialect
+    // parse → the same validator arms the new pipeline keeps. Each row
+    // asserts what the NEW pipeline produces; the comment records the
+    // OLD channel (modeled from the old source). Rows without a drift
+    // marker assert the channel matches the old pipeline's — a missed
+    // Ok<->Err side flip is a regression and fails red. The custom-path
+    // LIMIT BY / OFFSET rows match without a drift marker too: the
+    // skeleton parses those constructs into the clause and the validator's
+    // own Unsupported("LIMIT BY")/Unsupported("OFFSET") arms reject them
+    // (2026-09-10 simplify — one acceptance gate); the custom-path JOIN row
+    // keeps the old Unsupported channel through the skeleton's unsupported
+    // marker (the skeleton parses no joins). FailClosed is the INTO
+    // row (old pipeline silently ignored INTO, the skeleton rejects
+    // closed — its own pin is custom_path_into_is_fail_closed).
+    // ------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Old {
+        Accepted,
+        Unsupported,
+        Parse,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Drift {
+        None,
+        FailClosed,
+    }
+
+    struct Row {
+        sql: &'static str,
+        old: Old,
+        drift: Drift,
+        /// Expected message fragment for the new pipeline's rejection
+        /// (empty when the case is accepted).
+        contains: &'static str,
+    }
+
+    #[test]
+    fn parity_harness_old_pipeline_channels() {
+        let rows = [
+            // --- accepted, stock or spliced: old Accept → new Accept ---
+            Row {
+                sql: "SELECT * FROM S3Object s",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object[*] s",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT price FROM S3Object[*].books[*].price",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT * FROM S3Object[*]['a b']",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT * FROM S3Object[*].books[0]",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT * FROM S3Object[*].*",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object[*].b s",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object[*].b AS v",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.x FROM S3Object s WHERE s.x IS MISSING",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.x FROM S3Object s WHERE s.x IS NOT MISSING",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.x IS MISSING FROM S3Object s",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT count(*) FROM S3Object s",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object s LIMIT 5",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            Row {
+                sql: "SELECT x FROM S3Object[*].limit.name s",
+                old: Old::Accepted,
+                drift: Drift::None,
+                contains: "",
+            },
+            // --- rejected, same channel both pipelines ---
+            Row {
+                sql: "SELECT s.x FROM S3Object s WHERE s.x IS MISSING IS MISSING",
+                old: Old::Parse,
+                drift: Drift::None,
+                contains: "invalid IS MISSING expression",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object s LIMIT 5 OFFSET 2",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: OFFSET",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object s LIMIT 5 BY s.a",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: LIMIT BY",
+            },
+            Row {
+                sql: "SELECT * FROM S3Object s JOIN t ON s.x = t.x",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: JOIN",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object s GROUP BY s.b",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: GROUP BY",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object s ORDER BY s.b",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: ORDER BY",
+            },
+            Row {
+                sql: "SELECT DISTINCT s.a FROM S3Object s",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: DISTINCT",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object s UNION SELECT s.b FROM S3Object s",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: UNION",
+            },
+            Row {
+                sql: "SELECT * FROM S3Object[*].a UNION SELECT * FROM b",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: UNION",
+            },
+            Row {
+                sql: "SELECT * FROM (SELECT * FROM S3Object s)",
+                old: Old::Parse,
+                drift: Drift::None,
+                contains: "FROM must reference exactly one S3Object",
+            },
+            Row {
+                sql: "SELECT from FROM S3Object s",
+                old: Old::Parse,
+                drift: Drift::None,
+                contains: "end of statement",
+            },
+            Row {
+                sql: "SELECT from FROM S3Object[*].a",
+                old: Old::Parse,
+                drift: Drift::None,
+                contains: "Expected an expression",
+            },
+            Row {
+                sql: "SELECT * FROM other",
+                old: Old::Parse,
+                drift: Drift::None,
+                contains: "invalid FROM: expected S3Object",
+            },
+            // --- custom-path rejections: same channel both pipelines:
+            // LIMIT BY / OFFSET through the validator's arms (the skeleton
+            // parses them into the clause — 2026-09-10 simplify), JOIN
+            // through the skeleton's unsupported marker (channel restored
+            // 2026-09-10) ---
+            Row {
+                sql: "SELECT s.a FROM S3Object[*].b s LIMIT 5 BY s.a",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: LIMIT BY",
+            },
+            Row {
+                sql: "SELECT s.a FROM S3Object[*].b s LIMIT 5 OFFSET 2",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: OFFSET",
+            },
+            Row {
+                sql: "SELECT * FROM S3Object[*].a s JOIN t ON s.x = t.x",
+                old: Old::Unsupported,
+                drift: Drift::None,
+                contains: "unsupported: JOIN",
+            },
+            // --- documented channel drift ---
+            // old Accepted (the old pipeline ignored INTO — its validator
+            // had no into arm); new Parse, fail closed (R4 kept pin).
+            Row {
+                sql: "SELECT s.a INTO t FROM S3Object[*].b s",
+                old: Old::Accepted,
+                drift: Drift::FailClosed,
+                contains: "invalid FROM: expected S3Object",
+            },
+        ];
+        for row in &rows {
+            let (got, msg) = match parse(row.sql) {
+                Ok(_) => (Old::Accepted, String::new()),
+                // Assert on the full Display (the Unsupported payload is
+                // the fragment after "unsupported: "; Parse carries the
+                // whole "syntax error: ..." text already).
+                Err(e) => {
+                    let s = e.to_string();
+                    let c = match &e {
+                        Error::Parse(_) => Old::Parse,
+                        Error::Unsupported(_) => Old::Unsupported,
+                        other => panic!("{}: unexpected error channel {other:?}", row.sql),
+                    };
+                    (c, s)
+                }
+            };
+            let expected = match row.drift {
+                // For a non-drift row this IS the old channel: the equality
+                // below pins the side (Err stays Err) and the channel in one
+                // assert — a flip to Ok or another channel fails red.
+                Drift::None => row.old,
+                // The INTO row: assert the new channel (the old one is
+                // documented in the comment above the row).
+                Drift::FailClosed => Old::Parse,
+            };
+            assert_eq!(
+                got, expected,
+                "{}: new={got:?} expected={expected:?} old={:?}",
+                row.sql, row.old
+            );
+            if expected != Old::Accepted {
+                assert!(
+                    msg.contains(row.contains),
+                    "{}: {msg} does not contain {:?}",
+                    row.sql,
+                    row.contains
+                );
+            }
+        }
+        // Plan shapes for the accepted rows that no dedicated test pins: the
+        // quoted-name / index / `.*` segments, the `AS v` factor and the
+        // keyword-named path. The other accepted rows' shapes are pinned by
+        // `wildcard_where_limit` (`* FROM S3Object s`: empty segments, alias
+        // and the Wild projection), `from_alias_keyword_rules` (the
+        // `S3Object[*] s` bare alias), `traversal_path` (the four-segment
+        // walk + projection), `is_missing_rewrite` and
+        // `is_missing_in_projection_is_the_sentinel` (the sentinel shapes),
+        // `count_star_is_aggregate` and `limit_after_custom_factor_binds`
+        // (`S3Object[*] s` segments + the LIMIT binding). The old pipeline
+        // produced the same shapes on the spliced text; the MISSING sentinel
+        // names are the per-request uuid now instead of the old fixed pair.
+        let q = ok("SELECT s.a FROM S3Object[*] s");
+        assert_eq!(q.projections.len(), 1);
+        let q = ok("SELECT * FROM S3Object[*]['a b']");
+        assert_eq!(
+            q.from.segments,
+            vec![PathSeg::Wild, PathSeg::Name("a b".into())]
+        );
+        let q = ok("SELECT * FROM S3Object[*].books[0]");
+        assert_eq!(
+            q.from.segments,
+            vec![
+                PathSeg::Wild,
+                PathSeg::Name("books".into()),
+                PathSeg::Index(0)
+            ]
+        );
+        let q = ok("SELECT * FROM S3Object[*].*");
+        assert_eq!(q.from.segments, vec![PathSeg::Wild, PathSeg::Wild]);
+        let q = ok("SELECT s.a FROM S3Object[*].b AS v");
+        assert_eq!(
+            q.from.segments,
+            vec![PathSeg::Wild, PathSeg::Name("b".into())]
+        );
+        assert_eq!(q.from.alias.as_deref(), Some("v"));
+        let q = ok("SELECT x FROM S3Object[*].limit.name s");
+        assert_eq!(
+            q.from.segments,
+            vec![
+                PathSeg::Wild,
+                PathSeg::Name("limit".into()),
+                PathSeg::Name("name".into())
+            ]
+        );
     }
 }
