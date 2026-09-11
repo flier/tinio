@@ -20,5 +20,8 @@ tinio-store.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::_core::storage;
+use crate::{_api, _config, _core::storage};
 
 /// A CLI failure carrying its exit code.
 ///
@@ -32,14 +32,14 @@ pub enum Error {
     Io(#[from] io::Error),
     /// A configuration failure — exit code 1.
     #[error("configuration error: {0}")]
-    Config(#[from] crate::_config::Error),
+    Config(#[from] _config::Error),
     /// A storage-contract failure — exit code 1.
     #[error("storage error: {0}")]
     Storage(#[from] storage::Error),
     /// A management-plane failure — exit code 1.
     #[cfg(feature = "api")]
     #[error("management error: {0}")]
-    Api(#[from] crate::_api::Error),
+    Api(#[from] _api::Error),
 }
 
 impl Error {

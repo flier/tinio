@@ -110,5 +110,8 @@ otel = [
     "dep:tracing-opentelemetry",
 ]
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

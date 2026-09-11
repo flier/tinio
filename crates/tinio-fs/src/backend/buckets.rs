@@ -14,6 +14,7 @@ use super::{Error, FsStorage};
 use crate::{
     _core::{
         BucketsListing, ListBucketsParams, acl,
+        acl::{Acl, AclGrants},
         bucket::{self, Bucket},
         cors, object,
         storage::{BucketOps, UnorderedPager, already_exists, no_such_bucket, not_empty},
@@ -55,7 +56,7 @@ impl BucketOps for FsStorage {
         &self,
         name: &bucket::Name,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<(), Error> {
         // The lexical mapping: the validation supplements (the reserved
         // `.tinio` refusal — FR-020 — and the Windows charset/aliasing
@@ -98,18 +99,17 @@ impl BucketOps for FsStorage {
         // owner under it is stranded.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(err) = fs::set_permissions(
-                &dir,
-                std::fs::Permissions::from_mode(crate::fsutil::DIR_MODE_PRIVATE),
-            )
-            .await
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+            use crate::{fsutil, fsutil::DIR_MODE_PRIVATE};
+            if let Err(err) =
+                fs::set_permissions(&dir, Permissions::from_mode(DIR_MODE_PRIVATE)).await
             {
                 let _ = fs::remove_dir(&dir).await;
                 return Err(err.into());
             }
             if let Some(uid) = self.owner_uid(owner)
-                && let Err(err) = crate::fsutil::chown_file(&dir, uid).await
+                && let Err(err) = fsutil::chown_file(&dir, uid).await
             {
                 let _ = fs::remove_dir(&dir).await;
                 return Err(err.into());
@@ -314,7 +314,7 @@ impl BucketOps for FsStorage {
         self.bucket_store.clear_cors(name).await
     }
 
-    async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<acl::Acl, Error> {
+    async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<Acl, Error> {
         // Existence is the bucket directory (`NoSuchBucket` when missing
         // — mirroring head_bucket); the ACL comes from the `BUCKETS`
         // row, which answers `NoSuchBucket` itself when unrecorded (a
@@ -323,11 +323,7 @@ impl BucketOps for FsStorage {
         self.bucket_store.acl(name).await
     }
 
-    async fn put_bucket_acl(
-        &self,
-        name: &bucket::Name,
-        grants: &acl::AclGrants,
-    ) -> Result<(), Error> {
+    async fn put_bucket_acl(&self, name: &bucket::Name, grants: &AclGrants) -> Result<(), Error> {
         self.ensure_bucket(name).await?;
         self.bucket_store.set_acl(name, grants).await
     }
@@ -348,14 +344,18 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            acl, object,
+            acl,
+            acl::Acl,
+            object,
             storage::{
                 BucketsListing, Error as StorageError, Error::*, ListBucketsParams, MultipartOps,
                 ObjectOps,
             },
         },
         _util::testing::{assert_conformance, body, etag},
-        testutil::{storage, wait_for, wait_for_lock_waiter},
+        testutil::{
+            all_users_read_grant, other_owner_id, owner_id, storage, wait_for, wait_for_lock_waiter,
+        },
         tombstone,
     };
 
@@ -372,7 +372,7 @@ mod tests {
         assert!(storage.head_bucket(&b).await.is_err());
 
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         assert_eq!(storage.head_bucket(&b).await.unwrap().name, b);
@@ -397,7 +397,7 @@ mod tests {
 
         // Duplicate create.
         let err: StorageError = storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap_err()
             .into();
@@ -415,14 +415,14 @@ mod tests {
         let a = bucket::name("alpha").unwrap();
         let b = bucket::name("beta").unwrap();
         storage
-            .create_bucket(&a, None, &acl::Acl::default_private(None))
+            .create_bucket(&a, None, &Acl::default_private(None))
             .await
             .unwrap();
         let _guard = storage.lock_bucket_mutations(&a).await;
         let storage2 = storage.clone();
         let create_b = tokio::spawn(async move {
             storage2
-                .create_bucket(&b, None, &acl::Acl::default_private(None))
+                .create_bucket(&b, None, &Acl::default_private(None))
                 .await
         });
         let created = timeout(Duration::from_millis(500), create_b)
@@ -440,7 +440,7 @@ mod tests {
         let storage2 = storage.clone();
         let create_a = tokio::spawn(async move {
             storage2
-                .create_bucket(&a, None, &acl::Acl::default_private(None))
+                .create_bucket(&a, None, &Acl::default_private(None))
                 .await
         });
         assert!(
@@ -454,7 +454,7 @@ mod tests {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage.delete_bucket(&b).await.unwrap();
@@ -490,7 +490,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage.delete_bucket(&b).await.unwrap();
@@ -504,7 +504,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let held = storage.lock_bucket_mutations(&b).await;
@@ -527,7 +527,7 @@ mod tests {
             Duration::from_millis(80),
             tokio::spawn(async move {
                 storage_c
-                    .create_bucket(&bc, None, &acl::Acl::default_private(None))
+                    .create_bucket(&bc, None, &Acl::default_private(None))
                     .await
             }),
         )
@@ -560,7 +560,7 @@ mod tests {
                                 None
                             }
                             1 => {
-                                let _ = storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await;
+                                let _ = storage.create_bucket(&b, None, &Acl::default_private(None)).await;
                                 None
                             }
                             // PUT: only `NoSuchBucket` is benign.
@@ -614,7 +614,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -632,7 +632,9 @@ mod tests {
     #[tokio::test]
     async fn symlinked_bucket_follows_when_enabled_and_invisible_when_disabled() {
         use crate::{
-            _core::storage::ListObjectsParams, _util::testing::read_body, FsOptions,
+            _core::{acl::Acl, storage::ListObjectsParams},
+            _util::testing::read_body,
+            FsOptions,
             testutil::fs_options,
         };
         let root = tempfile::tempdir().unwrap();
@@ -661,7 +663,7 @@ mod tests {
             .into();
         assert!(matches!(err, NoSuchBucket(_)), "{err:?}");
         let err: StorageError = storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap_err()
             .into();
@@ -733,7 +735,7 @@ mod tests {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::create_dir_all(root.path().join("data/.tinio")).unwrap();
@@ -747,7 +749,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let upload = storage
@@ -757,7 +759,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -824,7 +826,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -870,7 +872,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -903,7 +905,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(name).unwrap(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -947,7 +949,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         // Move the root aside: `bucket_names` would fail its `read_dir`.
@@ -976,7 +978,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         assert!(
@@ -996,7 +998,7 @@ mod tests {
         // element survives the tag writes).
         let head = storage.head_bucket(&b).await.unwrap();
         assert!(
-            head.creation_time <= std::time::SystemTime::now(),
+            head.creation_time <= SystemTime::now(),
             "the creation time must survive bucket tagging"
         );
 
@@ -1023,7 +1025,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         assert!(
@@ -1075,7 +1077,7 @@ mod tests {
         // elements survive the CORS writes).
         let head = storage.head_bucket(&b).await.unwrap();
         assert!(
-            head.creation_time <= std::time::SystemTime::now(),
+            head.creation_time <= SystemTime::now(),
             "the creation time must survive bucket CORS writes"
         );
 
@@ -1103,21 +1105,17 @@ mod tests {
     async fn fs_bucket_acl_round_trip_preserves_owner() {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
-        let owner = crate::testutil::owner_id();
-        let grants = vec![crate::testutil::all_users_read_grant()];
+        let owner = owner_id();
+        let grants = vec![all_users_read_grant()];
         storage
-            .create_bucket(
-                &b,
-                Some(&owner),
-                &acl::Acl::default_private(Some(owner.clone())),
-            )
+            .create_bucket(&b, Some(&owner), &Acl::default_private(Some(owner.clone())))
             .await
             .unwrap();
         // The create-time ACL round-trips (owner + the owner's own
         // FULL_CONTROL).
         let created = storage.get_bucket_acl(&b).await.unwrap();
         assert_eq!(created.owner.as_ref(), Some(&owner));
-        assert_eq!(created, acl::Acl::default_private(Some(owner.clone())));
+        assert_eq!(created, Acl::default_private(Some(owner.clone())));
         // A put replaces the grant set; the owner element is preserved,
         // never changed by a put.
         storage.put_bucket_acl(&b, &grants).await.unwrap();
@@ -1128,7 +1126,7 @@ mod tests {
         // elements survive the ACL write).
         let head = storage.head_bucket(&b).await.unwrap();
         assert!(
-            head.creation_time <= std::time::SystemTime::now(),
+            head.creation_time <= SystemTime::now(),
             "the creation time must survive the ACL put"
         );
     }
@@ -1150,8 +1148,8 @@ mod tests {
     #[tokio::test]
     async fn fs_list_buckets_filters_by_owner_during_the_walk() {
         let (_root, storage) = storage();
-        let owner_a = crate::testutil::owner_id();
-        let owner_b = crate::testutil::other_owner_id();
+        let owner_a = owner_id();
+        let owner_b = other_owner_id();
         for (name, owner) in [
             ("alpha-a", &owner_a),
             ("alpha-b", &owner_a),
@@ -1161,7 +1159,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(name).unwrap(),
                     Some(owner),
-                    &acl::Acl::default_private(Some(owner.clone())),
+                    &Acl::default_private(Some(owner.clone())),
                 )
                 .await
                 .unwrap();
@@ -1216,7 +1214,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("legacy").unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1273,13 +1271,15 @@ mod tests {
     #[tokio::test]
     async fn fs_bucket_dir_mode_0700() {
         use std::os::unix::fs::PermissionsExt;
+
+        use crate::_core::acl::Acl;
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
-        let mode = std::fs::metadata(root.path().join("data"))
+        let mode = fs::metadata(root.path().join("data"))
             .unwrap()
             .permissions()
             .mode()
@@ -1290,34 +1290,36 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn fs_bucket_dir_chown_failure_removes_dir_and_errors() {
+        use std::collections::HashMap;
+
+        use crate::{
+            _core::acl::Acl,
+            testutil::{euid, owner_id},
+        };
         // Review round 1: the bucket-dir chown failure is fail-closed —
         // the create removes the just-created dir and errors (a
         // wrongly-owned 0700 bucket dir must not be left behind with
         // the create reporting success). Runs UNPRIVILEGED (the chown
         // to uid 0 fails with EPERM — the failure the test needs); as
         // root the chown succeeds, so the test skips.
-        if crate::testutil::euid() == 0 {
+        if euid() == 0 {
             eprintln!("skipped: the fail-closed tests need an UNPRIVILEGED process");
             return;
         }
         use crate::{FsOptions, testutil::fs_options};
         let root = tempfile::tempdir().unwrap();
-        let owner = crate::testutil::owner_id();
+        let owner = owner_id();
         let storage = FsStorage::new(
             root.path(),
             FsOptions {
-                owner_uids: std::collections::HashMap::from([(owner.clone(), 0)]),
+                owner_uids: HashMap::from([(owner.clone(), 0)]),
                 ..fs_options()
             },
         )
         .unwrap();
         let b = bucket::name("data").unwrap();
         let err = storage
-            .create_bucket(
-                &b,
-                Some(&owner),
-                &acl::Acl::default_private(Some(owner.clone())),
-            )
+            .create_bucket(&b, Some(&owner), &Acl::default_private(Some(owner.clone())))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err:?}");

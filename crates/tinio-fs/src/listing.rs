@@ -48,7 +48,9 @@ use tokio::fs;
 
 use crate::{
     _core::{
-        ETag, acl, bucket, checksum,
+        ETag, acl,
+        acl::Acl,
+        bucket, checksum,
         object::{self, Info, Tags},
         pipeline::{self, Completion},
         storage::{self, ListObjectsParams, ObjectListing, UnorderedPager},
@@ -429,15 +431,11 @@ impl FsListing {
         // same row): the producer rewrites preserve the replaced row's
         // elements, so the served page matches what the row holds after
         // the walk.
-        let mut row_meta: Vec<(
-            Tags,
-            Option<checksum::Recorded>,
-            Option<acl::OwnerId>,
-            acl::Acl,
-        )> = Vec::with_capacity(page.len());
+        let mut row_meta: Vec<(Tags, Option<checksum::Recorded>, Option<acl::OwnerId>, Acl)> =
+            Vec::with_capacity(page.len());
         for (i, stored) in gated.into_iter().enumerate() {
             row_meta.push(stored.as_ref().map_or_else(
-                || (Tags::empty(), None, None, acl::Acl::default_private(None)),
+                || (Tags::empty(), None, None, Acl::default_private(None)),
                 |stored| {
                     (
                         stored.tags.clone(),
@@ -1259,7 +1257,7 @@ mod tests {
     }
 
     /// The etag of one fixture file.
-    fn file_etag(root: &Path, key: &str) -> crate::_core::ETag {
+    fn file_etag(root: &Path, key: &str) -> ETag {
         ETag::from_content(&read(root.join("data").join(key)).unwrap())
     }
 

@@ -169,8 +169,8 @@ impl DirId {
     /// sync on the request threads).
     #[cfg(test)]
     fn of(dir: &Path) -> IoResult<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(dir)?;
+        use std::{fs::metadata, os::unix::fs::MetadataExt};
+        let meta = metadata(dir)?;
         Ok(Self {
             dev: meta.dev(),
             ino: meta.ino(),

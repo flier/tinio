@@ -21,5 +21,8 @@ list-v1 = ["tinio-server/list-v1"]
 list-v2 = ["tinio-server/list-v2"]
 otel = ["tinio-server/otel"]
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

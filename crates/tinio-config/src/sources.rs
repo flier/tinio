@@ -46,7 +46,7 @@ pub fn load_env_file(state_dir: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{env, fs};
 
     use super::*;
 
@@ -58,7 +58,7 @@ mod tests {
         let var = "TINIO_TEST_ENV_FILE_LOADED";
         fs::write(dir.path().join(".env"), format!("{var}=yes\n")).unwrap();
         load_env_file(dir.path()).unwrap();
-        assert_eq!(std::env::var(var).unwrap(), "yes");
+        assert_eq!(env::var(var).unwrap(), "yes");
     }
 
     #[test]

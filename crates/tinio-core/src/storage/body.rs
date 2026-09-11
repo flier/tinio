@@ -36,6 +36,8 @@ pub async fn collect_body(mut body: BodyStream) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+
     use futures::stream;
 
     use super::*;
@@ -64,7 +66,7 @@ mod tests {
             Ok(Bytes::from_static(b"tail")),
         ]));
         let err = collect_body(body).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.kind(), ErrorKind::Other);
         assert_eq!(err.to_string(), "boom");
     }
 }

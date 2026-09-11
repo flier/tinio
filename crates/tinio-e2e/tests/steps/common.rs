@@ -16,12 +16,21 @@
 //! contains/omits/equals) live here too, so a new feature does not have
 //! to hunt for them in a feature-specific step module.
 
-use std::{io, net::SocketAddr, path::Path, str, sync::Arc, time::Duration};
+use std::{
+    io,
+    io::ErrorKind,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str,
+    sync::Arc,
+    time::Duration,
+};
 
 use cucumber::{given, then};
 use md5::{Digest, Md5};
 use tempfile::TempDir;
 use tokio::{
+    fs,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -131,7 +140,7 @@ pub struct Server {
     /// Kept alive for the server's lifetime (the fs root must not be
     /// deleted while the plane serves it) — never read otherwise.
     _root: Option<TempDir>,
-    served: Option<std::path::PathBuf>,
+    served: Option<PathBuf>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -154,7 +163,7 @@ impl Server {
     pub async fn fs_nested(caps: Capabilities) -> Self {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("root");
-        tokio::fs::create_dir(&root).await.unwrap();
+        fs::create_dir(&root).await.unwrap();
         let storage = FsStorage::new(&root, fs_options()).unwrap();
         let mut server = Self::spawn_with(storage, caps, Some(base), None).await;
         server.served = Some(root);
@@ -397,7 +406,7 @@ pub async fn request(
     let retryable = |e: &io::Error| {
         matches!(
             e.kind(),
-            io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionRefused
+            ErrorKind::ConnectionAborted | ErrorKind::ConnectionRefused
         )
     };
     let mut attempt = 0;
@@ -545,7 +554,7 @@ pub(super) fn count_tag(body: &[u8], tag: &str) -> usize {
 /// traversal-proof and root-shape assertions.
 pub(super) async fn sorted_entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+    let mut entries = fs::read_dir(dir).await.unwrap();
     while let Some(entry) = entries.next_entry().await.unwrap() {
         names.push(entry.file_name().to_string_lossy().into_owned());
     }

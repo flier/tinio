@@ -5,6 +5,8 @@
 //! alike — the fs backend adds its own blocking-pool hop around the same
 //! core; see `tinio-fs`'s `Handle`).
 
+use std::sync::Arc;
+
 use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
 
 use crate::error::Error;
@@ -33,8 +35,8 @@ impl Handle {
 
     /// Wrap a ready database behind an owned `Arc` (the shared-clone
     /// pattern of the fs `Handle`).
-    pub fn new_shared(db: Database) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self::new(db))
+    pub fn new_shared(db: Database) -> Arc<Self> {
+        Arc::new(Self::new(db))
     }
 
     /// The wrapped database (table creation, stats, test hooks).

@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
-    _core::{object, to_nanos},
+    _core::{object, object::OBJECT_TAGS_MAX, to_nanos},
     error::Error,
     scan::{drain_pair, for_each_pair, has_prefix_pair},
     table::{self, TableDef},
@@ -34,7 +34,7 @@ pub type Table<'txn, T = redb::Table<'txn, <Def as TableDef>::Key, <Def as Table
 /// [`object::Tags::to_wire`]; both ride the point reads and the scan
 /// visitors.
 fn decode_tags_wire(wire: &str) -> object::Tags {
-    object::Tags::from_wire_limited(wire, object::OBJECT_TAGS_MAX)
+    object::Tags::from_wire_limited(wire, OBJECT_TAGS_MAX)
 }
 
 impl<'txn, T> table::Table<'txn, Def, T>

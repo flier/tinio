@@ -11,10 +11,12 @@ use async_trait::async_trait;
 use crate::_core::bucket::name;
 use crate::{
     _core::{
-        Bucket, BucketOps, BucketsListing, ListBucketsParams, acl, bucket::Name, cors, object,
-        paginate_ordered,
+        Bucket, BucketOps, BucketsListing, ListBucketsParams, acl,
+        acl::{Acl, AclGrants},
+        bucket::Name,
+        cors, object, paginate_ordered,
     },
-    _store::{bucket, decode_acl_wire, decode_owner_wire, objects, upload},
+    _store::{bucket, bucket::BucketRow, decode_acl_wire, decode_owner_wire, objects, upload},
     Error,
     error::{already_exists, no_such_bucket, not_empty},
     storage::MemoryStorage,
@@ -26,7 +28,7 @@ impl BucketOps for MemoryStorage {
         &self,
         name: &Name,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<(), Error> {
         self.db.write(|txn| {
             let mut buckets = bucket::Table::open(txn)?;
@@ -37,10 +39,10 @@ impl BucketOps for MemoryStorage {
             let acl_wire = acl.to_grants_wire();
             buckets.put_full(
                 name.as_ref().as_str(),
-                &bucket::BucketRow {
+                &BucketRow {
                     owner: owner_wire,
                     acl: acl_wire,
-                    ..bucket::BucketRow::at(SystemTime::now())
+                    ..BucketRow::at(SystemTime::now())
                 },
             )?;
             Ok(())
@@ -246,7 +248,7 @@ impl BucketOps for MemoryStorage {
         })
     }
 
-    async fn get_bucket_acl(&self, name: &Name) -> Result<acl::Acl, Error> {
+    async fn get_bucket_acl(&self, name: &Name) -> Result<Acl, Error> {
         // Existence is the `BUCKETS` row (`NoSuchBucket` when missing —
         // mirroring `head_bucket`; the row IS the bucket in mem, written
         // at create). The ACL recombines the stored owner element with
@@ -257,7 +259,7 @@ impl BucketOps for MemoryStorage {
             let buckets = bucket::Table::open_readonly(txn)?;
             buckets
                 .row(name.as_ref().as_str())?
-                .map(|row| acl::Acl {
+                .map(|row| Acl {
                     owner: decode_owner_wire(&row.owner),
                     grants: decode_acl_wire(&row.acl).grants,
                 })
@@ -265,12 +267,12 @@ impl BucketOps for MemoryStorage {
         })
     }
 
-    async fn put_bucket_acl(&self, name: &Name, grants: &acl::AclGrants) -> Result<(), Error> {
+    async fn put_bucket_acl(&self, name: &Name, grants: &AclGrants) -> Result<(), Error> {
         // Replace-all: the grant set replaces the row's ACL element; the
         // creation time, tags and owner element are preserved — a put
         // never changes the owner (contract ruling). `NoSuchBucket` when
         // the row is missing.
-        let grants_wire = acl::Acl {
+        let grants_wire = Acl {
             owner: None,
             grants: grants.clone(),
         }
@@ -299,7 +301,7 @@ impl BucketOps for MemoryStorage {
 mod tests {
     use super::*;
     use crate::{
-        _core::{MultipartOps, ObjectOps, object, storage::Error::*},
+        _core::{CompletedPart, MultipartOps, ObjectOps, acl::Acl, object, storage::Error::*},
         _util::testing::body,
         testutil::{other_owner_id, owner_id},
     };
@@ -309,7 +311,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         for n in ["zeta", "alpha", "mu-1"] {
             storage
-                .create_bucket(&name(n).unwrap(), None, &acl::Acl::default_private(None))
+                .create_bucket(&name(n).unwrap(), None, &Acl::default_private(None))
                 .await
                 .unwrap();
         }
@@ -338,11 +340,11 @@ mod tests {
         let alpha = name("alpha").unwrap();
         let zeta = name("zeta").unwrap();
         storage
-            .create_bucket(&alpha, None, &acl::Acl::default_private(None))
+            .create_bucket(&alpha, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
-            .create_bucket(&zeta, None, &acl::Acl::default_private(None))
+            .create_bucket(&zeta, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -362,7 +364,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let bucket = name("data").unwrap();
         storage
-            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .create_bucket(&bucket, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("pending.bin").unwrap();
@@ -373,7 +375,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -398,7 +400,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                &[crate::_core::CompletedPart {
+                &[CompletedPart {
                     part_number: part.part_number,
                     etag: part.etag.clone(),
                 }],
@@ -415,7 +417,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -436,7 +438,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let b = name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         assert!(
@@ -456,7 +458,7 @@ mod tests {
         // element survives the tag writes).
         let head = storage.head_bucket(&b).await.unwrap();
         assert!(
-            head.creation_time <= std::time::SystemTime::now(),
+            head.creation_time <= SystemTime::now(),
             "the creation time must survive bucket tagging"
         );
 
@@ -479,7 +481,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let b = name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         assert!(
@@ -541,7 +543,7 @@ mod tests {
         // elements survive the CORS writes).
         let head = storage.head_bucket(&b).await.unwrap();
         assert!(
-            head.creation_time <= std::time::SystemTime::now(),
+            head.creation_time <= SystemTime::now(),
             "the creation time must survive bucket CORS writes"
         );
 
@@ -571,7 +573,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let b = name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         {
@@ -587,7 +589,7 @@ mod tests {
         }
         assert_eq!(
             storage.get_bucket_acl(&b).await.unwrap(),
-            acl::Acl::default_private(None),
+            Acl::default_private(None),
             "garbage owner/ACL wires serve the private default with no owner"
         );
     }
@@ -606,7 +608,7 @@ mod tests {
                 .create_bucket(
                     &name(bn).unwrap(),
                     Some(owner),
-                    &acl::Acl::default_private(Some(owner.clone())),
+                    &Acl::default_private(Some(owner.clone())),
                 )
                 .await
                 .unwrap();
@@ -658,11 +660,7 @@ mod tests {
         // and nobody else — the expected-owner comparison is on the
         // EFFECTIVE owner.
         storage
-            .create_bucket(
-                &name("legacy").unwrap(),
-                None,
-                &acl::Acl::default_private(None),
-            )
+            .create_bucket(&name("legacy").unwrap(), None, &Acl::default_private(None))
             .await
             .unwrap();
         let lazy = storage

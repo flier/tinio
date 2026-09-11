@@ -3,7 +3,7 @@
 
 use std::{io, path::PathBuf};
 
-use crate::_core::storage;
+use crate::{_core::storage, _store};
 
 /// A redb or state-database failure.
 ///
@@ -46,7 +46,7 @@ pub enum Error {
     /// A shared redb failure (the five mapping kinds of
     /// [`crate::_store::Error`]).
     #[error(transparent)]
-    Redb(#[from] crate::_store::Error),
+    Redb(#[from] _store::Error),
 }
 
 /// The `STATE` table version does not match.

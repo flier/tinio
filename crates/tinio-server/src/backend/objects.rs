@@ -48,9 +48,12 @@ use crate::{
 };
 use crate::{
     _core::{
-        acl, bucket,
+        acl,
+        acl::Acl,
+        bucket,
         checksum::Algorithm,
         object,
+        object::OBJECT_TAGS_MAX,
         storage::{Error as StorageError, GetObjectResult, Storage},
     },
     backend::{
@@ -237,7 +240,9 @@ impl<S: Storage> S3Backend<S> {
             )
             .await?;
         #[cfg(not(feature = "acl"))]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        use crate::_core::acl::Acl;
+        #[cfg(not(feature = "acl"))]
+        let write_acl: Option<(acl::OwnerId, Acl)> = None;
         // The delegated PostObject B1 head runs only under identity mode
         // (the access layer saw only the bucket path there).
         #[cfg(feature = "acl")]
@@ -302,7 +307,7 @@ impl<S: Storage> S3Backend<S> {
         .await?;
         // The no-identity / toggle-off default (Task 5): the empty owner
         // wire and the grants-less private ACL.
-        let default_acl = acl::Acl::default_private(None);
+        let default_acl = Acl::default_private(None);
         let (owner, acl) = match &write_acl {
             Some((owner, acl)) => (Some(owner), acl),
             None => (None, &default_acl),
@@ -889,7 +894,7 @@ impl<S: Storage> S3Backend<S> {
         Self::require_cap(self.caps.tagging, "PutObjectTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        let tags = tags_from_tag_set(&req.input.tagging.tag_set, object::OBJECT_TAGS_MAX)?;
+        let tags = tags_from_tag_set(&req.input.tagging.tag_set, OBJECT_TAGS_MAX)?;
         self.storage
             .put_object_tags(&bucket, &key, &tags)
             .await
@@ -1008,6 +1013,7 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::CopyObjectInput>,
     ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
+        use crate::_core::acl::Acl;
         Self::require_cap(self.caps.copy_object, "CopyObject")?;
         let (src_bucket, src_key) = self.copy_source(&req.input.copy_source)?;
         let dst_bucket = self.bucket(req.input.bucket)?;
@@ -1077,7 +1083,7 @@ impl<S: Storage> S3Backend<S> {
             )
             .await?;
         #[cfg(not(feature = "acl"))]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        let write_acl: Option<(acl::OwnerId, Acl)> = None;
 
         // Server-side copy: the contract's copy primitive moves the
         // source bytes into the destination (no client passthrough,
@@ -1133,7 +1139,7 @@ impl<S: Storage> S3Backend<S> {
         )
         .await?;
         // The no-identity / toggle-off default (Task 5).
-        let default_acl = acl::Acl::default_private(None);
+        let default_acl = Acl::default_private(None);
         let (owner, acl) = match &write_acl {
             Some((owner, acl)) => (Some(owner), acl),
             None => (None, &default_acl),
@@ -1187,6 +1193,7 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::RenameObjectInput>,
     ) -> S3Result<S3Response<dto::RenameObjectOutput>> {
+        use http::header::ETAG;
         Self::require_cap(self.caps.copy_object, "RenameObject")?;
         let bucket = self.bucket(req.input.bucket)?;
         let dst = self.key(req.input.key)?;
@@ -1286,7 +1293,7 @@ impl<S: Storage> S3Backend<S> {
         // is an empty struct — the echo rides the response header.
         let mut resp = S3Response::new(dto::RenameObjectOutput::default());
         resp.headers.insert(
-            http::header::ETAG,
+            ETAG,
             Self::etag_wire(&info.etag)
                 .to_http_header()
                 .map_err(|_| s3_error!(InternalError, "invalid ETag header"))?,
@@ -1361,7 +1368,8 @@ mod tests {
     /// A well-formed Content-MD5 value (base64 of 16 zero bytes).
     #[cfg(feature = "acl")]
     fn valid_md5() -> String {
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 16])
+        use base64::engine::general_purpose::STANDARD;
+        base64::Engine::encode(&STANDARD, [0u8; 16])
     }
 
     #[cfg(feature = "acl")]
@@ -1981,6 +1989,7 @@ mod tests {
     #[cfg(feature = "acl")]
     #[tokio::test]
     async fn delete_objects_reports_denied_keys_per_key() {
+        use crate::_core::acl::Acl;
         // The handler-side per-key check (spec 2026-09-05, review B2):
         // the op-level coarse gate (bucket owner or any bucket-ACL
         // grantee) is the access layer's; here each key is gated by the
@@ -1998,7 +2007,7 @@ mod tests {
             .create_bucket(
                 &b,
                 Some(&alice),
-                &acl::Acl {
+                &Acl {
                     owner: Some(alice.clone()),
                     grants: vec![
                         grant_to(&alice, acl::Permission::FullControl),
@@ -2025,7 +2034,7 @@ mod tests {
                         .unwrap(),
                     object::Tags::empty(),
                     Some(owner),
-                    &acl::Acl::default_private(Some(owner.clone())),
+                    &Acl::default_private(Some(owner.clone())),
                 )
                 .await
                 .unwrap();
@@ -2113,6 +2122,7 @@ mod tests {
     #[cfg(feature = "acl")]
     #[tokio::test]
     async fn delete_objects_toggle_off_keeps_no_per_key_checks() {
+        use crate::{_core::acl::Acl, backend::testutil};
         // The toggle-off mode (accept-and-drop): no per-key checks — a
         // non-owner deletes the owner's key with a plain Deleted entry
         // (today's behavior; the access layer is the enforcement
@@ -2124,16 +2134,12 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_identity(crate::backend::testutil::acl_identity());
+        .with_identity(testutil::acl_identity());
         let storage = backend.storage();
         let alice = user_id("AKID");
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(
-                &b,
-                Some(&alice),
-                &acl::Acl::default_private(Some(alice.clone())),
-            )
+            .create_bucket(&b, Some(&alice), &Acl::default_private(Some(alice.clone())))
             .await
             .unwrap();
         let k = object::key("alice.txt").unwrap();
@@ -2144,7 +2150,7 @@ mod tests {
                 storage.stage_body(&b, &k, body(b"a"), None).await.unwrap(),
                 object::Tags::empty(),
                 Some(&alice),
-                &acl::Acl::default_private(Some(alice.clone())),
+                &Acl::default_private(Some(alice.clone())),
             )
             .await
             .unwrap();
@@ -3026,7 +3032,7 @@ mod tests {
         backend: &S3Backend<MemoryStorage>,
         b: &bucket::Name,
         key: &str,
-    ) -> crate::_core::object::Info {
+    ) -> object::Info {
         backend
             .storage()
             .head_object(b, &object::key(key).unwrap())
@@ -3038,10 +3044,11 @@ mod tests {
     /// hasher the wire uses — the test simulates a real client).
     #[cfg(feature = "multipart")]
     fn client_checksum(algo: Algorithm, data: &[u8]) -> String {
+        use crate::backend::{checksum, checksum::checksum_value_of};
         let mut hasher = ChecksumHasher::default();
-        crate::backend::checksum::enable_algo(&mut hasher, algo);
+        checksum::enable_algo(&mut hasher, algo);
         hasher.update(data);
-        crate::backend::checksum::checksum_value_of(&hasher.finalize(), algo)
+        checksum_value_of(&hasher.finalize(), algo)
             .unwrap()
             .to_string()
     }
@@ -3156,6 +3163,7 @@ mod tests {
     #[cfg(feature = "multipart")]
     #[tokio::test]
     async fn get_object_attributes_echoes_the_recorded_checksum_and_paginates_parts() {
+        use s3s::dto::CompletedPart;
         // Create (SHA256) → upload two parts with per-part checksums →
         // complete: the completion derives the composite and records it.
         // GetObjectAttributes then echoes the RECORDED composite under
@@ -3210,7 +3218,7 @@ mod tests {
                         etags
                             .iter()
                             .enumerate()
-                            .map(|(i, e)| dto::CompletedPart {
+                            .map(|(i, e)| CompletedPart {
                                 part_number: Some(i as i32 + 1),
                                 e_tag: Some(e.clone()),
                                 ..Default::default()
@@ -3717,15 +3725,12 @@ mod tests {
     /// a `data` bucket owned by the given owner.
     #[cfg(feature = "acl")]
     async fn acl_setup(owner: &acl::OwnerId) -> (S3Backend<MemoryStorage>, bucket::Name) {
+        use crate::_core::acl::Acl;
         let backend = acl_backend();
         let b = bucket::name("data").unwrap();
         backend
             .storage()
-            .create_bucket(
-                &b,
-                Some(owner),
-                &acl::Acl::default_private(Some(owner.clone())),
-            )
+            .create_bucket(&b, Some(owner), &Acl::default_private(Some(owner.clone())))
             .await
             .unwrap();
         (backend, b)
@@ -3734,6 +3739,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "acl")]
     async fn put_object_with_canned_public_read_stores_the_expanded_grants() {
+        use crate::_core::acl::ANONYMOUS_CANONICAL_ID;
         // PUT + `x-amz-acl: public-read`: the write records the expanded
         // grant set — the anonymous requester's FULL_CONTROL plus the
         // AllUsers READ — and the requester's owner element (B4 rule 2:
@@ -3754,9 +3760,9 @@ mod tests {
         let row = backend.storage().get_object_acl(&b, &key).await.unwrap();
         assert_eq!(
             row.owner.as_ref().map(|o| o.as_str()).unwrap(),
-            acl::ANONYMOUS_CANONICAL_ID
+            ANONYMOUS_CANONICAL_ID
         );
-        let anon = acl::OwnerId::new(acl::ANONYMOUS_CANONICAL_ID).unwrap();
+        let anon = acl::OwnerId::new(ANONYMOUS_CANONICAL_ID).unwrap();
         assert_eq!(
             row.grants,
             vec![
@@ -3769,13 +3775,14 @@ mod tests {
     #[tokio::test]
     #[cfg(all(feature = "acl", feature = "copy"))]
     async fn copy_object_takes_its_own_acl_and_owner() {
+        use crate::_core::acl::Acl;
         // The copy's ACL comes from the REQUEST (default-private here) —
         // never from the source's public grants; the copy's owner is the
         // requester, not the source's owner (Task 11, carry 5).
         let alice = user_id("AKID");
         let (backend, b) = acl_setup(&alice).await;
         let src = object::key("src.txt").unwrap();
-        let public = acl::Acl {
+        let public = Acl {
             owner: Some(alice.clone()),
             grants: vec![
                 grant_to(&alice, acl::Permission::FullControl),
@@ -3875,12 +3882,13 @@ mod tests {
     #[tokio::test]
     #[cfg(all(feature = "acl", feature = "copy"))]
     async fn rename_preserves_owner_and_acl() {
+        use crate::_core::acl::Acl;
         // RenameObject keeps the stored pair (design §3 — the server op
         // passes no ACL parameters; the backend preserves the row).
         let alice = user_id("AKID");
         let (backend, b) = acl_setup(&alice).await;
         let src = object::key("src.txt").unwrap();
-        let public = acl::Acl {
+        let public = Acl {
             owner: Some(alice.clone()),
             grants: vec![
                 grant_to(&alice, acl::Permission::FullControl),
@@ -3938,6 +3946,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "acl")]
     async fn post_object_overwrite_requires_destination_owner() {
+        use crate::_core::acl::Acl;
         // The handler-side B1 head for PostObject (carry 3): s3s routes
         // the form to the bucket path, so the access layer saw only the
         // base bucket-WRITE gate — the delegated put path knows the key.
@@ -3947,7 +3956,7 @@ mod tests {
         let alice = user_id("AKID");
         let backend = acl_backend();
         let b = bucket::name("data").unwrap();
-        let public_write = acl::Acl {
+        let public_write = Acl {
             owner: Some(alice.clone()),
             grants: vec![
                 grant_to(&alice, acl::Permission::FullControl),
@@ -3972,7 +3981,7 @@ mod tests {
                     .unwrap(),
                 object::Tags::empty(),
                 Some(&alice),
-                &acl::Acl::default_private(Some(alice.clone())),
+                &Acl::default_private(Some(alice.clone())),
             )
             .await
             .unwrap();

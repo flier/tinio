@@ -23,5 +23,8 @@ default = ["api", "mem"]
 api = ["dep:tinio-api"]
 mem = ["dep:tinio-mem"]
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

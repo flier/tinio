@@ -144,13 +144,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+    use redb::{
+        Database, ReadableDatabase, ReadableTable, TableDefinition, backends::InMemoryBackend,
+    };
 
     use super::*;
 
     fn mem_db() -> Database {
         Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .create_with_backend(InMemoryBackend::new())
             .unwrap()
     }
 

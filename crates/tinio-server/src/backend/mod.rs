@@ -26,6 +26,9 @@
 //! management-plane GET is intercepted pre-route in `data.rs` and is not
 //! subject to the access-layer pipeline.
 
+use s3s::auth::Credentials;
+
+use crate::_core::acl::Acl;
 #[cfg(feature = "acl")]
 pub(crate) mod acls;
 mod conditions;
@@ -475,10 +478,7 @@ impl<S: Storage> S3Backend<S> {
     /// B4, never the default owner). The write paths resolve through it;
     /// the ACL ops use the row-owner resolution instead.
     #[cfg(feature = "acl")]
-    pub(crate) fn owner_for(
-        &self,
-        credentials: Option<&s3s::auth::Credentials>,
-    ) -> Option<acl::OwnerId> {
+    pub(crate) fn owner_for(&self, credentials: Option<&Credentials>) -> Option<acl::OwnerId> {
         self.identity
             .as_ref()
             .map(|identity| identity.principal(credentials))
@@ -510,11 +510,11 @@ impl<S: Storage> S3Backend<S> {
     #[cfg(feature = "acl")]
     pub(crate) async fn write_acl_for(
         &self,
-        credentials: Option<&s3s::auth::Credentials>,
+        credentials: Option<&Credentials>,
         bucket: &bucket::Name,
         canned: Option<&str>,
         headers: GrantHeaders<'_>,
-    ) -> S3Result<Option<(acl::OwnerId, acl::Acl)>> {
+    ) -> S3Result<Option<(acl::OwnerId, Acl)>> {
         if !self.caps.acl || self.identity.is_none() {
             return Ok(None);
         }

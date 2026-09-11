@@ -2,10 +2,8 @@
 
 ## Imports
 
-- Top `use`; never inline. `super::server` → `server::Config`. Nest `foo::{Bar, dto::{self, Baz}}`.
-- 3+ (`a::b::c`): `use` then short form — code, tests, benches, docs. `Type::item`: `use` type then `Type::item` (not item, not module-qualify). Collide → alias (`IoError`); glob `Error::*` only `error.rs`/tests.
-- Workspace `tinio_*` → `_`+rest: `lib.rs` `#[doc(hidden)] pub extern crate tinio_core as _core;` (`#[cfg(feature)]`; test `#[cfg(test)] extern crate`). In-crate: `crate::{_core::{...}, path}`; else `tinio_fs::`.
-- `tokio::fs` over `std::fs` (sync / `spawn_blocking` / no-async-API / re-exports `Metadata` stay `std::fs`).
+- Top `use`; never inline. `super::server` → `server::Config`. Nest `foo::{Bar, dto::{self, Baz}}`. 3+/2-seg: drop qualifier unless generic/prefix/collision. `clippy::absolute_paths`. Glob `Error::*` only `error.rs`/tests.
+- `tinio_*` → `_`+rest: `lib.rs` `#[doc(hidden)] pub extern crate tinio_core as _core;` (`#[cfg(feature)]`; test `#[cfg(test)] extern crate`). In-crate `crate::{_core::{...}, path}`; else `tinio_fs::`. `tokio::fs` except sync/`spawn_blocking`/no-async-API/`Metadata`.
 
 ## Types & defaults
 

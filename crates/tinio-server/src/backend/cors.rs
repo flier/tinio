@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header};
-use s3s::{Body, S3Error, S3Request, S3Response, S3Result, dto, route::S3Route, s3_error};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, dto, path, route::S3Route, s3_error};
 
 use crate::{
     _core::{
@@ -145,7 +145,7 @@ impl PreflightRoute {
 /// 0.15); `get_bucket_name()` covers both the bucket-only and the object
 /// path.
 pub(crate) fn bucket_from_uri(uri: &Uri) -> Option<String> {
-    s3s::path::parse_path_style(uri.path())
+    path::parse_path_style(uri.path())
         .ok()
         .and_then(|path| path.get_bucket_name().map(str::to_string))
 }
@@ -501,7 +501,7 @@ mod tests {
         bucket_from_uri,
     };
     use crate::{
-        _core::{bucket, cors, storage::BucketOps},
+        _core::{acl::Acl, bucket, cors, storage::BucketOps},
         _mem::MemoryStorage,
         backend::{
             Capabilities,
@@ -809,7 +809,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage.put_bucket_cors(&name, &config).await.unwrap();
@@ -979,7 +979,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         let route = PreflightRoute::new(Arc::new(Configs::new(storage)) as Arc<dyn Lookup>);

@@ -29,7 +29,7 @@ use crate::backend::acls::grant_headers;
 use crate::backend::{ConditionalHeaders, byte_range};
 use crate::{
     _core::{
-        ETag, acl,
+        ETag,
         checksum::{Algorithm, Part, Recorded, Type, Upload, Value},
         multipart::{
             CompletedPart, PartNumber, check_part_minimum, part_number as parse_part_number,
@@ -214,6 +214,7 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
+        use crate::_core::acl::Acl;
         self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
@@ -301,9 +302,9 @@ impl<S: Storage> S3Backend<S> {
             )
             .await?;
         #[cfg(not(feature = "acl"))]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        let write_acl: Option<(acl::OwnerId, Acl)> = None;
         // The no-identity / toggle-off default (Task 5).
-        let default_acl = acl::Acl::default_private(None);
+        let default_acl = Acl::default_private(None);
         let (owner, acl) = match &write_acl {
             Some((owner, acl)) => (Some(owner), acl),
             None => (None, &default_acl),
@@ -1109,7 +1110,7 @@ mod tests {
             storage::{BucketOps, MultipartOps, ObjectOps},
         },
         _mem::MemoryStorage,
-        _util::testing::{body, tags},
+        _util::testing::{body, read_body, tags},
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_with_caps},
@@ -1370,6 +1371,7 @@ mod tests {
     #[cfg(feature = "copy")]
     #[tokio::test]
     async fn upload_part_copy_respects_copy_object_toggle() {
+        use crate::_core::acl::Acl;
         let storage = MemoryStorage::new().unwrap();
         let backend = S3Backend::new(
             storage,
@@ -1384,7 +1386,7 @@ mod tests {
             .create_bucket(
                 &bucket::name(&b).unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1417,6 +1419,7 @@ mod tests {
     #[cfg(feature = "multipart")]
     #[tokio::test]
     async fn list_parts_allow_zero_page_size_restores_the_legacy_empty_page() {
+        use crate::_core::acl::Acl;
         // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
         // empty page (the legacy behavior), never InvalidArgument.
         let backend = S3Backend::new(
@@ -1429,7 +1432,7 @@ mod tests {
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let create = backend
@@ -1459,6 +1462,7 @@ mod tests {
     #[cfg(feature = "multipart")]
     #[tokio::test]
     async fn list_multipart_uploads_allow_zero_page_size_restores_the_legacy_empty_page() {
+        use crate::_core::acl::Acl;
         // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
         // empty page (the legacy behavior), never InvalidArgument.
         let backend = S3Backend::new(
@@ -1473,7 +1477,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("data").unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1773,6 +1777,7 @@ mod tests {
     #[cfg(feature = "multipart")]
     #[tokio::test]
     async fn complete_full_object_size_check_runs_before_the_d2_skip() {
+        use std::slice;
         // W04: the FULL_OBJECT size requirements depend only on the
         // listed part sizes — they must fire even when a part lacks a
         // stored checksum (the D2 skip must not shadow them).
@@ -1795,7 +1800,7 @@ mod tests {
         let etag = dto::ETag::Strong(part.etag.as_str());
         // FULL_OBJECT without x-amz-mp-object-size → InvalidRequest,
         // even though the stored-checksum gate would skip validation.
-        let mut input = complete_input(&upload_id, std::slice::from_ref(&etag));
+        let mut input = complete_input(&upload_id, slice::from_ref(&etag));
         input.checksum_crc32 = Some("y/Q5Jg==".into());
         input.checksum_type = Some("FULL_OBJECT".parse().unwrap());
         let err = backend
@@ -1804,7 +1809,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidRequest");
         // Wrong size → InvalidRequest too.
-        let mut input = complete_input(&upload_id, std::slice::from_ref(&etag));
+        let mut input = complete_input(&upload_id, slice::from_ref(&etag));
         input.checksum_crc32 = Some("y/Q5Jg==".into());
         input.checksum_type = Some("FULL_OBJECT".parse().unwrap());
         input.mpu_object_size = Some(999);
@@ -1864,6 +1869,7 @@ mod tests {
     #[cfg(feature = "multipart")]
     #[tokio::test]
     async fn checksum_toggle_off_accepts_and_drops_part_checksum_entries() {
+        use std::slice;
         // F01: with the toggle off, a CompletedPart carrying TWO checksum
         // fields is accepted and dropped (v1 pass-through) — it must not
         // answer InvalidRequest, and the single-part complete must not
@@ -1883,7 +1889,7 @@ mod tests {
             .unwrap();
         let mut input = complete_input(
             &upload_id,
-            std::slice::from_ref(part.output.e_tag.as_ref().unwrap()),
+            slice::from_ref(part.output.e_tag.as_ref().unwrap()),
         );
         if let Some(parts) = input
             .multipart_upload
@@ -1949,6 +1955,7 @@ mod tests {
     #[cfg(feature = "multipart")]
     #[tokio::test]
     async fn checksum_toggle_off_list_uploads_drops_a_persisted_spec() {
+        use crate::_core::acl::Acl;
         // F02: a checksum spec persisted by an earlier on-run must not be
         // echoed by ListMultipartUploads while the toggle is off (off =
         // accept-and-drop) — ListParts already gates its echo, the two
@@ -1959,13 +1966,13 @@ mod tests {
             .create_multipart_upload(
                 &bucket::name(&b).unwrap(),
                 &object::key("big.bin").unwrap(),
-                Some(crate::_core::checksum::Upload {
+                Some(Upload {
                     algorithm: Algorithm::Crc32,
                     r#type: None,
                 }),
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1985,7 +1992,7 @@ mod tests {
     /// assertions: a rejected conditional complete must leave the
     /// destination untouched).
     async fn object_body(backend: &S3Backend<MemoryStorage>, b: &str) -> Vec<u8> {
-        crate::_util::testing::read_body(
+        read_body(
             backend
                 .storage()
                 .get_object(
@@ -2327,6 +2334,7 @@ mod tests {
     #[cfg(all(feature = "multipart", feature = "acl"))]
     #[tokio::test]
     async fn multipart_acl_applies_at_completion() {
+        use crate::_core::acl::{ANONYMOUS_CANONICAL_ID, Acl};
         // The CMU records the request's canned ACL alongside the
         // requester's owner; the completion applies the stored pair to
         // the object (backend-side, the tags precedent) — the object
@@ -2336,11 +2344,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         backend
             .storage()
-            .create_bucket(
-                &b,
-                Some(&alice),
-                &acl::Acl::default_private(Some(alice.clone())),
-            )
+            .create_bucket(&b, Some(&alice), &Acl::default_private(Some(alice.clone())))
             .await
             .unwrap();
         let create = backend
@@ -2376,10 +2380,10 @@ mod tests {
             .get_object_acl(&b, &object::key("big.bin").unwrap())
             .await
             .unwrap();
-        let anon = acl::OwnerId::new(acl::ANONYMOUS_CANONICAL_ID).unwrap();
+        let anon = acl::OwnerId::new(ANONYMOUS_CANONICAL_ID).unwrap();
         assert_eq!(
             row.owner.as_ref().map(|o| o.as_str()).unwrap(),
-            acl::ANONYMOUS_CANONICAL_ID
+            ANONYMOUS_CANONICAL_ID
         );
         assert_eq!(
             row.grants,

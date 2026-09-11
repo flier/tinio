@@ -23,7 +23,9 @@ use std::io::Cursor;
 use std::{
     cell::Cell,
     collections::VecDeque,
+    io,
     io::Read,
+    mem,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -148,7 +150,7 @@ struct CountingRead<R: Read> {
 }
 
 impl<R: Read> Read for CountingRead<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.count.set(self.count.get() + n as u64);
         Ok(n)
@@ -358,23 +360,23 @@ impl Packer {
         };
         if bytes.len() as u64 > EVENT_CAP {
             if !self.buf.is_empty() {
-                staged.frames.push(std::mem::take(&mut self.buf));
+                staged.frames.push(mem::take(&mut self.buf));
             }
             staged.too_large = true;
             return staged;
         }
         if bytes.len() as u64 + self.buf.len() as u64 > EVENT_CAP {
-            staged.frames.push(std::mem::take(&mut self.buf));
+            staged.frames.push(mem::take(&mut self.buf));
         }
         self.buf.extend_from_slice(&bytes);
         if self.buf.len() as u64 >= EVENT_CAP {
-            staged.frames.push(std::mem::take(&mut self.buf));
+            staged.frames.push(mem::take(&mut self.buf));
         }
         staged
     }
 
     fn take(&mut self) -> Option<Vec<u8>> {
-        (!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf))
+        (!self.buf.is_empty()).then(|| mem::take(&mut self.buf))
     }
 }
 
@@ -705,6 +707,8 @@ fn build_reader(
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Write as _};
+
+    use bzip2::write::BzEncoder;
 
     use super::*;
     use crate::{
@@ -1136,7 +1140,7 @@ mod tests {
 {\"b\": 2}
 "
         .to_vec();
-        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        let mut enc = BzEncoder::new(Vec::new(), bzip2::Compression::best());
         enc.write_all(&payload).unwrap();
         let bz = enc.finish().unwrap();
         let config = SelectConfig {

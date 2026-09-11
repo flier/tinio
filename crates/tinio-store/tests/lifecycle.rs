@@ -6,7 +6,7 @@
 
 use std::time::SystemTime;
 
-use redb::Database;
+use redb::{Database, backends::InMemoryBackend};
 use tinio_core::{
     acl::Acl,
     checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Upload, Value},
@@ -20,7 +20,7 @@ use tinio_store::{
 
 fn handle() -> Handle {
     let db = Database::builder()
-        .create_with_backend(redb::backends::InMemoryBackend::new())
+        .create_with_backend(InMemoryBackend::new())
         .unwrap();
     let handle = Handle::new(db);
     handle.write(ensure_all).unwrap();

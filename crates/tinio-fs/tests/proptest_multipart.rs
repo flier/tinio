@@ -11,7 +11,9 @@ use md5::{Digest, Md5};
 use prop::collection;
 use proptest::prelude::*;
 use tinio_core::{
-    ETag, bucket,
+    ETag,
+    acl::Acl,
+    bucket,
     multipart::{CompletedPart, MIN_PART_BYTES, PartInfo, PartNumber},
     object,
     storage::Error::NoSuchUpload,
@@ -53,7 +55,7 @@ proptest! {
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
             let upload = store
-                .create(&b, &key, None, object::Tags::empty(), None, &tinio_core::acl::Acl::default_private(None)).await.unwrap();
+                .create(&b, &key, None, object::Tags::empty(), None, &Acl::default_private(None)).await.unwrap();
 
             let mut parts = Vec::new();
             let mut expected = Vec::new();
@@ -108,7 +110,7 @@ proptest! {
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
             let upload = store
-                .create(&b, &key, None, object::Tags::empty(), None, &tinio_core::acl::Acl::default_private(None)).await.unwrap();
+                .create(&b, &key, None, object::Tags::empty(), None, &Acl::default_private(None)).await.unwrap();
             let first_data: Vec<u8> = (0..first).map(|i| i as u8).collect();
             let second_data: Vec<u8> = (0..second).map(|i| (i as u8).wrapping_mul(7)).collect();
             let p1 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(first_data.clone()), None).await.unwrap();
@@ -149,7 +151,7 @@ proptest! {
             let b = bucket::name("data").unwrap();
             let key = object::key("big.bin").unwrap();
             let upload = store
-                .create(&b, &key, None, object::Tags::empty(), None, &tinio_core::acl::Acl::default_private(None)).await.unwrap();
+                .create(&b, &key, None, object::Tags::empty(), None, &Acl::default_private(None)).await.unwrap();
             let pn: PartNumber = n.into();
             prop_assert!(u32::from(pn) == n);
             let part = store.put_part(&b, &key, &upload.upload_id, pn, body(b"x"), None).await.unwrap();

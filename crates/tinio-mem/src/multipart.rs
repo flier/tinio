@@ -12,10 +12,11 @@ use uuid::Uuid;
 
 use crate::{
     _core::{
-        CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps, MultipartUpload,
-        PartInfo, PartNumber, PartsListing, UploadsListing, acl, bucket::Name, checksum,
-        collect_body, from_nanos, group_and_paginate_unordered, key_marker_order,
-        multipart::check_part_minimum, now_nanos, object, split_uploads_order, uploads_order,
+        BodyStream, CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps,
+        MultipartUpload, PartInfo, PartNumber, PartsListing, UploadsListing, acl, acl::Acl,
+        bucket::Name, checksum, collect_body, from_nanos, group_and_paginate_unordered,
+        key_marker_order, multipart::check_part_minimum, now_nanos, object,
+        object::OBJECT_TAGS_MAX, split_uploads_order, uploads_order,
     },
     _store::{
         bucket, decode_acl_wire, decode_owner_wire, meta, object_part, objects, part,
@@ -38,7 +39,7 @@ struct UploadRow {
     initiated_at: u64,
     tags: object::Tags,
     owner: Option<acl::OwnerId>,
-    acl: acl::Acl,
+    acl: Acl,
     checksum: Option<checksum::Upload>,
 }
 
@@ -51,7 +52,7 @@ impl MultipartOps for MemoryStorage {
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<MultipartUpload, Error> {
         // Bucket existence first, like the fs backend and every S3 op: a
         // reserved/marker key on a missing bucket answers NoSuchBucket,
@@ -145,7 +146,7 @@ impl MultipartOps for MemoryStorage {
                 key: key.clone(),
                 initiated_at: from_nanos(initiated),
                 checksum,
-                tags: object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX),
+                tags: object::Tags::from_wire_limited(&tags_wire, OBJECT_TAGS_MAX),
                 owner: decode_owner_wire(&owner_wire),
                 acl: decode_acl_wire(&acl_wire),
             })
@@ -158,7 +159,7 @@ impl MultipartOps for MemoryStorage {
         key: &object::Key,
         upload_id: &str,
         part_number: PartNumber,
-        body: crate::_core::BodyStream,
+        body: BodyStream,
         checksum: Option<Arc<checksum::PartChecksum>>,
     ) -> Result<PartInfo, Error> {
         // Fast-fail on a missing bucket before buffering the body (the write
@@ -377,7 +378,7 @@ impl MultipartOps for MemoryStorage {
                     return Err(no_such_upload(upload_id));
                 };
                 (
-                    object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX),
+                    object::Tags::from_wire_limited(&tags_wire, OBJECT_TAGS_MAX),
                     decode_owner_wire(&owner_wire),
                     decode_acl_wire(&acl_wire),
                 )
@@ -676,7 +677,7 @@ impl MultipartOps for MemoryStorage {
                         key,
                         upload_id: upload_id.to_string(),
                         initiated_at,
-                        tags: object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                        tags: object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
                         owner: decode_owner_wire(owner_wire),
                         acl: decode_acl_wire(acl_wire),
                         checksum,
@@ -733,7 +734,9 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            BucketOps, CompletedPart, ListUploadsParams, MultipartOps, ObjectOps, PartInfo, bucket,
+            BucketOps, CompletedPart, ListUploadsParams, MultipartOps, ObjectOps, PartInfo,
+            acl::Acl,
+            bucket,
             multipart::{MIN_PART_BYTES, part_number},
             object,
             storage::Error::*,
@@ -754,7 +757,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         (storage, name)
@@ -769,7 +772,7 @@ mod tests {
         .unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("big.bin").unwrap();
@@ -780,7 +783,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -822,7 +825,7 @@ mod tests {
         .unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("big.bin").unwrap();
@@ -833,7 +836,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -891,7 +894,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -919,7 +922,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -930,7 +933,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -949,7 +952,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1005,7 +1008,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1088,7 +1091,7 @@ mod tests {
                 None,
                 tags.clone(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1191,7 +1194,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use super::Storage;
 use crate::{
     acl,
+    acl::{Acl, AclGrants},
     bucket::{self, Bucket},
     cors, object,
 };
@@ -93,7 +94,7 @@ pub trait BucketOps: Send + Sync + 'static {
         &self,
         name: &bucket::Name,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
@@ -190,10 +191,7 @@ pub trait BucketOps: Send + Sync + 'static {
 
     /// The bucket's ACL (S3 GetBucketAcl). `NoSuchBucket` when the
     /// bucket is missing.
-    async fn get_bucket_acl(
-        &self,
-        name: &bucket::Name,
-    ) -> Result<acl::Acl, <Self as Storage>::Error>
+    async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<Acl, <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -203,7 +201,7 @@ pub trait BucketOps: Send + Sync + 'static {
     async fn put_bucket_acl(
         &self,
         name: &bucket::Name,
-        grants: &acl::AclGrants,
+        grants: &AclGrants,
     ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;

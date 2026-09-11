@@ -21,6 +21,7 @@
 //! on, plain → off).
 use std::{
     env, fs,
+    fs::File,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
@@ -33,7 +34,10 @@ use assert_cmd::Command as AssertCmd;
 use cucumber::{given, then, when};
 
 use super::{FsKind, World, common::deterministic_bytes, has_tag};
-use crate::_server::_config::{Config, s3};
+use crate::_server::{
+    _config::{Config, s3},
+    Capabilities,
+};
 
 /// The fixed MinIO-convention credential pair the serve example accepts.
 pub const ACCESS_KEY: &str = "minioadmin";
@@ -99,7 +103,7 @@ impl External {
     /// `--config <file>` (`[s3] checksum = true`, `[s3] max_buckets = 3`),
     /// the fs-scanner variant becomes `TINIO_SCANNER` (`@cold-listing` →
     /// on, plain → off).
-    pub fn start(caps: &crate::_server::Capabilities, fs_kind: FsKind) -> Self {
+    pub fn start(caps: &Capabilities, fs_kind: FsKind) -> Self {
         let workdir = tempfile::tempdir().unwrap();
         let root = workdir.path().join("root");
         fs::create_dir_all(&root).unwrap();
@@ -226,8 +230,8 @@ fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<String> {
 /// types — one home for the knob list (a knob the schema gains is a
 /// knob the scenarios can set). None when every knob sits at its
 /// default (no file).
-fn config_for(caps: &crate::_server::Capabilities) -> Option<String> {
-    if *caps == crate::_server::Capabilities::default() {
+fn config_for(caps: &Capabilities) -> Option<String> {
+    if *caps == Capabilities::default() {
         return None;
     }
     let config = Config {
@@ -372,8 +376,8 @@ fn files_equal(a: &Path, b: &Path) {
         ma.len(),
         mb.len()
     );
-    let mut fa = fs::File::open(a).unwrap();
-    let mut fb = fs::File::open(b).unwrap();
+    let mut fa = File::open(a).unwrap();
+    let mut fb = File::open(b).unwrap();
     let (mut buf_a, mut buf_b) = ([0u8; 64 * 1024], [0u8; 64 * 1024]);
     loop {
         let na = fa.read(&mut buf_a).unwrap();

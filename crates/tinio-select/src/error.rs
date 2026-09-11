@@ -1,3 +1,5 @@
+use std::io;
+
 use derive_more::{Deref, From, PartialEq};
 use thiserror::Error;
 
@@ -6,7 +8,7 @@ use thiserror::Error;
 /// kind.
 #[derive(Debug, Deref, From, Error)]
 #[error(transparent)]
-pub struct IoError(std::io::Error);
+pub struct IoError(io::Error);
 
 impl PartialEq for IoError {
     fn eq(&self, other: &Self) -> bool {
@@ -45,6 +47,8 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
+    use std::{io as std_io, io::ErrorKind::NotFound};
+
     use super::Error;
 
     #[test]
@@ -72,7 +76,7 @@ mod tests {
         );
         // std::io::Error Display wraps the custom message; assert the framing
         // and payload rather than the exact io formatting.
-        let io = Error::from(std::io::Error::other("boom"));
+        let io = Error::from(std_io::Error::other("boom"));
         let msg = io.to_string();
         assert!(msg.starts_with("S3 select: io error:"), "{msg}");
         assert!(msg.contains("boom"), "{msg}");
@@ -92,14 +96,11 @@ mod tests {
 
     #[test]
     fn from_io_error() {
-        let io: std::io::Error = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let io: std_io::Error = std_io::Error::new(NotFound, "missing");
         let e = Error::from(io);
         // Io compares by kind() only, not payload.
-        assert_eq!(
-            e,
-            Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "other"))
-        );
-        assert_ne!(e, Error::from(std::io::Error::other("missing")));
+        assert_eq!(e, Error::from(std_io::Error::new(NotFound, "other")));
+        assert_ne!(e, Error::from(std_io::Error::other("missing")));
     }
 
     #[test]

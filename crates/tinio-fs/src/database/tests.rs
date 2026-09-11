@@ -23,6 +23,7 @@ use super::{
 };
 use crate::{
     _core::{bucket::name, object},
+    _store,
     _store::{bucket, meta, object_part, part, part_checksum, upload, upload_checksum},
     _util::testing::assert_send_sync,
 };
@@ -36,13 +37,10 @@ fn open_db() -> (tempfile::TempDir, Database, Stats) {
 #[test]
 fn redb_errors_wrap_per_kind() {
     let err = Error::Redb(TableDoesNotExist("t".into()).into());
-    assert!(
-        matches!(err, Error::Redb(crate::_store::Error::Table(_))),
-        "{err}"
-    );
+    assert!(matches!(err, Error::Redb(_store::Error::Table(_))), "{err}");
     let err = Error::Redb(TxnStorage(ValueTooLarge(1)).into());
     assert!(
-        matches!(err, Error::Redb(crate::_store::Error::Transaction(_))),
+        matches!(err, Error::Redb(_store::Error::Transaction(_))),
         "{err}"
     );
     assert!(
@@ -150,7 +148,7 @@ async fn corrupt_file_is_an_error() {
     fs::write(state.path().join("meta.redb"), b"not a redb file").unwrap();
     let err = open(state.path()).unwrap_err();
     assert!(
-        matches!(err, Error::Redb(crate::_store::Error::Open(_))),
+        matches!(err, Error::Redb(_store::Error::Open(_))),
         "{err:?}"
     );
 }

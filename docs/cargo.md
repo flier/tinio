@@ -8,6 +8,7 @@
 - `version`/`edition` from `[workspace.package]`.
 - `publish = false` except facade `tinio`.
 - `[lints.rust] unsafe_code = "forbid"` on every crate.
+- `[lints.clippy] absolute_paths = "warn"` on every crate — 3+ segment paths go through `use` (`docs/style.md`).
 - Optional/target deps at the crate.
 
 ## Versions
@@ -62,6 +63,9 @@ mem = ["dep:tinio-mem"]
 
 [dev-dependencies]
 tinio-util = { workspace = true, features = ["testing"] }
+
+[lints.clippy]
+absolute_paths = "warn"
 
 [lints.rust]
 unsafe_code = "forbid"

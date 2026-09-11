@@ -12,6 +12,7 @@ use sqlparser::{
     },
     parser::Parser,
 };
+use uuid::Uuid;
 
 // Re-export: `FromClause.segments` keeps the public path `sql::PathSeg`.
 pub use crate::path::PathSeg;
@@ -48,14 +49,14 @@ pub enum Projection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SentinelNames {
     /// Private: minted only via `mint()` (review 2026-09-10).
-    uuid: uuid::Uuid,
+    uuid: Uuid,
 }
 
 impl SentinelNames {
     /// Mint the request's sentinel names.
     pub fn mint() -> Self {
         Self {
-            uuid: uuid::Uuid::new_v4(),
+            uuid: Uuid::new_v4(),
         }
     }
 

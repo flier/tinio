@@ -8,13 +8,13 @@
 
 use std::time::{Duration, SystemTime};
 
-use redb::{Database, TableDefinition};
+use redb::{Database, TableDefinition, backends::InMemoryBackend};
 use tinio_core::{
     acl::Acl,
     checksum::{Algorithm, Part, Recorded, Type as ChecksumType, Upload, Value},
     cors,
     etag::ETag,
-    object::{self, Tags},
+    object::{self, OBJECT_TAGS_MAX, Tags},
 };
 use tinio_store::{
     bucket::{self, BucketRow},
@@ -27,7 +27,7 @@ use tinio_store::{
 /// byte-format guard's home: no tempdir, no fs `Handle`, no tokio.
 fn handle() -> Handle {
     let db = Database::builder()
-        .create_with_backend(redb::backends::InMemoryBackend::new())
+        .create_with_backend(InMemoryBackend::new())
         .unwrap();
     let handle = Handle::new(db);
     handle.write(ensure_all).unwrap();
@@ -272,7 +272,7 @@ fn legacy_buckets_arity_fails_loudly_on_open() {
         TableDefinition::new("buckets");
 
     let db = Database::builder()
-        .create_with_backend(redb::backends::InMemoryBackend::new())
+        .create_with_backend(InMemoryBackend::new())
         .unwrap();
     {
         let txn = db.begin_write().unwrap();
@@ -650,14 +650,14 @@ fn upload_tags_accessors_round_trip_and_self_heal() {
         );
         t.for_bucket("data", |_, (_, _, tags_wire, _, _)| {
             assert!(
-                object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX).is_empty(),
+                object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX).is_empty(),
                 "the bucket scan self-heals the same way"
             );
             Ok(())
         })?;
         t.for_each(|_, _, _, _, tags_wire, _, _| {
             assert!(
-                object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX).is_empty(),
+                object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX).is_empty(),
                 "the whole-table walk self-heals the same way"
             );
             Ok(())

@@ -1,7 +1,12 @@
 //! CSV input path: S3 Select `InputSerialization.CSV` framing over the
 //! `csv` crate (imported as `_csv`), under [`RecordReader`].
 
-use std::{cell::RefCell, io::Read, rc::Rc};
+use std::{
+    cell::RefCell,
+    io,
+    io::{ErrorKind, Read},
+    rc::Rc,
+};
 
 use _csv::{ReaderBuilder, StringRecord};
 use parse_display::{Display, FromStr};
@@ -100,16 +105,13 @@ impl<R: Read> CappedRead<R> {
 }
 
 impl<R: Read> Read for CappedRead<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         let mut state = self.state.borrow_mut();
         state.count += n as u64;
         if state.count > cap_with_allowance() {
             state.capped = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                CAP_MESSAGE,
-            ));
+            return Err(io::Error::new(ErrorKind::InvalidData, CAP_MESSAGE));
         }
         Ok(n)
     }

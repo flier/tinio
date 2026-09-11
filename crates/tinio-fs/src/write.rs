@@ -46,6 +46,7 @@ use uuid::Uuid;
 use crate::{
     _core::{BodyStream, ETag, checksum, object::RESERVED_SEGMENT},
     Error, fsutil,
+    fsutil::DirOwnerUid,
     path::TMP_DIR_NAME,
 };
 
@@ -89,7 +90,7 @@ async fn copy_across_volumes(temp: &Path, target: &Path) -> Result<(), Error> {
     // Private residue, server-user-owned: the mode hardening only
     // (spec 2026-09-05 §5a — no chown; `.tinio` dirs stay the server
     // user's).
-    fsutil::ensure_dir(&staging_dir, fsutil::DirOwnerUid::new(None)).await?;
+    fsutil::ensure_dir(&staging_dir, DirOwnerUid::new(None)).await?;
     let staging = staging_dir.join(Uuid::new_v4().to_string());
     let copied = async {
         fs::copy(temp, &staging).await?;
@@ -177,7 +178,7 @@ impl AtomicWriter {
     /// the sweep / startup repair (failure-handling.md §2C).
     pub async fn write(&self, target: &Path, body: BodyStream) -> Result<ETag, Error> {
         let (temp, etag) = self.stage(body, None).await?;
-        Self::commit(&temp, target, None, fsutil::DirOwnerUid::new(None)).await?;
+        Self::commit(&temp, target, None, DirOwnerUid::new(None)).await?;
         Ok(etag)
     }
 
@@ -208,7 +209,7 @@ impl AtomicWriter {
         temp: &Path,
         target: &Path,
         sync_root: Option<&Path>,
-        dir_owner_uid: fsutil::DirOwnerUid,
+        dir_owner_uid: DirOwnerUid,
     ) -> Result<(), Error> {
         // Every commit target is `bucket_dir.join(key)` — a parent always
         // exists (item 8: a `None` here would silently skip the dir
@@ -305,7 +306,7 @@ impl AtomicWriter {
     /// Private state, server-user-owned: the mode hardening only
     /// (spec 2026-09-05 §5a — no chown).
     async fn ensure_tmp_dir(&self) -> io::Result<()> {
-        fsutil::ensure_dir(&self.tmp_dir, fsutil::DirOwnerUid::new(None)).await?;
+        fsutil::ensure_dir(&self.tmp_dir, DirOwnerUid::new(None)).await?;
         Ok(())
     }
 
@@ -456,7 +457,10 @@ mod tests {
     use io::Error as IoError;
 
     use super::*;
-    use crate::_util::testing::{body, etag};
+    use crate::{
+        _util::testing::{body, etag},
+        fsutil::DirOwnerUid,
+    };
 
     #[tokio::test]
     async fn write_stores_content_and_etag() {
@@ -528,7 +532,7 @@ mod tests {
         let (temp, _) = writer.stage(body(b"x"), None).await.unwrap();
         // rename(file, existing-directory) fails on every platform — the
         // target stays untouched and the failed temp is removed (item 7c).
-        let err = AtomicWriter::commit(&temp, &target, None, fsutil::DirOwnerUid::new(None))
+        let err = AtomicWriter::commit(&temp, &target, None, DirOwnerUid::new(None))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Io(_)));
@@ -588,6 +592,8 @@ mod tests {
     async fn first_commit_syncs_the_new_ancestor_chain() {
         use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
+        use crate::fsutil::DirOwnerUid;
+
         let state = tempfile::tempdir().unwrap();
         // `sync_root` = the "bucket" root under the state dir; the
         // leaf parent is TWO levels deep — both new ancestors are
@@ -604,7 +610,7 @@ mod tests {
             .await
             .unwrap();
         let result =
-            AtomicWriter::commit(&temp, &target, Some(&root), fsutil::DirOwnerUid::new(None)).await;
+            AtomicWriter::commit(&temp, &target, Some(&root), DirOwnerUid::new(None)).await;
         fs::set_permissions(&root, Permissions::from_mode(0o755))
             .await
             .unwrap();

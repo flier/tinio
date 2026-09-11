@@ -66,30 +66,33 @@ impl<S: Storage> S3Backend<S> {
         // private default. No-identity mode keeps the Task 5 defaults
         // (B4 rule 3).
         #[cfg(feature = "acl")]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> =
-            if self.caps.acl && self.identity.is_some() {
-                let owner = self
-                    .owner_for(req.credentials.as_ref())
-                    .expect("identity attached above");
-                let acl = bucket_write_acl(
-                    &owner,
-                    req.input.acl.as_ref().map(|c| c.as_str()),
-                    &grant_headers(
-                        req.input.grant_full_control.as_deref(),
-                        req.input.grant_read.as_deref(),
-                        req.input.grant_read_acp.as_deref(),
-                        req.input.grant_write.as_deref(),
-                        req.input.grant_write_acp.as_deref(),
-                    ),
-                )?;
-                Some((owner, acl))
-            } else {
-                None
-            };
+        use crate::_core::acl::Acl;
+        #[cfg(feature = "acl")]
+        let write_acl: Option<(acl::OwnerId, Acl)> = if self.caps.acl && self.identity.is_some() {
+            let owner = self
+                .owner_for(req.credentials.as_ref())
+                .expect("identity attached above");
+            let acl = bucket_write_acl(
+                &owner,
+                req.input.acl.as_ref().map(|c| c.as_str()),
+                &grant_headers(
+                    req.input.grant_full_control.as_deref(),
+                    req.input.grant_read.as_deref(),
+                    req.input.grant_read_acp.as_deref(),
+                    req.input.grant_write.as_deref(),
+                    req.input.grant_write_acp.as_deref(),
+                ),
+            )?;
+            Some((owner, acl))
+        } else {
+            None
+        };
         #[cfg(not(feature = "acl"))]
-        let write_acl: Option<(acl::OwnerId, acl::Acl)> = None;
+        use crate::_core::acl::Acl;
+        #[cfg(not(feature = "acl"))]
+        let write_acl: Option<(acl::OwnerId, Acl)> = None;
         // The no-identity / toggle-off default (Task 5).
-        let default_acl = acl::Acl::default_private(None);
+        let default_acl = Acl::default_private(None);
         let (owner, acl) = match &write_acl {
             Some((owner, acl)) => (Some(owner), acl),
             None => (None, &default_acl),
@@ -416,7 +419,9 @@ mod tests {
     use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
     use crate::{
         _core::{
-            acl, bucket,
+            acl,
+            acl::Acl,
+            bucket,
             storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps},
         },
         _mem::MemoryStorage,
@@ -594,7 +599,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(name).unwrap(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -669,7 +674,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(name).unwrap(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -706,7 +711,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("data").unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -778,7 +783,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(name).unwrap(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -830,7 +835,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("data").unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -897,7 +902,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(format!("b-{i}")).unwrap(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -956,7 +961,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(name).unwrap(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -997,6 +1002,7 @@ mod tests {
     #[cfg(feature = "acl")]
     #[tokio::test]
     async fn list_buckets_filters_by_requester() {
+        use crate::_core::acl::Acl;
         // The enforced-mode owner filter (spec 2026-09-05): the
         // contract-level filter runs during the walk, before pagination
         // (review P2#4), so the continuation-token math applies to the
@@ -1035,7 +1041,7 @@ mod tests {
                 .create_bucket(
                     &bucket::name(bn).unwrap(),
                     owner.as_ref(),
-                    &acl::Acl::default_private(owner.clone()),
+                    &Acl::default_private(owner.clone()),
                 )
                 .await
                 .unwrap();
@@ -1046,7 +1052,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("legacy").unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1118,6 +1124,7 @@ mod tests {
     #[cfg(feature = "acl")]
     #[tokio::test]
     async fn list_buckets_toggle_off_keeps_the_unfiltered_listing() {
+        use crate::{_core::acl::Acl, backend::testutil};
         // The toggle-off mode (accept-and-drop): `caps.acl = false`
         // keeps the unfiltered legacy listing — every bucket, no Owner
         // element — even with the identity attached.
@@ -1128,14 +1135,14 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_identity(crate::backend::testutil::acl_identity());
+        .with_identity(testutil::acl_identity());
         let storage = backend.storage();
         let alice = user_id("AKID");
         storage
             .create_bucket(
                 &bucket::name("alpha").unwrap(),
                 Some(&alice),
-                &acl::Acl::default_private(Some(alice.clone())),
+                &Acl::default_private(Some(alice.clone())),
             )
             .await
             .unwrap();
@@ -1143,7 +1150,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("beta").unwrap(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1328,7 +1335,8 @@ mod tests {
     /// A well-formed Content-MD5 value (base64 of 16 zero bytes).
     #[cfg(feature = "acl")]
     fn valid_md5() -> String {
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 16])
+        use base64::engine::general_purpose::STANDARD;
+        base64::Engine::encode(&STANDARD, [0u8; 16])
     }
 
     #[cfg(feature = "acl")]
@@ -1587,7 +1595,10 @@ mod tests {
     async fn bucket_acl_owner_resolves_through_identity() {
         use std::sync::Arc;
 
-        use crate::_auth::identity::{Identity, User};
+        use crate::{
+            _auth::identity::{Identity, User},
+            _core::acl::Acl,
+        };
         // A recorded row owner: the identity map's user, with its
         // display name resolved on the response.
         let user = User::test("AKID", "secret", "user1");
@@ -1600,7 +1611,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("data").unwrap(),
                 Some(&canonical_id),
-                &acl::Acl::default_private(Some(canonical_id.clone())),
+                &Acl::default_private(Some(canonical_id.clone())),
             )
             .await
             .unwrap();
@@ -1625,7 +1636,7 @@ mod tests {
             .create_bucket(
                 &bucket::name("other").unwrap(),
                 Some(&unknown),
-                &acl::Acl::default_private(Some(unknown.clone())),
+                &Acl::default_private(Some(unknown.clone())),
             )
             .await
             .unwrap();

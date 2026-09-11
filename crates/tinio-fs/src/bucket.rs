@@ -16,8 +16,13 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 
 pub use crate::_core::bucket::{Name, name};
 use crate::{
-    _core::{acl, cors, object, storage::no_such_bucket},
-    _store::{bucket, decode_acl_wire, decode_owner_wire},
+    _core::{
+        acl,
+        acl::{Acl, AclGrants},
+        cors, object,
+        storage::no_such_bucket,
+    },
+    _store::{bucket, bucket::BucketRow, decode_acl_wire, decode_owner_wire},
     Error,
     database::{self, Handle},
 };
@@ -123,14 +128,14 @@ impl Store {
     /// self-heals via the shared decode helpers). A row-less bucket (a
     /// directory never seen through the API — the lazy first-sight
     /// record) answers the default private ACL with no owner.
-    pub async fn acl(&self, name: &Name) -> Result<acl::Acl, Error> {
+    pub async fn acl(&self, name: &Name) -> Result<Acl, Error> {
         let name = name.clone();
         self.handle
             .read(move |txn| {
                 let table = bucket::Table::open_readonly(txn)?;
                 Ok(table.row(&name)?.map_or_else(
-                    || acl::Acl::default_private(None),
-                    |row| acl::Acl {
+                    || Acl::default_private(None),
+                    |row| Acl {
                         owner: decode_owner_wire(&row.owner),
                         grants: decode_acl_wire(&row.acl).grants,
                     },
@@ -143,9 +148,9 @@ impl Store {
     /// the other wires — one read-modify-write transaction (a row-less
     /// bucket is lazily recorded first-sight with the new grant set;
     /// only a real change commits — no fsync).
-    pub async fn set_acl(&self, name: &Name, grants: &acl::AclGrants) -> Result<(), Error> {
+    pub async fn set_acl(&self, name: &Name, grants: &AclGrants) -> Result<(), Error> {
         let name = name.clone();
-        let wire = acl::Acl {
+        let wire = Acl {
             owner: None,
             grants: grants.clone(),
         }
@@ -156,9 +161,9 @@ impl Store {
                 let Some(mut row) = table.row(&name)? else {
                     table.put_full(
                         &name,
-                        &bucket::BucketRow {
+                        &BucketRow {
                             acl: wire.clone(),
-                            ..bucket::BucketRow::at(SystemTime::now())
+                            ..BucketRow::at(SystemTime::now())
                         },
                     )?;
                     return Ok(Some(()));
@@ -354,7 +359,7 @@ impl Store {
         name: &Name,
         created_at: SystemTime,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<(), Error> {
         let name = name.clone();
         let owner_wire = owner.map_or_else(String::new, |o| o.as_str().to_string());
@@ -362,11 +367,11 @@ impl Store {
         self.handle
             .write(move |txn| {
                 let mut table = bucket::Table::open(txn)?;
-                let row = bucket::BucketRow {
+                let row = BucketRow {
                     tags: String::new(),
                     owner: owner_wire,
                     acl: acl_wire,
-                    ..bucket::BucketRow::at(created_at)
+                    ..BucketRow::at(created_at)
                 };
                 table.put_full(&name, &row)?;
                 Ok(())

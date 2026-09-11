@@ -2,6 +2,8 @@
 //! and conditional requests, concurrent writes, and fs staging semantics.
 //! Ported from `tinio-server/tests/data_plane.rs`.
 
+use std::fs;
+
 use cucumber::{given, then, when};
 
 use super::common::{deterministic_bytes, md5_hex};
@@ -167,9 +169,8 @@ async fn no_tmp_remains(world: &mut super::World) {
         .root()
         .expect("fs-backed server root");
     let tmp = root.join(".tinio/tmp");
-    let clean = super::common::eventually(|| {
-        !tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none()
-    })
-    .await;
+    let clean =
+        super::common::eventually(|| !tmp.exists() || fs::read_dir(&tmp).unwrap().next().is_none())
+            .await;
     assert!(clean, "temp file left behind under {tmp:?}");
 }

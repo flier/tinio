@@ -110,14 +110,17 @@ impl IdentityFromConfig for Identity {
 /// so a CAP_CHOWN-only process (the mitigation the design prefers over
 /// full root) verifies as privileged too.
 #[cfg(unix)]
-pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), crate::_config::Error> {
+use crate::_config;
+#[cfg(unix)]
+pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), _config::Error> {
+    use crate::_config;
     let configured = config.owner().local_uid.is_some()
         || config.users().iter().any(|user| user.local_uid.is_some());
     if !configured {
         return Ok(());
     }
     probe_chown(dir).map_err(|err| {
-        crate::_config::Error::invalid_value(
+        _config::Error::invalid_value(
             "local_uid",
             format!(
                 "chown privilege (root or CAP_CHOWN) is required for the configured local_uid mappings but the process lacks it — startup fails closed: {err}. Remove the mappings or grant the capability"
@@ -131,26 +134,33 @@ pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), crate::
 /// or CAP_CHOWN — and clean up (the 0700 dir stays removable even after
 /// the file is root-owned).
 #[cfg(unix)]
-fn probe_chown(dir: &Path) -> std::io::Result<()> {
+use std::io;
+#[cfg(unix)]
+fn probe_chown(dir: &Path) -> io::Result<()> {
+    use std::{
+        fs,
+        fs::{DirBuilder, File},
+        process,
+    };
     let nonce = format!(
         "{}-{}",
-        std::process::id(),
+        process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
     );
     let probe_dir = dir.join(format!(".tinio-chown-probe-{nonce}"));
-    let mut builder = std::fs::DirBuilder::new();
+    let mut builder = DirBuilder::new();
     builder.mode(0o700);
     builder.create(&probe_dir)?;
     let file = probe_dir.join("probe");
     let outcome = (|| {
-        std::fs::File::create(&file)?;
+        File::create(&file)?;
         chown(&file, Some(0), None)
     })();
-    let _ = std::fs::remove_file(&file);
-    let _ = std::fs::remove_dir(&probe_dir);
+    let _ = fs::remove_file(&file);
+    let _ = fs::remove_dir(&probe_dir);
     outcome
 }
 
@@ -258,6 +268,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mapping_configured_without_chown_privilege_fails_startup() {
+        use crate::_config;
         // Spec §6: fail closed — any local_uid mapping requires chown
         // privilege (root or CAP_CHOWN); without it startup fails with a
         // config error. Skipped when the runner is privileged (the probe
@@ -268,10 +279,7 @@ mod tests {
         }
         let config = parse("version = 1\n[owner]\nlocal_uid = 1000\n");
         let err = ensure_chown_privilege(&config, root.path()).unwrap_err();
-        assert!(
-            matches!(err, crate::_config::Error::InvalidValue { .. }),
-            "{err}"
-        );
+        assert!(matches!(err, _config::Error::InvalidValue { .. }), "{err}");
         assert!(err.to_string().contains("local_uid"), "{err}");
         // Without any mapping the check passes even unprivileged.
         ensure_chown_privilege(&Config::default(), root.path()).unwrap();

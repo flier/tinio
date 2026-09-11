@@ -6,7 +6,9 @@ use async_trait::async_trait;
 
 use super::{Storage, body::BodyStream, range::ByteRange};
 use crate::{
-    acl, bucket, checksum,
+    acl,
+    acl::Acl,
+    bucket, checksum,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     object,
 };
@@ -160,7 +162,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage;

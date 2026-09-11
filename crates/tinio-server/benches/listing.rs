@@ -8,6 +8,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{
+    acl::Acl,
     bucket, object,
     storage::{BucketOps, ListObjectsParams, ObjectOps},
 };
@@ -27,7 +28,7 @@ fn listing(c: &mut Criterion) {
     let bname = bucket::name("data").unwrap();
     rt.block_on(async {
         storage
-            .create_bucket(&bname, None, &tinio_core::acl::Acl::default_private(None))
+            .create_bucket(&bname, None, &Acl::default_private(None))
             .await
             .unwrap();
         for i in 0..FLAT {

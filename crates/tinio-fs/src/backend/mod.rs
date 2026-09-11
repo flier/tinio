@@ -8,6 +8,7 @@
 //! ([`BucketOps`]), `objects.rs` ([`ObjectOps`]), and `multipart.rs`
 //! ([`MultipartOps`]).
 
+use crate::_core::{acl::Acl, object::OBJECT_TAGS_MAX};
 mod buckets;
 mod multipart;
 mod objects;
@@ -693,7 +694,7 @@ impl FsStorage {
         metadata: &Metadata,
         checksum: Option<checksum::Recorded>,
         parts: Vec<CompletedPartRow>,
-    ) -> Result<(object::Tags, Option<acl::OwnerId>, acl::Acl), Error> {
+    ) -> Result<(object::Tags, Option<acl::OwnerId>, Acl), Error> {
         let size = metadata.len();
         let mtime = metadata.modified()?;
         let identity = fsutil::file_identity(path, metadata);
@@ -722,7 +723,7 @@ impl FsStorage {
                             },
                         );
                     (
-                        object::Tags::parse_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX)
+                        object::Tags::parse_wire_limited(&tags_wire, OBJECT_TAGS_MAX)
                             .unwrap_or_default(),
                         decode_owner_wire(&owner_wire),
                         decode_acl_wire(&acl_wire),

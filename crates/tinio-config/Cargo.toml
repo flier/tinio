@@ -27,5 +27,8 @@ tempfile.workspace = true
 # false positive: used via serde `with = "humantime_serde"` attributes (scanner.rs)
 ignored = ["humantime-serde"]
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

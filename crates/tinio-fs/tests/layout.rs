@@ -11,12 +11,13 @@ use std::{fs::read_dir, path::Path};
 
 use redb::TableHandle;
 use tinio_core::{
+    acl::Acl,
     bucket,
     multipart::part_number,
     object,
     storage::{BucketOps, ListPartsParams, MultipartOps, ObjectOps},
 };
-use tinio_fs::{FsOptions, FsStorage, testing};
+use tinio_fs::{FsOptions, FsStorage, database, testing};
 use tinio_util::testing::{body, read_body};
 use tokio::fs;
 
@@ -47,7 +48,7 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
 
     let b = bucket_name("data");
     storage
-        .create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     storage
@@ -64,7 +65,7 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
             None,
             object::Tags::empty(),
             None,
-            &tinio_core::acl::Acl::default_private(None),
+            &Acl::default_private(None),
         )
         .await
         .unwrap();
@@ -122,7 +123,7 @@ async fn deleting_meta_redb_self_heals() {
     let storage = FsStorage::new(root.path(), fs_options(&state_dir)).unwrap();
     let b = bucket_name("data");
     storage
-        .create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     storage
@@ -152,7 +153,7 @@ async fn deleting_meta_redb_self_heals() {
 #[test]
 fn open_creates_exactly_the_schema_tables() {
     let dir = tempfile::tempdir().unwrap();
-    let opened = tinio_fs::database::open(dir.path()).unwrap();
+    let opened = database::open(dir.path()).unwrap();
     let txn = opened.db.begin_write().unwrap();
     let mut names: Vec<String> = txn
         .list_tables()

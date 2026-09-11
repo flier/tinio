@@ -221,7 +221,7 @@ fn collect_spec_ids(spec_dir: &Path) -> BTreeSet<String> {
     collect_md_ids(spec_dir, |rel| {
         rel.starts_with("contracts")
             || rel.starts_with("checklists")
-            || rel == std::path::Path::new("tasks.md")
+            || rel == Path::new("tasks.md")
     })
 }
 

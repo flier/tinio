@@ -5,18 +5,20 @@
 
 use std::time::{Duration, SystemTime};
 
-use redb::{Database, ReadableDatabase};
+use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
 use tinio_core::{
     acl::{self, Acl, Grant, Grantee, OwnerId},
     etag::ETag,
-    object, to_nanos,
+    object,
+    object::OBJECT_TAGS_MAX,
+    to_nanos,
 };
 
-use crate::{bucket, meta, state, upload};
+use crate::{bucket, bucket::BucketRow, meta, state, upload};
 
 fn mem_db() -> Database {
     Database::builder()
-        .create_with_backend(redb::backends::InMemoryBackend::new())
+        .create_with_backend(InMemoryBackend::new())
         .unwrap()
 }
 
@@ -107,11 +109,11 @@ fn bucket_row_round_trips_the_five_element_shape() {
         table
             .put_full(
                 "data",
-                &bucket::BucketRow {
+                &BucketRow {
                     tags: "a=b".into(),
                     owner: OWNER.into(),
                     acl: GRANTS.into(),
-                    ..bucket::BucketRow::at(created_at)
+                    ..BucketRow::at(created_at)
                 },
             )
             .unwrap();
@@ -136,7 +138,7 @@ fn meta_row_round_trips_the_eight_element_shape() {
         size: 1,
         mtime: 2,
         file_identity: 0,
-        tags: object::Tags::from_wire_limited("a=b", object::OBJECT_TAGS_MAX),
+        tags: object::Tags::from_wire_limited("a=b", OBJECT_TAGS_MAX),
         checksum: None,
         owner: Some(owner.clone()),
         acl: Acl {

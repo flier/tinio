@@ -46,6 +46,7 @@ use arrow::{
         UInt16Type, UInt32Type, UInt64Type,
     },
 };
+use bytes::Bytes;
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -55,7 +56,7 @@ use parquet::{
     schema::types::SchemaDescriptor,
 };
 use rust_decimal::Decimal;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     engine::positional,
@@ -97,7 +98,7 @@ impl ParquetReader {
         if len > max_bytes {
             return Err(Error::ParquetTooLarge);
         }
-        let bytes = bytes::Bytes::from(input.into_inner());
+        let bytes = Bytes::from(input.into_inner());
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(from_parquet)?;
         let mask = projection_mask(&builder, &projection);
         let enum_columns = enum_columns(builder.parquet_schema());
@@ -124,7 +125,7 @@ impl ParquetReader {
 /// resolves MISSING at row time. Duplicate matches (schema `a`/`A`) keep
 /// both, so the row lookup reports ambiguity.
 fn projection_mask(
-    builder: &ParquetRecordBatchReaderBuilder<bytes::Bytes>,
+    builder: &ParquetRecordBatchReaderBuilder<Bytes>,
     projection: &[String],
 ) -> ProjectionMask {
     if projection.is_empty() {
@@ -528,7 +529,7 @@ fn timestamp_string(unit: &TimeUnit, at: i64) -> Result<String, Error> {
 /// → second conversion, which `checked_mul` catches.
 fn date_string_from_days(days: i64) -> Result<String, Error> {
     let out_of_range = || Error::Format("parquet date out of range".into());
-    let offset = time::Duration::seconds(days.checked_mul(86_400).ok_or_else(out_of_range)?);
+    let offset = Duration::seconds(days.checked_mul(86_400).ok_or_else(out_of_range)?);
     let dt = OffsetDateTime::UNIX_EPOCH
         .checked_add(offset)
         .ok_or_else(out_of_range)?;
@@ -574,6 +575,7 @@ mod tests {
         buffer::OffsetBuffer,
         datatypes::{DataType, Field as ArrowField, Fields, Schema, TimeUnit},
     };
+    use bytes::Bytes;
     use parquet::{
         arrow::ArrowWriter,
         data_type::{ByteArray, ByteArrayType},
@@ -1101,8 +1103,7 @@ mod tests {
             "message s { required binary e (ENUM); required binary e; }",
             &[&[b"alpha"], &[&[0x01]]],
         );
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.clone())).unwrap();
         assert_eq!(builder.schema().fields().len(), 2, "the duplicate survived");
         assert!(enum_columns(builder.parquet_schema()).is_empty());
         match reader(bytes).next() {

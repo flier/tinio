@@ -45,3 +45,6 @@ harness = false
 # (no cucumber involvement), so `cargo test` runs it normally.
 [[test]]
 name = "traceability"
+
+[lints.clippy]
+absolute_paths = "warn"

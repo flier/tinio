@@ -3,11 +3,11 @@
 //! it — not the unit tests' in-memory `parse`. This is the crate's
 //! integration surface with the filesystem and the TOML format.
 
-use std::fs;
+use std::{fs, path::PathBuf};
 
 use tinio_config::{Config, Error};
 
-fn write(dir: &tempfile::TempDir, name: &str, text: &str) -> std::path::PathBuf {
+fn write(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
     let path = dir.path().join(name);
     fs::write(&path, text).unwrap();
     path

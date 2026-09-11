@@ -6,14 +6,15 @@ use std::{
 };
 
 use redb::ReadableDatabase;
-use tokio::fs;
+use tokio::{fs, time};
 
 use super::*;
 #[cfg(windows)]
 use crate::testutil::link_directory;
 use crate::{
     _core::{
-        acl, object,
+        acl::Acl,
+        object,
         storage::{BucketOps, Error as StorageError, ObjectOps},
     },
     _util::testing::body,
@@ -57,7 +58,7 @@ async fn new_from_db_constructs_over_an_opened_database() {
     assert_eq!(storage.state_dir(), state.path());
     let b = name("data").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     assert!(storage.bucket_names("").await.unwrap() == vec![b]);
@@ -78,7 +79,7 @@ async fn read_only_state_relocation_keeps_root_clean() {
     .unwrap();
     let b = name("data").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     storage
@@ -185,7 +186,7 @@ async fn set_max_concurrent_uploads_is_enforced() {
     let mut storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     let k = object::key("k").unwrap();
@@ -198,7 +199,7 @@ async fn set_max_concurrent_uploads_is_enforced() {
             None,
             object::Tags::empty(),
             None,
-            &acl::Acl::default_private(None),
+            &Acl::default_private(None),
         )
         .await
         .unwrap();
@@ -210,7 +211,7 @@ async fn set_max_concurrent_uploads_is_enforced() {
             None,
             object::Tags::empty(),
             None,
-            &acl::Acl::default_private(None),
+            &Acl::default_private(None),
         )
         .await
         .unwrap_err();
@@ -223,7 +224,7 @@ async fn bucket_names_skips_root_level_files() {
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     fs::write(root.path().join("notes.txt"), b"not a bucket")
@@ -239,7 +240,7 @@ async fn bucket_names_filters_by_prefix() {
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     for raw in ["alpha-1", "alpha-2", "beta-1"] {
         storage
-            .create_bucket(&name(raw).unwrap(), None, &acl::Acl::default_private(None))
+            .create_bucket(&name(raw).unwrap(), None, &Acl::default_private(None))
             .await
             .unwrap();
     }
@@ -273,7 +274,7 @@ async fn bucket_names_with_links(follow_symlinks: bool) -> Vec<String> {
     .unwrap();
     let b = name("real-bucket").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     #[cfg(unix)]
@@ -355,11 +356,13 @@ async fn bucket_names_skips_non_utf8_directory_names() {
     // A top-level directory whose name is not valid UTF-8 cannot be a
     // bucket name (the contract is UTF-8) — skipped, never a panic.
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    use crate::_core::acl::Acl;
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     let mut name = b"bad-".to_vec();
@@ -431,7 +434,7 @@ async fn lock_bucket_mutations_warns_after_the_threshold() {
             drop(guard);
         }
     });
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    time::sleep(Duration::from_millis(1500)).await;
     drop(held);
     task.await.unwrap();
 }
@@ -456,6 +459,7 @@ async fn ensure_bucket_refuses_a_file_in_place_of_a_bucket() {
 #[cfg(windows)]
 #[tokio::test]
 async fn resolve_object_file_rejects_a_junction_leaf_when_following_is_disabled() {
+    use crate::_core::acl::Acl;
     // A key whose path resolves through a junction is refused with
     // AccessDenied when following is disabled (the documented 403 — a
     // link inside the bucket never escapes the root, s3-surface.md).
@@ -464,7 +468,7 @@ async fn resolve_object_file_rejects_a_junction_leaf_when_following_is_disabled(
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     let b = name("data").unwrap();
     storage
-        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     fs::write(outside.path().join("x.txt"), b"s").await.unwrap();

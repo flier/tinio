@@ -16,8 +16,12 @@ use futures::stream::iter;
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
-        acl, bucket::Name, checksum, collect_body, from_nanos, group_and_paginate,
-        multipart::ObjectPart, now_nanos, object,
+        acl,
+        acl::{Acl, AclGrants},
+        bucket::Name,
+        checksum, collect_body, from_nanos, group_and_paginate,
+        multipart::ObjectPart,
+        now_nanos, object,
     },
     _store::{bucket, meta, object_part, objects, scan::for_each_pair},
     Error,
@@ -78,7 +82,7 @@ impl MemoryStorage {
         mut tags: object::Tags,
         mut checksum: Option<checksum::Recorded>,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<object::Info, Error> {
         // Defensive: the staged-body path already rejects reserved keys —
         // a direct stage/commit must not create an invisible, undeletable
@@ -234,7 +238,7 @@ impl ObjectOps for MemoryStorage {
         staged: StagedBody,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<object::Info, Error> {
         // The stage's tee digest records as the object's FULL_OBJECT
         // checksum (the kind is fixed by the write path — a plain PUT's
@@ -255,7 +259,7 @@ impl ObjectOps for MemoryStorage {
         dst_key: &object::Key,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
         // The contract's stream default (get → stage → commit) cannot
@@ -544,7 +548,7 @@ impl ObjectOps for MemoryStorage {
         Ok(())
     }
 
-    async fn get_object_acl(&self, bucket: &Name, key: &object::Key) -> Result<acl::Acl, Error> {
+    async fn get_object_acl(&self, bucket: &Name, key: &object::Key) -> Result<Acl, Error> {
         // Existence is the `OBJECT_META` row (`NoSuchKey` when missing);
         // the ACL recombines the stored owner element with the stored
         // grant set (the row form keeps them apart — the shared
@@ -552,7 +556,7 @@ impl ObjectOps for MemoryStorage {
         self.db.read(|txn| {
             let meta = meta::Table::open_readonly(txn)?;
             meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .map(|stored| acl::Acl {
+                .map(|stored| Acl {
                     owner: stored.owner.clone(),
                     grants: stored.acl.grants.clone(),
                 })
@@ -564,12 +568,12 @@ impl ObjectOps for MemoryStorage {
         &self,
         bucket: &Name,
         key: &object::Key,
-        grants: &acl::AclGrants,
+        grants: &AclGrants,
     ) -> Result<(), Error> {
         // Replace-all: the grant set replaces the row's ACL element; the
         // owner element is preserved — a put never changes it (contract
         // ruling). `NoSuchKey` when the object is missing.
-        let fresh = acl::Acl {
+        let fresh = Acl {
             owner: None,
             grants: grants.clone(),
         };
@@ -703,8 +707,8 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            BodyStream, BucketOps, ListObjectsParams, ObjectListing, ObjectOps, bucket, checksum,
-            object, storage::Error::*,
+            BodyStream, BucketOps, ListObjectsParams, ObjectListing, ObjectOps, acl::Acl, bucket,
+            checksum, object, storage::Error::*,
         },
         _util::testing::{body, complete_single_part, read_body},
         MemoryOptions,
@@ -715,7 +719,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         (storage, name)
@@ -734,7 +738,7 @@ mod tests {
         .unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("big.bin").unwrap();
@@ -772,7 +776,7 @@ mod tests {
         .unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k1 = object::key("a.bin").unwrap();
@@ -883,7 +887,7 @@ mod tests {
         ));
         assert!(matches!(
             storage
-                .list_objects(crate::_core::ListObjectsParams {
+                .list_objects(ListObjectsParams {
                     bucket: bucket.clone(),
                     prefix: String::new(),
                     delimiter: None,
@@ -1020,7 +1024,7 @@ mod tests {
         let (storage, bucket) = with_bucket().await;
         let other = bucket::name("other").unwrap();
         storage
-            .create_bucket(&other, None, &acl::Acl::default_private(None))
+            .create_bucket(&other, None, &Acl::default_private(None))
             .await
             .unwrap();
         put_keys(&storage, &bucket, &["a.txt"]).await;
@@ -1100,7 +1104,7 @@ mod tests {
                 staged,
                 tags.clone(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1120,7 +1124,7 @@ mod tests {
                 &dst,
                 copy_tags.clone(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
                 None,
             )
             .await
@@ -1152,7 +1156,7 @@ mod tests {
                 staged,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1196,7 +1200,7 @@ mod tests {
                 staged,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1232,7 +1236,7 @@ mod tests {
                 &copy,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
                 None,
             )
             .await

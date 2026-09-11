@@ -13,14 +13,17 @@
 //! cousins, so a MISSING operand answers `true` there (pinned, review
 //! 2026-09-06b R12).
 
-use std::{borrow::Cow, cmp::Ordering};
+use std::{borrow::Cow, cell::RefCell, cmp::Ordering, mem};
 
 use parse_display::Display;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use sqlparser::ast::{
-    AccessExpr, BinaryOperator, CastKind, DuplicateTreatment, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript,
-    UnaryOperator, Value as AstValue, ValueWithSpan,
+use sqlparser::{
+    ast,
+    ast::{
+        AccessExpr, BinaryOperator, CastKind, DuplicateTreatment, Expr, Function, FunctionArg,
+        FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript,
+        UnaryOperator, Value as AstValue, ValueWithSpan,
+    },
 };
 
 use crate::{
@@ -1397,7 +1400,7 @@ fn like_escape(v: &Option<ValueWithSpan>) -> Result<Option<char>, Error> {
     match v {
         None => Ok(None),
         Some(w) => {
-            let sqlparser::ast::Value::SingleQuotedString(s) = &w.value else {
+            let ast::Value::SingleQuotedString(s) = &w.value else {
                 return Err(Error::Value("ESCAPE must be a single character".into()));
             };
             let mut chars = s.chars();
@@ -1423,8 +1426,8 @@ const LIKE_CELL_CAP: u64 = 10_000_000;
 // data cache — `like_match` runs no nested eval under its borrow, so
 // re-entrancy is impossible (the engine is sync, one thread per stream).
 thread_local! {
-    static LIKE_MEMO: std::cell::RefCell<LikeMemo> =
-        const { std::cell::RefCell::new(LikeMemo::new()) };
+    static LIKE_MEMO: RefCell<LikeMemo> =
+        const { RefCell::new(LikeMemo::new()) };
 }
 
 #[derive(Default)]
@@ -1482,7 +1485,7 @@ fn like_match(text: &str, pattern: &str, escape: Option<char>) -> Result<bool, E
                     LikeTok::Char(c) => prev[j - 1] && text[j - 1] == *c,
                 };
             }
-            std::mem::swap(prev, cur);
+            mem::swap(prev, cur);
         }
         Ok(prev[m])
     })

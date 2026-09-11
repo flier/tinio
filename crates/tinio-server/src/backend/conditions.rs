@@ -528,7 +528,8 @@ mod tests {
 
     use super::*;
     use crate::_core::{
-        ETag, acl,
+        ETag,
+        acl::Acl,
         object::{self, Tags},
     };
 
@@ -762,7 +763,7 @@ mod tests {
             tags: Tags::empty(),
             checksum: None,
             owner: None,
-            acl: acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         }
     }
 

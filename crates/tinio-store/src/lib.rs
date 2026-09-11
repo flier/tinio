@@ -51,7 +51,7 @@ pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use redb::{Database, ReadableDatabase, TableHandle};
+    use redb::{Database, ReadableDatabase, TableHandle, backends::InMemoryBackend};
 
     use super::*;
     use crate::table::TableDef;
@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn ensure_all_creates_exactly_the_seven_tables_idempotently() {
         let db = Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .create_with_backend(InMemoryBackend::new())
             .unwrap();
         {
             let mut txn = db.begin_write().unwrap();

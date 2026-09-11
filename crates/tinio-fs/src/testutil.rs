@@ -63,7 +63,7 @@ pub(crate) fn all_users_read_grant() -> acl::Grant {
 pub(crate) fn euid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     let probe = tempfile::tempdir().unwrap();
-    std::fs::metadata(probe.path()).unwrap().uid()
+    fs::metadata(probe.path()).unwrap().uid()
 }
 
 /// A preset server tee slot (spec 2026-08-31): the digest cell already

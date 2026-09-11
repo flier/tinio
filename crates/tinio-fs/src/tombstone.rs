@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::{
     _core::pipeline::{self, Completion},
     error::Error,
-    fsutil::{ensure_dir, entries_of, remove_tree},
+    fsutil::{DirOwnerUid, ensure_dir, entries_of, remove_tree},
     path::STATE_DIR_NAME,
 };
 
@@ -41,7 +41,7 @@ pub(crate) async fn prepare(root: &Path) -> Result<PathBuf, Error> {
     // the per-component walk (the create still runs on the first
     // delete). Private residue, server-user-owned: the mode hardening
     // only (spec 2026-09-05 §5a — no chown).
-    ensure_dir(&dir, crate::fsutil::DirOwnerUid::new(None)).await?;
+    ensure_dir(&dir, DirOwnerUid::new(None)).await?;
     Ok(dir.join(Uuid::new_v4().to_string()))
 }
 
@@ -177,7 +177,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn remove_task_reports_failure_when_removal_fails() {
-        use std::os::windows::fs::OpenOptionsExt;
+        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
         use crate::_core::pipeline::{InlineRunner, Runner};
 
@@ -191,7 +191,7 @@ mod tests {
         // the failure (F03) so the awaiting scanner counts no removal
         // and logs the stuck tree — fire-and-forget callers log it from
         // their detached awaiter instead.
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)

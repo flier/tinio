@@ -699,7 +699,9 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            ETag, acl, object,
+            ETag,
+            acl::Acl,
+            object,
             pipeline::{InlineRunner, Runner},
             storage::{BucketOps, ObjectOps},
         },
@@ -765,7 +767,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -790,7 +792,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let file = root.path().join("data/a.txt");
@@ -823,7 +825,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let gone = object::key("gone.txt").unwrap();
@@ -858,7 +860,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn stuck_tombstone_counts_as_a_failure_not_as_reclaimed() {
-        use std::os::windows::fs::OpenOptionsExt;
+        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
@@ -868,7 +870,7 @@ mod tests {
         // tombstone tests' lock) — the tree stays, so the pass must
         // report zero reclamation and one failure (F03: an enqueue is
         // not a removal; a stuck tree never reads as progress).
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -1098,9 +1100,10 @@ mod tests {
     /// `PermissionDenied` (R3).
     #[cfg(unix)]
     fn swap_all_for_symlinks(root: &Path, n: usize) {
+        use std::fs;
         for i in 0..n {
             let path = root.join("data").join(format!("f{i:02}.txt"));
-            std::fs::remove_file(&path).unwrap();
+            fs::remove_file(&path).unwrap();
             symlink(root.join("gone"), &path).unwrap();
         }
     }
@@ -1201,18 +1204,18 @@ mod tests {
     async fn one_failing_bucket_does_not_starve_the_pass() {
         use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
-        use crate::_core::ETag;
+        use crate::_core::{ETag, acl::Acl};
 
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let bad = bucket::name("bad").unwrap();
         let good = bucket::name("good").unwrap();
         storage
-            .create_bucket(&bad, None, &acl::Acl::default_private(None))
+            .create_bucket(&bad, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
-            .create_bucket(&good, None, &acl::Acl::default_private(None))
+            .create_bucket(&good, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::write(root.path().join("good/a.txt"), b"x")
@@ -1359,7 +1362,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::create_dir(root.path().join("data/dir")).await.unwrap();

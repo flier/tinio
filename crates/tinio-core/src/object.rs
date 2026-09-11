@@ -8,7 +8,9 @@ use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_enco
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{
-    ETag, acl, checksum,
+    ETag, acl,
+    acl::Acl,
+    checksum,
     storage::{self, Error::*},
 };
 
@@ -149,7 +151,7 @@ pub struct Info {
     /// owner at the auth layer).
     pub owner: Option<acl::OwnerId>,
     /// The object's ACL (default private when none was written).
-    pub acl: acl::Acl,
+    pub acl: Acl,
 }
 
 /// The per-surface tag-count caps (S3): object tags ≤ 10, bucket tags
@@ -384,7 +386,7 @@ fn validate_object_key(key: &str) -> garde::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::_util::testing::assert_send_sync;
+    use crate::{_util::testing::assert_send_sync, acl::Acl};
 
     #[test]
     fn object_key_validates_and_exposes() {
@@ -429,7 +431,7 @@ mod tests {
             tags: Tags::empty(),
             checksum: None,
             owner: None,
-            acl: acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         assert_eq!(o.size, 5);
         assert_eq!(o.last_modified, t);

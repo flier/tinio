@@ -240,10 +240,13 @@ pub struct Summary {
 mod tests {
     use std::fs::{self, FileTimes, OpenOptions};
 
+    use tokio::time;
+
     use super::*;
     use crate::{
         _core::{
-            acl, bucket, object,
+            acl::Acl,
+            bucket, object,
             storage::{BucketOps, MultipartOps},
         },
         _util::testing::body,
@@ -301,7 +304,7 @@ mod tests {
         };
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -311,7 +314,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -353,7 +356,7 @@ mod tests {
         fs::write(state.path().join("tmp/fresh"), b"x").unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let upload = storage
@@ -363,7 +366,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -416,7 +419,7 @@ mod tests {
             // sleep notices the shutdown within one 1 s chunk.
             sweeper.run(rx).await;
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        time::sleep(Duration::from_millis(200)).await;
         tx.send(true).unwrap();
         task.await.unwrap();
     }
@@ -441,7 +444,7 @@ mod tests {
         let task = tokio::spawn(async move {
             sweeper.run(rx).await;
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        time::sleep(Duration::from_millis(200)).await;
         tx.send(true).unwrap();
         task.await.unwrap();
     }

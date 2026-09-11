@@ -8,7 +8,9 @@
 
 use std::io::Write as _;
 
-use cucumber::{given, then, when};
+use bzip2::write::BzEncoder;
+use cucumber::{gherkin::Step, given, then, when};
+use flate2::write::GzEncoder;
 
 /// The bucket every select scenario uses (one per scenario's server).
 /// Creation is the shared `I create bucket {string}` step (buckets.rs) —
@@ -18,11 +20,7 @@ const BUCKET: &str = "select";
 
 /// An object whose body is the step's `"""`-delimited docstring.
 #[given(regex = r#"an object "([^"]+)" with content"#)]
-async fn object_with_content(
-    world: &mut super::World,
-    key: String,
-    step: &cucumber::gherkin::Step,
-) {
+async fn object_with_content(world: &mut super::World, key: String, step: &Step) {
     let content = fixture_bytes(step);
     put_object(world, &key, &content).await;
 }
@@ -30,13 +28,9 @@ async fn object_with_content(
 /// Same, but the object's body is the docstring gzip-compressed (the GZIP
 /// input leg of FR-034).
 #[given(regex = r#"a gzip-compressed object "([^"]+)" with content"#)]
-async fn gzip_object_with_content(
-    world: &mut super::World,
-    key: String,
-    step: &cucumber::gherkin::Step,
-) {
+async fn gzip_object_with_content(world: &mut super::World, key: String, step: &Step) {
     let content = fixture_bytes(step);
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
     enc.write_all(&content).expect("gzip: write");
     let gz = enc.finish().expect("gzip: finish");
     put_object(world, &key, &gz).await;
@@ -44,13 +38,9 @@ async fn gzip_object_with_content(
 
 /// Same, but the object's body is the docstring bzip2-compressed.
 #[given(regex = r#"a bzip2-compressed object "([^"]+)" with content"#)]
-async fn bzip2_object_with_content(
-    world: &mut super::World,
-    key: String,
-    step: &cucumber::gherkin::Step,
-) {
+async fn bzip2_object_with_content(world: &mut super::World, key: String, step: &Step) {
     let content = fixture_bytes(step);
-    let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    let mut enc = BzEncoder::new(Vec::new(), bzip2::Compression::best());
     enc.write_all(&content).expect("bzip2: write");
     let bz = enc.finish().expect("bzip2: finish");
     put_object(world, &key, &bz).await;
@@ -84,7 +74,7 @@ const PARQUET_FIXTURE: &[u8] =
 /// trailing newline — the two delimiter ones plus any intentional blank
 /// edge lines; a fixture whose content itself begins or ends with a
 /// meaningful newline cannot express it.
-fn fixture_bytes(step: &cucumber::gherkin::Step) -> Vec<u8> {
+fn fixture_bytes(step: &Step) -> Vec<u8> {
     step.docstring()
         .map(|s| s.trim_matches('\n').as_bytes().to_vec())
         .unwrap_or_default()

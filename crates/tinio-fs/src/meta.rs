@@ -48,7 +48,13 @@ pub use object::{Key, key};
 
 pub use crate::bucket::{Name, name};
 use crate::{
-    _core::{acl, checksum, etag::ETag, from_nanos, object, to_nanos},
+    _core::{
+        acl,
+        acl::{Acl, AclGrants},
+        checksum,
+        etag::ETag,
+        from_nanos, object, to_nanos,
+    },
     _store::{meta, object_part},
     Error, bucket,
     database::{Handle, for_bucket_strict},
@@ -516,7 +522,7 @@ impl Store {
             object::Tags,
             Option<checksum::Recorded>,
             Option<acl::OwnerId>,
-            acl::Acl,
+            Acl,
         ),
         Error,
     > {
@@ -536,7 +542,7 @@ impl Store {
                 let owner = row.as_ref().and_then(|row| row.owner.clone());
                 let acl = row
                     .as_ref()
-                    .map_or_else(|| acl::Acl::default_private(None), |row| row.acl.clone());
+                    .map_or_else(|| Acl::default_private(None), |row| row.acl.clone());
                 table.put(
                     &bucket,
                     &key,
@@ -633,7 +639,7 @@ impl Store {
                 // hash-time ones — the row describes the same file read
                 // at hash time).
                 let (checksum, owner, acl) = table.get(&bucket, &key)?.map_or_else(
-                    || (None, None, acl::Acl::default_private(None)),
+                    || (None, None, Acl::default_private(None)),
                     |row| (row.checksum, row.owner, row.acl),
                 );
                 table.put(
@@ -679,10 +685,10 @@ impl Store {
     /// with no owner when the row is absent (a hand-dropped object has
     /// never had an ACL written) or its wires are domain-invalid
     /// (self-healing).
-    pub async fn acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<acl::Acl, Error> {
+    pub async fn acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Acl, Error> {
         Ok(self.stored_entry(bucket, key).await?.map_or_else(
-            || acl::Acl::default_private(None),
-            |row| acl::Acl {
+            || Acl::default_private(None),
+            |row| Acl {
                 owner: row.owner,
                 grants: row.acl.grants,
             },
@@ -702,11 +708,11 @@ impl Store {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        grants: &acl::AclGrants,
+        grants: &AclGrants,
     ) -> Result<bool, Error> {
         let bucket = bucket.clone();
         let key = key.clone();
-        let fresh = acl::Acl {
+        let fresh = Acl {
             owner: None,
             grants: grants.clone(),
         };
@@ -788,7 +794,7 @@ impl Store {
                     let owner = row.as_ref().and_then(|row| row.owner.clone());
                     let acl = row
                         .as_ref()
-                        .map_or_else(|| acl::Acl::default_private(None), |row| row.acl.clone());
+                        .map_or_else(|| Acl::default_private(None), |row| row.acl.clone());
                     table.put(
                         &bucket,
                         &entry.key,
@@ -1006,7 +1012,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{acl, bucket, object},
+        _core::{
+            acl,
+            acl::{Acl, AclGrants},
+            bucket, object,
+        },
         _store::meta::{Stored, Table},
         _util::testing::etag,
         database, fsutil, meta,
@@ -1692,15 +1702,12 @@ mod tests {
             .await
             .unwrap();
         // A fresh row has no owner and the private default.
-        assert_eq!(
-            store.acl(&b, &k).await.unwrap(),
-            acl::Acl::default_private(None)
-        );
+        assert_eq!(store.acl(&b, &k).await.unwrap(), Acl::default_private(None));
         // Put → Get round-trip (replace-all, no merge).
         let grants = vec![group_read_grant()];
         assert!(store.set_acl(&b, &k, &grants).await.unwrap());
         assert_eq!(store.acl(&b, &k).await.unwrap().grants, grants);
-        let replaced: acl::AclGrants = Vec::new();
+        let replaced: AclGrants = Vec::new();
         assert!(store.set_acl(&b, &k, &replaced).await.unwrap());
         assert_eq!(store.acl(&b, &k).await.unwrap().grants, replaced);
         // The row's other elements survive the ACL writes.
@@ -1713,7 +1720,7 @@ mod tests {
         assert!(!store.set_acl(&b, &missing, &grants).await.unwrap());
         assert_eq!(
             store.acl(&b, &missing).await.unwrap(),
-            acl::Acl::default_private(None)
+            Acl::default_private(None)
         );
     }
 
@@ -1772,10 +1779,7 @@ mod tests {
         let k = object::key("a.txt").unwrap();
         // Garbage owner/ACL wires self-heal to no owner and the private
         // default; the row itself is still served (its etag is valid).
-        assert_eq!(
-            store.acl(&b, &k).await.unwrap(),
-            acl::Acl::default_private(None)
-        );
+        assert_eq!(store.acl(&b, &k).await.unwrap(), Acl::default_private(None));
         let record = store.get(&b, &k).await.unwrap().unwrap();
         assert_eq!(record.etag, etag("d41d8cd98f00b204e9800998ecf8427e"));
         // The tags element survives independently.

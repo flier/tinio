@@ -8,6 +8,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{
+    acl::Acl,
     bucket,
     multipart::{CompletedPart, MIN_PART_BYTES},
     object,
@@ -34,7 +35,7 @@ fn multipart_assembly(c: &mut Criterion) {
         let key = object::key("big.bin").unwrap();
         rt.block_on(async {
             storage
-                .create_bucket(&bname, None, &tinio_core::acl::Acl::default_private(None))
+                .create_bucket(&bname, None, &Acl::default_private(None))
                 .await
                 .unwrap();
         });
@@ -52,7 +53,7 @@ fn multipart_assembly(c: &mut Criterion) {
                         None,
                         object::Tags::empty(),
                         None,
-                        &tinio_core::acl::Acl::default_private(None),
+                        &Acl::default_private(None),
                     )
                     .await
                     .unwrap();

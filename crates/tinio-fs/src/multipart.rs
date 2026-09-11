@@ -46,9 +46,13 @@ use uuid::Uuid;
 
 use crate::{
     _core::{
-        BodyStream, ETag, acl, bucket, checksum, from_nanos,
+        BodyStream, ETag, acl,
+        acl::Acl,
+        bucket, checksum, from_nanos,
         multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber, check_part_minimum},
-        object::{self},
+        object::{
+            OBJECT_TAGS_MAX, {self},
+        },
         storage::{
             self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload,
             group_and_paginate_unordered, uploads_order,
@@ -169,7 +173,7 @@ fn upload_from_row(
     initiated_at: u64,
     tags: object::Tags,
     owner: Option<acl::OwnerId>,
-    acl: acl::Acl,
+    acl: Acl,
     checksum: Option<checksum::Upload>,
 ) -> Result<Option<MultipartUpload>, storage::Error> {
     let Ok(key) = object::key(key) else {
@@ -200,7 +204,7 @@ type UploadRow = (
     u64,
     object::Tags,
     Option<acl::OwnerId>,
-    acl::Acl,
+    Acl,
     Option<checksum::Upload>,
 );
 
@@ -232,7 +236,7 @@ fn materialize_upload_rows(
                 upload_id.to_string(),
                 key.to_string(),
                 initiated_at,
-                object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
                 decode_owner_wire(owner_wire),
                 decode_acl_wire(acl_wire),
                 checksum_row,
@@ -392,7 +396,7 @@ impl Store {
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<MultipartUpload, Error> {
         // Cap the number of in-progress uploads (CWE-770): without a cap an
         // authenticated client can accumulate an unbounded number of
@@ -477,7 +481,7 @@ impl Store {
                 Ok(Some((
                     stored_key,
                     initiated_at,
-                    object::Tags::from_wire_limited(&tags_wire, object::OBJECT_TAGS_MAX),
+                    object::Tags::from_wire_limited(&tags_wire, OBJECT_TAGS_MAX),
                     decode_owner_wire(&owner_wire),
                     decode_acl_wire(&acl_wire),
                     checksum_row,
@@ -1248,7 +1252,7 @@ impl Store {
                             upload_id.to_string(),
                             key.to_string(),
                             initiated_at,
-                            object::Tags::from_wire_limited(tags_wire, object::OBJECT_TAGS_MAX),
+                            object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
                             decode_owner_wire(owner_wire),
                             decode_acl_wire(acl_wire),
                             checksum_row,
@@ -1397,6 +1401,7 @@ mod tests {
     use crate::{
         _core::{
             ETag,
+            acl::Acl,
             checksum::Algorithm,
             multipart::MIN_PART_BYTES,
             storage::{Error as StorageError, group_and_paginate_ordered},
@@ -1423,7 +1428,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1435,7 +1440,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap_err();
@@ -1468,7 +1473,7 @@ mod tests {
                             None,
                             object::Tags::empty(),
                             None,
-                            &acl::Acl::default_private(None),
+                            &Acl::default_private(None),
                         )
                         .await
                         .unwrap(),
@@ -1556,7 +1561,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1567,7 +1572,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1578,7 +1583,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1606,7 +1611,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1643,7 +1648,7 @@ mod tests {
                 }),
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1689,7 +1694,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1725,7 +1730,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1769,7 +1774,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1791,7 +1796,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1850,7 +1855,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1888,7 +1893,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1931,7 +1936,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1942,7 +1947,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1966,7 +1971,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1977,7 +1982,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2002,7 +2007,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2024,7 +2029,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2035,7 +2040,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2060,7 +2065,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2107,7 +2112,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2138,7 +2143,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2172,7 +2177,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2209,7 +2214,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2324,7 +2329,7 @@ mod tests {
                     None,
                     object::Tags::empty(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -2401,7 +2406,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2456,7 +2461,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2488,7 +2493,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2521,7 +2526,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2577,7 +2582,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2649,7 +2654,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2694,7 +2699,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2737,7 +2742,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2772,7 +2777,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -2818,7 +2823,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();

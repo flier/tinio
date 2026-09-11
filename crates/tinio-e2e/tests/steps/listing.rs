@@ -2,7 +2,7 @@
 //! `tinio-server/tests/data_plane.rs`: prefix + delimiter grouping and the
 //! continuation-token pagination loop.
 
-use cucumber::{given, then, when};
+use cucumber::{gherkin::Step, given, then, when};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 /// Unreserved + `/` left alone (list query values).
@@ -153,7 +153,7 @@ async fn listing_shows_keys(world: &mut super::World, n: u64) {
 /// table exactly, in listing order (the lexicographic full-listing
 /// assertion).
 #[then("the listing keys in order are")]
-async fn listing_keys_in_order(world: &mut super::World, step: &cucumber::gherkin::Step) {
+async fn listing_keys_in_order(world: &mut super::World, step: &Step) {
     let table = step.table().expect("the in-order step carries a table");
     let expected: Vec<String> = table.rows.iter().map(|row| row[0].clone()).collect();
     let text = String::from_utf8_lossy(&world.last.body).into_owned();

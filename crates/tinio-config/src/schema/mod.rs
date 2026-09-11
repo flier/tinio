@@ -13,6 +13,8 @@
 
 use garde::Error as GardeError;
 
+use crate::_core::{acl, acl::ANONYMOUS_CANONICAL_ID};
+
 pub mod api;
 pub mod auth;
 mod config;
@@ -42,12 +44,12 @@ pub(super) fn reject_empty(message: &str, is_empty: bool) -> garde::Result {
 /// the anonymous special-grantee ID, whose holder would BE the anonymous
 /// uploader (Task 7 ruling).
 pub(super) fn validate_canonical_id(value: &str, _context: &()) -> garde::Result {
-    if value == crate::_core::acl::ANONYMOUS_CANONICAL_ID {
+    if value == ANONYMOUS_CANONICAL_ID {
         return Err(GardeError::new(
             "must not be the anonymous canonical ID (it would make the principal the anonymous uploader)",
         ));
     }
-    match crate::_core::acl::OwnerId::new(value) {
+    match acl::OwnerId::new(value) {
         Ok(_) => Ok(()),
         Err(_) => Err(GardeError::new(
             "must be 64 lowercase hex digits (the canonical-account ID shape)",

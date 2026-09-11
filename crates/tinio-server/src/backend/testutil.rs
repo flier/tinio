@@ -10,7 +10,7 @@ use super::{Capabilities, S3Backend};
 #[cfg(feature = "acl")]
 use crate::_auth::identity::{Identity, User, derive_canonical_id};
 use crate::{
-    _core::{acl, bucket, storage::BucketOps},
+    _core::{acl, acl::Acl, bucket, storage::BucketOps},
     _mem::MemoryStorage,
 };
 
@@ -45,7 +45,7 @@ pub(crate) async fn setup_with_caps(caps: Capabilities) -> (S3Backend<MemoryStor
         .create_bucket(
             &bucket::name(&b).unwrap(),
             None,
-            &acl::Acl::default_private(None),
+            &Acl::default_private(None),
         )
         .await
         .unwrap();
@@ -68,12 +68,14 @@ pub(crate) fn user_id(access_key: &str) -> acl::OwnerId {
     derive_canonical_id(access_key)
 }
 
-/// The fixture user's credentials (a "signed" request).
 #[cfg(feature = "acl")]
-pub(crate) fn credentials_for(access_key: &str) -> s3s::auth::Credentials {
-    s3s::auth::Credentials {
+use s3s::auth::Credentials;
+#[cfg(feature = "acl")]
+pub(crate) fn credentials_for(access_key: &str) -> Credentials {
+    use s3s::auth::{Credentials, SecretKey};
+    Credentials {
         access_key: access_key.into(),
-        secret_key: s3s::auth::SecretKey::from("secret"),
+        secret_key: SecretKey::from("secret"),
     }
 }
 

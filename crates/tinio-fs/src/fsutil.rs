@@ -631,7 +631,10 @@ pub(crate) async fn ensure_dir(dir: &Path, owner_uid: DirOwnerUid) -> io::Result
 /// mapped uid when one was passed. Fail-closed — see [`ensure_dir`].
 #[cfg(unix)]
 async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
-    use std::os::unix::fs::{PermissionsExt, chown};
+    use std::{
+        fs::Permissions,
+        os::unix::fs::{PermissionsExt, chown},
+    };
 
     // The missing chain, deepest ancestor first — the caller proved
     // `dir` absent; every component up to the first existing ancestor
@@ -666,7 +669,7 @@ async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
         }
         created.push(component.clone());
         if let Err(err) =
-            fs::set_permissions(component, std::fs::Permissions::from_mode(DIR_MODE_PRIVATE)).await
+            fs::set_permissions(component, Permissions::from_mode(DIR_MODE_PRIVATE)).await
         {
             outcome = Err(err);
             break;
@@ -735,7 +738,7 @@ pub(crate) async fn entries_of(dir: &Path) -> Result<Vec<(PathBuf, String)>, Err
 
 #[cfg(test)]
 mod tests {
-    use std::fs::write;
+    use std::fs::{create_dir, write};
     #[cfg(unix)]
     use std::io::Cursor;
     #[cfg(windows)]
@@ -819,7 +822,7 @@ mod tests {
         assert!(entries_of(&file).await.is_err());
         // Normal directory listing: path + lossy name pairs.
         let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
+        create_dir(&sub).unwrap();
         write(sub.join("a.txt"), b"1").unwrap();
         let out = entries_of(&sub).await.unwrap();
         assert_eq!(out.len(), 1);
@@ -845,11 +848,11 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[tokio::test]
     async fn latest_part_mtime_skips_non_utf8_names() {
-        use std::os::unix::ffi::OsStringExt;
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
         let dir = tempfile::tempdir().unwrap();
         // A non-UTF8 name is skipped, not fatal.
-        let name = std::ffi::OsString::from_vec(b"part-\xFF".to_vec());
-        std::fs::write(dir.path().join(name), b"x").unwrap();
+        let name = OsString::from_vec(b"part-\xFF".to_vec());
+        write(dir.path().join(name), b"x").unwrap();
         assert!(latest_part_mtime(dir.path()).await.unwrap().is_none());
     }
 
@@ -897,17 +900,17 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn remove_tree_propagates_a_locked_tree() {
-        use std::os::windows::fs::OpenOptionsExt;
+        use std::{fs::create_dir, os::windows::fs::OpenOptionsExt};
         let dir = tempfile::tempdir().unwrap();
         let inner = dir.path().join("inner");
-        std::fs::create_dir(&inner).unwrap();
+        create_dir(&inner).unwrap();
         // An open handle with sharing denied blocks the Windows tree
         // removal — the error must propagate (a live tree is never
         // "gone"). Neither the read-only attribute (std's
         // `remove_dir_all` clears it before deleting) nor the default
         // share mode (std opens with FILE_SHARE_DELETE) counts as a
         // lock; only a share-mode-0 handle does.
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)

@@ -5,6 +5,14 @@
 //! `#[before]`/`#[after]` hooks ([`configure`]) spawn the in-process
 //! server per scenario and tear it down after.
 
+use std::{env, path::Path};
+
+use cucumber::{
+    Cucumber,
+    event::ScenarioFinished,
+    gherkin,
+    gherkin::{Feature, Scenario},
+};
 pub mod acl;
 pub mod buckets;
 pub mod clients;
@@ -89,7 +97,7 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
     let tagged = |t: &str| has_tag(tags, t);
     // Backend: an explicit @fs/@mem scenario tag wins; otherwise the
     // TINIO_E2E_BACKEND env override (the CI mem pass); default fs.
-    let env_backend = std::env::var("TINIO_E2E_BACKEND").ok();
+    let env_backend = env::var("TINIO_E2E_BACKEND").ok();
     let backend = if tagged("mem") {
         Backend::Mem
     } else if tagged("fs") {
@@ -157,9 +165,9 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
 /// the in-process hook uses (clients.rs translates `Capabilities` into the
 /// `--config` file and `FsKind` into the `TINIO_SCANNER` toggle).
 fn before_hook<'a>(
-    _feature: &'a cucumber::gherkin::Feature,
-    _rule: Option<&'a cucumber::gherkin::Rule>,
-    scenario: &'a cucumber::gherkin::Scenario,
+    _feature: &'a Feature,
+    _rule: Option<&'a gherkin::Rule>,
+    scenario: &'a Scenario,
     world: &'a mut World,
 ) -> LocalBoxFuture<'a, ()> {
     Box::pin(async move {
@@ -202,10 +210,10 @@ fn before_hook<'a>(
 /// shutdown; the spawned serve binary is killed synchronously). The world
 /// is `None` when the scenario never initialized it.
 fn after_hook<'a>(
-    _feature: &'a cucumber::gherkin::Feature,
-    _rule: Option<&'a cucumber::gherkin::Rule>,
-    _scenario: &'a cucumber::gherkin::Scenario,
-    _ev: &'a cucumber::event::ScenarioFinished,
+    _feature: &'a Feature,
+    _rule: Option<&'a gherkin::Rule>,
+    _scenario: &'a Scenario,
+    _ev: &'a ScenarioFinished,
     world: Option<&'a mut World>,
 ) -> LocalBoxFuture<'a, ()> {
     Box::pin(async move {
@@ -220,7 +228,7 @@ fn after_hook<'a>(
 /// The configured cucumber runner type: the default runner with the
 /// lifecycle hooks as plain fn pointers (the hook closure types are
 /// unnameable; the fn-pointer aliases are not).
-type ConfiguredRunner<I> = cucumber::Cucumber<
+type ConfiguredRunner<I> = Cucumber<
     World,
     Basic,
     I,
@@ -230,7 +238,7 @@ type ConfiguredRunner<I> = cucumber::Cucumber<
 >;
 
 /// The cucumber runner with the lifecycle hooks attached.
-pub fn configure<I: AsRef<std::path::Path>>() -> ConfiguredRunner<I> {
+pub fn configure<I: AsRef<Path>>() -> ConfiguredRunner<I> {
     World::cucumber()
         .before::<BeforeHookFn<World>>(before_hook)
         .after::<AfterHookFn<World>>(after_hook)

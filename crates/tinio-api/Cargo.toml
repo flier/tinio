@@ -15,5 +15,8 @@ tinio-core.workspace = true
 [dev-dependencies]
 tinio-util = { workspace = true, features = ["testing"] }
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

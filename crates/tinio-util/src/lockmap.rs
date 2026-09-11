@@ -258,7 +258,7 @@ mod tests {
                     let _guard = map.lock("k".to_string()).await;
                     let prev = holders.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(prev, 0, "two tasks hold one key: the slot split (F02)");
-                    tokio::task::yield_now().await;
+                    yield_now().await;
                     holders.fetch_sub(1, Ordering::SeqCst);
                 }
             }));

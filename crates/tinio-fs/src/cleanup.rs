@@ -15,7 +15,7 @@
 //! §3) needs read-only-mode state relocation and lands with US2 (T076).
 
 use std::{
-    future,
+    future::Future,
     io::{self, Error as IoError, ErrorKind},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -58,7 +58,7 @@ async fn record_repair(
     dry_run: bool,
     would: String,
     did: String,
-    op: impl future::Future<Output = Result<(), Error>>,
+    op: impl Future<Output = Result<(), Error>>,
 ) {
     if dry_run {
         actions.push(Ok(RepairAction {
@@ -661,7 +661,8 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            acl, bucket, object,
+            acl::Acl,
+            bucket, object,
             pipeline::InlineRunner,
             storage::{BucketOps, ObjectOps},
         },
@@ -719,7 +720,7 @@ mod tests {
         // record commits before its directory exists).
         let live = bucket::name("live-bucket").unwrap();
         storage
-            .create_bucket(&live, None, &acl::Acl::default_private(None))
+            .create_bucket(&live, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -730,7 +731,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -763,7 +764,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::create_dir_all(root.path().join("data/.tinio"))
@@ -870,7 +871,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let gone = bucket::name("gone-bucket").unwrap();
         storage
-            .create_bucket(&gone, None, &acl::Acl::default_private(None))
+            .create_bucket(&gone, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("k").unwrap();
@@ -882,7 +883,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -915,7 +916,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("live").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
 
@@ -929,7 +930,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -984,7 +985,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("live").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("k").unwrap();
@@ -996,7 +997,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1065,7 +1066,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("live").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("k").unwrap();
@@ -1084,7 +1085,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1220,7 +1221,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("live").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
 
@@ -1262,7 +1263,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::create_dir_all(root.path().join("data/sub"))
@@ -1297,7 +1298,7 @@ mod tests {
         let stale = bucket::name("stale-bucket").unwrap();
         let live = bucket::name("live-bucket").unwrap();
         storage
-            .create_bucket(&live, None, &acl::Acl::default_private(None))
+            .create_bucket(&live, None, &Acl::default_private(None))
             .await
             .unwrap();
         // A stale record: the bucket directory is gone out-of-band.
@@ -1330,7 +1331,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("a.txt").unwrap();
@@ -1373,7 +1374,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("a.txt").unwrap();
@@ -1399,7 +1400,7 @@ mod tests {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let gone = object::key("gone.txt").unwrap();
@@ -1518,11 +1519,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn staging_walk_survives_an_unreadable_subdir() {
+        use crate::_core::acl::Acl;
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::create_dir_all(root.path().join("data/blocked"))
@@ -1561,6 +1563,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bucket_staging_descents_symlinked_dirs_when_following() {
+        use crate::_core::acl::Acl;
         // A symlinked directory INSIDE a bucket is part of the bucket
         // only when following is enabled (the follow policy, one source
         // of truth): with following the residue behind the link is
@@ -1585,7 +1588,7 @@ mod tests {
             .unwrap();
             let b = bucket::name("data").unwrap();
             storage
-                .create_bucket(&b, None, &acl::Acl::default_private(None))
+                .create_bucket(&b, None, &Acl::default_private(None))
                 .await
                 .unwrap();
             fs::create_dir(root.path().join("data/real")).await.unwrap();
@@ -1610,6 +1613,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn full_repair_reports_unreadable_roots_and_probes() {
+        use crate::_core::acl::Acl;
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(
@@ -1624,7 +1628,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("a.txt").unwrap();
@@ -1729,6 +1733,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn orphan_stage_reports_an_unreadable_upload_dir() {
+        use crate::_core::acl::Acl;
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(
@@ -1743,7 +1748,7 @@ mod tests {
         .unwrap();
         let b = bucket::name("live").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let blocked = state.path().join("multipart/live/u-blocked");
@@ -1790,11 +1795,11 @@ mod tests {
         let b = bucket::name("live").unwrap();
         let stray = bucket::name("stray").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
-            .create_bucket(&stray, None, &acl::Acl::default_private(None))
+            .create_bucket(&stray, None, &Acl::default_private(None))
             .await
             .unwrap();
         fs::create_dir_all(state.path().join("multipart/live"))

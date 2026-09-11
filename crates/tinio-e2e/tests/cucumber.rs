@@ -16,6 +16,7 @@
 //! failures — a feature/step that drifts out of sync with its step
 //! definitions must fail the run, never pass silently as "skipped".
 
+use std::{env, fs::File, io};
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
@@ -44,12 +45,12 @@ fn main() {
     // Two independent axes: the cargo feature decides `@parquet` (without the
     // reader compiled in, those scenarios can only 501), the env opt-in
     // decides the external-client tags (they need third-party binaries).
-    if !std::env::args().any(|a| a == "--tags") {
+    if !env::args().any(|a| a == "--tags") {
         let mut excluded = Vec::new();
         if !cfg!(feature = "parquet") {
             excluded.push("@parquet");
         }
-        if std::env::var_os("TINIO_E2E_EXTERNAL").is_none() {
+        if env::var_os("TINIO_E2E_EXTERNAL").is_none() {
             excluded.extend(["@interop", "@boto3", "@mc"]);
         }
         if !excluded.is_empty() {
@@ -59,7 +60,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" and ");
             unsafe {
-                std::env::set_var("CUCUMBER_FILTER_TAGS", filter);
+                env::set_var("CUCUMBER_FILTER_TAGS", filter);
             }
         }
     }
@@ -71,9 +72,9 @@ fn main() {
     // The report file opens BEFORE the runtime starts — no blocking fs
     // inside the async block (style.md). The Json writer takes a std
     // `Write`, so the file must be a std one.
-    let report_file = std::env::var("TINIO_E2E_REPORT")
+    let report_file = env::var("TINIO_E2E_REPORT")
         .ok()
-        .map(|path| std::fs::File::create(&path).expect("create report file"));
+        .map(|path| File::create(&path).expect("create report file"));
     rt.block_on(async {
         if let Some(file) = report_file {
             // Pretty output to stdout + Cucumber-JSON to the file, mirroring
@@ -82,7 +83,7 @@ fn main() {
             configure()
                 .init_tracing()
                 .with_writer(
-                    BasicWriter::new(std::io::stdout(), Coloring::Auto, Verbosity::Default)
+                    BasicWriter::new(io::stdout(), Coloring::Auto, Verbosity::Default)
                         .summarized()
                         .tee::<World, _>(JsonWriter::new(file).discard_stats_writes()),
                 )

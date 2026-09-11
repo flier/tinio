@@ -250,7 +250,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{BucketOps, ListObjectsParams, MultipartOps, ObjectOps, acl, object},
+        _core::{
+            BucketOps, CompletedPart, ListObjectsParams, MultipartOps, ObjectOps, acl::Acl,
+            multipart::MIN_PART_BYTES, object, storage,
+        },
         _util::testing::{assert_conformance, assert_send_sync, body},
     };
 
@@ -265,7 +268,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let bucket = name("data").unwrap();
         storage
-            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .create_bucket(&bucket, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("abc").unwrap();
@@ -287,7 +290,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let bucket = name("data").unwrap();
         storage
-            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .create_bucket(&bucket, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("big.bin").unwrap();
@@ -298,13 +301,13 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
         // The first part is non-final in the two-part list — it must be
         // >= the 5 MiB minimum the complete enforces in-txn.
-        let min = crate::_core::multipart::MIN_PART_BYTES as usize;
+        let min = MIN_PART_BYTES as usize;
         let p1 = storage
             .upload_part(
                 &bucket,
@@ -333,11 +336,11 @@ mod tests {
                 &key,
                 &upload.upload_id,
                 &[
-                    crate::_core::CompletedPart {
+                    CompletedPart {
                         part_number: p1.part_number,
                         etag: p1.etag.clone(),
                     },
-                    crate::_core::CompletedPart {
+                    CompletedPart {
                         part_number: p2.part_number,
                         etag: p2.etag.clone(),
                     },
@@ -372,7 +375,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new().unwrap());
         let bucket = name("race").unwrap();
         storage
-            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .create_bucket(&bucket, None, &Acl::default_private(None))
             .await
             .unwrap();
         let key = object::key("a.txt").unwrap();
@@ -461,8 +464,7 @@ mod tests {
         .unwrap();
         storage.adjust_total(4).unwrap();
         let err = storage.adjust_total(10).unwrap_err();
-        let Error::Storage(crate::_core::storage::Error::EntityTooLarge { size, limit }) = err
-        else {
+        let Error::Storage(storage::Error::EntityTooLarge { size, limit }) = err else {
             panic!("expected EntityTooLarge, got {err:?}");
         };
         assert_eq!((size, limit), (14, 8));

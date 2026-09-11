@@ -331,6 +331,7 @@ mod tests {
     #[cfg(feature = "list-v1")]
     #[tokio::test]
     async fn v1_allow_zero_page_size_restores_the_legacy_empty_page() {
+        use crate::_core::acl::Acl;
         // The `[s3] allow_zero_page_size` escape hatch: 0 and negative
         // values answer the empty page (the legacy `.max(0)` clamp),
         // never InvalidArgument.
@@ -344,7 +345,7 @@ mod tests {
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -370,6 +371,7 @@ mod tests {
     #[cfg(feature = "list-v2")]
     #[tokio::test]
     async fn v2_allow_zero_page_size_restores_the_legacy_empty_page() {
+        use crate::_core::acl::Acl;
         // The `[s3] allow_zero_page_size` escape hatch: 0 answers the
         // empty page (the legacy behavior), never InvalidArgument.
         let backend = S3Backend::new(
@@ -382,7 +384,7 @@ mod tests {
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -408,6 +410,7 @@ mod tests {
     #[cfg(feature = "list-v1")]
     #[tokio::test]
     async fn v1_echoes_the_effective_page_size_after_a_clamp() {
+        use crate::_core::acl::Acl;
         let backend = S3Backend::new(
             MemoryStorage::new().unwrap(),
             Capabilities {
@@ -418,7 +421,7 @@ mod tests {
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         for key in ["a.txt", "b.txt", "c.txt"] {
@@ -449,6 +452,7 @@ mod tests {
     #[cfg(feature = "list-v1")]
     #[tokio::test]
     async fn v1_entries_carry_the_lazy_resolved_row_owner() {
+        use crate::_core::acl::Acl;
         // The enforced-mode owner surface (spec 2026-09-05): each list
         // entry's Owner element comes from the row owner (`Info.owner`),
         // the display name resolved via the identity map; a legacy row
@@ -459,11 +463,7 @@ mod tests {
         let alice = user_id("AKID");
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(
-                &b,
-                Some(&alice),
-                &acl::Acl::default_private(Some(alice.clone())),
-            )
+            .create_bucket(&b, Some(&alice), &Acl::default_private(Some(alice.clone())))
             .await
             .unwrap();
         async fn commit(
@@ -484,8 +484,8 @@ mod tests {
                     object::Tags::empty(),
                     owner,
                     &owner
-                        .map(|o| acl::Acl::default_private(Some(o.clone())))
-                        .unwrap_or_else(|| acl::Acl::default_private(None)),
+                        .map(|o| Acl::default_private(Some(o.clone())))
+                        .unwrap_or_else(|| Acl::default_private(None)),
                 )
                 .await
                 .unwrap();
@@ -522,6 +522,7 @@ mod tests {
     #[cfg(feature = "list-v2")]
     #[tokio::test]
     async fn v2_echoes_the_effective_page_size_after_a_clamp() {
+        use crate::_core::acl::Acl;
         let backend = S3Backend::new(
             MemoryStorage::new().unwrap(),
             Capabilities {
@@ -532,7 +533,7 @@ mod tests {
         let storage = backend.storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         for key in ["a.txt", "b.txt", "c.txt"] {

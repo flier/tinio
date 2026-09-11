@@ -23,10 +23,13 @@
 //! override as HTTP 500.
 
 use std::{
-    io,
+    io, panic,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
+    thread,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -34,7 +37,10 @@ use cfg_if::cfg_if;
 use futures::{Stream, StreamExt};
 use http::StatusCode;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto, s3_error};
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::{
+    sync::{OwnedSemaphorePermit, mpsc},
+    task,
+};
 
 use crate::{
     _core::storage::{GetObjectResult, Storage},
@@ -59,7 +65,7 @@ const CHANNEL_CAP: usize = 4;
 /// Stream-send deadline (X5): a client that stopped reading must not pin a
 /// concurrency permit forever. After [`SEND_TIMEOUT`] of a full out channel
 /// the engine gives up and unwinds — the drop unwinds the whole topology.
-const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `try_send` with a wall-clock deadline: a `Full` channel hands the item
 /// back for the retry (never cloned); `false` = client gone (closed) or
@@ -68,24 +74,24 @@ fn send_or_unwind(
     tx: &mpsc::Sender<Result<SelectEvent, Error>>,
     mut item: Result<SelectEvent, Error>,
 ) -> bool {
-    let deadline = std::time::Instant::now() + SEND_TIMEOUT;
+    let deadline = Instant::now() + SEND_TIMEOUT;
     loop {
         match tx.try_send(item) {
             Ok(()) => return true,
             Err(mpsc::error::TrySendError::Closed(_)) => return false,
             Err(mpsc::error::TrySendError::Full(buf)) => {
                 item = buf;
-                if std::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     return false;
                 }
-                std::thread::sleep(SEND_POLL);
+                thread::sleep(SEND_POLL);
             }
         }
     }
 }
 
 /// The retry interval of [`send_or_unwind`].
-const SEND_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+const SEND_POLL: Duration = Duration::from_millis(25);
 
 /// The sync bridge input (spec §1.1): `std::io::Read` over the forwarder's
 /// bounded channel — `blocking_recv` blocks the calling thread, so this
@@ -257,7 +263,7 @@ impl<S: Storage> S3Backend<S> {
         // on a tokio worker; the §1.1 "CPU never on a worker" rule applies
         // here too.
         let (plan, mut config, raw_scan) =
-            tokio::task::spawn_blocking(move || build_config(req.input.request))
+            task::spawn_blocking(move || build_config(req.input.request))
                 .await
                 .map_err(|_| s3_error!(InternalError, "select request build task panicked"))??;
 
@@ -321,7 +327,7 @@ impl<S: Storage> S3Backend<S> {
             // Review 2026-09-06b R8: without this, a panic in the engine
             // ends the stream silently — no error item, no Stats/End.
             // Unwind-capture and surface it as an in-stream S3QueryError.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 for item in select_iter(plan, config, input) {
                     if !send_or_unwind(&out_tx, item) {
                         // X5: client gone (closed channel) or stalled
@@ -756,9 +762,10 @@ fn resolve_scan_range(scan: &dto::ScanRange, size: u64) -> S3Result<ScanRange> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{io::ErrorKind, time::Duration};
 
     use s3s::S3;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::{
@@ -1293,14 +1300,12 @@ mod tests {
         // The next must wait for the cap.
         let waiting = select(&backend, &b, request("SELECT * FROM S3Object s"));
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), waiting)
-                .await
-                .is_err(),
+            timeout(Duration::from_millis(200), waiting).await.is_err(),
             "the next select must wait for the concurrency cap"
         );
         // Draining one response to its stream end releases its permit.
         let _ = collect_records(held.remove(0).output.payload.unwrap()).await;
-        let resp = tokio::time::timeout(
+        let resp = timeout(
             Duration::from_secs(5),
             select(&backend, &b, request("SELECT * FROM S3Object s")),
         )
@@ -1395,11 +1400,7 @@ mod tests {
         // X9: Io errors can embed on-disk paths — the wire sees a fixed
         // message, the detail is logged server-side.
         let err = map_stream_error(Error::Io(
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "/srv/secret/object.csv",
-            )
-            .into(),
+            io::Error::new(ErrorKind::PermissionDenied, "/srv/secret/object.csv").into(),
         ));
         assert_eq!(err.code().as_str(), "S3QueryError", "{err:?}");
         assert_eq!(err.message().unwrap(), "S3 select: io error", "{err:?}");

@@ -37,7 +37,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::fs;
+use tokio::fs::File;
 
 use crate::{
     _core::{ETag, object, pipeline},
@@ -267,7 +267,7 @@ impl ComputeTask {
 /// `PermissionDenied` — a swap between the walk and the hash cannot
 /// escape the storage root (R3). The nofollow open runs on the tokio
 /// blocking pool ([`fsutil::open_file`]).
-async fn open_policy(path: &Path, follow_symlinks: bool) -> io::Result<fs::File> {
+async fn open_policy(path: &Path, follow_symlinks: bool) -> io::Result<File> {
     fsutil::open_file(path, follow_symlinks).await
 }
 
@@ -317,7 +317,7 @@ pub(crate) async fn md5_of_path(
 /// own before/after pair. The read loop is the shared
 /// [`fsutil::md5_stream_async`]
 /// (F43).
-async fn md5_of_handle(file: &mut fs::File, buf: &mut [u8]) -> result::Result<[u8; 16], Error> {
+async fn md5_of_handle(file: &mut File, buf: &mut [u8]) -> result::Result<[u8; 16], Error> {
     Ok(fsutil::md5_stream_async(file, buf).await?)
 }
 
@@ -348,12 +348,14 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::runtime::Builder;
+    use tokio::{fs, runtime::Builder};
 
     use super::*;
     use crate::{
         _core::{
-            ETag, object,
+            ETag,
+            acl::Acl,
+            object,
             pipeline::{InlineRunner, Runner, Task},
             to_nanos,
         },
@@ -428,7 +430,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: crate::_core::acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         let handle = File::options().write(true).open(&file).unwrap();
         handle
@@ -465,7 +467,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: crate::_core::acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         let handle = File::options().write(true).open(&file).unwrap();
         handle
@@ -498,7 +500,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: crate::_core::acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         // Overwrite in place with different same-size content. The sleep
         // lands the rewrite in a later Windows FILETIME tick (~16 ms
@@ -539,7 +541,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: crate::_core::acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         let replacement = state.path().join("replacement.bin");
         std_fs::write(&replacement, b"hello").unwrap();
@@ -559,6 +561,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn composed_etag_rehashes_on_quick_replacement() {
+        use crate::_core::acl::Acl;
         // The identity beats the clock: a same-size replacement within
         // the jitter window is still detected (new inode), where the
         // mtime fallback would wrongly keep the composed form.
@@ -575,7 +578,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: crate::_core::acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         let replacement = state.path().join("replacement.bin");
         std_fs::write(&replacement, b"hello").unwrap();

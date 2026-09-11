@@ -6,7 +6,14 @@ use async_trait::async_trait;
 use derive_more::Debug;
 
 use super::{Storage, body::BodyStream, range::ByteRange};
-use crate::{acl, bucket, checksum, etag::ETag, multipart::ObjectPart, object};
+use crate::{
+    acl,
+    acl::{Acl, AclGrants},
+    bucket, checksum,
+    etag::ETag,
+    multipart::ObjectPart,
+    object,
+};
 
 /// Result of a successful object write.
 ///
@@ -176,7 +183,7 @@ pub trait ObjectOps: Send + Sync + 'static {
                 staged,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await?;
         Ok(PutObjectResult { etag: info.etag })
@@ -224,7 +231,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         staged: Self::StagedBody,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -266,7 +273,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         dst_key: &object::Key,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
         _checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
@@ -347,7 +354,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<acl::Acl, <Self as Storage>::Error>
+    ) -> Result<Acl, <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -358,7 +365,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        grants: &acl::AclGrants,
+        grants: &AclGrants,
     ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
@@ -394,6 +401,7 @@ mod tests {
     use futures::stream;
 
     use super::*;
+    use crate::acl::Acl;
 
     #[test]
     fn listing_types_construct() {
@@ -405,7 +413,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         let listing = ObjectListing {
             objects: vec![info],
@@ -435,7 +443,7 @@ mod tests {
                 tags: object::Tags::empty(),
                 checksum: None,
                 owner: None,
-                acl: acl::Acl::default_private(None),
+                acl: Acl::default_private(None),
             },
             body: Box::pin(stream::empty()),
             served_range: Some((0, 0)),
@@ -453,7 +461,7 @@ mod tests {
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
-            acl: acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         let result = GetObjectResult {
             info,

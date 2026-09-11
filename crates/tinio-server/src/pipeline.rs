@@ -53,6 +53,7 @@ use tokio::{
     runtime::{Builder, Runtime},
     sync::{Mutex as TokioMutex, mpsc, watch},
     task::JoinHandle,
+    time::timeout,
 };
 
 use crate::{
@@ -425,7 +426,7 @@ where
     /// IO drain; an interrupted walk leaves a partial tombstone,
     /// reclaimed by the next startup repair (D-B) or scanner pass.
     pub async fn drain(&self) {
-        let removal = tokio::time::timeout(REMOVAL_DRAIN_TIMEOUT, self.remove.drain());
+        let removal = timeout(REMOVAL_DRAIN_TIMEOUT, self.remove.drain());
         let ((), _) = tokio::join!(self.io.drain(), removal);
         self.db.drain().await;
     }
@@ -682,6 +683,7 @@ fn apply_thread_priority_result(result: Result<(), ThreadPriorityError>) {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         error::Error as StdError,
         mem,
         sync::{
@@ -1524,7 +1526,7 @@ mod tests {
                 db_pipeline: pipelines.db(),
                 // No owner-to-uid mapping — every object stays
                 // server-user-owned (the hardened default).
-                owner_uids: std::collections::HashMap::new(),
+                owner_uids: HashMap::new(),
             },
         )
         .expect("FsStorage accepts the real pipeline runtimes");

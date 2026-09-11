@@ -5,7 +5,9 @@ use std::time::SystemTime;
 use derive_more::{AsRef, Deref, Display, Into};
 
 use crate::{
-    acl, bucket, checksum,
+    acl,
+    acl::Acl,
+    bucket, checksum,
     etag::ETag,
     object,
     storage::{self, Error::*},
@@ -139,7 +141,7 @@ pub struct MultipartUpload {
     pub owner: Option<acl::OwnerId>,
     /// The create-time ACL (persisted in the upload state and applied to
     /// the object at completion).
-    pub acl: acl::Acl,
+    pub acl: Acl,
 }
 
 /// Metadata of a single uploaded multipart part.
@@ -204,7 +206,7 @@ pub struct ObjectPart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::_util::testing::assert_send_sync;
+    use crate::{_util::testing::assert_send_sync, acl::Acl};
 
     #[test]
     fn part_info_round_trip() {
@@ -229,7 +231,7 @@ mod tests {
             checksum: None,
             tags: object::Tags::empty(),
             owner: None,
-            acl: acl::Acl::default_private(None),
+            acl: Acl::default_private(None),
         };
         assert_eq!(m.upload_id, "uuid-v4");
         assert_eq!(m.key.as_ref(), "big.bin");

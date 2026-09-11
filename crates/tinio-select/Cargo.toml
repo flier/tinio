@@ -43,5 +43,8 @@ required-features = ["parquet"]
 default = []
 parquet = ["dep:parquet", "dep:arrow", "dep:bytes"]
 
+[lints.clippy]
+absolute_paths = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

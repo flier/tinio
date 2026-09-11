@@ -16,9 +16,13 @@ use tokio::fs;
 use super::{Error, FsStorage};
 #[cfg(not(unix))]
 use crate::_core::storage::ObjectOps;
+#[cfg(unix)]
+use crate::fsutil;
 use crate::{
     _core::{
-        BodyStream, acl, bucket, checksum,
+        BodyStream, acl,
+        acl::Acl,
+        bucket, checksum,
         multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
         object::{self, Info},
         storage::{
@@ -26,7 +30,6 @@ use crate::{
             UploadsListing, access_denied, invalid_key, key_marker_order, split_uploads_order,
         },
     },
-    fsutil,
     write::AtomicWriter,
 };
 
@@ -84,7 +87,7 @@ impl MultipartOps for FsStorage {
         checksum: Option<checksum::Upload>,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &acl::Acl,
+        acl: &Acl,
     ) -> Result<MultipartUpload, Error> {
         self.ensure_bucket(bucket).await?;
         // The multipart path must not be a backdoor for `.tinio` (FR-020).
@@ -237,6 +240,11 @@ impl MultipartOps for FsStorage {
         // `resolve_key` re-runs the symlink policy against it.
         let _guard = self.lock_bucket_mutations(bucket).await;
         let phase2 = async {
+            #[cfg(unix)]
+            use crate::fsutil::DirOwnerUid;
+            #[cfg(not(unix))]
+            use crate::fsutil::DirOwnerUid;
+
             let bucket_dir = self.ensure_bucket(bucket).await?;
             let target = self.resolve_key(&bucket_dir, key).await?;
             // The unix dir hardening (spec 2026-09-05 §5a): a prefix
@@ -251,9 +259,9 @@ impl MultipartOps for FsStorage {
                 &target,
                 Some(&bucket_dir),
                 #[cfg(unix)]
-                fsutil::DirOwnerUid(dir_owner_uid),
+                DirOwnerUid(dir_owner_uid),
                 #[cfg(not(unix))]
-                fsutil::DirOwnerUid,
+                DirOwnerUid,
             )
             .await?;
             Ok::<_, Error>(target)
@@ -279,13 +287,14 @@ impl MultipartOps for FsStorage {
         // completion idempotently.
         #[cfg(unix)]
         if !self.owner_uids.is_empty() {
+            use crate::_store::decode_owner_wire;
             let stored_owner = self
                 .handle
                 .read(|txn| {
                     let uploads = crate::_store::upload::Table::open_readonly(txn)?;
-                    Ok(uploads.get_matching(bucket, key, upload_id)?.and_then(
-                        |(_, _, _, owner_wire, _)| crate::_store::decode_owner_wire(&owner_wire),
-                    ))
+                    Ok(uploads
+                        .get_matching(bucket, key, upload_id)?
+                        .and_then(|(_, _, _, owner_wire, _)| decode_owner_wire(&owner_wire)))
                 })
                 .map_err(Error::from)?;
             if let Some(uid) = self.owner_uid(stored_owner.as_ref())
@@ -398,17 +407,22 @@ impl MultipartOps for FsStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use bytes::Bytes;
     use futures::stream;
 
     use super::*;
     use crate::{
         _core::{
-            acl, object,
+            CompletedPart,
+            acl::Acl,
+            multipart::MIN_PART_BYTES,
+            object,
             storage::{BucketOps, ObjectOps},
         },
         _util::testing::{body, read_body},
-        testutil::{checksum_tee, fs_options, md5_wire, storage},
+        testutil::{all_users_read_grant, checksum_tee, fs_options, md5_wire, owner_id, storage},
     };
 
     #[tokio::test]
@@ -418,7 +432,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("big.bin").unwrap();
@@ -429,7 +443,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -440,8 +454,8 @@ mod tests {
                 &upload.upload_id,
                 1.into(),
                 Box::pin(stream::iter(vec![
-                    Ok::<_, std::io::Error>(Bytes::from_static(b"x")),
-                    Err(std::io::Error::other("boom")),
+                    Ok::<_, io::Error>(Bytes::from_static(b"x")),
+                    Err(io::Error::other("boom")),
                 ])),
                 None,
             )
@@ -473,7 +487,7 @@ mod tests {
         let (root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("big.bin").unwrap();
@@ -484,14 +498,14 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
         let mut parts = Vec::new();
         // Non-final parts must be >= the 5 MiB minimum the backend
         // enforces at complete; the final part may be small.
-        let min = crate::_core::multipart::MIN_PART_BYTES as usize;
+        let min = MIN_PART_BYTES as usize;
         let parts_data: [Vec<u8>; 3] = [vec![b'a'; min], vec![b'b'; min], b"ij".to_vec()];
         for (i, data) in parts_data.iter().enumerate() {
             let part = storage
@@ -564,7 +578,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("big.bin").unwrap();
@@ -575,7 +589,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -628,7 +642,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -638,7 +652,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -649,7 +663,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -677,7 +691,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
@@ -688,7 +702,7 @@ mod tests {
                     None,
                     object::Tags::empty(),
                     None,
-                    &acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();
@@ -736,7 +750,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("same.bin").unwrap();
@@ -747,7 +761,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -758,7 +772,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -782,7 +796,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("same.bin").unwrap();
@@ -793,7 +807,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -804,7 +818,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -868,7 +882,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -920,7 +934,7 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("big.bin").unwrap();
@@ -932,14 +946,14 @@ mod tests {
                 None,
                 tags.clone(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
         // Two parts: the non-final first must meet the 5 MiB S3 minimum;
         // both upload with a tee so the retained rows carry per-part
         // checksums (the digest values are the parts' real content MD5s).
-        let min = crate::_core::multipart::MIN_PART_BYTES as usize;
+        let min = MIN_PART_BYTES as usize;
         let first = vec![b'a'; min];
         let p1 = storage
             .upload_part(
@@ -971,11 +985,11 @@ mod tests {
             kind: checksum::Type::Composite,
         };
         let completed = [
-            crate::_core::CompletedPart {
+            CompletedPart {
                 part_number: p1.part_number,
                 etag: p1.etag,
             },
-            crate::_core::CompletedPart {
+            CompletedPart {
                 part_number: p2.part_number,
                 etag: p2.etag,
             },
@@ -1015,7 +1029,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 None,
-                &acl::Acl::default_private(None),
+                &Acl::default_private(None),
             )
             .await
             .unwrap();
@@ -1028,7 +1042,7 @@ mod tests {
                 &b,
                 &k,
                 &upload2.upload_id,
-                &[crate::_core::CompletedPart {
+                &[CompletedPart {
                     part_number: p.part_number,
                     etag: p.etag,
                 }],
@@ -1049,12 +1063,12 @@ mod tests {
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
-            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         let k = object::key("big.bin").unwrap();
-        let owner = crate::testutil::owner_id();
-        let grants = vec![crate::testutil::all_users_read_grant()];
+        let owner = owner_id();
+        let grants = vec![all_users_read_grant()];
         let upload = storage
             .create_multipart_upload(
                 &b,
@@ -1062,7 +1076,7 @@ mod tests {
                 None,
                 object::Tags::empty(),
                 Some(&owner),
-                &acl::Acl {
+                &Acl {
                     owner: Some(owner.clone()),
                     grants: grants.clone(),
                 },
@@ -1080,7 +1094,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                &[crate::_core::CompletedPart {
+                &[CompletedPart {
                     part_number: part.part_number,
                     etag: part.etag,
                 }],

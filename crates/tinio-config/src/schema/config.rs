@@ -11,7 +11,7 @@ use toml::Deserializer;
 
 use super::{api, auth, log, owner, pipeline, s3, scanner, server, storage, telemetry, users};
 use crate::{
-    _core::acl::{OwnerId, derive_canonical_id},
+    _core::acl::{DEFAULT_ROOT_ACCESS_KEY, OwnerId, derive_canonical_id},
     Error, error,
 };
 
@@ -190,7 +190,7 @@ fn validate_owner_and_users(config: &Config, _context: &()) -> garde::Result {
     // the same fallback the identity assembly uses).
     let root_key = match &config.auth {
         Some(auth) => auth.access_key.as_str(),
-        None => crate::_core::acl::DEFAULT_ROOT_ACCESS_KEY,
+        None => DEFAULT_ROOT_ACCESS_KEY,
     };
     if let Some((i, user)) = config
         .users()
@@ -259,7 +259,7 @@ mod tests {
 
     use super::{
         Config, Version,
-        auth::{self, SecretKey},
+        auth::SecretKey,
         log::{self, AccessFormat, Format, Verbosity},
         pipeline as pipeline_mod, s3,
     };
@@ -645,7 +645,7 @@ mod tests {
         let from_string = SecretKey::from("sk".to_string());
         assert_eq!(&*from_str, "sk");
         assert_eq!(&*from_string, "sk");
-        let boxed: secrecy::SecretBox<auth::SecretKey> = from_str.into();
+        let boxed: secrecy::SecretBox<SecretKey> = from_str.into();
         assert_eq!(&**boxed.expose_secret(), "sk");
     }
 

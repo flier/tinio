@@ -10,7 +10,9 @@ use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use futures::stream;
 use tinio_core::{
-    BodyStream, bucket, object, storage,
+    BodyStream,
+    acl::Acl,
+    bucket, object, storage,
     storage::{BucketOps, ObjectOps},
 };
 use tinio_fs::{AtomicWriter, FsStorage, testing::fs_options};
@@ -65,7 +67,7 @@ fn streaming_read(c: &mut Criterion) {
         rt.block_on(async {
             let b = bucket::name("data").unwrap();
             storage
-                .create_bucket(&b, None, &tinio_core::acl::Acl::default_private(None))
+                .create_bucket(&b, None, &Acl::default_private(None))
                 .await
                 .unwrap();
             storage
@@ -106,7 +108,7 @@ fn small_write(c: &mut Criterion) {
                 .create_bucket(
                     &bucket::name("data").unwrap(),
                     None,
-                    &tinio_core::acl::Acl::default_private(None),
+                    &Acl::default_private(None),
                 )
                 .await
                 .unwrap();

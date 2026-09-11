@@ -17,7 +17,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -49,6 +49,7 @@ use s3s::{
 use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
 use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
+use tracing::{callsite::DefaultCallsite, dispatcher, metadata};
 
 #[cfg(feature = "acl")]
 use crate::_auth::{AclAccess, ConfigAuth, Identity};
@@ -529,16 +530,15 @@ impl DataPlaneService {
 /// before any listener (exactly the pipeline tests' WARN-filtered
 /// global): the gate must follow the LIVE dispatcher, not the process's
 /// first appraisal.
-static ACCESS_LOG_CALLSITE: std::sync::LazyLock<&'static tracing::callsite::DefaultCallsite> =
-    std::sync::LazyLock::new(|| {
-        tracing::callsite! {
-            name: "tinio_access_log_gate",
-            kind: tracing::metadata::Kind::EVENT,
-            target: ACCESS_TARGET,
-            level: tracing::Level::INFO,
-            fields: (),
-        }
-    });
+static ACCESS_LOG_CALLSITE: LazyLock<&'static DefaultCallsite> = LazyLock::new(|| {
+    tracing::callsite! {
+        name: "tinio_access_log_gate",
+        kind: metadata::Kind::EVENT,
+        target: ACCESS_TARGET,
+        level: tracing::Level::INFO,
+        fields: (),
+    }
+});
 
 /// Whether any subscriber listens on the access target — the T052
 /// allocation gate, checked against the CURRENT dispatcher (thread-local
@@ -547,7 +547,7 @@ static ACCESS_LOG_CALLSITE: std::sync::LazyLock<&'static tracing::callsite::Defa
 #[inline]
 fn access_log_enabled() -> bool {
     use tracing::Callsite;
-    tracing::dispatcher::get_default(|d| d.enabled(ACCESS_LOG_CALLSITE.metadata()))
+    dispatcher::get_default(|d| d.enabled(ACCESS_LOG_CALLSITE.metadata()))
 }
 
 /// Which direction a counting body streams (the metric recorded at the
@@ -691,11 +691,13 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
+        runtime,
         task::JoinHandle,
         time::sleep,
     };
     use tracing::{
         Event, Metadata, Subscriber, field,
+        field::Field,
         span::{self, Id},
         subscriber::with_default,
     };
@@ -754,11 +756,11 @@ mod tests {
     struct Fields<'a>(&'a mut HashMap<String, String>);
 
     impl field::Visit for Fields<'_> {
-        fn record_str(&mut self, field: &field::Field, value: &str) {
+        fn record_str(&mut self, field: &Field, value: &str) {
             self.0.insert(field.name().to_string(), value.to_string());
         }
 
-        fn record_debug(&mut self, field: &field::Field, value: &dyn Debug) {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
             self.0
                 .insert(field.name().to_string(), format!("{value:?}"));
         }
@@ -1029,6 +1031,7 @@ mod tests {
     #[cfg(feature = "cors")]
     #[tokio::test]
     async fn options_preflight_answered_on_the_plane() {
+        use crate::_core::acl::Acl;
         // The preflight route on the real data plane: seed the mem storage
         // with a CORS config (via the storage handle), spawn the plane
         // (`Capabilities::default` → cors on), then a raw browser OPTIONS
@@ -1038,7 +1041,7 @@ mod tests {
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -1119,10 +1122,11 @@ mod tests {
     async fn seeded_cors_plane(
         config: cors::Config,
     ) -> (SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
+        use crate::_core::acl::Acl;
         let storage = MemoryStorage::new().unwrap();
         let name = bucket::name("data").unwrap();
         storage
-            .create_bucket(&name, None, &crate::_core::acl::Acl::default_private(None))
+            .create_bucket(&name, None, &Acl::default_private(None))
             .await
             .unwrap();
         storage
@@ -1336,7 +1340,10 @@ mod tests {
 
         use super::*;
         use crate::{
-            _auth::identity::{Identity, User},
+            _auth::{
+                derive_canonical_id,
+                identity::{Identity, User},
+            },
             _core::{
                 acl::{Acl, GROUP_ALL_USERS, Grant, Grantee, GroupUri, OwnerId, Permission},
                 bucket, object,
@@ -1447,8 +1454,8 @@ mod tests {
 
         /// The two-user fixture: alice (the owner) and bob (the grantee).
         fn identity_pair() -> (Identity, OwnerId, OwnerId) {
-            let alice_id = crate::_auth::derive_canonical_id("AKID");
-            let bob_id = crate::_auth::derive_canonical_id("BKID");
+            let alice_id = derive_canonical_id("AKID");
+            let bob_id = derive_canonical_id("BKID");
             (
                 Identity::test(vec![
                     User::test("AKID", "alice-secret", "alice"),
@@ -1601,7 +1608,7 @@ mod tests {
         let capture = CaptureSubscriber::default();
         let capture2 = capture.clone();
         with_default(capture, || {
-            tokio::runtime::Builder::new_current_thread()
+            runtime::Builder::new_current_thread()
                 .enable_io()
                 .build()
                 .unwrap()
@@ -1614,7 +1621,7 @@ mod tests {
                 let plane = DataPlane::new(storage, Capabilities::default());
 
                 let client = thread::spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
+                    runtime::Builder::new_current_thread()
                             .enable_io()
                             .build()
                             .unwrap()

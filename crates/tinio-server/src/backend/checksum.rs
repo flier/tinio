@@ -10,6 +10,8 @@
 
 use std::{
     io,
+    io::ErrorKind,
+    mem,
     pin::Pin,
     sync::{
         Arc, OnceLock,
@@ -30,7 +32,9 @@ use s3s::{
         Checksum as _, Crc32, Crc32c, Crc64Nvme, Md5, Sha1, Sha256, Sha512, XxHash3, XxHash64,
         XxHash128,
     },
-    dto, s3_error,
+    dto,
+    dto::CompletedPart,
+    s3_error,
 };
 
 use super::map_backend_error;
@@ -425,7 +429,7 @@ macro_rules! impl_checksum_value_fields {
 
 impl_checksum_value_fields!(dto::UploadPartInput);
 impl_checksum_value_fields!(dto::PutObjectInput);
-impl_checksum_value_fields!(dto::CompletedPart);
+impl_checksum_value_fields!(CompletedPart);
 impl_checksum_value_fields!(dto::CompleteMultipartUploadInput);
 impl_checksum_value_fields!(dto::Checksum);
 
@@ -544,7 +548,7 @@ impl Stream for VerifyStream {
                 self.finished = true;
                 // `finalize` consumes the hasher — take it out of the
                 // pinned stream (the stream is done).
-                let checksum = std::mem::take(&mut self.hasher).finalize();
+                let checksum = mem::take(&mut self.hasher).finalize();
                 let computed = self
                     .spec
                     .algorithm
@@ -595,7 +599,7 @@ impl Stream for VerifyStream {
                 } else {
                     self.state.mismatched.store(true, Ordering::Relaxed);
                     Poll::Ready(Some(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                        ErrorKind::InvalidData,
                         "checksum mismatch",
                     ))))
                 }
@@ -793,7 +797,9 @@ fn crc_params(algo: checksum::Algorithm) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use futures::stream;
+    use std::io::ErrorKind;
+
+    use futures::{stream, task::noop_waker};
 
     use super::*;
     use crate::_core::object;
@@ -1217,7 +1223,7 @@ mod tests {
             None,
             &state,
         ));
-        let waker = futures::task::noop_waker();
+        let waker = noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
         // Drive manually so the intermediate `Pending` is observable.
         let mut saw_pending = false;
@@ -1568,7 +1574,7 @@ mod tests {
         let body = VerifyStream::wrap(
             Box::pin(stream::iter(vec![
                 Ok::<_, io::Error>(Bytes::from_static(b"hello")),
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom")),
+                Err(io::Error::new(ErrorKind::BrokenPipe, "boom")),
             ])),
             &spec,
             None,
@@ -1578,7 +1584,7 @@ mod tests {
         let mut seen_error = false;
         while let Some(chunk) = body.next().await {
             if let Err(err) = chunk {
-                seen_error = err.kind() == io::ErrorKind::BrokenPipe;
+                seen_error = err.kind() == ErrorKind::BrokenPipe;
             }
         }
         assert!(seen_error, "the inner stream error must reach the consumer");
