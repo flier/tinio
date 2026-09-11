@@ -1,10 +1,13 @@
 //! The single cucumber test binary. All scenarios live in
 //! `tests/features/`; step definitions live in `tests/steps/`.
 //!
-//! Default tag filter: scenarios that need external client binaries
-//! (`@interop`/`@boto3`/`@mc`) are excluded unless the user passes an
-//! explicit `--tags` on the CLI or sets `TINIO_E2E_EXTERNAL=1` — the
-//! same "opt-in" semantics the old `#[ignore]` integration tests had.
+//! Default tag filter: scenarios that cannot pass in this build are excluded
+//! unless the user passes an explicit `--tags` on the CLI. The two exclusion
+//! axes are independent: `@parquet` drops out unless the binary was compiled
+//! `--features parquet` (the parquet input reader lives behind
+//! `tinio-server/select-parquet`, off by default), and the external client
+//! tags (`@interop`/`@boto3`/`@mc`) drop out unless `TINIO_E2E_EXTERNAL=1` —
+//! the same "opt-in" semantics the old `#[ignore]` integration tests had.
 //!
 //! `TINIO_E2E_REPORT=<path>` additionally writes a Cucumber-JSON report
 //! to the given file (CI uses this for the PR test report).
@@ -37,13 +40,27 @@ fn main() {
     // Must run before the tokio runtime starts: CUCUMBER_FILTER_TAGS is
     // read by cucumber's CLI parser when no --tags is given. SAFETY: no
     // threads exist yet; the runtime is built below.
-    if std::env::var_os("TINIO_E2E_EXTERNAL").is_none() && !std::env::args().any(|a| a == "--tags")
-    {
-        unsafe {
-            std::env::set_var(
-                "CUCUMBER_FILTER_TAGS",
-                "not @interop and not @boto3 and not @mc",
-            );
+    //
+    // Two independent axes: the cargo feature decides `@parquet` (without the
+    // reader compiled in, those scenarios can only 501), the env opt-in
+    // decides the external-client tags (they need third-party binaries).
+    if !std::env::args().any(|a| a == "--tags") {
+        let mut excluded = Vec::new();
+        if !cfg!(feature = "parquet") {
+            excluded.push("@parquet");
+        }
+        if std::env::var_os("TINIO_E2E_EXTERNAL").is_none() {
+            excluded.extend(["@interop", "@boto3", "@mc"]);
+        }
+        if !excluded.is_empty() {
+            let filter = excluded
+                .iter()
+                .map(|tag| format!("not {tag}"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            unsafe {
+                std::env::set_var("CUCUMBER_FILTER_TAGS", filter);
+            }
         }
     }
 

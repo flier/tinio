@@ -1139,6 +1139,57 @@ mod tests {
         assert_eq!(err.status_code().unwrap().as_u16(), 400, "{err:?}");
     }
 
+    /// The committed fixture `tinio-select`'s integration test reads and
+    /// asserts (`crates/tinio-select/tests/parquet.rs`; regenerate with its
+    /// ignored generator). Both layers embed the same file, so they cannot
+    /// drift onto different fixtures.
+    #[cfg(feature = "select-parquet")]
+    const PARQUET_FIXTURE: &[u8] =
+        include_bytes!("../../../tinio-select/tests/fixtures/select.parquet");
+
+    /// The parquet read path end to end: a real parquet object through the
+    /// storage read path, the engine, and the CSV output. The three parquet
+    /// tests beside this one pin only the request-level constraints — none
+    /// of them ever lands a parquet body in the reader.
+    #[tokio::test]
+    #[cfg(feature = "select-parquet")]
+    async fn select_parquet_object_projects_and_filters() {
+        let (backend, b) = setup_name().await;
+        // The `select` helper's key is fixed ("data.csv"): the
+        // `InputSerialization`, not the suffix, picks the reader.
+        put(&backend, &b, "data.csv", PARQUET_FIXTURE).await;
+        let parquet = |expression: &str| {
+            let mut req = request(expression);
+            req.input_serialization = dto::InputSerialization {
+                parquet: Some(dto::ParquetInput {}),
+                ..Default::default()
+            };
+            req
+        };
+        // Every column of every row: the file's schema order, the float's
+        // raw carrier text, and the present null as an empty CSV cell.
+        let resp = select(&backend, &b, parquet("SELECT * FROM S3Object s"))
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_records(resp.output.payload.unwrap()).await,
+            b"1,alice,3.5,true,12.34\n2,bob,,false,5.67\n3,carol,1.25,true,9.99\n"
+        );
+        // A projection pruned to two columns and filtered on a third (a
+        // column read for the predicate alone still resolves).
+        let resp = select(
+            &backend,
+            &b,
+            parquet("SELECT s.name, s.score FROM S3Object s WHERE s.id >= 2"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_records(resp.output.payload.unwrap()).await,
+            b"bob,\ncarol,1.25\n"
+        );
+    }
+
     #[tokio::test]
     async fn select_ambiguous_field_is_in_stream_error() {
         let (backend, b) = setup_name().await;
@@ -1343,10 +1394,13 @@ mod tests {
     fn stream_io_error_is_fixed_message() {
         // X9: Io errors can embed on-disk paths — the wire sees a fixed
         // message, the detail is logged server-side.
-        let err = map_stream_error(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "/srv/secret/object.csv",
-        )));
+        let err = map_stream_error(Error::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "/srv/secret/object.csv",
+            )
+            .into(),
+        ));
         assert_eq!(err.code().as_str(), "S3QueryError", "{err:?}");
         assert_eq!(err.message().unwrap(), "S3 select: io error", "{err:?}");
     }

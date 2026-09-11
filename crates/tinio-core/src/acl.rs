@@ -513,4 +513,73 @@ mod tests {
         assert!(!can_delete(&bob, &alice, &lazy, Some(&alice)));
         assert!(!can_delete(&lazy, &bob, &lazy, Some(&alice)));
     }
+
+    #[test]
+    fn grants_wire_drops_a_group_outside_the_documented_set() {
+        // An unknown group URI has no wire form: the encoder drops the
+        // grant, the decoder rejects the element (self-heal happens at
+        // the `from_grants_wire` boundary only).
+        let acl = Acl {
+            owner: None,
+            grants: vec![
+                Grant {
+                    grantee: Grantee::Group(GroupUri("http://evildomain/".into())),
+                    permission: Permission::Read,
+                },
+                Grant {
+                    grantee: Grantee::Canonical(uid()),
+                    permission: Permission::Read,
+                },
+            ],
+        };
+        let wire = acl.to_grants_wire();
+        assert_eq!(wire, format!("id={},READ", uid().as_str()));
+        assert_eq!(
+            Acl::from_grants_wire(&wire).grants,
+            vec![acl.grants[1].clone()]
+        );
+    }
+
+    #[test]
+    fn grants_wire_parse_rejects_malformed_elements() {
+        // A grantee with neither the `id=` nor the `uri=` prefix.
+        assert_eq!(
+            Acl::parse_grants_wire("nope,READ"),
+            Err(AclError::InvalidGroupUri("nope".into()))
+        );
+        // A `uri=` element decoding to a URI outside the three constants.
+        assert_eq!(
+            Acl::parse_grants_wire("uri=http%3A%2F%2Fevildomain%2F,READ"),
+            Err(AclError::InvalidGroupUri("http://evildomain/".into()))
+        );
+    }
+
+    #[test]
+    fn grants_wire_parse_over_the_cap_is_overflow_not_self_heal() {
+        let grants: Vec<Grant> = (0..=ACL_GRANTS_MAX)
+            .map(|i| Grant {
+                grantee: Grantee::Canonical(id(&format!("{i:064x}"))),
+                permission: Permission::Read,
+            })
+            .collect();
+        let wire = Acl {
+            owner: None,
+            grants,
+        }
+        .to_grants_wire();
+        assert_eq!(Acl::parse_grants_wire(&wire), Err(AclError::GrantsOverflow));
+        // The public parser self-heals the same wire to the default private ACL.
+        assert_eq!(Acl::from_grants_wire(&wire), Acl::default_private(None));
+    }
+
+    #[test]
+    fn grants_wire_parse_canonicalizes_unsorted_and_duplicate_input() {
+        let a = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        let b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let wire = format!("id={a},READ&id={b},FULL_CONTROL&id={b},FULL_CONTROL");
+        assert_eq!(
+            Acl::parse_grants_wire(&wire).unwrap().to_grants_wire(),
+            format!("id={b},FULL_CONTROL&id={a},READ")
+        );
+    }
 }

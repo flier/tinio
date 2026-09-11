@@ -10,6 +10,7 @@
 //! text in that cell (`display`) — CSV quoting/escaping applies to the cell.
 
 use _csv::{QuoteStyle, Terminator, WriterBuilder};
+use smart_default::SmartDefault;
 
 use crate::{
     csv::map_error,
@@ -26,26 +27,20 @@ pub enum OutputMode {
 }
 
 /// CSV output options (S3 Select `OutputSerialization.CSV`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CsvOutputParams {
-    pub field_delimiter: u8,
-    pub record_delimiter: u8,
-    pub quote: u8,
-    pub escape: u8,
-    pub quote_fields: QuoteFields,
-}
-
+///
 /// AWS defaults: `,`, `\n`, `"`, `"`, ASNEEDED.
-impl Default for CsvOutputParams {
-    fn default() -> Self {
-        Self {
-            field_delimiter: b',',
-            record_delimiter: b'\n',
-            quote: b'"',
-            escape: b'"',
-            quote_fields: QuoteFields::AsNeeded,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, SmartDefault)]
+pub struct CsvOutputParams {
+    #[default(b',')]
+    pub field_delimiter: u8,
+    #[default(b'\n')]
+    pub record_delimiter: u8,
+    #[default(b'"')]
+    pub quote: u8,
+    #[default(b'"')]
+    pub escape: u8,
+    #[default(QuoteFields::AsNeeded)]
+    pub quote_fields: QuoteFields,
 }
 
 /// Field quoting policy (S3 Select `QuoteFields`, default ASNEEDED).
@@ -56,18 +51,12 @@ pub enum QuoteFields {
 }
 
 /// JSON output options (S3 Select `OutputSerialization.JSON`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JsonOutputParams {
-    pub record_delimiter: u8,
-}
-
+///
 /// AWS default: `\n`.
-impl Default for JsonOutputParams {
-    fn default() -> Self {
-        Self {
-            record_delimiter: b'\n',
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, SmartDefault)]
+pub struct JsonOutputParams {
+    #[default(b'\n')]
+    pub record_delimiter: u8,
 }
 
 /// One `OutRow` in `mode`, ready to pack into an event.
@@ -107,7 +96,8 @@ fn serialize_csv(params: &CsvOutputParams, row: &OutRow) -> Result<Vec<u8>, Erro
         });
     wtr.write_record(fields)
         .map_err(|e| map_error(e, "output"))?;
-    wtr.into_inner().map_err(|e| Error::Io(e.into_error()))
+    wtr.into_inner()
+        .map_err(|e| Error::Io(e.into_error().into()))
 }
 
 /// JSON row: `{"k": v, ...}`, MISSING omits the key (zip stops at the shorter

@@ -28,6 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use smart_default::SmartDefault;
+
 #[cfg(feature = "parquet")]
 use crate::parquet::ParquetReader;
 #[cfg(feature = "parquet")]
@@ -84,20 +86,14 @@ pub struct ParquetParams {
 /// Continuation-event policy (grilling Q3). `idle` = send `Cont` after that
 /// duration with no emitted event; `every_n` = send `Cont` after that many
 /// records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Defaults: 5 s idle, 4096 records (tinio-server's pick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SmartDefault)]
 pub struct ContPolicy {
+    #[default(Some(Duration::from_secs(5)))]
     pub idle: Option<Duration>,
+    #[default(Some(4096))]
     pub every_n: Option<usize>,
-}
-
-impl Default for ContPolicy {
-    /// Grilling Q3 defaults: 5 s idle, 4096 records (tinio-server's pick).
-    fn default() -> Self {
-        Self {
-            idle: Some(Duration::from_secs(5)),
-            every_n: Some(4096),
-        }
-    }
 }
 
 /// Parquet memory bound (review 2026-09-05): the whole object is buffered;
@@ -105,9 +101,12 @@ impl Default for ContPolicy {
 pub const MAX_PARQUET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One select request: input framing + output mode + pipeline knobs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SmartDefault)]
 pub struct SelectConfig {
+    /// AWS documented defaults for unset input fields (review 2026-09-05).
+    #[default(InputFormat::Csv(csv::Params::default()))]
     pub input_format: InputFormat,
+    #[default(OutputMode::Csv(Default::default()))]
     pub output: OutputMode,
     pub compression: Option<Compression>,
     /// ScanRange window (resolved, validated by the server): a record counts
@@ -117,30 +116,8 @@ pub struct SelectConfig {
     /// RequestProgress — `Progress` cadence 1 s / 1 MB (grilling Q2).
     pub request_progress: bool,
     pub cont: ContPolicy,
+    #[default(MAX_PARQUET_BYTES)]
     pub max_parquet_bytes: u64,
-}
-
-impl Default for SelectConfig {
-    fn default() -> Self {
-        Self {
-            // AWS documented defaults for unset input fields (review 2026-09-05).
-            input_format: InputFormat::Csv(csv::Params {
-                field_delimiter: b',',
-                record_delimiter: b'\n',
-                quote: b'"',
-                escape: b'"',
-                comments: None,
-                header: None,
-                allow_quoted_record_delimiter: true,
-            }),
-            output: OutputMode::Csv(Default::default()),
-            compression: None,
-            scan_range: None,
-            request_progress: false,
-            cont: ContPolicy::default(),
-            max_parquet_bytes: MAX_PARQUET_BYTES,
-        }
-    }
 }
 
 /// One select request driven to its `Stats` + `End` by pull; `input` is a
@@ -736,17 +713,10 @@ mod tests {
         sql::parse,
     };
 
-    /// AWS-ish CSV params (`,`/`\n`/`"`/`"`, no comments) — the csv
-    /// test-helper shape for the given header mode.
     fn params(header: Option<Header>) -> Params {
         Params {
-            field_delimiter: b',',
-            record_delimiter: b'\n',
-            quote: b'"',
-            escape: b'"',
-            comments: None,
             header,
-            allow_quoted_record_delimiter: true,
+            ..Default::default()
         }
     }
 

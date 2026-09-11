@@ -13,20 +13,21 @@
 //! cousins, so a MISSING operand answers `true` there (pinned, review
 //! 2026-09-06b R12).
 
-use std::cmp::Ordering;
+use std::{borrow::Cow, cmp::Ordering};
 
+use parse_display::Display;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript, UnaryOperator,
-    Value as AstValue, ValueWithSpan,
+    AccessExpr, BinaryOperator, CastKind, DuplicateTreatment, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript,
+    UnaryOperator, Value as AstValue, ValueWithSpan,
 };
 
 use crate::{
     error::Error,
     json::{json_lookup, to_value},
     row::{Field, NameStyle, Record, Value, display, parse_number},
-    sql::{Projection, QueryPlan, contains_aggregate},
+    sql::{Projection, QueryPlan, contains_aggregate, is_aggregate_name},
 };
 
 /// One output row: keys (alias > plain field name > the record's names) and
@@ -877,6 +878,238 @@ pub(crate) fn is_sentinel_call(name: &ObjectName, sentinel: &str) -> bool {
     part.quote_style.is_none() && part.value.eq_ignore_ascii_case(sentinel)
 }
 
+/// Why the evaluator cannot run an expression form. The single definition of
+/// what the engine supports: `eval`'s catch-all arms and the validator's
+/// parse-time walk both consult [`unsupported_form`], so the request-level
+/// refusal and the runtime error cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Display)]
+pub(crate) enum UnsupportedForm {
+    #[display("unsupported expression: {0}")]
+    Expression(Cow<'static, str>),
+    #[display("unsupported function: {0}")]
+    Function(String),
+    /// A literal kind the converter has no mapping for (`X'…'`, `N'…'`, `$$…$$`).
+    /// Carries the evaluator's own message verbatim: a second prefix here
+    /// would be a diagnostic nobody else spells.
+    #[display("{0}")]
+    Literal(String),
+    /// A statically decidable operand defect (`1e999`, a bad `ESCAPE`).
+    /// Same verbatim-text rule as [`Self::Literal`].
+    #[display("{0}")]
+    Malformed(String),
+}
+
+impl From<UnsupportedForm> for Error {
+    /// The verdict's channel — the one place it is decided, so the parse-time
+    /// walk and `eval` cannot disagree about which verdict answers `Parse` and
+    /// which answers `Unsupported`.
+    ///
+    /// A malformed operand (`ESCAPE 'ab'`, `1e999`) is a malformed *query*:
+    /// `Parse`, the "LIMIT must be a positive integer" precedent. Every other
+    /// verdict is a declined form and carries the `Display` text verbatim —
+    /// including `Literal`, whose text is the evaluator's own message.
+    fn from(form: UnsupportedForm) -> Self {
+        match form {
+            UnsupportedForm::Malformed(m) => Error::Parse(m),
+            other => Error::Unsupported(other.to_string()),
+        }
+    }
+}
+
+/// The longest rendered form a diagnostic may carry. The echo is otherwise
+/// bounded only by `MAX_EXPRESSION` (256 KiB), which would put a same-size
+/// string in the 400 body; 256 chars is past any diagnostic's useful length.
+const RENDERED_DIAGNOSTIC: usize = 256;
+
+/// `text` cut to [`RENDERED_DIAGNOSTIC`] chars on a char boundary.
+///
+/// One scan and no copy: `char_indices().nth(n)` yields the byte offset of the
+/// first char past the limit — or `None` when there is nothing to cut — so
+/// neither the length check nor the truncation allocates.
+fn bounded(mut text: String) -> String {
+    match text.char_indices().nth(RENDERED_DIAGNOSTIC) {
+        None => text,
+        Some((cut, _)) => {
+            text.truncate(cut);
+            text.push_str("...");
+            text
+        }
+    }
+}
+
+/// The rendered SQL text of a form with no dedicated name — with the request's
+/// MISSING sentinel name replaced by the operator it stands for, and bounded.
+///
+/// The sentinel is the evaluator's own production (`__s3_is_missing_<uuid>`,
+/// minted per request), and a rendered subtree can contain it: the dialect's
+/// `parse_infix` hook rewrites `X IS MISSING` wherever it appears, including
+/// inside a form this predicate rejects. Echoing the text verbatim would hand
+/// the client an internal symbol. Nothing is exploitable today (the uuid is
+/// per-request and that request has already been parsed), but the name is not
+/// the client's business; `IS MISSING` is what the user wrote.
+fn rendered(expr: &Expr, missing_name: &str) -> String {
+    let text = expr.to_string();
+    // `replace` copies the whole string, and the sentinel is absent from
+    // almost every diagnostic — probe before paying for the copy.
+    if missing_name.is_empty() || !text.contains(missing_name) {
+        return bounded(text);
+    }
+    bounded(text.replace(missing_name, "IS MISSING"))
+}
+
+/// The function allowlist the predicate consults (design Q8): exactly the
+/// aggregate set in this spec. The scalar-function library spec appends
+/// scalar names HERE, never to `is_aggregate_name` — that predicate also
+/// decides aggregate mode (governing `*` and the scan-accumulate path), so
+/// widening it would make `SELECT LOWER(s.a) …` take the wrong execution
+/// path.
+fn is_allowed_function(name: &ObjectName) -> bool {
+    is_aggregate_name(name)
+}
+
+/// Classify one node. `None` means the engine evaluates this form; `Some`
+/// names the reason it cannot. Switches on the `Expr` *variant* only — an
+/// identifier whose text happens to be a keyword (`s.CAST`) is supported,
+/// which is the recorded AWS divergence (spec Q2/Q8).
+///
+/// The payload-carrying forms (`Value`, `Like`) are judged by the evaluator's
+/// own operand checks below rather than by a second implementation of them, so
+/// a literal or an `ESCAPE` cannot pass the walk and then fail per row: the
+/// walk runs the same `literal`/`like_escape` the evaluator does and keeps
+/// their message, only on a request-level channel.
+pub(crate) fn unsupported_form(expr: &Expr, missing_name: &str) -> Option<UnsupportedForm> {
+    // Forms `eval` implements whose *shape* is the whole story, taken from its
+    // positive match arms.
+    let supported = matches!(
+        expr,
+        Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::CompoundFieldAccess { .. }
+            | Expr::JsonAccess { .. }
+            | Expr::Nested(_)
+            | Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+    );
+    if supported {
+        return None;
+    }
+    let named = |name: &'static str| Some(UnsupportedForm::Expression(Cow::Borrowed(name)));
+    // An unnamed form keeps its rendered text, bounded.
+    let owned = |text: String| Some(UnsupportedForm::Expression(Cow::Owned(bounded(text))));
+    match expr {
+        // The converter is the only judge of a literal, so this arm runs it and
+        // keeps its verdict: a kind with no mapping (`X'…'`) stays the
+        // `Unsupported` it always was, while a value outside the decimal model
+        // (`1e999`, a 29-digit literal) becomes a request-level parse error
+        // instead of a per-row one. The conversion result is dropped — eval
+        // re-derives it per row, which is what it did before this arm existed.
+        Expr::Value(v) => match literal(&v.value) {
+            Ok(_) => None,
+            Err(Error::Unsupported(m)) => Some(UnsupportedForm::Literal(bounded(m))),
+            Err(Error::Value(m)) => Some(UnsupportedForm::Malformed(bounded(m))),
+            // `literal` has no other channel; kept so a future one cannot
+            // silently fall through to `None`.
+            Err(other) => Some(UnsupportedForm::Malformed(bounded(other.to_string()))),
+        },
+        // An `ESCAPE` operand, same reasoning: the pattern shape is supported,
+        // the operand goes through the evaluator's own single-character check.
+        Expr::Like {
+            any: false,
+            escape_char,
+            ..
+        } => match like_escape(escape_char) {
+            Ok(_) => None,
+            Err(Error::Value(m)) => Some(UnsupportedForm::Malformed(bounded(m))),
+            Err(other) => Some(UnsupportedForm::Malformed(bounded(other.to_string()))),
+        },
+        Expr::UnaryOp { op, .. } => match op {
+            UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus => None,
+            other => owned(other.to_string()),
+        },
+        Expr::BinaryOp { op, .. } => match op {
+            BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo => None,
+            other => owned(other.to_string()),
+        },
+        // The per-request sentinel is the evaluator's own production; the
+        // allowlist's names are evaluated by the accumulate path, not `eval`.
+        Expr::Function(f) => {
+            if is_sentinel_call(&f.name, missing_name) || is_allowed_function(&f.name) {
+                None
+            } else {
+                // Named as written: the diagnostic preserves the user's
+                // spelling (`unsupported function: LOWER`), so this is a
+                // case- and quote-preserving single-part lookup. Reusing
+                // `single_part_name` here would lowercase the name — that
+                // lowercasing is its aggregate-matching job, not a display
+                // rule.
+                Some(UnsupportedForm::Function(bounded(
+                    match f.name.0.as_slice() {
+                        [ObjectNamePart::Identifier(part)] => part.value.clone(),
+                        _ => f.name.to_string(),
+                    },
+                )))
+            }
+        }
+        // LIKE ANY is named here so both layers report the same thing:
+        // the parse-time walk consults this arm, and `eval`'s dedicated
+        // `any: true` guard routes through the predicate too.
+        Expr::Like { any: true, .. } => named("LIKE ANY"),
+        Expr::ILike { .. } => named("ILIKE"),
+        Expr::Case { .. } => named("CASE"),
+        // `TRY_CAST`/`SAFE_CAST` are not their own variants in 0.62 — they
+        // are `CastKind`s. `CastKind` has exactly these four variants and no
+        // `Display` impl, so match exhaustively on it.
+        Expr::Cast { kind, .. } => named(match kind {
+            CastKind::Cast | CastKind::DoubleColon => "CAST",
+            CastKind::TryCast => "TRY_CAST",
+            CastKind::SafeCast => "SAFE_CAST",
+        }),
+        Expr::Substring { .. } => named("SUBSTRING"),
+        Expr::Trim { .. } => named("TRIM"),
+        Expr::Extract { .. } => named("EXTRACT"),
+        Expr::Ceil { .. } => named("CEIL"),
+        Expr::Floor { .. } => named("FLOOR"),
+        Expr::Position { .. } => named("POSITION"),
+        Expr::Interval(_) => named("INTERVAL"),
+        Expr::TypedString { .. } => named("TYPED STRING"),
+        Expr::IsDistinctFrom(..) | Expr::IsNotDistinctFrom(..) => named("IS DISTINCT FROM"),
+        // No subquery arm: `reject_subqueries` (`sql.rs`) refuses `Subquery`,
+        // `InSubquery` and `Exists` on every expression *before* this predicate
+        // is consulted, so naming them here would be a second authority for one
+        // decision — and a second message (`reject_subqueries` answers
+        // `unsupported: subquery`). Unreachable from either layer: the walk runs
+        // behind it, and `eval` only ever sees a plan `parse` built. The
+        // catch-all below still refuses the shapes, rendering them.
+        // Anything else keeps the text it produced before this predicate
+        // existed, only bounded and with the sentinel name scrubbed: the
+        // pre-predicate catch-all was `Error::Unsupported(<rendered>)`, so an
+        // unnamed variant gains the `expression:` prefix (named deliberately
+        // by the spec) and nothing else.
+        other => Some(UnsupportedForm::Expression(Cow::Owned(rendered(
+            other,
+            missing_name,
+        )))),
+    }
+}
+
 /// Evaluate a parsed expression tree to a scalar. `eval` runs no code of
 /// its own — the `Expr` is sqlparser's AST and every arithmetic/comparison
 /// rule below is data-driven; a missing column collapses to `Value::Null`
@@ -892,7 +1125,10 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error> {
             Field::Missing => Ok(Value::Null),
         },
         Expr::Nested(e) => eval(e, ctx),
-        Expr::UnaryOp { op, expr } => match op {
+        // The `un_op @` binding is load-bearing: the destructured `expr`
+        // field shadows the whole node, and the predicate must classify the
+        // UnaryOp itself, not its operand.
+        un_op @ Expr::UnaryOp { op, expr } => match op {
             UnaryOperator::Not => {
                 let v = eval(expr, ctx)?;
                 Ok(match v {
@@ -904,7 +1140,9 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error> {
             UnaryOperator::Minus => unary_minus(eval(expr, ctx)?),
             // `+` is the identity in our arithmetic.
             UnaryOperator::Plus => eval(expr, ctx),
-            other => Err(Error::Unsupported(other.to_string())),
+            // The whole node, not the operator: the predicate's own arm names
+            // the operator.
+            _ => Err(unsupported(un_op, ctx)),
         },
         Expr::BinaryOp { left, op, right } => {
             let l = eval(left, ctx)?;
@@ -935,7 +1173,7 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error> {
                 | BinaryOperator::Multiply
                 | BinaryOperator::Divide
                 | BinaryOperator::Modulo => arith(op, l, r),
-                other => Err(Error::Unsupported(other.to_string())),
+                _ => Err(unsupported(expr, ctx)),
             }
         }
         Expr::InList {
@@ -975,17 +1213,44 @@ fn eval(expr: &Expr, ctx: &RowCtx) -> Result<Value, Error> {
                     Field::Missing
                 )));
             }
-            Err(Error::Value("internal: unexpected aggregate call".into()))
+            match unsupported_form(expr, ctx.missing_name) {
+                Some(form) => Err(form.into()),
+                // The predicate calls this supported — the drift case (an
+                // aggregate name reaching `eval`). Keep the internal error it
+                // had; the corpus is what catches this.
+                None => Err(Error::Value("internal: unexpected aggregate call".into())),
+            }
         }
+        // Snowflake's `LIKE ANY` is outside the AWS surface and the covered
+        // grammar: refuse rather than silently run plain LIKE semantics. It
+        // goes through the predicate like everything else, so parse time and
+        // runtime name the form identically and no short name is hard-coded
+        // here.
+        Expr::Like { any: true, .. } => Err(unsupported(expr, ctx)),
         Expr::Like {
             negated,
-            any,
+            any: false,
             expr,
             pattern,
             escape_char,
-        } => eval_like(expr, pattern, escape_char, *any, *negated, ctx),
-        Expr::ILike { .. } => Err(Error::Unsupported("ILIKE".into())),
-        other => Err(Error::Unsupported(other.to_string())),
+        } => eval_like(expr, pattern, escape_char, *negated, ctx),
+        // `ILike` keeps no arm of its own: the catch-all names it through the
+        // predicate. `LIKE ANY` cannot reach `eval_like` — this arm precedes
+        // it, and the predicate names the form in the catch-all behind both —
+        // so `eval_like` carries no `any` backstop to fall out of step.
+        other => Err(unsupported(other, ctx)),
+    }
+}
+
+/// Runtime diagnostic for a form the predicate rejects. The predicate is the
+/// single authority; the fallback below is unreachable by construction and
+/// exists only so a future drift cannot silently answer `Ok`.
+fn unsupported(expr: &Expr, ctx: &RowCtx) -> Error {
+    match unsupported_form(expr, ctx.missing_name) {
+        // Same channel mapping the walk uses — one home for it, so the two
+        // layers cannot disagree about which verdict is `Parse`.
+        Some(form) => form.into(),
+        None => Error::Unsupported(rendered(expr, ctx.missing_name)),
     }
 }
 
@@ -1103,15 +1368,9 @@ fn eval_like(
     expr: &Expr,
     pattern: &Expr,
     escape_char: &Option<ValueWithSpan>,
-    any: bool,
     negated: bool,
     ctx: &RowCtx,
 ) -> Result<Value, Error> {
-    // Snowflake's `LIKE ANY` is outside the AWS surface and the covered
-    // grammar: refuse rather than silently run plain LIKE semantics.
-    if any {
-        return Err(Error::Unsupported("LIKE ANY".into()));
-    }
     let escape = like_escape(escape_char)?;
     let subject = eval(expr, ctx)?;
     let pattern = eval(pattern, ctx)?;
@@ -1405,11 +1664,18 @@ fn integral(v: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+    // `AttachedToken` is not re-exported at `sqlparser::ast` (its only name
+    // there is a private `use`), so it is imported by its public path.
+    use sqlparser::ast::helpers::attached_token::AttachedToken;
+    use sqlparser::ast::{
+        CaseWhen, CeilFloorKind, DataType, DateTimeField, ExtractSyntax, FunctionArgumentList,
+        Interval, TypedString,
+    };
 
     use super::*;
     use crate::{
         row::{Columns, Value},
-        sql::parse,
+        sql::{FromClause, SentinelNames, parse},
     };
 
     fn csv(fields: &[&str], names: &[&str]) -> Record {
@@ -1921,10 +2187,23 @@ mod tests {
     #[test]
     fn like_escape_must_be_one_char() {
         // sqlparser 0.62 parses any literal string after ESCAPE; standard
-        // SQL takes exactly one character.
-        let mut engine = Engine::new(
-            parse("SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\%b' ESCAPE '\\%'").unwrap(),
+        // SQL takes exactly one character. Request-level since the walk began
+        // consulting the evaluator's own check: the two-char form is a 400,
+        // and the runtime arm below is the backstop (the parse half can no
+        // longer reach it, so the plan is built by hand — the same shape the
+        // parity corpus below uses).
+        assert_eq!(
+            parse("SELECT * FROM S3Object s WHERE s._1 LIKE 'a\\%b' ESCAPE '\\%'")
+                .unwrap_err()
+                .to_string(),
+            "S3 select: ESCAPE must be a single character"
         );
+        let mut engine = Engine::new(plan_with_where(like_expr(
+            "_1",
+            false,
+            "a%b",
+            Some(AstValue::SingleQuotedString("\\%".into()).into()),
+        )));
         match engine.next(csv(&["a%b"], &["_1"])) {
             Err(Error::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
             other => panic!("expected one-char escape error, got {other:?}"),
@@ -2057,39 +2336,502 @@ mod tests {
         }
     }
 
+    /// Builds `Expr::Function` with a single-part name — the shape the parser
+    /// produces for `LOWER(x)`, `count(x)` and the request sentinel alike.
+    fn func(name: &str) -> Expr {
+        Expr::Function(Function {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+        })
+    }
+
     #[test]
-    fn like_any_is_refused() {
-        // Snowflake's `LIKE ANY` is outside the AWS surface: refuse rather
-        // than silently run single-pattern LIKE semantics.
-        let mut engine =
-            Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 LIKE ANY 'x%'").unwrap());
-        match engine.next(csv(&["x"], &["_1"])) {
-            Err(Error::Unsupported(m)) => assert_eq!(m, "LIKE ANY"),
-            other => panic!("expected LIKE ANY unsupported, got {other:?}"),
+    fn unsupported_form_is_variant_based_not_text_based() {
+        // `s.CAST` — an identifier whose *text* is a keyword — is supported.
+        let compound = Expr::CompoundIdentifier(vec![Ident::new("s"), Ident::new("CAST")]);
+        assert!(unsupported_form(&compound, "sentinel").is_none());
+        // `CAST(x AS INT)` — the *variant* — is not, and is named statically.
+        // (`Expr::Cast` in 0.62 has five fields; `array` is the one easy to miss.)
+        let cast = Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(Expr::Identifier(Ident::new("x"))),
+            data_type: DataType::Int(None),
+            array: false,
+            format: None,
+        };
+        match unsupported_form(&cast, "sentinel") {
+            Some(UnsupportedForm::Expression(n)) => assert_eq!(n, "CAST"),
+            other => panic!("expected Expression(CAST), got {other:?}"),
         }
     }
 
     #[test]
-    fn ilike_is_unsupported() {
-        // AWS S3 Select has no case-insensitive LIKE: reject rather than
-        // silently behave as a case-sensitive LIKE (review 2026-09-05b).
-        let mut engine =
-            Engine::new(parse("SELECT * FROM S3Object s WHERE s._1 ILIKE 'X'").unwrap());
-        match engine.next(csv(&["x"], &["_1"])) {
-            Err(Error::Unsupported(m)) => assert_eq!(m, "ILIKE"),
-            other => panic!("expected ILIKE unsupported, got {other:?}"),
+    fn unsupported_form_admits_aggregates_and_the_request_sentinel() {
+        assert!(unsupported_form(&func("count"), "sentinel").is_none());
+        assert!(unsupported_form(&func("sum"), "sentinel").is_none());
+        assert!(unsupported_form(&func("sentinel"), "sentinel").is_none());
+        match unsupported_form(&func("LOWER"), "sentinel") {
+            Some(UnsupportedForm::Function(n)) => assert_eq!(n, "LOWER"),
+            other => panic!("expected Function(LOWER), got {other:?}"),
         }
     }
 
     #[test]
-    fn unknown_function_arm_guards() {
-        // A non-aggregate plan never carries an aggregate call (sql.rs sets
-        // `aggregates` only for the five names); any other function is an
-        // unreachable shape — guard, not a real result.
-        let mut engine = Engine::new(parse("SELECT unknown_fn(s._1) FROM S3Object s").unwrap());
-        match engine.next(csv(&["1"], &["_1"])) {
+    fn unsupported_form_diagnostics_carry_their_text() {
+        assert_eq!(
+            UnsupportedForm::Expression("CASE".into()).to_string(),
+            "unsupported expression: CASE"
+        );
+        assert_eq!(
+            UnsupportedForm::Function("LOWER".into()).to_string(),
+            "unsupported function: LOWER"
+        );
+        // The two operand verdicts carry the evaluator's own text verbatim —
+        // a prefix here would be a diagnostic nothing else spells.
+        assert_eq!(
+            UnsupportedForm::Literal("X'41'".into()).to_string(),
+            "X'41'"
+        );
+        assert_eq!(
+            UnsupportedForm::Malformed("invalid numeric value: 1e999".into()).to_string(),
+            "invalid numeric value: 1e999"
+        );
+    }
+
+    /// Literal operands are judged by the converter itself, so the request-level
+    /// refusal cannot drift from the value the evaluator would have produced.
+    /// Before this, every one of these parsed, streamed, and failed per row —
+    /// the acceptance-surface hole the walk exists to close.
+    ///
+    /// The byte/raw-string rows at the top are the same family one step worse:
+    /// until `S3SelectDialect` reported `GenericDialect`'s `TypeId` (see the
+    /// `dialect()` override), `dialect_of!`'s byte/raw prefix arms
+    /// (`tokenizer.rs:1085`/`1125`) read false, so `B'1'` never became a
+    /// literal at all — it tokenized as the identifier `B` aliased `'1'` and
+    /// the query returned a MISSING column named `1` (an empty CSV field)
+    /// instead of erroring.
+    #[test]
+    fn literal_operand_defects_are_request_level() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "SELECT B'1' FROM S3Object s",
+                "S3 select: unsupported: B'1'",
+            ),
+            // The lowercase prefix is the same token: sqlparser's `Display`
+            // names the byte form in uppercase, as it does for `0x41` below.
+            (
+                "SELECT b'1' FROM S3Object s",
+                "S3 select: unsupported: B'1'",
+            ),
+            (
+                "SELECT R'1' FROM S3Object s",
+                "S3 select: unsupported: R'1'",
+            ),
+            // The double-quoted and triple-quoted spellings reach the same
+            // catch-all. `B'''1'''` renders as `B''1''` — sqlparser's
+            // triple-quote `Display`, observed, not predicted.
+            (
+                "SELECT B\"1\" FROM S3Object s",
+                "S3 select: unsupported: B\"1\"",
+            ),
+            (
+                "SELECT R\"1\" FROM S3Object s",
+                "S3 select: unsupported: R\"1\"",
+            ),
+            (
+                "SELECT R'''1''' FROM S3Object s",
+                "S3 select: unsupported: R'''1'''",
+            ),
+            (
+                "SELECT B'''1''' FROM S3Object s",
+                "S3 select: unsupported: B''1''",
+            ),
+            (
+                "SELECT X'41' FROM S3Object s",
+                "S3 select: unsupported: X'41'",
+            ),
+            // `0x41` is the same literal spelled differently; sqlparser
+            // normalizes it, so both name the hex form.
+            (
+                "SELECT 0x41 FROM S3Object s",
+                "S3 select: unsupported: X'41'",
+            ),
+            (
+                "SELECT N'x' FROM S3Object s",
+                "S3 select: unsupported: N'x'",
+            ),
+            (
+                "SELECT $$x$$ FROM S3Object s",
+                "S3 select: unsupported: $$x$$",
+            ),
+            (
+                "SELECT U&'x' FROM S3Object s",
+                "S3 select: unsupported: U&'x'",
+            ),
+            (
+                "SELECT 1e999 FROM S3Object s",
+                "S3 select: invalid numeric value: 1e999",
+            ),
+            (
+                "SELECT 99999999999999999999999999999 FROM S3Object s",
+                "S3 select: numeric value exceeds 28-digit precision: 99999999999999999999999999999",
+            ),
+            (
+                "SELECT s.a FROM S3Object s WHERE s.a = X'41'",
+                "S3 select: unsupported: X'41'",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(parse(sql).unwrap_err().to_string(), *expected, "for {sql}");
+        }
+    }
+
+    /// The runtime half of the pair above, on hand-built plans because `parse`
+    /// refuses all of it now: the same converter text on its own channel, which
+    /// is what the two rewritten `like_escape_*` tests assert for `ESCAPE`.
+    #[test]
+    fn literal_operand_defects_keep_their_runtime_text() {
+        let hex = Expr::Value(AstValue::HexStringLiteral("41".into()).into());
+        match Engine::new(plan_with_where(hex)).next(csv(&["x"], &["_1"])) {
+            Err(Error::Unsupported(m)) => assert_eq!(m, "X'41'"),
+            other => panic!("expected the hex refusal, got {other:?}"),
+        }
+        let big = Expr::Value(AstValue::Number("1e999".into(), false).into());
+        match Engine::new(plan_with_where(big)).next(csv(&["x"], &["_1"])) {
+            Err(Error::Value(m)) => assert_eq!(m, "invalid numeric value: 1e999"),
+            other => panic!("expected the numeric value error, got {other:?}"),
+        }
+    }
+
+    /// An unnamed form is echoed, so the echo is scrubbed and bounded: the
+    /// request's sentinel name never reaches the client, and a 256 KiB
+    /// expression cannot become a 256 KiB message.
+    #[test]
+    fn rendered_diagnostics_scrub_the_sentinel_and_are_bounded() {
+        let sentinel = SentinelNames::mint();
+        let name = sentinel.is_missing();
+        // The dialect rewrites `IS MISSING` wherever it appears, so a rejected
+        // container's rendered text can carry the sentinel inside it.
+        let nested = Expr::Tuple(vec![func(&name)]);
+        match unsupported_form(&nested, &name) {
+            Some(UnsupportedForm::Expression(text)) => {
+                assert!(!text.contains(&name), "sentinel leaked: {text}");
+                assert!(text.contains("IS MISSING"), "{text}");
+            }
+            other => panic!("expected Expression, got {other:?}"),
+        }
+        // Bounded on a char boundary: 300 chars in, the cap plus the ellipsis
+        // out (the tuple's own parens included).
+        let long = Expr::Tuple(vec![Expr::Identifier(Ident::new("a".repeat(300)))]);
+        match unsupported_form(&long, &name) {
+            Some(UnsupportedForm::Expression(text)) => {
+                assert_eq!(text.chars().count(), RENDERED_DIAGNOSTIC + 3, "{text}");
+                assert!(text.ends_with("..."), "{text}");
+            }
+            other => panic!("expected Expression, got {other:?}"),
+        }
+    }
+
+    /// A plan built without `parse` — the validator refuses the forms these
+    /// tests drive, so the engine arms cannot be reached through a query.
+    fn plan(projections: Vec<Projection>, where_expr: Option<Expr>) -> QueryPlan {
+        QueryPlan {
+            from: FromClause {
+                segments: vec![],
+                alias: Some("s".into()),
+            },
+            projections,
+            where_expr,
+            limit: None,
+            aggregates: false,
+            missing: SentinelNames::mint(),
+        }
+    }
+
+    /// The common shape: project `_1` and filter on `where_expr`.
+    fn plan_with_where(where_expr: Expr) -> QueryPlan {
+        plan(
+            vec![Projection::Item {
+                expr: col(),
+                alias: None,
+            }],
+            Some(where_expr),
+        )
+    }
+
+    /// The parity corpus: one row per form [`unsupported_form`] names, each
+    /// row asserting that *both* layers consulting the predicate — the
+    /// parse-time walk behind [`parse`] and [`Engine::next`] — refuse that
+    /// form, with the one expected string the row carries. Neither layer
+    /// passes on its own: a predicate that renames or drops a form fails the
+    /// row twice over, which is what keeps the two from drifting.
+    ///
+    /// `subquery` is the one named form with no row here: `reject_subqueries`
+    /// (`sql.rs`) refuses `Subquery`/`InSubquery`/`Exists` on every expression
+    /// before either layer can see one, so its refusal is pinned at that layer
+    /// (the `unsupported: subquery` assertions in `sql.rs`) rather than twice.
+    ///
+    /// A row's SQL text and its hand-built `Expr` are two *spellings* of one
+    /// form, not two equal ASTs: what the row pins is that both produce the
+    /// same expected string. The three fields are asserted as:
+    ///
+    /// - parse: `parse(sql)` answers `S3 select: unsupported: {expected}`
+    ///   (request-level, before any byte is streamed);
+    /// - eval: a plan whose WHERE is the hand-built `Expr` answers
+    ///   `Error::Unsupported(expected)` on the first record.
+    ///
+    /// The hand-built `Expr`s are the eval half's only channel: `parse`
+    /// refuses every one of these forms, so no end-to-end query can reach
+    /// `eval` with one (design: "the `eval` side of the corpus must call
+    /// `eval`/`unsupported_form` directly with hand-built `Expr`s").
+    ///
+    /// The two infix-only rows (`LIKE ANY`, `ILIKE`) are reached through the
+    /// same catch-all as every other row, so they need no dedicated tests of
+    /// their own — the ones they had were folded into this table, which covers
+    /// the whole named set at once, on both layers.
+    #[test]
+    fn eval_refuses_every_named_form_the_predicate_knows() {
+        let cases: &[(&str, Expr, &str)] = &[
+            (
+                "SELECT CASE WHEN s.a > 1 THEN 1 ELSE 0 END FROM S3Object s",
+                Expr::Case {
+                    case_token: AttachedToken::empty(),
+                    end_token: AttachedToken::empty(),
+                    operand: None,
+                    conditions: vec![CaseWhen {
+                        condition: col(),
+                        result: str_lit("x"),
+                    }],
+                    else_result: None,
+                },
+                "unsupported expression: CASE",
+            ),
+            (
+                "SELECT CAST(s.a AS INT) FROM S3Object s",
+                cast(CastKind::Cast),
+                "unsupported expression: CAST",
+            ),
+            (
+                "SELECT TRY_CAST(s.a AS INT) FROM S3Object s",
+                cast(CastKind::TryCast),
+                "unsupported expression: TRY_CAST",
+            ),
+            (
+                "SELECT SAFE_CAST(s.a AS INT) FROM S3Object s",
+                cast(CastKind::SafeCast),
+                "unsupported expression: SAFE_CAST",
+            ),
+            (
+                "SELECT SUBSTRING(s.a, 1) FROM S3Object s",
+                Expr::Substring {
+                    expr: Box::new(col()),
+                    substring_from: None,
+                    substring_for: None,
+                    special: false,
+                    shorthand: false,
+                },
+                "unsupported expression: SUBSTRING",
+            ),
+            (
+                "SELECT TRIM(s.a) FROM S3Object s",
+                Expr::Trim {
+                    trim_where: None,
+                    trim_what: None,
+                    expr: Box::new(col()),
+                    trim_characters: None,
+                },
+                "unsupported expression: TRIM",
+            ),
+            (
+                "SELECT EXTRACT(MONTH FROM s.a) FROM S3Object s",
+                Expr::Extract {
+                    field: DateTimeField::Month,
+                    syntax: ExtractSyntax::From,
+                    expr: Box::new(col()),
+                },
+                "unsupported expression: EXTRACT",
+            ),
+            (
+                "SELECT CEIL(s.a TO YEAR) FROM S3Object s",
+                Expr::Ceil {
+                    expr: Box::new(col()),
+                    field: CeilFloorKind::DateTimeField(DateTimeField::Year),
+                },
+                "unsupported expression: CEIL",
+            ),
+            (
+                "SELECT FLOOR(s.a TO YEAR) FROM S3Object s",
+                Expr::Floor {
+                    expr: Box::new(col()),
+                    field: CeilFloorKind::DateTimeField(DateTimeField::Year),
+                },
+                "unsupported expression: FLOOR",
+            ),
+            (
+                "SELECT POSITION('x' IN s.a) FROM S3Object s",
+                Expr::Position {
+                    expr: Box::new(str_lit("x")),
+                    r#in: Box::new(col()),
+                },
+                "unsupported expression: POSITION",
+            ),
+            (
+                "SELECT INTERVAL '1 day' FROM S3Object s",
+                Expr::Interval(Interval {
+                    value: Box::new(str_lit("1 day")),
+                    leading_field: None,
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                }),
+                "unsupported expression: INTERVAL",
+            ),
+            (
+                "SELECT DATE '2020-01-01' FROM S3Object s",
+                Expr::TypedString(TypedString {
+                    data_type: DataType::Date,
+                    value: AstValue::SingleQuotedString("2020-01-01".into()).into(),
+                    uses_odbc_syntax: false,
+                }),
+                "unsupported expression: TYPED STRING",
+            ),
+            (
+                "SELECT s.a FROM S3Object s WHERE s._1 IS DISTINCT FROM 'x'",
+                Expr::IsDistinctFrom(Box::new(col()), Box::new(str_lit("x"))),
+                "unsupported expression: IS DISTINCT FROM",
+            ),
+            // Infix-only forms, both refused rather than silently run as
+            // something else: `LIKE ANY` (Snowflake, outside the AWS surface —
+            // plain single-pattern LIKE would be a silent semantic change) and
+            // `ILIKE` (AWS S3 Select has no case-insensitive LIKE, so a
+            // case-sensitive LIKE would be a silent one too — review
+            // 2026-09-05b); both `Like` and `ILike` carry five fields.
+            (
+                "SELECT * FROM S3Object s WHERE s._1 LIKE ANY 'x%'",
+                Expr::Like {
+                    negated: false,
+                    any: true,
+                    expr: Box::new(col()),
+                    pattern: Box::new(str_lit("x%")),
+                    escape_char: None,
+                },
+                "unsupported expression: LIKE ANY",
+            ),
+            (
+                "SELECT * FROM S3Object s WHERE s._1 ILIKE 'X'",
+                Expr::ILike {
+                    negated: false,
+                    any: false,
+                    expr: Box::new(col()),
+                    pattern: Box::new(str_lit("X")),
+                    escape_char: None,
+                },
+                "unsupported expression: ILIKE",
+            ),
+            (
+                "SELECT LOWER(s.a) FROM S3Object s",
+                func("LOWER"),
+                "unsupported function: LOWER",
+            ),
+            (
+                "SELECT COALESCE(s.a, 'x') FROM S3Object s",
+                func("COALESCE"),
+                "unsupported function: COALESCE",
+            ),
+            (
+                "SELECT unknown_fn(s._1) FROM S3Object s",
+                func("unknown_fn"),
+                "unsupported function: unknown_fn",
+            ),
+            (
+                "SELECT s.a FROM S3Object s WHERE NOW() = s.a",
+                func("NOW"),
+                "unsupported function: NOW",
+            ),
+        ];
+        for (sql, expr, expected) in cases {
+            // Parse half: the walk behind `parse` refuses the request-level
+            // SQL with the shared predicate's own text.
+            assert_eq!(
+                parse(sql).unwrap_err().to_string(),
+                format!("S3 select: unsupported: {expected}"),
+                "parse half for {sql}"
+            );
+            // Eval half: the same form, hand-built, refused by the evaluator.
+            let mut engine = Engine::new(plan_with_where(expr.clone()));
+            match engine.next(csv(&["x"], &["_1"])) {
+                Err(Error::Unsupported(m)) => assert_eq!(m, *expected, "eval half for {sql}"),
+                other => panic!("expected {sql} refused at eval, got {other:?}"),
+            }
+        }
+    }
+
+    /// The subject expression of the corpus above: the WHERE column `_1` of
+    /// the `csv(&["x"], &["_1"])` record it is run over.
+    fn col() -> Expr {
+        Expr::Identifier(Ident::new("_1"))
+    }
+
+    fn str_lit(s: &str) -> Expr {
+        Expr::Value(AstValue::SingleQuotedString(s.into()).into())
+    }
+
+    /// `CAST`/`TRY_CAST`/`SAFE_CAST` are one `Expr::Cast` variant differing
+    /// only in its `CastKind`; the operand and target type never reach the
+    /// classification, which is variant-based.
+    fn cast(kind: CastKind) -> Expr {
+        Expr::Cast {
+            kind,
+            expr: Box::new(col()),
+            data_type: DataType::Int(None),
+            array: false,
+            format: None,
+        }
+    }
+
+    /// A `Like` node over `subject`, parameterised by the three fields the
+    /// tests vary — the node's other two are always the same here.
+    fn like_expr(
+        subject: &str,
+        any: bool,
+        pattern: &str,
+        escape_char: Option<ValueWithSpan>,
+    ) -> Expr {
+        Expr::Like {
+            negated: false,
+            any,
+            expr: Box::new(Expr::Identifier(Ident::new(subject))),
+            pattern: Box::new(str_lit(pattern)),
+            escape_char,
+        }
+    }
+
+    /// The drift guard: the predicate admits the aggregate names (they belong to
+    /// the scan-accumulate path), so an aggregate reaching `eval`'s Function arm
+    /// is precisely the case the two sides disagree on — the arm must keep its
+    /// internal error, proving the backstop still exists.
+    #[test]
+    fn function_arm_drift_guard_keeps_the_internal_error() {
+        let mut engine = Engine::new(plan(
+            vec![Projection::Item {
+                expr: func("sum"),
+                alias: None,
+            }],
+            None,
+        ));
+        match engine.next(csv(&["x"], &["_1"])) {
             Err(Error::Value(m)) => assert_eq!(m, "internal: unexpected aggregate call"),
-            other => panic!("expected aggregate guard, got {other:?}"),
+            other => panic!("expected the internal error, got {other:?}"),
         }
     }
 
@@ -2862,9 +3604,21 @@ mod tests {
     #[test]
     fn like_escape_non_string_rejected() {
         // A non-string ESCAPE operand (a numeric literal) is refused — the
-        // `else` arm of the single-quoted-string match.
-        let mut engine =
-            Engine::new(parse("SELECT * FROM S3Object s WHERE s.a LIKE 'h%' ESCAPE 5").unwrap());
+        // `else` arm of the single-quoted-string match. Same split as
+        // `like_escape_must_be_one_char`: the walk refuses it at request
+        // level, the hand-built plan drives the runtime arm.
+        assert_eq!(
+            parse("SELECT * FROM S3Object s WHERE s.a LIKE 'h%' ESCAPE 5")
+                .unwrap_err()
+                .to_string(),
+            "S3 select: ESCAPE must be a single character"
+        );
+        let mut engine = Engine::new(plan_with_where(like_expr(
+            "a",
+            false,
+            "h%",
+            Some(AstValue::Number("5".into(), false).into()),
+        )));
         match engine.next(str_cell("hello")) {
             Err(Error::Value(m)) => assert_eq!(m, "ESCAPE must be a single character"),
             other => panic!("expected escape error, got {other:?}"),

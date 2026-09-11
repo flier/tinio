@@ -19,5 +19,10 @@
     "github:swarm-pr": "name-only",
     "github:sync-coordinator": "name-only",
     "github:workflow-automation": "name-only"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(clip.exe)"
+    ]
   }
 }

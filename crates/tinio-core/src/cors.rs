@@ -9,8 +9,9 @@
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
-/// RFC 3986 unreserved left alone for the CORS stored wire.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+/// RFC 3986 unreserved left alone on the stored wires (the CORS config and
+/// the ACL grants `uri=` element, which share [`crate::percent`]'s codec).
+pub(crate) const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')

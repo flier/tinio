@@ -1,10 +1,24 @@
+use derive_more::{Deref, From, PartialEq};
 use thiserror::Error;
+
+/// `std::io::Error` compared by `kind()` — the payload is not `PartialEq`,
+/// and whole-event-sequence assertions in the events adapter only need the
+/// kind.
+#[derive(Debug, Deref, From, Error)]
+#[error(transparent)]
+pub struct IoError(std::io::Error);
+
+impl PartialEq for IoError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind() == other.kind()
+    }
+}
 
 /// Errors raised by the select pipeline. `Parse`/`Unsupported` are
 /// request-level (the server maps them to 400 before streaming);
 /// the rest surface as error items inside the 200 event stream
 /// (spec §3) under `Custom("S3QueryError")` (grilling Q2).
-#[derive(Debug, Error)]
+#[derive(Debug, Error, From, PartialEq)]
 pub enum Error {
     #[error("S3 select: {0}")]
     Parse(String),
@@ -19,34 +33,14 @@ pub enum Error {
     #[error("S3 select: input error: {0}")]
     Format(String),
     #[error("S3 select: io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[from(forward)]
+    Io(IoError),
     #[error("S3 select: output record exceeds 1 MB limit")]
     TooLarge,
     #[error("S3 select: nested column not supported for CSV output")]
     NestedCsv,
     #[error("S3 select: parquet object exceeds the memory bound")]
     ParquetTooLarge,
-}
-
-/// Manual `PartialEq` — `std::io::Error` is not comparable, so `Io` compares
-/// by `kind()`; the rest compare payloads. Purpose: whole-event-sequence
-/// assertions in the events adapter's tests.
-impl PartialEq for Error {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Parse(a), Self::Parse(b)) => a == b,
-            (Self::Unsupported(a), Self::Unsupported(b)) => a == b,
-            (Self::Value(a), Self::Value(b)) => a == b,
-            (Self::Ambiguous(a), Self::Ambiguous(b)) => a == b,
-            (Self::MissingHeader(a), Self::MissingHeader(b)) => a == b,
-            (Self::Format(a), Self::Format(b)) => a == b,
-            (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
-            (Self::TooLarge, Self::TooLarge) => true,
-            (Self::NestedCsv, Self::NestedCsv) => true,
-            (Self::ParquetTooLarge, Self::ParquetTooLarge) => true,
-            _ => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -78,7 +72,7 @@ mod tests {
         );
         // std::io::Error Display wraps the custom message; assert the framing
         // and payload rather than the exact io formatting.
-        let io = Error::Io(std::io::Error::other("boom"));
+        let io = Error::from(std::io::Error::other("boom"));
         let msg = io.to_string();
         assert!(msg.starts_with("S3 select: io error:"), "{msg}");
         assert!(msg.contains("boom"), "{msg}");
@@ -103,9 +97,9 @@ mod tests {
         // Io compares by kind() only, not payload.
         assert_eq!(
             e,
-            Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "other"))
+            Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "other"))
         );
-        assert_ne!(e, Error::Io(std::io::Error::other("missing")));
+        assert_ne!(e, Error::from(std::io::Error::other("missing")));
     }
 
     #[test]

@@ -7,15 +7,15 @@ use std::ops::ControlFlow;
 use sqlparser::{
     ast::{
         DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-        LimitClause, ObjectName, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
-        TableFactor, Value, Visit, Visitor,
+        LimitClause, ObjectName, ObjectNamePart, Query, Select, SelectFlavor, SelectItem, SetExpr,
+        Statement, TableFactor, Value, Visit, Visitor,
     },
     parser::Parser,
 };
 
 // Re-export: `FromClause.segments` keeps the public path `sql::PathSeg`.
 pub use crate::path::PathSeg;
-use crate::{dialect::S3SelectDialect, error::Error};
+use crate::{dialect::S3SelectDialect, engine, error::Error};
 
 /// The parsed FROM clause: the S3Object path walk plus the optional alias.
 /// The `segments` list is the whole traversal state (a non-traversed clause
@@ -198,6 +198,9 @@ pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
     if select.having.is_some() {
         return Err(Error::Unsupported("HAVING".into()));
     }
+    reject_unread_clauses(query, select)?;
+    reject_empty_projection(select)?;
+    reject_wildcard_options(select)?;
     let limit = match &query.limit_clause {
         None => None,
         Some(LimitClause::LimitOffset {
@@ -262,6 +265,7 @@ pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
             alias,
         });
     }
+    reject_unsupported_expressions(select, &missing)?;
     if aggregates && projections.iter().any(|p| matches!(p, Projection::Wild)) {
         return Err(Error::Parse(
             "aggregates require an explicit select list".into(),
@@ -299,6 +303,13 @@ fn positive_limit(limit: &Expr) -> Result<Option<usize>, Error> {
     }
 }
 
+/// One declined clause or FROM-factor field, reported by name — the refusal
+/// constructor the field-allowlist checks (`validate_from`,
+/// `reject_unread_clauses`) share.
+fn unsupported<T>(name: &str) -> Result<T, Error> {
+    Err(Error::Unsupported(name.into()))
+}
+
 /// The FROM clause must be exactly the single `S3Object` factor; builds the
 /// `FromClause` from the caller's segments and the factor's own alias — the
 /// single source for both paths (custom-path statements carry the dialect's
@@ -312,9 +323,75 @@ fn validate_from(select: &Select, segments: Vec<PathSeg>) -> Result<FromClause, 
     if !twj.joins.is_empty() {
         return Err(Error::Unsupported(JOIN_KIND.into()));
     }
-    let TableFactor::Table { name, alias, .. } = &twj.relation else {
+    // Every field of the FROM factor the engine does not read must be at its
+    // default, for the same reason `reject_unread_clauses` exists: `FromClause`
+    // carries the path segments and the alias and nothing else, so any other
+    // field is dropped on the floor. The `..` this replaces did exactly that —
+    // `PARTITION (p)`, `S3Object(p)`, `WITH (a)` and `TABLESAMPLE (10)` all
+    // parsed and then quietly meant something else.
+    //
+    // The alias's own column list (`S3Object s (a, b)`) was the last hole of
+    // this class — `FromClause.alias` is the name string and nothing else, so
+    // the columns parsed and then silently meant nothing. It has its own arm
+    // below (`TableAlias::columns`, a `TableAlias` field rather than a
+    // `TableFactor` one). `TableAlias`'s other fields need no arm: `name` is
+    // read, `explicit` carries no semantic, and `at` — PartiQL's `AT index` —
+    // is set only behind `supports_partiql`, which this dialect does not
+    // delegate, so it is dead here as `version`/`json_path` are.
+    //
+    // Three of the eight arms below are dead under this dialect for the same
+    // reason — `version` (needs `supports_table_versioning`), `json_path`
+    // (needs `supports_partiql`), `index_hints` (needs `supports_table_hints`)
+    // — none is in `dialect.rs`'s `delegate!` list, so all three stay `false`.
+    // Kept as future-proofing so a dialect change cannot open a silent hole —
+    // the standing `reject_unread_clauses` gives its own dead arms.
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+    } = &twj.relation
+    else {
         return Err(Error::Parse(ONE_S3OBJECT_MSG.into()));
     };
+    if !partitions.is_empty() {
+        return unsupported("PARTITION");
+    }
+    if args.is_some() {
+        return unsupported("table-function args");
+    }
+    if !with_hints.is_empty() {
+        return unsupported("WITH");
+    }
+    if version.is_some() {
+        return unsupported("VERSION");
+    }
+    if *with_ordinality {
+        return unsupported("WITH ORDINALITY");
+    }
+    if json_path.is_some() {
+        return unsupported("JSON path");
+    }
+    if sample.is_some() {
+        return unsupported("TABLESAMPLE");
+    }
+    if !index_hints.is_empty() {
+        return unsupported("index hints");
+    }
+    // The alias's column list: `FromClause` keeps the alias *name*, so
+    // `S3Object s (a, b)` named two columns that went nowhere — refusing the
+    // factor is the honest answer, exactly as for the eight fields above.
+    if let Some(alias) = alias
+        && !alias.columns.is_empty()
+    {
+        return unsupported("alias column list");
+    }
     let [ObjectNamePart::Identifier(name_ident)] = name.0.as_slice() else {
         // sqlparser 0.62 added `ObjectNamePart::Function` (a call in
         // object-name position) — never a valid FROM factor here.
@@ -332,6 +409,196 @@ fn validate_from(select: &Select, segments: Vec<PathSeg>) -> Result<FromClause, 
         segments,
         alias: alias.as_ref().map(|a| a.name.value.clone()),
     })
+}
+
+/// Every `Select`/`Query` field the engine does not read must be at its
+/// default. `QueryPlan` carries six fields, so a clause with no field cannot
+/// reach the engine — accepting one would silently drop it. Every field
+/// listed here is non-AWS syntax, so over-rejecting is impossible.
+///
+/// The two destructures below carry no `..`, and that is the guard: a
+/// sqlparser bump that adds a field to `Query` or `Select` stops compiling
+/// here until someone classifies it — read by `parse` (bound with `_`, each
+/// already validated or consumed before this call), refused below by name, or
+/// exempt with its reason. The `..` this replaces accepted and dropped a new
+/// field without a word; `validate_from` binding all ten factor fields is the
+/// same guard on the FROM side, and the reason `PARTITION` cannot come back.
+///
+/// `flavor` is not an `Option` and cannot be tested for emptiness: it is a
+/// plain enum. Asserting `Standard` is what rejects the `FROM`-first forms
+/// (`FromFirst`, `FromFirstNoSelect`), both reachable under GenericDialect.
+///
+/// `optimizer_hints` is the one deliberate exception — a hint is advisory by
+/// definition, so dropping it is the correct semantic — and `select_token` is
+/// pure token bookkeeping. Both are named here so the per-bump audit does not
+/// rediscover them.
+fn reject_unread_clauses(query: &Query, select: &Select) -> Result<(), Error> {
+    // Read by `parse` before this call — `body` is the `SetExpr` arm, `with`,
+    // `order_by`, `distinct`, `group_by` and `having` have their own refusals
+    // above, `limit_clause` is the LIMIT block, `from` is `validate_from`,
+    // `projection` is the projection loop and `selection` is both the WHERE
+    // checks and `QueryPlan.where_expr`. Bound with `_` rather than re-tested:
+    // a second verdict on a field `parse` has already decided is how the two
+    // drift apart.
+    let Query {
+        with: _,
+        body: _,
+        order_by: _,
+        limit_clause: _,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+    // `optimizer_hints` (advisory by definition) and `select_token` (pure
+    // token bookkeeping) are the two exempt fields: bound for the audit,
+    // never refused.
+    let Select {
+        select_token: _,
+        optimizer_hints: _,
+        distinct: _,
+        select_modifiers,
+        top,
+        top_before_distinct,
+        projection: _,
+        exclude,
+        into,
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        connect_by,
+        group_by: _,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having: _,
+        named_window,
+        qualify,
+        window_before_qualify,
+        value_table_mode,
+        flavor,
+    } = select;
+    // Everything bound without a `_` above is refused here, by name, in this
+    // order.
+    if top.is_some() || *top_before_distinct {
+        return unsupported("TOP");
+    }
+    if into.is_some() {
+        return unsupported("INTO");
+    }
+    if qualify.is_some() {
+        return unsupported("QUALIFY");
+    }
+    if !named_window.is_empty() || *window_before_qualify {
+        return unsupported("WINDOW");
+    }
+    if !lateral_views.is_empty() {
+        return unsupported("LATERAL VIEW");
+    }
+    if prewhere.is_some() {
+        return unsupported("PREWHERE");
+    }
+    if !connect_by.is_empty() {
+        return unsupported("CONNECT BY");
+    }
+    if !cluster_by.is_empty() {
+        return unsupported("CLUSTER BY");
+    }
+    if !distribute_by.is_empty() {
+        return unsupported("DISTRIBUTE BY");
+    }
+    if !sort_by.is_empty() {
+        return unsupported("SORT BY");
+    }
+    if fetch.is_some() {
+        return unsupported("FETCH");
+    }
+    // A separate field and a different construct: MSSQL's `FOR XML`/`FOR JSON`/
+    // `FOR BROWSE` share the `for_clause` slot, so borrowing the lock clause's
+    // label reported `FOR UPDATE` for all of them (`parse_for_clause` is
+    // dialect-ungated, so they really do reach here). Homogeneous checks — all
+    // field presence — so they read as a table and each name sits beside the
+    // predicate reporting it, which is what makes a swapped label visible on
+    // the page rather than only in a failing assertion (the same shape
+    // `reject_wildcard_options` gives its options).
+    let locks_and_for = [
+        (!locks.is_empty(), "FOR UPDATE"),
+        (for_clause.is_some(), "FOR"),
+    ];
+    if let Some((_, name)) = locks_and_for.iter().find(|(present, _)| *present) {
+        return unsupported(name);
+    }
+    if settings.is_some() {
+        return unsupported("SETTINGS");
+    }
+    if format_clause.is_some() {
+        return unsupported("FORMAT");
+    }
+    if !pipe_operators.is_empty() {
+        return unsupported("PIPE");
+    }
+    // Dead under GenericDialect (Redshift-only / BigQuery-only gates, and the
+    // trait default for select_modifiers) — asserted as future-proofing so a
+    // dialect change cannot open a silent hole.
+    if exclude.is_some() {
+        return unsupported("EXCLUDE");
+    }
+    if select_modifiers.is_some() {
+        return unsupported("SELECT modifier");
+    }
+    if value_table_mode.is_some() {
+        return unsupported("value table");
+    }
+    if *flavor != SelectFlavor::Standard {
+        return unsupported("FROM-first SELECT");
+    }
+    Ok(())
+}
+
+/// A query must say what it projects. `supports_empty_projections()` is true,
+/// so `SELECT FROM S3Object s` parses with an empty projection and would
+/// serialize zero-column rows — harder to diagnose than a refusal.
+fn reject_empty_projection(select: &Select) -> Result<(), Error> {
+    if select.projection.is_empty() {
+        return Err(Error::Parse("empty projection".into()));
+    }
+    Ok(())
+}
+
+/// `SelectItem::Wildcard` carries a `WildcardAdditionalOptions` that the
+/// projection mapping drops. Rejected per option, by name, for the five
+/// options `GenericDialect` can actually produce (`opt_alias` is dead — the
+/// dialect does not override `supports_select_wildcard_with_alias`).
+/// `QualifiedWildcard` carries the same struct but `s.*` is already refused
+/// wholesale above.
+///
+/// No whole-struct equality against `Default` is used: the struct's `Default`
+/// is a manual impl whose `wildcard_token` is a synthesized `Mul` token, so
+/// equality against it never holds for a parsed wildcard.
+fn reject_wildcard_options(select: &Select) -> Result<(), Error> {
+    for item in &select.projection {
+        let SelectItem::Wildcard(opts) = item else {
+            continue;
+        };
+        // Homogeneous checks — all field presence — so they read as a table
+        // and each name sits beside the predicate that reports it. That is
+        // what makes a swapped label visible on the page rather than only in
+        // a failing assertion.
+        let options = [
+            (opts.opt_ilike.is_some(), "ILIKE"),
+            (opts.opt_exclude.is_some(), "EXCLUDE"),
+            (opts.opt_except.is_some(), "EXCEPT"),
+            (opts.opt_replace.is_some(), "REPLACE"),
+            (opts.opt_rename.is_some(), "RENAME"),
+        ];
+        if let Some((_, name)) = options.iter().find(|(present, _)| *present) {
+            return Err(Error::Unsupported((*name).into()));
+        }
+    }
+    Ok(())
 }
 
 /// Does the select/list expression tree contain one of the five aggregate
@@ -364,7 +631,7 @@ pub(crate) fn contains_aggregate(expr: &Expr) -> bool {
     guard.0
 }
 
-fn is_aggregate_name(name: &ObjectName) -> bool {
+pub(crate) fn is_aggregate_name(name: &ObjectName) -> bool {
     let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else {
         return false;
     };
@@ -522,6 +789,62 @@ fn reject_subqueries(expr: &Expr) -> Result<(), Error> {
     let _ = expr.visit(&mut guard);
     if guard.0 {
         return Err(Error::Unsupported("subquery".into()));
+    }
+    Ok(())
+}
+
+/// Walk every expression the plan carries and refuse any form the evaluator
+/// cannot run. The walk is eager and whole-tree; `eval` is lazy and
+/// short-circuiting, which is why the two cannot share a traversal — only
+/// the per-node `unsupported_form` classification.
+///
+/// Entry points: each projection expression and `where_expr`. Aggregate
+/// argument expressions are reached by recursion from the projection — no
+/// separate traversal is needed (`pre_visit_expr` fires for nested
+/// expressions too).
+///
+/// The sentinel and the function allowlist are the predicate's business:
+/// this walk adds no list of its own, which is what keeps the parse-time
+/// refusal and the runtime error from ever disagreeing. Nor does it add a
+/// channel of its own: the predicate carries one per verdict, so a declined
+/// form answers `Unsupported` and a malformed operand (`ESCAPE 'ab'`,
+/// `1e999`) answers `Parse` — the same split `positive_limit` draws for
+/// `LIMIT`, and the reason the walk's operand refusals need no wording here.
+fn reject_unsupported_expressions(select: &Select, missing: &SentinelNames) -> Result<(), Error> {
+    struct Walk<'a> {
+        missing_name: &'a str,
+    }
+    impl Visitor for Walk<'_> {
+        // The verdict travels in the break, so the visitor carries no second
+        // piece of state that could fall out of step with it.
+        type Break = Error;
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            match engine::unsupported_form(expr, self.missing_name) {
+                Some(form) => ControlFlow::Break(form.into()),
+                None => ControlFlow::Continue(()),
+            }
+        }
+    }
+    // is_missing() returns an owned String — bind it before borrowing,
+    // or the temporary does not live long enough for the `&'a str` field.
+    let missing_name = missing.is_missing();
+    let mut walk = Walk {
+        missing_name: &missing_name,
+    };
+    let targets = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::UnnamedExpr(e) => Some(e),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .chain(select.selection.iter());
+    for expr in targets {
+        if let ControlFlow::Break(err) = expr.visit(&mut walk) {
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -913,10 +1236,13 @@ mod tests {
     fn user_sentinel_like_call_is_an_unknown_function() {
         // R15 guard deleted: the sentinel name is a per-request uuid, user
         // text cannot collide. A fixed-name `__s3_is_missing(x)` call is an
-        // ordinary unknown function — legal at parse time, rejected by the
-        // engine during eval (in-stream error channel, not request-level 400).
-        let q = ok("SELECT __s3_is_missing(s.a) FROM S3Object s");
-        assert!(!q.aggregates);
+        // ordinary unknown function — and never adopted as the sentinel, so
+        // the walk names it as an unknown function rather than letting it
+        // mean `IS MISSING`.
+        rej(
+            "SELECT __s3_is_missing(s.a) FROM S3Object s",
+            "unsupported: unsupported function: __s3_is_missing",
+        );
     }
 
     #[test]
@@ -1132,12 +1458,14 @@ mod tests {
             "unsupported: GROUP BY", // supports_group_by_expr true arm consumes GROUPING SETS
         );
         // supports_select_wildcard_except: the EXCEPT parses into the
-        // Wildcard item's options, which the projection loop's Wildcard
-        // arm drops — the plan is the plain `*` (the pre-refactor
-        // validator's Wildcard arm behaved identically: same channel Ok).
-        // A delegation miss makes the stock parse fail at EXCEPT → red.
-        let q = ok("SELECT * EXCEPT (a) FROM S3Object s");
-        assert_eq!(q.projections, vec![Projection::Wild]);
+        // Wildcard item's options, which `reject_wildcard_options` now
+        // refuses by name (before that check existed the projection loop
+        // dropped them and the plan was the plain `*`). Still
+        // drift-sensitive: a delegation miss leaves the stock parse
+        // failing at EXCEPT with a syntax error ("…in the query body,
+        // found: a"), so it is the message that discriminates, not the
+        // bare Err channel.
+        rej("SELECT * EXCEPT (a) FROM S3Object s", "unsupported: EXCEPT");
         // supports_parens_around_table_factor: with the argument true the
         // stock factor parser unwraps `(S3Object s)` into the plain factor
         // (+alias); false would parse a derived table and fail the
@@ -1781,6 +2109,304 @@ mod tests {
                 PathSeg::Name("limit".into()),
                 PathSeg::Name("name".into())
             ]
+        );
+    }
+
+    #[test]
+    fn unread_clauses_are_rejected_on_both_from_paths() {
+        // Each construct in BOTH spellings. The custom path may fail earlier
+        // (clause ordering) with a different message — both must be rejected;
+        // the messages are never compared across paths (spec: legitimately
+        // different, and the custom one is known to be less precise).
+        //
+        // Observed: EVERY custom spelling here fails earlier in the skeleton,
+        // so none of the new arms is reached on that path. The skeleton's
+        // clause order is DISTINCT → projection → FROM → WHERE → GROUP BY →
+        // HAVING → ORDER BY → LIMIT, so any clause outside it is left as a
+        // trailing token (`Expected: end of statement, found: …`) — all but
+        // the first two rows, which fail on the FROM keyword check itself
+        // (`invalid FROM: expected S3Object`) because the skeleton parses no
+        // TOP and no INTO.
+        //
+        // The stock path's message is pinned per row (its own name, not just
+        // *a* refusal): the deliverable is that each refused clause reports
+        // its own name, and a swapped label between two arms of one `if`
+        // chain is otherwise invisible. The custom path keeps `is_err()` —
+        // its message is the skeleton's, and asserting one here would pin
+        // clause ordering instead of the name.
+        let stock = [
+            ("SELECT TOP 1 s.a FROM S3Object s", "TOP"),
+            ("SELECT s.a INTO t FROM S3Object s", "INTO"),
+            ("SELECT s.a FROM S3Object s QUALIFY s.a > 1", "QUALIFY"),
+            (
+                "SELECT s.a FROM S3Object s WINDOW w AS (PARTITION BY s.a)",
+                "WINDOW",
+            ),
+            (
+                "SELECT s.a FROM S3Object s FETCH FIRST 1 ROWS ONLY",
+                "FETCH",
+            ),
+            ("SELECT s.a FROM S3Object s FOR UPDATE", "FOR UPDATE"),
+            ("SELECT s.a FROM S3Object s FOR JSON AUTO", "FOR"),
+            ("SELECT s.a FROM S3Object s SETTINGS x = 1", "SETTINGS"),
+            ("SELECT s.a FROM S3Object s FORMAT CSV", "FORMAT"),
+            (
+                "SELECT s.a FROM S3Object s LATERAL VIEW explode(s.b) t AS c",
+                "LATERAL VIEW",
+            ),
+            ("SELECT s.a FROM S3Object s PREWHERE s.a > 1", "PREWHERE"),
+            (
+                "SELECT s.a FROM S3Object s CONNECT BY PRIOR s.a = s.b",
+                "CONNECT BY",
+            ),
+            ("SELECT s.a FROM S3Object s CLUSTER BY s.a", "CLUSTER BY"),
+            (
+                "SELECT s.a FROM S3Object s DISTRIBUTE BY s.a",
+                "DISTRIBUTE BY",
+            ),
+            ("SELECT s.a FROM S3Object s SORT BY s.a", "SORT BY"),
+            // `supports_pipe_operator` is delegated `true`, so `|>` parses
+            // into `Query.pipe_operators` and only the PIPE arm refuses it.
+            ("SELECT s.a FROM S3Object s |> SELECT s.b", "PIPE"),
+        ];
+        for (q, name) in stock {
+            rej(q, &format!("S3 select: unsupported: {name}"));
+            assert!(
+                parse(&q.replace("S3Object s", "S3Object[*] s")).is_err(),
+                "must reject the custom spelling of: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_factor_fields_must_be_default() {
+        // The FROM factor carries ten fields; `FromClause` keeps two. Anything
+        // else is dropped on the floor, so each must be refused by name rather
+        // than parsed and ignored — the `..` in `validate_from` swallowed all
+        // of them, which is how `PARTITION (p)` came to mean a bare scan.
+        // Four of these predate the dialect change that surfaced the fifth;
+        // they are the same silent-drop defect, fixed in the same arm. The
+        // last row is the one field of the class that is not a `TableFactor`
+        // field: the alias's own column list, which `FromClause` dropped just
+        // as silently (probe-verified 2026-09-11).
+        for (q, name) in [
+            ("SELECT * FROM S3Object PARTITION (p)", "PARTITION"),
+            ("SELECT * FROM S3Object(p)", "table-function args"),
+            ("SELECT * FROM S3Object WITH (a)", "WITH"),
+            ("SELECT * FROM S3Object TABLESAMPLE (10)", "TABLESAMPLE"),
+            ("SELECT * FROM S3Object s (a, b)", "alias column list"),
+        ] {
+            assert_eq!(
+                parse(q).unwrap_err().to_string(),
+                format!("S3 select: unsupported: {name}"),
+                "for {q}"
+            );
+        }
+        // The control: an ordinary factor still parses.
+        assert!(parse("SELECT * FROM S3Object s").is_ok());
+    }
+
+    #[test]
+    fn from_first_select_is_rejected() {
+        // `SelectFlavor::FromFirst` and `::FromFirstNoSelect` — both reachable
+        // because GenericDialect::supports_from_first_select() is true. The
+        // message is pinned, not just the channel: a bare `is_err()` cannot
+        // tell this refusal from any other rejection of the same query.
+        for q in ["FROM S3Object s SELECT s.a", "FROM S3Object s"] {
+            assert_eq!(
+                parse(q).unwrap_err().to_string(),
+                "S3 select: unsupported: FROM-first SELECT",
+                "for {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_projection_is_rejected() {
+        // GenericDialect::supports_empty_projections() is true.
+        assert_eq!(
+            parse("SELECT FROM S3Object s").unwrap_err().to_string(),
+            "S3 select: empty projection"
+        );
+        // The custom FROM path cannot produce one at all: its skeleton parses
+        // `FROM S3Object…` inside `parse_statement`, so `SELECT FROM` dies at
+        // the parser before `reject_empty_projection` could run — a syntax
+        // error, not the validator's message. Pinned so the second spelling
+        // stays explicitly covered rather than silently assumed (design: the
+        // gap is either closed by the stock arm or pinned here).
+        for q in ["SELECT FROM S3Object[*] s", "SELECT FROM S3Object[*].a.b s"] {
+            let err = parse(q).unwrap_err();
+            assert!(
+                matches!(err, Error::Parse(_)),
+                "must be a syntax error, got {err:?} for {q}"
+            );
+            assert!(
+                err.to_string().contains("syntax error"),
+                "must be the parser's refusal, got {err} for {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_queries_still_parse() {
+        // The guard against the flavor assertion rejecting everything.
+        for q in [
+            "SELECT s.a FROM S3Object s",
+            "SELECT * FROM S3Object s",
+            "SELECT count(*) FROM S3Object s",
+            "SELECT s.a, s.b FROM S3Object s WHERE s.a > 1 LIMIT 10",
+            "SELECT s.a FROM S3Object[*].books[0] s",
+            "SELECT s.a FROM s3object s",
+        ] {
+            assert!(parse(q).is_ok(), "must accept: {q}");
+        }
+    }
+
+    #[test]
+    fn optimizer_hints_are_accepted_and_ignored() {
+        // The one named exception: a hint is advisory, dropping it is correct.
+        // Pinned so it cannot be "fixed" into a rejection later.
+        assert!(parse("SELECT /*+ hint */ * FROM S3Object s").is_ok());
+    }
+
+    #[test]
+    fn wildcard_options_are_rejected_by_name() {
+        // The projection mapping turns `SelectItem::Wildcard` into
+        // `Projection::Wild` and drops the options — so `SELECT * EXCLUDE (a)`
+        // returns the very column the user asked to withhold.
+        let cases = [
+            ("SELECT * EXCLUDE (a) FROM S3Object s", "EXCLUDE"),
+            ("SELECT * EXCEPT (a) FROM S3Object s", "EXCEPT"),
+            ("SELECT * REPLACE (a AS b) FROM S3Object s", "REPLACE"),
+            ("SELECT * RENAME (a AS b) FROM S3Object s", "RENAME"),
+            ("SELECT * ILIKE '%a%' FROM S3Object s", "ILIKE"),
+        ];
+        for (q, name) in cases {
+            assert_eq!(
+                parse(q).unwrap_err().to_string(),
+                format!("S3 select: unsupported: {name}"),
+                "for {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_options_are_rejected_on_the_custom_path_too() {
+        // The custom skeleton ingests the options with the projection, so this
+        // check is NOT a no-op there (probe-verified 2026-09-10) — and unlike
+        // the clause arms, the custom path reaches THIS arm and so reports the
+        // same name the stock path does. Pinned to the sibling's strength.
+        for (q, name) in [
+            ("SELECT * EXCLUDE (a) FROM S3Object[*] s", "EXCLUDE"),
+            ("SELECT * EXCEPT (a) FROM S3Object[*] s", "EXCEPT"),
+        ] {
+            rej(q, &format!("S3 select: unsupported: {name}"));
+        }
+    }
+
+    #[test]
+    fn plain_wildcards_still_parse() {
+        for q in ["SELECT * FROM S3Object s", "SELECT s.a, * FROM S3Object s"] {
+            assert!(parse(q).is_ok(), "must accept: {q}");
+        }
+    }
+
+    #[test]
+    fn wildcard_alias_option_stays_unreachable() {
+        // `WildcardAdditionalOptions::opt_alias` has no arm in
+        // `reject_wildcard_options`, because this dialect never sets it:
+        // sqlparser gates `SELECT * AS x` on `supports_select_wildcard_with_alias`,
+        // which `S3SelectDialect` does not delegate, so it takes the trait
+        // default (`false`).
+        //
+        // Pinned because it is the one wildcard option the check would
+        // silently drop if a sqlparser bump — or a new delegation — enabled
+        // it. This test goes red first, which is the prompt to add the arm.
+        assert!(parse("SELECT * AS x FROM S3Object s").is_err());
+    }
+
+    #[test]
+    fn the_walk_runs_before_the_aggregate_shape_check() {
+        // The walk descends into an aggregate's argument, so an unsupported
+        // form nested there is refused at request level naming the form.
+        assert_eq!(
+            parse("SELECT count(LOWER(s.a)) FROM S3Object s")
+                .unwrap_err()
+                .to_string(),
+            "S3 select: unsupported: unsupported function: LOWER"
+        );
+        // Q7's ordering guard. `count(*) + LOWER(s.a)` trips BOTH checks: the
+        // projection is a `BinaryOp`, so `contains_aggregate` is true and
+        // `validate_aggregate_item` rejects it as a non-bare call. Only a walk
+        // that runs *first* yields the LOWER message — move the call below the
+        // aggregate checks and this assertion fails.
+        assert_eq!(
+            parse("SELECT count(*) + LOWER(s.a) FROM S3Object s")
+                .unwrap_err()
+                .to_string(),
+            "S3 select: unsupported: unsupported function: LOWER"
+        );
+        // The contrasting half of the guard: the same projection shape with a
+        // supported operand still gets the aggregate-shape diagnosis, so the
+        // pair above contrasts two live paths rather than a message that no
+        // longer exists.
+        assert_eq!(
+            parse("SELECT count(*) + s.a FROM S3Object s")
+                .unwrap_err()
+                .to_string(),
+            "S3 select: non-aggregate expression in aggregate select list"
+        );
+    }
+
+    #[test]
+    fn aggregates_and_missing_predicates_still_parse() {
+        // The sentinel exception: the dialect rewrites `IS [NOT] MISSING` into a
+        // Function node named __s3_is_missing_<uuid>, minted per request. Failing
+        // to admit it turns every such query into a 400.
+        for q in [
+            "SELECT count(*) FROM S3Object s",
+            "SELECT count(s._1), sum(s.x) FROM S3Object s WHERE s.y IS MISSING",
+            "SELECT s.a FROM S3Object s WHERE s.a IS NOT MISSING",
+            "SELECT s.a FROM S3Object s WHERE s.a is not missing",
+            "SELECT s.a FROM S3Object s WHERE (s.a) IS MISSING",
+            "SELECT s.a FROM S3Object s WHERE s.a IS NULL",
+            "SELECT s.a FROM S3Object s WHERE s.a IN (1, 2)",
+            "SELECT s.a FROM S3Object s WHERE s.a BETWEEN 1 AND 2",
+            "SELECT s.a FROM S3Object s WHERE s.a NOT LIKE 'x%' ESCAPE '!'",
+        ] {
+            assert!(parse(q).is_ok(), "must accept: {q}");
+        }
+    }
+
+    #[test]
+    fn keyword_shaped_identifiers_are_not_expressions() {
+        // Form-based, never text-based: the recorded AWS divergence (spec Q2/Q8).
+        for q in [
+            "SELECT s.CAST FROM S3Object s",
+            "SELECT s.date FROM S3Object s",
+        ] {
+            assert!(parse(q).is_ok(), "must accept: {q}");
+        }
+    }
+
+    #[test]
+    fn wildcard_options_inside_a_function_argument_are_refused() {
+        // Task 3 review: `foo` is not an aggregate, so `aggregates` is false
+        // and `validate_aggregate_item` never inspects the argument — the
+        // options inside it were silently dropped. The walk closes the hole by
+        // classifying the enclosing `Expr::Function`, so the diagnostic names
+        // the *function*, not EXCLUDE. The guarantee is the refusal; the
+        // message is incidental.
+        rej(
+            "SELECT foo(* EXCLUDE (a)) FROM S3Object s",
+            "unsupported function: foo",
+        );
+        // The allowed-name variant never reached the drop: a wildcard carrying
+        // options is not a bare aggregate argument, so the shape check refuses
+        // it without the walk.
+        rej(
+            "SELECT count(* EXCLUDE (a)) FROM S3Object s",
+            "non-aggregate expression in aggregate select list",
         );
     }
 }

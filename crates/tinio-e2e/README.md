@@ -49,6 +49,7 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@tagging-off` | scenario | `caps.tagging = false` (the six `?tagging` ops answer `NotImplemented`). |
 | `@cors-off` | scenario | `caps.cors = false` (the three `?cors` ops answer `NotImplemented`; the preflight route is not registered). |
 | `@cold-listing` | scenario | fs scanner interval 100 ms (cold-listing scenarios). |
+| `@parquet` | scenario | Parquet input; needs `--features parquet` (the reader lives behind `tinio-server/select-parquet`) — excluded by the default filter when the feature is off. |
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
 
 The **`@external` umbrella** is `@interop` ∪ `@boto3` ∪ `@mc`.
@@ -60,15 +61,16 @@ cargo test -p tinio-e2e                          # in-process suite only (defaul
 cargo test -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
 cargo test -p tinio-e2e --test cucumber -- --tags '@boto3'
 cargo test -p tinio-e2e --test cucumber -- --tags '@mc'
+cargo test -p tinio-e2e --features parquet --test cucumber -- --tags '@parquet'  # Parquet input
 cargo test -p tinio-e2e --test traceability      # spec↔tag cross-check
 ```
 
-- **The default run excludes `@external`**: `cargo test -p tinio-e2e` without `--tags` runs
-  only the in-process scenarios. The runner sets `CUCUMBER_FILTER_TAGS=not @interop and not
-  @boto3 and not @mc` unless an explicit `--tags` appears on the argv or
-  `TINIO_E2E_EXTERNAL=1` is set.
-- **An explicit `--tags` replaces the default filter** — a tagged run must re-state the
-  `@external` exclusion. CI's mem pass does: `--tags 'not @fs and not @interop and not
+- **The default run excludes what this build cannot serve**: `cargo test -p tinio-e2e` without
+  `--tags` gets a runner-composed `CUCUMBER_FILTER_TAGS` from two independent axes — `@parquet`
+  is excluded unless the binary was built `--features parquet`, and the `@external` umbrella is
+  excluded unless `TINIO_E2E_EXTERNAL=1` is set.
+- **An explicit `--tags` replaces the default filter** — a tagged run must re-state both
+  exclusions. CI's mem pass does: `--tags 'not @fs and not @parquet and not @interop and not
   @boto3 and not @mc'` with `TINIO_E2E_BACKEND=mem`.
 - `--retry 1` retries failed scenarios once (the CI `@interop` run uses it to mitigate
   external-client flakes).
@@ -88,7 +90,7 @@ the presence check when `rclone` is missing.
 | Var | Effect |
 |---|---|
 | `TINIO_E2E_BACKEND` | `mem` runs the backend-neutral scenarios on the mem backend (CI mem pass). Explicit `@fs`/`@mem` scenario tags win over it; default `fs`. |
-| `TINIO_E2E_EXTERNAL` | Set to `1` to disable the default `@external` exclusion (all scenarios run; an explicit `--tags` still wins). |
+| `TINIO_E2E_EXTERNAL` | Set to `1` to disable the default `@external` exclusion (the `@parquet` exclusion is unaffected — it follows the cargo feature; an explicit `--tags` still wins). |
 | `TINIO_E2E_REPORT` | Path of the Cucumber-JSON report written alongside the pretty stdout (CI uploads it for the PR test report). A bare filename lands in `crates/tinio-e2e/` — cargo runs test binaries with the package root as cwd. |
 | `TINIO_BOTO3_PYTHON` | Override for the boto3 venv python. Default: `<target-dir>/tinio-e2e-venv/bin/python3` (Linux) / `Scripts\python.exe` (Windows). |
 

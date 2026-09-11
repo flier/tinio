@@ -9,7 +9,11 @@
 
 ## Types & defaults
 
-- Untrusted → ctor (`bucket::name`, …). Qualify (`bucket::Name`); import module. `derive_more` (`full`); `parse-display` enums. `From<&str>`: literals (panic). `SmartDefault`/`#[serde(default)]`.
+- Untrusted → ctor (`bucket::name`, …). Qualify (`bucket::Name`); import module. `From<&str>`: literals (panic). `SmartDefault`/`#[serde(default)]`.
+
+## Derives
+
+- derive `Display`/`FromStr` → `parse-display`; rest → `derive_more`; `Default` → `SmartDefault`; `impl` only thiserror `Error` (`#[error]`/`#[from]`; nest `#[from(forward)]`/ctor).
 
 ## Validation (garde)
 

@@ -22,7 +22,6 @@ cucumber = { workspace = true, features = ["output-json", "tracing"] }
 flate2 = { workspace = true }
 futures = { workspace = true }
 hmac = { workspace = true }
-http = { workspace = true }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
 sha2 = { workspace = true }
@@ -34,6 +33,9 @@ tinio-fs = { path = "../tinio-fs" }
 tinio-mem = { path = "../tinio-mem" }
 tinio-server = { path = "../tinio-server" }
 tinio-util = { path = "../tinio-util", features = ["testing"] }
+
+[features]
+parquet = ["tinio-server/select-parquet"]
 
 [[test]]
 name = "cucumber"

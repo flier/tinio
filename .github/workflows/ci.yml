@@ -206,6 +206,43 @@ jobs:
         with:
           mode: ${{ matrix.target }}
 
+  # Parquet (select-parquet) is compiled by NO default-feature graph: the
+  # workspace legs, both cucumber passes and the docs leg all run without
+  # it, and the feature-matrix job only cargo-hack *checks* tinio-server
+  # (--no-dev-deps, no test execution). So the parquet reader and its
+  # server-side path would never run in CI. This job owns every
+  # parquet-gated test surface: the reader's unit + integration tests, the
+  # server's parquet select test, and the @parquet cucumber scenario.
+  test-parquet:
+    name: Test (select-parquet)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+
+      - name: install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # Same cargo/runner profile flags as run-test-leg's default leg — the
+      # feature is the only difference. nextest runs no doctests, which
+      # `run-test-leg`'s separate --doc step covers for the default graph.
+      - name: test (parquet reader + server)
+        run: |
+          cargo nextest run --cargo-profile ci --profile ci -p tinio-select --features parquet
+          cargo nextest run --cargo-profile ci --profile ci -p tinio-server --features select-parquet
+
+      # --test cucumber keeps the args off the plain-harness traceability
+      # target; an explicit --tags replaces the runner's default filter, so
+      # this pass is exactly the @parquet scenario and nothing else.
+      - name: e2e cucumber (@parquet)
+        run: cargo test --profile ci -p tinio-e2e --features parquet --test cucumber -- --tags '@parquet' --retry 2
+
   # The no-default-features and rustdoc legs: different compile graphs that
   # warm nothing downstream, so they run as a leaf job instead of holding
   # up the ubuntu chain (previously e2e/bench-smoke waited on them).
@@ -336,8 +373,9 @@ jobs:
 
       # --- cucumber e2e suite (e2e and e2e-port) --------------------------
       # In-process scenarios; the runner's built-in default filter excludes
-      # the external-client tags (@interop/@boto3/@mc), so the fs pass needs
-      # no --tags. The mem pass skips @fs-only scenarios (traversal,
+      # the feature-gated (@parquet) and external-client (@interop/@boto3/
+      # @mc) tags, so the fs pass needs no --tags. The mem pass skips
+      # @fs-only scenarios (traversal,
       # nested-root, out-of-band); backend-neutral scenarios run on mem via
       # TINIO_E2E_BACKEND. --test cucumber keeps the args from reaching the
       # plain-harness traceability target (its own step below), and an
@@ -353,7 +391,7 @@ jobs:
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @parquet and not @interop and not @boto3 and not @mc' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json

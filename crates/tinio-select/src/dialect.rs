@@ -1,9 +1,16 @@
 //! Custom sqlparser Dialect: the `IS [NOT] MISSING` hook + the custom FROM
 //! factor via the `parse_statement` hook. Every other method delegates to
 //! GenericDialect — an incomplete delegation silently changes stock-path
-//! behavior (e.g. supports_limit_comma).
+//! behavior (e.g. supports_limit_comma) — and `Dialect::dialect()` reports
+//! that same identity, so stock's hardcoded `dialect_of!` guards take the
+//! delegated arm instead of silently going false. That one override is what
+//! closes `B'…'`/`R'…'`; it is also the reason this dialect is not a faithful
+//! wrapper in the two hooks above, which stock never asks about by identity.
 
-use std::cell::{Cell, RefCell};
+use std::{
+    any::TypeId,
+    cell::{Cell, RefCell},
+};
 
 use delegate::delegate;
 use sqlparser::{
@@ -496,6 +503,29 @@ impl Dialect for S3SelectDialect {
     }
 
     // -----------------------------------------------------------------
+    // Dialect identity: stock's `dialect_of!`/`dialect_is!` guards
+    // -----------------------------------------------------------------
+    /// Report `GenericDialect`'s `TypeId`, so every `dialect_of!` /
+    /// `dialect_is!` guard in stock behaves as it does for the dialect this
+    /// one delegates to. Both macros expand to `x.dialect.is::<T>()`, i.e.
+    /// `TypeId::of::<T>() == self.dialect()`, and the trait default returns
+    /// *this* type's `TypeId` — under which all 74 `GenericDialect`-naming
+    /// guards read false and silently take the wrong arm. The byte/raw
+    /// string prefixes (`tokenizer.rs:1085`/`1125`) are the sharp edge: with
+    /// them false, `B'1'` tokenizes as the identifier `B` aliased `'1'`, and
+    /// `SELECT B'1' FROM S3Object s` parsed to MISSING instead of being
+    /// refused. See `Dialect::dialect`'s own doc ("overridden by dialects
+    /// that behave like other dialects") and its `parse_with_wrapped_dialect`
+    /// test. The `delegate!` list above is unaffected: it forwards methods,
+    /// not identity.
+    fn dialect(&self) -> TypeId {
+        // Forwarded, not written down: "the identity of the dialect I delegate
+        // to". Today that is `GenericDialect`'s own default, but if it ever
+        // overrides `dialect()` the delegation follows it here too.
+        self.inner.dialect()
+    }
+
+    // -----------------------------------------------------------------
     // Custom statement hook
     // -----------------------------------------------------------------
     fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
@@ -600,5 +630,31 @@ fn is_sentinel_expr(expr: &Expr, sentinel: &str) -> bool {
         } => is_sentinel_expr(expr, sentinel),
         Expr::Nested(e) => is_sentinel_expr(e, sentinel),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::dialect::Dialect;
+
+    use super::*;
+
+    /// The `dialect()` override is the whole fix for the byte/raw-string
+    /// prefixes, and it is a one-value contract: every `dialect_of!` /
+    /// `dialect_is!` guard in stock reduces to `TypeId::of::<T>() ==
+    /// self.dialect()`. Pinned here because a `delegate!` re-audit (or a
+    /// future `dialect()` of our own) could silently take it back out —
+    /// the observable, `SELECT B'1' FROM S3Object s` answering 400 instead
+    /// of a MISSING column, is pinned separately in `engine.rs`.
+    #[test]
+    fn identity_is_generic_so_stock_guards_match_the_delegate() {
+        let dialect = S3SelectDialect::new(SentinelNames::mint(), "SELECT 1");
+        assert_eq!(dialect.dialect(), TypeId::of::<GenericDialect>());
+        // The counter-assertion is against the trait *default* (`self.type_id()`,
+        // the value every stock guard reads as false), not against
+        // `GenericDialect.dialect()` — that method is the default too, so the
+        // comparison would re-check the line above through the same impl and
+        // could never fail. Delete the override and this goes red.
+        assert_ne!(dialect.dialect(), TypeId::of::<S3SelectDialect>());
     }
 }

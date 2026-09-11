@@ -48,7 +48,6 @@ criterion = { workspace = true, features = [
     "rayon",
     "cargo_bench_support",
 ] }
-dhat.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

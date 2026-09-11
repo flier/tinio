@@ -15,9 +15,6 @@ tinio-fs.workspace = true
 tinio-mem = { workspace = true, optional = true }
 tinio-server.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Console"] }
-
 [dev-dependencies]
 tinio-util = { workspace = true, features = ["testing"] }
 

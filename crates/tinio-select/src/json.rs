@@ -977,6 +977,26 @@ mod tests {
     }
 
     #[test]
+    fn reserved_keyword_attribute_is_accepted() {
+        // Recorded divergence (spec A2): AWS answers 400 for an unquoted
+        // reserved keyword used as an attribute name and requires `s."CAST"`;
+        // we accept it, and MinIO — the reference OSS implementation —
+        // documents the same non-compliance ("AWS S3's reserved keywords list
+        // is not yet respected"). Pinned at the EVALUATION layer, not at
+        // parse: a parse-level `Ok` assertion would keep passing when the
+        // scalar-function spec turns CAST into a real function, which is
+        // exactly the change that should force a re-decision here. The
+        // support predicate is form-based, so this is a compound identifier
+        // whose text happens to be a keyword.
+        let rows = run(
+            "SELECT s.CAST FROM S3Object s",
+            Type::Lines,
+            "{\"CAST\": \"x\"}\n",
+        );
+        assert_eq!(rows[0].vals, vec![s("x")]);
+    }
+
+    #[test]
     fn empty_line_is_a_format_error() {
         // A blank LINES record cannot parse as JSON — an in-stream Format
         // error (there is no blank-line skip rule in the AWS surface).

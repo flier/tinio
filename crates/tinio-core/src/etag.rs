@@ -3,7 +3,7 @@
 use std::{num::ParseIntError, ops::Deref, str::FromStr};
 
 use bytes::Bytes;
-use derive_more::Display;
+use derive_more::{Deref, Display};
 use md5::{Digest, Md5};
 
 use crate::{multipart::PartInfo, storage};
@@ -36,13 +36,13 @@ use crate::{multipart::PartInfo, storage};
 ///
 /// assert!(ETag::new("not-a-hex-etag").is_err());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Display)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Display, Deref)]
 #[display("{}", self.as_str())]
 pub enum ETag {
     /// Content MD5 for a single upload.
     Single([u8; 16]),
     /// Composed multipart ETag `MD5-of-MD5s-N`.
-    Composed([u8; 16], u32),
+    Composed(#[deref] [u8; 16], u32),
 }
 
 /// Wire-format [`ETag`] parse failure.
@@ -86,16 +86,6 @@ impl FromStr for ETag {
             return Ok(Self::Composed(digest, parts));
         }
         Err(Error::InvalidFormat)
-    }
-}
-
-impl Deref for ETag {
-    type Target = [u8; 16];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Single(digest) | Self::Composed(digest, _) => digest,
-        }
     }
 }
 

@@ -11,6 +11,7 @@ bzip2.workspace = true
 bytes = { workspace = true, optional = true }
 csv.workspace = true
 delegate.workspace = true
+derive_more = { workspace = true, features = ["full"] }
 flate2.workspace = true
 parse-display.workspace = true
 parquet = { workspace = true, optional = true }
@@ -21,6 +22,7 @@ serde_json = { workspace = true, features = [
     "arbitrary_precision",
     "preserve_order",
 ] }
+smart-default.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
@@ -32,6 +34,10 @@ criterion.workspace = true
 [[bench]]
 name = "select_scan"
 harness = false
+
+[[test]]
+name = "parquet"
+required-features = ["parquet"]
 
 [features]
 default = []

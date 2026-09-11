@@ -26,7 +26,7 @@ use crate::storage::{self, invalid_checksum};
 /// assert_eq!("SHA512".parse(), Ok(checksum::Algorithm::Sha512));
 /// assert_eq!("XXHASH64".parse(), Ok(checksum::Algorithm::XxHash64));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, FromStr)]
 #[display(style = "UPPERCASE")]
 pub enum Algorithm {
     /// CRC-32 (ISO-HDLC), `x-amz-checksum-crc32`.
@@ -66,10 +66,9 @@ impl Algorithm {
         Self::XxHash128,
     ];
 
-    /// The `&'static str` wire name (`"CRC32"` … `"XXHASH128"`) — the
-    /// allocation-free form for the backends' persisted rows, and the
-    /// ONE home for the spelling (F13): [`Display`] delegates here, so
-    /// the derived `FromStr` and the persisted rows can never diverge.
+    /// Allocation-free wire name (`"CRC32"` … `"XXHASH128"`) for persisted
+    /// rows. Same spelling as derived [`Display`]/`FromStr` (`UPPERCASE`);
+    /// the round-trip test pins the two together (F13).
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::Crc32 => "CRC32",
@@ -83,15 +82,6 @@ impl Algorithm {
             Self::XxHash3 => "XXHASH3",
             Self::XxHash128 => "XXHASH128",
         }
-    }
-}
-
-/// The wire name — one spelling home: [`Algorithm::wire_name`] is the
-/// single source (the backends persist it; `FromStr` parses it back), so
-/// the two can never diverge (F13).
-impl std::fmt::Display for Algorithm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.wire_name())
     }
 }
 

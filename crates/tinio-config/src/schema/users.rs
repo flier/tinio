@@ -4,13 +4,14 @@
 //! display name to the access key; `local_uid` is unix-only (Windows fails
 //! validation at parse).
 
+use derive_more::PartialEq;
 use garde::Validate;
-use secrecy::{ExposeSecret, SecretBox};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 use super::validate_local_uid;
-use super::{auth::SecretKey, reject_empty, validate_canonical_id_opt};
+use super::{auth::Secret, reject_empty, validate_canonical_id_opt};
 use crate::_core::acl::{OwnerId, derive_canonical_id};
 
 /// One configured S3 user (`[[users]]`).
@@ -32,7 +33,7 @@ use crate::_core::acl::{OwnerId, derive_canonical_id};
 /// assert_eq!(user.resolved_canonical_id().as_str().len(), 64);
 /// assert_eq!(&**user.secret_key.expose_secret(), "secret");
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, PartialEq)]
 #[garde(allow_unvalidated)]
 pub struct Config {
     /// The SigV4 access key (≥ 1 char).
@@ -40,7 +41,7 @@ pub struct Config {
     pub access_key: String,
     /// The SigV4 secret key (non-empty — the `[auth]` rule body).
     #[garde(custom(validate_secret_key))]
-    pub secret_key: SecretBox<SecretKey>,
+    pub secret_key: Secret,
     /// The canonical account ID (default `hex(SHA-256(access_key))`).
     #[serde(default)]
     #[garde(custom(validate_canonical_id_opt))]
@@ -78,21 +79,11 @@ impl Config {
 }
 
 /// The secret-key rule (spec §6): the `[auth]` non-empty check.
-fn validate_secret_key(value: &SecretBox<SecretKey>, _context: &()) -> garde::Result {
+fn validate_secret_key(value: &Secret, _context: &()) -> garde::Result {
     reject_empty(
         "users.secret_key must not be empty",
         value.expose_secret().is_empty(),
     )
-}
-
-impl PartialEq for Config {
-    fn eq(&self, other: &Self) -> bool {
-        self.access_key == other.access_key
-            && self.secret_key.expose_secret() == other.secret_key.expose_secret()
-            && self.canonical_id == other.canonical_id
-            && self.display_name == other.display_name
-            && self.local_uid == other.local_uid
-    }
 }
 
 #[cfg(test)]

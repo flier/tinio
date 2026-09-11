@@ -1,74 +1,57 @@
-//! RFC 3986 percent-encoding of the ACL grants wire.
-//!
-//! [`encode`] and [`decode`] are the pair the tags wire used before the
-//! dev merge moved it onto the `percent-encoding` crate (extracted from
-//! the object module — the tags wire is byte-identical). The ACL grants
-//! wire uses [`decode`] too, and `encode_uri` for its `uri=` grantee
-//! elements, which carry the RFC 3986 encoding of a full group URI.
+//! The wire codecs over `percent-encoding`: the ACL grants wire's `uri=`
+//! grantee elements (`encode_uri`, the RFC 3986 unreserved set — the same
+//! set the CORS wire uses) and the [`decode`] the grants parser and the
+//! request path share.
 
-/// The hex digits of the wire `%XX` encoding (encode's per-byte lookup).
-const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+use percent_encoding::{percent_decode_str, utf8_percent_encode};
 
-/// Percent-encode the wire-reserved characters (`%`, `=`, `&`, `+`,
-/// space). Everything else — the Unicode charset included — passes
-/// through untouched.
-pub fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '%' | '=' | '&' | '+' | ' ' => {
-                out.push('%');
-                out.push(HEX_DIGITS[(c as u32 >> 4) as usize] as char);
-                out.push(HEX_DIGITS[(c as u32 & 0xF) as usize] as char);
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
+use crate::cors::UNRESERVED;
 
-/// Percent-decode `%XX` sequences (`+` stays literal). The two hex
-/// bytes are read as raw bytes — never sliced out of the `&str` — so a
-/// `%` followed by a raw non-ASCII char cannot hit a mid-char boundary
-/// and panic: the bytes fail UTF-8 or hex validation and the `%` passes
-/// through, leaving the caller's domain validation to reject the
-/// input.
-pub fn decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|h| u8::from_str_radix(h, 16).ok());
-            if let Some(byte) = hex {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Percent-encode a URI-valued wire element (`uri=` grantee): every
-/// byte outside the RFC 3986 unreserved set (`ALPHA / DIGIT / - . _ ~`)
-/// becomes `%XX`. [`encode`] above only covers the tags subset (`%`
-/// `=` `&` `+` space) — a group URI's reserved `:` and `/` must be
-/// encoded too, giving the canonical `http%3A%2F%2F...` grantee wire.
+/// Percent-encode a URI-valued wire element (`uri=` grantee): every byte
+/// outside the RFC 3986 unreserved set becomes `%XX`, giving the canonical
+/// `http%3A%2F%2F...` grantee wire.
 pub(crate) fn encode_uri(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push(HEX_DIGITS[(b >> 4) as usize] as char);
-            out.push(HEX_DIGITS[(b & 0xF) as usize] as char);
+    utf8_percent_encode(s, UNRESERVED).to_string()
+}
+
+/// Percent-decode `%XX` sequences (`+` stays literal). An invalid sequence
+/// passes through and invalid UTF-8 is replaced — never a panic, leaving
+/// the caller's domain validation to reject the result.
+pub fn decode(s: &str) -> String {
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_leaves_plus_literal_and_passes_stray_percent_through() {
+        assert_eq!(decode("a+b"), "a+b");
+        assert_eq!(decode("%"), "%");
+        assert_eq!(decode("%2"), "%2");
+        assert_eq!(decode("%ZZ"), "%ZZ");
+        // A `%` followed by a raw multi-byte char: the following bytes are
+        // not two hex digits, so the `%` passes through and the sequence
+        // survives lossy decoding.
+        assert_eq!(decode("%é"), "%é");
+    }
+
+    #[test]
+    fn decode_round_trips_the_uri_wire() {
+        for s in ["http://acs.amazonaws.com/groups/global/AllUsers", "é中", ""] {
+            assert_eq!(decode(&encode_uri(s)), s);
         }
     }
-    out
+
+    #[test]
+    fn encode_uri_escapes_every_non_unreserved_byte() {
+        assert_eq!(
+            encode_uri("http://acs.amazonaws.com/groups/global/AllUsers"),
+            "http%3A%2F%2Facs.amazonaws.com%2Fgroups%2Fglobal%2FAllUsers"
+        );
+        assert_eq!(encode_uri("a-b._~Z9"), "a-b._~Z9");
+        // Per-byte, so a multi-byte char becomes two `%XX` triplets.
+        assert_eq!(encode_uri("é"), "%C3%A9");
+    }
 }

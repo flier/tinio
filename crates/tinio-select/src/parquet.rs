@@ -15,32 +15,44 @@
 //! verbatim through SELECT * and parse lazily on the 28-digit spine only
 //! when a numeric operator consumes them (the CSV/JSON lazy rule — NaN/inf
 //! are row-build errors, never a silently wrong number); decimal through
-//! `parse_number`; timestamp → RFC 3339 ISO string (UTC, `Z` suffix);
-//! list/struct → `Json` (JSON output renders natively, CSV output is the
-//! engine's nested error). Nulls map to present `Null` (JSON null
-//! semantics); MISSING means the column itself is absent. Projection: an
-//! empty set reads every schema column (`Wild`/reference-free plans);
-//! otherwise only the referenced columns are read, matched
-//! case-insensitively against the top-level column names (identifier rules)
-//! — unknown names are dropped and their lookup resolves MISSING.
+//! `parse_number`; timestamp and date → RFC 3339 ISO string (UTC, `Z`
+//! suffix — a date is midnight of that day); ENUM (a top-level
+//! BYTE_ARRAY annotation only) → checked-UTF-8 string; list/struct → `Json`
+//! (JSON output renders natively, CSV output is the engine's nested error).
+//! Nulls map to present `Null` (JSON null semantics); MISSING means the
+//! column itself is absent. Projection: an empty set reads every schema column
+//! (`Wild`/reference-free plans); otherwise only the referenced columns are
+//! read, matched case-insensitively against the top-level column names
+//! (identifier rules) — unknown names are dropped and their lookup resolves
+//! MISSING.
 
-use std::{io::Cursor, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    rc::Rc,
+    str::from_utf8,
+};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Decimal128Array, Decimal256Array, FixedSizeListArray, LargeListArray,
-        LargeStringArray, ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+        Array, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array, FixedSizeListArray,
+        LargeListArray, LargeStringArray, ListArray, PrimitiveArray, RecordBatch, StringArray,
+        StructArray,
     },
     datatypes::{
-        ArrowPrimitiveType, DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
-        Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
-        TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
-        UInt64Type,
+        ArrowPrimitiveType, DataType, Date32Type, Date64Type, Float32Type, Float64Type, Int8Type,
+        Int16Type, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type,
+        UInt16Type, UInt32Type, UInt64Type,
     },
 };
-use parquet::arrow::{
-    ProjectionMask,
-    arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder},
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder},
+    },
+    basic::{ConvertedType, LogicalType},
+    schema::types::SchemaDescriptor,
 };
 use rust_decimal::Decimal;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -61,6 +73,15 @@ pub struct ParquetReader {
     /// into every row of the batch (S7).
     batch: Option<RecordBatch>,
     names: Rc<Vec<String>>,
+    /// Top-level root field names carrying the parquet ENUM annotation,
+    /// captured once in `new` (never per row or per batch): arrow erases the
+    /// annotation into `DataType::Binary`, so reader construction is the last
+    /// point that can still tell an ENUM from an unannotated BYTE_ARRAY.
+    enum_columns: HashSet<String>,
+    /// Per-batch ENUM hints, positionally aligned with the batch's columns —
+    /// resolved once when the batch is adopted, in the same pass as `names`,
+    /// so the per-row loop indexes instead of hashing a name per cell.
+    enum_hints: Vec<EnumHint>,
     row: usize,
     /// The decoded-batch budget (X2) — same limit as the file-bytes bound.
     max_bytes: u64,
@@ -79,6 +100,7 @@ impl ParquetReader {
         let bytes = bytes::Bytes::from(input.into_inner());
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(from_parquet)?;
         let mask = projection_mask(&builder, &projection);
+        let enum_columns = enum_columns(builder.parquet_schema());
         let inner = builder
             .with_projection(mask)
             .build()
@@ -87,6 +109,8 @@ impl ParquetReader {
             inner,
             batch: None,
             names: Rc::new(Vec::new()),
+            enum_columns,
+            enum_hints: Vec::new(),
             row: 0,
             max_bytes,
         })
@@ -124,6 +148,42 @@ fn projection_mask(
     ProjectionMask::columns(schema, names)
 }
 
+/// The top-level parquet root fields annotated ENUM, by name.
+///
+/// `parquet` 59.3.0 maps the ENUM annotation — `LogicalType::Enum` and
+/// `ConvertedType::ENUM` alike — to arrow `DataType::Binary`
+/// (`arrow/schema/primitive.rs` lines 281, 288), the very type it gives an
+/// unannotated BYTE_ARRAY, BSON, Geometry/Geography and `_Unknown`: the arrow
+/// type alone cannot tell them apart, and `arrow_value` sees only that. The
+/// annotation is still legible here, off the parquet schema the builder holds,
+/// so it is read once at construction and the per-row path only looks a name up.
+///
+/// A name is kept only when EVERY top-level root field of that name is
+/// annotated: a duplicate name pairing an ENUM with an unannotated `Binary`
+/// would otherwise silently re-type the latter as a string. Nested leaves (a
+/// longer column path) are dropped — the top-level mapping never sees them, so
+/// an ENUM inside a list or struct stays refused (see `arrow_json`).
+fn enum_columns(schema: &SchemaDescriptor) -> HashSet<String> {
+    let mut hints: HashMap<&str, bool> = HashMap::new();
+    for column in schema.columns() {
+        let parts = column.path().parts();
+        if parts.len() != 1 {
+            continue;
+        }
+        let annotated = column.converted_type() == ConvertedType::ENUM
+            || matches!(column.logical_type_ref(), Some(LogicalType::Enum));
+        hints
+            .entry(parts[0].as_str())
+            .and_modify(|all| *all &= annotated)
+            .or_insert(annotated);
+    }
+    hints
+        .into_iter()
+        .filter(|&(_, annotated)| annotated)
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
 impl RecordReader for ParquetReader {
     fn next(&mut self) -> Result<Option<Record>, Error> {
         loop {
@@ -147,6 +207,15 @@ impl RecordReader for ParquetReader {
                         if batch.get_array_memory_size() as u64 > self.max_bytes {
                             return Err(Error::ParquetTooLarge);
                         }
+                        // Resolve the ENUM hint here, in the same pass and the
+                        // same order as `names`: it is fixed per batch, so the
+                        // per-cell work collapses to an index.
+                        let enum_hints: Vec<EnumHint> = batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| EnumHint::of(self.enum_columns.contains(f.name())))
+                            .collect();
                         self.names = Rc::new(
                             batch
                                 .schema()
@@ -155,6 +224,7 @@ impl RecordReader for ParquetReader {
                                 .map(|f| f.name().clone())
                                 .collect(),
                         );
+                        self.enum_hints = enum_hints;
                         self.batch = Some(batch);
                         self.row = 0;
                         continue;
@@ -167,9 +237,18 @@ impl RecordReader for ParquetReader {
             }
             let fields = (0..batch.num_columns())
                 .map(|j| {
+                    // The batch's field names ARE the parquet root field names
+                    // (`complex.rs` `convert_field`: `Field::new(parquet_type
+                    // .name(), ..)`, and an embedded `ARROW:schema` hint is
+                    // rejected unless its names match), so `enum_hints` — built
+                    // positionally from those names when the batch was adopted
+                    // — lines up with `batch.column(j)`: order- and
+                    // projection-independent, and a field the mask filtered out
+                    // simply never asks.
                     Ok(Field::Present(arrow_value(
                         batch.column(j).as_ref(),
                         self.row,
+                        self.enum_hints[j],
                     )?))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -184,7 +263,11 @@ impl RecordReader for ParquetReader {
 
 /// One top-level parquet cell → `Value`. A null is present `Null` (JSON
 /// null semantics); MISSING is only an absent column (pruned or unknown).
-fn arrow_value(array: &dyn Array, i: usize) -> Result<Value, Error> {
+/// The hint rides in beside the array because it is not recoverable from it:
+/// arrow has already flattened the parquet annotation into `DataType::Binary`.
+/// It is [`EnumHint::Annotated`] only for a top-level ENUM-annotated column
+/// (`enum_columns`) — every other `Binary` producer keeps the refusal.
+fn arrow_value(array: &dyn Array, i: usize, enum_hint: EnumHint) -> Result<Value, Error> {
     if array.is_null(i) {
         return Ok(Value::Null);
     }
@@ -209,6 +292,13 @@ fn arrow_value(array: &dyn Array, i: usize) -> Result<Value, Error> {
         DataType::LargeUtf8 => {
             Value::String(downcast::<LargeStringArray>(array).value(i).to_string())
         }
+        // AWS reads an ENUM as a string. The guard is load-bearing: without the
+        // annotation `Binary` means an unannotated BYTE_ARRAY, BSON, Geometry,
+        // Geography or `_Unknown` (primitive.rs lines 281-289), all of which
+        // must keep failing in the catch-all below — never silently become text.
+        DataType::Binary if enum_hint == EnumHint::Annotated => {
+            Value::String(enum_string(array, i)?)
+        }
         DataType::Decimal128(precision, scale) => Value::Decimal(decimal_value(
             *precision,
             decimal_text(
@@ -232,6 +322,12 @@ fn arrow_value(array: &dyn Array, i: usize) -> Result<Value, Error> {
             };
             Value::String(timestamp_string(unit, at)?)
         }
+        DataType::Date32 => Value::String(date_string_from_days(
+            primitive::<Date32Type>(array, i) as i64,
+        )?),
+        DataType::Date64 => {
+            Value::String(date_string_from_millis(primitive::<Date64Type>(array, i))?)
+        }
         DataType::List(_)
         | DataType::LargeList(_)
         | DataType::FixedSizeList(_, _)
@@ -242,6 +338,38 @@ fn arrow_value(array: &dyn Array, i: usize) -> Result<Value, Error> {
             )));
         }
     })
+}
+
+/// Whether the column a cell came from carries the parquet ENUM annotation
+/// (`enum_columns`). A nested cell is always [`EnumHint::Unannotated`]: it has
+/// no top-level root field to resolve a hint against, so an ENUM inside a
+/// list or struct keeps the `Binary` catch-all (see `arrow_json`). Nested
+/// ENUM support is deliberately out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumHint {
+    Annotated,
+    Unannotated,
+}
+
+impl EnumHint {
+    /// `Annotated` exactly when `enum_columns` holds the column's name.
+    fn of(annotated: bool) -> Self {
+        if annotated {
+            Self::Annotated
+        } else {
+            Self::Unannotated
+        }
+    }
+}
+
+/// One ENUM cell as text. The annotation says these bytes ARE a string, so an
+/// invalid sequence is a corrupt value and is refused — `from_utf8`, not
+/// `from_utf8_lossy`, whose U+FFFD substitution would smuggle in exactly the
+/// silently-wrong value `float_text` refuses for NaN/inf.
+fn enum_string(array: &dyn Array, i: usize) -> Result<String, Error> {
+    from_utf8(downcast::<BinaryArray>(array).value(i))
+        .map(str::to_owned)
+        .map_err(|e| Error::Format(format!("parquet enum is not valid UTF-8: {e}")))
 }
 
 /// The depth ceiling of our own nested recursion (X3): a stacked-overflow is
@@ -283,7 +411,11 @@ fn arrow_json(array: &dyn Array, i: usize, depth: usize) -> Result<serde_json::V
             }
             serde_json::Value::Object(map)
         }
-        _ => value_to_json(&arrow_value(array, i)?),
+        // A nested cell carries `EnumHint::Unannotated`: `enum_columns` keys
+        // top-level root fields, and this recursion has no path back to one —
+        // so an ENUM inside a list/struct keeps refusing rather than decoding
+        // by accident.
+        _ => value_to_json(&arrow_value(array, i, EnumHint::Unannotated)?),
     })
 }
 
@@ -379,6 +511,37 @@ fn timestamp_string(unit: &TimeUnit, at: i64) -> Result<String, Error> {
         .expect("rfc3339 formatting is infallible"))
 }
 
+/// Days since the Unix epoch → RFC 3339 midnight UTC. Chosen over a bare
+/// `YYYY-MM-DD` so DATE and TIMESTAMP share one shape on the service's
+/// string spine until a real timestamp type exists (spec Q4).
+///
+/// The offset is built in *seconds*, not nanoseconds: a nanosecond
+/// intermediate is an i64, which would cap the range at ±292 years of the
+/// epoch and fail a legal post-2262 DATE (a `Date32` day count is an i32, and
+/// a `Date64` millisecond count divides to ~±10¹¹ days, so neither needs that
+/// truncation). With seconds, `time`'s own date span is the only bound: past
+/// it — or on a date RFC 3339 cannot spell at all, i.e. a negative year — the
+/// value is a `Format` error, never a panic or a wrap.
+///
+/// `Duration::seconds` is total (i64 seconds is the representation, unlike
+/// the panicking `days`), so the only arithmetic that can overflow is the day
+/// → second conversion, which `checked_mul` catches.
+fn date_string_from_days(days: i64) -> Result<String, Error> {
+    let out_of_range = || Error::Format("parquet date out of range".into());
+    let offset = time::Duration::seconds(days.checked_mul(86_400).ok_or_else(out_of_range)?);
+    let dt = OffsetDateTime::UNIX_EPOCH
+        .checked_add(offset)
+        .ok_or_else(out_of_range)?;
+    dt.format(&Rfc3339)
+        .map_err(|e| Error::Format(format!("parquet date format: {e}")))
+}
+
+/// Milliseconds → that day's midnight UTC. `div_euclid` floors toward
+/// negative infinity, so a pre-epoch value lands on the right day.
+fn date_string_from_millis(ms: i64) -> Result<String, Error> {
+    date_string_from_days(ms.div_euclid(86_400_000))
+}
+
 /// The typed value at `i` for the matched `data_type` arm.
 fn primitive<T: ArrowPrimitiveType>(array: &dyn Array, i: usize) -> T::Native {
     downcast::<PrimitiveArray<T>>(array).value(i)
@@ -403,15 +566,20 @@ mod tests {
 
     use arrow::{
         array::{
-            ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float64Array, Int32Array,
-            Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-            TimestampSecondArray,
+            ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+            DictionaryArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+            ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
         },
         buffer::OffsetBuffer,
         datatypes::{DataType, Field as ArrowField, Fields, Schema, TimeUnit},
     };
-    use parquet::arrow::ArrowWriter;
+    use parquet::{
+        arrow::ArrowWriter,
+        data_type::{ByteArray, ByteArrayType},
+        file::{properties::WriterProperties, writer::SerializedFileWriter},
+        schema::parser::parse_message_type,
+    };
     use rust_decimal::Decimal;
 
     use super::*;
@@ -527,6 +695,43 @@ mod tests {
         buf
     }
 
+    /// A parquet file from a raw message-type string plus its leaf columns'
+    /// BYTE_ARRAY values, in schema order.
+    ///
+    /// `ArrowWriter` derives the parquet schema from an arrow `DataType`, and
+    /// arrow has no ENUM data type — it cannot write the annotation under test
+    /// at all. The low-level writer takes the parquet schema directly:
+    /// `parse_message_type` → `SerializedFileWriter` → one `write_batch` per
+    /// column. Every fixture here is `required` at each level, so there are no
+    /// definition or repetition levels to supply.
+    fn raw_file(message: &str, columns: &[&[&[u8]]]) -> Vec<u8> {
+        let schema = parse_message_type(message).unwrap();
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf = Vec::new();
+        let mut writer = SerializedFileWriter::new(&mut buf, Arc::new(schema), props).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        for values in columns {
+            let mut column = row_group.next_column().unwrap().unwrap();
+            let bytes: Vec<ByteArray> = values.iter().map(|v| ByteArray::from(*v)).collect();
+            column
+                .typed::<ByteArrayType>()
+                .write_batch(&bytes, None, None)
+                .unwrap();
+            column.close().unwrap();
+        }
+        row_group.close().unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// One `(ENUM)`-annotated `required binary e` column. The unannotated
+    /// BYTE_ARRAY it must not be confused with is a plain `raw_file` at the
+    /// call site that wants one; an `annotation` parameter selecting between
+    /// the two was dead, since both callers here always annotate.
+    fn enum_file(values: &[&[u8]]) -> Vec<u8> {
+        raw_file("message s { required binary e (ENUM); }", &[values])
+    }
+
     fn reader(bytes: Vec<u8>) -> ParquetReader {
         ParquetReader::new(Cursor::new(bytes), Vec::new(), MAX_BYTES).unwrap()
     }
@@ -587,6 +792,172 @@ mod tests {
             Field::Present(Value::Decimal(Decimal::new(150, 2)))
         );
         assert_eq!(r.next().unwrap(), None);
+
+        // The AWS-listed parquet type table, one case per type: INT32/INT64
+        // are the fixture's `small`/`id`, and DECIMAL/LIST/STRING/TIMESTAMP
+        // are `price`/`tags`/`name`/`at_*` — this list adds INT8/INT16
+        // (mapped all along, untested until now) and DATE, so the AWS table
+        // reads as one list. ENUM is the one listed type this loop cannot
+        // carry: `ArrowWriter` needs an arrow data type to write from, and
+        // arrow has none for ENUM — its fixture comes from the low-level
+        // writer instead, in `enum_column_reads_as_string` below.
+        let day_2024 = 19_723; // 2024-01-01, days since the Unix epoch
+        let cases: Vec<(ArrowField, ArrayRef, Value)> = vec![
+            (
+                ArrowField::new("i8", DataType::Int8, false),
+                Arc::new(Int8Array::from(vec![-8i8])) as ArrayRef,
+                Value::Int(-8),
+            ),
+            (
+                ArrowField::new("i16", DataType::Int16, false),
+                Arc::new(Int16Array::from(vec![-16i16])) as ArrayRef,
+                Value::Int(-16),
+            ),
+            (
+                ArrowField::new("d32", DataType::Date32, false),
+                Arc::new(Date32Array::from(vec![day_2024])) as ArrayRef,
+                Value::String("2024-01-01T00:00:00Z".into()),
+            ),
+            (
+                ArrowField::new("d64", DataType::Date64, false),
+                Arc::new(Date64Array::from(vec![day_2024 as i64 * 86_400_000])) as ArrayRef,
+                Value::String("2024-01-01T00:00:00Z".into()),
+            ),
+        ];
+        for (field, array, want) in cases {
+            let mut r = reader(one_column(field, array));
+            let Record::Parquet(Columns { fields, .. }) = record(&mut r) else {
+                panic!("expected parquet record")
+            };
+            assert_eq!(fields[0], Field::Present(want));
+            assert_eq!(r.next().unwrap(), None);
+        }
+        // `Dictionary` is neither an AWS-listed type nor a Parquet ENUM: it
+        // keeps the catch-all, a `Format` error rather than a silent value.
+        let dict = DictionaryArray::new(
+            Int32Array::from(vec![0]),
+            Arc::new(StringArray::from(vec!["x"])),
+        );
+        match reader(one_column(
+            ArrowField::new(
+                "dict",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Arc::new(dict) as ArrayRef,
+        ))
+        .next()
+        {
+            Err(Error::Format(msg)) => {
+                assert_eq!(msg, "parquet type not supported: Dictionary(Int32, Utf8)")
+            }
+            other => panic!("expected format error, got {other:?}"),
+        }
+    }
+
+    /// The single value of a one-column date fixture, read through the reader
+    /// path — the fixture plumbing the `DATE` cases share.
+    fn date_value(data_type: DataType, array: ArrayRef) -> Field {
+        let bytes = one_column(ArrowField::new("d", data_type, true), array);
+        let Record::Parquet(Columns { fields, .. }) = record(&mut reader(bytes)) else {
+            panic!("expected parquet record")
+        };
+        fields.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn date32_maps_to_midnight_utc() {
+        // 19723 days since the Unix epoch = 2024-01-01.
+        let array = Arc::new(Date32Array::from(vec![Some(19723)])) as ArrayRef;
+        assert_eq!(
+            date_value(DataType::Date32, array),
+            Field::Present(Value::String("2024-01-01T00:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn date32_pre_epoch_is_negative() {
+        // -1 = 1969-12-31: a negative day count renders as the day before
+        // the epoch. No division happens on this path (days convert to a
+        // whole-day offset by multiplication), so it pins the sign, not the
+        // floor rule — `Date64`'s, and the discriminating case for it, is
+        // `date64_floors_to_the_day`.
+        let array = Arc::new(Date32Array::from(vec![Some(-1)])) as ArrayRef;
+        assert_eq!(
+            date_value(DataType::Date32, array),
+            Field::Present(Value::String("1969-12-31T00:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn dates_past_2262_still_read() {
+        // The offset is built in seconds. An i64 *nanosecond* intermediate
+        // capped the range at ±292 years of the epoch, so a legal DATE past
+        // 2262-04-11 failed the whole read; `time`'s own date span is now the
+        // bound. The day counts come from `time`'s calendar, so the assertion
+        // pins the day→date conversion rather than a hand-computed constant.
+        let day_of = |year: i32| {
+            time::Date::from_calendar_date(year, time::Month::January, 1)
+                .expect("a valid year")
+                .to_julian_day()
+        };
+        let epoch = day_of(1970);
+        for (year, want) in [
+            (2300, "2300-01-01T00:00:00Z"),
+            (9999, "9999-01-01T00:00:00Z"),
+        ] {
+            let days = day_of(year) - epoch;
+            assert_eq!(
+                arrow_value(&Date32Array::from(vec![days]), 0, EnumHint::Unannotated).unwrap(),
+                Value::String(want.into()),
+                "year {year}"
+            );
+        }
+    }
+
+    #[test]
+    fn date64_floors_to_the_day() {
+        // A non-midnight millisecond value must yield that day's midnight: the
+        // type disclaims time-of-day, so the arm enforces it rather than leaking
+        // whatever the input happened to carry.
+        let noon = 19723i64 * 86_400_000 + 12 * 3_600_000;
+        let array = Arc::new(Date64Array::from(vec![Some(noon)])) as ArrayRef;
+        assert_eq!(
+            date_value(DataType::Date64, array),
+            Field::Present(Value::String("2024-01-01T00:00:00Z".into()))
+        );
+        // The reader path cannot carry a non-midnight Date64: arrow-rs's
+        // writer stores the type as whole days (`arrow_writer/mod.rs`:
+        // `x / 86_400_000`) and its reader scales back (`array_reader/
+        // primitive_array.rs`: `x as i64 * 86_400_000`), so what reaches the
+        // arm is day-aligned whatever the input carried. The floor rule is
+        // pinned on the arm itself instead, pre-epoch case included — that is
+        // the one truncation would push to the next day.
+        for (ms, want) in [
+            (noon, "2024-01-01T00:00:00Z"),
+            (-3_600_000, "1969-12-31T00:00:00Z"),
+        ] {
+            assert_eq!(
+                arrow_value(&Date64Array::from(vec![ms]), 0, EnumHint::Unannotated).unwrap(),
+                Value::String(want.into()),
+                "millis {ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_dates_are_format_errors() {
+        // Never a panic or a wrap. The message is pinned, not just the variant:
+        // the catch-all is also `Error::Format`, so a variant-only check cannot
+        // tell the date arm from a read that never reached it.
+        let array = Arc::new(Date32Array::from(vec![Some(i32::MAX)])) as ArrayRef;
+        let bytes = one_column(ArrowField::new("d", DataType::Date32, true), array);
+        // ParquetReader::next is `Result<Option<Record>, Error>` — the error is
+        // the OUTER variant, not nested in an Option.
+        match reader(bytes).next() {
+            Err(Error::Format(m)) => assert_eq!(m, "parquet date out of range"),
+            other => panic!("expected format error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -714,6 +1085,114 @@ mod tests {
             Err(Error::Format(msg)) => {
                 assert_eq!(msg, "parquet type not supported: Binary")
             }
+            other => panic!("expected format error, got {other:?}"),
+        }
+    }
+
+    /// The one place a name lookup could mis-decode. A parquet schema may
+    /// repeat a top-level name, and arrow's batch then carries two fields both
+    /// named `e` — so a per-name `true` would hand the unannotated column the
+    /// ENUM column's decode. The hint is dropped for the whole name instead,
+    /// and the file refuses, which is the honest answer for a schema whose
+    /// columns cannot be told apart by name.
+    #[test]
+    fn a_duplicate_name_mixing_enum_with_binary_refuses_both() {
+        let bytes = raw_file(
+            "message s { required binary e (ENUM); required binary e; }",
+            &[&[b"alpha"], &[&[0x01]]],
+        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap();
+        assert_eq!(builder.schema().fields().len(), 2, "the duplicate survived");
+        assert!(enum_columns(builder.parquet_schema()).is_empty());
+        match reader(bytes).next() {
+            Err(Error::Format(msg)) => assert_eq!(msg, "parquet type not supported: Binary"),
+            other => panic!("expected format error, got {other:?}"),
+        }
+    }
+
+    /// `(ENUM)` on a top-level BYTE_ARRAY: AWS reads it as a string, and this
+    /// reader decodes the bytes as UTF-8 — arrow has already flattened the
+    /// annotation into `DataType::Binary`, so the parquet schema is the only
+    /// place the distinction survives.
+    #[test]
+    fn enum_column_reads_as_string() {
+        let mut r = reader(enum_file(&[b"alpha", b"beta"]));
+        for want in ["alpha", "beta"] {
+            let Record::Parquet(Columns { fields, .. }) = record(&mut r) else {
+                panic!("expected parquet record")
+            };
+            assert_eq!(fields[0], Field::Present(Value::String(want.into())));
+        }
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    /// A corrupt ENUM is refused, not repaired: `from_utf8_lossy` would answer
+    /// `a\u{fffd}b`, a value the file never held.
+    #[test]
+    fn enum_invalid_utf8_is_a_format_error() {
+        let bytes = enum_file(&[&[0x61, 0xff, 0x62]]);
+        match reader(bytes).next() {
+            Err(Error::Format(msg)) => {
+                assert!(
+                    msg.starts_with("parquet enum is not valid UTF-8:"),
+                    "got {msg}"
+                )
+            }
+            other => panic!("expected format error, got {other:?}"),
+        }
+    }
+
+    /// The guard that keeps the ENUM arm from being a blanket `Binary` arm.
+    /// Both columns reach arrow as `DataType::Binary` — `(Some(LogicalType::
+    /// Enum))` and `(None, ConvertedType::NONE)` are adjacent lines of
+    /// `primitive.rs` (288 and 281's neighbours) — so only the name lookup
+    /// separates them: `e (ENUM)` reads as a string, the bare BYTE_ARRAY
+    /// `blob` beside it keeps the catch-all, projected either way.
+    #[test]
+    fn enum_does_not_leak_onto_an_unannotated_binary() {
+        let bytes = raw_file(
+            "message s { required binary e (ENUM); required binary blob; }",
+            &[&[b"alpha"], &[&[0x01]]],
+        );
+
+        // Projected to the ENUM column alone: a string.
+        let mut r =
+            ParquetReader::new(Cursor::new(bytes.clone()), vec!["e".into()], MAX_BYTES).unwrap();
+        let Record::Parquet(Columns { fields, names }) = record(&mut r) else {
+            panic!("expected parquet record")
+        };
+        assert_eq!(*names, vec!["e"]);
+        assert_eq!(fields[0], Field::Present(Value::String("alpha".into())));
+        assert_eq!(r.next().unwrap(), None);
+
+        // Projected to the Binary column alone: still refused.
+        let mut r =
+            ParquetReader::new(Cursor::new(bytes.clone()), vec!["blob".into()], MAX_BYTES).unwrap();
+        match r.next() {
+            Err(Error::Format(msg)) => assert_eq!(msg, "parquet type not supported: Binary"),
+            other => panic!("expected format error, got {other:?}"),
+        }
+
+        // Both in one batch: the ENUM still reads, the row still fails on the
+        // Binary — the hint is per column, never per batch.
+        match reader(bytes).next() {
+            Err(Error::Format(msg)) => assert_eq!(msg, "parquet type not supported: Binary"),
+            other => panic!("expected format error, got {other:?}"),
+        }
+    }
+
+    /// Nested ENUM is out of scope, deliberately: `enum_columns` keys top-level
+    /// root fields, so an ENUM under a group resolves no hint and keeps the
+    /// refusal rather than being decoded by a guess.
+    #[test]
+    fn nested_enum_is_still_refused() {
+        let bytes = raw_file(
+            "message s { required group meta { required binary e (ENUM); } }",
+            &[&[b"alpha"]],
+        );
+        match reader(bytes).next() {
+            Err(Error::Format(msg)) => assert_eq!(msg, "parquet type not supported: Binary"),
             other => panic!("expected format error, got {other:?}"),
         }
     }

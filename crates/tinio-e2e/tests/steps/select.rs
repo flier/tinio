@@ -56,6 +56,26 @@ async fn bzip2_object_with_content(
     put_object(world, &key, &bz).await;
 }
 
+/// A parquet object built from the committed fixture — the same bytes
+/// `tinio-select`'s integration test asserts and `tinio-server`'s parquet
+/// test selects (regenerate with the ignored generator in
+/// `crates/tinio-select/tests/parquet.rs`). No docstring: parquet is binary,
+/// and a `"""` block cannot carry it.
+///
+/// The scenario is tagged `@parquet` because the reader lives behind
+/// `tinio-server/select-parquet`: with the feature off the request answers
+/// 501 before the body is even read. The runner's default filter excludes
+/// the tag; the parquet CI leg selects it with `--features parquet`.
+#[given(regex = r#"^a parquet object "([^"]+)"$"#)]
+async fn parquet_object(world: &mut super::World, key: String) {
+    put_object(world, &key, PARQUET_FIXTURE).await;
+}
+
+/// The shared fixture bytes (`include_bytes!` crosses into the owning crate
+/// on purpose — one file, three layers).
+const PARQUET_FIXTURE: &[u8] =
+    include_bytes!("../../../tinio-select/tests/fixtures/select.parquet");
+
 /// The docstring value, its delimiter newlines trimmed: the gherkin parser
 /// keeps the newline that closes the opening `"""` and the one before the
 /// closing delimiter, so a fixture's first content byte would be `\n`
@@ -268,10 +288,11 @@ fn select_body(
 }
 
 /// The input serialization chosen from the fixture's suffix, layered:
-/// `.gz`/`.bz2` strip to the compression type, the stem's `.jsonl` ⇒ JSON
-/// LINES, `.jsond` ⇒ JSON DOCUMENT, `.csvh` ⇒ CSV with `FileHeaderInfo USE`
-/// (the AWS doc sample's named columns), anything else ⇒ CSV. Every
-/// combination is expressible: `data.csv.gz`, `people.jsonl.bz2`, …
+/// `.gz`/`.bz2` strip to the compression type, the stem's `.parquet` ⇒
+/// Parquet, `.jsonl` ⇒ JSON LINES, `.jsond` ⇒ JSON DOCUMENT, `.csvh` ⇒ CSV
+/// with `FileHeaderInfo USE` (the AWS doc sample's named columns), anything
+/// else ⇒ CSV. Every combination is expressible: `data.csv.gz`,
+/// `people.jsonl.bz2`, …
 fn input_serialization(key: &str) -> String {
     let (stem, compression) = if let Some(stem) = key.strip_suffix(".bz2") {
         (stem, Some("BZIP2"))
@@ -280,7 +301,11 @@ fn input_serialization(key: &str) -> String {
     } else {
         (key, None)
     };
-    let format = if stem.ends_with(".jsonl") {
+    let format = if stem.ends_with(".parquet") {
+        // Parquet takes no delimiter/header options, and the server refuses
+        // `CompressionType` on it — the format alone.
+        "<Parquet/>"
+    } else if stem.ends_with(".jsonl") {
         "<JSON><Type>LINES</Type></JSON>"
     } else if stem.ends_with(".jsond") {
         "<JSON><Type>DOCUMENT</Type></JSON>"

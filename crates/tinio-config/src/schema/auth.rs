@@ -1,10 +1,11 @@
 use std::ops;
 
+use derive_more::{Deref, From, PartialEq};
 use garde::Validate;
 use secrecy::{CloneableSecret, ExposeSecret, SecretBox, SerializableSecret, zeroize::Zeroize};
 use serde::{Deserialize, Serialize};
 
-fn validate_auth_secret_key(value: &SecretBox<SecretKey>, _context: &()) -> garde::Result {
+fn validate_auth_secret_key(value: &Secret, _context: &()) -> garde::Result {
     super::reject_empty(
         "auth.secret_key must not be empty",
         value.expose_secret().is_empty(),
@@ -53,6 +54,19 @@ impl From<SecretKey> for SecretBox<SecretKey> {
     }
 }
 
+/// Zeroizing secret-key box. [`PartialEq`] compares the exposed material —
+/// `SecretBox` itself is not comparable.
+#[derive(Clone, Debug, Deref, From, Serialize, Deserialize)]
+#[from(forward)]
+#[serde(transparent)]
+pub struct Secret(SecretBox<SecretKey>);
+
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose_secret() == other.expose_secret()
+    }
+}
+
 /// S3 credentials (`[auth]`; optional section — when present, both keys are
 /// required; generated on first start with ≥ 16/32 bytes CSPRNG, per
 /// data-model.md Credentials).
@@ -79,19 +93,12 @@ impl From<SecretKey> for SecretBox<SecretKey> {
 /// assert!(!auth.access_key.is_empty());
 /// assert!(!auth.secret_key.expose_secret().is_empty());
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, PartialEq)]
 pub struct Config {
     /// Access key (≥ 16 bytes when generated).
     #[garde(length(min = 1))]
     pub access_key: String,
     /// Secret key (≥ 32 bytes when generated).
     #[garde(custom(validate_auth_secret_key))]
-    pub secret_key: SecretBox<SecretKey>,
-}
-
-impl PartialEq for Config {
-    fn eq(&self, other: &Self) -> bool {
-        self.access_key == other.access_key
-            && self.secret_key.expose_secret() == other.secret_key.expose_secret()
-    }
+    pub secret_key: Secret,
 }

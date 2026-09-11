@@ -8,6 +8,7 @@
 ## CI legs
 
 - `.github/actions/run-test-leg` — its `run:` lines are the exact unit/doc commands (modes default / no-default / doc): nextest `--cargo-profile ci --profile ci` (`.config/nextest.toml` = runner profile: fail-fast false, retries 2), doctests via `cargo test --doc --profile ci` (nextest can't run them), rustdoc `-D warnings`.
+- `test-parquet` (ci.yml) is the only leg that compiles the parquet reader: `parquet`/`select-parquet` is off in every default graph, and the features job only cargo-hack *checks* tinio-server (`--no-dev-deps`, no test execution). It runs `cargo nextest run -p tinio-select --features parquet`, `-p tinio-server --features select-parquet`, and `cargo test -p tinio-e2e --features parquet --test cucumber -- --tags '@parquet'` (the `@parquet` scenario; the runner's default filter excludes the tag wherever the feature is off). tinio-select's `tests/parquet.rs` is a `required-features = ["parquet"]` target — `pub mod parquet` does not exist without the feature, so an ungated `[[test]]` would fail to compile in the default graph.
 - Local equivalents keep `cargo test` (canonical above; cucumber sections) — the CI nextest profile is for the runners.
 
 ## Standard acceptance (pre-push gate)
@@ -19,8 +20,12 @@ Mirror the CI legs locally before push; every leg must be green. The unix-only l
 cargo +nightly fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test -p tinio-select --features parquet
+cargo test -p tinio-server --features select-parquet
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
+
+The last two are the `test-parquet` leg's Rust half — `cargo test --workspace` cannot reach them (the feature is off in every default graph). The cucumber half has its own command below.
 
 ### rustdoc
 
@@ -38,13 +43,14 @@ Layout: `tests/features/`, `tests/steps/`. Tag taxonomy / FR-025 / WSL2: `crates
 - `cucumber` pinned once workspace (`"0.23"`, no features); tinio-e2e enables `output-json`/`tracing` in `[dev-dependencies]` only — never a lib dep.
 - Targets: `[[test]] cucumber` (`harness = false`) + plain-harness `traceability`.
 - Scoping: cucumber args → `--test cucumber` (`traceability` rejects `--tags`/`--retry`). No-arg `cargo test -p tinio-e2e` fine unscoped.
-- Default filter excludes `@external` (`not @interop and not @boto3 and not @mc`); explicit `--tags` replaces it — re-state exclusion.
+- Default filter (tests/cucumber.rs): `@parquet` is excluded unless the binary was built `--features parquet`, the external tags (`@interop`/`@boto3`/`@mc`) unless `TINIO_E2E_EXTERNAL=1`; an explicit `--tags` replaces the whole filter — re-state exclusions.
 - Env: `TINIO_E2E_BACKEND` (`mem` CI; `@fs`/`@mem` tags win), `TINIO_E2E_EXTERNAL=1`, `TINIO_E2E_REPORT=<path>` (bare name → package root), `TINIO_BOTO3_PYTHON`.
 
 ```
 cargo test -p tinio-e2e
 cargo test -p tinio-e2e --test cucumber -- --tags @interop --retry 1
-cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @interop and not @boto3 and not @mc'   # CI mem
+cargo test -p tinio-e2e --features parquet --test cucumber -- --tags '@parquet'
+cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @parquet and not @interop and not @boto3 and not @mc'   # CI mem
 cargo test -p tinio-e2e --test traceability
 ```
 
@@ -54,7 +60,7 @@ cargo test -p tinio-e2e --test traceability
 - Steps: `Given`/`When` = actions, `Then` = assertions; first-person verbs; `And` chains; unanchored regex; `{int}`/`{string}`/`{word}`.
 - One module per S3 family (`buckets`, `clients`, `common`, `conditions`, `errors`, `listing`, `multipart`, `objects`, `reserved_paths` — declared in `tests/steps/mod.rs`; the `metrics`/`tagging` scenarios ride the generic `common` request steps, no dedicated module); shared `World`.
 - Data-driven: `Examples` tables; one behavior per scenario.
-- Tags: feature `@FR-xxx`/`@SC-xxx`/`@Txxx` (filter-inherited, hook-invisible); scenario config (`@fs`/`@mem`/`@nested-root`/`@checksum-on`/`@minimal-caps`/`@cold-listing`/`@max-buckets-3`/`@tagging-off`) + external (`@interop`/`@aws`/`@rclone`/`@boto3`/`@mc`). One mapping: `config_from_tags`.
+- Tags: feature `@FR-xxx`/`@SC-xxx`/`@Txxx` (filter-inherited, hook-invisible); scenario config (`@fs`/`@mem`/`@nested-root`/`@checksum-on`/`@minimal-caps`/`@cold-listing`/`@max-buckets-3`/`@tagging-off`) + feature-gated (`@parquet`, needs `--features parquet`) + external (`@interop`/`@aws`/`@rclone`/`@boto3`/`@mc`). One mapping: `config_from_tags`.
 - Spec IDs: `cargo test -p tinio-e2e --test traceability`.
 
 ### Migration

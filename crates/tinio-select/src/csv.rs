@@ -5,6 +5,7 @@ use std::{cell::RefCell, io::Read, rc::Rc};
 
 use _csv::{ReaderBuilder, StringRecord};
 use parse_display::{Display, FromStr};
+use smart_default::SmartDefault;
 
 use crate::{
     error::Error,
@@ -13,11 +14,18 @@ use crate::{
 };
 
 /// CSV input options (S3 Select `InputSerialization.CSV`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// AWS defaults: `,`, `\n`, `"`, `"`, no comments, `NONE` header, quoted
+/// record delimiters allowed.
+#[derive(Debug, Clone, PartialEq, Eq, SmartDefault)]
 pub struct Params {
+    #[default(b',')]
     pub field_delimiter: u8,
+    #[default(b'\n')]
     pub record_delimiter: u8,
+    #[default(b'"')]
     pub quote: u8,
+    #[default(b'"')]
     pub escape: u8,
     pub comments: Option<u8>,
     pub header: Option<Header>,
@@ -25,6 +33,7 @@ pub struct Params {
     /// distinguish a record delimiter inside a quoted field, so this flag is
     /// not enforced — `true` and `false` both parse permissively (AWS
     /// `true`). Documented here and pinned by tests, never silently ignored.
+    #[default = true]
     pub allow_quoted_record_delimiter: bool,
 }
 
@@ -187,7 +196,7 @@ impl<R: Read> Reader<R> {
 pub(crate) fn map_error(e: _csv::Error, context: &str) -> Error {
     let msg = format!("csv {context}: {e}");
     match e.into_kind() {
-        _csv::ErrorKind::Io(io) => Error::Io(io),
+        _csv::ErrorKind::Io(io) => Error::Io(io.into()),
         _ => Error::Format(msg),
     }
 }
@@ -263,13 +272,8 @@ mod tests {
 
     fn params(header: Option<Header>) -> Params {
         Params {
-            field_delimiter: b',',
-            record_delimiter: b'\n',
-            quote: b'"',
-            escape: b'"',
-            comments: None,
             header,
-            allow_quoted_record_delimiter: true,
+            ..Default::default()
         }
     }
 

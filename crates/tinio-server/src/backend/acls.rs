@@ -316,3 +316,143 @@ pub(crate) fn bucket_write_acl(
 ) -> S3Result<Acl> {
     expand_acl(owner, None, canned, *headers)
 }
+
+#[cfg(test)]
+mod tests {
+    use s3s::S3Error;
+
+    use super::*;
+    use crate::_core::acl::GROUP_ALL_USERS;
+
+    const OWNER: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    const OTHER: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    fn owner() -> OwnerId {
+        OwnerId::new(OWNER).unwrap()
+    }
+
+    fn grantee(
+        type_: &'static str,
+        id: Option<&str>,
+        uri: Option<&str>,
+        email: Option<&str>,
+    ) -> dto::Grantee {
+        dto::Grantee {
+            type_: dto::Type::from_static(type_),
+            id: id.map(Into::into),
+            uri: uri.map(Into::into),
+            display_name: None,
+            email_address: email.map(Into::into),
+        }
+    }
+
+    fn is_invalid_argument(err: &S3Error) -> bool {
+        err.code().as_str() == "InvalidArgument"
+    }
+
+    #[test]
+    fn policy_owner_must_carry_a_well_formed_id() {
+        let own = owner();
+        let missing = dto::Owner {
+            id: None,
+            display_name: None,
+        };
+        assert!(is_invalid_argument(
+            &policy_owner_matches(Some(&missing), &own).unwrap_err()
+        ));
+        let malformed = dto::Owner {
+            id: Some("nothex".into()),
+            display_name: None,
+        };
+        assert!(is_invalid_argument(
+            &policy_owner_matches(Some(&malformed), &own).unwrap_err()
+        ));
+        let matching = dto::Owner {
+            id: Some(OWNER.into()),
+            display_name: None,
+        };
+        assert!(policy_owner_matches(Some(&matching), &own).is_ok());
+        let other = dto::Owner {
+            id: Some(OTHER.into()),
+            display_name: None,
+        };
+        assert!(is_invalid_argument(
+            &policy_owner_matches(Some(&other), &own).unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn bucket_acl_grants_accepts_the_grant_header_source() {
+        let own = owner();
+        let headers = GrantHeaders {
+            read: Some(r#"id="ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100""#),
+            ..GrantHeaders::default()
+        };
+        let grants = bucket_acl_grants(None, &headers, None, &own).unwrap();
+        assert!(grants.contains(&Grant {
+            grantee: Grantee::Canonical(OwnerId::new(OTHER).unwrap()),
+            permission: Permission::Read,
+        }));
+        assert!(grants.contains(&Grant {
+            grantee: Grantee::Canonical(own),
+            permission: Permission::FullControl,
+        }));
+    }
+
+    #[test]
+    fn policy_grant_must_carry_a_permission() {
+        let g = dto::Grant {
+            grantee: Some(grantee(dto::Type::CANONICAL_USER, Some(OWNER), None, None)),
+            permission: None,
+        };
+        assert!(is_invalid_argument(&grants_from_policy(&[g]).unwrap_err()));
+    }
+
+    #[test]
+    fn grantee_shape_is_strict_per_type() {
+        // canonical-user carrying another address form (URI or email) or no ID.
+        for gee in [
+            grantee(
+                dto::Type::CANONICAL_USER,
+                Some(OWNER),
+                Some(GROUP_ALL_USERS),
+                None,
+            ),
+            grantee(
+                dto::Type::CANONICAL_USER,
+                Some(OWNER),
+                None,
+                Some("u@example.com"),
+            ),
+            grantee(dto::Type::CANONICAL_USER, None, None, None),
+        ] {
+            assert!(is_invalid_argument(&grantee_from_dto(&gee).unwrap_err()));
+        }
+        // group carrying an ID or email, or missing its URI entirely.
+        for gee in [
+            grantee(dto::Type::GROUP, Some(OWNER), Some(GROUP_ALL_USERS), None),
+            grantee(
+                dto::Type::GROUP,
+                None,
+                Some(GROUP_ALL_USERS),
+                Some("u@example.com"),
+            ),
+            grantee(dto::Type::GROUP, None, None, None),
+        ] {
+            assert!(is_invalid_argument(&grantee_from_dto(&gee).unwrap_err()));
+        }
+        // The valid shapes survive.
+        assert!(
+            grantee_from_dto(&grantee(
+                dto::Type::GROUP,
+                None,
+                Some(GROUP_ALL_USERS),
+                None
+            ))
+            .is_ok()
+        );
+        assert!(
+            grantee_from_dto(&grantee(dto::Type::CANONICAL_USER, Some(OWNER), None, None)).is_ok()
+        );
+    }
+}

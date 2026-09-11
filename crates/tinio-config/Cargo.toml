@@ -6,6 +6,7 @@ description = "Configuration and credential resolution for tinio (TOML config, .
 publish = false
 
 [dependencies]
+derive_more = { workspace = true, features = ["full"] }
 dotenvy.workspace = true
 garde = { workspace = true, features = ["derive", "regex", "url"] }
 humantime-serde.workspace = true

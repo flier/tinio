@@ -363,3 +363,27 @@ Feature: S3 Select over objects
     When I select over object "data.csv" with query "SELECT * FROM S3Object s" over the last "4" bytes
     Then the select results contain "4,5"
     And the select results do not contain "0,1"
+
+  Scenario: A refused clause and an unknown function are request-level parse errors
+    Given I create bucket "select"
+    And an object "data.csv" with content:
+      """
+      1,x
+      """
+    When I try select over object "data.csv" with query "SELECT TOP 1 s._1 FROM S3Object s"
+    Then the select fails with HTTP 400 and code "S3QueryParsingError"
+    When I try select over object "data.csv" with query "SELECT LOWER(s._1) FROM S3Object s"
+    Then the select fails with HTTP 400 and code "S3QueryParsingError"
+
+  # Parquet input is behind the server's `select-parquet` feature (default
+  # off), so this scenario can only run on a feature-enabled suite — the
+  # `@parquet` tag keeps it out of every default pass, and the parquet CI leg
+  # runs it with `--features parquet` (docs/tests.md).
+  @parquet
+  Scenario: Parquet input projects, filters and renders nulls
+    Given I create bucket "select"
+    And a parquet object "data.parquet"
+    When I select over object "data.parquet" with query "SELECT s.name, s.price FROM S3Object s WHERE s.id >= 2"
+    Then the select results contain "bob,5.67" and "carol,9.99" but not "alice,12.34"
+    When I select over object "data.parquet" with query "SELECT * FROM S3Object s"
+    Then the select results contain "2,bob,,false,5.67"

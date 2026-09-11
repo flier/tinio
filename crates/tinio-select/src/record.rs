@@ -191,13 +191,8 @@ mod tests {
 
     fn params(header: Option<Header>) -> Params {
         Params {
-            field_delimiter: b',',
-            record_delimiter: b'\n',
-            quote: b'"',
-            escape: b'"',
-            comments: None,
             header,
-            allow_quoted_record_delimiter: true,
+            ..Default::default()
         }
     }
 
