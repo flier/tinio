@@ -34,6 +34,8 @@ use s3s::{
     s3_error,
 };
 
+#[cfg(feature = "acl")]
+use crate::_core::acl::Acl;
 #[cfg(feature = "copy")]
 use crate::backend::{
     conditions::{ConditionFailure, condition_error},
@@ -48,9 +50,7 @@ use crate::{
 };
 use crate::{
     _core::{
-        acl,
-        acl::Acl,
-        bucket,
+        acl, bucket,
         checksum::Algorithm,
         object,
         object::OBJECT_TAGS_MAX,

@@ -26,8 +26,10 @@
 //! management-plane GET is intercepted pre-route in `data.rs` and is not
 //! subject to the access-layer pipeline.
 
+#[cfg(feature = "acl")]
 use s3s::auth::Credentials;
 
+#[cfg(feature = "acl")]
 use crate::_core::acl::Acl;
 #[cfg(feature = "acl")]
 pub(crate) mod acls;

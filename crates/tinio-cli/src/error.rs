@@ -5,7 +5,9 @@
 
 use std::io;
 
-use crate::{_api, _config, _core::storage};
+#[cfg(feature = "api")]
+use crate::_api;
+use crate::{_config, _core::storage};
 
 /// A CLI failure carrying its exit code.
 ///

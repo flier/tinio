@@ -21,6 +21,8 @@ use s3s::{
 };
 use tracing::warn;
 
+#[cfg(not(feature = "acl"))]
+use crate::_core::acl;
 #[cfg(feature = "copy")]
 use crate::_core::storage::ByteRange;
 #[cfg(feature = "acl")]
