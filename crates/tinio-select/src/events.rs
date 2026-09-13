@@ -502,7 +502,20 @@ impl SelectIter {
             return;
         }
         if let Err(e) = self.step() {
+            // Flush before failing (deviation ⑤): the packer's staged frame
+            // belongs to elements that were read successfully before the
+            // failure, so the client receives their Records event and only
+            // then the error — dropping them would contradict the spec.
+            self.flush_staged();
             self.outbox.fail(e);
+        }
+    }
+
+    /// Flush the packer's staged frame, if any: the one rule both the failure
+    /// path and the EOF path end on.
+    fn flush_staged(&mut self) {
+        if let Some(bytes) = self.packer.take() {
+            self.flush_frame(bytes);
         }
     }
 
@@ -605,9 +618,7 @@ impl SelectIter {
             let bytes = serialize_row(&self.mode, &row)?;
             self.buffer_row(bytes)?;
         }
-        if let Some(bytes) = self.packer.take() {
-            self.flush_frame(bytes);
-        }
+        self.flush_staged();
         self.outbox.push(SelectEvent::Stats(self.tally.snapshot()));
         self.outbox.push(SelectEvent::End);
         Ok(())
@@ -1016,6 +1027,86 @@ mod tests {
                 Ok(SelectEvent::End),
             ]
         );
+    }
+
+    #[test]
+    fn json_document_streams_past_1mb_then_stats() {
+        // Deviation ①: an over-1 MB DOCUMENT streams element by element.
+        // Deviation ⑥: `bytes_processed` closes on the last element's start, so it
+        // is `scanned - 1` for a `[...]`-rooted document — the leading `[` belongs
+        // to no record. Pinned deliberately: no existing test covers DOCUMENT byte
+        // counters at all, and this value moves with deviation ⑥.
+        let elem = |tag: &str| {
+            format!(
+                "{{\"tag\":\"{tag}\",\"pad\":\"{}\"}}",
+                "a".repeat(400 * 1024)
+            )
+        };
+        let doc = format!("[{},{},{},{}]", elem("a"), elem("b"), elem("c"), elem("d"));
+        let scanned = doc.len() as u64;
+        assert!(
+            scanned > 1024 * 1024,
+            "the fixture must exceed the old whole-document cap"
+        );
+        let config = SelectConfig {
+            input_format: InputFormat::Json(json::Params {
+                ty: json::Type::Document,
+            }),
+            output: OutputMode::Json(JsonOutputParams::default()),
+            ..Default::default()
+        };
+        let events = run("SELECT * FROM S3Object", config, doc.as_bytes());
+        let stats = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(SelectEvent::Stats(c)) => Some(*c),
+                _ => None,
+            })
+            .expect("Stats before End");
+        assert_eq!(stats.bytes_scanned, scanned);
+        assert_eq!(stats.bytes_processed, scanned - 1);
+        let rows: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                Ok(SelectEvent::Records(b)) => Some(b.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(rows.iter().filter(|&&b| b == b'\n').count(), 4);
+        assert!(matches!(events.last(), Some(Ok(SelectEvent::End))));
+    }
+
+    #[test]
+    fn json_document_reports_the_cap_after_prior_records() {
+        // Deviation ⑤: a DOCUMENT malformation surfaces in-stream, after the records
+        // that preceded it — the first element's record stands, then the over-cap
+        // element errors the stream out.
+        let big = "a".repeat(1024 * 1024);
+        let doc = format!("[{{\"id\": 1}}, {{\"x\": \"{big}\"}}]");
+        let config = SelectConfig {
+            input_format: InputFormat::Json(json::Params {
+                ty: json::Type::Document,
+            }),
+            output: OutputMode::Json(JsonOutputParams::default()),
+            ..Default::default()
+        };
+        let events = run("SELECT * FROM S3Object", config, doc.as_bytes());
+        let first_err = events
+            .iter()
+            .position(Result::is_err)
+            .expect("a stream error");
+        assert!(
+            events[..first_err]
+                .iter()
+                .any(|e| matches!(e, Ok(SelectEvent::Records(_)))),
+            "the first element's record must precede the error"
+        );
+        match &events[first_err] {
+            Err(crate::Error::Format(m)) => assert_eq!(m, "input record exceeds 1 MB"),
+            other => panic!("expected the reader cap error, got {other:?}"),
+        }
     }
 
     #[test]

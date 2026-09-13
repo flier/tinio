@@ -3695,6 +3695,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "rust_decimal",
+ "serde",
  "serde_json",
  "smart-default",
  "sqlparser",

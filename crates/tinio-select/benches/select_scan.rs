@@ -1,5 +1,5 @@
 //! Criterion bench: CSV full scan vs filtered scan (select-object-content
-//! plan Task 15).
+//! plan Task 15) plus the JSON DOCUMENT scan (json-streaming plan Task 11').
 //!
 //! Fixture: a 100k-row, 4-column headerless CSV (default `_1.._4` names)
 //! generated once in setup and held in memory — in-memory only, no
@@ -18,6 +18,12 @@
 //! row after parse, so filtered scan's IO volume is identical); criterion
 //! reports it as MiB/s. `Cont`/`Stats`/`End` events use the default
 //! `SelectConfig` (the server's `ContPolicy`).
+//!
+//! `json_document_scan` drives the streaming `json::Reader` façade (Task 8)
+//! over an 897_751-byte array fixture. That fixture is deliberately under the
+//! old 1 MB whole-document cap, so the streaming rewrite is compared against
+//! the **pre-refactor** criterion baseline (which the old façade measured)
+//! with the same command.
 
 use std::{
     hint::black_box,
@@ -27,9 +33,13 @@ use std::{
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use tinio_select::{
-    events::{SelectConfig, SelectEvent, select_iter},
+    events::{InputFormat, SelectConfig, SelectEvent, select_iter},
+    json,
     sql::{QueryPlan, parse},
 };
+
+#[path = "../tests/support/json_fixture.rs"]
+mod json_fixture;
 
 /// Fixture rows (plan Task 15: 100k-row CSV).
 const ROWS: usize = 100_000;
@@ -98,5 +108,46 @@ fn filtered_scan(c: &mut Criterion) {
     );
 }
 
-criterion_group!(benches, full_scan, filtered_scan);
+/// Benchmark fixture rows (JSON). 897 751 bytes as generated, deliberately:
+/// the doc must stay *under* the 1 MB whole-document cap so the pre-refactor
+/// implementation can read it too — a bigger fixture would make the before/after
+/// incomparable rather than merely slow.
+const JSON_ELEMENTS: usize = 10_000;
+
+/// JSON DOCUMENT scan: an array of small objects, streamed (2026-09-12).
+fn json_document_scan(c: &mut Criterion) {
+    let mut doc = String::from("[");
+    for i in 0..JSON_ELEMENTS {
+        if i > 0 {
+            doc.push(',');
+        }
+        doc.push_str(&json_fixture::element_compact(i as u64));
+    }
+    doc.push(']');
+    let doc = doc.into_bytes();
+    let plan = parse("SELECT * FROM S3Object").unwrap();
+    // Struct-update form, matching `events.rs:995-1001` — also what keeps
+    // `clippy::field_reassign_with_default` quiet under `-D warnings`.
+    let config = SelectConfig {
+        input_format: InputFormat::Json(json::Params {
+            ty: json::Type::Document,
+        }),
+        ..Default::default()
+    };
+    let mut group = c.benchmark_group("json_document_scan");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_secs(WARM_UP));
+    group.measurement_time(Duration::from_secs(MEASURE));
+    group.throughput(Throughput::Bytes(doc.len() as u64));
+    group.bench_function("select_star", |b| {
+        b.iter_batched(
+            || Box::new(Cursor::new(doc.clone())) as Box<dyn Read + Send>,
+            |input| drain(plan.clone(), config.clone(), input),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(benches, full_scan, filtered_scan, json_document_scan);
 criterion_main!(benches);

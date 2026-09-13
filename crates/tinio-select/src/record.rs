@@ -102,6 +102,14 @@ pub fn decompressed(
 /// Measured on the reader's own span accounting: the record's first byte
 /// through its terminator (a span that may also include comment lines
 /// immediately preceding the record, which the `csv` parser consumes inline).
+/// Amended 2026-09-12 (json-streaming): for JSON the cap binds each root
+/// (a DOCUMENT array's elements count separately; a single-value root is
+/// one record). Amended 2026-09-13 (Q9(a)/Q15): the cap is charged per
+/// root PULL — every served byte counts (matched values, skipped subtrees
+/// and delimiters alike) — and deviation ③'s tier is NOT outside it: a
+/// single-value root's pull is charged like any other, so an over-1 MB
+/// document errors instead of accumulating without bound. The memory
+/// backstop stays "skip without materializing + one root ≤ 1 MB".
 pub(crate) const MAX_RECORD: u64 = 1024 * 1024;
 pub(crate) const CAP_MESSAGE: &str = "input record exceeds 1 MB";
 
@@ -120,8 +128,9 @@ pub struct ScanRange {
 /// `[start, end]` with `end = None` meaning "no upper bound" (the stream's
 /// own EOF). Pre-range records are consumed and dropped; the first record
 /// whose start passes `end` stops the stream (`Ok(None)`), and nothing past
-/// it is ever read. JSON DOCUMENT's whole object is one byte-0 record, so
-/// `start > 0` yields nothing — correct, not a bug (spec §Background).
+/// it is ever read. JSON DOCUMENT records report their root element's start
+/// (2026-09-12 json-streaming, spec D6): the window filters them like any
+/// other framing; a single-object root still starts at byte 0.
 pub struct RangeFilter<R: RecordReader> {
     inner: R,
     start: u64,
@@ -349,6 +358,8 @@ mod tests {
 
     #[test]
     fn document_start_above_zero_yields_nothing() {
+        // The single object root starts at byte 0, so `start = 1` still drops
+        // it — element-level offsets keep this case (spec D6).
         let plan = parse("SELECT * FROM S3Object").unwrap();
         let reader = json::Reader::new(
             Cursor::new(b"{\"a\": 1}\n".to_vec()),
@@ -363,6 +374,31 @@ mod tests {
                 start: 1,
                 end: None,
             },
+        );
+        assert_eq!(r.next().unwrap(), None);
+    }
+
+    #[test]
+    fn document_scan_range_filters_elements_by_start() {
+        let plan = parse("SELECT * FROM S3Object").unwrap();
+        let reader = json::Reader::new(
+            Cursor::new(b"[{\"a\": 1}, {\"b\": 2}]".to_vec()),
+            json::Params {
+                ty: json::Type::Document,
+            },
+            &plan.from,
+        );
+        // Element 2 starts at 11: the window [11, infinity) keeps only it.
+        let mut r = RangeFilter::new(
+            reader,
+            ScanRange {
+                start: 11,
+                end: None,
+            },
+        );
+        assert_eq!(
+            r.next().unwrap(),
+            Some(Record::Json(Some(serde_json::json!({"b": 2}))))
         );
         assert_eq!(r.next().unwrap(), None);
     }
