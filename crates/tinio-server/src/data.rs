@@ -1098,19 +1098,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_invalid_bucket_name_is_400_by_s3s_not_403() {
-        // op-review C1: s3s validates the path in `prepare` (AwsNameValidation)
-        // BEFORE the route matches — an invalid bucket (uppercase) is a 400
-        // InvalidBucketName, never a 403 CORS denial from the route.
+    async fn preflight_invalid_bucket_name_is_403_from_the_route() {
+        // s3s 0.15 parsed the path in `prepare` (AwsNameValidation) BEFORE
+        // route matching — an invalid bucket (uppercase) was a 400
+        // InvalidBucketName and this route never ran. s3s 0.16 matches the
+        // custom route FIRST and lets it claim the request: a matched route
+        // skips path classification, so `PreflightRoute` answers — 403
+        // AccessDenied, the CORS mismatch message, never a 400. The route
+        // re-checks the name itself (`bucket_from_uri` → `parse_path_style`,
+        // the same AwsNameValidation): "MyBucket" fails that parse, the
+        // denial site here.
         let (addr, shutdown, handle) = spawn_plane().await;
         let (status, body) = raw_request(
             addr,
             "OPTIONS /MyBucket/key HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n",
         )
         .await;
-        let text = String::from_utf8_lossy(&body);
-        assert_eq!(status, 400, "{text}");
-        assert!(text.contains("InvalidBucketName"), "{text}");
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert_eq!(status, 403, "{text}");
+        assert!(text.contains("<code>accessdenied</code>"), "{text}");
+        assert!(
+            text.contains("corsresponse: this cors request is not allowed"),
+            "{text}"
+        );
+        // The pre-0.16 answer is gone: the 400 never reaches the wire.
+        assert!(!text.contains("invalidbucketname"), "{text}");
+        // A denial is bare — no CORS decoration (denials never echo ACAO).
+        assert!(!text.contains("access-control-allow-origin"), "{text}");
         shutdown.send(true).unwrap();
         handle.await.unwrap();
     }

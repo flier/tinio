@@ -9,7 +9,7 @@
 //! by `last_record_start` are therefore uncompressed stream bytes — the
 //! basis of ScanRange (`RangeFilter`).
 
-use std::io::Read;
+use std::io::{self, Read};
 
 use bzip2::read::MultiBzDecoder;
 use flate2::read::MultiGzDecoder;
@@ -97,21 +97,37 @@ pub fn decompressed(
     }
 }
 
-/// AWS input-record cap (design §1, review 2026-09-05 #3): a record over
-/// 1 MB errors the stream out — bounds memory, defuses decompression bombs.
-/// Measured on the reader's own span accounting: the record's first byte
-/// through its terminator (a span that may also include comment lines
-/// immediately preceding the record, which the `csv` parser consumes inline).
-/// Amended 2026-09-12 (json-streaming): for JSON the cap binds each root
-/// (a DOCUMENT array's elements count separately; a single-value root is
-/// one record). Amended 2026-09-13 (Q9(a)/Q15): the cap is charged per
-/// root PULL — every served byte counts (matched values, skipped subtrees
-/// and delimiters alike) — and deviation ③'s tier is NOT outside it: a
-/// single-value root's pull is charged like any other, so an over-1 MB
-/// document errors instead of accumulating without bound. The memory
-/// backstop stays "skip without materializing + one root ≤ 1 MB".
+/// One record root. The memory defence is that unmatched subtrees are never
+/// materialized and nothing buffers the document: this cap binds each root value
+/// (a DOCUMENT over 1 MB streams fine as long as every root value fits). The
+/// exact `data_pos` span check is the cap authority; a charged `Read` backstop
+/// additionally aborts a grossly over-cap matched value mid-read at
+/// `MAX_RECORD + CAP_ALLOWANCE`, so a single over-cap root cannot be
+/// materialized whole. Sampling points are in the struson design spec,
+/// byte-supply section.
 pub(crate) const MAX_RECORD: u64 = 1024 * 1024;
 pub(crate) const CAP_MESSAGE: &str = "input record exceeds 1 MB";
+
+/// The pinned cap error, built in one place so its kind and its message cannot
+/// drift apart: `json::error`'s `From<ReaderError>` recognizes exactly this
+/// pair (`InvalidData` plus `CAP_MESSAGE`) and maps it back to the cap variant.
+/// Every mid-read raiser goes through here — `json::line`'s line-width check,
+/// `json::feed`'s charged `Read` backstop, `csv`'s read-ahead wrapper.
+pub(crate) fn cap_io_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, CAP_MESSAGE)
+}
+
+/// The allowance a charged `Read` wrapper adds over `MAX_RECORD`, shared by
+/// the two formats whose readers meter themselves rather than measuring a
+/// span after the fact (`json::feed`'s backstop, `csv`'s read-ahead wrapper).
+///
+/// Both readers look past the end of the record they are measuring — struson
+/// reads ahead in ~1 KiB fills and looks one byte further on delimiter bytes,
+/// the `csv` crate's own buffer prefetches across record boundaries — so the
+/// exact per-record verdict stays the span check's while this margin keeps a
+/// just-under-cap record from false-tripping. A grossly over-cap record still
+/// aborts after roughly a cap of input instead of buffering unboundedly.
+pub(crate) const CAP_ALLOWANCE: u64 = 64 * 1024;
 
 /// A resolved ScanRange window: a record counts when its first byte falls
 /// in `[start, end]`; `end = None` = no upper bound (the stream's own EOF).

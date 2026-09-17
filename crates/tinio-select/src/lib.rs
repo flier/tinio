@@ -24,4 +24,4 @@ pub mod record;
 pub mod row;
 pub mod sql;
 
-pub use self::error::{Error, IoError};
+pub use self::error::{Error, IoError, JsonInputError};

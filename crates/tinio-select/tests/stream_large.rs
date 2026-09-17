@@ -10,7 +10,7 @@ use std::{
 
 use flate2::write::GzEncoder;
 use tinio_select::{
-    json,
+    Error, json,
     record::{Compression, RecordReader, decompressed},
     row::Record,
     sql::parse,
@@ -50,10 +50,10 @@ fn large_document_streams_to_completion() {
         // Strict, not `>=`: `last` starts at 0, so this also requires the very
         // first record to start past the `[`, and a reader returning a constant
         // offset (which `start >= last` accepted) now fails. This is the only
-        // CI-level check of spec deviation 6 (element-level real offsets).
+        // CI-level check of spec deviation ⑤ (element-level real offsets).
         assert!(
             start > last,
-            "record starts must strictly advance (spec deviation 6): record \
+            "record starts must strictly advance (spec deviation ⑤): record \
              {count} starts at {start}, previous at {last}"
         );
         last = start;
@@ -65,7 +65,9 @@ fn large_document_streams_to_completion() {
 #[test]
 fn over_cap_element_errors_after_prior_records() {
     // The spec's cap-behaviour pin on the CI path (inline data, not the LFS
-    // fixture). `CAP_MESSAGE` is `pub(crate)`, so the literal is pinned here.
+    // fixture). The public accessor classifies the failure mode; the literal is
+    // the `CAP_MESSAGE` rendering, pinned here because the constant is
+    // `pub(crate)`.
     let big = "a".repeat(1024 * 1024);
     let doc = format!("[{{\"id\": 1}}, {{\"x\": \"{big}\"}}]");
     let plan = parse("SELECT * FROM S3Object").unwrap();
@@ -78,7 +80,22 @@ fn over_cap_element_errors_after_prior_records() {
     );
     assert!(matches!(r.next().unwrap(), Some(Record::Json(Some(_)))));
     match r.next() {
-        Err(tinio_select::Error::Format(m)) => assert_eq!(m, "input record exceeds 1 MB"),
+        // A separate crate can name and match the variant now: the public
+        // `JsonInputError` payload carries the classifiers, so telling the cap
+        // from another JSON failure needs no Display string.
+        Err(Error::Json(json)) => {
+            assert!(json.is_cap(), "{json:?}");
+            let e = Error::Json(json);
+            assert!(e.is_cap(), "{e:?}");
+            assert!(e.is_json_input(), "{e:?}");
+            // The crate-level Display — byte-identical to the old
+            // `Error::Format(CAP_MESSAGE)` rendering — is what the S3 Select
+            // layer surfaces to the client.
+            assert_eq!(
+                e.to_string(),
+                "S3 select: input error: input record exceeds 1 MB"
+            );
+        }
         other => panic!("expected the reader cap error, got {other:?}"),
     }
 }

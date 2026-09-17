@@ -25,6 +25,7 @@ serde_json = { workspace = true, features = [
 ] }
 smart-default.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
+struson.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
 uuid = { workspace = true, features = ["v4"] }

@@ -1,59 +1,137 @@
-//! JSON record readers: LINES / DOCUMENT framings over one streaming
-//! kernel — serde_json pulls one record root per call through a framing
-//! filter, and the FROM path runs as a compiled state machine on serde's
-//! event flow. Memory is bounded by one *pull*, never by the input: a LINES
-//! line (≤ 1 MB span) or one DOCUMENT array element; a single-value DOCUMENT
-//! root accumulates its whole match set in that one pull, and that pull is
-//! charged like any other, so it is bounded by the cap rather than unbounded
-//! (deviation ③, amended).
+//! JSON record readers: LINES / DOCUMENT framings over the struson kernel.
 //!
-//! Throughput: serde_json's `IoRead` reads one byte per call, so each handler
-//! hands its framing a `BufReader` (a second layer never engages — refills
-//! are capacity-sized and `BufReader::read` bypasses its buffer). The gap
-//! against the whole-record `from_slice` parse this replaces is the price of
-//! bounded memory, and it is real: `json_document_scan` in
-//! `benches/select_scan.rs` is the baseline, and the measured old→new
-//! criterion numbers live in the plan (Task 8).
+//! Kernel: one `struson::reader::JsonStreamReader` per root. Each handler
+//! drives it through the single `ValueSource` seam, and each pull reads one
+//! root value; the `Matcher` is the pausable stepper over the FROM path, and
+//! it stops as soon as one record (MISSING included) is queued, so a record
+//! reader charges the 1 MB cap at a batch boundary, with a charged `Read`
+//! backstop (`json::feed`) aborting a grossly over-cap value mid-read. An
+//! unmatched subtree goes through `skip_value`: validation without
+//! materialization. Numbers arrive as the verbatim token from
+//! `next_number_as_str`, the only position source is
+//! `current_position(false).data_pos` (`peek()` never advances it), and the
+//! trailing probe — a `peek()` after the top-level value panics — is
+//! `consume_trailing_whitespace`, which consumes the reader. LINES pulls
+//! exactly one whole line, DOCUMENT delivers exactly one record per delivery.
 //!
-//! Recorded deviations (spec 2026-09-12, docs/superpowers/specs/):
-//! ① DOCUMENT total size is unbounded — the 1 MB cap binds the root pull.
-//! ② A non-final Name step's duplicate key errors mid-stream: rows already
-//!   yielded by earlier pulls of that object are not retracted, and the
-//!   failing pull's own rows are dropped — `next` clears `pending` and sets
-//!   `done`, so a caller polling after the error sees a finished stream.
-//! ③ A single-value root accumulates its match set per pull — bounded by the
-//!   record cap that pull is charged against, not unbounded.
-//! ④ An invalid LINES line may parse-error before the span cap fires.
-//! ⑤ A DOCUMENT malformation surfaces after the records before it.
-//! ⑥ DOCUMENT records report element-start offsets and ScanRange filters
-//!   them (AWS: LINES-only — an extension).
+//! Memory is bounded by one *pull*, never by the input: a LINES line (≤ 1 MB
+//! span) or one DOCUMENT array element. A single-value DOCUMENT root
+//! accumulates its whole match set in that one pull, where the exact span check
+//! is the cap authority and a charged `Read` backstop (`feed::BudgetedRead`)
+//! aborts a grossly over-cap value mid-read, so memory is O(cap) with a small
+//! constant factor — the charge is in input and rendered-row bytes, so per-row
+//! container overhead sits outside it — not the whole document (deviation ⑦).
+//!
+//! Throughput baseline: the serde_json streaming kernel this module replaces
+//! measured json_document_scan at 47.080-52.227 ms / 16.393-18.185 MiB/s
+//! on 2026-09-13, Intel Core i7-14700KF. The struson kernel must not be
+//! slower than this (acceptance threshold, struson design spec, acceptance
+//! criteria).
+//!
+//! Throughput after the kernel swap: the same `json_document_scan` measured
+//! 42.209-44.780 ms / 19.119-20.284 MiB/s on 2026-09-13, Intel Core
+//! i7-14700KF (rustc 1.98.1). The whole interval sits below the baseline's
+//! 47.080-52.227 ms / 16.393-18.185 MiB/s, so the struson kernel is not
+//! slower. criterion's `change:` block reads `time: [-25.073% -9.6399%
+//! +10.886%] (p = 0.33 > 0.05)` and `thrpt: [-9.8176% +10.668% +33.462%]`
+//! ("No change in performance detected"): at that p the point estimate is not
+//! trustworthy, and the verdict rests on the disjoint absolute intervals, not
+//! on the change block. `json_document_scan` in `benches/select_scan.rs` is the
+//! baseline, and the gap against the whole-record `from_slice` parse is the
+//! price of bounded memory. Buffer layers: struson carries its own fixed 1 KiB
+//! read buffer, so DOCUMENT hands it the source directly; LINES wraps the
+//! source in `LineFraming`, whose own `BufReader` exists because the framing
+//! serves one byte per call and reports EOF at the newline.
+//!
+//! Recorded deviations from the serde_json kernel, in the numbering of the
+//! binding spec `docs/superpowers/specs/2026-09-12-json-streaming-struson-design.md`
+//! ("semantic preservation and deviations"):
+//! ① DOCUMENT total size is unbounded — the 1 MB cap binds each root instead:
+//!   an array document of elements each ≤ 1 MB streams at any size, while a
+//!   single-object or scalar root over 1 MB still errors.
+//! ② The timing of a non-final Name step's duplicate key is relaxed: the
+//!   stream errors as soon as a duplicate key is seen, so rows already
+//!   produced inside that object are not retracted. A final Name step stays
+//!   strict, holding the value until the object closes.
+//! ③ LINES cap versus parse-error priority: parsing is struson's and happens
+//!   as bytes are served, so an invalid line may parse-error before the line
+//!   width cap fires.
+//! ④ DOCUMENT error timing is streamed: a document-level format error is
+//!   exposed element by element instead of all-or-nothing, so records before
+//!   the failing element have been produced. An unterminated document's
+//!   `rows_before` follows the probes.
+//! ⑤ DOCUMENT records report real element-level offsets (uncompressed
+//!   absolute; a single-value root reports its value start, and an empty root
+//!   array's zero-match MISSING reports 0), and ScanRange filters them.
+//!   `last_record_start` is no longer always 0 under DOCUMENT, and
+//!   `BytesProcessed` advances with the scan.
+//! ⑥ The cap is charged over a root value's own span: element separators and
+//!   whitespace belong to no span, and the `]` is not part of the last
+//!   element, so an element, a single-value root, or a line of exactly 1 MB
+//!   passes at the line.
+//! ⑦ Cap timing and mid-root interruption: an array root is measured per
+//!   element span at that element's end, while a single-value root is sampled
+//!   and compared at batch boundaries. The exact span check is the cap
+//!   authority; a charged `Read` backstop (`feed::BudgetedRead`, abort
+//!   threshold `MAX_RECORD + 64 KiB`) additionally stops a grossly over-cap
+//!   matched value mid-read, so memory is O(cap) with a small constant factor
+//!   rather than the whole document: the bound is on the charged bytes (input
+//!   bytes served and the rendered length of the queued rows), so the per-row
+//!   `Value`/`Map`/`Vec` overhead and the member-key index sit outside the
+//!   measurement. Unmatched subtrees still buffer nothing and struson's read
+//!   buffer stays a fixed 1 KiB.
+//! ⑧ Number tokens are no longer normalized: serde_json's arbitrary-precision
+//!   mode rewrote a signless exponent (`1e309` → `1e+309`), while struson's
+//!   `next_number_as_str()` is the input token verbatim, so `RawNumber`
+//!   replays the input from now on.
+//! ⑨ Error types and message sources changed: a JSON input error moved from
+//!   `Error::Format(String)` to the structured `Error::Json(json::Error)`,
+//!   and the wording comes from struson's `ReaderError` variants instead of
+//!   serde_json. The blast radius is 16 sites; the cap's Display is verbatim
+//!   unchanged and the trailing-data messages are synthesized by the handlers
+//!   with the old wording. One distribution moved: the retired trailing probe
+//!   deserialized a second value, so it could tell `{} {}` (our message) from
+//!   `{} x` (serde's error). `consume_trailing_whitespace` reports ANY
+//!   trailing byte as `TrailingData` and cannot tell those shapes apart, so
+//!   `{} x` is now reported by the SAME synthesized trailing message as
+//!   `{} {}` / `5 {}` — which supersedes the spec's narrative for that one
+//!   row of `document_single_root_trailing_garbage_errors`; `5x` / `123#`
+//!   still fail during the value read.
+//! ⑩ Test deletion: three tests pinned serde_json's reserved-key mechanism
+//!   (`$serde_json::private::Number`, the `NUMBER_TOKEN` constant with
+//!   them), which does not exist under the new kernel; duplicate-key collapse
+//!   is pinned again by a test that does not depend on engine internals.
+//! ⑪ The depth limit moved implementation point: serde_json's recursion
+//!   threshold 128 became `ReaderSettings::max_nesting_depth = 128` (struson's
+//!   default), with zero behavioural change.
+//! ⑫ The `pending_high` read points changed: the high-water pin moved into
+//!   `Matcher`, the handlers expose a `#[cfg(test)] pending_high()`, and the
+//!   two `document.rs` assertions were rewritten with unchanged semantics.
+//! ⑬ A new JSON-side error module: `crate::Error` gained the `Json` variant
+//!   (it keeps its derived `PartialEq`), and `json/error.rs` was added with
+//!   `json::Error`, which derives `PartialEq` too: its `Io` payload is the
+//!   crate's own `IoError` newtype — never a bare `io::Error` — so the
+//!   hand-written impl that payload used to force is gone.
 
-pub(crate) mod core;
 pub(crate) mod document;
-pub(crate) mod framing;
+pub(crate) mod error;
+pub(crate) mod feed;
+pub(crate) mod line;
 pub(crate) mod lines;
 pub(crate) mod matcher;
+pub(crate) mod source;
+#[cfg(test)]
+pub(crate) mod struson_contract;
+pub(crate) mod tail;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod value;
 
-use std::io::{Error as IoError, ErrorKind, Read};
+use std::io::Read;
 
 pub(crate) use value::{json_lookup, to_value};
 
 use crate::{error::Error, record::RecordReader, row::Record, sql::FromClause};
-
-/// The `serde_json::Error` → crate `Error` tail both handlers' `map_err` ends
-/// on: an io error keeps its kind, anything else becomes a `Format` error
-/// under the `json input` prefix. Each handler keeps only its own precedence
-/// arms in front of this.
-pub(crate) fn json_error(e: serde_json::Error) -> Error {
-    if e.is_io() {
-        let kind = e.io_error_kind().unwrap_or(ErrorKind::Other);
-        return Error::from(IoError::new(kind, e.to_string()));
-    }
-    Error::Format(format!("json input: {e}"))
-}
 
 /// JSON input framing (S3 Select `InputSerialization.JSON.Type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,15 +152,17 @@ pub struct Reader<R: Read> {
 }
 
 enum Handler<R: Read> {
-    Lines(lines::Lines<R>),
-    Document(document::Document<R>),
+    // Both variants are boxed: each carries a reader plus a matcher frame
+    // stack, and the two differ in size enough to trip clippy's variant lint.
+    Lines(Box<lines::Lines<R>>),
+    Document(Box<document::Document<R>>),
 }
 
 impl<R: Read> Reader<R> {
     pub fn new(reader: R, params: Params, from: &FromClause) -> Self {
         let inner = match params.ty {
-            Type::Lines => Handler::Lines(lines::Lines::new(reader, from)),
-            Type::Document => Handler::Document(document::Document::new(reader, from)),
+            Type::Lines => Handler::Lines(Box::new(lines::Lines::new(reader, from))),
+            Type::Document => Handler::Document(Box::new(document::Document::new(reader, from))),
         };
         Self { inner }
     }
@@ -348,15 +428,16 @@ mod tests {
     fn raw_number_passthrough_no_decimal_parse() {
         // Arbitrary precision: an exponential token never hits f64 (1e309
         // overflows f64) or the decimal spine — `RawNumber` carries it
-        // through. Known serde_json normalization (verified 1.0.151): its
-        // arbitrary-precision scanner rewrites a signless exponent as
-        // `e+` — `1e309` becomes `1e+309` — so the token is preserved up
-        // to that sign-injection, never re-parsed.
+        // through. The retired serde_json arbitrary-precision scanner
+        // rewrote a signless exponent as `e+` (`1e309` → `1e+309`); that
+        // injection left with the kernel, and struson's
+        // `next_number_as_str()` replays the input token verbatim
+        // (deviation ⑧).
         let rows = run("SELECT x FROM S3Object s", Type::Lines, "{\"x\": 1e309}\n");
         assert_eq!(rows[0].keys, vec!["x"]);
-        assert_eq!(rows[0].vals, vec![raw("1e+309")]);
+        assert_eq!(rows[0].vals, vec![raw("1e309")]);
         let rows = run("SELECT * FROM S3Object s", Type::Lines, "{\"x\": 1e309}\n");
-        assert_eq!(rows[0].vals, vec![raw("1e+309")]);
+        assert_eq!(rows[0].vals, vec![raw("1e309")]);
         // A plain integer token is verbatim.
         let rows = run(
             "SELECT x FROM S3Object s",

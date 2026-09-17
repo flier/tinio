@@ -3,6 +3,8 @@ use std::io;
 use derive_more::{Deref, From, PartialEq};
 use thiserror::Error;
 
+use crate::json::error::Error as JsonError;
+
 /// `std::io::Error` compared by `kind()` — the payload is not `PartialEq`,
 /// and whole-event-sequence assertions in the events adapter only need the
 /// kind.
@@ -13,6 +15,26 @@ pub struct IoError(io::Error);
 impl PartialEq for IoError {
     fn eq(&self, other: &Self) -> bool {
         self.kind() == other.kind()
+    }
+}
+
+/// A JSON input failure, nameable from outside the crate.
+///
+/// `json::Error` stays `pub(crate)`: its variants carry `struson` types
+/// (`ValueType`, `JsonReaderPosition`, `UnexpectedStructureKind`), and a public
+/// variant holding them would make `struson` a de-facto public dependency. This
+/// newtype is the public face `Error::Json` exposes instead — downstream can
+/// name and match the variant — and it forwards Display verbatim, so the
+/// rendered crate-level message is byte-identical.
+#[derive(Debug, Error, From, PartialEq)]
+#[error(transparent)]
+pub struct JsonInputError(pub(crate) JsonError);
+
+impl JsonInputError {
+    /// The 1 MB per-root record cap — the only JSON failure the S3 Select layer
+    /// reports specially.
+    pub fn is_cap(&self) -> bool {
+        matches!(self.0, JsonError::Cap)
     }
 }
 
@@ -34,6 +56,9 @@ pub enum Error {
     MissingHeader(String), // -> Custom("MissingHeaderName") in-stream
     #[error("S3 select: input error: {0}")]
     Format(String),
+    /// JSON input failures: every mode keeps its own value (see json::error).
+    #[error("S3 select: input error: {0}")]
+    Json(#[from] JsonInputError),
     #[error("S3 select: io error: {0}")]
     #[from(forward)]
     Io(IoError),
@@ -45,11 +70,28 @@ pub enum Error {
     ParquetTooLarge,
 }
 
+/// Failure-mode classification for consumers outside the crate, which cannot
+/// name `json::Error` (`json::error` is `pub(crate)`) and would otherwise have
+/// to match on the Display string. `is_cap` delegates to the classifier on the
+/// `Json` payload, so both entry points give one verdict.
+impl Error {
+    /// The 1 MB per-root record cap — the failure the S3 Select layer reports
+    /// specially, and the only one it tells apart from a malformed document.
+    pub fn is_cap(&self) -> bool {
+        matches!(self, Self::Json(e) if e.is_cap())
+    }
+
+    /// Any JSON input failure, the cap included.
+    pub fn is_json_input(&self) -> bool {
+        matches!(self, Self::Json(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io as std_io, io::ErrorKind::NotFound};
 
-    use super::Error;
+    use super::{Error, JsonError, JsonInputError};
 
     #[test]
     fn display_messages() {
@@ -73,6 +115,10 @@ mod tests {
         assert_eq!(
             Error::Format("f".into()).to_string(),
             "S3 select: input error: f"
+        );
+        assert_eq!(
+            Error::Json(JsonError::Cap.into()).to_string(),
+            "S3 select: input error: input record exceeds 1 MB"
         );
         // std::io::Error Display wraps the custom message; assert the framing
         // and payload rather than the exact io formatting.
@@ -127,5 +173,39 @@ mod tests {
         assert_ne!(Error::TooLarge, Error::NestedCsv);
         assert_ne!(Error::TooLarge, Error::Parse("".into()));
         assert_ne!(Error::Parse("".into()), Error::TooLarge);
+    }
+
+    #[test]
+    fn is_cap_recognizes_only_the_cap() {
+        assert!(Error::Json(JsonError::Cap.into()).is_cap());
+        // The payload's classifier and the crate-level one give one verdict.
+        assert!(Error::Json(JsonError::Cap.into()).is_json_input());
+        assert!(JsonInputError::from(JsonError::Cap).is_cap());
+        // Another JSON failure is an input error, but not the cap.
+        assert!(!Error::Json(JsonError::Other("json input: boom".into()).into()).is_cap());
+        assert!(!JsonInputError::from(JsonError::Other("json input: boom".into())).is_cap());
+        assert!(!Error::from(std_io::Error::other("boom")).is_cap());
+        assert!(!Error::Format("f".into()).is_cap());
+    }
+
+    #[test]
+    fn is_json_input_covers_every_json_failure() {
+        assert!(Error::Json(JsonError::Cap.into()).is_json_input());
+        assert!(Error::Json(JsonError::Other("json input: boom".into()).into()).is_json_input());
+        // The CSV-ish format error is a different input failure.
+        assert!(!Error::Format("f".into()).is_json_input());
+        assert!(!Error::from(std_io::Error::other("boom")).is_json_input());
+    }
+
+    #[test]
+    fn non_json_errors_are_false_for_every_accessor() {
+        for e in [
+            Error::Format("f".into()),
+            Error::Parse("p".into()),
+            Error::TooLarge,
+        ] {
+            assert!(!e.is_cap(), "{e:?}");
+            assert!(!e.is_json_input(), "{e:?}");
+        }
     }
 }

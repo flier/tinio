@@ -502,7 +502,7 @@ impl SelectIter {
             return;
         }
         if let Err(e) = self.step() {
-            // Flush before failing (deviation ⑤): the packer's staged frame
+            // Flush before failing (deviation ④): the packer's staged frame
             // belongs to elements that were read successfully before the
             // failure, so the client receives their Records event and only
             // then the error — dropping them would contradict the spec.
@@ -1032,10 +1032,10 @@ mod tests {
     #[test]
     fn json_document_streams_past_1mb_then_stats() {
         // Deviation ①: an over-1 MB DOCUMENT streams element by element.
-        // Deviation ⑥: `bytes_processed` closes on the last element's start, so it
+        // Deviation ⑤: `bytes_processed` closes on the last element's start, so it
         // is `scanned - 1` for a `[...]`-rooted document — the leading `[` belongs
         // to no record. Pinned deliberately: no existing test covers DOCUMENT byte
-        // counters at all, and this value moves with deviation ⑥.
+        // counters at all, and this value moves with deviation ⑤.
         let elem = |tag: &str| {
             format!(
                 "{{\"tag\":\"{tag}\",\"pad\":\"{}\"}}",
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn json_document_reports_the_cap_after_prior_records() {
-        // Deviation ⑤: a DOCUMENT malformation surfaces in-stream, after the records
+        // Deviation ④: a DOCUMENT malformation surfaces in-stream, after the records
         // that preceded it — the first element's record stands, then the over-cap
         // element errors the stream out.
         let big = "a".repeat(1024 * 1024);
@@ -1104,7 +1104,7 @@ mod tests {
             "the first element's record must precede the error"
         );
         match &events[first_err] {
-            Err(crate::Error::Format(m)) => assert_eq!(m, "input record exceeds 1 MB"),
+            Err(crate::Error::Json(e)) => assert!(e.is_cap(), "{e:?}"),
             other => panic!("expected the reader cap error, got {other:?}"),
         }
     }

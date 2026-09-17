@@ -3,8 +3,7 @@
 
 use std::{
     cell::RefCell,
-    io,
-    io::{ErrorKind, Read},
+    io::{self, Read},
     rc::Rc,
 };
 
@@ -14,7 +13,7 @@ use smart_default::SmartDefault;
 
 use crate::{
     error::Error,
-    record::{CAP_MESSAGE, MAX_RECORD, RecordReader},
+    record::{CAP_ALLOWANCE, CAP_MESSAGE, MAX_RECORD, RecordReader, cap_io_error},
     row::{Columns, Field, Record, Value},
 };
 
@@ -80,22 +79,13 @@ struct CapState {
 /// giant field would buffer unboundedly before that check fires (the
 /// "defuses decompression bombs" claim did not hold for CSV; JSON checks
 /// incrementally and is safe). The wrapper counts bytes released to the
-/// reader since the last reset and errors past `MAX_RECORD` + the read-ahead
-/// allowance — the `csv` crate's internal buffer (8 KiB) prefetches across
-/// record boundaries, so the exact per-record decision stays the span check
-/// (same message) while the wrapper bounds the memory envelope.
+/// reader since the last reset and errors past `MAX_RECORD` +
+/// `record::CAP_ALLOWANCE` — the `csv` crate's internal buffer (8 KiB)
+/// prefetches across record boundaries, so the exact per-record decision stays
+/// the span check (same message) while the wrapper bounds the memory envelope.
 struct CappedRead<R: Read> {
     inner: R,
     state: Rc<RefCell<CapState>>,
-}
-
-/// Read-ahead allowance over the span cap for the wrapper: the internal
-/// buffer can prefetch the first bytes of the next record during a record's
-/// own fill, so a just-under-cap record would otherwise false-trigger.
-pub(crate) const CAP_READ_AHEAD: u64 = 64 * 1024;
-
-fn cap_with_allowance() -> u64 {
-    MAX_RECORD + CAP_READ_AHEAD
 }
 
 impl<R: Read> CappedRead<R> {
@@ -109,9 +99,9 @@ impl<R: Read> Read for CappedRead<R> {
         let n = self.inner.read(buf)?;
         let mut state = self.state.borrow_mut();
         state.count += n as u64;
-        if state.count > cap_with_allowance() {
+        if state.count > MAX_RECORD + CAP_ALLOWANCE {
             state.capped = true;
-            return Err(io::Error::new(ErrorKind::InvalidData, CAP_MESSAGE));
+            return Err(cap_io_error());
         }
         Ok(n)
     }

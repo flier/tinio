@@ -22,7 +22,7 @@ use sqlparser::{
     ast::{
         AccessExpr, BinaryOperator, CastKind, DuplicateTreatment, Expr, Function, FunctionArg,
         FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, Subscript,
-        UnaryOperator, Value as AstValue, ValueWithSpan,
+        UnaryOperator, Value as AstValue,
     },
 };
 
@@ -978,8 +978,9 @@ fn is_allowed_function(name: &ObjectName) -> bool {
 /// The payload-carrying forms (`Value`, `Like`) are judged by the evaluator's
 /// own operand checks below rather than by a second implementation of them, so
 /// a literal or an `ESCAPE` cannot pass the walk and then fail per row: the
-/// walk runs the same `literal`/`like_escape` the evaluator does and keeps
-/// their message, only on a request-level channel.
+/// walk runs the same `literal` the evaluator does, and the same
+/// [`escape_literal`] the evaluator delegates its literal ESCAPE operands to,
+/// keeping their message on a request-level channel.
 pub(crate) fn unsupported_form(expr: &Expr, missing_name: &str) -> Option<UnsupportedForm> {
     // Forms `eval` implements whose *shape* is the whole story, taken from its
     // positive match arms.
@@ -1026,7 +1027,7 @@ pub(crate) fn unsupported_form(expr: &Expr, missing_name: &str) -> Option<Unsupp
             any: false,
             escape_char,
             ..
-        } => match like_escape(escape_char) {
+        } => match escape_literal(escape_char) {
             Ok(_) => None,
             Err(Error::Value(m)) => Some(UnsupportedForm::Malformed(bounded(m))),
             Err(other) => Some(UnsupportedForm::Malformed(bounded(other.to_string()))),
@@ -1370,11 +1371,11 @@ enum LikeTok {
 fn eval_like(
     expr: &Expr,
     pattern: &Expr,
-    escape_char: &Option<ValueWithSpan>,
+    escape_char: &Option<Box<Expr>>,
     negated: bool,
     ctx: &RowCtx,
 ) -> Result<Value, Error> {
-    let escape = like_escape(escape_char)?;
+    let escape = like_escape(escape_char, ctx)?;
     let subject = eval(expr, ctx)?;
     let pattern = eval(pattern, ctx)?;
     let matched = match (&subject, &pattern) {
@@ -1393,22 +1394,52 @@ fn eval_like(
     }))
 }
 
-/// The ESCAPE operand: exactly one character. sqlparser 0.62 carries it as
-/// a `ValueWithSpan` (a single-quoted literal), validated here — the
-/// parser accepts any literal string, so a bad one is a value error.
-fn like_escape(v: &Option<ValueWithSpan>) -> Result<Option<char>, Error> {
-    match v {
-        None => Ok(None),
-        Some(w) => {
-            let ast::Value::SingleQuotedString(s) = &w.value else {
-                return Err(Error::Value("ESCAPE must be a single character".into()));
-            };
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => Ok(Some(c)),
-                _ => Err(Error::Value("ESCAPE must be a single character".into())),
-            }
-        }
+/// The one error the ESCAPE operand ever answers with — the walk and `eval`
+/// share it, so a request-level refusal and a per-row one read identically.
+fn escape_error() -> Error {
+    Error::Value("ESCAPE must be a single character".into())
+}
+
+/// Exactly one character, or [`escape_error`].
+fn one_char(s: &str) -> Result<char, Error> {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(c),
+        _ => Err(escape_error()),
+    }
+}
+
+/// The ESCAPE operand as the request-level walk judges it. 0.63 carries the
+/// operand as an arbitrary expression (0.62 carried an already-evaluated
+/// `ValueWithSpan`), but the walk holds no row to resolve one against: a
+/// literal is checked on its own kind, and every other spelling keeps the
+/// operand's own verdict — the one `parse` has always answered for a bad one.
+fn escape_literal(v: &Option<Box<Expr>>) -> Result<Option<char>, Error> {
+    let Some(e) = v else { return Ok(None) };
+    match &**e {
+        // The parser accepts any literal string, so a bad one is a value
+        // error; a non-string literal (`ESCAPE 5`) has always been one too.
+        Expr::Value(w) => match &w.value {
+            ast::Value::SingleQuotedString(s) => one_char(s).map(Some),
+            _ => Err(escape_error()),
+        },
+        _ => Err(escape_error()),
+    }
+}
+
+/// The evaluator's view of the same operand: a literal takes the walk's own
+/// verdict, and any other expression — only a hand-built plan can carry one,
+/// since the walk refuses them at request level — is resolved against the row
+/// first. Its whole contract is the escape character, so a value that is not
+/// one, or a form `eval` refuses, answers the same error.
+fn like_escape(v: &Option<Box<Expr>>, ctx: &RowCtx) -> Result<Option<char>, Error> {
+    let Some(e) = v else { return Ok(None) };
+    if matches!(&**e, Expr::Value(_)) {
+        return escape_literal(v);
+    }
+    match eval(e, ctx) {
+        Ok(Value::String(s)) => one_char(&s).map(Some),
+        _ => Err(escape_error()),
     }
 }
 
@@ -1672,7 +1703,7 @@ mod tests {
     use sqlparser::ast::helpers::attached_token::AttachedToken;
     use sqlparser::ast::{
         CaseWhen, CeilFloorKind, DataType, DateTimeField, ExtractSyntax, FunctionArgumentList,
-        Interval, TypedString,
+        Interval, TypedString, ValueWithSpan,
     };
 
     use super::*;
@@ -2189,9 +2220,10 @@ mod tests {
 
     #[test]
     fn like_escape_must_be_one_char() {
-        // sqlparser 0.62 parses any literal string after ESCAPE; standard
-        // SQL takes exactly one character. Request-level since the walk began
-        // consulting the evaluator's own check: the two-char form is a 400,
+        // sqlparser accepts any string after ESCAPE — any expression at all,
+        // since 0.63 — while standard SQL takes exactly one character.
+        // Request-level since the walk began consulting the evaluator's own
+        // check: the two-char form is a 400,
         // and the runtime arm below is the backstop (the parse half can no
         // longer reach it, so the plan is built by hand — the same shape the
         // parity corpus below uses).
@@ -2364,12 +2396,10 @@ mod tests {
         let compound = Expr::CompoundIdentifier(vec![Ident::new("s"), Ident::new("CAST")]);
         assert!(unsupported_form(&compound, "sentinel").is_none());
         // `CAST(x AS INT)` — the *variant* — is not, and is named statically.
-        // (`Expr::Cast` in 0.62 has five fields; `array` is the one easy to miss.)
         let cast = Expr::Cast {
             kind: CastKind::Cast,
             expr: Box::new(Expr::Identifier(Ident::new("x"))),
             data_type: DataType::Int(None),
-            array: false,
             format: None,
         };
         match unsupported_form(&cast, "sentinel") {
@@ -2797,13 +2827,15 @@ mod tests {
             kind,
             expr: Box::new(col()),
             data_type: DataType::Int(None),
-            array: false,
             format: None,
         }
     }
 
     /// A `Like` node over `subject`, parameterised by the three fields the
-    /// tests vary — the node's other two are always the same here.
+    /// tests vary — the node's other two are always the same here. The ESCAPE
+    /// operand is taken as the literal 0.62 carried and boxed as the
+    /// expression 0.63 carries it as: the two hand-built plans below are the
+    /// runtime arm's only channel.
     fn like_expr(
         subject: &str,
         any: bool,
@@ -2815,7 +2847,7 @@ mod tests {
             any,
             expr: Box::new(Expr::Identifier(Ident::new(subject))),
             pattern: Box::new(str_lit(pattern)),
-            escape_char,
+            escape_char: escape_char.map(|v| Box::new(Expr::Value(v))),
         }
     }
 
