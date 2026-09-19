@@ -1,0 +1,107 @@
+# `--sandbox`: the shared facts, and the conventions the four plans run under
+
+**What this document is.** `2026-09-18-sandbox-p0-core.md`, `-p1-linux.md`, `-p2-windows.md` and `-p3-macos.md` implement one feature in four phases across three platforms. A fact that two of them could state has exactly one owner (`docs/superpowers/README.md`), and for the facts below that owner is this document: they belong to no single phase, so each plan refers to a section here instead of writing it out again.
+
+**Why it exists.** A review pass over the four plans found one defect in four shapes. The doc-example rule was written out in three wordings, the `unsafe_code` allocation in four, the list of what a launcher platform owns was carried by P2 and P3 "in the same words" by P2's own account, and `probe_read_only` was assigned to whichever of P2 and P3 happened to land first. None of those is a disagreement between the documents; each is the state that precedes one.
+
+**This document is not a phase.** It has no tasks, no checkboxes and nothing to run. It is read beside the four plans, and it restates no design decision: `docs/superpowers/specs/2026-09-18-sandbox-design.md` remains the authority for every `design §N` and `decision N` cited here.
+
+## 1. The conventions all four plans run under
+
+Each row is a project rule with an owner outside this feature. A plan states its own delta and never the rule; the deltas are arithmetic — how many `clippy::absolute_paths` sites a plan's own code blocks leave for the implementer, and which functions carry its crate's `#[allow(unsafe_code)]`.
+
+| Rule | Owner |
+|---|---|
+| Test-first; Red-Green-Refactor strictly enforced | constitution IV (`.specify/memory/constitution.md`) |
+| No `unwrap()` / `expect()` / `panic!()` in library code; tests may use them | constitution II |
+| Every public item carries a doc comment with at least one runnable rustdoc example; `no_run` where the example has side effects or would launch a process | constitution III |
+| `unsafe` only where no safe alternative exists, in the smallest scope, with documented invariants and an explicit review justification | constitution II |
+| Imports: top `use`, never inline; 3+ segment paths go through `use` (`clippy::absolute_paths`) | `docs/style.md` §Imports, `docs/cargo.md` §Rules |
+| Manifests: no comments in `Cargo.toml`, workspace-pinned dependencies, group order | `docs/cargo.md` |
+| The pre-push gate is the **Standard acceptance** block, run in full; a plan adds its own legs to that list and never substitutes a shorter one | `docs/tests.md` |
+| The lint follows the implementation: a platform backend is `unsafe_code = "deny"` with its `#[allow(unsafe_code)]` sites enumerated in design decision 14, while `tinio-sandbox-core`, the facade and every crate with no `unsafe` site stay `forbid` | `docs/cargo.md` §Rules + design decision 14 |
+| English only in code, comments, docs and commit messages | `CLAUDE.md` |
+| No agent or tool attribution in commit messages or PR bodies | `CLAUDE.md` |
+| Documents are not hard-wrapped: one line per paragraph, list item and table row | `docs/style.md` §Docs & scripts (the operator's global `CLAUDE.md` carries the same rule; the project's `CLAUDE.md` does not) |
+| Git writes — commit, push, merge, rebase, stash — are never automatic | `CLAUDE.md` |
+
+**The last row and a plan's `Commit` step are two different statements, and both hold.** The step fixes the *scope* of a phase — which files, one commit per task. Authorisation is `CLAUDE.md`'s and is per operation: a commit a plan specifies is still asked for before it runs, and nothing beyond it is.
+
+**A plan that finds itself writing one of these rules out in full is looking at a second copy.** The `docs/cargo.md` lint bullet is the worked case: P1 Task 9 Step 4 writes it once, and P2 and P3 each verify the line rather than restating it.
+
+**The plans' own code blocks are not swept for the imports rule, and this is one instruction rather than the three it used to be.** Satisfying it is the implementer's step rather than a precondition of the plan: each task's lint step runs `cargo clippy --all-targets -- -D warnings`, and what it reports *is* the list. Most of what it finds sits in test setup and FFI plumbing, where a bare `std::fs::write` or `std::mem::size_of` reads better than a wall of imports — correct those in place as you write the code, and do not relax the rule. **Each plan states only the count its own blocks leave** — P1 about 14, P3 about 80, P2 about 125 — because the count is the only part of this that is a plan's own.
+
+## 2. The crates: one topology, two shapes
+
+**Topology.** `tinio-sandbox-core` ← `tinio-sandbox-{linux,macos,windows}` ← `tinio-sandbox`. The layering is forced rather than stylistic: the platform crates implement the core's trait, so they depend on the core, so the crate that *selects* a platform cannot also *define* the trait. **A platform crate depending on the facade is a cycle and is forbidden** (design decision 3, which carries the sketch).
+
+**Every platform crate leaves the workspace buildable on every host**, because `members = ["crates/*"]` has no per-target form: all three compile and lint on targets they do not serve. Two shapes satisfy that, and each crate takes one:
+
+| Shape | Taken by | What it costs |
+|---|---|---|
+| A crate-root `#![cfg(target_os = "…")]`, leaving the crate an empty library elsewhere | `-linux`, `-windows` | Nothing is gated per item; the whole crate exists only on its own target. |
+| The crate compiles everywhere, with each platform-specific item gated internally and a stub arm beside it | `-macos` | Every item carries its own `#[cfg]`. |
+
+**Whichever shape a crate takes, every separate target repeats the gate it needs.** A crate-root `#![cfg]` does not reach `src/bin/`, `tests/` or `examples/`, so each of those files opens with its own attribute.
+
+**What neither shape permits is an unconditional reference to an item that is configured out.** The measured case is `rustix`: it builds on Windows — it ships no crate-level gate and simply links a different backend — but its `mount`/`fs`/`process`/`thread` modules are absent there, so the first line of platform code naming one is `E0433: cannot find … in rustix`. That is why `tinio-sandbox-linux` takes the crate-root gate: its code uses `std::os::fd` and those modules throughout.
+
+## 3. What the core owns, and what a launcher platform owns
+
+The core owns the payload *type*, the event *type*, the relay that decodes and re-emits, the adoption *rule*, the supervision loop, the argv-element helpers and the terminal record. **Its spellings are P0 Task 2's** — every name, signature and field, reconciled there once and consumed unchanged; the design's §1 sketch is indicative and P0 is normative (design §1). Both launcher plans consume that surface and add nothing to it.
+
+**Both child-launching platforms own the same list.** It is stated here once because it is one list with per-platform deltas, not two lists that happen to agree:
+
+- the child-side program and argv — the launcher re-invokes **itself**: program `std::env::current_exe()`, argv from `std::env::args_os()` filtered, with the listener-descriptor element appended.
+- the **rebuild** core's adoption rule deliberately leaves out — core hands back the listener as a descriptor, and turning it into a `TcpListener` is the platform's, which is what keeps that conversion inside the crate's one enumerated `unsafe` site.
+- the two pipes the child's standard handles are wired to: `piped` on stdin and on stdout, `inherit` on stderr, which is left untouched and unmediated because that is where every log goes.
+- the payload write — `serde_json` into the child's stdin, then the write end closed. The core has no `encode` method: the payload is `serde`'s, and the call site is where it is serialized.
+- the thread that drives the core's `Observer` over the child's stdout for as long as the child lives.
+- the signal relay, and the child-side stop hook that gives a forwarded stop somewhere to land.
+
+**The deltas are the platform's and stay in the platform's plan.** Windows adds `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` and the handle-list half of decision 16, the `Options { program, args }` test seam, and the console-control relay. macOS adds the profile's text, its allowance set and its pre-flight, and the listener's `FD_CLOEXEC` work.
+
+**Neither platform carries the program or the argv in `LaunchPlan`.** Both derive them from `current_exe()` and `args_os()`; Windows' `Options` overrides them for tests only.
+
+## 4. Names more than one document must spell the same way
+
+| Name | What it is | Owner |
+|---|---|---|
+| `adopted_listener` | The facade's platform-neutral name for the child's rebuild of its listener. It is why `Adopted` carries a descriptor number rather than a socket — the rebuild is each platform's own, and shared code reaches it by this one name. **The signature is `fn adopted_listener(adopted: &Adopted) -> tinio_sandbox::Result<TcpListener>`**: core's `Result`, so a caller can carry it with `?` alongside everything else the facade returns. P3's version returns `std::io::Result`; it changes to match, because the two only compiled side by side by accident — each `confined` returns `Box<dyn Error + Send + Sync>`, so a caller using core's `Result` would have silently turned a failed listener rebuild into `Error::Wait`, "could not wait for the confined child", which is a different failure entirely. | design §10 owns the name; this row owns the signature |
+| `on_stop` / `disarm` | The two **crate-level** names each launcher crate exports for the signal relay. There is no shared code between the crates and no core trait — Windows drives it from a console-control event, macOS from `signal-hook` — so the names are the whole contract. **Nothing else about them is shared, and the row used to imply otherwise**: the signatures differ (`on_stop(impl Fn() + Send + 'static)` on Windows, taking the shutdown hook; `on_stop(child_pid: i32)` on macOS, taking the pid), and so does what each facade re-exports — Windows' facade carries `on_stop` and leaves `disarm` on the platform crate, while macOS' carries `adopted_listener` and a `disarm_signal_relay` wrapper rather than the pair. A plan that adds `disarm` to the facade because this row names it would contradict P2. **macOS needs a third crate-level name, because the launcher's half and the child's half live in one module**: `relay::on_forwarded_stop(hook)` is the child-side hook — the thing a forwarded stop lands on — and `relay::on_stop(pid)` is the launcher-side arming, so the module cannot spell both `on_stop`. The facade presents the child-side one under the shared `on_stop`, which is the name shared code calls and the shape P2's `confined` calls too. | P0 Task 2 Step 6 states the crate-level rule; design §3 step 9 is the requirement |
+| `probe_read_only` | `tinio_config::server::probe_read_only`, the targeted single-key lookup of decision 18. | **P2 Task 11 Step 1** — P2 is the earlier of the two phases that need it, so the edit is P2's and P3 verifies it |
+| The `serve.rs` helpers — `parse_args`, `Args`, `sandbox_exposures`, `emit`/`emit_error` | One file, three plans. **P1 Task 7 owns every helper that lands in `crates/tinio-server/examples/serve.rs`**, because that task is what restructures the entry point and it lands first; P2 and P3 consume them and define none. This is not tidiness: the three plans independently defined `emit` and `emit_error` while adding the error frame, and two `fn emit` in one module is `E0428`. A helper a later plan needs that the P1 version does not provide is added **to P1's task**, not copied beside it. | **P1 Task 7**; P2 and P3 consume |
+| `serve`'s signature | `async fn serve(args: Args, config: Option<Config>, mut storage: FsStorage, inherited: Option<TcpListener>, stop: Option<watch::Receiver<bool>>) -> Result<(), Box<dyn Error + Send + Sync>>`. **Only the last two are optional, and each `None` is a fact about a platform**: Linux serves in the process that confined itself, binds its own listener and has nothing to forward a stop to, so it passes `storage, None, None`; the launcher platforms' child passes `storage, Some(listener), Some(stop)`, and `stop` is created in the child rather than carried across the launch. **`storage` is not optional**: every caller that reaches `serve` serves from one, so `None` had two readings — a caller bug, or "the body builds one" — and the plans took different ones until it was corrected. **A launcher must never construct an `FsStorage`**: constructing one opens the state database, and the child opens the same one; that rule is about the launcher/child pair, so a plain unconfined run, which *is* the server, builds its own. | **P1 Task 7**, which restructures the entry point; P2 and P3 call it and may not change it |
+
+## 5. Three things called a relay
+
+Name each by its own phrase, never by "the relay" alone:
+
+- the **event relay** — the child's stdout, decoded and re-emitted by the parent (design decision 19); core's `Observer`, driven by a thread the platform spawns.
+- the **signal relay** — a termination signal, moved from the launcher to the child while it waits (design §3 step 9, decision 20's second half); each launcher platform's own.
+- **exit-status forwarding** — the child's exit code carried back to the caller after it has exited (design §3 step 8); core's `supervise`.
+
+## 6. Verification
+
+Design §12 is the policy and is not restated here. Two of its consequences are shared by all three platform phases, and each is easy to state differently in each plan:
+
+- a platform's verification script lives in **that platform's own crate** — `wsl-chroot.sh`, `verify-windows.ps1`, `macos-sandbox-verify.sh` — for the reason §12 gives: everything it runs is that platform's.
+- a platform's verification goes in `docs/tests.md` under a `## Platform-gated verification (<platform>)` heading, in the compressed style of the existing WSL2 section. P1 Task 9 Step 3 adds the first lines to that section and P3 Task 10 Step 3 adds the macOS one.
+
+**What CI asserts and what a local script asserts are deliberately different answers**, and the difference is P3's to state: a leg shared with the rest of the matrix records refusals as evidence to read, while a quiet machine can assert on them (design §12's CI bullet, P3 Task 10).
+
+## 7. Logging: every core operation is traced
+
+**Every core operation of the sandbox emits a `tracing` event** — in the core and on all three platforms. The rule exists because this feature's characteristic failure is silent: a jail that was not built, an ACL that was not granted, a profile that granted more than intended, a filter that was skipped. None of those changes the exit status, and each is exactly what an operator has to reconstruct after the fact from a log.
+
+- **Levels, and the split matters because of what `serve` actually enables.** `info!` for the events that answer "was this process confined, and to what" — the resolved mode and model, the exposure set actually applied, the seccomp install or its skip, the launch with its pid, and the exit. `debug!` for the per-item detail behind them: each `unshare`, each map write, each mount, each bounding-set drop, each ACE grant and revoke, each relayed signal. The reason for the split is concrete rather than aesthetic: **`serve` builds its subscriber at a fixed `Verbosity::Info` with no environment filter** (`crates/tinio-server/src/log.rs` — `build_subscriber` takes a `Verbosity`, not an `EnvFilter`), so inside the serving process a `debug!`-only rule would emit nothing anyone could see until the `[log]` wiring lands with the CLI. A confinement that leaves no visible record is the failure this requirement exists to prevent. A window that installs its own subscriber — a launcher arm, which has no other subscriber yet — may show the `debug!` half as well; the split still matters, because the events that must survive a `serve`-owned subscriber are the `info!` ones.
+- **Fields, not sentences.** Every event carries the operation's own arguments as structured fields (`step`, `path`, `access`, `sid`, `pid`, `errno`) so a log is greppable by value rather than by prose. `warn!` for a documented degradation (the skipped seccomp filter is the one design §11 names). `error!` for a failure, emitted **where the returned `Error` is built**, so the log's `step` and the error's `step` are the same string and cannot drift apart.
+- **The sink is stderr, and a sandbox crate may install its own subscriber to get there.** Stdout is the event protocol and nothing else (design decision 19), so no tracing event may be written to it. Beyond that, either arrangement is fine: the process that owns the runtime may install the subscriber — in `serve` it already writes to stderr — or a crate may install its own for a window where nothing else has, which is what a launcher arm does, because it returns before `serve`'s subscriber exists. **Use `try_init` and never `init`**, so a subscriber the caller already installed wins and the crate does not silently replace it or panic.
+- **The core emits too, and it is not the same as a returned value.** The launcher machinery is where a stuck launch is diagnosed: `adopt`'s outcome and why, the payload decode, the relay's first terminal event, and what `Child::wait` returned. P1's `Seccomp` doc argues that a library which writes to stderr cannot be tested or silenced — that argument is about `eprintln!`, not about `tracing`, which emits nothing at all until a subscriber is installed; the plan keeps returning the value *and* traces the operation.
+- **The dependency.** `tracing` is already in `[workspace.dependencies]`, so each sandbox crate gains `tracing.workspace = true` and the workspace gains no new third-party dependency. `tracing-subscriber` joins the dev-dependencies of a crate whose tests assert on events.
+- **What counts as a core operation.** At minimum: the mode/model resolution and the availability probe; each `unshare`, each map write; each mount with its source and kind; `pivot_root` and the detach; the retained capability set and each drop; `capset`; the seccomp install or its skip; the jail directory; on Windows the package name and SID, the profile creation, each ACE grant and revoke, `CreateProcessW` with its pid, the Job object, the payload write, and each forwarded stop; on macOS the rendered profile's rule and parameter counts, the pre-flight and its failure, the close-on-exec change, the spawn, the payload write, and each relayed signal.
+- **How it is checked.** A crate's test for a core operation runs under a recording subscriber and asserts the event's `step` field, so "it logs" is a property a test can lose. In the end-to-end tests the `info!` half is what can be asserted by reading the child's stderr as it stands today — which is also what makes a failed launch diagnosable from a CI log rather than only from a reproduction. An earlier version of this row promised `RUST_LOG=tinio_sandbox=debug`; that holds only once a phase gives `serve`'s subscriber an environment filter, and no phase does yet.
+
+## The check, before a phase closes
+
+`docs/superpowers/README.md` carries the check. Run it per phase against this document too: if a task is about to write out a rule from §1, a crate shape from §2, a bullet from §3, a name from §4 or a relay from §5, then the plan it is being written into has grown a second copy of a fact that lives here.

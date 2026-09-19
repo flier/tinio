@@ -16,6 +16,7 @@
 - Cargo conventions: `docs/cargo.md`.
 - Code style: `docs/style.md` — garde, imports (3+ segments, enum variants, `tokio::fs`), Error, lib.rs, newtypes, derives (`parse-display`, `derive_more`), compressed prose.
 - Tests: `docs/tests.md` — async harness, cucumber/e2e cargo+run, Gherkin, migration vs unit/conformance.
+- Specs & plans: `docs/superpowers/README.md` — one definer per cross-document fact, and the ownership check that runs before a phase closes.
 
 ## Manual Edits
 
