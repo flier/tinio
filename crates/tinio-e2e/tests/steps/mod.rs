@@ -164,6 +164,10 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
 /// binary instead — configured from the same `config_from_tags` mapping
 /// the in-process hook uses (clients.rs translates `Capabilities` into the
 /// `--config` file and `FsKind` into the `TINIO_SCANNER` toggle).
+///
+/// The `@read-only` branch (FR-023) spawns a read-only fs plane with its
+/// state in a scratch home ([`Server::read_only`]) — every mutating
+/// operation answers `AccessDenied`.
 fn before_hook<'a>(
     _feature: &'a Feature,
     _rule: Option<&'a gherkin::Rule>,
@@ -191,6 +195,12 @@ fn before_hook<'a>(
                 Backend::Mem => Server::acl_mem(caps).await,
                 Backend::Fs => Server::acl(caps).await,
             }
+        } else if has_tag(&scenario.tags, "read-only") {
+            // The read-only plane (FR-023): every mutating operation
+            // answers AccessDenied. Checked ahead of the `(backend,
+            // fs_kind)` dispatch below, which would otherwise need a
+            // read-only arm per `FsKind`.
+            Server::read_only(caps).await
         } else {
             match (backend, fs_kind) {
                 (Backend::Mem, _) => Server::mem(caps).await,

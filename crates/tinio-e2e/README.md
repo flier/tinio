@@ -48,6 +48,7 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@minimal-caps` | scenario | Multipart / copy-object / list v1 / list v2 / delete-objects / tagging / cors all off (unsupported-op error scenarios). |
 | `@tagging-off` | scenario | `caps.tagging = false` (the six `?tagging` ops answer `NotImplemented`). |
 | `@cors-off` | scenario | `caps.cors = false` (the three `?cors` ops answer `NotImplemented`; the preflight route is not registered). |
+| `@read-only` | scenario | `PlaneConfig::read_only` — every mutating operation answers `AccessDenied` (FR-023). |
 | `@cold-listing` | scenario | fs scanner interval 100 ms (cold-listing scenarios). |
 | `@parquet` | scenario | Parquet input; needs `--features parquet` (the reader lives behind `tinio-server/select-parquet`) — excluded by the default filter when the feature is off. |
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |

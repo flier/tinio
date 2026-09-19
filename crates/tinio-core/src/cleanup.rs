@@ -30,7 +30,7 @@ use std::error::Error;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::storage;
+use crate::{mode::AccessMode, storage};
 
 /// A pinned, `Send` stream of cleanup actions (progress reporting).
 ///
@@ -127,7 +127,9 @@ pub enum RepairKind {
 }
 
 /// Construction options of a [`Cleanup`] implementation: whether the
-/// pipeline runs in dry-run mode (report only, never touch anything).
+/// pipeline runs in dry-run mode (report only, never touch anything), and
+/// the plane's write policy — read-only mode forbids the repair stages that
+/// write the storage root (FR-023).
 ///
 /// # Examples
 ///
@@ -147,6 +149,9 @@ pub struct CleanupOptions {
     /// Report exactly what a real run would change without modifying
     /// anything.
     pub dry_run: bool,
+    /// The served plane's write policy: read-only mode skips the repair
+    /// stages that write the storage root (see [`AccessMode`]).
+    pub access: AccessMode,
 }
 
 /// The cleanup contract: startup repair, doctor diagnostics/fix, and scanner
@@ -261,6 +266,9 @@ mod tests {
     fn cleanup_options_default_is_not_dry_run() {
         let options = CleanupOptions::default();
         assert!(!options.dry_run);
+        // The other default: a plane that never opted into read-only mode
+        // may repair the root, which is what the repair stages assume.
+        assert_eq!(options.access, AccessMode::ReadWrite);
     }
 
     #[test]

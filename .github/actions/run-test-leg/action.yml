@@ -27,6 +27,28 @@ runs:
       with:
         tool: nextest
 
+    # The serve example is a PREREQUISITE of tinio-server's serve_read_only
+    # integration test, which spawns it. `cargo test` (the local gate) leaves
+    # the built example at `<profile>/examples/serve`, which is where the test
+    # looks; nextest's target selection is not something this leg can rely on
+    # to do the same, and the difference is a red leg either way. `--profile
+    # ci` keeps the binary in the same profile dir the test derives from its
+    # own location.
+    #
+    # The feature flags MATCH THE LEG: a plain `-p tinio-server` build would
+    # put a DEFAULT-features server at that path and the no-default leg would
+    # then spawn a binary with an `acl` stack its own test graph does not have
+    # — the artifact under test must be the one the leg builds.
+    - name: build the serve example (a serve_read_only prerequisite)
+      if: inputs.mode == 'default'
+      shell: bash
+      run: cargo build --profile ci -p tinio-server --example serve
+
+    - name: build the serve example (--no-default-features)
+      if: inputs.mode == 'no-default'
+      shell: bash
+      run: cargo build --profile ci -p tinio-server --example serve --no-default-features
+
     # --cargo-profile ci = the Cargo compile profile ([profile.ci] in the
     # root Cargo.toml). --profile ci = the nextest runner profile
     # (.config/nextest.toml): fail-fast off keeps CI parity with cargo

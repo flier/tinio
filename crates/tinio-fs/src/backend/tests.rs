@@ -104,6 +104,158 @@ async fn read_only_state_relocation_keeps_root_clean() {
     assert!(!root.path().join(".tinio").exists());
 }
 
+#[test]
+fn read_only_requires_an_explicit_state_dir() {
+    // FR-023 (decision 13): read-only with no state dir would silently
+    // create `<root>/.tinio` — the write the mode promises never to make —
+    // so construction refuses it. The check precedes `canonicalize`, so it
+    // answers `InvalidValue` even for a root that does not exist.
+    let root = tempfile::tempdir().unwrap();
+    for missing in [false, true] {
+        let root = if missing {
+            root.path().join("missing")
+        } else {
+            root.path().to_path_buf()
+        };
+        let err = FsStorage::new(
+            &root,
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                ..fs_options()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue(_)), "{err:?}");
+        assert!(err.to_string().contains("state_dir"), "{err}");
+    }
+}
+
+#[test]
+fn read_only_refuses_an_in_root_state_dir() {
+    // FR-023 (decision 17a): an explicit state dir inside the storage root
+    // writes the very tree the mode promises to leave alone — and a
+    // writable root would never complain — so construction refuses it. A
+    // state dir outside the root is accepted (the check is not a blanket
+    // refusal).
+    let root = tempfile::tempdir().unwrap();
+    let err = FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            state_dir: Some(root.path().join("state")),
+            ..fs_options()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidValue(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("outside the storage root"),
+        "{err}"
+    );
+
+    // Clause 1 (the verbatim shape of the same root) and the Windows case
+    // relaxation — NTFS resolves all three forms into the root, so all
+    // three are refused. The verbatim leg keeps the first clause from
+    // being deleted as dead code on Windows; the differently-cased leg is
+    // the regression the case-insensitive comparison protects. Only the
+    // leaf is cased up there: uppercasing a whole temp path would make the
+    // refusal depend on `to_lowercase(to_uppercase(p)) == to_lowercase(p)`,
+    // which a character like `ß` (→ `SS` → `ss`) breaks.
+    #[cfg(windows)]
+    for dir in [
+        PathBuf::from(format!(r"\\?\{}\state", root.path().display())),
+        root.path().join("STATE"),
+    ] {
+        let err = FsStorage::new(
+            root.path(),
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                state_dir: Some(dir),
+                ..fs_options()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidValue(_)), "{err:?}");
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            state_dir: Some(state.path().to_path_buf()),
+            ..fs_options()
+        },
+    )
+    .unwrap();
+}
+
+/// The verbatim-to-plain root mapping ([`FsStorage::plain`]): the
+/// containment rule compares the state dir against both shapes of the
+/// canonical root, so each arm is pinned — the UNC spelling, which no
+/// fixture can produce here (it needs a real UNC root), and the
+/// no-verbatim-prefix case, which must answer `None` instead of passing
+/// its input through as if it were already plain.
+#[cfg(windows)]
+#[test]
+fn plain_strips_the_verbatim_prefix() {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    let plain = |path: &str| FsStorage::plain(Path::new(path));
+    assert_eq!(
+        plain(r"\\?\C:\data").as_deref(),
+        Some(Path::new(r"C:\data"))
+    );
+    assert_eq!(
+        plain(r"\\?\UNC\srv\share\data").as_deref(),
+        Some(Path::new(r"\\srv\share\data")),
+        "a verbatim UNC root becomes the plain UNC spelling"
+    );
+    assert_eq!(plain(r"C:\data"), None, "already plain — nothing to strip");
+    // A path `Path::to_str` cannot read (an unpaired surrogate here) has no
+    // plain form at all: `None` falls back on the verbatim comparison
+    // rather than handing the caller a path it made up.
+    let ill_formed = PathBuf::from(OsString::from_wide(&[0xD800]));
+    assert_eq!(FsStorage::plain(&ill_formed), None);
+}
+
+/// The Windows half of the containment rule: the comparison folds case,
+/// because NTFS resolves `…\DATA` and `…\data` to the same directory while
+/// [`Path::starts_with`] compares literally — and it stays component-wise,
+/// so `…\data2` is a sibling of `…\data`, not inside it.
+#[cfg(windows)]
+#[test]
+fn containment_folds_case_and_stays_component_wise() {
+    let root = Path::new(r"C:\data");
+    assert!(FsStorage::contained_in_root(
+        Path::new(r"c:\DATA\state"),
+        root
+    ));
+    assert!(
+        !FsStorage::contained_in_root(Path::new(r"C:\data2\state"), root),
+        "a name that merely starts with the root's is not inside it"
+    );
+    assert!(!FsStorage::contained_in_root(Path::new(r"C:\other"), root));
+}
+
+/// The unix half of the same rule: `starts_with` compares
+/// case-sensitively, because unix filesystems distinguish `…/Data` from
+/// `…/data`, and still component-wise.
+#[cfg(not(windows))]
+#[test]
+fn containment_is_case_sensitive_and_component_wise() {
+    let root = Path::new("/data");
+    assert!(FsStorage::contained_in_root(Path::new("/data/state"), root));
+    assert!(!FsStorage::contained_in_root(
+        Path::new("/Data/state"),
+        root
+    ));
+    assert!(!FsStorage::contained_in_root(
+        Path::new("/data2/state"),
+        root
+    ));
+}
+
 #[tokio::test]
 async fn new_consumes_the_compact_marker() {
     let root = tempfile::tempdir().unwrap();

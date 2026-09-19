@@ -1,11 +1,18 @@
 //! Minimal serve binary for the interop harness (task T032).
 //!
 //! Serves one storage root over the S3 data plane: `serve <root>
-//! [--port N] [--address HOST:PORT]`. The actual bound address is printed
-//! to stdout (the harness parses it — needed for `--port 0`). The scanner
-//! is on by default (config defaults) and toggled by `TINIO_SCANNER`
-//! (`0`/`1`); the sweep runs with default TTLs. Superseded by the full CLI
-//! in US2.
+//! [--port N] [--address HOST:PORT]`. Stdout carries exactly one line —
+//! the actual bound address (the harness parses it, needed for `--port 0`)
+//! — and everything else, diagnostics included, goes to stderr. The
+//! scanner is on by default (config defaults) and toggled by
+//! `TINIO_SCANNER` (`0`/`1`); the sweep runs with default TTLs.
+//! Superseded by the full CLI in US2.
+//!
+//! `--read-only` (FR-023) refuses every mutating operation and moves the
+//! tool's state out of the root — `TINIO_STATE_DIR` if set, else
+//! `<home>/.tinio/roots/<hash>/` — so the root is only ever read. The
+//! resolved mode is the config file's `[server] read_only`, overlaid by
+//! `TINIO_READ_ONLY` (`1`/`true`, `0`/`false`) and then by the flag.
 //!
 //! Auth: s3s rejects signed requests when no auth provider is configured,
 //! and real S3 clients always sign — so the harness accepts the fixed
@@ -16,10 +23,15 @@
 //! configured `[[users]]` assembled by
 //! `tinio_server::identity::Identity::from_config`.
 
-#[cfg(unix)]
-use std::path::Path;
 use std::{
-    env, error::Error, fs, net::SocketAddr, path::PathBuf, process, sync::Arc, time::Duration,
+    env,
+    error::Error,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process,
+    sync::Arc,
+    time::Duration,
 };
 
 use futures::StreamExt;
@@ -27,10 +39,11 @@ use sweep::{Options, Sweeper};
 use tinio_config::{
     Config,
     log::{AccessFormat, Format, Verbosity},
-    pipeline,
+    pipeline, sources, state,
 };
 use tinio_core::{
     cleanup::{Cleanup, CleanupOptions, RepairKind},
+    mode::AccessMode,
     pipeline::Runner,
     storage::{
         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
@@ -40,7 +53,7 @@ use tinio_fs::{
     FsCleanup, FsOptions, FsStorage, Scanner, ScannerOptions, database::WriteLockSnapshot, sweep,
 };
 use tinio_server::{
-    Capabilities, DataPlane, identity, log as server_log,
+    Capabilities, DataPlane, PlaneConfig, identity, log as server_log,
     metrics::{self, WriteLockStats},
     pipeline::Pipelines,
 };
@@ -50,7 +63,9 @@ use tokio::{net::TcpListener, sync::watch};
 use tracing::subscriber;
 
 fn usage() -> ! {
-    eprintln!("usage: serve <root> [--port N] [--address HOST:PORT] [--config <config.toml>]");
+    eprintln!(
+        "usage: serve <root> [--port N] [--address HOST:PORT] [--config <config.toml>] [--read-only]"
+    );
     process::exit(2);
 }
 
@@ -87,20 +102,20 @@ fn capabilities_for(config: &Option<Config>) -> Capabilities {
 /// identity, no enforced behavior). The identity is the single
 /// `Identity::from_config` assembly (spec §6); the credential fallback
 /// for the auth-only plane is the same `[auth]` pair that assembly uses.
-fn plane_for(storage: FsStorage, caps: Capabilities, config: &Option<Config>) -> DataPlane {
+fn plane_for(storage: FsStorage, plane: PlaneConfig, config: &Option<Config>) -> DataPlane {
     // An absent `--config` serves the default shape (the minioadmin pair
     // and the core owner element).
     #[cfg(feature = "acl")]
-    if caps.acl {
+    if plane.caps.acl {
         return DataPlane::new_with_acl(
             storage,
-            caps,
+            plane,
             Identity::from_config(config.as_ref().unwrap_or(&Config::default())),
         );
     }
     let (access_key, secret) =
         identity::root_auth_pair(config.as_ref().unwrap_or(&Config::default()));
-    DataPlane::new_with_auth(storage, caps, &access_key, &secret)
+    DataPlane::new_with_auth(storage, plane, &access_key, &secret)
 }
 
 #[tokio::main]
@@ -112,8 +127,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let mut address: Option<SocketAddr> = None;
     let mut config_path: Option<PathBuf> = None;
+    let mut read_only_flag = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--read-only" => read_only_flag = true,
             "--config" => {
                 config_path = Some(match args.next() {
                     Some(path) => path.into(),
@@ -148,9 +165,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None => SocketAddr::from(([127, 0, 0, 1], 9000)),
     };
 
-    // The harness passes a fresh scratch path — create the root if missing
-    // (FsStorage itself requires an existing directory).
-    fs::create_dir_all(&root)?;
     // The real dual-pipeline runtime (pipeline-spec.md §3.3): `--config
     // <file>` consumes the parsed `[pipeline]` section (F07 — the values
     // an operator sets are no longer silently dropped); without it the
@@ -160,15 +174,67 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(path) => Some(Config::load(path)?),
         None => None,
     };
+    // FR-023 resolution, lowest precedence first: the config file's
+    // `[server] read_only`, then the `TINIO_READ_ONLY` overlay when set,
+    // then the flag. An absent `--config` contributes the default
+    // (read-write). `.env` joins when the CLI brings the dotenvy wiring
+    // (T066/T067).
+    let file_read_only = config
+        .as_ref()
+        .is_some_and(|config| config.server.read_only);
+    let read_only = sources::env_read_only()?.unwrap_or(file_read_only) || read_only_flag;
+    let access = AccessMode::from(read_only);
+
+    // The harness passes a fresh scratch path — create the root if missing
+    // (FsStorage itself requires an existing directory). Read-only mode
+    // serves a root that must already exist: creating it would write the
+    // one thing the mode promises to leave alone. A missing root fails
+    // during state-dir resolution — `default_home_state_dir` canonicalizes
+    // it — or, with `TINIO_STATE_DIR` set, in `FsStorage::new`'s own
+    // canonicalization.
+    if !read_only {
+        fs::create_dir_all(&root)?;
+    }
     // Spec §6 OS-mapping validation: any `[owner]`/`[[users]] local_uid`
     // mapping requires chown privilege at startup (root or CAP_CHOWN) —
     // fail closed with a config error (unix; Windows already rejected the
-    // key at parse).
+    // key at parse). Read-only mode skips the probe: it writes
+    // `<root>/.tinio-chown-probe-<nonce>/probe` into the served root
+    // (decision 14).
     #[cfg(unix)]
-    identity::ensure_chown_privilege(
-        config.as_ref().unwrap_or(&Config::default()),
-        Path::new(&root),
-    )?;
+    if !read_only {
+        identity::ensure_chown_privilege(
+            config.as_ref().unwrap_or(&Config::default()),
+            Path::new(&root),
+        )?;
+    }
+    // Read-only mode relocates the tool's state out of the served root
+    // (FR-023); normal mode leaves it at the backend's default
+    // `<root>/.tinio/`. The diagnostic goes to stderr: stdout carries the
+    // bound address alone, and the harness parses it.
+    let state_dir = if read_only {
+        // `TINIO_STATE_DIR` wins over the derived layout: the read-only
+        // deployments where there is no writable home are exactly the ones
+        // that need the escape hatch.
+        let dir = match state::env_state_dir()? {
+            Some(dir) => {
+                eprintln!(
+                    "read-only mode: state dir {} (from {})",
+                    dir.display(),
+                    state::STATE_DIR_VAR
+                );
+                dir
+            }
+            None => {
+                let dir = state::default_home_state_dir(Path::new(&root))?;
+                eprintln!("read-only mode: state dir {}", dir.display());
+                dir
+            }
+        };
+        Some(dir)
+    } else {
+        None
+    };
     let pipeline_config = match &config {
         Some(config) => config.pipeline.clone().unwrap_or_default(),
         None => pipeline::Config::default(),
@@ -178,7 +244,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         root,
         FsOptions {
             follow_symlinks: false,
-            state_dir: None,
+            state_dir,
+            access,
             compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
             meta_batch_size: DEFAULT_META_BATCH_SIZE,
             meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
@@ -194,8 +261,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(s3) = config.as_ref().and_then(|c| c.s3.as_ref()) {
         storage.set_max_concurrent_uploads(s3.max_concurrent_uploads);
     }
-    // Operational logs to stderr (info), access log to `<root>/.tinio/access.log`
-    // (T052). The `[log]` config wiring lands with the US2 CLI.
+    // Operational logs to stderr (info), access log to `<state
+    // dir>/access.log` (T052) — `<root>/.tinio/` in normal mode, the
+    // relocated dir in read-only mode. The `[log]` config wiring lands
+    // with the US2 CLI.
     fs::create_dir_all(storage.state_dir())?;
     let subscriber = server_log::build_subscriber(
         Verbosity::Info,
@@ -213,7 +282,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Best-effort: a failed stage is warned and readiness proceeds — the
     // scanner covers the residue. The stale-bucket prune runs here,
     // pre-serving, so it stays lock-free (no request can race it yet).
-    let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+    let cleanup = FsCleanup::new(
+        &storage,
+        CleanupOptions {
+            access,
+            ..Default::default()
+        },
+    );
     match cleanup.repair(RepairKind::Startup).await {
         Ok(mut actions) => {
             while let Some(action) = actions.next().await {
@@ -240,6 +315,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         delay: Duration::from_secs(10),
         max_wait: Duration::from_secs(15),
         cycle: Duration::from_secs(24 * 3600),
+        access,
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let scanner = Scanner::new(storage.clone(), scanner_options);
@@ -261,13 +337,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let metrics_storage = storage.clone();
     let metrics_io = pipelines.io();
     let metrics_db = pipelines.db();
-    let plane = plane_for(storage, caps, &config).with_metrics(Arc::new(move || {
-        metrics::refresh(
-            metrics_io.stats(),
-            metrics_db.stats(),
-            write_lock_stats(metrics_storage.write_lock_stats()),
-        );
-    }));
+    let plane = plane_for(storage, PlaneConfig { caps, access }, &config).with_metrics(Arc::new(
+        move || {
+            metrics::refresh(
+                metrics_io.stats(),
+                metrics_db.stats(),
+                write_lock_stats(metrics_storage.write_lock_stats()),
+            );
+        },
+    ));
     plane.serve(listener, shutdown_tx.subscribe()).await?;
     // Stop the scanner and the sweeper BEFORE the pipelines: the watch
     // signals take effect at the next pass boundary, so awaiting the

@@ -2,7 +2,7 @@
 
 **Branch**: `001-s3-local-server` | **Date**: 2026-08-21
 
-Entities derived from the feature spec (Key Entities + FR-001..024). The filesystem is the single source of truth; every entity below maps to concrete on-disk state. `<state-dir>` below means `<root>/.tinio/` in normal mode and `~/.tinio/roots/<sha1(canonical root)16>/` in read-only mode (FR-023).
+Entities derived from the feature spec (Key Entities + FR-001..024). The filesystem is the single source of truth; every entity below maps to concrete on-disk state. `<state-dir>` below means `<root>/.tinio/` in normal mode and `~/.tinio/roots/<sha256(canonical root)16>/` in read-only mode (FR-023).
 
 **Backend seam**: `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness); `tinio-fs` implements it over the local filesystem (v1); `tinio-mem` provides the in-memory reference backend (CLI default when no directory is given); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, `meta.redb`, tmp/) are `tinio-fs` internals behind that contract.
 
@@ -14,7 +14,7 @@ Entities derived from the feature spec (Key Entities + FR-001..024). The filesys
 |-------|------|-------|
 | path | `PathBuf` | User-chosen local directory; canonicalized at startup |
 | buckets | `[Bucket]` | Top-level subdirectories (excluding reserved `.tinio/`) |
-| reserved_dir | `PathBuf` | `<root>/.tinio/` — never served or listed (FR-020); in read-only mode (FR-023) the state dir is `~/.tinio/roots/<sha1(canonical root)16>/` (mode 0700) instead, and the root is never written |
+| reserved_dir | `PathBuf` | `<root>/.tinio/` — never served or listed (FR-020); in read-only mode (FR-023) the state dir is `~/.tinio/roots/<sha256(canonical root)16>/` (mode 0700) instead, and the root is never written |
 
 Validation: canonicalization before use; unix-socket path limit (108 bytes) documented limitation. In read-only mode the root need not be writable at all.
 
@@ -73,7 +73,7 @@ Generation rules: first `start` without config → config auto-created with rand
 
 ### Reserved Directory (`.tinio/`)
 
-Normal mode: `<root>/.tinio/`. Read-only mode (FR-023): `~/.tinio/roots/<sha1(canonical root)16>/` (mode 0700) — same layout under the state dir; `<root>` is then never written, and a pre-existing `<root>/.tinio/.tinio.toml` or `<root>/.tinio/config.toml` is still read (but never modified; `.tinio.toml` wins when both exist; other root-`.tinio/` contents are ignored). The home base is resolved via the `dirs` crate.
+Normal mode: `<root>/.tinio/`. Read-only mode (FR-023): `~/.tinio/roots/<sha256(canonical root)16>/` (mode 0700) — the name is the first 16 hex characters of `sha2::Sha256` over the canonical root path — same layout under the state dir; `<root>` is then never written, and a pre-existing `<root>/.tinio/.tinio.toml` or `<root>/.tinio/config.toml` is still read (but never modified; `.tinio.toml` wins when both exist; other root-`.tinio/` contents are ignored — so the meta view is empty for a root served read-write earlier). The home base is resolved via the `dirs` crate; `TINIO_STATE_DIR` replaces the derived location with an explicit state dir, used verbatim (see `contracts/config.md`). The root-side config read and the `.env` load from the state dir land with the CLI (T143).
 
 | Entry | Purpose |
 |-------|---------|
@@ -112,7 +112,7 @@ State transitions: `stopped` → `starting` (bind port + control channel, write 
 - FR-021: `[s3]` capability toggles; disabled ops return NotImplemented; unknown keys fail startup.
 - FR-017: unknown access-log format variables fail startup.
 - FR-022: ETag served only on size/mtime match; Content-Type inferred; user metadata dropped.
-- FR-023: read-only mode rejects all S3 mutating ops with `AccessDenied`; state dir relocates to `~/.tinio/roots/<sha1(canonical root)16>/`; root never written.
+- FR-023: read-only mode rejects all S3 mutating ops with `AccessDenied`; state dir relocates to `~/.tinio/roots/<sha256(canonical root)16>/`; root never written.
 - FR-024: background ETag scanner — low priority, never blocks startup, rate-limitable, disableable, aborts on shutdown.
 - FR-020 (any-depth): `.tinio` is a reserved path segment at every level, not just the root.
 - FR-033: owner/ACL rows (shared redb elements, self-healing decode), the write-path owner-recording rules, and the unix payload modes + `local_uid` mapping rules above — `[owner]`/`[[users]]` config contract in `contracts/config.md`; the wire/enforcement contract in `contracts/s3-surface.md`.

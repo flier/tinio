@@ -15,7 +15,7 @@
 - **Perform no git write operations whatsoever** (CLAUDE.md overrides the skill's commit step): every task closes with "checkpoint: report the list of files pending commit", and **does not run** `git add/commit/push`.
 - Code, comments, tests, commit messages and documents are always in English.
 - **Documents: no hard line wraps** — every paragraph and list item is one unbroken line (docs/style.md).
-- Existing tests are **not edited** except where a task says so explicitly. A red existing test is an implementation bug, not grounds for changing the test.
+- Existing tests are **not edited** except where a task says so explicitly. A red existing test is an implementation bug, not grounds for changing the test. Later controller rulings authorized three more edits outside the task lists — a `#[cfg(feature = "cors")]` on `data.rs`'s preflight test, the same on `identity.rs`'s `uid()` helper, and a one-token rustdoc backtick fix in `crates/tinio-select/src/json/error.rs` — and no others.
 - New tests follow docs/tests.md: async tests use `#[tokio::test]` / `async fn`, **never** `Runtime::block_on` or a hand-rolled `rt(...)`. Sync tests use `#[test]`.
 - `unsafe_code = "forbid"` is per-crate (`docs/cargo.md:10`). Under edition 2024 `std::env::set_var` is `unsafe`, so **no test may mutate the process environment**.
 - Style (docs/style.md): compressed prose, imports of 3+ segments de-qualified, per-crate `Error`, `SmartDefault` for defaults, `parse-display`/`derive_more` for derives.
@@ -65,12 +65,13 @@
 - Create: `crates/tinio-core/src/mode.rs`
 - Modify: `crates/tinio-core/src/lib.rs` (module list + `pub use` block)
 - Modify: `crates/tinio-core/src/cleanup.rs:145-150` (`CleanupOptions`)
+- Modify: `crates/tinio-fs/src/cleanup.rs:1160,1191` — the two test call sites that build `CleanupOptions { dry_run: true }` without `..Default::default()` and so stop compiling the moment the field lands. Fixing them here keeps `cargo check --workspace --all-targets` green for every task between this one and Task 9, which owns that file. Same authorization as Task 6's eight tests: the interface change moves its own call sites.
 
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `tinio_core::mode::AccessMode` (also re-exported at the crate root as `tinio_core::AccessMode`), with `Default` = `ReadWrite`, `From<bool>`, and `AccessMode::is_read_only(self) -> bool`; `CleanupOptions { dry_run: bool, access: AccessMode }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/tinio-core/src/mode.rs` with only the tests module first:
 
@@ -96,12 +97,12 @@ mod tests {
 
 Add `pub mod mode;` to `crates/tinio-core/src/lib.rs` **in alphabetical position** — the list is `acl, bucket, checksum, cleanup, cors, etag, multipart, object, percent, pipeline, storage`, and `mode` sorts between `etag` and `multipart`.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-core mode::`
 Expected: FAIL — `cannot find type AccessMode in this scope` / unresolved import.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Prepend to `crates/tinio-core/src/mode.rs`:
 
@@ -145,7 +146,7 @@ impl From<bool> for AccessMode {
 
 Add `mode::AccessMode` to the `pub use self::{…}` block in `crates/tinio-core/src/lib.rs` (alongside `bucket::Bucket`, `etag::ETag`) — rustfmt will place it.
 
-- [ ] **Step 4: Add `access` to `CleanupOptions`**
+- [x] **Step 4: Add `access` to `CleanupOptions`**
 
 In `crates/tinio-core/src/cleanup.rs`, extend the struct (keep the existing `dry_run` doc comment; extend the struct doc to mention the policy):
 
@@ -166,12 +167,12 @@ pub struct CleanupOptions {
 
 Add `use crate::mode::AccessMode;` to that file's imports.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p tinio-core`
 Expected: PASS — including the crate's existing `CleanupOptions` doctest (it uses `..CleanupOptions::default()`, so the new field is absorbed).
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Report the files pending commit. Do not run git commands.
 
@@ -190,17 +191,17 @@ Report the files pending commit. Do not run git commands.
 - Consumes: nothing.
 - Produces: `tinio_config::state::home_state_dir(root: &Path, home: &Path) -> Result<PathBuf, Error>`, `default_home_state_dir(root: &Path) -> Result<PathBuf, Error>`, the `STATE_DIR_VAR` constant with `env_state_dir() -> Result<Option<PathBuf>, Error>` / `parse_state_dir(&str) -> Result<PathBuf, Error>`; `Error::Root { path: PathBuf, source: io::Error }`.
 
-- [ ] **Step 1: Add the dependencies**
+- [x] **Step 1: Add the dependencies**
 
 In the root `Cargo.toml` `[workspace.dependencies]`, insert between `derive_more = "2"` and `dotenvy = "0.15"`:
 
 ```toml
-dirs = "6"
+dirs = "7"
 ```
 
 In `crates/tinio-config/Cargo.toml` `[dependencies]`, insert `dirs.workspace = true` between `derive_more` and `dotenvy`, and `hex.workspace = true` + `sha2.workspace = true` in their alphabetical positions (after `garde`, before `humantime-serde` for both — `garde < hex < humantime-serde < parse-display` and `garde < humantime-serde < parse-display < secrecy < serde < serde_ignored < sha2 < smart-default`, so `hex` goes after `garde`, `sha2` after `serde_ignored`).
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `crates/tinio-config/src/state.rs`:
 
@@ -307,12 +308,12 @@ mod tests {
 
 Add `pub mod state;` to `crates/tinio-config/src/lib.rs` — alphabetically after `pub mod sources;`.
 
-- [ ] **Step 3: Run test to verify it fails**
+- [x] **Step 3: Run test to verify it fails**
 
 Run: `cargo test -p tinio-config state::`
 Expected: FAIL — `cannot find function home_state_dir`.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Prepend to `crates/tinio-config/src/state.rs`:
 
@@ -376,19 +377,12 @@ pub const STATE_DIR_VAR: &str = "TINIO_STATE_DIR";
 /// unwritable, and where `default_home_state_dir` would otherwise fail
 /// startup outright.
 ///
-/// Split into a pure parse plus a two-line lookup, like the other env
+/// The lookup itself is `sources::parse_var`, shared with the read-only
 /// overlay: `std::env::set_var` is `unsafe` under edition 2024 and every
 /// crate forbids `unsafe_code`, so a test cannot mutate the process
-/// environment.
+/// environment, and the pure parse below is the part worth testing.
 pub fn env_state_dir() -> Result<Option<PathBuf>, Error> {
-    match env::var(STATE_DIR_VAR) {
-        Ok(raw) => parse_state_dir(&raw).map(Some),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => Err(Error::invalid_value(
-            STATE_DIR_VAR,
-            "value is not valid Unicode",
-        )),
-    }
+    sources::parse_var(STATE_DIR_VAR, parse_state_dir)
 }
 
 /// Parse a `TINIO_STATE_DIR` value.
@@ -475,20 +469,25 @@ fn create_dir_0700(dir: &Path) -> io::Result<()> {
 Add to `crates/tinio-config/src/error.rs`: a variant and its constructor, matching the file's existing shape (variant after `Env`, constructor with the other `pub(crate) fn`s):
 
 ```rust
-    /// The storage root could not be resolved (missing, unreadable, or not
-    /// a directory) — the state directory cannot be derived from it.
-    #[error("failed to resolve the storage root `{path}`: {source}")]
+    /// A path in the state-directory layout could not be resolved or
+    /// violates a layout rule, so the state directory cannot be derived
+    /// or prepared: the storage root could not be canonicalized; a
+    /// `<home>/.tinio` parent is a symlink, could not be created, or
+    /// could not be restricted to 0700; or a path the layout needs as a
+    /// directory exists as something else.
+    #[error("failed to resolve the state directory at `{path}`: {source}")]
     Root {
-        /// The path that could not be resolved.
+        /// The path the resolution failed at.
         path: PathBuf,
-        /// The underlying I/O error.
+        /// The underlying I/O error, or the layout rule the path violates.
         #[source]
         source: io::Error,
     },
 ```
 
 ```rust
-/// Storage-root resolution failure.
+/// State-directory resolution failure or layout-rule refusal at a path
+/// in its layout.
 #[inline]
 pub(crate) fn root(path: impl Into<PathBuf>, source: io::Error) -> Error {
     Error::Root {
@@ -498,7 +497,7 @@ pub(crate) fn root(path: impl Into<PathBuf>, source: io::Error) -> Error {
 }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p tinio-config`
 Expected: PASS (6 new tests; the existing ones untouched).
@@ -506,7 +505,7 @@ Expected: PASS (6 new tests; the existing ones untouched).
 Run: `cargo doc -p tinio-config --no-deps` with `RUSTDOCFLAGS="-D warnings"`
 Expected: no doc warnings (the new module and items are documented).
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Report the files pending commit.
 
@@ -519,52 +518,48 @@ Report the files pending commit.
 
 **Interfaces:**
 - Consumes: `crate::schema::Config` (field `server: server::Config` with `pub read_only: bool`).
-- Produces: `tinio_config::sources::READ_ONLY_VAR: &str`; `tinio_config::sources::parse_read_only(raw: &str) -> Result<bool, Error>`; `tinio_config::sources::apply_read_only_env(config: &mut Config) -> Result<(), Error>`.
+- Produces: `tinio_config::sources::READ_ONLY_VAR: &str`; `tinio_config::sources::parse_read_only(raw: &str) -> Result<bool, Error>`; `tinio_config::sources::env_read_only() -> Result<Option<bool>, Error>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `#[cfg(test)] mod tests` in `crates/tinio-config/src/sources.rs`:
 
 ```rust
     #[test]
     fn read_only_flag_parses_strictly() {
-        for raw in ["1", "true"] {
+        // The trimmed form parses like its bare value.
+        for raw in ["1", "true", " 1 "] {
             assert!(parse_read_only(raw).unwrap(), "{raw}");
         }
         for raw in ["0", "false"] {
             assert!(!parse_read_only(raw).unwrap(), "{raw}");
         }
-        let err = parse_read_only("yes").unwrap_err();
-        assert!(err.to_string().contains(READ_ONLY_VAR), "{err}");
-    }
-
-    #[test]
-    fn read_only_overlay_sets_the_config_field() {
-        let mut config = Config::parse("version = 1").unwrap();
-        assert!(!config.server.read_only);
-        apply_read_only(&mut config, true);
-        assert!(config.server.read_only);
-        apply_read_only(&mut config, false);
-        assert!(!config.server.read_only);
+        // An empty value is an error, never "unset" or "false".
+        for raw in ["", "yes"] {
+            let err = parse_read_only(raw).unwrap_err();
+            assert!(err.to_string().contains(READ_ONLY_VAR), "{raw}: {err}");
+        }
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-config sources::`
 Expected: FAIL — `cannot find function parse_read_only`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
-Append to `crates/tinio-config/src/sources.rs` (imports: extend the existing `use std::path::Path;` to also bring in `env`; add `use crate::schema::Config;`):
+Append to `crates/tinio-config/src/sources.rs` (imports: extend the existing `use std::path::Path;` to also bring in `env`):
 
 ```rust
 /// The environment variable that selects read-only mode (FR-023).
 pub const READ_ONLY_VAR: &str = "TINIO_READ_ONLY";
 
-/// Parse a `TINIO_READ_ONLY` value: `1`/`true` and `0`/`false` only, the
-/// same closed shape as `TINIO_SCANNER`. Anything else is a startup error —
-/// a typo must not silently serve a writable root.
+/// Parse a `TINIO_READ_ONLY` value: `1`/`true` and `0`/`false` only.
+/// Anything else is a startup error — a typo must not silently serve a
+/// writable root. Deliberately stricter than `TINIO_SCANNER`, whose
+/// handler (`tinio-fs`'s `scanner_enabled`) ignores an unrecognised value
+/// and falls back to the `[scanner]` section gate.
 pub fn parse_read_only(raw: &str) -> Result<bool, Error> {
     match raw.trim() {
         "1" | "true" => Ok(true),
@@ -576,40 +571,24 @@ pub fn parse_read_only(raw: &str) -> Result<bool, Error> {
     }
 }
 
-/// Set the `[server] read_only` field.
-///
-/// Split out from [`apply_read_only_env`] because the process environment
-/// cannot be mutated from a test: `std::env::set_var` is `unsafe` under
-/// edition 2024 and every crate here forbids `unsafe_code`.
-pub fn apply_read_only(config: &mut Config, read_only: bool) {
-    config.server.read_only = read_only;
-}
-
-/// Apply the `TINIO_READ_ONLY` overlay (FR-023): an unset variable leaves
-/// the config file's value standing; a set one must parse.
-pub fn apply_read_only_env(config: &mut Config) -> Result<(), Error> {
-    match env::var(READ_ONLY_VAR) {
-        Ok(raw) => {
-            apply_read_only(config, parse_read_only(&raw)?);
-            Ok(())
-        }
-        Err(env::VarError::NotPresent) => Ok(()),
-        Err(env::VarError::NotUnicode(_)) => Err(Error::invalid_value(
-            READ_ONLY_VAR,
-            "value is not valid Unicode",
-        )),
-    }
+/// The `TINIO_READ_ONLY` overlay (FR-023): `Some(_)` when the variable is
+/// set, `None` when it is not (the caller keeps the config file's value),
+/// and an error when it is set to something that does not parse.
+pub fn env_read_only() -> Result<Option<bool>, Error> {
+    parse_var(READ_ONLY_VAR, parse_read_only)
 }
 ```
 
-Update the module doc's third bullet, which currently says the config file "is overlayed by the CLI": add that `TINIO_READ_ONLY` is applied here in the interim, ahead of the clap `env` attributes the CLI will bring (T066/T067).
+The overlay returns the value instead of writing `config.server.read_only`: the caller (the `serve` example, Task 10) owns the precedence, so the config file's own value stays where it was parsed.
 
-- [ ] **Step 4: Run the tests**
+Update the module doc's third bullet, which currently says the config file "is overlayed by the CLI": add that `TINIO_READ_ONLY` is resolved here in the interim, ahead of the clap `env` attributes the CLI will bring (T066/T067).
+
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-config`
 Expected: PASS.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Report the files pending commit.
 
@@ -625,7 +604,7 @@ Report the files pending commit.
 - Consumes: nothing.
 - Produces: `crate::backend::ops::tinio_s3_ops` — a `macro_rules!` macro taking one identifier (the consumer macro) and invoking it with the table. Also (test-only) `crate::backend::ops::table_ops() -> Vec<&'static str>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/tinio-server/src/backend/ops.rs` with the table and the cross-check test. The table's rows are exactly the 36 operations of `backend/s3.rs`, grouped by whether they mutate, with the two optional clauses in the fixed order `#[gated]`, `#[on_ok]`. Every operation appears in **exactly one** group: the read group is all 16 non-mutating operations — `list_parts` and `list_multipart_uploads` included, they only read — and the read-only decorator serves them; the write group is the 20 that mutate. `table_has_no_duplicates` pins that, and a duplicated row would not compile anyway (two `async fn`s of the same name in one generated impl).
 
@@ -764,9 +743,10 @@ pub(crate) use tinio_s3_ops;
 ///   name plus stripping features — and must be comparable with `s3.rs`'s raw
 ///   text, which `include_str!` never filters by feature;
 /// - [`table_ops`] carries the derived `#[cfg]`, so it is what *this* build
-///   compiles (measured: an 11-row table yields 3 names with
-///   `--no-default-features`, 11 with `--all-features`). It is a subset check
-///   against the table, never an equality with the file.
+///   compiles (measured: 17 of the table's 36 rows with `--no-default-features`,
+///   23 with `--no-default-features --features multipart`, 36 with
+///   `--all-features`). It is a subset check against the table, never an
+///   equality with the file.
 ///
 /// The `allow`s cover this shape, not its content: a `Vec::new()` followed by
 /// `push` trips `clippy::vec_init_then_push`, and a row without `#[gated]`
@@ -863,7 +843,7 @@ mod tests {
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
-                let mut features = std::mem::take(&mut pending);
+                let mut features = take(&mut pending);
                 features.sort();
                 rows.push((name, features));
                 continue;
@@ -921,9 +901,9 @@ mod tests {
 }
 ```
 
-Add `mod ops;` to `crates/tinio-server/src/backend/mod.rs`'s module list (next to `mod s3;`).
+Add `pub(crate) mod ops;` to `crates/tinio-server/src/backend/mod.rs`'s module list (next to `mod s3;`) — `pub(crate)`, because Tasks 5–7 import the macro from sibling modules. The test module needs `use std::mem::take;`: the parser calls `take(&mut pending)`, because `clippy::absolute_paths` rejects `std::mem::take` as a 3-segment path in an expression (warn-level, and the gate is `-D warnings`) — the same reason `tinio-fs/src/write_task.rs` imports it.
 
-- [ ] **Step 2: Run the tests**
+- [x] **Step 2: Run the tests**
 
 Run: `cargo test -p tinio-server backend::ops`
 Expected: PASS — `table_matches_the_s3_dispatch` (36 rows on both sides, names *and* features), `compiled_ops_come_from_the_table`, `table_has_no_duplicates`.
@@ -932,9 +912,9 @@ Run: `cargo test -p tinio-server --no-default-features backend::ops`, then `--no
 Expected: PASS in all three. Two properties are checked and they need different forms — which is exactly why `table_features` and `table_ops` are built two ways:
 
 - **the table's facts equal the file's** (names and stripping features): feature-independent, because the file side is `include_str!` text and `table_features` pushes unconditionally;
-- **what this build compiles is a subset of the table**: `table_ops` is `#[cfg]`-filtered by the build, so it shrinks as features come off (measured: 3 names with `--no-default-features` where the table has 11 rows). A plain `const` array could not do this, which is why the derived `#[cfg]` form exists.
+- **what this build compiles is a subset of the table**: `table_ops` is `#[cfg]`-filtered by the build, so it shrinks as features come off (measured on the real table: 17 of 36 rows with `--no-default-features`, 23 with `multipart` alone, 36 with `--all-features`). A plain `const` array could not do this, which is why the derived `#[cfg]` form exists.
 
-- [ ] **Step 3: Checkpoint**
+- [x] **Step 3: Checkpoint**
 
 Report the files pending commit.
 
@@ -950,7 +930,7 @@ Report the files pending commit.
 - Consumes: `crate::backend::ops::tinio_s3_ops`.
 - Produces: `crate::metrics::multipart_in_progress_inc()` (new, `pub(crate)`, `#[cfg(feature = "multipart")]`), consumed by the table's `#[on_ok]` clauses; the additivity of `multipart_in_progress_dec()` to the same table.
 
-- [ ] **Step 1: The `status` label becomes the real HTTP status (decision 11)**
+- [x] **Step 1: The `status` label becomes the real HTTP status (decision 11)**
 
 `MetricS3::record`'s Err arm folds every client error into `400` today. Replace it — this is the only behavior change that rides with the refactor, and it makes the label equal what s3s puts on the wire (`s3s/src/ops/mod.rs:136-140` uses exactly `err.status_code().unwrap_or(500)`):
 
@@ -968,7 +948,7 @@ Update the one assertion that pins the old class mapping — `metrics.rs:790`, `
 Run: `cargo test -p tinio-server metrics::`
 Expected: PASS — `metric_s3_records_status_classes` with the `404` assertion, everything else untouched.
 
-- [ ] **Step 2: Add the missing increment helper**
+- [x] **Step 2: Add the missing increment helper**
 
 The table needs `multipart_in_progress_inc()`, which does not exist — the increment is inline in `create_multipart_upload` (`metrics.rs:1409-1411`). Add it beside `multipart_in_progress_dec()` (which is at `metrics.rs:286`), **mirroring the current behavior exactly**: the existing inline increment takes no `test_lock` guard (only `dec` does), so the helper must not add one.
 
@@ -982,7 +962,7 @@ pub(crate) fn multipart_in_progress_inc() {
 }
 ```
 
-- [ ] **Step 3: Replace the hand-written delegation**
+- [x] **Step 3: Replace the hand-written delegation**
 
 Delete the whole `#[async_trait] impl<T: S3 + Send + Sync> S3 for MetricS3<T> { … }` block (`metrics.rs:1162–1496`) and replace it with the macro definition plus its invocation:
 
@@ -1042,7 +1022,7 @@ pub(crate) use wire_name;
 
 Add `use crate::backend::ops::tinio_s3_ops;` to the file's imports (`metrics.rs` currently imports nothing from `crate::backend`).
 
-- [ ] **Step 4: Run the refactor's gate — the existing test, unedited**
+- [x] **Step 4: Run the refactor's gate — the existing test, unedited**
 
 Run: `cargo test -p tinio-server metrics::`
 Expected: PASS, with `metric_s3_records_every_delegated_operation` and `metric_s3_maintains_multipart_gauge` **unmodified** and `metric_s3_records_status_classes` unmodified **apart from the one `400`→`404` assertion Step 1 requires**. Any other edit means the refactor changed behavior — fix the refactor, not the test.
@@ -1050,7 +1030,7 @@ Expected: PASS, with `metric_s3_records_every_delegated_operation` and `metric_s
 Run: `cargo test -p tinio-e2e --test cucumber -- --tags '@SC-008 or @T075'`
 Expected: PASS — `metrics.feature` untouched.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Report the files pending commit, and state explicitly that the three metric tests and `metrics.feature` were not edited **except** `metric_s3_records_status_classes`'s `400`→`404` assertion, which decision 11 requires.
 
@@ -1070,7 +1050,7 @@ Report the files pending commit, and state explicitly that the three metric test
 - Consumes: `crate::backend::ops::tinio_s3_ops`, `crate::backend::Capabilities`.
 - Produces: `crate::capability::CapabilityS3<T>` with `pub fn new(inner: T, caps: Capabilities) -> Self` and `pub fn inner(&self) -> &T`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/tinio-server/src/capability.rs`:
 
@@ -1112,12 +1092,12 @@ mod tests {
 
 Write the two behavior tests as `#[tokio::test]`s: a disabled toggle answers `NotImplemented` whose message is `"<Operation> is disabled"`, and the same operation with the toggle on is **not** `NotImplemented` (it reaches the handler and fails differently, or succeeds). Then run them.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server capability::`
 Expected: FAIL — `cannot find type CapabilityS3`.
 
-- [ ] **Step 3: Write the decorator**
+- [x] **Step 3: Write the decorator**
 
 Prepend to `crates/tinio-server/src/capability.rs`:
 
@@ -1197,7 +1177,7 @@ The matcher is verbatim Task 4's; the `#[on_ok(...)]` clause is matched and drop
 
 Add `pub mod capability;` to `crates/tinio-server/src/lib.rs` (alphabetically before `mod data;`).
 
-- [ ] **Step 4: Wire it into the plane and delete the handler gates**
+- [x] **Step 4: Wire it into the plane and delete the handler gates**
 
 In `crates/tinio-server/src/data.rs`, every place that builds the chain (`new_shared` at 116, `new_with_auth` at 148, `new_with_acl` at 194-196) changes from
 
@@ -1265,14 +1245,14 @@ The assertions themselves do not change — the code (`NotImplemented`), the COR
 
 Then run the crate and migrate anything else that fails for the same reason — the table above is the verified set, not a licence to skip the run.
 
-- [ ] **Step 5: Normalize the six multipart messages**
+- [x] **Step 5: Normalize the six multipart messages**
 
 The six multipart operations now answer `"<Operation> is disabled"` instead of `"multipart is disabled"`. Nothing asserts the old strings; grep to confirm before and after:
 
 Run: `rg -n "multipart is disabled" crates/ specs/`
 Expected before: only `multipart.rs:210` (the deleted helper). After: no hits.
 
-- [ ] **Step 6: Run the refactor's gate**
+- [x] **Step 6: Run the refactor's gate**
 
 Run: `cargo test -p tinio-server`
 Expected: PASS — with the eight off-mode tests migrated onto `CapabilityS3` (Step 4) and their assertions unchanged.
@@ -1283,7 +1263,7 @@ Expected: PASS with the off-mode scenarios (`@cors-off`, `@tagging-off`, `@acl-o
 Run: `cargo clippy -p tinio-server --all-targets -- -D warnings`
 Expected: clean — in particular no `unused_imports` left behind by the deleted gates.
 
-- [ ] **Step 7: Checkpoint**
+- [x] **Step 7: Checkpoint**
 
 Report the files pending commit; state which eight off-mode unit tests were migrated onto `CapabilityS3` (with their assertions unchanged) and that the cucumber off-mode scenarios were not edited.
 
@@ -1297,9 +1277,9 @@ Report the files pending commit; state which eight off-mode unit tests were migr
 
 **Interfaces:**
 - Consumes: `crate::backend::ops::tinio_s3_ops`.
-- Produces: `crate::readonly::S3ReadonlyBackend<T>` with `pub fn new(inner: T) -> Self` and `pub fn inner(&self) -> &T`.
+- Produces: `crate::readonly::S3ReadonlyBackend<T>` with `pub fn new(inner: T) -> Self`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/tinio-server/src/readonly.rs` with a fake inner `S3` that records every call, and three `#[tokio::test]`s:
 
@@ -1307,47 +1287,32 @@ Create `crates/tinio-server/src/readonly.rs` with a fake inner `S3` that records
 - every **write** in the table answers `AccessDenied` **and the inner backend was never called**;
 - `post_object` (the browser form upload, which s3s's trait default routes to `self.put_object`) answers `AccessDenied`.
 
-Drive the read/write split from the same table the decorator uses — `tinio_s3_ops!` with a test-only consumer macro emitting the two name lists — so the test cannot drift from the implementation:
+Drive the read/write split from the same table the decorator uses — a test-only consumer macro (`readonly_probe`) generating the recording fake's `S3` impl and the call-by-name dispatches, with the group lists imported from `backend::ops` and intersected with the compiled set — so the test cannot drift from the implementation:
 
 ```rust
-macro_rules! readonly_op_names {
-    (
-        read { $( $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
-        write { $( $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
-    ) => {
-        /// Every `read` row compiled into this feature set.
-        #[cfg(test)]
-        #[allow(clippy::vec_init_then_push)]
-        pub(crate) fn read_ops() -> Vec<&'static str> {
-            let mut ops = Vec::new();
-            $(
-                $( $( $(#[cfg(feature = $rf)])? )+ )?
-                ops.push(stringify!($r));
-            )*
-            ops
-        }
+use crate::backend::ops::{read_ops, table_ops, write_ops};
 
-        /// Every `write` row compiled into this feature set.
-        #[cfg(test)]
-        #[allow(clippy::vec_init_then_push)]
-        pub(crate) fn write_ops() -> Vec<&'static str> {
-            let mut ops = Vec::new();
-            $(
-                $( $( $(#[cfg(feature = $wf)])? )+ )?
-                ops.push(stringify!($w));
-            )*
-            ops
-        }
-    };
+/// The rows of `names` this build compiles. [`read_ops`] and
+/// [`write_ops`] are deliberately unfiltered (they pin the table's
+/// groups in every build), while [`call_read`]/[`call_write`] carry
+/// only the arms this feature set compiles — so the tests intersect
+/// the two through [`table_ops`], the same filtering the decorator's
+/// own `#[cfg]`s apply.
+fn compiled(names: Vec<&'static str>) -> Vec<&'static str> {
+    let ops = table_ops();
+    names
+        .into_iter()
+        .filter(|name| ops.contains(name))
+        .collect()
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server readonly::`
 Expected: FAIL — `cannot find type S3ReadonlyBackend`.
 
-- [ ] **Step 3: Write the decorator**
+- [x] **Step 3: Write the decorator**
 
 ```rust
 //! Read-only mode as a decorator (FR-023).
@@ -1376,11 +1341,6 @@ impl<T> S3ReadonlyBackend<T> {
     /// Wrap `inner` in read-only mode.
     pub fn new(inner: T) -> Self {
         Self { inner }
-    }
-
-    /// The wrapped implementation.
-    pub fn inner(&self) -> &T {
-        &self.inner
     }
 }
 
@@ -1414,12 +1374,12 @@ tinio_s3_ops!(readonly_impl);
 
 Add `pub mod readonly;` to `crates/tinio-server/src/lib.rs` (alphabetically after `pub mod pipeline;`).
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-server readonly::`
 Expected: PASS — every read forwards (not 501), every write is `AccessDenied` with the inner untouched, `post_object` is `AccessDenied`.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Report the files pending commit.
 
@@ -1435,7 +1395,7 @@ Report the files pending commit.
 - Consumes: `AccessMode`, `Capabilities`, `S3ReadonlyBackend`, `CapabilityS3`.
 - Produces: `crate::data::PlaneConfig { pub caps: Capabilities, pub access: AccessMode }`, `impl From<Capabilities> for PlaneConfig`, `PlaneConfig::read_only(caps) -> Self`, `PlaneConfig::is_read_only(&self) -> bool`; the four `DataPlane` constructors take `plane: impl Into<PlaneConfig>` in place of `caps: Capabilities`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `data.rs`'s test module:
 
@@ -1450,12 +1410,12 @@ In `data.rs`'s test module:
 
 The read/write behaviour of a read-only plane is **not** re-asserted here: `S3ReadonlyBackend`'s own table-driven test (Task 7) covers every operation, and the end-to-end assertion on a real plane is Task 11's. This step only pins the construction input.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server data::`
 Expected: FAIL — `cannot find type PlaneConfig`.
 
-- [ ] **Step 3: Implement `PlaneConfig` and thread it**
+- [x] **Step 3: Implement `PlaneConfig` and thread it**
 
 ```rust
 /// A data plane's construction inputs: the `[s3]` capability toggles and the
@@ -1511,7 +1471,7 @@ The two arms have different types, so each constructor forks on `plane.is_read_o
 
 Re-export `PlaneConfig` from `lib.rs` next to `DataPlane`.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-server`
 Expected: PASS — all 15 existing constructor call sites compile unchanged through `From<Capabilities>`.
@@ -1519,7 +1479,7 @@ Expected: PASS — all 15 existing constructor call sites compile unchanged thro
 Run: `cargo check --workspace --all-targets`
 Expected: clean.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Report the files pending commit.
 
@@ -1535,18 +1495,18 @@ Report the files pending commit.
 - Consumes: `CleanupOptions.access: AccessMode` (Task 1).
 - Produces: `FsCleanup` skips its two root-writing stages when constructed with `AccessMode::ReadOnly`; the scanner skips its tombstone purge the same way.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/tinio-fs/src/cleanup.rs`'s test module, add a `#[tokio::test]` that builds an fs storage over a temp root, plants residue in both places — a file under `<state-dir>/tmp/` and a tree under `<root>/.tinio/deleting/` — constructs `FsCleanup` with `CleanupOptions { access: AccessMode::ReadOnly, ..Default::default() }`, runs `repair(RepairKind::Startup)`, and asserts: the tombstone is **still there** and the root's `.tinio/deleting` was not enqueued, while the state-dir tmp residue **was** cleared.
 
 A second `#[tokio::test]`, in `scanner.rs`'s test module, covers the scanner's own gate (nothing else exercises it — the e2e harness passes no scanner, so this is the only coverage): plant a tree under `<root>/.tinio/deleting/`, run one scan cycle with `ScannerOptions { access: AccessMode::ReadOnly, .. }`, and assert it is untouched and not enqueued; then repeat with `AccessMode::ReadWrite` and assert it **is** enqueued — the positive control, without which the test would also pass if the scan silently did nothing.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-fs cleanup:: scanner::`
 Expected: FAIL — the tombstone is removed (the stage still runs) and the purge still enqueues.
 
-- [ ] **Step 3: Implement the gate**
+- [x] **Step 3: Implement the gate**
 
 Add to `FsCleanup` (beside `dry_run`, which is the only `CleanupOptions` field stored today):
 
@@ -1574,7 +1534,7 @@ The state-dir stages (`repair_tmp`, `repair_multipart_orphans`, `repair_orphan_u
 
 Read-only mode reaches the scanner through a new `ScannerOptions.access: AccessMode` field (default `ReadWrite`, so every existing construction compiles unchanged); the tombstone-leftover block (`scanner.rs:264-280`) is skipped when it is read-only.
 
-- [ ] **Step 4: The `FsOptions` construction guard (decision 13)**
+- [x] **Step 4: The `FsOptions` construction guard (decision 13)**
 
 `FsOptions` gains `access: AccessMode` (default `ReadWrite`) and `FsStorage::new` rejects read-only with no state dir:
 
@@ -1595,9 +1555,17 @@ Then add the containment half (decision 17a) **after** `canonicalize`, in the sa
             if let Some(dir) = options.state_dir.as_deref() {
                 // Lexical (see the design's residual): the state dir need not
                 // exist yet, so it cannot be canonicalized here.
-                let absolute = std::path::absolute(dir)
+                let absolute = absolute(dir)
                     .map_err(|_| invalid_value("state_dir: could not be resolved in read-only mode"))?;
-                if absolute.starts_with(&canonical) {
+                // As shipped this comparison is `FsStorage::contained_in_root`:
+                // on unix a single case-sensitive `starts_with`, on Windows a
+                // case-insensitive component comparison over **both** path
+                // shapes — `canonicalize` answers `\\?\C:\…` while `absolute`
+                // answers `C:\…`, so comparing only the verbatim shape is a
+                // silent no-op on Windows (measured), and NTFS is
+                // case-insensitive, so an in-root dir spelled in another case
+                // would otherwise evade the guard (also measured).
+                if Self::contained_in_root(&absolute, &canonical) {
                     return Err(invalid_value(
                         "state_dir: must be outside the storage root in read-only mode",
                     ));
@@ -1606,16 +1574,18 @@ Then add the containment half (decision 17a) **after** `canonicalize`, in the sa
         }
 ```
 
+`absolute` is `std::path::absolute`, imported (`use std::path::absolute;`) — `clippy::absolute_paths` rejects the qualified 3-segment form in an expression, `std` included.
+
 `crates/tinio-fs/src/testing.rs`'s `fs_options()` — which constructs every field — gains `access: AccessMode::ReadWrite`.
 
 Test it: `FsStorage::new(root, FsOptions { access: AccessMode::ReadOnly, ..fs_options() })` must return `Err`, and so must the same call with `state_dir: Some(root.join("state"))`.
 
-- [ ] **Step 5: Run the whole fs crate**
+- [x] **Step 5: Run the whole fs crate**
 
 Run: `cargo test -p tinio-fs`
 Expected: PASS — the new read-only gating test and guard test, plus `read_only_state_relocation_keeps_root_clean` and `delete_bucket_tombstone_stays_on_the_data_volume` both **unedited**. The latter pins the tombstone to the root's volume; this task must not move it.
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Report the files pending commit.
 
@@ -1627,10 +1597,10 @@ Report the files pending commit.
 - Modify: `crates/tinio-server/examples/serve.rs` (arg parsing at 115-145; wiring at 152-232)
 
 **Interfaces:**
-- Consumes: `tinio_config::state::home_state_dir`, `sources::apply_read_only_env`, `PlaneConfig::read_only`, `CleanupOptions.access`.
+- Consumes: `tinio_config::state::home_state_dir`, `sources::env_read_only`, `PlaneConfig::read_only`, `CleanupOptions.access`.
 - Produces: a `--read-only` flag and the read-only wiring in the example.
 
-- [ ] **Step 1: Add the flag and the resolution**
+- [x] **Step 1: Add the flag and the resolution**
 
 In the arg loop (115-145), add:
 
@@ -1643,29 +1613,27 @@ with `let mut read_only_flag = false;` beside `address`/`config_path`, and exten
 After the config is loaded (`serve.rs:158-161`), resolve the mode — lowest precedence first: the config file, then the environment overlay, then the flag:
 
 ```rust
-    let mut config = match &config_path {
+    let config = match &config_path {
         Some(path) => Some(Config::load(path)?),
         None => None,
     };
-    // FR-023 resolution, lowest precedence first: the config file, then the
-    // `TINIO_READ_ONLY` overlay, then the flag. `.env` joins when the CLI
-    // brings the dotenvy wiring (T066/T067).
-    let mut read_only = false;
-    if let Some(config) = config.as_mut() {
-        tinio_config::sources::apply_read_only_env(config)?;
-        read_only = config.server.read_only;
-    } else {
-        let mut probe = Config::parse("version = 1")?;
-        tinio_config::sources::apply_read_only_env(&mut probe)?;
-        read_only = probe.server.read_only;
-    }
-    read_only |= read_only_flag;
+    // FR-023 resolution, lowest precedence first: the config file's
+    // `[server] read_only`, then the `TINIO_READ_ONLY` overlay when set,
+    // then the flag. An absent `--config` contributes the default
+    // (read-write). `.env` joins when the CLI brings the dotenvy wiring
+    // (T066/T067).
+    let file_read_only = config
+        .as_ref()
+        .is_some_and(|config| config.server.read_only);
+    let read_only = sources::env_read_only()?.unwrap_or(file_read_only) || read_only_flag;
     let access = AccessMode::from(read_only);
 ```
 
-(An absent `--config` still honours `TINIO_READ_ONLY`: the probe parses the minimal document so the overlay has somewhere to land.)
+The file layer is read, not written: `env_read_only` hands back the overlay's value and the `unwrap_or` expresses the precedence in one place, so an absent `--config` needs no synthetic document to write into.
 
-- [ ] **Step 2: Wire the read-only behavior**
+The call is `sources::env_read_only`, not the fully-qualified path: `clippy::absolute_paths` rejects a 3-segment path in an expression `std` included, so `serve.rs`'s existing `use tinio_config::{Config, log::{…}, pipeline};` gains `sources` and `state`, and the rest of this task's snippets call `state::env_state_dir()`, `state::STATE_DIR_VAR` and `state::default_home_state_dir(…)`.
+
+- [x] **Step 2: Wire the read-only behavior**
 
 - Skip the root creation when read-only — the root must already exist, and `FsStorage::new` canonicalizes it, so a missing root fails with a clear error rather than being created:
 
@@ -1675,25 +1643,29 @@ After the config is loaded (`serve.rs:158-161`), resolve the mode — lowest pre
     }
 ```
 
-- Resolve the state dir before constructing the storage, and log it — it now lives outside the root, and which of the two it is matters to an operator:
+- Resolve the state dir before constructing the storage, and log it to stderr — stdout carries the bound address alone (the interop harness parses it) — because it now lives outside the root, and which of the two it is matters to an operator:
 
 ```rust
+    // Read-only mode relocates the tool's state out of the served root
+    // (FR-023); normal mode leaves it at the backend's default
+    // `<root>/.tinio/`. The diagnostic goes to stderr: stdout carries the
+    // bound address alone, and the harness parses it.
     let state_dir = if read_only {
         // `TINIO_STATE_DIR` wins over the derived layout: the read-only
         // deployments where there is no writable home are exactly the ones
         // that need the escape hatch.
-        let dir = match tinio_config::state::env_state_dir()? {
+        let dir = match state::env_state_dir()? {
             Some(dir) => {
-                println!(
+                eprintln!(
                     "read-only mode: state dir {} (from {})",
                     dir.display(),
-                    tinio_config::state::STATE_DIR_VAR
+                    state::STATE_DIR_VAR
                 );
                 dir
             }
             None => {
-                let dir = tinio_config::state::default_home_state_dir(Path::new(&root))?;
-                println!("read-only mode: state dir {}", dir.display());
+                let dir = state::default_home_state_dir(Path::new(&root))?;
+                eprintln!("read-only mode: state dir {}", dir.display());
                 dir
             }
         };
@@ -1711,10 +1683,10 @@ The override is deliberately **not** part of the `flags > env > .env > file` cha
 - Build the plane with it: `plane_for(storage, PlaneConfig { caps, access }, &config)` — `plane_for` takes `PlaneConfig` in place of `Capabilities` and forwards it to `new_with_acl`/`new_with_auth`, which now accept `impl Into<PlaneConfig>`. Keep `capabilities_for` and its two tests unchanged.
 - Pass `access` to the scanner options (Task 9's new field).
 
-- [ ] **Step 3: Verify by hand**
+- [x] **Step 3: Verify by hand**
 
 Run: `cargo run -p tinio-server --example serve -- ./scratch-root --read-only --port 0`
-Expected: prints `read-only mode: state dir <home>/.tinio/roots/<hash>` and a listener line; `./scratch-root` contains no `.tinio/`.
+Expected: prints `read-only mode: state dir <home>/.tinio/roots/<hash>` on stderr and the listener line on stdout; `./scratch-root` contains no `.tinio/`.
 
 Then, against the printed port:
 
@@ -1728,7 +1700,7 @@ Expected: fails with `AccessDenied`. And `aws s3 ls` succeeds (an empty bucket l
 Run: `cargo test -p tinio-server --example serve` — the two `capabilities_for` tests, unedited.
 Expected: PASS.
 
-- [ ] **Step 4: Checkpoint**
+- [x] **Step 4: Checkpoint**
 
 Report the files pending commit.
 
@@ -1743,7 +1715,7 @@ Report the files pending commit.
 - Consumes: `tinio_config::state::home_state_dir`, `PlaneConfig::read_only`, `tinio_fs::{FsOptions, FsStorage}`.
 - Produces: nothing.
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 The test builds an fs storage over a scratch root with a state dir resolved under a **scratch home** (never the real `$HOME`), wires a read-only plane, and drives it through the `S3` trait. Dev-dependencies already present: `tokio` (full), `tempfile`, `tinio-fs` (with the `testing` feature's `fs_options()`), `http`.
 
@@ -1756,7 +1728,7 @@ Cover:
 5. **`#[cfg(unix)]` genuinely read-only root** — after the storage is opened, `chmod 0500` the root (`std::fs::set_permissions`, `PermissionsExt`), then serve reads and assert they still succeed. Restore the mode before the tempdir drops, or use a `Drop`-guarded fixture.
 6. **The root's own state DB is not read (decision 15)** — the in-root meta view is empty by design, and this pins it rather than leaving it undefined. First build a *read-write* storage over the root (`state_dir: None`) and set a bucket tag through it, so `<root>/.tinio/meta.redb` holds a tag; drop it; then build the read-only plane over the same root with a scratch home. Assert: the planted object is still readable/listable, and `GetBucketTagging` answers **200 with an empty tag set** (this server never answers `NoSuchTagSet` — the handler returns `tag_set_from_tags(&[])`), i.e. the tag written through the read-write run is invisible.
 
-- [ ] **Step 2: Run the test**
+- [x] **Step 2: Run the test**
 
 Run: `cargo test -p tinio-server --test read_only`
 Expected: PASS on Windows (leg 5 absent via `#[cfg(unix)]`).
@@ -1764,7 +1736,7 @@ Expected: PASS on Windows (leg 5 absent via `#[cfg(unix)]`).
 Run on WSL2 (docs/tests.md "Platform-gated verification"): `cargo test -p tinio-server --test read_only`
 Expected: PASS with leg 5 active — a genuinely read-only root still serves.
 
-- [ ] **Step 3: Checkpoint**
+- [x] **Step 3: Checkpoint**
 
 Report the files pending commit.
 
@@ -1783,7 +1755,7 @@ Report the files pending commit.
 - Consumes: `_server::PlaneConfig` (the state dir is a scratch `TempDir`; no `tinio-config` dev-dependency is added — the resolved layout is asserted by Task 2's unit tests and Task 11's integration test, and the harness only needs *a* state dir outside the root).
 - Produces: a `@read-only` scenario tag.
 
-- [ ] **Step 1: Extend the harness**
+- [x] **Step 1: Extend the harness**
 
 In `common.rs`:
 
@@ -1841,7 +1813,7 @@ async fn served_root_holds(world: &mut super::World, bucket: String, key: String
 
 `Server::root()` already exposes the served root for fs-backed servers, and `tokio::fs` is already imported in `common.rs`.
 
-- [ ] **Step 2: Write the feature file**
+- [x] **Step 2: Write the feature file**
 
 `read_only.feature`. Fixtures are planted on disk by the step above; **reads are limited to what a planted root can express** — buckets and objects. Tagging, ACL and multipart reads depend on state in `meta.redb` that the filesystem cannot plant, so they stay with the Rust suites. Every scenario carries `@fs` (the constructor builds an `FsStorage`, so the tag must not claim backend neutrality) and `@read-only`.
 
@@ -1937,7 +1909,7 @@ Feature: Read-only mode
 
 The last scenario pins decision 12 — a `403`, not the `404 NoSuchBucket` the read-write server answers for a genuinely missing bucket. The step vocabulary is pre-existing (`the response status is`, `the error code is`, `the response body contains`, the raw-request steps); the only new step in this task is `served_root_holds`.
 
-- [ ] **Step 3: Drop the allow-list entry and document the tag**
+- [x] **Step 3: Drop the allow-list entry and document the tag**
 
 In `traceability.rs`, delete the `FR-023` entry and its comment (lines 82-84) — `@FR-023` in the new feature satisfies both directions of the cross-check.
 
@@ -1947,7 +1919,7 @@ In `crates/tinio-e2e/README.md`'s tag table, add a row beside `@cors-off`:
 | `@read-only` | scenario | `PlaneConfig::read_only` — every mutating operation answers `AccessDenied` (FR-023). |
 ```
 
-- [ ] **Step 4: Run the suite**
+- [x] **Step 4: Run the suite**
 
 Run: `cargo test -p tinio-e2e --test cucumber -- --retry 2`
 Expected: PASS. This is the default (fs) leg and it is the leg that runs the `@read-only` scenarios: every scenario carries `@fs` because `Server::read_only` builds an `FsStorage`, so the mem leg's `not @fs` filter excludes them by construction.
@@ -1958,7 +1930,7 @@ Expected: PASS with the `@read-only` scenarios **skipped** (`not @fs`) — they 
 Run: `cargo test -p tinio-e2e --test traceability`
 Expected: PASS.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Report the files pending commit.
 
@@ -1972,7 +1944,7 @@ Report the files pending commit.
 
 **Interfaces:** none.
 
-- [ ] **Step 1: The spec's `sha1` wording**
+- [x] **Step 1: The spec's `sha1` wording**
 
 FR-023 and the Reserved-Directory sections say `sha1(canonical root)16`. The implementation derives the name from `sha2::Sha256`'s first 16 hex characters. Update the wording in `spec.md` (FR-023), `data-model.md` (Reserved Directory), `contracts/config.md` (the read-only section), and `research.md` §21 (its dependency table names `dirs`; note the hashing choice beside it).
 
@@ -1981,11 +1953,11 @@ Same section of `contracts/config.md`, two additions this design introduces:
 - **`TINIO_STATE_DIR`** — an explicit state dir used verbatim instead of the derived `~/.tinio/roots/<hash>/`, for the deployments with no writable home (service accounts, containers, immutable images). Record that it is not part of the `flags > env > .env > file` chain (it selects the state dir, not a config value), that an empty value is an error, and that its parents are not created mode 0700 and are not symlink-checked — the caller chose the location. Add it to the environment-variable list beside `TINIO_READ_ONLY` and `TINIO_SCANNER`.
 - **Hardening (decision 17)** — a read-only storage refuses an explicit state dir that lies inside the served root, and the derived `<home>/.tinio` / `roots` are refused if they are symlinks (normal mode's `prove_contained` already refuses a symlinked `<root>/.tinio`).
 
-- [ ] **Step 2: The capability-message note**
+- [x] **Step 2: The capability-message note**
 
 `contracts/s3-surface.md`'s FR-021 paragraph and `contracts/config.md`'s `[s3]` bullet: state that a disabled capability answers `NotImplemented "<Operation> is disabled"` uniformly — the six multipart operations included, whose message changed from `"multipart is disabled"`. Note the error *code* is unchanged.
 
-- [ ] **Step 3: The read-only operation list**
+- [x] **Step 3: The read-only operation list**
 
 `contracts/s3-surface.md`'s "Read-only mode (FR-023)" section currently lists only bucket/object/multipart operations. Replace it with the actual write set: the table's 20 `write` rows, naming the tagging, ACL and CORS writes that the parenthetical omitted, and add read-only mode as a fourth source of the 403 ambiguity. Record the missing-bucket deviation (decision 12) in the same section: a write to a bucket that does not exist answers `AccessDenied`, not `NoSuchBucket`, with the AWS/MinIO authorization-first citations, and a note that the B3 every-principal-404 pass-through is a read-write-mode rule.
 
@@ -1994,7 +1966,7 @@ The same section gains the two consequences this design makes explicit (decision
 - **The root's own `.tinio/` is not read.** `spec.md` already says other contents of the root's `.tinio/` are ignored in read-only mode; spell out what that means for a root previously served read-write: its tags, ACLs, CORS configuration and upload records live in `<root>/.tinio/meta.redb` (the only place they are stored — there are no in-root sidecars), so those reads answer empty while objects still serve from disk. The ACL plane is fail-closed: the owner identity still passes by the owner bypass, a non-owner identity loses its grants. Point at `TINIO_STATE_DIR` for an operator who wants the state dir somewhere specific.
 - **An in-root state dir is refused in read-only mode** (construction error), because it would silently write the tree the mode promises to leave alone.
 
-- [ ] **Step 4: `tasks.md`**
+- [x] **Step 4: `tasks.md`**
 
 T058, T076 and T077 each carry a clause this plan does not implement (the root-side config read; the `.env` load from the state dir; tinio-api's state/socket/logs relocation). Split them rather than over-claim — in this file a tick means done:
 
@@ -2003,9 +1975,9 @@ T058, T076 and T077 each carry a clause this plan does not implement (the root-s
 3. **T058** — move its trailing clause (*"pre-existing root config still read but never written"*) into that new task, then tick it: the integration test itself is Task 11.
 4. **T076** — move the tinio-api half (*"affects tinio-api (state, socket, logs)"*) into the new task, then tick the rest: the resolver, the mode-0700 parents, the fs-side relocation (`meta.redb`, multipart, tmp) and the root-never-written guarantee are this plan's Tasks 2, 9 and 10.
 
-Notes on the ticked entries: the CLI flag (T067) reuses `tinio_config::state::{home_state_dir, env_state_dir}` and `sources::apply_read_only_env`; `TINIO_STATE_DIR` is this design's addition; and on T050/T133 the multipart denial messages are now per-operation.
+Notes on the ticked entries: the CLI flag (T067) reuses `tinio_config::state::{home_state_dir, env_state_dir}` and `sources::env_read_only`; `TINIO_STATE_DIR` is this design's addition; and on T050/T133 the multipart denial messages are now per-operation.
 
-- [ ] **Step 5: `CONTEXT.md`**
+- [x] **Step 5: `CONTEXT.md`**
 
 Add a "Read-only mode" glossary entry beside "Capability toggle":
 
@@ -2013,12 +1985,12 @@ Add a "Read-only mode" glossary entry beside "Capability toggle":
 - **Read-only mode** — the served plane's write policy (FR-023): every mutating S3 operation answers `AccessDenied` and the storage root is never written, so a genuinely read-only filesystem can be served. Tool state relocates from `<root>/.tinio/` to `~/.tinio/roots/<hash>/` (`TINIO_STATE_DIR` overrides the location). The root's own `.tinio/` is not read in this mode, so metadata written by an earlier read-write run — tags, ACLs, CORS, upload records — reads back empty while objects still serve.
 ```
 
-- [ ] **Step 6: Verify the doc gate**
+- [x] **Step 6: Verify the doc gate**
 
 Run (bash): `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 Expected: clean.
 
-- [ ] **Step 7: Final gate**
+- [x] **Step 7: Final gate**
 
 Run every command in docs/tests.md "Standard acceptance" that the environment supports, and report the output of each. Do not run git commands.
 

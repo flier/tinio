@@ -202,22 +202,12 @@ fn stored_parts<'a>(
 }
 
 impl<S: Storage> S3Backend<S> {
-    /// The runtime multipart gate: disabled → `NotImplemented` (FR-021).
-    fn require_multipart(&self) -> S3Result<()> {
-        if self.caps.multipart {
-            Ok(())
-        } else {
-            Err(s3_error!(NotImplemented, "multipart is disabled"))
-        }
-    }
-
     #[cfg(feature = "multipart")]
     pub(crate) async fn op_create_multipart_upload(
         &self,
         req: S3Request<dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
         use crate::_core::acl::Acl;
-        self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         // The create-time checksum spec is persisted and drives the
@@ -349,7 +339,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::UploadPartInput>,
     ) -> S3Result<S3Response<dto::UploadPartOutput>> {
-        self.require_multipart()?;
         // Cloned: the checksum-spec parse below borrows the whole input.
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
@@ -438,10 +427,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::UploadPartCopyInput>,
     ) -> S3Result<S3Response<dto::UploadPartCopyOutput>> {
-        Self::require_cap(
-            self.caps.multipart && self.caps.copy_object,
-            "UploadPartCopy",
-        )?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         let upload_id = req.input.upload_id;
@@ -548,7 +533,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<dto::CompleteMultipartUploadOutput>> {
-        self.require_multipart()?;
         // Cloned: the checksum validation below borrows the whole input.
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
@@ -876,7 +860,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<dto::AbortMultipartUploadOutput>> {
-        self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         // If-Match-Initiated-Time: the upload must still be the one the
@@ -921,7 +904,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::ListPartsInput>,
     ) -> S3Result<S3Response<dto::ListPartsOutput>> {
-        self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         let upload_id = req.input.upload_id;
@@ -1013,7 +995,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<dto::ListMultipartUploadsOutput>> {
-        self.require_multipart()?;
         let bucket = self.bucket(req.input.bucket)?;
         let max_uploads = req.input.max_uploads.unwrap_or(1000);
         let max_uploads =
@@ -1102,6 +1083,8 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+    #[cfg(feature = "copy")]
+    use crate::backend::testutil::setup_gated_with_caps;
     #[cfg(feature = "acl")]
     use crate::backend::testutil::{acl_backend, user_id};
     use crate::{
@@ -1373,26 +1356,13 @@ mod tests {
     #[cfg(feature = "copy")]
     #[tokio::test]
     async fn upload_part_copy_respects_copy_object_toggle() {
-        use crate::_core::acl::Acl;
-        let storage = MemoryStorage::new().unwrap();
-        let backend = S3Backend::new(
-            storage,
-            Capabilities {
-                copy_object: false,
-                ..Default::default()
-            },
-        );
-        let b = "data".to_string();
+        let caps = Capabilities {
+            copy_object: false,
+            ..Default::default()
+        };
+        let (backend, b) = setup_gated_with_caps(caps).await;
         backend
-            .storage()
-            .create_bucket(
-                &bucket::name(&b).unwrap(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap();
-        backend
+            .inner()
             .storage()
             .put_object(
                 &bucket::name(&b).unwrap(),

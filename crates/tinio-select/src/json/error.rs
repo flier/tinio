@@ -2,7 +2,7 @@
 //! keeps its own value and the original struson error (with its location)
 //! survives instead of degrading into a formatted string.
 //!
-//! From<ReaderError> keeps a catch-all arm: `ReaderError` IS `#[non_exhaustive]`
+//! `From<ReaderError>` keeps a catch-all arm: `ReaderError` IS `#[non_exhaustive]`
 //! in 0.7.2 (vendored `reader/mod.rs:513`), so the arm is mandatory and an
 //! upgrade must not silently drop a variant.
 

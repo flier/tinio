@@ -152,12 +152,23 @@ pub struct SpawnedServer {
 /// readiness line; returns the child and the bound endpoint
 /// (`127.0.0.1:PORT`). `scanner` sets `TINIO_SCANNER` per Some (None
 /// leaves it unset), `config` is passed through `--config`.
+///
+/// The child inherits this process's environment, so the three variables
+/// that would change what it serves are cleared first: a shell exporting
+/// `TINIO_SCANNER` (the harness decides the scanner, not the caller
+/// shell), `TINIO_READ_ONLY` (FR-023, which would otherwise put every
+/// spawned server in read-only mode), and `TINIO_STATE_DIR` (which would
+/// relocate its state). The `scanner` argument sets its variable back
+/// afterwards.
 fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, String) {
     let mut cmd = Command::new(serve_bin());
     cmd.arg(root).arg("--port").arg("0");
     if let Some(config) = config {
         cmd.arg("--config").arg(config);
     }
+    cmd.env_remove("TINIO_SCANNER")
+        .env_remove("TINIO_READ_ONLY")
+        .env_remove("TINIO_STATE_DIR");
     if let Some(s) = scanner {
         cmd.env("TINIO_SCANNER", if s { "1" } else { "0" });
     }
@@ -204,10 +215,12 @@ impl Drop for SpawnedServer {
     }
 }
 
-/// Read the child's stdout until the `listening on` readiness line (the
-/// serve example prints exactly one line to stdout). A reader thread keeps
-/// the pipe drained so the child never blocks on a full buffer; the thread
-/// exits when the child dies.
+/// Read the child's stdout until the `listening on` readiness line — the
+/// only line the serve example writes there (its diagnostics, the resolved
+/// state dir included, go to stderr, which [`spawn_child`] discards) — and
+/// scanned line by line, so a preceding line would still be skipped. A
+/// reader thread keeps the pipe drained so the child never blocks on a
+/// full buffer; the thread exits when the child dies.
 fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<String> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

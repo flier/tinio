@@ -172,6 +172,7 @@ mod tests {
         Config::parse(text).unwrap()
     }
 
+    #[cfg(feature = "acl")]
     fn uid() -> OwnerId {
         OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap()
     }

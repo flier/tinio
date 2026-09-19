@@ -14,6 +14,8 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(feature = "acl")]
 use s3s::dto;
+#[cfg(not(feature = "acl"))]
+use s3s::dto::Owner;
 use s3s::{
     S3Request, S3Response, S3Result,
     dto::{
@@ -244,7 +246,7 @@ impl<S: Storage> S3Backend<S> {
         #[cfg(feature = "acl")]
         let owner = owner.as_ref().map(|id| self.acl_owner(Some(id)));
         #[cfg(not(feature = "acl"))]
-        let owner: Option<s3s::dto::Owner> = None;
+        let owner: Option<Owner> = None;
         Ok(S3Response::new(ListBucketsOutput {
             buckets: Some(buckets),
             continuation_token: listing
@@ -278,7 +280,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<GetBucketTaggingInput>,
     ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        Self::require_cap(self.caps.tagging, "GetBucketTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         let tags = self
             .storage
@@ -301,7 +302,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        Self::require_cap(self.caps.tagging, "PutBucketTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         let tags = tags_from_tag_set(&req.input.tagging.tag_set, object::BUCKET_TAGS_MAX)?;
         self.storage
@@ -317,7 +317,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        Self::require_cap(self.caps.tagging, "DeleteBucketTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         self.storage
             .delete_bucket_tags(&bucket)
@@ -337,7 +336,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::GetBucketAclInput>,
     ) -> S3Result<S3Response<dto::GetBucketAclOutput>> {
-        Self::require_cap(self.caps.acl, "GetBucketAcl")?;
         let bucket = self.bucket(req.input.bucket)?;
         let acl = self
             .storage
@@ -367,7 +365,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::PutBucketAclInput>,
     ) -> S3Result<S3Response<dto::PutBucketAclOutput>> {
-        Self::require_cap(self.caps.acl, "PutBucketAcl")?;
         require_content_md5(req.input.content_md5.as_deref())?;
         let bucket = self.bucket(req.input.bucket)?;
         // The ACL row read doubles as the existence check (NoSuchBucket
@@ -418,10 +415,11 @@ mod tests {
     #[cfg(feature = "acl")]
     use crate::_auth::identity::{Identity, User};
     #[cfg(feature = "acl")]
+    use crate::_core::acl;
+    #[cfg(feature = "acl")]
     use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
     use crate::{
         _core::{
-            acl,
             acl::Acl,
             bucket,
             storage::{self, BucketOps, Error::NoSuchBucket, ObjectOps},
@@ -430,7 +428,7 @@ mod tests {
         _util::testing::{assert_conformance, body},
         backend::{
             Capabilities,
-            testutil::{s3_request, setup},
+            testutil::{s3_request, setup, setup_gated_with_caps},
         },
     };
 
@@ -1298,11 +1296,13 @@ mod tests {
     #[tokio::test]
     async fn tagging_toggle_off_gates_the_bucket_tagging_ops() {
         // The tagging toggle off answers NotImplemented (FR-021). The
-        // gate fires before the bucket check — no bucket is needed.
-        let backend = backend_with(Capabilities {
+        // gate fires before the bucket check — the fixture's bucket is
+        // never consulted.
+        let (backend, _b) = setup_gated_with_caps(Capabilities {
             tagging: false,
             ..Default::default()
-        });
+        })
+        .await;
         let err = backend
             .get_bucket_tagging(s3_request(dto::GetBucketTaggingInput {
                 bucket: "data".into(),
@@ -1658,10 +1658,11 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "acl")]
     async fn bucket_acl_toggle_off_gates_the_ops() {
-        let backend = backend_with(Capabilities {
+        let (backend, _b) = setup_gated_with_caps(Capabilities {
             acl: false,
             ..Default::default()
-        });
+        })
+        .await;
         let err = backend
             .get_bucket_acl(s3_request(dto::GetBucketAclInput {
                 bucket: "data".into(),

@@ -40,10 +40,13 @@ use tokio::{
 use super::sigv4::Signer;
 pub use crate::_fs::testing::fs_options;
 use crate::{
-    _core::storage::Storage,
-    _fs::{FsStorage, Scanner, ScannerOptions},
+    _core::{mode::AccessMode, storage::Storage},
+    _fs::{FsOptions, FsStorage, Scanner, ScannerOptions},
     _mem::MemoryStorage,
-    _server::{_config::Config, Capabilities, DataPlane, Identity, identity::IdentityFromConfig},
+    _server::{
+        _config::Config, Capabilities, DataPlane, Identity, PlaneConfig,
+        identity::IdentityFromConfig,
+    },
 };
 
 /// Repeatable body of length `n`: `(i * 31 + 7) % 256` at position `i`.
@@ -140,6 +143,10 @@ pub struct Server {
     /// Kept alive for the server's lifetime (the fs root must not be
     /// deleted while the plane serves it) — never read otherwise.
     _root: Option<TempDir>,
+    /// The read-only scenarios' scratch state dir (FR-023), kept outside
+    /// the served root: alive for the server's lifetime — never read
+    /// otherwise.
+    _home: Option<TempDir>,
     served: Option<PathBuf>,
     shutdown: watch::Sender<bool>,
 }
@@ -149,12 +156,12 @@ impl Server {
     pub async fn fs(caps: Capabilities) -> Self {
         let root = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
-        Self::spawn_with(storage, caps, Some(root), None).await
+        Self::spawn_with(storage, caps.into(), Some(root), None).await
     }
 
     /// Serve the in-memory reference backend.
     pub async fn mem(caps: Capabilities) -> Self {
-        Self::spawn_with(MemoryStorage::new().unwrap(), caps, None, None).await
+        Self::spawn_with(MemoryStorage::new().unwrap(), caps.into(), None, None).await
     }
 
     /// Serve a filesystem backend over a nested root: the base tempdir
@@ -165,7 +172,7 @@ impl Server {
         let root = base.path().join("root");
         fs::create_dir(&root).await.unwrap();
         let storage = FsStorage::new(&root, fs_options()).unwrap();
-        let mut server = Self::spawn_with(storage, caps, Some(base), None).await;
+        let mut server = Self::spawn_with(storage, caps.into(), Some(base), None).await;
         server.served = Some(root);
         server
     }
@@ -186,17 +193,40 @@ impl Server {
                 delay: Duration::from_millis(1),
                 max_wait: Duration::from_millis(10),
                 cycle: interval,
+                access: AccessMode::ReadWrite,
             },
         );
-        Self::spawn_with(storage, caps, Some(root), Some(scanner)).await
+        Self::spawn_with(storage, caps.into(), Some(root), Some(scanner)).await
+    }
+
+    /// Serve a fresh filesystem root in read-only mode (FR-023), with the
+    /// tool state in a scratch directory outside the root.
+    pub async fn read_only(caps: Capabilities) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                state_dir: Some(home.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let mut server =
+            Self::spawn_with(storage, PlaneConfig::read_only(caps), Some(root), None).await;
+        server._home = Some(home);
+        server
     }
 
     /// Bind the data plane — plus an optional background scanner on a
     /// cloned shutdown receiver (it aborts on shutdown) — and spawn its
-    /// accept loop.
+    /// accept loop. `plane` carries both the capability toggles and the
+    /// write policy, so a caller opts into read-only mode by handing in
+    /// [`PlaneConfig::read_only`].
     async fn spawn_with<S: Storage>(
         storage: S,
-        caps: Capabilities,
+        plane: PlaneConfig,
         root: Option<TempDir>,
         scanner: Option<Scanner>,
     ) -> Self {
@@ -208,14 +238,15 @@ impl Server {
         if let Some(scanner) = scanner {
             tokio::spawn(scanner.run(rx.clone()));
         }
-        let plane = DataPlane::new(storage, caps);
+        let data_plane = DataPlane::new(storage, plane);
         tokio::spawn(async move {
-            plane.serve(listener, rx).await.unwrap();
+            data_plane.serve(listener, rx).await.unwrap();
         });
         let served = root.as_ref().map(|r| r.path().to_path_buf());
         Self {
             addr,
             _root: root,
+            _home: None,
             served,
             shutdown,
         }
@@ -245,6 +276,7 @@ impl Server {
         Self {
             addr,
             _root: root,
+            _home: None,
             served,
             shutdown,
         }
@@ -501,6 +533,32 @@ pub fn extract(text: &str, open: &str, close: &str) -> String {
         return String::new();
     };
     text[start..end].to_string()
+}
+
+/// Plant a file at `rel`, relative to the served root, creating its
+/// parents — the out-of-band fixture body shared by this module's `the
+/// served root holds …` step and `reserved_paths`' `I write … in the
+/// served root` step (their Gherkin sentences differ, the write does not).
+pub(super) async fn plant_in_root(world: &super::World, rel: impl AsRef<Path>, body: &str) {
+    let root = world
+        .server
+        .as_ref()
+        .and_then(|server| server.root())
+        .expect("a fixture step needs a running fs-backed server");
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().expect("a relative path has a parent"))
+        .await
+        .unwrap();
+    fs::write(&path, body.as_bytes()).await.unwrap();
+}
+
+/// Plant a bucket directory and one object directly on disk (FR-023). The
+/// read-only scenarios cannot build their fixture over the wire: every
+/// mutating request — bucket create and object upload included — answers
+/// `AccessDenied`.
+#[given(expr = "the served root holds bucket {string} with object {string} and body {string}")]
+async fn served_root_holds(world: &mut super::World, bucket: String, key: String, body: String) {
+    plant_in_root(world, Path::new(&bucket).join(&key), &body).await;
 }
 
 /// The generic response assertions — one home, so a new feature does not

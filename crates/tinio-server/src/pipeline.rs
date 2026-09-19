@@ -704,7 +704,9 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            ETag, object,
+            ETag,
+            mode::AccessMode,
+            object,
             pipeline::Task,
             storage::{
                 DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
@@ -1518,6 +1520,7 @@ mod tests {
             FsOptions {
                 follow_symlinks: false,
                 state_dir: None,
+                access: AccessMode::ReadWrite,
                 compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
                 meta_batch_size: DEFAULT_META_BATCH_SIZE,
                 meta_batch_bytes: DEFAULT_META_BATCH_BYTES,

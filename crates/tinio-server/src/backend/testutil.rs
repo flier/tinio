@@ -9,9 +9,12 @@ use s3s::S3Request;
 use super::{Capabilities, S3Backend};
 #[cfg(feature = "acl")]
 use crate::_auth::identity::{Identity, User, derive_canonical_id};
+#[cfg(feature = "acl")]
+use crate::_core::acl;
 use crate::{
-    _core::{acl, acl::Acl, bucket, storage::BucketOps},
+    _core::{acl::Acl, bucket, storage::BucketOps},
     _mem::MemoryStorage,
+    capability::CapabilityS3,
 };
 
 /// A minimal `S3Request` with default headers (tests fill the input).
@@ -50,6 +53,17 @@ pub(crate) async fn setup_with_caps(caps: Capabilities) -> (S3Backend<MemoryStor
         .await
         .unwrap();
     (backend, b)
+}
+
+/// Like [`setup_with_caps`], through the capability decorator: the `[s3]`
+/// gates live there now (FR-021), so a test that asserts a refusal must
+/// drive `CapabilityS3`, not a bare `S3Backend`. The wrapped backend is
+/// reachable via [`CapabilityS3::inner`] for fixture setup.
+pub(crate) async fn setup_gated_with_caps(
+    caps: Capabilities,
+) -> (CapabilityS3<S3Backend<MemoryStorage>>, String) {
+    let (backend, bucket) = setup_with_caps(caps).await;
+    (CapabilityS3::new(backend, caps), bucket)
 }
 
 /// The identity map of the ACL write-path fixtures: two signed users

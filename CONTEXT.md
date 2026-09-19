@@ -30,6 +30,7 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 ## Storage & server
 
 - **Served root** — the directory a server instance serves; the fs backend keeps its state and buckets inside it, and never writes outside it.
-- **State dir** — `.tinio/` inside the served root: the fs backend's metadata database and temp areas.
+- **State dir** — the fs backend's metadata database and temp areas: `.tinio/` inside the served root in normal mode; read-only mode relocates it to the home state dir (see Read-only mode).
 - **Scanner** — the fs backend's background sweeper (temp cleanup, interrupted-upload cleanup); "cold listing" exercises listing before the scanner has caught up.
 - **Capability toggle** — a server configuration switch that enables/disables an S3 operation or feature (multipart, copy, list v1/v2, delete-objects, checksum validation).
+- **Read-only mode** — the served plane's write policy (FR-023): every mutating S3 operation answers `AccessDenied` and the storage root is never written, so a genuinely read-only filesystem can be served. Tool state relocates from `<root>/.tinio/` to `~/.tinio/roots/<hash>/` (`TINIO_STATE_DIR` overrides the location). The root's own `.tinio/` is not read in this mode, so metadata written by an earlier read-write run — tags, ACLs, CORS, upload records — reads back empty while objects still serve.

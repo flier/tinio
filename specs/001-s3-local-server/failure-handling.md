@@ -53,7 +53,7 @@ These hold under every abnormal condition in this document:
 | Case collisions on case-insensitive hosts | Host FS semantics; no artificial enforcement |
 | Out-of-band file modification | ETag served only when meta size/mtime matches, else recomputed streaming and rewritten (FR-022); Last-Modified always from FS mtime |
 | Same-size, same-mtime-tick edit | Stale ETag may be served — documented granularity limit (FR-022); a same-size edit with a changed file identity (new inode) is re-hashed (60 s mtime-window fallback where no identity exists, e.g. Windows) |
-| Empty/read-only root in read-only mode | Supported: all state under `~/.tinio/roots/<sha1>/` (FR-023); root never written |
+| Empty/read-only root in read-only mode | Supported: all state under `~/.tinio/roots/<sha256>/` (FR-023); root never written |
 
 ### D. Interruption and crash
 

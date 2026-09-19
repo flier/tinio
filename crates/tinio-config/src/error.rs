@@ -15,10 +15,7 @@ use std::{io, path::PathBuf};
 /// use tinio_config::Error;
 ///
 /// let err = Error::Missing("api.https.cert".into());
-/// assert_eq!(
-///     err.to_string(),
-///     "missing required configuration: api.https.cert"
-/// );
+/// assert_eq!(err.to_string(), "missing required value: api.https.cert");
 ///
 /// let err = Error::InvalidValue {
 ///     key: "server.port".into(),
@@ -56,8 +53,9 @@ pub enum Error {
         /// Why the value is invalid.
         reason: String,
     },
-    /// A required key is absent.
-    #[error("missing required configuration: {0}")]
+    /// A required value is absent: a configuration key, or an environment
+    /// fact such as the home directory the state-directory layout needs.
+    #[error("missing required value: {0}")]
     Missing(String),
     /// The `.env` file could not be loaded.
     #[error("failed to load environment file `{path}`: {source}")]
@@ -67,6 +65,20 @@ pub enum Error {
         /// The underlying dotenvy error.
         #[source]
         source: dotenvy::Error,
+    },
+    /// A path in the state-directory layout could not be resolved or
+    /// violates a layout rule, so the state directory cannot be derived
+    /// or prepared: the storage root could not be canonicalized; a
+    /// `<home>/.tinio` parent is a symlink, could not be created, or
+    /// could not be restricted to 0700; or a path the layout needs as a
+    /// directory exists as something else.
+    #[error("failed to resolve the state directory at `{path}`: {source}")]
+    Root {
+        /// The path the resolution failed at.
+        path: PathBuf,
+        /// The underlying I/O error, or the layout rule the path violates.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -98,6 +110,16 @@ pub(crate) fn unknown_key(message: impl Into<String>) -> Error {
 #[inline]
 pub(crate) fn env(path: PathBuf, source: dotenvy::Error) -> Error {
     Error::Env { path, source }
+}
+
+/// State-directory resolution failure or layout-rule refusal at a path
+/// in its layout.
+#[inline]
+pub(crate) fn root(path: impl Into<PathBuf>, source: io::Error) -> Error {
+    Error::Root {
+        path: path.into(),
+        source,
+    }
 }
 
 impl Error {
@@ -144,7 +166,7 @@ mod tests {
         let cases = [
             (
                 Error::Missing("api.https.cert".into()),
-                "missing required configuration: api.https.cert",
+                "missing required value: api.https.cert",
             ),
             (
                 Error::InvalidValue {

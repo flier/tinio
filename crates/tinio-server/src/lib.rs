@@ -30,17 +30,20 @@ pub extern crate tinio_util as _util;
 
 pub mod backend;
 
+pub mod capability;
+
 mod data;
 mod error;
 pub mod identity;
 pub mod log;
 pub mod metrics;
 pub mod pipeline;
+pub mod readonly;
 
 #[cfg(feature = "acl")]
 pub use self::_auth::{Identity, User};
 pub use self::{
     backend::{Capabilities, S3Backend},
-    data::DataPlane,
+    data::{DataPlane, PlaneConfig},
     error::Error,
 };

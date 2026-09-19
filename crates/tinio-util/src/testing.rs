@@ -2566,7 +2566,11 @@ mod tests {
 /// 60 s default (read once per call; unset or unparsable → default).
 /// A knob for slow runners: fs-drain waits (tombstone reclaim under CI
 /// load / Defender scans / contended machines) starve without it.
-fn wait_timeout_secs() -> u64 {
+///
+/// Public so a harness that owns its own poll loop — one whose failure path
+/// must kill a child and quote its pipes, which `wait_for` cannot express —
+/// still honours this one knob and default instead of growing a second.
+pub fn wait_timeout_secs() -> u64 {
     env::var("TINIO_TEST_WAIT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

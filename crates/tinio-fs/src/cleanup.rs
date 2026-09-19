@@ -27,8 +27,11 @@ use futures::stream;
 use tokio::fs;
 
 use crate::{
-    _core::cleanup::{
-        ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
+    _core::{
+        cleanup::{
+            ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
+        },
+        mode::AccessMode,
     },
     backend::FsStorage,
     bucket,
@@ -86,6 +89,7 @@ async fn record_repair(
 /// use futures::StreamExt;
 /// use tinio_core::{
 ///     cleanup::{Cleanup, CleanupOptions, RepairKind},
+///     mode::AccessMode,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
@@ -98,6 +102,7 @@ async fn record_repair(
 /// let options = FsOptions {
 ///     follow_symlinks: false,
 ///     state_dir: None,
+///     access: AccessMode::ReadWrite,
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
@@ -126,6 +131,9 @@ pub struct FsCleanup {
     storage: FsStorage,
     /// Report-only mode (doctor `--dry-run`): never touches anything.
     dry_run: bool,
+    /// The plane's write policy: read-only mode forbids the stages that
+    /// write the storage root (FR-023).
+    access: AccessMode,
     /// Idle grace for upload directories without a `UPLOADS` record:
     /// an orphan is deleted only when its parts have been idle at least
     /// this long (the sweep's `multipart_ttl` default; the startup
@@ -143,6 +151,7 @@ impl FsCleanup {
             state_dir: storage.state_dir().to_path_buf(),
             storage: storage.clone(),
             dry_run: options.dry_run,
+            access: options.access,
             multipart_grace: Options::default().multipart_ttl,
         }
     }
@@ -620,8 +629,20 @@ impl Cleanup for FsCleanup {
     async fn repair(&self, kind: RepairKind) -> Result<ActionStream<Error>, Error> {
         let mut actions = Vec::new();
         self.repair_tmp(&mut actions).await;
-        self.repair_delete_tombstones(&mut actions).await;
-        self.repair_bucket_staging(&mut actions).await;
+        // FR-023: the two stages that write the storage root are skipped
+        // read-only. A root previously served read-write may legitimately
+        // still hold an unpublished tombstone or staging residue — private
+        // state, deliberately left alone: the mode promises not to write
+        // the root, not to clean it.
+        if self.access.is_read_only() {
+            tracing::debug!(
+                "read-only mode: skipping the root-writing repair stages \
+                 (delete tombstones, bucket staging residue)"
+            );
+        } else {
+            self.repair_delete_tombstones(&mut actions).await;
+            self.repair_bucket_staging(&mut actions).await;
+        }
         self.repair_multipart_orphans(&mut actions).await;
         self.repair_orphan_upload_dirs(&mut actions).await;
         self.repair_buckets(&mut actions).await;
@@ -1157,8 +1178,14 @@ mod tests {
             .unwrap();
         drop(handle);
 
-        let cleanup = FsCleanup::new(&storage, CleanupOptions { dry_run: true })
-            .with_multipart_grace(Duration::from_secs(60));
+        let cleanup = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .with_multipart_grace(Duration::from_secs(60));
         let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
         assert!(
             actions
@@ -1188,7 +1215,13 @@ mod tests {
             .await
             .unwrap();
 
-        let cleanup = FsCleanup::new(&storage, CleanupOptions { dry_run: true });
+        let cleanup = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
         let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
         assert!(
             actions
@@ -1826,6 +1859,76 @@ mod tests {
         assert_eq!(errs, 0, "stray files must not fail the repair");
         assert!(state.path().join("multipart/live/stray-part").exists());
         assert!(state.path().join("multipart/stray").exists());
+    }
+
+    #[tokio::test]
+    async fn read_only_repair_skips_the_root_writing_stages() {
+        // FR-023: read-only mode never writes the storage root — the two
+        // stages that touch it (the delete tombstones under
+        // `<root>/.tinio/deleting/` and the in-bucket `.tinio` staging
+        // residue) are skipped, while the state-dir stages still run.
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                follow_symlinks: true,
+                compact_threshold_percent: 20,
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+
+        // Root-side residue: an unpublished delete-bucket tombstone.
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let tombstone = tombstone::dir(root.path()).join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        fs::create_dir_all(&tombstone).await.unwrap();
+        fs::write(tombstone.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+        // ... and an in-bucket staging file.
+        fs::create_dir_all(root.path().join("data/.tinio"))
+            .await
+            .unwrap();
+        fs::write(root.path().join("data/.tinio/aaaa"), b"residue")
+            .await
+            .unwrap();
+
+        // State-dir residue: a leftover temp file.
+        fs::create_dir(state.path().join("tmp")).await.unwrap();
+        fs::write(state.path().join("tmp/upload-leftover"), b"x")
+            .await
+            .unwrap();
+
+        let cleanup = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                access: AccessMode::ReadOnly,
+                ..Default::default()
+            },
+        );
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+
+        assert!(
+            !actions.iter().any(|a| a.description.contains("tombstone")),
+            "no root-writing stage may run: {actions:?}"
+        );
+        assert!(tombstone.exists(), "the tombstone is left alone");
+        assert!(
+            root.path().join("data/.tinio").exists(),
+            "the bucket staging residue is left alone"
+        );
+        // The state-dir stages still run.
+        assert!(
+            actions.iter().any(|a| a.description.contains("temp file")),
+            "{actions:?}"
+        );
+        assert!(!state.path().join("tmp/upload-leftover").exists());
     }
 
     #[tokio::test]

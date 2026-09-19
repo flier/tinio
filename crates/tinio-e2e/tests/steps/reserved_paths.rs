@@ -10,21 +10,13 @@
 use cucumber::{given, then};
 use tokio::fs;
 
+use super::common::plant_in_root;
+
 /// Out-of-band filesystem write into the served root (fs-only): places an
 /// inner server's state or a foreign bucket entry directly on disk.
 #[given(expr = "I write {string} to {string} in the served root")]
 async fn write_in_root(world: &mut super::World, text: String, rel: String) {
-    let root = world
-        .server
-        .as_ref()
-        .expect("server running")
-        .root()
-        .expect("fs-backed server root");
-    let path = root.join(rel);
-    fs::create_dir_all(path.parent().expect("relative path has a parent"))
-        .await
-        .unwrap();
-    fs::write(&path, text.as_bytes()).await.unwrap();
+    plant_in_root(world, rel, &text).await;
 }
 
 /// Create a top-level directory in the served root without the S3 API

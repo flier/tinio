@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     fs::{Metadata, canonicalize},
     io::ErrorKind,
-    path::{Path, PathBuf},
+    path::{Path, PathBuf, absolute},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -30,12 +30,14 @@ pub use objects::StagedBody;
 use tokio::fs;
 
 pub use crate::error::Error;
-pub(crate) use crate::error::{invalid_path, invalid_value, root_not_directory};
+pub(crate) use crate::error::{invalid_path, invalid_state_dir, invalid_value, root_not_directory};
 use crate::{
     _core::{
         ETag, acl,
         bucket::{Name, name},
-        checksum, object, pipeline,
+        checksum,
+        mode::AccessMode,
+        object, pipeline,
         storage::{
             COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
             DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
@@ -81,6 +83,7 @@ use crate::{
 /// use std::sync::Arc;
 ///
 /// use tinio_core::{
+///     mode::AccessMode,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
@@ -91,6 +94,7 @@ use crate::{
 /// let options = FsOptions {
 ///     follow_symlinks: false, // default: reject symlinks
 ///     state_dir: None,
+///     access: AccessMode::ReadWrite, // default: serve every operation
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
@@ -111,9 +115,15 @@ pub struct FsOptions {
     pub follow_symlinks: bool,
     /// State-dir override: where the private state lives. `None` (default)
     /// = `<root>/.tinio/`; read-only mode relocates it to
-    /// `~/.tinio/roots/<sha1(root)>/` (FR-023).
+    /// `~/.tinio/roots/<sha256(canonical root)16>/` (FR-023).
     #[garde(skip)]
     pub state_dir: Option<PathBuf>,
+    /// The plane's write policy (FR-023; see [`AccessMode`]). Read-only
+    /// mode never writes the storage root, so it requires an explicit
+    /// out-of-root `state_dir`: the default `<root>/.tinio/` would write
+    /// the root.
+    #[garde(skip)]
+    pub access: AccessMode,
     /// Compact trigger: the fragmentation percentage at which the state
     /// database is compacted at startup (`[storage.fs]
     /// compact_threshold_percent`, 5..=90).
@@ -180,6 +190,7 @@ pub struct FsOptions {
 ///
 /// use tinio_core::{
 ///     bucket,
+///     mode::AccessMode,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
@@ -196,6 +207,7 @@ pub struct FsOptions {
 ///     FsOptions {
 ///         follow_symlinks: false,
 ///         state_dir: None,
+///         access: AccessMode::ReadWrite,
 ///         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///         meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
@@ -286,6 +298,20 @@ pub struct FsStorage {
 /// warn marks a stuck peer, not routine contention.
 const MUTATION_LOCK_WARN_THRESHOLD: Duration = Duration::from_secs(1);
 
+/// The lowercased components of a path — the case-insensitive comparison
+/// form of the read-only containment rule (Windows only; NTFS resolves
+/// case-different names to the same directory).
+///
+/// A path whose bytes are not valid Unicode is lowercased lossily; NTFS
+/// cannot express two such names as distinct either, so the approximation
+/// cannot hide a real in-root state dir.
+#[cfg(windows)]
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
 impl FsStorage {
     /// Open (or create) the backend over `root` — the convenience path:
     /// open the state database, evaluate and run compaction while the
@@ -369,15 +395,83 @@ impl FsStorage {
 
     fn resolve(root: PathBuf, options: FsOptions) -> Result<(PathBuf, PathBuf, FsOptions), Error> {
         options.validate().map_err(invalid_value)?;
+        if options.access.is_read_only() && options.state_dir.is_none() {
+            return Err(invalid_state_dir(
+                "required in read-only mode (the default `<root>/.tinio` would write the root)",
+            ));
+        }
         let canonical = canonicalize(&root)?;
         if !canonical.is_dir() {
             return Err(root_not_directory(canonical));
+        }
+        // Read-only mode also refuses an explicit state dir inside the
+        // storage root: such a caller silently writes the very tree the
+        // mode promises to leave alone, and a writable root would never
+        // complain. Lexical (the design's residual): the state dir need
+        // not exist yet, so it cannot be canonicalized here.
+        if options.access.is_read_only()
+            && let Some(dir) = options.state_dir.as_deref()
+        {
+            let absolute = absolute(dir)
+                .map_err(|_| invalid_state_dir("could not be resolved in read-only mode"))?;
+            if Self::contained_in_root(&absolute, &canonical) {
+                return Err(invalid_state_dir(
+                    "must be outside the storage root in read-only mode",
+                ));
+            }
         }
         let state_dir = match options.state_dir {
             Some(ref dir) => dir.clone(),
             None => state_dir(&canonical)?,
         };
         Ok((canonical, state_dir, options))
+    }
+
+    /// Whether the (lexically absolutized) state dir lies inside the
+    /// canonical root — the read-only containment rule (FR-023, decision
+    /// 17a).
+    ///
+    /// Case-sensitively, exactly as [`Path::starts_with`] compares: unix
+    /// filesystems distinguish `…/Data` from `…/data`.
+    #[cfg(not(windows))]
+    fn contained_in_root(absolute: &Path, canonical: &Path) -> bool {
+        absolute.starts_with(canonical)
+    }
+
+    /// Whether the (lexically absolutized) state dir lies inside the
+    /// canonical root — the read-only containment rule (FR-023, decision
+    /// 17a).
+    ///
+    /// Case-**insensitively**: NTFS resolves `d:\temp\…` and `D:\Temp\…`
+    /// to the same directory while [`Path::starts_with`] compares
+    /// components literally, so a differently-cased in-root state dir is
+    /// exactly the mistake this guard exists to catch. The comparison
+    /// stays component-wise (so `…\data2` is not "inside" `…\data`), and
+    /// it runs against both shapes of the canonical root:
+    /// `std::fs::canonicalize` answers a verbatim path (`\\?\D:\data`)
+    /// while `std::path::absolute` answers the plain form (`D:\data`).
+    #[cfg(windows)]
+    fn contained_in_root(absolute: &Path, canonical: &Path) -> bool {
+        let candidate = lower_components(absolute);
+        [Some(canonical), Self::plain(canonical).as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|root| candidate.starts_with(&lower_components(root)))
+    }
+
+    /// The plain (non-verbatim) form of a canonical root:
+    /// `std::fs::canonicalize` answers a verbatim path (`\\?\C:\data`, or
+    /// `\\?\UNC\srv\share\data` for a UNC root) while
+    /// `std::path::absolute` answers the plain form (`C:\data`,
+    /// `\\srv\share\data`). `None` when the path carries no verbatim
+    /// prefix.
+    #[cfg(windows)]
+    fn plain(canonical: &Path) -> Option<PathBuf> {
+        let text = canonical.to_str()?.strip_prefix(r"\\?\")?;
+        Some(match text.strip_prefix("UNC\\") {
+            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+            None => PathBuf::from(text),
+        })
     }
 
     fn from_resolved(
@@ -389,6 +483,7 @@ impl FsStorage {
         let FsOptions {
             follow_symlinks,
             state_dir: _,
+            access: _,
             compact_threshold_percent,
             meta_batch_size,
             meta_batch_bytes,

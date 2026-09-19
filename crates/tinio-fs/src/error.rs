@@ -20,6 +20,8 @@ use std::{
     path::PathBuf,
 };
 
+use garde::{Error as GardeError, Path as GardePath, Report};
+
 use crate::{
     _core::{pipeline, storage},
     database::{self, Error as DatabaseError},
@@ -64,6 +66,17 @@ pub(crate) fn invalid_path(path: impl Into<PathBuf>) -> Error {
 /// A construction-option value violates validation rules.
 #[inline]
 pub(crate) fn invalid_value(report: garde::Report) -> Error {
+    Error::InvalidValue(report)
+}
+
+/// The `state_dir` option violates a read-only-mode rule: `garde` validates
+/// field by field, so a cross-field rule (read-only mode requires an
+/// explicit state dir, outside the storage root) builds its report by hand
+/// (FR-023).
+#[inline]
+pub(crate) fn invalid_state_dir(message: &str) -> Error {
+    let mut report = Report::new();
+    report.append(GardePath::new("state_dir"), GardeError::new(message));
     Error::InvalidValue(report)
 }
 

@@ -23,6 +23,7 @@ pub mod checksum;
 pub mod cleanup;
 pub mod cors;
 pub mod etag;
+pub mod mode;
 pub mod multipart;
 pub mod object;
 pub mod percent;
@@ -32,6 +33,7 @@ pub mod storage;
 pub use self::{
     bucket::Bucket,
     etag::ETag,
+    mode::AccessMode,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     storage::{
         BodyStream, BucketOps, BucketsListing, ByteRange, GetObjectResult, ListBucketsParams,

@@ -4,7 +4,10 @@
 //! wraps every request to record the access-log event (`tinio::access`
 //! target, T052), the HTTP metrics (request count/duration/in-flight),
 //! and the upload/download byte counters on the streaming bodies (T054).
-//! The service itself is the [`MetricS3`] wrapper around [`S3Backend`].
+//! The service itself is the s3s service over a stack of decorators: the
+//! [`MetricS3`] metrics/access-log wrapper, the write policy
+//! ([`S3ReadonlyBackend`], read-only planes only), the capability gate
+//! ([`CapabilityS3`]), and [`S3Backend`] at the bottom.
 //!
 //! Graceful shutdown: `serve` stops accepting connections when the
 //! shutdown channel turns true; in-flight connections are spawned tasks
@@ -56,11 +59,13 @@ use crate::_auth::{AclAccess, ConfigAuth, Identity};
 #[cfg(feature = "cors")]
 use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
 use crate::{
-    _core::storage::Storage,
+    _core::{AccessMode, storage::Storage},
     backend::{Capabilities, S3Backend},
+    capability::CapabilityS3,
     error::Error,
     log::{ACCESS_TARGET, AccessField, AccessFields},
     metrics::{self, MetricS3},
+    readonly::S3ReadonlyBackend,
 };
 
 /// The `/metrics` scrape path (F10/F49): the hook refreshes the
@@ -95,6 +100,42 @@ impl S3Auth for StaticAuth {
     }
 }
 
+/// A data plane's construction inputs: the `[s3]` capability toggles and the
+/// write policy. `From<Capabilities>` yields read-write, so existing call
+/// sites pass a bare `Capabilities` unchanged and a read-only caller opts in
+/// with [`PlaneConfig::read_only`].
+#[derive(Debug, Clone, Copy)]
+pub struct PlaneConfig {
+    /// The `[s3]` capability toggles (FR-021).
+    pub caps: Capabilities,
+    /// The write policy (FR-023).
+    pub access: AccessMode,
+}
+
+impl PlaneConfig {
+    /// A read-only plane over `caps`.
+    pub fn read_only(caps: Capabilities) -> Self {
+        Self {
+            caps,
+            access: AccessMode::ReadOnly,
+        }
+    }
+
+    /// Whether this plane refuses mutating operations.
+    pub fn is_read_only(&self) -> bool {
+        self.access.is_read_only()
+    }
+}
+
+impl From<Capabilities> for PlaneConfig {
+    fn from(caps: Capabilities) -> Self {
+        Self {
+            caps,
+            access: AccessMode::ReadWrite,
+        }
+    }
+}
+
 /// The data plane: the s3s service behind the metrics/access middleware.
 pub struct DataPlane {
     service: Arc<DataPlaneService>,
@@ -102,8 +143,8 @@ pub struct DataPlane {
 
 impl DataPlane {
     /// Build the data plane over a storage backend.
-    pub fn new<S: Storage>(storage: S, caps: Capabilities) -> Self {
-        Self::new_shared(Arc::new(storage), caps)
+    pub fn new<S: Storage>(storage: S, plane: impl Into<PlaneConfig>) -> Self {
+        Self::new_shared(Arc::new(storage), plane)
     }
 
     /// Build the data plane over a SHARED storage handle: the backend and
@@ -112,23 +153,24 @@ impl DataPlane {
     /// UNGATED: it exists in every build (feature-off builds keep a
     /// constructor via [`DataPlane::new`]); only the cors wiring is
     /// `#[cfg(feature = "cors")]`.
-    pub fn new_shared<S: Storage>(storage: Arc<S>, caps: Capabilities) -> Self {
-        let backend = MetricS3::new(S3Backend::new_shared(Arc::clone(&storage), caps));
+    pub fn new_shared<S: Storage>(storage: Arc<S>, plane: impl Into<PlaneConfig>) -> Self {
+        let plane = plane.into();
+        let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps);
         #[cfg(feature = "cors")]
         {
-            let mut builder = S3ServiceBuilder::new(backend);
+            let mut builder = Self::service_builder(plane, backend);
             // Double gate: the compile-time feature AND the runtime
             // capability arm the preflight route; the erased lookup rides
             // on the service either way (None with the capability off — no
             // route, no decoration).
-            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
+            if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
                 builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
             Self::from_service(builder.build(), None)
         }
         #[cfg(not(feature = "cors"))]
-        Self::from_service(S3ServiceBuilder::new(backend).build())
+        Self::from_service(Self::service_builder(plane, backend).build())
     }
 
     /// Build the data plane with a single static credential pair (SigV4).
@@ -140,20 +182,21 @@ impl DataPlane {
     /// config-based auth provider in US3 (T082/T083).
     pub fn new_with_auth<S: Storage>(
         storage: S,
-        caps: Capabilities,
+        plane: impl Into<PlaneConfig>,
         access_key: &str,
         secret_key: &str,
     ) -> Self {
+        let plane = plane.into();
         let storage = Arc::new(storage);
-        let backend = MetricS3::new(S3Backend::new_shared(Arc::clone(&storage), caps));
-        let mut builder = S3ServiceBuilder::new(backend);
+        let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps);
+        let mut builder = Self::service_builder(plane, backend);
         builder.set_auth(StaticAuth {
             access_key: access_key.to_string(),
             secret_key: secret_key.into(),
         });
         #[cfg(feature = "cors")]
         {
-            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
+            if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
                 builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
@@ -187,19 +230,19 @@ impl DataPlane {
     #[cfg(feature = "acl")]
     pub fn new_with_acl<S: Storage>(
         storage: S,
-        caps: Capabilities,
+        plane: impl Into<PlaneConfig>,
         identity: Arc<Identity>,
     ) -> Self {
+        let plane = plane.into();
         let storage = Arc::new(storage);
-        let backend = MetricS3::new(
-            S3Backend::new_shared(Arc::clone(&storage), caps).with_identity(Arc::clone(&identity)),
-        );
-        let mut builder = S3ServiceBuilder::new(backend);
+        let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps)
+            .with_identity(Arc::clone(&identity));
+        let mut builder = Self::service_builder(plane, backend);
         builder.set_auth(ConfigAuth::new(Arc::clone(&identity)));
         builder.set_access(AclAccess::new(Arc::clone(&storage), identity));
         #[cfg(feature = "cors")]
         {
-            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
+            if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
                 builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
@@ -207,6 +250,23 @@ impl DataPlane {
         }
         #[cfg(not(feature = "cors"))]
         Self::from_service(builder.build())
+    }
+
+    /// The s3s service builder over `backend`. The layers nest in order,
+    /// from the inside out: the capability gate, then the write policy —
+    /// a read-only plane refuses mutating operations *inside* the
+    /// [`MetricS3`] wrapper, so a refusal is still counted and logged —
+    /// and the metrics wrapper outermost.
+    ///
+    /// The two policies build different chain types, so the fork lives
+    /// here, where s3s's type-erased builder is the one meeting point.
+    fn service_builder<S: Storage>(plane: PlaneConfig, backend: S3Backend<S>) -> S3ServiceBuilder {
+        let gated = CapabilityS3::new(backend, plane.caps);
+        if plane.is_read_only() {
+            S3ServiceBuilder::new(MetricS3::new(S3ReadonlyBackend::new(gated)))
+        } else {
+            S3ServiceBuilder::new(MetricS3::new(gated))
+        }
     }
 
     /// Attach the scrape-time metrics refresh (F10): the `/metrics`
@@ -703,15 +763,13 @@ mod tests {
     };
 
     use super::*;
+    use crate::{_core::pipeline::Stats, _mem::MemoryStorage};
     #[cfg(feature = "cors")]
-    use crate::_core::cors;
     use crate::{
         _core::{
-            bucket, object,
-            pipeline::Stats,
+            bucket, cors, object,
             storage::{BucketOps, ObjectOps},
         },
-        _mem::MemoryStorage,
         _util::testing::body,
     };
 
@@ -860,6 +918,13 @@ mod tests {
         assert_eq!(&t[6..7], "/");
         assert_eq!(&t[11..12], ":");
         assert!(t.ends_with(" +0000"), "{t}");
+    }
+
+    #[test]
+    fn capabilities_convert_to_read_write_plane() {
+        let plane: PlaneConfig = Capabilities::default().into();
+        assert!(!plane.is_read_only());
+        assert!(PlaneConfig::read_only(Capabilities::default()).is_read_only());
     }
 
     #[test]
@@ -1097,6 +1162,7 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[cfg(feature = "cors")]
     #[tokio::test]
     async fn preflight_invalid_bucket_name_is_403_from_the_route() {
         // s3s 0.15 parsed the path in `prepare` (AwsNameValidation) BEFORE

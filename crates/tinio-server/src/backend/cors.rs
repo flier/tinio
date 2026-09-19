@@ -1,8 +1,10 @@
 //! Bucket CORS operations of the S3 mapping layer (spec 2026-09-05).
 //!
 //! GetBucketCors/PutBucketCors/DeleteBucketCors over the storage
-//! contract, gated on `caps.cors` (feature-off builds omit the forwards
-//! entirely — s3s's trait defaults answer "is not implemented yet").
+//! contract, runtime-gated on `caps.cors` by
+//! [`CapabilityS3`](crate::capability::CapabilityS3) (feature-off builds
+//! omit the forwards entirely — s3s's trait defaults answer "is not
+//! implemented yet").
 //! The put validates the config on the request path (400 InvalidRequest
 //! on any violation) — the storage codec's self-heal applies to rows,
 //! never input — and enforces the Content-MD5 header three-state.
@@ -31,7 +33,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::GetBucketCorsInput>,
     ) -> S3Result<S3Response<dto::GetBucketCorsOutput>> {
-        Self::require_cap(self.caps.cors, "GetBucketCors")?;
         let bucket = self.bucket(req.input.bucket)?;
         match self
             .storage
@@ -53,7 +54,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::PutBucketCorsInput>,
     ) -> S3Result<S3Response<dto::PutBucketCorsOutput>> {
-        Self::require_cap(self.caps.cors, "PutBucketCors")?;
         let bucket = self.bucket(req.input.bucket)?;
         validate_content_md5(req.input.content_md5.as_deref())?;
         let config = cors_config_from_dto(req.input.cors_configuration)?;
@@ -68,7 +68,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<dto::DeleteBucketCorsOutput>> {
-        Self::require_cap(self.caps.cors, "DeleteBucketCors")?;
         let bucket = self.bucket(req.input.bucket)?;
         self.storage
             .delete_bucket_cors(&bucket)
@@ -507,7 +506,7 @@ mod tests {
         _mem::MemoryStorage,
         backend::{
             Capabilities,
-            testutil::{s3_request, setup, setup_with_caps},
+            testutil::{s3_request, setup, setup_gated_with_caps},
         },
     };
 
@@ -761,8 +760,9 @@ mod tests {
     #[tokio::test]
     async fn cors_toggle_off_gates_the_bucket_cors_ops() {
         // The cors toggle off answers NotImplemented (FR-021). The gate
-        // fires before the bucket check — no bucket is needed.
-        let (backend, _b) = setup_with_caps(Capabilities {
+        // fires before the bucket check — the fixture's bucket is never
+        // consulted.
+        let (backend, _b) = setup_gated_with_caps(Capabilities {
             cors: false,
             ..Default::default()
         })

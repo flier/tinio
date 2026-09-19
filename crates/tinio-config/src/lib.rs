@@ -11,7 +11,8 @@
 //! CLI — FR-016, in [`sources`]).
 //!
 //! Module layout: [`schema`] (structs/enums + serde/garde/smart-default
-//! attributes), [`sources`] (`.env` loading), [`Error`]. Validation is derive-driven
+//! attributes), [`sources`] (`.env` loading), [`state`] (state-directory
+//! resolution), [`Error`]. Validation is derive-driven
 //! ([`garde::Validate`] on every section); [`Config::parse`] runs it
 //! after deserialization and maps the report onto [`Error`].
 //!
@@ -24,6 +25,7 @@ pub extern crate tinio_core as _core;
 mod error;
 pub mod schema;
 pub mod sources;
+pub mod state;
 
 pub use schema::{
     Config, Version, api, auth, log, owner, pipeline, s3, scanner, server, storage, telemetry,

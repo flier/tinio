@@ -115,7 +115,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::ListObjectsInput>,
     ) -> S3Result<S3Response<dto::ListObjectsOutput>> {
-        Self::require_cap(self.caps.list_objects_v1, "ListObjects")?;
         let page = self
             .list_page(
                 req.input.bucket,
@@ -144,7 +143,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::ListObjectsV2Input>,
     ) -> S3Result<S3Response<dto::ListObjectsV2Output>> {
-        Self::require_cap(self.caps.list_objects_v2, "ListObjectsV2")?;
         let continuation_token = req.input.continuation_token;
         let start_after = req.input.start_after;
         let page = self

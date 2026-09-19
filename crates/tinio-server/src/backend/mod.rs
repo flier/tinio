@@ -10,8 +10,10 @@
 //!
 //! Capability groups are strippable at compile time (`multipart`, `copy`,
 //! `list-v1`, `list-v2`, `cors` cargo features) and disableable at runtime
-//! ([`Capabilities`], from the `[s3]` config section) — disabled groups
-//! answer `NotImplemented` (FR-021).
+//! ([`Capabilities`], from the `[s3]` config section) — a disabled group's
+//! operations answer `NotImplemented` (FR-021), refused by the
+//! [`CapabilityS3`](crate::capability::CapabilityS3) decorator wrapped
+//! around this mapping, not by these handlers.
 //!
 //! **403 ambiguity (the ACL plane, spec 2026-09-05)**: with owners/ACLs
 //! enforced, a 403 `AccessDenied` can mean an ACL denial at the access
@@ -38,6 +40,7 @@ mod conditions;
 pub(crate) mod cors;
 mod errors;
 mod locks;
+pub(crate) mod ops;
 mod s3;
 
 pub(crate) mod buckets;
@@ -328,16 +331,6 @@ impl<S: Storage> S3Backend<S> {
     /// The capability toggles.
     pub fn capabilities(&self) -> Capabilities {
         self.caps
-    }
-
-    /// Runtime capability gate (FR-021): disabled groups answer
-    /// `NotImplemented`.
-    pub(crate) fn require_cap(enabled: bool, name: &'static str) -> S3Result<()> {
-        if enabled {
-            Ok(())
-        } else {
-            Err(s3_error!(NotImplemented, "{name} is disabled"))
-        }
     }
 
     /// The bucket of a request input, validated (FR-012).

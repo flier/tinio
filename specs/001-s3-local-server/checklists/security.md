@@ -68,7 +68,7 @@
 ## Security Failure & Boundary Scenarios
 
 - [x] CHK034 Is observability of failed authentication attempts specified (request logging includes method/path/status per FR-017)? [Coverage, Spec §FR-017]
-- [x] CHK035 Does the read-only-mode AccessDenied requirement consistently cover ALL mutating operation classes (bucket create/delete, object put/delete/copy, all multipart operations)? [Consistency, Spec §FR-023]
+- [x] CHK035 Does the read-only-mode AccessDenied requirement consistently cover ALL mutating operations — every write, tagging, ACL and CORS writes included, per the fixed list in `contracts/s3-surface.md` (§Read-only mode)? [Consistency, Spec §FR-023]
 - [x] CHK036 Is the boundary between capability-disabled (NotImplemented) and security-denied (AccessDenied) responses clearly distinguished in requirements? [Clarity, Spec §FR-021 vs §FR-023]
 - [x] CHK037 Are interrupted-upload / concurrent-write integrity requirements specified (no partial object visible as completed, last-write-wins) as part of data-safety requirements? [Completeness, Spec §FR-011, §Edge Cases]
 - [x] CHK038 Is the zero-side-effect guarantee for rejected traversal requests (fail without touching the filesystem) objectively verifiable per SC-004? [Measurability, Spec §FR-006, §SC-004]

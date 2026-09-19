@@ -79,9 +79,6 @@ const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // FR-019: metric-recording overhead — a performance property;
     // verified by the metrics_overhead bench (T092).
     "FR-019",
-    // FR-023: read-only mode — US2, not yet implemented (T058 unchecked);
-    // nothing to exercise.
-    "FR-023",
     // SC-003: flat memory on 1 GB transfers — verified by the manual
     // perf script (T089).
     "SC-003",

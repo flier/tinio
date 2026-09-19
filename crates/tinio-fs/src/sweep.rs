@@ -52,6 +52,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// use std::{sync::Arc, time::Duration};
 ///
 /// use tinio_core::{
+///     mode::AccessMode,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
@@ -67,6 +68,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// let options = FsOptions {
 ///     follow_symlinks: false,
 ///     state_dir: None,
+///     access: AccessMode::ReadWrite,
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,

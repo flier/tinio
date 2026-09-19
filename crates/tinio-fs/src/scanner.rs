@@ -35,7 +35,7 @@ use tokio::{
 };
 
 use crate::{
-    _core::{bucket, cleanup::CleanupOptions, object, pipeline::Completion},
+    _core::{bucket, cleanup::CleanupOptions, mode::AccessMode, object, pipeline::Completion},
     _store::meta,
     FsCleanup,
     backend::FsStorage,
@@ -70,6 +70,10 @@ pub struct ScannerOptions {
     pub max_wait: Duration,
     /// Full-tree re-scan cadence (catches out-of-band changes over time).
     pub cycle: Duration,
+    /// The plane's write policy: read-only mode skips the tombstone
+    /// purge, the one pass stage that writes the storage root (FR-023;
+    /// see [`AccessMode`]).
+    pub access: AccessMode,
 }
 
 /// The background ETag scanner of a storage backend.
@@ -80,6 +84,7 @@ pub struct ScannerOptions {
 /// use std::{fs, sync::Arc, time::Duration};
 ///
 /// use tinio_core::{
+///     mode::AccessMode,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
@@ -94,6 +99,7 @@ pub struct ScannerOptions {
 /// let options = FsOptions {
 ///     follow_symlinks: false,
 ///     state_dir: None,
+///     access: AccessMode::ReadWrite,
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
@@ -111,6 +117,7 @@ pub struct ScannerOptions {
 ///     delay: Duration::from_millis(1),
 ///     max_wait: Duration::from_millis(10),
 ///     cycle: Duration::from_millis(50),
+///     access: AccessMode::ReadWrite,
 /// };
 /// let scanner = Scanner::new(storage.clone(), options);
 /// Runtime::new().unwrap().block_on(async {
@@ -241,26 +248,46 @@ impl Scanner {
         // row. The meta-orphan half of the old `reclaim_meta_orphans`
         // full pass is derived per bucket above — no second full scan
         // per round.
-        let cleanup = FsCleanup::new(&self.storage, CleanupOptions::default());
+        let cleanup = FsCleanup::new(
+            &self.storage,
+            CleanupOptions {
+                // The mode rides along: the stale-record stage is not
+                // gated today, but one plane must not have two views of
+                // its write policy (FR-023).
+                access: self.options.access,
+                ..Default::default()
+            },
+        );
         match cleanup.reclaim_stale_buckets().await {
             Ok(reclaimed) => summary.reclaimed += reclaimed,
             Err(err) => tracing::warn!(error = %err, "stale-bucket reclamation failed"),
         }
-        // Unpublished delete-bucket trees (a crash after the unpublish
-        // rename, or a failed fire-and-forget `remove_dir_all`) live
-        // under `<root>/.tinio/deleting/` — not a live bucket name, so
-        // the reconcile loop never sees them. They are enqueued on the
-        // removal lane (D-A) — never removed inline — and the
-        // completions are AWAITED so the summary counts ACTUAL removals
-        // (F03): an enqueue is not a removal, and a stuck tree must
-        // read as zero reclamation (plus a `removal_failures` count),
-        // never as a climbing counter. The cycle waits for the leftover
-        // tree walks — leftovers are crash/failure residue, rare by
-        // construction, and the removal lane's own workers do the IO —
-        // while the lane stays the storage's own (an inline runner
-        // offline, so the enqueue still clears). A tree that fails is
-        // error-logged ONCE (the known-stuck set suppresses the repeat
-        // passes' retries); a later success clears it.
+        // FR-023: the leftover purge is the one pass stage that writes the
+        // storage root (an enqueue whose removal deletes trees under
+        // `<root>/.tinio/deleting/`), so read-only mode skips it — the
+        // stages above write only the relocated state dir.
+        if !self.options.access.is_read_only() {
+            self.reclaim_tombstones(&mut summary).await;
+        }
+        Ok(summary)
+    }
+
+    /// Unpublished delete-bucket trees (a crash after the unpublish
+    /// rename, or a failed fire-and-forget `remove_dir_all`) live
+    /// under `<root>/.tinio/deleting/` — not a live bucket name, so
+    /// the reconcile loop never sees them. They are enqueued on the
+    /// removal lane (D-A) — never removed inline — and the
+    /// completions are AWAITED so the summary counts ACTUAL removals
+    /// (F03): an enqueue is not a removal, and a stuck tree must
+    /// read as zero reclamation (plus a `removal_failures` count),
+    /// never as a climbing counter. The cycle waits for the leftover
+    /// tree walks — leftovers are crash/failure residue, rare by
+    /// construction, and the removal lane's own workers do the IO —
+    /// while the lane stays the storage's own (an inline runner
+    /// offline, so the enqueue still clears). A tree that fails is
+    /// error-logged ONCE (the known-stuck set suppresses the repeat
+    /// passes' retries); a later success clears it.
+    async fn reclaim_tombstones(&self, summary: &mut ScanSummary) {
         let leftover_runner = self.storage.remove_pipeline();
         let mut pending = FuturesUnordered::new();
         match tombstone::leftovers(self.storage.root()).await {
@@ -301,7 +328,6 @@ impl Scanner {
                 ),
             }
         }
-        Ok(summary)
     }
 
     /// Reconcile one bucket: for every object file, ensure a matching meta
@@ -719,6 +745,7 @@ mod tests {
             delay: Duration::from_millis(1),
             max_wait: Duration::from_millis(10),
             cycle: Duration::from_millis(50),
+            access: AccessMode::ReadWrite,
         }
     }
 
@@ -893,6 +920,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_scan_skips_the_tombstone_leftovers() {
+        // FR-023: the tombstone-leftover purge is the one scanner stage
+        // that writes the storage root — read-only mode skips it. The
+        // read-write leg is the positive control (without it the test
+        // would also pass if the scan silently did nothing).
+        let root = tempfile::tempdir().unwrap();
+        let leftover = tombstone::dir(root.path()).join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        fs::create_dir_all(&leftover).await.unwrap();
+        fs::write(leftover.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+        // A counting lane: the enqueue is observable, and a regression
+        // removes the tree (a gated lane would deadlock the pass on the
+        // completion it awaits).
+        let lane = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                remove_pipeline: lane.clone(),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+
+        let scanner = Scanner::new(
+            storage.clone(),
+            ScannerOptions {
+                access: AccessMode::ReadOnly,
+                ..options()
+            },
+        );
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(lane.enqueued(), 0, "nothing is enqueued read-only");
+        assert_eq!(summary.reclaimed, 0);
+        assert_eq!(summary.removal_failures, 0);
+        assert!(leftover.exists(), "the root is left alone");
+
+        // Positive control: the same leftover IS enqueued read-write.
+        let scanner = Scanner::new(storage, options());
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(lane.enqueued(), 1, "the read-write pass enqueues it");
+        assert_eq!(summary.reclaimed, 1);
+        assert!(!leftover.exists());
+    }
+
+    #[tokio::test]
     async fn write_batch_enqueues_pace_like_compute_batches() {
         let root = tempfile::tempdir().unwrap();
         files(root.path(), 3);
@@ -913,6 +986,7 @@ mod tests {
                 delay: Duration::from_millis(200),
                 max_wait: Duration::from_millis(10),
                 cycle: Duration::from_millis(50),
+                access: AccessMode::ReadWrite,
             },
         );
         let started = Instant::now();
@@ -1065,6 +1139,7 @@ mod tests {
                 delay: Duration::from_millis(1),
                 max_wait: Duration::from_millis(10),
                 cycle: Duration::from_millis(1),
+                access: AccessMode::ReadWrite,
             },
         );
         let (tx, rx) = watch::channel(false);
@@ -1341,6 +1416,7 @@ mod tests {
                 delay: Duration::from_millis(10),
                 max_wait: Duration::from_millis(10),
                 cycle: Duration::from_millis(50),
+                access: AccessMode::ReadWrite,
             },
         );
         let task = tokio::spawn(async move { scanner.scan_once().await.unwrap() });

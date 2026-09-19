@@ -10,6 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     _core::{
+        mode::AccessMode,
         pipeline::InlineRunner,
         storage::{
             DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
@@ -35,6 +36,7 @@ pub fn fs_options() -> FsOptions {
     FsOptions {
         follow_symlinks: false,
         state_dir: None,
+        access: AccessMode::ReadWrite,
         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
         meta_batch_size: DEFAULT_META_BATCH_SIZE,
         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,

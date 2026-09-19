@@ -742,7 +742,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::DeleteObjectsInput>,
     ) -> S3Result<S3Response<dto::DeleteObjectsOutput>> {
-        Self::require_cap(self.caps.delete_objects, "DeleteObjects")?;
         let bucket = self.bucket(req.input.bucket)?;
         let quiet = req.input.delete.quiet.unwrap_or(false);
         // The enforced-mode per-key check (spec 2026-09-05, review B2):
@@ -867,7 +866,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::GetObjectTaggingInput>,
     ) -> S3Result<S3Response<dto::GetObjectTaggingOutput>> {
-        Self::require_cap(self.caps.tagging, "GetObjectTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         let head = self
@@ -891,7 +889,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::PutObjectTaggingInput>,
     ) -> S3Result<S3Response<dto::PutObjectTaggingOutput>> {
-        Self::require_cap(self.caps.tagging, "PutObjectTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         let tags = tags_from_tag_set(&req.input.tagging.tag_set, OBJECT_TAGS_MAX)?;
@@ -909,7 +906,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<dto::DeleteObjectTaggingOutput>> {
-        Self::require_cap(self.caps.tagging, "DeleteObjectTagging")?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         self.storage
@@ -929,7 +925,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::GetObjectAclInput>,
     ) -> S3Result<S3Response<dto::GetObjectAclOutput>> {
-        Self::require_cap(self.caps.acl, "GetObjectAcl")?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         let head = self
@@ -958,7 +953,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::PutObjectAclInput>,
     ) -> S3Result<S3Response<dto::PutObjectAclOutput>> {
-        Self::require_cap(self.caps.acl, "PutObjectAcl")?;
         require_content_md5(req.input.content_md5.as_deref())?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
@@ -1014,7 +1008,6 @@ impl<S: Storage> S3Backend<S> {
         req: S3Request<dto::CopyObjectInput>,
     ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
         use crate::_core::acl::Acl;
-        Self::require_cap(self.caps.copy_object, "CopyObject")?;
         let (src_bucket, src_key) = self.copy_source(&req.input.copy_source)?;
         let dst_bucket = self.bucket(req.input.bucket)?;
         let dst_key = self.key(req.input.key)?;
@@ -1194,7 +1187,6 @@ impl<S: Storage> S3Backend<S> {
         req: S3Request<dto::RenameObjectInput>,
     ) -> S3Result<S3Response<dto::RenameObjectOutput>> {
         use http::header::ETAG;
-        Self::require_cap(self.caps.copy_object, "RenameObject")?;
         let bucket = self.bucket(req.input.bucket)?;
         let dst = self.key(req.input.key)?;
         let src = self.key(rename_source_key(&req.input.rename_source).to_string())?;
@@ -1334,18 +1326,21 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+    #[cfg(feature = "copy")]
+    use crate::_util::testing::tags;
     #[cfg(feature = "acl")]
     use crate::{
         _core::storage::BucketOps,
         backend::testutil::{acl_backend, credentials_for, post_request, signed_request, user_id},
+        capability::CapabilityS3,
     };
     use crate::{
         _core::{bucket, checksum, storage::ObjectOps},
         _mem::MemoryStorage,
-        _util::testing::{body, read_body, tags},
+        _util::testing::{body, read_body},
         backend::{
             Capabilities,
-            testutil::{s3_request, setup, setup_with_caps},
+            testutil::{s3_request, setup, setup_gated_with_caps, setup_with_caps},
         },
     };
 
@@ -1418,8 +1413,8 @@ mod tests {
     /// A PutObjectAcl with the body-policy grant source and a valid
     /// Content-MD5.
     #[cfg(feature = "acl")]
-    async fn put_acl(
-        backend: &S3Backend<MemoryStorage>,
+    async fn put_acl<T: S3>(
+        backend: &T,
         b: &str,
         key: &str,
         policy: dto::AccessControlPolicy,
@@ -2127,15 +2122,16 @@ mod tests {
         // non-owner deletes the owner's key with a plain Deleted entry
         // (today's behavior; the access layer is the enforcement
         // surface when wired).
-        let backend = S3Backend::new(
-            MemoryStorage::new().unwrap(),
-            Capabilities {
-                acl: false,
-                ..Default::default()
-            },
-        )
-        .with_identity(testutil::acl_identity());
-        let storage = backend.storage();
+        let caps = Capabilities {
+            acl: false,
+            ..Default::default()
+        };
+        let backend = CapabilityS3::new(
+            S3Backend::new(MemoryStorage::new().unwrap(), caps)
+                .with_identity(testutil::acl_identity()),
+            caps,
+        );
+        let storage = backend.inner().storage();
         let alice = user_id("AKID");
         let b = bucket::name("data").unwrap();
         storage
@@ -2876,7 +2872,7 @@ mod tests {
 
     #[tokio::test]
     async fn tagging_toggle_off_drops_the_headers_and_gates_the_ops() {
-        let (backend, b) = setup_with_caps(Capabilities {
+        let (backend, b) = setup_gated_with_caps(Capabilities {
             tagging: false,
             ..Default::default()
         })
@@ -2896,6 +2892,7 @@ mod tests {
             .await
             .unwrap();
         let head = backend
+            .inner()
             .storage()
             .head_object(&bucket::name(&b).unwrap(), &object::key("t.txt").unwrap())
             .await
@@ -3673,7 +3670,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "acl")]
     async fn object_acl_toggle_off_gates_the_ops() {
-        let (backend, b) = setup_with_caps(Capabilities {
+        let (backend, b) = setup_gated_with_caps(Capabilities {
             acl: false,
             ..Default::default()
         })

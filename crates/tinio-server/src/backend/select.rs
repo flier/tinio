@@ -255,7 +255,6 @@ impl<S: Storage> S3Backend<S> {
         &self,
         req: S3Request<dto::SelectObjectContentInput>,
     ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
-        Self::require_cap(self.caps.select, "SelectObjectContent")?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
         // X6: the parse+validate is CPU-bound — a 256 KiB adversarial
@@ -775,7 +774,7 @@ mod tests {
         _util::testing::body,
         backend::{
             Capabilities,
-            testutil::{s3_request, setup, setup_with_caps},
+            testutil::{s3_request, setup, setup_gated_with_caps},
         },
     };
 
@@ -922,7 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_capability_off_is_not_implemented() {
-        let (backend, _) = setup_with_caps(Capabilities {
+        let (backend, _) = setup_gated_with_caps(Capabilities {
             select: false,
             ..Default::default()
         })

@@ -56,7 +56,7 @@ mod tests {
             ),
             (
                 Error::Config(ConfigError::Missing("api".into())),
-                "configuration error: missing required configuration: api",
+                "configuration error: missing required value: api",
             ),
             (
                 Error::Storage(NoSuchBucket("data".into())),

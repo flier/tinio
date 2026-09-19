@@ -110,7 +110,7 @@ Implementation of the scanner design in [scanner.md](scanner.md) for the filesys
 - **Reconciliation**: per [scanner.md §2](scanner.md) — missing → compute; size/mtime mismatch → recompute; object gone → reclaim via §8.3; match → skip. Reads/writes meta via `crates/tinio-fs/src/meta.rs` (redb transactions on `OBJECT_META`).
 - **Yield**: after a bounded batch of entries, yield to the runtime so in-flight S3 requests preempt scanning (tuned by the T093 cold/warm benchmark).
 - **Pacing**: `[scanner]` delay/max_wait/cycle per contracts/config.md; `TINIO_SCANNER` env override.
-- **Read-only mode**: the walk runs identically, but meta writes land in the home state dir (`~/.tinio/roots/<sha1>/`, FR-023).
+- **Read-only mode**: the walk runs identically, but meta writes land in the home state dir (`~/.tinio/roots/<sha256>/`, FR-023).
 
 ## 10. State-database compaction and integrity (`crates/tinio-fs/src/state.rs`)
 
