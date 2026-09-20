@@ -4882,9 +4882,12 @@ where the read is `child.terminal()`, taken **after** the wait. The ordering is 
 
 `Child::new` takes a `FnMut() -> Result<ExitStatus>`, and the relay thread's `JoinHandle<Option<Terminal>>` reaches it through `Child::with_relay`, so the two calls above fit as written. `supervise(&mut child, || ())` then runs the wait — which joins the relay before it returns — and the `Grants` guard's `Drop` covers a `Child` that is never waited on.
 
-The facade's Windows arm in `crates/tinio-sandbox/src/lib.rs` gains **two names from this phase** — the child-side listener rebuild, under the platform-neutral name P3 also uses, and the stop hook — and nothing else from the platform's `launch` module:
+The facade's Windows arm in `crates/tinio-sandbox/src/lib.rs` gains **two names from this phase** — the child-side listener rebuild, under the platform-neutral name P3 also uses, and the stop hook — plus **this platform's cfg-gated alias**, which is the path a consumer names to reach the settings the shared surface deliberately does not carry (design decision 2; P1's Linux arm is the same line for `linux`), and nothing else from the platform's `launch` module:
 
 ```rust
+#[cfg(target_os = "windows")]
+pub use crate::_windows as windows;
+
 #[cfg(target_os = "windows")]
 pub use tinio_sandbox_windows::launch::{listener as adopted_listener, on_stop};
 
@@ -4898,7 +4901,7 @@ pub use tinio_sandbox_windows::launch::{listener as adopted_listener, on_stop};
 // rather than a shortcut.)
 ```
 
-**The two names are there because the child-side path is shared.** `serve`'s `confined` is gated by `feature = "sandbox"` alone, with no `target_os`, so it is one path across all three platforms and can name neither platform crate; the facade is where each call such a path makes gets one platform-neutral name, `#[cfg]`-selected, and nothing else from the platform's `launch` module rides along — `adopted_listener` rebuilds the inherited listener from the descriptor the payload carried, `on_stop` is the hook a forwarded stop lands on, and the names no shared call site uses (`command_args`, the launcher's own argv construction, and `disarm`, which is reached at most from an already-Windows-gated arm) stay on the platform crate. P3's facade arm is the same shape — `pub use tinio_sandbox_macos::launch::listener as adopted_listener;` — which is why the name is spelled identically in both plans. **The configuration is not on the facade**: `Options` and `Capability` are reached by naming `tinio_sandbox_windows` directly inside the launch path's `#[cfg(windows)]` block, exactly as `serve`'s Linux arm names `tinio-sandbox-linux` for `LinuxOptions` (design decision 2, and §10's "the difference is configuration rather than dispatch"). `Backend as Platform` and `backend as platform` are P0's selection and P2 restates neither, and `confine` and `socket` stay in this crate, where any caller that has already named it can reach them.
+**The two names are there because the child-side path is shared.** `serve`'s `confined` is gated by `feature = "sandbox"` alone, with no `target_os`, so it is one path across all three platforms and can name neither platform crate; the facade is where each call such a path makes gets one platform-neutral name, `#[cfg]`-selected, and nothing else from the platform's `launch` module rides along — `adopted_listener` rebuilds the inherited listener from the descriptor the payload carried, `on_stop` is the hook a forwarded stop lands on, and the names no shared call site uses (`command_args`, the launcher's own argv construction, and `disarm`, which is reached at most from an already-Windows-gated arm) stay on the platform crate. P3's facade arm is the same shape — `pub use tinio_sandbox_macos::launch::listener as adopted_listener;` — which is why the name is spelled identically in both plans. **A platform's own settings are not on it either**, and where this arm reaches them is design decision 2's boundary to state rather than this plan's: the alias that section names is `tinio_sandbox::windows` here, and a consumer writes `tinio_sandbox::windows::Options` inside the `#[cfg(target_os = "windows")]` block it would have written anyway. `Backend as Platform` and `backend as platform` are P0's selection and P2 restates neither, and `confine` and `socket` stay in this crate, where any caller that has already named it can reach them.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -5520,7 +5523,7 @@ Expected: PASS — the relay forwards, the control case shows a targeted stop do
 - Create: `crates/tinio-server/tests/sandbox_e2e_windows.rs`
 
 **Interfaces:**
-- Consumes: `tinio_sandbox::{AccessMode, Child, Confinement, Event, Exposure, LaunchPlan, Sandbox, adopt, adopted_listener, is_listener_fd_arg, on_stop, supervise}`; on the Windows arm `tinio_sandbox_windows::{Backend, Options}` and the `Capability` its helper parses, plus `control::send_stop` in the end-to-end test; `tracing` and `tracing_subscriber` (both already dependencies of `tinio-server` — the launcher installs the sink `serve`'s own subscriber cannot reach); `tinio_config::server::probe_read_only`.
+- Consumes: `tinio_sandbox::{AccessMode, Child, Confinement, Event, Exposure, LaunchPlan, Sandbox, adopt, adopted_listener, is_listener_fd_arg, on_stop, supervise}`; on the Windows arm `tinio_sandbox::windows::{Backend, Capability, Options}` — the facade's cfg-gated alias for this platform's crate, not a dependency of this crate's own (design decision 2) — plus `tinio_sandbox::windows::control::send_stop` in the end-to-end test; `tracing` and `tracing_subscriber` (both already dependencies of `tinio-server` — the launcher installs the sink `serve`'s own subscriber cannot reach); `tinio_config::server::probe_read_only`.
 - Produces: nothing the library uses.
 
 Three things change in the entry point, in the design's order: the payload discriminator comes first (§10 step 1), the configuration is read as **bytes** and parsed only where it stays in the process (decision 18), and the endpoint travels as an **event** on stdout — emitted by whichever process bound the socket, exactly once (decision 19). Since the child's stdout is a pipe the parent relays, the parent's own stdout is the operator's only view of the protocol, and nothing else on this path may write to it. The macOS arm does not exist yet, so a sandbox request there must fail closed rather than serve unconfined (§11).
@@ -5608,28 +5611,13 @@ Run: `cargo test -p tinio-config probe_reads_only` — FAIL, then PASS.
 `crates/tinio-server/examples/serve.rs`, appended to the existing `mod tests`:
 
 ```rust
-    #[test]
-    fn the_executables_directory_is_exposed_on_windows_only() {
-        let root = Path::new("/srv/tinio");
-        let exe_dir = std::env::current_exe().unwrap();
-        let exe_dir = exe_dir.parent().unwrap();
-        #[cfg(windows)]
-        {
-            let exposures = sandbox_exposures(root, root, AccessMode::ReadWrite);
-            assert!(
-                exposures.iter().any(|e| e.host == exe_dir && e.access == AccessMode::ReadOnly),
-                "the confined child cannot load without an ACE on its own directory"
-            );
-        }
-        #[cfg(not(windows))]
-        {
-            let exposures = sandbox_exposures(root, root, AccessMode::ReadWrite);
-            assert!(!exposures.iter().any(|e| e.host == exe_dir));
-        }
-    }
+    // The executable's directory is **not** tested here. It is this crate's own
+    // backend that merges it into the whitelist (`backend::exposures`, Task 3,
+    // decision 22) and Task 3 is where its tests live; the helper below is P1's,
+    // so a test of it here would be a second copy of both.
 
     // The gate repeats the one above it, and for the same reason: this test names
-    // `tinio_sandbox_windows::Capability`, which does not exist on the other two
+    // the facade's Windows alias, which does not exist on the other two
     // targets (shared §2).
     #[test]
     #[cfg(all(feature = "sandbox", target_os = "windows"))]
@@ -5638,7 +5626,7 @@ Run: `cargo test -p tinio-config probe_reads_only` — FAIL, then PASS.
         assert!(capabilities_from(Some("")).unwrap().is_empty());
         assert_eq!(
             capabilities_from(Some("privateNetworkClientServer")).unwrap(),
-            vec![tinio_sandbox_windows::Capability::PrivateNetworkClientServer]
+            vec![tinio_sandbox::windows::Capability::PrivateNetworkClientServer]
         );
         assert!(capabilities_from(Some("bogus")).is_err());
     }
@@ -5667,28 +5655,11 @@ Expected: FAIL — `cannot find function 'capabilities_from'`.
 
 In `crates/tinio-server/examples/serve.rs`. **`emit` and `emit_error` are the one pair this list does not define, and the reason is the file**: both belong to P1 — `2026-09-18-sandbox-linux.md` Task 7 writes them beside `serve`'s signature, because that is the phase that restructures this file — and one file cannot carry two `fn emit` (`E0428`). It is the rule the plan already applies to `Args`, `parse_args`, `sandbox_exposures` and `serve`'s signature, and it costs these arms nothing: what they add to the helper is a **caller**, and the only frame they write through it is their own `Error` — a startup refusal, or a child that exited without ever reporting — because `Listening` belongs to the process that serves and the parent relays it (decision 19).
 
+**`sandbox_exposures` is P1's and is not defined here either**, which the same rule settles: `2026-09-18-sandbox-shared.md` §4 gives every helper in this file one owner, P1 Task 7 writes this one, and P2 adds only its caller — `Sandbox::from_exposures(sandbox_exposures(Path::new(&args.root), &state, root_access), true)` in the arm below. **The executable's own directory is not this helper's to expose**: on Windows that entry is this crate's backend's — `backend::exposures` merges it into the whitelist and refuses to widen a path the caller exposed read-write (Task 3, decision 22, with its own tests) — so the helper stays the platform-neutral set P3 also calls, and no second copy of the rule belongs in this file.
+
 ```rust
 #[cfg(feature = "sandbox")]
-use tinio_sandbox::{AccessMode, Event, Exposure, LaunchPlan, Sandbox};
-
-/// P1's exposure helper, extended with decision 22's automatic entry: on the
-/// launcher platforms the directory holding this executable is exposed
-/// read-only, because a confined child cannot load without an ACE on it.
-#[cfg(feature = "sandbox")]
-fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: AccessMode) -> Vec<Exposure> {
-    let mut sandbox = Sandbox::new().expose(root, root_access);
-    if !state_dir.starts_with(root) {
-        sandbox = sandbox.expose(state_dir, AccessMode::ReadWrite);
-    }
-    #[cfg(windows)]
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    {
-        sandbox = sandbox.expose(dir, AccessMode::ReadOnly);
-    }
-    sandbox.exposures().to_vec()
-}
+use tinio_sandbox::{AccessMode, Event, LaunchPlan, Sandbox};
 
 /// The container's capabilities from `TINIO_SANDBOX_CAPABILITIES`.
 ///
@@ -5697,20 +5668,19 @@ fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: AccessMode) -> 
 /// names (`privateNetworkClientServer`, for a non-loopback bind).
 ///
 /// **`target_os = "windows"` as well as the feature, and the test below carries
-/// the same gate.** `tinio-sandbox-windows` is a dependency of this crate only
-/// under `[target.'cfg(target_os = "windows")'.dependencies]` (Step 4), while the
+/// the same gate.** The facade publishes this platform's crate under a
+/// `#[cfg(target_os = "windows")]` alias (design decision 2), while the
 /// `sandbox` feature is on by default everywhere — so on Linux and macOS, which
-/// is where P1's legs and CI build, an item gated by the feature alone names a
-/// crate that is not in the graph at all and fails with `E0433: failed to resolve
-/// … tinio_sandbox_windows`. This is shared §2's rule in its second shape: a
-/// crate-root `#![cfg]` does not reach `tests/` or `examples/`, so every separate
-/// target repeats the gate it needs, and no item that is configured out may be
-/// named by one that is not.
+/// is where P1's legs and CI build, an item gated by the feature alone names an
+/// alias that does not exist there and fails to resolve. This is shared §2's rule
+/// in its second shape: a crate-root `#![cfg]` does not reach `tests/` or
+/// `examples/`, so every separate target repeats the gate it needs, and no item
+/// that is configured out may be named by one that is not.
 #[cfg(all(feature = "sandbox", target_os = "windows"))]
 fn capabilities_from(
     raw: Option<&str>,
-) -> Result<Vec<tinio_sandbox_windows::Capability>, Box<dyn Error + Send + Sync>> {
-    tinio_sandbox_windows::Capability::parse_list(raw).map_err(Into::into)
+) -> Result<Vec<tinio_sandbox::windows::Capability>, Box<dyn Error + Send + Sync>> {
+    tinio_sandbox::windows::Capability::parse_list(raw).map_err(Into::into)
 }
 
 /// Windows' step of design §10 step 6: bind the port, hand the socket over,
@@ -5730,7 +5700,7 @@ fn confine_or_launch(
     config_bytes: &[u8],
 ) -> Result<tinio_sandbox::Child, Box<dyn Error + Send + Sync>> {
     {
-        use tinio_sandbox_windows::{Backend, Options};
+        use tinio_sandbox::windows::{Backend, Options};
 
         let listener = std::net::TcpListener::bind(address)?;
         // **No `Listening` event is emitted here, even though this is the
@@ -5746,12 +5716,14 @@ fn confine_or_launch(
         let plan = LaunchPlan::for_launch(String::from_utf8_lossy(config_bytes).into_owned())
             .with_listener(listener);
         // The container's capability list is a Windows setting with no
-        // equivalent on the other two platforms, so this arm names the platform
-        // crate directly instead of going through the facade's `platform()` —
-        // the facade returns whatever backend the build targets, and an options
-        // value only one of them has cannot be handed to it (design decision 2,
-        // §10). What stays cfg-free is the dispatch: `Confinement` is the
-        // core's, and the match below is the same on every platform.
+        // equivalent on the other two platforms, and the `use` above reaches it
+        // through the facade's alias for this platform's crate rather than
+        // through `platform()` — the facade returns whatever backend the build
+        // targets, and an options value only one of them has cannot be handed to
+        // it (design decision 2 owns that boundary, and §10's "the difference is
+        // configuration rather than dispatch"). What stays cfg-free is the
+        // dispatch: `Confinement` is the core's, and the match below is the same
+        // on every platform.
         let options = Options {
             capabilities: capabilities_from(
                 std::env::var("TINIO_SANDBOX_CAPABILITIES").ok().as_deref(),
@@ -5770,9 +5742,11 @@ fn confine_or_launch(
 
 **There is no non-Windows arm, and that is the point.** An earlier draft gave this helper a `#[cfg(not(windows))]` branch that called `sandbox.enter(&LinuxOptions::default())` and returned `Ok(None)` — a call into an API no phase defines (P1's backend answers `Confinement::InPlace` from `confine`, and there is no `enter`), kept alive only so the helper could keep one shape. P1's Linux arm stays exactly as `2026-09-18-sandbox-linux.md` Task 7 wrote it, inline in `main`; this plan neither restates it nor wraps it (the one-definer rule in `docs/superpowers/README.md`).
 
-**Nothing is added to the facade for this step.** The arm above names `tinio_sandbox_windows` directly for the container's options, and the two platform names the child side needs — `adopted_listener` and `on_stop` — are the re-exports Task 9 puts on the facade. That is decision 2's boundary: the facade shares what every platform needs to *drive* a confinement, and a backend's own settings stay in its own crate.
+**Nothing is added to the facade for this step.** The arm above reaches the container's options through the facade's `tinio_sandbox::windows` alias, and the two platform names the child side needs — `adopted_listener` and `on_stop` — are the re-exports Task 9 puts on the facade. That is decision 2's boundary: the facade shares what every platform needs to *drive* a confinement, and a backend's own settings stay in its own crate.
 
 (a) this process's arguments, with the launcher's own element removed so the parser never sees it:
+
+**This is the file's single `own_args`, and P3 calls it rather than writing a second one** — the rule `2026-09-18-sandbox-shared.md` §4 states for every helper that lands in this one file, and the same shape as Step 1's `probe_read_only`: this task is the earlier of the two launcher plans, so the definition is written here, and `2026-09-18-sandbox-p3-macos.md` Task 8's two call sites (`confined` and `main`) are calls. Two definitions of one function in one module is `E0428`, which is exactly what a second copy beside this one would be.
 
 ```rust
 /// This process's arguments: `argv[0]` dropped, and the launcher's private
@@ -5858,6 +5832,9 @@ fn confined(adopted: tinio_sandbox::Adopted) -> Result<(), Box<dyn Error + Send 
     // the pair `state_dir`/`access` — the path the exposure set named and the
     // mode the run resolved — and both are re-derived here from the same three
     // sources rather than handed over (design §10).
+    // The lanes `serve` is handed beside the storage — `2026-09-18-sandbox-shared.md`
+    // §4 says why the value has to travel rather than be rebuilt inside the body.
+    let pipelines = /* the lanes the options literal below names */;
     let storage = FsStorage::new(
         /* the root and options, with this `state_dir` and `access` */
     )?;
@@ -5878,6 +5855,8 @@ fn confined(adopted: tinio_sandbox::Adopted) -> Result<(), Box<dyn Error + Send 
             args,
             config,
             storage,
+            access,
+            pipelines,
             Some(listener),
             Some(shutdown_rx),
         ))
@@ -6076,14 +6055,17 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // before `config` is moved into `serve`, because its options read the
     // configured `local_uid` mappings.
     //
-    // The two `None`s are the platform facts: no inherited listener, because this
-    // process binds its own, and no stop receiver, because nothing forwards a
-    // signal to something that is not a child.
+    // The lanes `serve` is handed beside the storage (`2026-09-18-sandbox-shared.md`
+    // §4). What this call passes beside them is its own platform fact: no
+    // inherited listener, because this process binds its own, and no stop
+    // receiver, because nothing forwards a signal to something that is not a
+    // child.
+    let pipelines = /* the lanes the options literal below names */;
     let storage = FsStorage::new(&args.root, FsOptions { /* verbatim from the body */ })?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(serve(args, config, storage, None, None))
+        .block_on(serve(args, config, storage, access, pipelines, None, None))
 }
 
 /// Parse the configuration bytes, or `None` when the operator gave none.
@@ -6095,41 +6077,10 @@ fn parse_config(bytes: &[u8]) -> Result<Option<Config>, Box<dyn Error + Send + S
 }
 ```
 
-(d) `serve` keeps **the one signature all three plans carry**, owned by P1 — the storage, then the inherited listener and the optional shutdown receiver, so only the process that bound the socket prints it and a forwarded stop has somewhere to land:
+(d) `serve` — **the one entry point all three plans call, and `2026-09-18-sandbox-shared.md` §4 is where its signature is written down**: what it takes, in what order, and which of those parameters are optional are that row's, and this plan neither repeats the declaration nor re-argues it. What is this plan's is what its own two callers do and what the body does with the two substitutions:
 
 ```rust
-/// **One signature across the three plans, and P1 owns it**
-/// (`2026-09-18-sandbox-linux.md` Task 7): `args`, `config`, `storage`,
-/// `inherited`, `stop`, in that order, with the last two optional.
-///
-/// **`storage` is not optional, and a ruling that made it `Option<FsStorage>`
-/// had to be corrected.** Every caller that reaches `serve` serves from a
-/// storage, so `None` had no meaning the three plans could agree on: P1 read it
-/// as a caller bug and returned an error, this plan read it as "the body builds
-/// one", and those are not the same function. The two callers that build one
-/// *before* the confinement are P1's Linux arm, whose state directory is one of
-/// the jail's mounts, and this plan's `confined`, which never ran the parent's
-/// pre-confinement sequence; the plain run builds its own at its call site.
-/// **What the three plans share is the entry sequence, not a storage value**,
-/// and this is the shape that lets each keep its own: the Windows launcher builds
-/// nothing at all (constructing a storage opens the state database the child is
-/// about to open), so its last call is `confine_or_launch` and it never reaches
-/// `serve`; `inherited` and `stop` are `None` for every process that is not a
-/// confined child, which is every run on Linux and every unconfined run here.
-async fn serve(
-    args: Args,
-    config: Option<Config>,
-    mut storage: FsStorage,
-    inherited: Option<TcpListener>,
-    stop: Option<watch::Receiver<bool>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // ... the existing body, unchanged up to the bind, with one addition: the
-    // storage arrives as an `Option` and is resolved once, here, where its
-    // construction has always been. `Some` is a caller that had to build it
-    // before the confinement — P1's Linux arm, whose state directory is one of
-    // the jail's mounts, and this plan's `confined` — and `None`, which is the
-    // ordinary server run from the tail of `main`, is the case the body builds it
-    // for, from the root and the resolved mode, exactly as it does today ...
+    // ... the existing body, unchanged up to the bind ...
     let listener = match inherited {
         // The child's listener came from the launcher (decision 16), and the
         // event is still the child's to send: `Listening` means the data plane
@@ -6152,12 +6103,13 @@ async fn serve(
         .serve(listener, stop.unwrap_or_else(|| shutdown_tx.subscribe()))
         .await?;
     // ... and the shutdown sequence at the end keeps sending on `shutdown_tx` ...
-}
 ```
+
+**Two callers reach it here, and this plan's third process never does.** `confined` builds the child's storage because the child never ran the parent's pre-confinement sequence, and the plain run builds its own at its call site; the launcher builds nothing at all, because constructing one opens the state database the child is about to open, so its last call is `confine_or_launch`.
 
 **The substitution sits at the plane's call site and nowhere else, and that is the whole point of the line.** `scanner.run(shutdown_rx)` and `plane.serve(listener, …)` are two independent subscribers: rebinding `shutdown_rx` to the caller's receiver — the shape an earlier draft of this step had — would hand a forwarded stop to the **background scanner** and leave the server *accepting*, which is the exact opposite of what the hook exists for (design §3 step 9). What the plane takes is either the caller's receiver or a subscription to this process's own sender; the scanner's own receiver is untouched either way. Note also that both ends derive from the same `shutdown_tx` in the child: the hook's `send(true)` reaches the plane through the caller's receiver, and the shutdown sequence's own `send(true)` reaches the scanner and the sweeper — a stop from either source therefore stops everything, which is what a reader of the two channels might otherwise doubt.
 
-`Args` gains `sandbox: bool` and `parse_args` takes the argument iterator (so the launcher's element is filtered in exactly one place). `tinio-server/Cargo.toml` gains the test target:
+**`Args` and `parse_args` are P1 Task 7's, and this step adds a caller to them rather than the field and the signature**: `2026-09-18-sandbox-shared.md` §4 gives every helper in this one file a single owner, and P1's task is where `struct Args` — `sandbox` included — and the signature that takes the argument iterator are written, so there is nothing for P2 to add beside them. What this step owes them is the call site above, `parse_args(own_args())`: the launcher's own element never reaches the iterator the parser is handed, so it is filtered in exactly one place. `tinio-server/Cargo.toml` gains the test target:
 
 ```toml
 [[test]]
@@ -6165,14 +6117,7 @@ name = "sandbox_e2e_windows"
 required-features = ["sandbox"]
 ```
 
-and the backend itself, in a target-gated table of its own beside the one P1 added for Linux:
-
-```toml
-[target.'cfg(target_os = "windows")'.dependencies]
-tinio-sandbox-windows.workspace = true
-```
-
-**Why a second dependency rather than something on the facade.** The launch path names the container's `Options` and its tests name `Capability`, and both are this backend's own settings — deliberately outside the facade's shared surface, which is the core plus `platform()` (design decision 2, §10). P1's Linux arm takes the same shape for `LinuxOptions`. The target gate spares the other targets; `tinio-sandbox-windows` is still a workspace member everywhere and its own `#![cfg(windows)]` is what leaves it empty there.
+**No platform dependency is added to that manifest, and this is the one thing about the backend this step used to get backwards.** The launch path names the container's `Options` and its tests name `Capability`, and the question of how a consumer reaches a platform's own settings is **design decision 2's to answer, not this plan's**: a consumer names the facade and nothing else, and reaches them through the facade's cfg-gated alias for the platform's crate — `tinio_sandbox::windows::Options`, inside a `#[cfg(target_os = "windows")]` block it would have written anyway. An earlier draft had `tinio-server` take a `[target.'cfg(target_os = "windows")'.dependencies]` table of its own, on the argument that P1's Linux arm did the same for its own platform's options; that ruling was reversed, because by the time P3's arm exists the crate would carry one target-gated dependency per platform while every arm lives in the same function, and because reaching past the facade for a platform crate contradicts the contract the facade exists to state. `tinio-sandbox-windows` is still a workspace member everywhere and its own `#![cfg(windows)]` is what leaves it empty on the other two targets.
 
 - [ ] **Step 5: Run the example's tests, and confirm stdout is the protocol's alone**
 
@@ -6209,7 +6154,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tinio_sandbox::Event;
-use tinio_sandbox_windows::control;
+use tinio_sandbox::windows::control;
 
 /// `CREATE_NEW_PROCESS_GROUP` — the launcher is spawned as the leader of its own
 /// process group, which is what makes a console control event addressed at *it*
@@ -6900,7 +6845,7 @@ EOF
 | decision 19 (stdout is an SSE event stream; **the child writes `Listening` and the parent re-emits it**, decoding rather than forwarding; stderr unmediated) | 9 (the relay wiring), 11 (the emission and the consumer), 13 (§12's event-contract bullet) |
 | decision 20 (Job object **and** signal forwarding; the `CreateProcessW`→assign window recorded rather than claimed) | 5 (the window), 9 (terminate on the two job failures), 10, 11 |
 | decision 21 (derived, deterministic SID; the profile is the second artifact, reusable and removed) | 2, 4, 9, 11 (the residue and takeover e2e) |
-| decision 22 (the executable's directory) | 3, 11 |
+| decision 22 (the executable's directory) | 3 (the backend's `exposures`, which is the only place the entry is produced; Task 11 calls the helper that does not carry it) |
 | decision 26 (confined before the runtime) | 11 (the launcher never builds a runtime; the child builds it after adopting) |
 | **shared §7 (every core operation traced, split into `info!` for "was this process confined, and to what" and `debug!` for the per-item detail, `error!` where an `Error` is built)** | 1 (`handles::step` builds and logs in one place, with the recording-subscriber test), 2, 3, 4, 5, 8, 10, 11 (the launcher installs the sink it would otherwise never reach) |
 

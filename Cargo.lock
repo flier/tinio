@@ -3932,6 +3932,7 @@ dependencies = [
  "tinio-core",
  "tinio-fs",
  "tinio-mem",
+ "tinio-sandbox",
  "tinio-server",
  "tinio-util",
  "tokio",
@@ -4017,11 +4018,14 @@ version = "0.1.0"
 dependencies = [
  "derive_more",
  "hex",
+ "linux-raw-sys",
  "rustix",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "tinio-sandbox-core",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4074,6 +4078,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "cfg-if",
+ "clap",
  "criterion",
  "derive_more",
  "futures",
@@ -4103,6 +4108,7 @@ dependencies = [
  "tinio-core",
  "tinio-fs",
  "tinio-mem",
+ "tinio-sandbox",
  "tinio-select",
  "tinio-util",
  "tokio",

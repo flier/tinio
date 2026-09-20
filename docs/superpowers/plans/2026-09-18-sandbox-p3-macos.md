@@ -43,7 +43,7 @@
 
 P3 consumes the core P0 builds; it does not rebuild it. The shared surface lives in its own document, `docs/superpowers/plans/2026-09-18-sandbox-p0-core.md` — P0 Task 1 is the vocabulary, Task 2 the launcher machinery (`adopt`, `Event`/`Observer`, `LaunchPlan`), Task 3 the facade and the three platform-crate stubs — and both other platform plans have landed before it. **The facts all four documents share rather than any one of them building are in `2026-09-18-sandbox-shared.md`** — the conventions (§1), the crate topology and its two shapes (§2), the list of what a launcher platform owns (§3), the names two documents must spell alike (§4), the three relays (§5) and the two verification conventions (§6) — and this plan refers to them by section.
 
-**P3 depends on P1, and this plan never restates what P1 wrote.** P1 (`2026-09-18-sandbox-p1-linux.md`) owns, in the one `serve.rs` both plans edit: `parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, _>` and `struct Args { root, address, config_path, read_only, sandbox }` (its Task 7), the two-phase `main` — the argument parse, the configuration read, the read-only resolution and the guarded `create_dir_all` all happen before anything is confined (its Task 7) — the `sandbox` feature and the example's `required-features = ["sandbox"]` (its Task 7), the **`serve` entry point with its five-parameter signature** (`args`, `config`, `mut storage`, `inherited`, `stop`), which P3 consumes unchanged — its two optional parameters are `inherited` and `stop`, and its signature note is the statement of why they and not the others are optional (its Task 7), the readiness migration that turns `crates/tinio-server/tests/serve_read_only.rs`'s scraped line into a decoded `Event` frame (its Task 8), and the `sandbox_exposures(root, state_dir, root_access) -> Vec<Exposure>` helper (its Task 7) this plan reuses unchanged. **The file's two frame helpers are P1's as well** — `emit(event: &Event)` and `emit_error(message: &str)`, written in its Task 7 — because they live in `serve.rs`, which all three plans edit, and a second `fn emit` in one file is `E0428`: P2's and P3's arms call them and define neither, which is the same ownership rule the names above follow. P3 writes no argument parser, no second `main` and no helper of its own in that file: what it changes is the exposure set's construction, the launch, and the child arm.
+**P3 depends on P1, and this plan never restates what P1 wrote.** P1 (`2026-09-18-sandbox-p1-linux.md`) owns, in the one `serve.rs` both plans edit: `parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, _>` and `struct Args { root, address, config_path, read_only, sandbox }` (its Task 7), the two-phase `main` — the argument parse, the configuration read, the read-only resolution and the guarded `create_dir_all` all happen before anything is confined (its Task 7) — the `sandbox` feature and the example's `required-features = ["sandbox"]` (its Task 7), the **`serve` entry point, whose signature `2026-09-18-sandbox-shared.md` §4 owns and this plan neither lists nor counts** (its Task 7), which P3 consumes unchanged, the readiness migration that turns `crates/tinio-server/tests/serve_read_only.rs`'s scraped line into a decoded `Event` frame (its Task 8), and the `sandbox_exposures(root, state_dir, root_access) -> Vec<Exposure>` helper (its Task 7) this plan reuses unchanged. **The file's two frame helpers are P1's as well** — `emit(event: &Event)` and `emit_error(message: &str)`, written in its Task 7 — because they live in `serve.rs`, which all three plans edit, and a second `fn emit` in one file is `E0428`: P2's and P3's arms call them and define neither, which is the same ownership rule the names above follow. P3 writes no argument parser, no second `main` and no helper of its own in that file: what it changes is the exposure set's construction, the launch, and the child arm.
 
 **Decision 5 is P1's arm and this plan keeps it.** `main` refuses `--sandbox` in a build without the feature (exit 2) and, on a platform whose backend another plan owns, refuses it as well rather than accepting it and confining nothing (P1 Task 7 writes both; P2 and P3 replace the second with their own platform arm and keep the first). The arm is restored in Task 8 Step 2(e) below, because a build that silently ignores the flag is the failure the whole design exists to prevent.
 
@@ -3680,21 +3680,7 @@ use tinio_sandbox::{AccessMode, Backend as _, Confinement, Exposure, LaunchPlan,
 
 `Backend as _` is what brings `platform()`'s `confine` into scope without naming the trait anywhere else — the Linux plan's call site already does exactly this.
 
-(b) the exposures helper. **It is P1's, unchanged** — same name, same signature, same return type:
-
-```rust
-/// The paths the confined process must reach: the served root with the access
-/// the mode dictates, and the state directory when it lies outside the root —
-/// never inside, where the root's own rule already covers it (design §9).
-#[cfg(feature = "sandbox")]
-fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: AccessMode) -> Vec<Exposure> {
-    let mut sandbox = Sandbox::new().expose(root, root_access);
-    if !state_dir.starts_with(root) {
-        sandbox = sandbox.expose(state_dir, AccessMode::ReadWrite);
-    }
-    sandbox.exposures().to_vec()
-}
-```
+(b) the exposures helper. **It is P1's and P3 defines none of it**: `sandbox_exposures` lives in the one `serve.rs` all three plans edit, `2026-09-18-sandbox-shared.md` §4 owns it along with that file's other helpers, and P1 Task 7 is the task that writes it — same name, same signature, same return type, none of which this plan restates.
 
 **P3 does not change this helper, and the earlier draft of this step was wrong to try.** It proposed a macOS-flavoured version returning a `Sandbox` with the device files already applied, and justified it as "replacing the Linux plan's Linux-only shape" — while the same step's prose claimed the Linux behaviour does not change at all. Both cannot be true, and the one-definer rule settles it: the helper is P1's Task 7, macOS calls the same function with the same arguments, and the device-file flag is passed where P1 passes it — as the second argument of `from_exposures` in the caller:
 
@@ -3815,25 +3801,11 @@ fn confine_or_launch(
 
 (d) this process's own arguments, and the child's arm (design §10 steps 1 and 8):
 
+**`own_args` is P2 Task 11's, and P3 defines none of it** — the rule `2026-09-18-sandbox-shared.md` §4 states for every helper that lands in this one file, applied between the two launcher plans exactly as it is applied between P1 and them: `2026-09-18-sandbox-p2-windows.md` Task 11 writes the file's single `fn own_args() -> Vec<OsString>`, and both of this plan's uses of it (the child's arm below and `main`) are calls into that one definition. Two definitions of one function in one module is `E0428` — the same failure a second `fn emit` would be — and the plan that lands first is what owns the helper. **What stays here is the macOS fact the filter exists for**: the element every child inherits is the core's `listener_fd_arg` spelling (`tinio-sandbox-fd=<n>`, decision 17), it is dropped from the `argv[0]`-less `args_os()` before any parser downstream sees it (design §3: the child's argv carries the payload descriptor and nothing else that is security-relevant), and the predicate that recognises it — `is_listener_fd_arg` — lives in the crate that writes the element rather than in this file.
+
+The child's arm:
+
 ```rust
-/// This process's arguments: `argv[0]` dropped, and the launcher's private
-/// descriptor element removed so the argument parser never sees it (design §3:
-/// the child's argv carries the payload descriptor and nothing else that is
-/// security-relevant).
-fn own_args() -> Vec<OsString> {
-    // The launcher's private descriptor element is stripped here so no parser
-    // downstream ever sees it (design §3: the child's argv carries the payload
-    // descriptor and nothing else that is security-relevant). The stripping is
-    // macOS-only because that is the only platform with a launcher so far — the
-    // predicate itself lives in the crate that writes the element.
-    #[cfg(target_os = "macos")]
-    let strip = |arg: &OsString| tinio_sandbox::is_listener_fd_arg(arg);
-    #[cfg(not(target_os = "macos"))]
-    let strip = |_: &OsString| false;
-
-    env::args_os().skip(1).filter(|arg| !strip(arg)).collect()
-}
-
 /// The confined child: design §10 step 8 and nothing else. The configuration
 /// comes from the payload's **bytes**, never from re-reading the path in `argv`
 /// — the file it names is outside every exposure, and re-reading it would be
@@ -3876,6 +3848,9 @@ fn confined(
     } else {
         None
     };
+    // The lanes `serve` is handed beside the storage — `2026-09-18-sandbox-shared.md`
+    // §4 says why the value has to travel rather than be rebuilt inside the body.
+    let pipelines = /* the lanes the options literal below names */;
     // The `FsStorage::new(root, FsOptions { … })` call the body makes today,
     // verbatim — the same literal the unconfined path builds, with this
     // process's `state_dir` and `access` — and **the two call sites have to be
@@ -3911,7 +3886,7 @@ fn confined(
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(serve(args, config, storage, Some(listener), Some(stop_rx)))
+        .block_on(serve(args, config, storage, access, pipelines, Some(listener), Some(stop_rx)))
 }
 ```
 
@@ -4068,40 +4043,28 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // The call the body makes today, verbatim, and the same one the child's
     // `confined` makes (Step 2(d)): the two call sites are kept in step by the
     // state directory they both name, which is also an exposure.
+    let access = AccessMode::from(read_only);
+    let pipelines = /* the lanes the options literal below names */;
     let storage = FsStorage::new(
         Path::new(&args.root),
         /* the options literal, verbatim from the body */
     )?;
-    // ... and then this process serves. The two `None`s are its half of the
-    // signature: it bound its own listener rather than adopting a child's, and
-    // nothing forwards a stop to a process that is not a child.
-    serve(args, config, storage, None, None)
+    // ... and then this process serves. What it passes beside the storage is its
+    // own platform fact: it bound its own listener rather than adopting a
+    // child's, and nothing forwards a stop to a process that is not a child
+    // (design decision 6). What the call takes, and in what order, is
+    // `2026-09-18-sandbox-shared.md` §4's and is not stated here.
+    serve(args, config, storage, access, pipelines, None, None)
 }
 ```
 
-Two small signature changes make the above work: `parse_args` takes the argument iterator rather than reading `env::args()` itself, so the launcher's own descriptor element is filtered out in exactly one place; and `Args` keeps the filtered `argv: Vec<OsString>` with a `child_argv()` that clones it, because the child must be re-invoked with the same arguments this process was started with (minus the program name), minus nothing else and with nothing added except the descriptor element the launcher appends.
+Two signature changes make the above work, and **which plan holds the pen is decided by who needs the thing, not by which plan the rule happens to name**: `Args` is P1 Task 7's type and `2026-09-18-sandbox-shared.md` §4 owns it, so what this plan states is the **macOS requirement** — and then carries the half of it that no one else needs. `parse_args` takes the argument iterator already, landed with P1's task, so that half is consumed as it stands and the launcher's descriptor element is filtered out of the iterator before the parser is handed it, in exactly one place. **`argv` and `child_argv()` are this plan's addition to P1's type**: only P3 needs them, and a helper belongs to whoever needs it first — the same reading that gives P2 the file's `own_args` (both launcher plans need it, P2 lands earlier, so P2 owns it and this plan calls it). The parsed arguments keep the filtered `argv: Vec<OsString>` (`argv[0]` dropped, the descriptor element already removed by `own_args`) with a `child_argv()` that clones it, because the child must be re-invoked with the same arguments this process was started with, minus nothing else and with nothing added except the descriptor element the launcher appends. The field and the method are added **here rather than in P1's task**, which the rule's "added to P1's task, not copied beside it" would otherwise ask for: that leg presumes a plan still to be executed, and P1's has landed — it restructured the entry point for a platform that confines in place and never re-invokes itself, so it has no use for the arguments it parsed, while this is the plan whose arm re-issues them. Every other member of the type is P1's and landed, and none of it is restated here: `root`, `address`, `config_path`, `read_only` and `sandbox` are the five fields that task writes — `sandbox` among them, set by the parser from `--sandbox` (design decision 5) — so `argv` is the one field this plan adds.
 
 **The launcher's side reaches `serve` never, and builds no storage** — which is a different statement from the one the paragraph above makes about the serving path. `main`'s macOS arm resolves the state directory as a `PathBuf`, for the exposure set's second entry and for the profile's `-D` parameters, and hands the plan to `confine_or_launch`, which exits: constructing an `FsStorage` there would *open* the state database in the process whose child opens the same one, and two handles on one state directory is not something the storage layer is written for. The child's `confined` is where that handle is taken, and the plain run's path above is where the other one is; P1's signature note states the same rule for its own platform.
 
-(f) `serve`'s signature — **P1's, consumed unchanged** — its listener, and the one place an endpoint is announced. The two frame helpers it and the macOS arm's refusals call, `emit(event: &Event)` and `emit_error(message: &str)`, are **P1's too**, defined once in this same file beside its arm: a second `fn emit` here would be `E0428`, and the rule that gives `serve.rs`'s helpers one owner is the one that already gives `parse_args`, `Args`, `sandbox_exposures` and the `serve` signature theirs. P3 calls them and defines neither:
+(f) `serve` itself — **P1's, whose signature `2026-09-18-sandbox-shared.md` §4 owns and this plan does not write out** — its listener, and the one place an endpoint is announced. The two frame helpers it and the macOS arm's refusals call, `emit(event: &Event)` and `emit_error(message: &str)`, are **P1's too**, defined once in this same file beside its arm: a second `fn emit` here would be `E0428`, and the rule that gives `serve.rs`'s helpers one owner is the one that already gives `parse_args`, `Args`, `sandbox_exposures` and the `serve` signature theirs. P3 calls them and defines neither. What follows is only what the macOS arm adds inside the body: **`serve`'s own declaration is not repeated here**, and neither is the storage's construction:
 
 ```rust
-// `emit` and `emit_error` are above, P1's: the child's readiness frame below and
-// the launcher arm's refusals both go through them. Nothing here redefines
-// either — one owner per helper, and this file already has them.
-async fn serve(
-    args: Args,
-    config: Option<Config>,
-    mut storage: FsStorage,
-    inherited: Option<TcpListener>,
-    stop: Option<watch::Receiver<bool>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // `mut`, because the very next call — `set_max_concurrent_uploads(…)`, which
-    // is where the moved body starts — takes `&mut self`. `storage` is **not**
-    // optional and never was a platform fact: every caller that reaches `serve`
-    // serves from a storage, so an `Option` here would have three plans reading
-    // it three ways (one as a caller bug, one as "the body builds one"), which is
-    // why P1's corrected signature hands it over by value.
     // ... `storage.set_max_concurrent_uploads(…)` onward, unchanged ...
     let listener = match inherited {
         // The launcher platforms hand the bound socket over (decision 16); the
@@ -4121,10 +4084,9 @@ async fn serve(
     // ... the scanner takes `shutdown_rx`, the sweeper its own subscription ...
     plane.serve(listener, stop.unwrap_or_else(|| shutdown_tx.subscribe())).await?;
     // ... the rest, with `storage` in place of the local it replaced ...
-}
 ```
 
-**The signature is P1's, not this plan's, and two of its five parameters are optional rather than three.** P1 Task 7 introduces it and states why: `inherited` and `stop` are the platform-dependent ones — a launcher's child adopts a socket its parent bound, and only a child has a stop forwarded to it — while `args`, `config` and `storage` are facts every caller has. This plan's `confined` is the launcher-side caller (it passes all three of the optional-shaped ones together), and the plain serving path passes `storage` with two `None`s; P3 adds no parameter and changes none. The two substitutions inside the body are the ones a launcher platform needs and P1 left in place for it: `inherited` replaces the bind, and `stop` replaces the plane's own receiver — **at the plane's call site, not on the scanner's**, because the scanner and the plane are independent subscribers and a stop delivered only to the scanner would leave the server accepting (P2 Task 11 states that, and this plan applies it unchanged rather than restating it).
+**The signature is P1's, not this plan's, and `2026-09-18-sandbox-shared.md` §4 is where it is written down** — what it takes, in what order, and which of its parameters are optional are that row's, and this plan neither lists them nor counts them. What is this plan's is that `confined` is the launcher-side caller and the plain serving path is the other, that P3 adds no parameter and changes none, and that the two substitutions above are the ones a launcher platform needs and P1 left in place for it: `inherited` replaces the bind, and `stop` replaces the plane's own receiver — **at the plane's call site, not on the scanner's**, because the scanner and the plane are independent subscribers and a stop delivered only to the scanner would leave the server accepting (P2 Task 11 states that, and this plan applies it unchanged rather than restating it).
 
 Delete the `#[tokio::main]` attribute (the Linux plan already replaced it with a plain `fn main`), delete the old `println!("listening on …")`, and make sure nothing else in the file reads `Config` before step 7 above. Every remaining `println!` and `eprintln!` in this file is a bug: stdout is the protocol channel and the logs belong on stderr.
 
@@ -4734,7 +4696,7 @@ EOF
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". Two places carry an explicit *procedure* instead of a value, because the value cannot be known before a Mac runs it — and both say so in the step: the baseline allowance set (Tasks 4 and 5, which measure and then require the pruning run) and the `accept` rule (Task 7, whose outcome is already measured and whose step says what to do if the machine disagrees). Task 11 forbids writing an evidence row without a pasted measurement rather than templating one.
 
-**Type consistency.** Every core item is called exactly as P0 Task 2 fixes it — that surface, and the ownership of it, is `2026-09-18-sandbox-shared.md` §3's and is not repeated here. There is no `nonce()`, no `MAGIC` and no `with_nonce` on it: the payload is one JSON object. **The crate's public surface, and nothing else**: `Backend` and `backend()` at the root (the type the facade's `platform()` selects — Task 1), `confine`, `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` and `SANDBOX_EXEC` (Task 2), `launch::listener` and `launch::PREFLIGHT_MARKER`, `profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)> }, with_canonical_paths, Allowance, RUNTIME_BASELINE, DEVICE_RULES}` (Task 1), and `relay::{on_stop, on_forwarded_stop, disarm, relay_decision, RELAYED_SIGNALS}` (Task 3) — the launcher's half and the child's half of the relay, in that order, with the facade presenting the child's as `on_stop` (Task 3 Step 4) so both launcher platforms call one name. **Everything else in those modules is private and stays private** — `validate_path`, `refuse` and `push` in `profile.rs`; `hand_over`, `make_inheritable`, `preflight`, `spawn_error`, `PREFLIGHT_TIMEOUT` and `step` in `launch.rs` — and the Self-Review says so rather than listing them as surface, because none of them is called from outside the crate. **`serve`'s signature is P1's five-parameter form and P3 changes none of it**: `confined` passes the storage it built with `Some(listener)` and `Some(stop)`; the plain serving path passes its own storage with two `None`s; and the launcher passes none of the three because it never reaches `serve` — the storage there is the parameter that is *not* optional, and the placement of the two constructions (Step 2(e)) is what keeps the launcher from building one. `harness::{Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule, CHILD_ENV, PARAMS_ENV, LAUNCH_ENV}` is created in Task 4 and used by Tasks 5, 6 and 7. No name is introduced twice with different meanings; the test harness's `Child` is its own type and is always written `harness::Child`. The crate's lint is `unsafe_code = "deny"` with exactly one `#[allow(unsafe_code)]` site — `launch::listener`, whose `# Safety` section carries the invariant that the descriptor is the launcher's, held open for the child's whole lifetime and never closed, **and that `from_raw_fd` is called at most once per descriptor number** — and `make_inheritable` is deliberately written to need none: it clears `FD_CLOEXEC` through the socket's own `AsFd` rather than through a descriptor reconstructed from an integer, which is what keeps the crate's site count at one (decision 14, its Scope and the Bookkeeping bullet).
+**Type consistency.** Every core item is called exactly as P0 Task 2 fixes it — that surface, and the ownership of it, is `2026-09-18-sandbox-shared.md` §3's and is not repeated here. There is no `nonce()`, no `MAGIC` and no `with_nonce` on it: the payload is one JSON object. **The crate's public surface, and nothing else**: `Backend` and `backend()` at the root (the type the facade's `platform()` selects — Task 1), `confine`, `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` and `SANDBOX_EXEC` (Task 2), `launch::listener` and `launch::PREFLIGHT_MARKER`, `profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)> }, with_canonical_paths, Allowance, RUNTIME_BASELINE, DEVICE_RULES}` (Task 1), and `relay::{on_stop, on_forwarded_stop, disarm, relay_decision, RELAYED_SIGNALS}` (Task 3) — the launcher's half and the child's half of the relay, in that order, with the facade presenting the child's as `on_stop` (Task 3 Step 4) so both launcher platforms call one name. **Everything else in those modules is private and stays private** — `validate_path`, `refuse` and `push` in `profile.rs`; `hand_over`, `make_inheritable`, `preflight`, `spawn_error`, `PREFLIGHT_TIMEOUT` and `step` in `launch.rs` — and the Self-Review says so rather than listing them as surface, because none of them is called from outside the crate. **`serve`'s signature is P1's, `2026-09-18-sandbox-shared.md` §4 owns it, and P3 changes none of it**: `confined` passes the storage it built, its listener and its stop receiver; the plain serving path passes its own storage and no platform values at all; and the launcher passes none of them because it never reaches `serve` — the placement of the two storage constructions (Step 2(e)) is what keeps the launcher from building one. `harness::{Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule, CHILD_ENV, PARAMS_ENV, LAUNCH_ENV}` is created in Task 4 and used by Tasks 5, 6 and 7. No name is introduced twice with different meanings; the test harness's `Child` is its own type and is always written `harness::Child`. The crate's lint is `unsafe_code = "deny"` with exactly one `#[allow(unsafe_code)]` site — `launch::listener`, whose `# Safety` section carries the invariant that the descriptor is the launcher's, held open for the child's whole lifetime and never closed, **and that `from_raw_fd` is called at most once per descriptor number** — and `make_inheritable` is deliberately written to need none: it clears `FD_CLOEXEC` through the socket's own `AsFd` rather than through a descriptor reconstructed from an integer, which is what keeps the crate's site count at one (decision 14, its Scope and the Bookkeeping bullet).
 
 **Deliberately out of P3's scope.**
 

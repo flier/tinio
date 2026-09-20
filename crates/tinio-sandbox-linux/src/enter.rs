@@ -1,0 +1,1020 @@
+//! `confine`: build the jail and step into it.
+
+use std::{
+    env,
+    ffi::CString,
+    fs,
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+};
+
+use rustix::{
+    io::Errno,
+    mount::{
+        MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind_recursive, mount_change,
+        mount_remount, unmount,
+    },
+    process::{getegid, pivot_root},
+    thread::{
+        CapabilitySet, UnshareFlags, capabilities, remove_capability_from_bounding_set,
+        set_capabilities, set_no_new_privs,
+    },
+};
+use tracing::{Span, debug, field, instrument};
+
+use crate::{
+    _core::{Confinement, Error, Result, Sandbox},
+    Mechanism,
+    caps::{self, Cap},
+    jail::{jail_root, mirror_under},
+    mechanism::{Resolved, fail, refused, step, unshare, userns_available},
+    options::Options,
+    plan::{Mount, MountKind, OverlayDirs, plan},
+    seccomp,
+};
+
+/// Write one id map through the descriptor that was opened for it.
+///
+/// **Through the descriptor, not through a fresh `fs::write`**: these files are
+/// only writable from the namespace they describe, and the open has to happen
+/// after the `unshare` that created it — writing through the held handle is what
+/// keeps that true by construction instead of by comment (design decision 12).
+/// The name is a parameter so the error names the map that failed without
+/// re-deriving it from the path. The span records which map and what it says
+/// (shared §7).
+#[instrument(level = "debug", skip(file), ret)]
+fn write_map(file: &mut fs::File, name: &'static str, contents: &str) -> Result<()> {
+    file.write_all(contents.as_bytes()).map_err(step(name))
+}
+
+/// The one combination the user-namespace model cannot carry (design §8).
+///
+/// One function so the two checks that need it — the request and the
+/// resolution — cannot word the refusal differently.
+fn local_uid_conflicts_with_userns() -> Error {
+    Error::Unsupported {
+        detail: "a local_uid mapping cannot be used with the user-namespace model — an unmapped \
+                 uid cannot be chowned to; start with TINIO_SANDBOX_MODEL=root (or as root), or \
+                 drop the mapping",
+    }
+}
+
+impl crate::Backend {
+    /// Confine the calling process.
+    ///
+    /// Returns [`Confinement::InPlace`] on success; the process is jailed by
+    /// then, and every failure is fatal (design §11).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadPath`] before anything irreversible happens;
+    /// [`Error::Unsupported`] when the model is unavailable or a combination
+    /// the design refuses was asked for; [`Error::Step`] for any refusing
+    /// syscall, named by the step.
+    #[instrument(skip_all, fields(model = ?opts.model(), euid = opts.euid()))]
+    pub(crate) fn enter(&mut self, sandbox: &Sandbox, opts: &Options) -> Result<Confinement> {
+        let prepared = validate_and_plan(sandbox, opts)?;
+        create_jail_root(&prepared.jail)?;
+        let map_fds = enter_user_namespace(prepared.resolved, opts)?;
+        enter_mount_namespace()?;
+        apply_planned_mounts(sandbox, &prepared.mounts, &prepared.overlay)?;
+        // 7. The maps have been read by every mount that needed them; the
+        //    descriptors are closed explicitly because nothing here ever
+        //    `exec`s, so `CLOEXEC` never gets a chance to close them and they
+        //    would otherwise be inherited by the whole server lifetime.
+        drop(map_fds);
+        pivot_into_jail(&prepared.jail)?;
+        // 9. Drop everything the jail no longer needs, then cut the network.
+        //    The filter's outcome is recorded on the backend rather than
+        //    dropped: `serve` reads it to warn when the one degradable step
+        //    degraded (design §11).
+        drop_capabilities(caps::retained(
+            opts.served_root_access(),
+            opts.local_uid_configured(),
+        ))?;
+        self.seccomp = Some(seccomp::install()?);
+
+        Ok(Confinement::InPlace)
+    }
+}
+
+/// The jail layout [`crate::Backend::enter`] steps into, decided while the
+/// process can still exit cleanly.
+struct Prepared {
+    resolved: Resolved,
+    jail: PathBuf,
+    overlay: OverlayDirs,
+    mounts: Vec<Mount>,
+}
+
+/// Validate the request and build the mount plan, before anything irreversible.
+#[instrument(skip_all, fields(model = ?opts.model()))]
+fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
+    // 1. Validate everything a mistake could be made about, while the
+    //    process can still be repaired by exiting.
+
+    // The combination that cannot work, refused before anything is probed
+    // or created: under a user namespace the process is chowned *to* an
+    // unmapped uid, so a `local_uid` mapping has nothing to land in
+    // (design §8).
+    //
+    // A *forced* user namespace is decided from the request alone — no
+    // probe, no privilege, no namespace — because the refusal is the same
+    // whether or not this host would grant the namespace, and asking the
+    // request is what makes the answer identical on every host. The other
+    // half of the same rule is checked against the **resolved** model below.
+    if opts.model() == Mechanism::UserNamespace && opts.local_uid_configured() {
+        return Err(refused("local_uid", local_uid_conflicts_with_userns()));
+    }
+
+    // Nothing exposed is the caller's bug, not the platform's shortcoming,
+    // and it is decided **before the probe** so the answer does not depend on
+    // what this host happens to allow. `Error::Unsupported` would send the
+    // operator to look at their kernel, which is the wrong place (design §11).
+    let served_root = sandbox
+        .exposures()
+        .first()
+        .map(|e| e.host.clone())
+        .ok_or_else(|| fail("confine", io::Error::other("nothing exposed to confine to")))?;
+
+    let resolved_now = resolve_model(opts)?;
+    validate_exposures(sandbox)?;
+
+    let model = resolved_model(resolved_now);
+    let jail = jail_root(&opts.resolved_tmpdir(), &served_root);
+    let overlay = OverlayDirs {
+        upper: jail.join(".overlay/upper"),
+        work: jail.join(".overlay/work"),
+    };
+    let mounts = plan(sandbox, &jail, model, &overlay).map_err(|error| refused("plan", error))?;
+
+    Ok(Prepared {
+        resolved: resolved_now,
+        jail,
+        overlay,
+        mounts,
+    })
+}
+
+/// Probe, refuse an unavailable or conflicting model. `ret` is the Info event
+/// for which model ran (shared §7).
+#[instrument(skip_all, ret, fields(requested = ?opts.model(), euid = opts.euid()))]
+fn resolve_model(opts: &Options) -> Result<Resolved> {
+    // Design decision 7's three tiers, decided by asking the kernel rather
+    // than guessing: `userns_available` forks a child, so a refusal costs
+    // nothing here. `Auto` needs the answer only when the user namespace
+    // might be the choice; the forced models that do not depend on it skip
+    // the fork.
+    let needs_probe = matches!(opts.model(), Mechanism::UserNamespace | Mechanism::Auto);
+    let resolved_now = opts.model().resolved(
+        opts.euid(),
+        if needs_probe {
+            userns_available()?
+        } else {
+            false
+        },
+    );
+    if let Resolved::Unavailable(detail) = resolved_now {
+        // `Error::Unsupported`, because the platform really cannot confine
+        // this process — the one thing P0's `Error` reserves that variant
+        // for.
+        return Err(refused("model", Error::Unsupported { detail }));
+    }
+
+    // **The other half of the `local_uid` rule, and the half the request
+    // cannot answer.** `Auto` resolves *into* the user namespace whenever
+    // the probe grants one, so a check that only looked at `opts.model()`
+    // would let `Auto` + a configured `local_uid` proceed on exactly the
+    // hosts where the mapping is unusable — and it would keep `CAP_CHOWN`
+    // inside a namespace where the configured uid is not mapped, which
+    // design §8 and §11 both call a startup configuration error. The
+    // resolved model is the only thing that knows.
+    if matches!(resolved_now, Resolved::UserNamespace) && opts.local_uid_configured() {
+        return Err(refused("local_uid", local_uid_conflicts_with_userns()));
+    }
+    Ok(resolved_now)
+}
+
+/// Refuse a missing or un-mirrorable exposure before a directory is created.
+fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
+    // Existence first: `/tmp/does-not-exist` should say so, not report a
+    // jail-root mismatch, and the jail directory created just below must
+    // not be the thing that makes a mistyped path look present.
+    //
+    // The `/` passed as the jail here is a sentinel, and it is a real
+    // check: `mirror_under` validates the path it composes, so this refuses
+    // an exposure of `/` — whose mirror under *any* jail is the jail itself
+    // — as well as a relative one, and it does it before a directory is
+    // created anywhere.
+    for exposure in sandbox.exposures() {
+        if !exposure.host.exists() {
+            return Err(refused(
+                "expose",
+                Error::BadPath {
+                    path: exposure.host.clone(),
+                    reason: "does not exist",
+                },
+            ));
+        }
+        mirror_under(Path::new("/"), &exposure.host).map_err(|error| refused("expose", error))?;
+    }
+    Ok(())
+}
+
+/// The jail root inside `$TMPDIR` — created before the first `unshare`.
+#[instrument(skip_all, fields(jail = %jail.display()))]
+fn create_jail_root(jail: &Path) -> Result<()> {
+    // 2. The jail root, **inside `$TMPDIR`** — the first host resource the
+    //    confinement touches, and the one whose failure names nothing on its
+    //    own. It may already exist — the previous run's leftover, which
+    //    design decision 10 says to take over. The step string is the
+    //    difference between an operator who knows to look at their temp
+    //    directory and one reading an `EACCES` about a path they never
+    //    chose: the jail's parent is `std::env::temp_dir()` unless
+    //    `Options::with_tmpdir` says otherwise, and the error is
+    //    `create jail root in $TMPDIR` for that reason. The variable is
+    //    named rather than its value because P0's `Error::Step` keeps paths
+    //    out of `step` so the message stays stable.
+    //
+    //    **Before the first `unshare`, and that is the point of the step
+    //    string**: `$TMPDIR` is a precondition standing in front of the
+    //    whole sequence rather than a step inside it, so a read-only, full
+    //    or missing temp directory is refused while the process can still be
+    //    repaired by exiting instead of after two namespaces have been
+    //    entered. Nothing below depends on a namespace to create it.
+    fs::create_dir_all(jail).map_err(step("create jail root in $TMPDIR"))
+}
+
+/// A private user namespace, with uid/gid maps written through descriptors
+/// opened after the `unshare` (design decision 12).
+#[instrument(skip_all, fields(resolved = ?resolved))]
+fn enter_user_namespace(
+    resolved: Resolved,
+    opts: &Options,
+) -> Result<Option<(fs::File, fs::File, fs::File)>> {
+    // 3. A private user namespace first, and on its own. The uid and gid
+    //    maps below can only be written through `/proc/<pid>/…`, which is
+    //    reachable exactly while the mount namespace is the host's — so the
+    //    two unshares are separate steps with the map write between them
+    //    (design decision 12). A descriptor opened *before* this call is
+    //    bound to the initial namespace and its write returns EPERM, which
+    //    is why the files are opened after it.
+    if !matches!(resolved, Resolved::UserNamespace) {
+        return Ok(None);
+    }
+    let euid = opts.euid();
+    let egid = getegid().as_raw();
+    unshare(UnshareFlags::NEWUSER, "unshare user namespace")?;
+
+    // Opened here, after the unshare, and written **through**: a
+    // descriptor opened before it belongs to the initial namespace, so
+    // its write is what is refused (design decision 12). Holding the
+    // handle and writing through it makes that ordering structural
+    // rather than a comment someone can move away from.
+    let mut setgroups = open_map("/proc/self/setgroups", "open setgroups map")?;
+    write_map(&mut setgroups, "setgroups", "deny")?;
+    let mut uid_map = open_map("/proc/self/uid_map", "open uid map")?;
+    write_map(&mut uid_map, "uid_map", &format!("0 {euid} 1"))?;
+    let mut gid_map = open_map("/proc/self/gid_map", "open gid map")?;
+    write_map(&mut gid_map, "gid_map", &format!("0 {egid} 1"))?;
+    Ok(Some((setgroups, uid_map, gid_map)))
+}
+
+/// The private mount namespace, then the tree made private for `pivot_root`.
+#[instrument(level = "debug", ret)]
+fn enter_mount_namespace() -> Result<()> {
+    // 4. The private mount namespace, now that the maps exist. One thread
+    //    still, which is what makes both unshares legal (design §10).
+    unshare(UnshareFlags::NEWNS, "unshare mount namespace")?;
+
+    // 5. `pivot_root` refuses while the old root is shared, so the whole
+    //    tree is made private first. On the host measured this is already
+    //    true; the call is unconditional because the hosts where it is not
+    //    are exactly the ones that would otherwise fail with a bare EINVAL.
+    //
+    //    **`mount_change` takes propagation flags, and this is the call it
+    //    is for.** It emits `mount(NULL, target, NULL, flags, NULL)` with no
+    //    `MS_REMOUNT`, so `PRIVATE | REC` here is what makes the tree
+    //    private — and the very same function cannot make anything
+    //    read-only, which is why the remount in `apply_mount` is a
+    //    different call (see the note there).
+    mount_change(
+        "/",
+        MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+    )
+    .map_err(step("make / private"))?;
+    Ok(())
+}
+
+/// The mounts, in plan order. `ret` is the Info event for the exposure set
+/// that landed (shared §7).
+#[instrument(
+    skip_all,
+    ret,
+    fields(mounts = mounts.len(), exposures = ?sandbox.exposures())
+)]
+fn apply_planned_mounts(sandbox: &Sandbox, mounts: &[Mount], overlay: &OverlayDirs) -> Result<()> {
+    // 6. The mounts, in plan order.
+    for entry in mounts {
+        apply_mount(entry, overlay)?;
+    }
+    Ok(())
+}
+
+/// Pivot into the jail and detach the old root.
+#[instrument(level = "debug", skip_all, ret, fields(jail = %jail.display()))]
+fn pivot_into_jail(jail: &Path) -> Result<()> {
+    // 8. The pivot. `put_old` must already exist inside the new root, and
+    //    the jail is a tmpfs we own, so creating it writes nothing to the
+    //    served root (design §4).
+    let put_old = jail.join(".oldroot");
+    fs::create_dir_all(&put_old).map_err(step("create put_old"))?;
+    env::set_current_dir(jail).map_err(step("chdir jail"))?;
+    pivot_root(".", ".oldroot").map_err(step("pivot_root"))?;
+    env::set_current_dir("/").map_err(step("chdir /"))?;
+    unmount("/.oldroot", UnmountFlags::DETACH).map_err(step("umount old root"))?;
+    Ok(())
+}
+
+// `unshare` is not defined here: it is `crate::mechanism`'s, declared there because
+// its first caller — the user-namespace probe — lives in that module, and
+// imported above. One wrapper means one safety argument (and one `unsafe`
+// site) for one syscall; a second body here would be a second place to get
+// `CLONE_FILES` wrong. It is `pub(crate)` in that module for this import and no
+// other reason — a private item cannot be imported at all, so the earlier
+// spelling of this line was a compile error waiting for the first build.
+
+/// Open a `/proc` map file, keeping the descriptor so the close is explicit.
+///
+/// **The step string is a parameter for the reason [`write_map`]'s name is
+/// one**: the three maps fail identically — a container with no `/proc` answers
+/// `ENOENT` for all three — so an error that does not say which map was missing
+/// leaves the operator to guess, and the map whose absence is diagnosable
+/// (`setgroups` vs `uid_map`) is the whole content of the failure.
+fn open_map(path: &str, step_name: &'static str) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(step(step_name))
+}
+
+/// Whether a refused read-only remount selects the overlay fallback (design §4).
+///
+/// **`EPERM` is the trigger and nothing else is.** It is
+/// `can_change_locked_flags()` refusing the request: `copy_mnt_ns` calls
+/// `lock_mnt_tree` whenever the new mount namespace belongs to a different user
+/// namespace, so every host mount arrives with its per-mount flags locked —
+/// nosuid, nodev, noexec, ro, atime — and `MS_REMOUNT|MS_BIND` has to re-assert
+/// all of them to get through. The source's locked flags decide it, and not its
+/// filesystem: a bare tmpfs remounts and a `nosuid,nodev` one does not. Every
+/// other errno is a failure to report rather than a mechanism to switch to: a
+/// fallback taken on `EINVAL` would quietly replace a malformed mount with a
+/// different one, and the run would report a read-only exposure it never
+/// established.
+///
+/// A function rather than an inline guard because this *is* the read-only
+/// decision: `apply_mount` cannot be unit-tested without mounting a filesystem,
+/// and which errno takes the fallback is everything about it worth pinning.
+fn refused_remount_needs_the_overlay(source: Errno) -> bool {
+    source == Errno::PERM
+}
+
+/// The **writable** mount points strictly below `target` in a
+/// `/proc/self/mountinfo` table.
+///
+/// **Why the check exists.** [`apply_mount`] binds an exposure with
+/// `mount_bind_recursive`, which pulls the source's *submounts* in too, and a
+/// successful remount makes the top mount read-only while leaving them alone: a
+/// nested filesystem would stay writable inside a jail that reports the
+/// exposure as read-only, and a write through it would land on the host.
+/// `mount_setattr` with `AT_RECURSIVE` is the textbook fix and `rustix` 1.1.4
+/// has none for a mount that already exists — its `MountAttrFlags` configures
+/// one being *created* through `fsopen` — while reaching the syscall directly
+/// would be a fourth `unsafe` site (decision 14). A plain non-recursive bind is
+/// no alternative either: the nested mount's *contents* would vanish from the
+/// jail instead of becoming read-only. So the shape is refused by name, which
+/// is fail-closed.
+///
+/// **Writability, not existence, is the predicate.** A submount that is already
+/// `ro` cannot be written through, and the confined process cannot remount it
+/// writable — that takes `CAP_SYS_ADMIN` in the mount's owning namespace, which
+/// the capability drop is about to take away — so reporting it would reject a
+/// configuration that is already as read-only as the exposure asks for. The
+/// mount's own options are the sixth field, and `rw` is always one of them.
+///
+/// **The fifth whitespace-separated field is the mount point, escaped** —
+/// `\040` for a space, `\011` for a tab, `\012` for a newline and `\134` for a
+/// backslash — and it is decoded before the comparison, which is the only reason
+/// a target with a space in its name can match its own submounts. No raw
+/// whitespace can appear in the field, so splitting on it is safe.
+fn writable_nested_mounts_in(table: &str, target: &Path) -> Vec<PathBuf> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let mount_point = fields.nth(4)?;
+            let options = fields.next()?;
+            Some((decode_mountinfo(mount_point), options))
+        })
+        .filter(|(mount, options)| {
+            mount.starts_with(target)
+                && mount != target
+                && options.split(',').any(|option| option == "rw")
+        })
+        .map(|(mount, _)| mount)
+        .collect()
+}
+
+/// Decode one mountinfo field: the kernel escapes exactly `\040`, `\011`,
+/// `\012` and `\134`, and an escape this function does not know is copied
+/// through rather than guessed at, so a field it misreads cannot become a
+/// different path.
+fn decode_mountinfo(field: &str) -> PathBuf {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(index) = rest.find('\\') {
+        out.push_str(&rest[..index]);
+        let escape = &rest[index + 1..];
+        match escape.get(..3) {
+            Some("040") => out.push(' '),
+            Some("011") => out.push('\t'),
+            Some("012") => out.push('\n'),
+            Some("134") => out.push('\\'),
+            _ => {
+                out.push('\\');
+                rest = escape;
+                continue;
+            }
+        }
+        rest = escape.get(3..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    PathBuf::from(out)
+}
+
+/// `/proc/self/mountinfo` as text, which is the host's table until the pivot.
+///
+/// Text rather than bytes because [`writable_nested_mounts_in`] compares paths, and a
+/// line that is not UTF-8 — a mount source named in some other encoding —
+/// refuses here instead of being decoded lossily: a lossy mount point would miss
+/// a nested mount under a target with the same affliction, and missing one is
+/// the under-enforcement the caller exists to stop.
+fn read_mountinfo() -> Result<String> {
+    fs::read_to_string("/proc/self/mountinfo").map_err(step("read /proc/self/mountinfo"))
+}
+
+fn apply_mount(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+    match entry.kind {
+        MountKind::JailTmpfs => apply_jail_tmpfs(entry)?,
+        // `return`: the overlay fallback re-enters this function, and that
+        // recursive call is the one that traces — falling through would emit a
+        // second `mount applied` with the bind's kind (design decision 8).
+        MountKind::Bind => return apply_bind(entry, overlay),
+        MountKind::OverlayReadOnly => apply_overlay_read_only(entry, overlay)?,
+    }
+    trace_mount(entry);
+    Ok(())
+}
+
+fn trace_mount(entry: &Mount) {
+    // One event per mount, carrying the source, the target, the kind and the
+    // access the confined process gets through it (shared §7). At the end
+    // rather than once per arm, so all three kinds are traced by construction
+    // and a fourth kind cannot be added without being traced.
+    debug!(
+        step = "mount",
+        source = %entry.source.display(),
+        target = %entry.target.display(),
+        kind = ?entry.kind,
+        access = ?entry.access,
+        "mount applied"
+    );
+}
+
+fn apply_jail_tmpfs(entry: &Mount) -> Result<()> {
+    if let Some(parent) = entry.target.parent() {
+        fs::create_dir_all(parent).map_err(step("create jail parent"))?;
+    }
+    // **`size=1m` is enough, and the arithmetic is the reason rather
+    // than a guess.** What lands in this tmpfs is directories: one for
+    // each prefix of each mirrored path (`/srv`, `/srv/data`, `/dev`,
+    // …), one for `.oldroot`, the four device nodes, and the overlay's
+    // pair. The deepest realistic set — a served root three components
+    // down, a state directory beside it, four device files — is on the
+    // order of twenty directories, and a tmpfs directory is at most one
+    // 4 KiB page plus its entries: under 100 KiB, against 1 MiB, which
+    // is 256 such pages. The quota's real subject is the overlay's
+    // upper, the only thing in the jail that can ever hold data — and
+    // the mount that exposes the served root through it is `MS_RDONLY`,
+    // so a write aimed at that exposure is refused at the mount with
+    // `EROFS` and never reaches this quota (`OverlayDirs` says which
+    // write `ENOSPC` is actually for).
+    mount(
+        "tmpfs",
+        &entry.target,
+        "tmpfs",
+        MountFlags::NOSUID | MountFlags::NODEV,
+        Some(c"size=1m,mode=0755"),
+    )
+    .map_err(step("mount tmpfs"))
+}
+
+fn apply_bind(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+    // **"Is the source a directory?", not "is it a file?"** The four
+    // device files are character devices, so `is_file()` is false for
+    // every one of them: that spelling runs the *directory* branch for
+    // `/dev/null`, creating a directory at `<jail>/dev/null` and then
+    // binding a chardev onto it — `ENOTDIR` at best, and at worst a
+    // jail that never builds. Task 6's precondition is what makes the
+    // second one visible: a half-built jail is a *failure* there rather
+    // than a host without namespaces.
+    if entry.source.is_dir() {
+        fs::create_dir_all(&entry.target).map_err(step("create mount point"))?;
+    } else {
+        if let Some(parent) = entry.target.parent() {
+            fs::create_dir_all(parent).map_err(step("create device parent"))?;
+        }
+        fs::File::create(&entry.target).map_err(step("create device node"))?;
+    }
+    // Recursive, not plain: a bare `MS_BIND` of a mount-point source is
+    // refused with EINVAL inside a user namespace (measured), and for a
+    // source with no submounts the two forms are identical — so the
+    // recursive call is the one to write everywhere.
+    mount_bind_recursive(&entry.source, &entry.target).map_err(step("mount --bind"))?;
+    if entry.access.is_read_only() {
+        return enforce_bind_read_only(entry, overlay);
+    }
+    trace_mount(entry);
+    Ok(())
+}
+
+/// Remount the bind read-only, or fall back to the overlay when locked flags
+/// refuse the remount (design decision 8).
+fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+    // **`mount_remount`, not `mount_change`, and this is the primary
+    // enforcement of `AccessMode::ReadOnly`** (design decision 8).
+    // `mount_change` takes `MountPropagationFlags` — `MountFlags`
+    // has no `PRIVATE`, and `RDONLY`/`BIND` are not propagation
+    // flags at all — and what it emits is
+    // `mount(NULL, target, NULL, flags, NULL)`, with no `MS_REMOUNT`
+    // anywhere in it, so a read-only request spelled through it
+    // would return success and leave the served root writable. A
+    // silent success here is worse than a failure: the run reports
+    // confinement and the operator has none, which is exactly the
+    // class of failure design §11 refuses.
+    //
+    // **And the overlay is the other half of the same rule, not an
+    // alternative to it.** The remount is accepted where the
+    // exposure's source carries no locked per-mount flags and
+    // refused with `EPERM` where it does — which, once the mount
+    // namespace belongs to a different user namespace, is every
+    // host mount, `/tmp`'s `nosuid,nodev` tmpfs included. For the
+    // refused case the `MS_RDONLY` overlay is what makes the
+    // exposure read-only. The mount plan no longer chooses between
+    // them, because nothing that performs no syscall can (Task 2):
+    // this is the decision, and the source's locked flags make it.
+    //
+    // Re-entering `apply_mount` with the other kind, rather than
+    // duplicating the overlay's body here, keeps the trace below
+    // true: exactly one `mount applied` event per mount, carrying
+    // the kind that actually landed.
+    match mount_remount(&entry.target, MountFlags::RDONLY | MountFlags::BIND, "") {
+        Ok(()) => {
+            refuse_writable_nested_mounts(entry)?;
+            trace_mount(entry);
+            Ok(())
+        }
+        Err(source) if refused_remount_needs_the_overlay(source) => {
+            debug!(
+                step = "remount ro",
+                target = %entry.target.display(),
+                "the remount was refused; falling back to the read-only overlay"
+            );
+            let fallback = Mount {
+                kind: MountKind::OverlayReadOnly,
+                ..entry.clone()
+            };
+            apply_mount(&fallback, overlay)
+        }
+        Err(source) => Err(fail("remount ro", source)),
+    }
+}
+
+/// A successful remount leaves nested mounts writable; refuse that hole.
+fn refuse_writable_nested_mounts(entry: &Mount) -> Result<()> {
+    // **The landed remount is the only branch that needs the
+    // nested-mount check, and the second arm is why.** It
+    // makes the *top* mount read-only and leaves the
+    // submounts exactly as they were, so a writable one
+    // below is the hole — while the `EPERM` arm's overlay is
+    // `MS_RDONLY` from the start and covers the whole merged
+    // view end to end (measured: a write through a nested
+    // mount under it is refused with `EROFS`, while the host
+    // path stays writable, so the refusal is the overlay's
+    // own and not a permission artefact). Checking before
+    // the attempt would refuse every source with locked
+    // flags and a submount — `/dev` with `/dev/pts` and
+    // `/dev/shm` — where the overlay copes.
+    //
+    // Read here, after the remount, because this is when
+    // both facts are settled, and `/proc` is still the
+    // host's, the pivot having not happened yet. The table
+    // reports *resolved* paths — measured: a mount made
+    // through the symlink `/tmp/x/link/j` is listed as
+    // `/tmp/x/real/j` — so a `$TMPDIR` under a symlinked
+    // ancestor would make an unresolved target miss its own
+    // submounts. Canonicalised when the call answers, and the
+    // target as it stands when it does not, which can cost a
+    // missed refusal but cannot invent one.
+    let target = fs::canonicalize(&entry.target).unwrap_or_else(|_| entry.target.clone());
+    let nested = writable_nested_mounts_in(&read_mountinfo()?, &target);
+    if let Some(mount) = nested.first() {
+        // **The nested mount is named by its *host* path**,
+        // which is the exposure's plus the remainder below
+        // the target: the jail path it was found at is a name
+        // the operator never chose and would have to
+        // translate. The strip cannot fail — the filter that
+        // selected this mount matched the same prefix — and
+        // if it ever does the jail path is reported rather
+        // than a new failure raised: a cosmetic mapping is not
+        // worth a failure path.
+        let host = mount
+            .strip_prefix(&target)
+            .map_or_else(|_| mount.clone(), |rest| entry.source.join(rest));
+        return Err(fail(
+            "read-only exposure",
+            io::Error::other(format!(
+                "{} is mounted below {}: the recursive bind carried it into \
+                 the jail but the remount makes only the top mount read-only, \
+                 so a write through it would reach the host — serve that root \
+                 read-write, or move the nested mount outside it",
+                host.display(),
+                entry.source.display(),
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+    // **The fallback arm, and the only way in is the substitution
+    // above.** `plan` emits no entry of this kind (Task 2), and keeping
+    // the mechanism a `MountKind` rather than an inline branch is what
+    // lets that substitution reuse this body instead of a second copy
+    // of it.
+    fs::create_dir_all(&entry.target).map_err(step("create overlay mount point"))?;
+    fs::create_dir_all(&overlay.upper).map_err(step("create overlay upper"))?;
+    fs::create_dir_all(&overlay.work).map_err(step("create overlay work"))?;
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        entry.source.display(),
+        overlay.upper.display(),
+        overlay.work.display()
+    );
+    let options = CString::new(options).map_err(|_| {
+        refused(
+            "mount overlay",
+            Error::Unsupported {
+                detail: "an exposed path contains a NUL byte",
+            },
+        )
+    })?;
+    // **`as_c_str()` and not `&options`**: `mount`'s data parameter is
+    // `Data: Into<Option<&CStr>>`, and a `CString` reference is not one
+    // of those — the conversion is explicit all the way down.
+    mount(
+        "overlay",
+        &entry.target,
+        "overlay",
+        MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV,
+        Some(options.as_c_str()),
+    )
+    .map_err(step("mount overlay ro"))
+}
+
+fn resolved_model(resolved: Resolved) -> Mechanism {
+    match resolved {
+        Resolved::UserNamespace => Mechanism::UserNamespace,
+        Resolved::Root => Mechanism::Root,
+        Resolved::Unavailable(_) => Mechanism::Root,
+    }
+}
+
+#[instrument(level = "debug", skip_all, ret, fields(retained = ?keep, effective = field::Empty))]
+fn drop_capabilities(keep: &[Cap]) -> Result<()> {
+    // No new privileges first: it is what lets the seccomp filter install
+    // without CAP_SYS_ADMIN.
+    set_no_new_privs(true).map_err(step("no_new_privs"))?;
+
+    // **The bounding set goes first, and that order is load-bearing.**
+    // `PR_CAPBSET_DROP` requires `CAP_SETPCAP` in the *effective* set at the
+    // moment of the call, and the capset below is what takes it away — so a
+    // sweep written after the capset fails with `EPERM` on its first capability
+    // and the bounding set is never touched. Measured on WSL2: with caps intact
+    // the drop succeeds; after an empty capset it returns `EPERM` and a
+    // `PR_CAPBSET_READ` still reports the capability as present. Dropping from
+    // the bounding set does not clear the effective bit, so the sweep may drop
+    // `CAP_SETPCAP` itself and keep going.
+    for cap in ALL_CAPABILITIES {
+        if keep.iter().any(|kept| kept.set() == cap) {
+            continue;
+        }
+        // Neither errno is ignorable, and they mean different things: `EINVAL`
+        // is "past this kernel's `CAP_LAST_CAP`", and `EPERM` means the ordering
+        // above is wrong or a capability was asked for that this namespace does
+        // not hold.
+        //
+        // **`EINVAL` is reachable rather than impossible, and on a kernel older
+        // than 5.9 it is the ordinary outcome**: capabilities 38-40 —
+        // `PERFMON`, `BPF`, `CHECKPOINT_RESTORE` — do not exist there, so the
+        // array above is this kernel's own list only from 5.9 on and the sweep
+        // hits `EINVAL` at 38. Failing closed is the outcome design §11 asks
+        // for; the step string is what makes it diagnosable, because it names
+        // the drop that ran past the kernel's bound rather than leaving an
+        // unattributed `EINVAL` at a capability nobody can see.
+        //
+        // **Two `Errno`s are compared directly, and the earlier spelling is
+        // worth naming because it does not compile**: `raw_os_error()` returns
+        // an `i32` on both types, so comparing it against
+        // `Some(Errno::INVAL.raw_os_error())` puts an `i32` beside an
+        // `Option<i32>` — and `Errno` derives `PartialEq`, so the comparison
+        // the code wants is the one it can have.
+        remove_capability_from_bounding_set(cap).map_err(|source| {
+            let name = if source == Errno::INVAL {
+                "drop capability from bounding set: past CAP_LAST_CAP"
+            } else {
+                "drop capability from bounding set"
+            };
+            fail(name, source)
+        })?;
+        // One event per drop, so the run's own capability set is reconstructible
+        // from the log rather than from the array above it (shared §7).
+        debug!(
+            step = "drop capability",
+            capability = cap.bits(),
+            "dropped from the bounding set"
+        );
+    }
+
+    // Only now is the process's own set narrowed to what it keeps.
+    let mut wanted = CapabilitySet::empty();
+    for cap in keep {
+        wanted |= cap.set();
+    }
+
+    let mut sets = capabilities(None).map_err(step("read capabilities"))?;
+    sets.effective = wanted;
+    sets.permitted = wanted;
+    sets.inheritable = CapabilitySet::empty();
+    set_capabilities(None, sets).map_err(step("capset"))?;
+    Span::current().record("effective", wanted.bits());
+
+    // The bounding set is what makes the drop stick across `execve`: with euid 0
+    // the kernel recomputes the permitted set as full on exec, and only the
+    // bounding set bounds it. Every capability not kept has left it by now.
+    Ok(())
+}
+
+/// Every capability `CAP_CHOWN` (0) through `CAP_CHECKPOINT_RESTORE` (40), in
+/// kernel numbering order.
+///
+/// Spelled out because `rustix` publishes no iterator over them: `CapabilitySet`
+/// is a `bitflags` type whose `iter()` walks the bits *set in a value*, not the
+/// universe of capabilities, and `Flags::iter_defined_names()` would drag an
+/// explicit `bitflags` dependency in for one loop. The array doubles as the
+/// sweep's bound — 41 is `CAP_LAST_CAP + 1`, so the loop can never reach the
+/// `EINVAL` the kernel returns past that.
+const ALL_CAPABILITIES: [CapabilitySet; 41] = [
+    CapabilitySet::CHOWN,
+    CapabilitySet::DAC_OVERRIDE,
+    CapabilitySet::DAC_READ_SEARCH,
+    CapabilitySet::FOWNER,
+    CapabilitySet::FSETID,
+    CapabilitySet::KILL,
+    CapabilitySet::SETGID,
+    CapabilitySet::SETUID,
+    CapabilitySet::SETPCAP,
+    CapabilitySet::LINUX_IMMUTABLE,
+    CapabilitySet::NET_BIND_SERVICE,
+    CapabilitySet::NET_BROADCAST,
+    CapabilitySet::NET_ADMIN,
+    CapabilitySet::NET_RAW,
+    CapabilitySet::IPC_LOCK,
+    CapabilitySet::IPC_OWNER,
+    CapabilitySet::SYS_MODULE,
+    CapabilitySet::SYS_RAWIO,
+    CapabilitySet::SYS_CHROOT,
+    CapabilitySet::SYS_PTRACE,
+    CapabilitySet::SYS_PACCT,
+    CapabilitySet::SYS_ADMIN,
+    CapabilitySet::SYS_BOOT,
+    CapabilitySet::SYS_NICE,
+    CapabilitySet::SYS_RESOURCE,
+    CapabilitySet::SYS_TIME,
+    CapabilitySet::SYS_TTY_CONFIG,
+    CapabilitySet::MKNOD,
+    CapabilitySet::LEASE,
+    CapabilitySet::AUDIT_WRITE,
+    CapabilitySet::AUDIT_CONTROL,
+    CapabilitySet::SETFCAP,
+    CapabilitySet::MAC_OVERRIDE,
+    CapabilitySet::MAC_ADMIN,
+    CapabilitySet::SYSLOG,
+    CapabilitySet::WAKE_ALARM,
+    CapabilitySet::BLOCK_SUSPEND,
+    CapabilitySet::AUDIT_READ,
+    CapabilitySet::PERFMON,
+    CapabilitySet::BPF,
+    CapabilitySet::CHECKPOINT_RESTORE,
+];
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use rustix::io::Errno;
+
+    use super::{refused_remount_needs_the_overlay, writable_nested_mounts_in};
+    use crate::{
+        _core::{AccessMode, Backend as BackendTrait, Error, LaunchPlan, Sandbox},
+        Backend, Mechanism,
+        options::Options,
+    };
+
+    #[test]
+    fn an_empty_sandbox_is_refused() {
+        // `Error::Step`, not `Unsupported`: nothing exposed is the caller's bug,
+        // and `Unsupported` would send the operator to look at their kernel
+        // (design §11). P0's stub returns the same variant for the same reason.
+        // The check runs before the availability probe, so this test needs no
+        // namespace and gets one answer on every host.
+        let err = Backend::default()
+            .confine(&Sandbox::new(), &LaunchPlan::new())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: "confine",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_relative_exposure_is_refused_before_anything_irreversible_happens() {
+        // Validation must run before any unshare, so an operator typo does not
+        // leave the process half-confined. `Auto` is the model here because it
+        // resolves on any host this test can run on, which leaves the exposure
+        // loop as the only thing that can refuse.
+        let sandbox = Sandbox::new().expose("relative", AccessMode::ReadOnly);
+        let mut backend = Backend::with_options(Options::default().with_euid(0));
+        let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
+        assert!(matches!(err, Error::BadPath { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_missing_path_is_refused_before_anything_irreversible_happens() {
+        let sandbox = Sandbox::new().expose("/no/such/path/at/all", AccessMode::ReadOnly);
+        let mut backend =
+            Backend::with_options(Options::default().with_model(Mechanism::Root).with_euid(0));
+        let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::BadPath {
+                    reason: "does not exist",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_model_is_refused() {
+        // Forced root without root: decided from the injected euid alone, with
+        // no probe and therefore the same answer on every host.
+        let sandbox = Sandbox::new().expose("/", AccessMode::ReadOnly);
+        let mut backend = Backend::with_options(
+            Options::default()
+                .with_model(Mechanism::Root)
+                .with_euid(1000),
+        );
+        let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_local_uid_mapping_is_refused_under_the_user_namespace() {
+        // An unmapped uid cannot be chowned to, so the combination is a
+        // configuration error rather than a runtime surprise (design §8). A
+        // *forced* user namespace is refused from the request alone — no probe,
+        // no privileges, no namespace — because the refusal is the same whether
+        // or not this host would grant one. The `Auto` half of the same rule
+        // cannot be decided before the probe, so it is checked against the
+        // **resolved** model in `enter`; no unit test can drive that path,
+        // because what the probe answers is a property of the host.
+        let sandbox = Sandbox::new().expose("/", AccessMode::ReadOnly);
+        let mut backend = Backend::with_options(
+            Options::default()
+                .with_model(Mechanism::UserNamespace)
+                .with_local_uid(true)
+                .with_euid(1000),
+        );
+        let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
+        assert!(err.to_string().contains("local_uid"), "{err}");
+        assert!(err.to_string().contains("root"), "{err}");
+    }
+
+    #[test]
+    fn the_jail_is_derived_from_the_first_exposure() {
+        // The first exposure is the served root by construction: `serve`
+        // exposes it first. Options that do not change that are the only ones
+        // unit-testable, because everything after validation is irreversible.
+        let opts = Options::default().with_tmpdir(PathBuf::from("/tmp"));
+        assert_eq!(opts.tmpdir(), Some(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn only_eperm_selects_the_overlay_fallback() {
+        // **The read-only mechanism is the locked-flag answer, so the reading
+        // of that answer has to be exact** (design §4, re-measured 2026-09-20):
+        // `EPERM` is what a read-only remount of a source with locked flags
+        // gets, and it takes the `MS_RDONLY` overlay; every other errno stays a
+        // failure, because a fallback taken on one of them would mount
+        // something other than what was refused and report a read-only exposure
+        // it never established. This is also where the overlay's own test lives
+        // now: nothing pure can pin it any more — `plan` emits `Bind` for every
+        // read-only exposure — and the branch itself needs a filesystem, which
+        // is what Task 6's jail run supplies.
+        assert!(refused_remount_needs_the_overlay(Errno::PERM));
+        assert!(!refused_remount_needs_the_overlay(Errno::INVAL));
+        assert!(!refused_remount_needs_the_overlay(Errno::ACCESS));
+    }
+
+    #[test]
+    fn only_a_writable_mount_below_the_target_is_reported() {
+        // **The hole, and the predicate that separates it from the safe
+        // shapes**: the bind is recursive, so `cache` is carried into a jail
+        // whose exposure a successful remount makes read-only at the top only,
+        // and a write through `cache` then reaches the host. A submount that is
+        // already `ro` is not that hole — it cannot be written through, and the
+        // confined process cannot remount it writable without `CAP_SYS_ADMIN`
+        // in the mount's owning namespace, which the capability drop removes —
+        // so reporting it would refuse a configuration that is already as
+        // read-only as the exposure asks for. The neighbours must not match
+        // either: the target itself, and a path sharing its spelling but not its
+        // components.
+        // **`archive`'s per-mount options are `ro` while its superblock options
+        // after the `-` separator are `rw`, and that pair is the row that pins
+        // the field being read.** It is the shape measured on a real remount —
+        // the top mount's sixth field goes `ro` and its superblock field stays
+        // `rw` — so a helper reading the superblock instead of the mount would
+        // find `rw` there, report this mount, and fail the assertion below.
+        let table = "\
+            24 30 0:23 / /tmp/jail/srv/data rw - tmpfs tmpfs rw\n\
+            25 24 8:1 / /tmp/jail/srv/data/cache rw - ext4 /dev/sdb1 rw\n\
+            26 24 8:2 / /tmp/jail/srv/data/archive ro - ext4 /dev/sdc1 rw\n\
+            27 30 8:3 / /tmp/jail/srv/data2 rw - ext4 /dev/sdd1 rw\n\
+            28 30 8:4 / /tmp/elsewhere rw - ext4 /dev/sde1 rw\n";
+        assert_eq!(
+            writable_nested_mounts_in(table, Path::new("/tmp/jail/srv/data")),
+            vec![PathBuf::from("/tmp/jail/srv/data/cache")]
+        );
+        // The whole subtree and not one level of it, with the read-only
+        // submount excluded from the middle of it.
+        assert_eq!(
+            writable_nested_mounts_in(table, Path::new("/tmp/jail/srv")).len(),
+            3,
+            "`data`, `data/cache` and `data2` — not the already-read-only `data/archive`"
+        );
+        // And nothing below the deepest mount, so a served root with no
+        // submounts at all reports nothing.
+        assert!(writable_nested_mounts_in(table, Path::new("/tmp/jail/srv/data/cache")).is_empty());
+    }
+
+    #[test]
+    fn a_mount_point_is_decoded_before_it_is_compared() {
+        // `\040` is a space and `\134` is a backslash, and they are decoded
+        // because the escaped spelling never matches the path it denotes:
+        // `/srv/my\040data/one` does not start with `/srv/my data`, so an
+        // undecoded comparison would leave the nested mount unreported — the
+        // one outcome this check may not have.
+        let table = "\
+            24 30 0:23 / /srv/my\\040data rw - tmpfs tmpfs rw\n\
+            25 24 8:1 / /srv/my\\040data/one rw - ext4 /dev/sdb1 rw\n\
+            26 24 8:2 / /srv/back\\134slash/deep rw - ext4 /dev/sdc1 rw\n";
+        assert_eq!(
+            writable_nested_mounts_in(table, Path::new("/srv/my data")),
+            vec![PathBuf::from("/srv/my data/one")]
+        );
+        assert_eq!(
+            writable_nested_mounts_in(table, Path::new("/srv/back\\slash")),
+            vec![PathBuf::from("/srv/back\\slash/deep")]
+        );
+    }
+}

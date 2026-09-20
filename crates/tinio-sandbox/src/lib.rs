@@ -48,6 +48,27 @@ pub use crate::_core::{
     LaunchPayload, LaunchPlan, Observer, Result, Sandbox, Terminal, adopt, is_listener_fd_arg,
     listener_fd_arg, listener_fd_from_arg, supervise,
 };
+/// The Linux backend's own crate, for the settings the shared surface does not
+/// carry — its `Options` (the model and the `tmpdir` knob) and its `Seccomp`
+/// answer.
+///
+/// **A consumer names this facade and nothing else**, which is the rule the
+/// module doc above states and which a consumer that reached
+/// `tinio-sandbox-linux` by name would break: by the time all three arms of
+/// `serve`'s `main` exist, such a consumer would need one target-gated
+/// dependency per platform while every arm lives in the same function. The
+/// re-export does not widen the *shared* surface — these are still the
+/// platform's own types in the platform's own crate, reached through a
+/// `#[cfg]` the consumer would have written anyway.
+///
+/// # Examples
+///
+/// ```
+/// let options = tinio_sandbox::linux::Options::default();
+/// assert!(!options.local_uid_configured());
+/// ```
+#[cfg(target_os = "linux")]
+pub use crate::_linux as linux;
 /// The backend for the platform this build targets, and the constructor for it.
 ///
 /// # Examples

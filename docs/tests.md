@@ -74,6 +74,7 @@ Constitution VI: `audit` (dev+main), `semver` (API MUST check).
 - Catch `use` out of `#[cfg]` / leftover path.
 - `test-parquet`: parquet-only (`parquet`/`select-parquet` off default).
 - `tests/parquet.rs` needs `required-features = ["parquet"]` or `pub mod parquet`/`[[test]]` break.
+- The `tinio-server` `sandbox_e2e` target requires the `sandbox` feature; **the `serve` example deliberately carries no `required-features`**, and adding one breaks this leg. The `no-default` mode below builds `--example serve --no-default-features` (because `serve_read_only` spawns it), and an explicit `--example` selection whose `required-features` are unmet is a hard error — `exit 101` — while the implicit `cargo test --workspace --no-default-features` silently skips such a target, so the gate does not see it. The example must build and serve in every feature configuration (design decisions 4 and 19); what the feature gates is the `--sandbox` arm's body, not the program's existence.
 - `test-port` / `e2e-port` / `interop-port`: same cmds, windows/macos.
 
 ## Cucumber (tinio-e2e)
@@ -120,12 +121,11 @@ Gate e2e = fs/mem/`@parquet`/traceability. `@boto3`/`@mc` need `TINIO_E2E_EXTERN
 
 ## Platform-gated verification (WSL2)
 
+- Confinement (`--sandbox`): `bash crates/tinio-sandbox-linux/scripts/wsl-chroot.sh` — both models, the confined server, and the external e2e leg (`TINIO_E2E_EXTERNAL=1`; needs aws cli v2, rclone, mc and the e2e boto3 venv, and fails without them).
+- The confinement tests **fail** rather than skip when the host cannot create an unprivileged user namespace — a skip through `eprintln!` is swallowed by libtest and would report a green suite that certified nothing. `TINIO_SANDBOX_ALLOW_SKIP=1` opts out deliberately, naming the `unshare` command that was tried. A CI runner on Ubuntu 24.04's AppArmor default is therefore red until unprivileged user namespaces are allowed or the binary carries a profile; that is the intended reading, not a flake.
 - `#[cfg(unix)]` (copy/ETag) invisible on Win; unused-import may be CI-load-bearing (E0599).
 - WSL2 if Win-clean/CI-red (`/mnt/e/GitHub/tinio`, ext4 `CARGO_TARGET_DIR`).
-- crates/tinio-e2e/README.md "WSL2":
-  `cargo clippy --workspace --all-targets -- -D warnings`
+- crates/tinio-e2e/README.md "WSL2": `cargo clippy --workspace --all-targets -- -D warnings`
 - Hammer tests (`wait_for`, 60s, `TINIO_TEST_WAIT_TIMEOUT_SECS`) starve on loaded CI.
 - Repro WSL2 before flaky-vs-real.
-- `lint` `windows-gnu`: ubuntu cross, no native Win. `cargo clippy --target x86_64-pc-windows-gnu
-  --workspace --all-targets -- -D warnings` (`rustup target add
-  x86_64-pc-windows-gnu` + mingw-w64).
+- `lint` `windows-gnu`: ubuntu cross, no native Win. `cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets -- -D warnings` (`rustup target add x86_64-pc-windows-gnu` + mingw-w64).

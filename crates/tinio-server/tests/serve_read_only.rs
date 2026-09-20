@@ -48,6 +48,7 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 use tinio_config::{sources::READ_ONLY_VAR, state::STATE_DIR_VAR};
 use tinio_core::acl::DEFAULT_ROOT_ACCESS_KEY;
+use tinio_sandbox::Event;
 use tinio_util::testing::wait_timeout_secs;
 use tokio::time::sleep;
 
@@ -61,9 +62,6 @@ const SECRET_KEY: &str = "minioadmin";
 /// client sent — never against the bound address — so the value is the
 /// signer's to choose (`data.rs`'s acl test picks the same one).
 const HOST: &str = "localhost";
-
-/// The one line the example writes to stdout (the harness parses it).
-const READY: &str = "listening on ";
 
 /// The serve example binary: cargo sets `CARGO_BIN_EXE_*` for bins only,
 /// never for examples, so it is resolved relative to this test binary's own
@@ -176,8 +174,16 @@ impl Serve {
         }
     }
 
-    /// Wait for the `listening on <addr>` readiness line and return the
-    /// address the child actually bound (`--port 0` makes it ephemeral).
+    /// Wait for the `listening` event and return the address the child
+    /// actually bound (`--port 0` makes it ephemeral).
+    ///
+    /// The example speaks the sandbox's event stream (design decision 19):
+    /// one SSE frame per event — an `event:` line, a `data:` line, a blank
+    /// line — so **a frame is not a line**, and [`Serve::stdout_event`] is
+    /// what accumulates until `Event::decode` sees a whole one. The `error`
+    /// frame a refusal sends is read as the refusal it is rather than as a
+    /// timeout, which is what the frame buys: a consumer of stdout gets a
+    /// cause where the old text scrape found only an absence.
     ///
     /// Bounded: a child that never gets there fails this wait with its
     /// captured stderr instead of hanging the suite, and one that dies
@@ -186,11 +192,13 @@ impl Serve {
         let timeout = wait_timeout();
         let deadline = Instant::now() + timeout;
         loop {
-            for line in self.stdout.lock().expect("the stdout buffer").iter() {
-                if let Some(raw) = line.strip_prefix(READY) {
-                    return raw.parse().unwrap_or_else(|e| {
-                        panic!("cannot parse the readiness line `{line}`: {e}")
-                    });
+            if let Some(event) = self.stdout_event() {
+                match event {
+                    Event::Listening { addr } => return addr,
+                    Event::Error { message } => {
+                        self.stop();
+                        panic!("the server refused to start: {message}");
+                    }
                 }
             }
             if let Some(status) = self.child.try_wait().expect("the child's status") {
@@ -198,20 +206,41 @@ impl Serve {
                 // quotes, and a live child's are not at EOF yet.
                 self.stop();
                 panic!(
-                    "the server exited ({status}) before printing `{READY}`; stderr:\n{}",
+                    "the server exited ({status}) without reporting `listening`; stderr:\n{}",
                     self.stderr_text()
                 );
             }
             if Instant::now() >= deadline {
                 self.stop();
                 panic!(
-                    "the server printed no `{READY}` line within {} s; stderr:\n{}",
+                    "the server reported no event within {} s; stderr:\n{}",
                     timeout.as_secs(),
                     self.stderr_text()
                 );
             }
             sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    /// The first complete event frame among the stdout lines so far, or
+    /// `None` while they hold none. A frame is `Event::encode`'s two field
+    /// lines closed by a blank line, so scanning line by line would hand
+    /// `Event::decode` half a frame; the accumulation here is what makes the
+    /// blank line the frame's end rather than a line to skip.
+    fn stdout_event(&self) -> Option<Event> {
+        let mut frame = String::new();
+        for line in self.stdout.lock().expect("the stdout buffer").iter() {
+            if line.is_empty() {
+                if let Some(event) = Event::decode(&frame) {
+                    return Some(event);
+                }
+                frame.clear();
+            } else {
+                frame.push_str(line);
+                frame.push('\n');
+            }
+        }
+        None
     }
 
     /// Wait for the child to exit on its own — the legs that expect a
@@ -474,7 +503,7 @@ fn names_path(haystack: &str, path: &Path) -> bool {
 }
 
 /// Case 1: `--read-only` with `TINIO_STATE_DIR` serves read-only, keeps the
-/// state out of the served root, and writes exactly one line to stdout.
+/// state out of the served root, and writes exactly one frame to stdout.
 #[tokio::test]
 async fn the_read_only_flag_relocates_the_state_and_refuses_writes() {
     let scratch = Scratch::new();
@@ -507,7 +536,7 @@ async fn the_read_only_flag_relocates_the_state_and_refuses_writes() {
         "the planted object's body must arrive intact"
     );
     // The state really moved out of the root, into the dir the diagnostic
-    // names on stderr (stdout is the harness's readiness line alone).
+    // names on stderr (stdout is the harness's readiness frame alone).
     let diagnostic = format!("read-only mode: state dir {}", state.display());
     let stderr = server.stderr_containing(&diagnostic).await;
     assert!(
@@ -526,17 +555,19 @@ async fn the_read_only_flag_relocates_the_state_and_refuses_writes() {
 
     server.stop();
     // Complete now that the child is gone: stdout carried the readiness
-    // line and nothing else.
+    // frame and nothing else — two field lines and the blank line that
+    // closes them, which the line count pins and the decode reads.
     let stdout = server.stdout_lines();
     assert_eq!(
-        stdout.len(),
-        1,
-        "stdout must carry the readiness line alone; got {stdout:?}"
+        Event::decode(&stdout.join("\n")),
+        Some(Event::Listening { addr }),
+        "stdout must carry the readiness frame; got {stdout:?}"
     );
-    assert!(
-        stdout[0].starts_with(READY),
-        "the single stdout line must be the readiness line; got {:?}",
-        stdout[0]
+    assert_eq!(
+        stdout.len(),
+        3,
+        "stdout must carry the readiness frame alone (an event line, a data line, a blank \
+         line); got {stdout:?}"
     );
 }
 
@@ -713,7 +744,8 @@ async fn missing_root_fails(label: &str, missing: &Path, env: &[(&str, &str)]) -
     stderr
 }
 
-/// Case 6: an unknown argument exits with status 2, the `usage()` path.
+/// Case 6: an unknown argument exits with status 2, the refused-command-line
+/// path.
 #[tokio::test]
 async fn an_unknown_argument_exits_with_the_usage_status() {
     let scratch = Scratch::new();
@@ -727,8 +759,90 @@ async fn an_unknown_argument_exits_with_the_usage_status() {
         Some(2),
         "an unknown argument must exit 2 (usage); stderr:\n{stderr}"
     );
+    // clap's rendering, and the casing is its: a `Usage:` line that still
+    // names the binary is the guidance this leg is about, and the flag that
+    // could have answered it (`--help`) is disabled.
     assert!(
-        stderr.contains("usage: serve"),
+        stderr.contains("Usage: serve"),
         "the usage text must name the binary; stderr:\n{stderr}"
+    );
+    // And the same refusal is an event on stdout: a consumer that waits for a
+    // frame reads the cause where an empty stream is the timeout it reports
+    // (design decision 19). This is the one leg that reads a *refusal* frame
+    // off stdout without a server ever binding.
+    let event = server
+        .stdout_event()
+        .expect("the refusal frame, since the process exited");
+    assert!(
+        matches!(&event, Event::Error { message } if message.contains("--not-a-flag")),
+        "an unknown argument must send an `error` frame naming it, not {event:?}"
+    );
+    // **The frame and nothing else**, counted rather than grepped: the parse
+    // library in the dependency graph is the one writer the source grep for
+    // `println!`/`stdout()` cannot see, so stdout's exclusivity is asserted
+    // here, on the stream itself, for the path that now runs clap.
+    let lines = server.stdout_lines();
+    assert_eq!(
+        lines.len(),
+        3,
+        "stdout must carry one frame — an `event:` line, a `data:` line and the blank line \
+         that closes it — and nothing else; got {lines:?}"
+    );
+}
+
+/// Case 7: a build **without** the `sandbox` feature refuses `--sandbox`
+/// rather than ignoring the flag.
+///
+/// **This arm is reachable as of the final review pass, and that is the whole
+/// reason this leg exists.** The example used to be declared
+/// `required-features = ["sandbox"]`, so no build could produce a `serve`
+/// binary without the feature — which left the refusal in the example's `main`
+/// (`#[cfg(not(feature = "sandbox"))]`) unreachable in every configuration that
+/// could be built, and untested. The attribute is gone because a
+/// `--no-default-features` build must still be able to serve the harness, and
+/// what the feature gates is the `--sandbox` arm's body rather than the
+/// program's existence (design decisions 4 and 19) — so a build without it is
+/// a build that can receive the request this test makes.
+///
+/// It runs only where the feature is off, which is CI's `no-default` leg: that
+/// leg builds the example with `--no-default-features` and then runs this
+/// suite, so the binary under test is the one the assertion is about. A
+/// default-features run compiles this out, because there the flag is honoured.
+#[cfg(not(feature = "sandbox"))]
+#[tokio::test]
+async fn a_build_without_the_sandbox_feature_refuses_the_flag() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+
+    let mut server = Serve::spawn(&root, &["--sandbox"], &[]);
+    let status = server.exited().await;
+    let stderr = server.stderr_text();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "a build without the feature must refuse `--sandbox` with the usage status rather than \
+         run unconfined; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("without the `sandbox` feature"),
+        "stderr must name the feature the build is missing; got:\n{stderr}"
+    );
+    // And the same refusal is an event on stdout: a consumer that waits for a
+    // frame reads the cause where an empty stream is the timeout it reports
+    // (design decision 19) — the property that keeps a refusal legible without
+    // the operator having to know which build they were handed.
+    let event = server
+        .stdout_event()
+        .expect("the refusal frame, since the process exited");
+    assert!(
+        matches!(&event, Event::Error { message } if message.contains("`sandbox` feature")),
+        "the refusal must send an `error` frame naming the feature, not {event:?}"
+    );
+    let lines = server.stdout_lines();
+    assert_eq!(
+        lines.len(),
+        3,
+        "stdout must carry the refusal frame and nothing else — an `event:` line, a `data:` \
+         line and the blank line that closes it; got {lines:?}"
     );
 }

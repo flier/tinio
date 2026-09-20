@@ -2599,7 +2599,7 @@ A platform other than the three has no selection and therefore no `platform()` �
 
 - [x] **Step 4: Write the three platform crates**
 
-`crates/tinio-sandbox-linux/Cargo.toml` — the real one, whose body P1 fills (plus the `Mechanism` enum spelled in full at the end of this script block):
+`crates/tinio-sandbox-linux/Cargo.toml` — the real one, whose body P1 fills. **`Mechanism` is not in this stub**: P1 Task 3 defines `pub enum Mechanism` in `mechanism.rs` and re-exports it from the crate root, so callers keep writing `tinio_sandbox_linux::Mechanism`. An earlier draft of this block spelled the enum here so P1 Task 2 could name the variants before Task 3 existed; that compile-order split is gone now that the type and its behaviour share a module.
 
 ```toml
 [package]
@@ -2706,36 +2706,6 @@ impl BackendTrait for Backend {
 // to show the derived `Default` exists.
 pub fn backend() -> Backend {
     Backend
-}
-
-/// Which confinement mechanism Linux uses (design decision 7).
-///
-/// **Complete here, not in P1.** P1's mount-plan unit tests build a plan for
-/// every variant, so a one-variant placeholder would leave that task's tests
-/// referencing names that do not compile until a later task defines them — a
-/// compile-order defect across this plan's own boundary. Nothing outside
-/// `tinio-sandbox-linux` reads this type; it is a platform crate's vocabulary
-/// that simply happens to be cheap to spell in full. What P1 adds is the
-/// *behaviour* — `Resolved`, `from_env`, `resolved()` and the availability
-/// probe — not the variants.
-///
-/// # Examples
-///
-/// ```
-/// use tinio_sandbox_linux::Mechanism;
-///
-/// assert_eq!(Mechanism::default(), Mechanism::Auto);
-/// assert_ne!(Mechanism::Root, Mechanism::UserNamespace);
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Mechanism {
-    /// Prefer the user namespace; resolve the fallback at confinement time.
-    #[default]
-    Auto,
-    /// Force `unshare(CLONE_NEWUSER | CLONE_NEWNS)`.
-    UserNamespace,
-    /// Force `unshare(CLONE_NEWNS)` with `CAP_SYS_ADMIN`.
-    Root,
 }
 ```
 

@@ -17,7 +17,7 @@ An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://
 | `tinio-e2e` | Cucumber BDD suites: in-process conformance, external-client interop |
 | `tinio-util` | Shared test harness (`testing` feature) |
 
-Workspace docs: [`docs/`](docs) — cargo conventions, code style, test guide.
+Workspace docs: [`docs/`](docs) — cargo conventions, code style, test guide, [`--sandbox` operator notes](docs/sandbox.md).
 
 ## Quickstart
 

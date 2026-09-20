@@ -1608,7 +1608,9 @@ In the arg loop (115-145), add:
             "--read-only" => read_only_flag = true,
 ```
 
-with `let mut read_only_flag = false;` beside `address`/`config_path`, and extend `usage()` to print it.
+with `let mut read_only_flag = false;` beside `address`/`config_path`, and put the flag into the command line's help text.
+
+**Nothing in that snippet is spelled this way any more, and the delta is the sandbox work's rather than this plan's.** `serve` no longer hand-parses its arguments: `2026-09-18-sandbox-p1-linux.md`'s Task 7 replaced the `while let Some(arg) = args.next()` loop with `clap`, so the flag is a field on that file's private `RawArgs` (`#[arg(long)] read_only: bool`, which `parse_args` folds into `Args::read_only`), and `usage()` is gone with the loop — the usage line an operator sees is the one clap renders into a refused command line, so there is nothing left to extend by hand. **This plan's decisions are unaffected**: the flag, its precedence against `TINIO_READ_ONLY` and the config file, and the two `if !read_only` guards are all as written below; only the loop and `usage()` named here are stale, and the flag's own documentation is `docs/sandbox.md`'s and the CLI's to carry.
 
 After the config is loaded (`serve.rs:158-161`), resolve the mode — lowest precedence first: the config file, then the environment overlay, then the flag:
 

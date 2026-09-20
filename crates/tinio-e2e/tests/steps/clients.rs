@@ -23,6 +23,7 @@ use std::{
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Read},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
@@ -32,6 +33,7 @@ use std::{
 
 use assert_cmd::Command as AssertCmd;
 use cucumber::{given, then, when};
+use tinio_sandbox::Event;
 
 use super::{FsKind, World, common::deterministic_bytes, has_tag};
 use crate::_server::{
@@ -43,7 +45,8 @@ use crate::_server::{
 pub const ACCESS_KEY: &str = "minioadmin";
 pub const SECRET_KEY: &str = "minioadmin";
 
-const READY: &str = "listening on ";
+/// How long a spawned child gets to report the bound address before the
+/// scenario fails rather than hanging on a pipe that will never carry it.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The workspace target dir (`CARGO_TARGET_DIR` override honored).
@@ -145,13 +148,13 @@ fn terminate(child: &mut Child) {
 #[derive(Debug)]
 pub struct SpawnedServer {
     child: Child,
-    endpoint: String,
+    endpoint: SocketAddr,
 }
 
 /// Spawn the serve binary serving `root` on `--port 0` and wait for the
-/// readiness line; returns the child and the bound endpoint
-/// (`127.0.0.1:PORT`). `scanner` sets `TINIO_SCANNER` per Some (None
-/// leaves it unset), `config` is passed through `--config`.
+/// `listening` event; returns the child and the bound endpoint. `scanner`
+/// sets `TINIO_SCANNER` per Some (None leaves it unset), `config` is passed
+/// through `--config`.
 ///
 /// The child inherits this process's environment, so the three variables
 /// that would change what it serves are cleared first: a shell exporting
@@ -160,7 +163,7 @@ pub struct SpawnedServer {
 /// spawned server in read-only mode), and `TINIO_STATE_DIR` (which would
 /// relocate its state). The `scanner` argument sets its variable back
 /// afterwards.
-fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, String) {
+fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, SocketAddr) {
     let mut cmd = Command::new(serve_bin());
     cmd.arg(root).arg("--port").arg("0");
     if let Some(config) = config {
@@ -177,16 +180,24 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", serve_bin().display()));
     let stdout = child.stdout.take().expect("piped stdout");
+    // The address travels as the value the child bound: it comes out of the
+    // event's typed field and goes to `TcpStream::connect`/a URL as it stands,
+    // so nothing here can disagree with what `local_addr` reported.
     let endpoint = match wait_for_ready(stdout) {
-        Some(line) => line
-            .trim()
-            .strip_prefix(READY)
-            .expect("ready line prefix")
-            .to_string(),
+        Some(Event::Listening { addr }) => addr,
+        // **A refusal is reported as the refusal it is.** Discarding the event
+        // and reporting the `None` below made a server that refused to start
+        // read as the stale-binary guess — a diagnosis that sends the reader
+        // after the wrong thing, where `serve_read_only.rs`'s waiter already
+        // panics with the frame's own message.
+        Some(Event::Error { message }) => {
+            terminate(&mut child);
+            panic!("server refused to start: {message}");
+        }
         None => {
             terminate(&mut child);
             panic!(
-                "server did not print `{READY}` — is a stale serve.exe holding this root? \
+                "server reported no `listening` event — is a stale serve.exe holding this root? \
                  ({} `--port 0`)",
                 serve_bin().display()
             );
@@ -202,9 +213,9 @@ impl SpawnedServer {
         Self { child, endpoint }
     }
 
-    /// The bound address, `127.0.0.1:PORT`.
-    fn endpoint(&self) -> &str {
-        &self.endpoint
+    /// The bound address.
+    fn endpoint(&self) -> SocketAddr {
+        self.endpoint
     }
 }
 
@@ -215,21 +226,36 @@ impl Drop for SpawnedServer {
     }
 }
 
-/// Read the child's stdout until the `listening on` readiness line — the
-/// only line the serve example writes there (its diagnostics, the resolved
-/// state dir included, go to stderr, which [`spawn_child`] discards) — and
-/// scanned line by line, so a preceding line would still be skipped. A
-/// reader thread keeps the pipe drained so the child never blocks on a
-/// full buffer; the thread exits when the child dies.
-fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<String> {
+/// Read the child's stdout until it reports its first event.
+///
+/// The child speaks the sandbox's event stream (design decision 19): one SSE
+/// frame per event, an `event:` line and a `data:` line, closed by a blank line.
+/// **A frame is not a line**, so this accumulates until the blank line and
+/// decodes the block — decoding line by line would hand `Event::decode` half a
+/// frame, and searching for the old text would find nothing at all. Text that is
+/// not a frame — a log a dependency wrote before the subscriber was installed,
+/// say — does not decode and is skipped rather than fatal, which is the property
+/// the framing buys and the reason this is not a `strip_prefix`.
+///
+/// **The event, not just the address**: a refusal arrives as an `Error` frame,
+/// and the caller is the side that can name it. A reader thread keeps the pipe
+/// drained so the child never blocks on a full buffer; the thread exits when the
+/// child dies.
+fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<Event> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
+        let mut frame = String::new();
         while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
-            if line.contains(READY) {
-                let _ = tx.send(line);
-                return;
+            if line.trim_end().is_empty() {
+                if let Some(event) = Event::decode(&frame) {
+                    let _ = tx.send(event);
+                    return;
+                }
+                frame.clear();
+            } else {
+                frame.push_str(&line);
             }
             line.clear();
         }
@@ -640,9 +666,13 @@ async fn start_second_server(world: &mut World) {
     let root = ext.workdir.path().join("root2");
     fs::create_dir_all(&root).unwrap();
     let spawned = SpawnedServer::start(&root, None, None);
+    // All this can establish is that the address came from a bound listener:
+    // the reported value is the child's own `local_addr()`, so a port of zero
+    // would mean it never did. **Which** port the kernel chose is exactly what
+    // `--port 0` asks not to be pinned, so it is not this assertion's to name.
     assert!(
-        !spawned.endpoint().is_empty(),
-        "second server must bind an ephemeral port"
+        spawned.endpoint().port() != 0,
+        "the second server must report the address it actually bound"
     );
     world.ext_second = Some(spawned);
 }
