@@ -3482,6 +3482,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sse-core"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28f4c044039e70ba5724b7e9dacf9fb610394773d15df2bb629170ca30391c88"
+dependencies = [
+ "bytes",
+ "memchr",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3972,6 +3983,59 @@ dependencies = [
  "tinio-util",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "tinio-sandbox"
+version = "0.1.0"
+dependencies = [
+ "tinio-sandbox-core",
+ "tinio-sandbox-linux",
+ "tinio-sandbox-macos",
+ "tinio-sandbox-windows",
+]
+
+[[package]]
+name = "tinio-sandbox-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "derive_more",
+ "serde",
+ "serde_json",
+ "sse-core",
+ "thiserror 2.0.20",
+ "tinio-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tinio-sandbox-linux"
+version = "0.1.0"
+dependencies = [
+ "derive_more",
+ "hex",
+ "rustix",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tinio-sandbox-core",
+]
+
+[[package]]
+name = "tinio-sandbox-macos"
+version = "0.1.0"
+dependencies = [
+ "tinio-sandbox-core",
+]
+
+[[package]]
+name = "tinio-sandbox-windows"
+version = "0.1.0"
+dependencies = [
+ "tinio-sandbox-core",
 ]
 
 [[package]]

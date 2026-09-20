@@ -53,7 +53,7 @@ P2 (`2026-09-18-sandbox-p2-windows.md`) is the other launcher, and it lands firs
 
 | Consumed from `tinio-sandbox-core` | Called as | Used by |
 |---|---|---|
-| `Access::{ReadOnly, ReadWrite}` + `is_writable()` | `Access::ReadWrite`, `exposure.access.is_writable()` | Tasks 1, 2, 4, 6, 8 |
+| `AccessMode::{ReadOnly, ReadWrite}` + `is_read_only()` — **`tinio-core`'s type**, re-exported by the core rather than defined in it | `AccessMode::ReadWrite`, `!exposure.access.is_read_only()`, `AccessMode::from(read_only)` | Tasks 1, 2, 4, 6, 8 |
 | `Exposure { host, access }` | field reads (`.host`, `.access`), construction in `with_canonical_paths` | Tasks 1, 2, 4 |
 | `Sandbox::{new, expose, device_files, exposures, device_files_enabled, from_exposures}` | `Sandbox::from_exposures(exposures, device_files)` rebuilds, with the flag as an argument rather than state the rebuilt set carries | Tasks 1, 2, 4, 6, 8 |
 | `Error::{Step { step, source }, Unsupported { detail }, BadPath { path, reason }, Wait(io::Error), Launch { operation, path, source }}`, `Result<T>` | `Step` for a named operation, `BadPath` for an exposure, `Launch` for the failed spawn, `Unsupported` for `sandbox-exec` missing, `Wait` for the wait closure's `?`. `BadPayload` is never seen here: core's `adopt` turns a decode failure into `Ok(None)` | everywhere |
@@ -110,7 +110,7 @@ Task 8 (the `serve` wiring) is where these meet the call site. Where P2 has alre
 - Read only: `docs/cargo.md` (Task 1 Step 9 verifies the rule bullet P1 already wrote; this plan does not edit it)
 
 **Interfaces:**
-- Consumes: `tinio_sandbox_core::{Access, Exposure, Sandbox, Error, Result}` (P0 Task 1).
+- Consumes: `tinio_sandbox_core::{AccessMode, Exposure, Sandbox, Error, Result}` (P0 Task 1).
 - Produces: `tinio_sandbox_macos::profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)> }, with_canonical_paths(&Sandbox) -> Sandbox, Allowance { id, rule, evidence }, RUNTIME_BASELINE: &[Allowance], DEVICE_RULES: &[Allowance]}`, and from the crate root the `Backend` the facade selects plus its `backend()` constructor. The `Profile` is one traversal's two halves: the text names each exposure as `(param "E<i>")` and `params` carries the matching values in the same order, because exposed paths travel as `-D` arguments rather than as profile text (decision 24).
 
 This is the whole profile policy. It is pure, so it is testable on the machine this plan is written on — which matters, because everything else in P3 needs a Mac.
@@ -119,7 +119,7 @@ This is the whole profile policy. It is pure, so it is testable on the machine t
 
 Run: `cargo doc -p tinio-sandbox-core --no-deps --open` (or read `crates/tinio-sandbox-core/src/{lib,sandbox,access,error}.rs`).
 
-Confirm the names in the "Depends on P0" table above — `Sandbox::exposures`, `Exposure { host, access }`, `Access::is_writable` or the `matches!` you will use instead, `Error::BadPath { path, reason }`. Write the `use` block against what is actually there, and adjust the calls in Step 3 to match. Record any rename in the commit body.
+Confirm the names in the "Depends on P0" table above — `Sandbox::exposures`, `Exposure { host, access }`, `AccessMode::is_read_only()` (the type is `tinio-core`'s, re-exported by the core, so `tinio_sandbox_core::AccessMode` and `tinio_core::AccessMode` name the same type and either path works), `Error::BadPath { path, reason }`. Write the `use` block against what is actually there, and adjust the calls in Step 3 to match. Record any rename in the commit body.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -131,13 +131,13 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use tinio_sandbox_core::{Access, Sandbox};
+    use tinio_sandbox_core::{AccessMode, Sandbox};
 
     use super::*;
 
     #[test]
     fn the_base_is_deny_default() {
-        let rendered = profile(&Sandbox::new().expose("/srv/data", Access::ReadWrite)).unwrap();
+        let rendered = profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadWrite)).unwrap();
         let mut lines = rendered.text.lines();
         assert_eq!(lines.next(), Some("(version 1)"));
         assert_eq!(lines.next(), Some("(deny default)"));
@@ -145,11 +145,11 @@ mod tests {
 
     #[test]
     fn read_write_grants_the_write_and_read_only_does_not() {
-        let rw = profile(&Sandbox::new().expose("/srv/data", Access::ReadWrite)).unwrap();
+        let rw = profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadWrite)).unwrap();
         assert!(rw.text.contains("(allow file-read* file-write* (subpath (param \"E0\")))"), "{}", rw.text);
         assert_eq!(rw.params, vec![(String::from("E0"), OsString::from("/srv/data"))]);
 
-        let ro = profile(&Sandbox::new().expose("/srv/data", Access::ReadOnly)).unwrap();
+        let ro = profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadOnly)).unwrap();
         assert!(ro.text.contains("(allow file-read* (subpath (param \"E0\")))"), "{}", ro.text);
         assert!(!ro.text.contains("file-write* (subpath (param \"E0\"))"), "{}", ro.text);
         // Read-only is the absence of the write keyword, not the absence of the
@@ -165,8 +165,8 @@ mod tests {
         // halves in step: a text that referenced `E1` while `params[1]` was
         // something else would grant a path nobody asked for.
         let sandbox = Sandbox::new()
-            .expose("/srv/data", Access::ReadOnly)
-            .expose("/home/u/.tinio/roots/h", Access::ReadWrite);
+            .expose("/srv/data", AccessMode::ReadOnly)
+            .expose("/home/u/.tinio/roots/h", AccessMode::ReadWrite);
         let rendered = profile(&sandbox).unwrap();
         assert!(rendered.text.contains("(allow file-read* file-write* (subpath (param \"E1\")))"), "{}", rendered.text);
         assert_eq!(
@@ -196,7 +196,7 @@ mod tests {
         // network rules was observed taking a real connection out of a
         // handed-in listener's backlog.
         let sandbox = Sandbox::new()
-            .expose("/srv/data", Access::ReadWrite)
+            .expose("/srv/data", AccessMode::ReadWrite)
             .device_files();
         let rendered = profile(&sandbox).unwrap();
         for op in ["network-outbound", "network-bind", "network-inbound", "network*"] {
@@ -227,8 +227,8 @@ mod tests {
         // rather than silently granting nothing.
         let hostile = PathBuf::from("/srv/x\") (allow network-outbound) (subpath \"/");
         let sandbox = Sandbox::new()
-            .expose(&hostile, Access::ReadWrite)
-            .expose("/home/u/data", Access::ReadOnly);
+            .expose(&hostile, AccessMode::ReadWrite)
+            .expose("/home/u/data", AccessMode::ReadOnly);
         let rendered = profile(&sandbox).unwrap();
         assert!(!rendered.text.contains("/srv"), "{}", rendered.text);
         assert!(!rendered.text.contains("/home/u"), "{}", rendered.text);
@@ -256,7 +256,7 @@ mod tests {
         // subset of its data with no explanation.
         let mut sandbox = Sandbox::new();
         for index in 0..=MAX_EXPOSURES {
-            sandbox = sandbox.expose(format!("/srv/data/{index}"), Access::ReadOnly);
+            sandbox = sandbox.expose(format!("/srv/data/{index}"), AccessMode::ReadOnly);
         }
 
         let err = profile(&sandbox).unwrap_err();
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_refused() {
-        let err = profile(&Sandbox::new().expose("relative/path", Access::ReadOnly)).unwrap_err();
+        let err = profile(&Sandbox::new().expose("relative/path", AccessMode::ReadOnly)).unwrap_err();
         assert!(matches!(err, Error::BadPath { reason: "not absolute", .. }), "{err:?}");
     }
 
@@ -281,14 +281,14 @@ mod tests {
         {
             use std::os::unix::ffi::OsStrExt;
             let raw = std::ffi::OsStr::from_bytes(b"/srv/\xff\xfe");
-            let err = profile(&Sandbox::new().expose(raw, Access::ReadOnly)).unwrap_err();
+            let err = profile(&Sandbox::new().expose(raw, AccessMode::ReadOnly)).unwrap_err();
             assert!(matches!(err, Error::BadPath { reason: "not valid UTF-8", .. }), "{err:?}");
         }
     }
 
     #[test]
     fn control_characters_are_refused() {
-        let err = profile(&Sandbox::new().expose("/srv/a\nb", Access::ReadOnly)).unwrap_err();
+        let err = profile(&Sandbox::new().expose("/srv/a\nb", AccessMode::ReadOnly)).unwrap_err();
         assert!(matches!(err, Error::BadPath { reason: "control character", .. }), "{err:?}");
     }
 
@@ -317,7 +317,7 @@ mod tests {
             std::os::unix::fs::symlink(&real, &link).unwrap();
             let canonical_real = std::fs::canonicalize(&real).unwrap();
 
-            let sandbox = with_canonical_paths(&Sandbox::new().expose(&link, Access::ReadWrite));
+            let sandbox = with_canonical_paths(&Sandbox::new().expose(&link, AccessMode::ReadWrite));
             let hosts: Vec<_> = sandbox.exposures().iter().map(|e| e.host.clone()).collect();
             assert!(hosts.contains(&link), "{hosts:?}");
             assert!(hosts.contains(&canonical_real), "{hosts:?}");
@@ -329,7 +329,7 @@ mod tests {
             // always a *second* path and the asserted length of this case is 2.
             // An earlier version asserted 1 and could only pass on a host without
             // that rewrite.
-            let rewritten = with_canonical_paths(&Sandbox::new().expose(&real, Access::ReadWrite));
+            let rewritten = with_canonical_paths(&Sandbox::new().expose(&real, AccessMode::ReadWrite));
             assert!(
                 rewritten.exposures().iter().any(|e| e.host == canonical_real),
                 "{:?}",
@@ -340,17 +340,17 @@ mod tests {
 
             // A path that already is its canonical form is not duplicated — which
             // is a claim only a path this test canonicalised itself can support.
-            let plain = with_canonical_paths(&Sandbox::new().expose(&canonical_real, Access::ReadWrite));
+            let plain = with_canonical_paths(&Sandbox::new().expose(&canonical_real, AccessMode::ReadWrite));
             assert_eq!(plain.exposures().len(), 1, "{:?}", plain.exposures());
         }
     }
 
     #[test]
     fn canonicalisation_leaves_access_and_device_files_alone() {
-        let sandbox = Sandbox::new().expose("/srv/data", Access::ReadOnly).device_files();
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly).device_files();
         let out = with_canonical_paths(&sandbox);
         assert!(out.device_files_enabled());
-        assert!(out.exposures().iter().all(|e| e.access == Access::ReadOnly));
+        assert!(out.exposures().iter().all(|e| e.access == AccessMode::ReadOnly));
     }
 }
 ```
@@ -446,7 +446,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use tinio_sandbox_core::{Access, Error, Exposure, Result, Sandbox};
+use tinio_sandbox_core::{AccessMode, Error, Exposure, Result, Sandbox};
 use tracing::{error, info};
 
 /// One allowance in the profile, with the evidence that justifies it.
@@ -711,10 +711,10 @@ const MAX_EXPOSURES: usize = 4096;
 /// ```
 /// use std::ffi::OsString;
 ///
-/// use tinio_sandbox_core::{Access, Sandbox};
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
 /// use tinio_sandbox_macos::profile::profile;
 ///
-/// let rendered = profile(&Sandbox::new().expose("/srv/data", Access::ReadOnly)).unwrap();
+/// let rendered = profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadOnly)).unwrap();
 /// assert!(rendered.text.starts_with("(version 1)\n(deny default)\n"));
 /// assert!(rendered.text.contains("(allow file-read* (subpath (param \"E0\")))"));
 /// assert!(!rendered.text.contains("file-write* (subpath (param \"E0\"))"));
@@ -737,8 +737,8 @@ pub fn profile(sandbox: &Sandbox) -> Result<Profile> {
         // a rule whatever it contains.
         let param = format!("E{index}");
         let rule = match exposure.access {
-            Access::ReadOnly => format!("(allow file-read* (subpath (param \"{param}\")))"),
-            Access::ReadWrite => {
+            AccessMode::ReadOnly => format!("(allow file-read* (subpath (param \"{param}\")))"),
+            AccessMode::ReadWrite => {
                 format!("(allow file-read* file-write* (subpath (param \"{param}\")))")
             }
         };
@@ -800,10 +800,10 @@ pub fn profile(sandbox: &Sandbox) -> Result<Profile> {
 /// # Examples
 ///
 /// ```
-/// use tinio_sandbox_core::{Access, Sandbox};
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
 /// use tinio_sandbox_macos::profile::with_canonical_paths;
 ///
-/// let out = with_canonical_paths(&Sandbox::new().expose("/srv/data", Access::ReadOnly));
+/// let out = with_canonical_paths(&Sandbox::new().expose("/srv/data", AccessMode::ReadOnly));
 /// assert_eq!(out.exposures().len(), 1);
 /// ```
 pub fn with_canonical_paths(sandbox: &Sandbox) -> Sandbox {
@@ -917,10 +917,10 @@ The guard itself is the one already written at the top of `profile` in Step 5 �
 //! ```
 //! use std::ffi::OsString;
 //!
-//! use tinio_sandbox_core::{Access, Sandbox};
+//! use tinio_sandbox_core::{AccessMode, Sandbox};
 //! use tinio_sandbox_macos::profile::profile;
 //!
-//! let rendered = profile(&Sandbox::new().expose("/srv/data", Access::ReadWrite)).unwrap();
+//! let rendered = profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadWrite)).unwrap();
 //! assert!(rendered.text.contains("(allow file-read* file-write* (subpath (param \"E0\")))"));
 //! assert_eq!(rendered.params[0], (String::from("E0"), OsString::from("/srv/data")));
 //! ```
@@ -994,7 +994,7 @@ Expected: clean. `cargo check` builds this member on Linux and Windows too, whic
 
 This plan used to carry its own version of the same bullet, worded differently, and this file's version and P1's disagreed about which backends were excepted.
 
-What to do here is check, before Step 10's commit:
+What to do here is check, before the phase's commit (see [Commit](#commit)):
 
 ```bash
 rg -n 'unsafe_code' docs/cargo.md
@@ -1003,13 +1003,6 @@ rg -n 'unsafe_code' docs/cargo.md
 Expected: the rule bullet names the platform backends, says each becomes `deny` as its backend lands, and points at decision 14; the second occurrence — the `[lints.rust]` block near line 71, inside the worked `tinio-mem` example manifest — still reads `forbid`, because `tinio-mem` is not a platform backend, the exception does not apply to it, and an example showing `deny` would read as licence to relax the lint anywhere. If the rule bullet does **not** name the backends, P1 has not landed: stop and say so rather than writing the line here.
 
 `docs/cargo.md` is therefore **not** in this step's `git add`.
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos
-git commit -m "feat(sandbox): generate the macOS SBPL profile from the exposure set"
-```
 
 ---
 
@@ -1044,7 +1037,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
-    use tinio_sandbox_core::Access;
+    use tinio_sandbox_core::AccessMode;
 
     use super::*;
 
@@ -1056,7 +1049,7 @@ mod tests {
     /// the text and the parameters the launch will actually be handed: one
     /// read-only exposure, which is one `(param "E0")` and one `params` entry.
     fn rendered_profile() -> Profile {
-        profile(&Sandbox::new().expose("/srv/data", Access::ReadOnly)).expect("profile")
+        profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadOnly)).expect("profile")
     }
 
     #[test]
@@ -1101,8 +1094,8 @@ mod tests {
         // into a startup failure.
         let rendered = profile(
             &Sandbox::new()
-                .expose("/srv/data", Access::ReadOnly)
-                .expose("/home/u/.tinio/roots/h", Access::ReadWrite),
+                .expose("/srv/data", AccessMode::ReadOnly)
+                .expose("/home/u/.tinio/roots/h", AccessMode::ReadWrite),
         )
         .expect("profile");
         let args = command_args(Path::new("/srv/bin/serve"), &own_argv(), &rendered, None);
@@ -1343,10 +1336,10 @@ const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// # Examples
 ///
 /// ```no_run
-/// use tinio_sandbox_core::{Access, LaunchPlan, LaunchPayload, Sandbox};
+/// use tinio_sandbox_core::{AccessMode, LaunchPlan, LaunchPayload, Sandbox};
 /// use tinio_sandbox_macos::confine;
 ///
-/// let sandbox = Sandbox::new().expose("/srv/data", Access::ReadWrite);
+/// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
 /// let plan = LaunchPlan::for_launch(String::new());
 /// let _child = confine(&sandbox, &plan)?;
 /// # Ok::<(), tinio_sandbox_core::Error>(())
@@ -1580,11 +1573,11 @@ pub fn confine(_sandbox: &Sandbox, _plan: &LaunchPlan) -> Result<Confinement> {
 /// use std::ffi::OsString;
 /// use std::path::Path;
 ///
-/// use tinio_sandbox_core::{Access, Sandbox};
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
 /// use tinio_sandbox_macos::command_args;
 /// use tinio_sandbox_macos::profile::profile;
 ///
-/// let rendered = profile(&Sandbox::new().expose("/srv/data", Access::ReadOnly)).unwrap();
+/// let rendered = profile(&Sandbox::new().expose("/srv/data", AccessMode::ReadOnly)).unwrap();
 /// let args = command_args(Path::new("/srv/bin/serve"), &[], &rendered, Some(7));
 /// assert_eq!(args[0], OsString::from("-p"));
 /// assert_eq!(args[1], OsString::from(rendered.text.clone()));
@@ -1995,13 +1988,6 @@ cargo clippy -p tinio-sandbox-macos --all-targets -- -D warnings
 ```
 
 The unit tests must pass and clippy must be clean, under Apple's toolchain rather than the authoring host's — that combination is where a `cfg` mistake would first appear, and the `E0432` an ungated macOS-only import produces is exactly the kind of failure this step exists to catch. **There is no `--example probe` here**: `tests/startup.rs` is Task 4's probe and no task creates an example of that name, so a step that ran one would be discarding a failure it could not explain (`|| true` on a command that does not exist is not a check). The crate's own tests are the check this step can actually make.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos
-git commit -m "feat(sandbox): launch the confined child with sandbox-exec -p"
-```
 
 ---
 
@@ -2550,13 +2536,6 @@ Both tests leave `SIGTERM` handled in the test binary for the rest of its run, w
 Run: `cargo test -p tinio-sandbox-macos --test relay -- --nocapture`
 Expected: FAIL before Step 3 — the test process dies on the signal it sends itself, and the harness reports a killed test binary rather than an assertion failure. Then, with the implementation in place, PASS both tests: the first asserts the child died of `SIGTERM` while the test process lived, the second asserts a disarmed relay forwards nothing.
 
-- [ ] **Step 8: Commit**
-
-```bash
-git add Cargo.toml crates/tinio-sandbox-macos
-git commit -m "feat(sandbox): relay termination signals to the confined child on macOS"
-```
-
 ---
 
 ### Task 4: A confined process starts at all
@@ -2567,7 +2546,7 @@ git commit -m "feat(sandbox): relay termination signals to the confined child on
 - Modify: `crates/tinio-sandbox-macos/src/profile.rs` (the candidate set grows here)
 
 **Interfaces:**
-- Consumes: `tinio_sandbox_macos::{confine, launch::listener}`, `tinio_sandbox_core::{adopt, Access, Adopted, Confinement, LaunchPlan, Result, Sandbox}`.
+- Consumes: `tinio_sandbox_macos::{confine, launch::listener}`, `tinio_sandbox_core::{adopt, AccessMode, Adopted, Confinement, LaunchPlan, Result, Sandbox}`.
 - Produces: `harness::{CHILD_ENV, LAUNCH_ENV, PARAMS_ENV, Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule}` — Tasks 5, 6 and 7 all use this harness, and every child-side probe gets its parameters and its listener from `Child`. `launch` is the launcher-copy entry point each probe calls from its `None` arm (see the module docs for why the copy exists).
 
 This is the phase's first real question: **does a `(deny default)` profile leave enough for a Rust process to start?** Design §5 says the exact set is empirical and the Risks table says "the first task of P3 is to make a confined server start and serve one request, not to refine the profile". A first run that fails is the expected outcome, not a mistake.
@@ -2592,7 +2571,7 @@ mod harness;
 
 use std::thread;
 
-use tinio_sandbox_core::{Access, Sandbox};
+use tinio_sandbox_core::{AccessMode, Sandbox};
 
 use harness::Report;
 
@@ -2649,7 +2628,7 @@ fn a_confined_process_starts() {
     // pruning run measures the shipped profile: a sandbox without them would
     // leave the `DEVICE_RULES` out of the text the pruner renders, so those ids
     // could never get a verdict.
-    let sandbox = Sandbox::new().expose(&root, Access::ReadWrite).device_files();
+    let sandbox = Sandbox::new().expose(&root, AccessMode::ReadWrite).device_files();
     let params = [("marker", marker.display().to_string())];
 
     // Two modes, one probe. Normally the child is launched through `confine`,
@@ -2724,7 +2703,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use tinio_sandbox_core::{Access, Confinement, LaunchPlan, Sandbox};
+use tinio_sandbox_core::{AccessMode, Confinement, LaunchPlan, Sandbox};
 use tinio_sandbox_macos::confine;
 
 /// Selects the child role in the re-executed test binary.
@@ -2983,7 +2962,7 @@ fn launcher_parameters(sandbox: &Sandbox, extra: &[(&str, String)], report: &Pat
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let mut text = parameters(extra, report, addr);
     for exposure in sandbox.exposures() {
-        let access = if exposure.access.is_writable() { "rw" } else { "ro" };
+        let access = if exposure.access.is_read_only() { "ro" } else { "rw" };
         text.push_str(&format!("expose={access}:{}\n", exposure.host.display()));
     }
     text.push_str(&format!("devices={}\n", u8::from(sandbox.device_files_enabled())));
@@ -3001,7 +2980,7 @@ fn sandbox_from_params(params: &[(String, String)]) -> Sandbox {
     for (key, value) in params {
         if key == "expose" {
             let (access, host) = value.split_once(':').expect("access:path");
-            let access = if access == "rw" { Access::ReadWrite } else { Access::ReadOnly };
+            let access = if access == "rw" { AccessMode::ReadWrite } else { AccessMode::ReadOnly };
             sandbox = sandbox.expose(host, access);
         }
     }
@@ -3097,7 +3076,7 @@ fn report_path(sandbox: &Sandbox) -> PathBuf {
     let host = sandbox
         .exposures()
         .iter()
-        .find(|exposure| exposure.access.is_writable())
+        .find(|exposure| !exposure.access.is_read_only())
         .map(|exposure| exposure.host.clone())
         .expect("a confinement test needs at least one writable exposure");
     let path = host.join(".tinio-sandbox-test-report.txt");
@@ -3180,13 +3159,6 @@ Two rules of engagement while doing this:
 
 Run: `cargo test -p tinio-sandbox-macos --test startup -- --nocapture`
 Expected: PASS — `payload=ok`, `threads=4`, `read_marker=confined`, and a non-zero `available_parallelism`. The `payload=ok` assertion is what proves the payload-on-stdin handover of design §3 step 7 and the listener descriptor in argv both worked, so a pass here is the phase's first real progress.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos
-git commit -m "feat(sandbox): make a confined Rust process start on macOS"
-```
 
 ---
 
@@ -3288,13 +3260,6 @@ There is no network rule to leave alone and none to prune: the `accept` question
 Run: `cargo test -p tinio-sandbox-macos`
 Expected: PASS — `startup` green with the reduced baseline, and every pure test from Tasks 1 and 2 still green.
 
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos
-git commit -m "test(sandbox): prune the macOS baseline profile to what the probe needs"
-```
-
 ---
 
 ### Task 6: The exposure rules bite
@@ -3303,7 +3268,7 @@ git commit -m "test(sandbox): prune the macOS baseline profile to what the probe
 - Create: `crates/tinio-sandbox-macos/tests/exposures.rs`
 
 **Interfaces:**
-- Consumes: the harness, `Access`, `Sandbox`.
+- Consumes: the harness, `AccessMode`, `Sandbox`.
 - Produces: nothing the library uses; this is the proof that `expose(path, access)` means what design §2's table says on this platform.
 
 - [ ] **Step 1: Write the failing test**
@@ -3320,7 +3285,7 @@ git commit -m "test(sandbox): prune the macOS baseline profile to what the probe
 
 mod harness;
 
-use tinio_sandbox_core::{Access, Sandbox};
+use tinio_sandbox_core::{AccessMode, Sandbox};
 
 /// Runs inside the confinement and reports what each path allows.
 #[test]
@@ -3405,7 +3370,7 @@ fn a_read_write_exposure_is_readable_and_writable() {
     let state = link.join(".tinio");
     std::fs::create_dir_all(&state).expect("create state");
 
-    let sandbox = Sandbox::new().expose(&link, Access::ReadWrite);
+    let sandbox = Sandbox::new().expose(&link, AccessMode::ReadWrite);
     let report = harness::run_confined(
         &sandbox,
         &[
@@ -3468,8 +3433,8 @@ fn a_read_only_exposure_refuses_writes_and_still_reads() {
     // Design §2: the state directory is read-write on every platform, so the
     // report path lives there and the served root stays unwritable.
     let sandbox = Sandbox::new()
-        .expose(&root, Access::ReadOnly)
-        .expose(&state, Access::ReadWrite);
+        .expose(&root, AccessMode::ReadOnly)
+        .expose(&state, AccessMode::ReadWrite);
     let report = harness::run_confined(
         &sandbox,
         &[
@@ -3522,7 +3487,7 @@ Fix in this order, then rerun after each fix:
 
 1. If an exposure is denied although the profile names it, check the `-D` value `profile.rs` rendered for that exposure for the path the kernel sees (`std::fs::canonicalize` and compare the `params` entry) — on macOS `/tmp` and `$TMPDIR` are symlinks, and this is what `with_canonical_paths` is for.
 2. If reads under an exposure are denied but the exposure itself resolves, the ancestor traversal is being checked after all: add `(allow file-read-metadata)` (or the narrowest form that works) to `RUNTIME_BASELINE` with its observation, and rerun Task 5's pruning script so it is pruned like everything else.
-3. If a write into a read-only exposure *succeeds*, the rule is wrong, not the test: `Access::ReadOnly` must emit no `file-write*` for that path. Fix `profile` before touching anything else.
+3. If a write into a read-only exposure *succeeds*, the rule is wrong, not the test: `AccessMode::ReadOnly` must emit no `file-write*` for that path. Fix `profile` before touching anything else.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -3533,13 +3498,6 @@ Expected: PASS — both tests, `payload=ok`, every `ok:` assertion exact, the re
 
 Run: `bash crates/tinio-sandbox-macos/scripts/prune-profile.sh`
 Expected: the same table as Task 5, modulo any rule added in Step 3. A rule whose necessity changes here was only ever needed by a path this test exercises; update its `evidence`.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos
-git commit -m "test(sandbox): pin the macOS exposure rules for read, write and refusal"
-```
 
 ---
 
@@ -3572,7 +3530,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use tinio_sandbox_core::{Access, Sandbox};
+use tinio_sandbox_core::{AccessMode, Sandbox};
 
 /// Runs inside the confinement: accept on the inherited listener, and try to
 /// reach out.
@@ -3645,7 +3603,7 @@ fn the_confined_process_cannot_reach_out() {
     let addr = target.local_addr().expect("local addr");
     TcpStream::connect(addr).expect("an unconfined process must reach the target");
 
-    let sandbox = Sandbox::new().expose(&root, Access::ReadWrite);
+    let sandbox = Sandbox::new().expose(&root, AccessMode::ReadWrite);
     let report = harness::run_confined(&sandbox, &[("outbound", addr.to_string())], "child_network");
 
     report.expect("payload", "ok");
@@ -3662,7 +3620,7 @@ fn the_profile_grants_no_network_operation_at_all() {
     // of any kind. Measured on macOS 15.8: a profile carrying zero network
     // rules accepted a real connection from a listener the parent had handed
     // in, and the kernel logged no `accept` violation.
-    let sandbox = Sandbox::new().expose("/srv/data", Access::ReadWrite);
+    let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
     let rendered = tinio_sandbox_macos::profile::profile(&sandbox).expect("profile");
     for op in ["network-outbound", "network-bind", "network-inbound", "network*"] {
         assert!(!rendered.text.contains(op), "{op} appears in {}", rendered.text);
@@ -3679,13 +3637,6 @@ Expected: PASS on all three tests. `accept=ok:ping` proves both that the descrip
 
 A denial here contradicts a measurement taken on macOS 15.8, and none of the three things it can mean is "add `network-inbound`": the listener is not actually being inherited (check the payload's fd number against design §3 step 7), the descriptor lost its listening state between parent and child, or this macOS version gates `accept` where 15.8 did not. The third is a real possibility — the tool that separates them is `log stream --predicate 'sender == "Sandbox"'`, which names the refused operation as it happens and is how every macOS row of design §5 was established (`log show` reports nothing for refusals on 15.8, even with `--info --debug`). Record what it says; do not add a rule to turn a red test green.
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos
-git commit -m "test(sandbox): assert the macOS profile carries no network rule"
-```
-
 ---
 
 ### Task 8: `serve` on macOS — the launcher path
@@ -3695,7 +3646,7 @@ git commit -m "test(sandbox): assert the macOS profile carries no network rule"
 - Modify: `crates/tinio-server/examples/serve.rs`
 
 **Interfaces:**
-- Consumes: `tinio_sandbox::{adopt, is_listener_fd_arg, on_stop, platform, supervise, Access, Backend as _, Confinement, Event, LaunchPlan, Sandbox}` (the facade re-exports core and the selected platform crate) plus the file's existing `FsStorage`/`FsOptions`, `state`, `sources` and `watch` imports, which the child's storage construction and stop channel use unchanged.
+- Consumes: `tinio_sandbox::{adopt, is_listener_fd_arg, on_stop, platform, supervise, AccessMode, Backend as _, Confinement, Event, LaunchPlan, Sandbox}` (the facade re-exports core and the selected platform crate) plus the file's existing `FsStorage`/`FsOptions`, `state`, `sources` and `watch` imports, which the child's storage construction and stop channel use unchanged.
 - Produces: `serve --sandbox` working on macOS; the confined child serving on the parent's listener, owning the state handle and reacting to a forwarded stop.
 
 This is design §10's sequence for a child-launching platform: steps 1 (discriminator), 2 (targeted read-only lookup), 3 (bytes only), 5 (sources exist), 6 (bind, expose, launch), 7 (print, supervise, forward), 8 (runtime).
@@ -3724,7 +3675,7 @@ In `crates/tinio-server/examples/serve.rs`:
 use std::ffi::OsString;
 
 #[cfg(feature = "sandbox")]
-use tinio_sandbox::{Access, Backend as _, Confinement, Exposure, LaunchPlan, Sandbox};
+use tinio_sandbox::{AccessMode, Backend as _, Confinement, Exposure, LaunchPlan, Sandbox};
 ```
 
 `Backend as _` is what brings `platform()`'s `confine` into scope without naming the trait anywhere else — the Linux plan's call site already does exactly this.
@@ -3736,10 +3687,10 @@ use tinio_sandbox::{Access, Backend as _, Confinement, Exposure, LaunchPlan, San
 /// the mode dictates, and the state directory when it lies outside the root —
 /// never inside, where the root's own rule already covers it (design §9).
 #[cfg(feature = "sandbox")]
-fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: Access) -> Vec<Exposure> {
+fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: AccessMode) -> Vec<Exposure> {
     let mut sandbox = Sandbox::new().expose(root, root_access);
     if !state_dir.starts_with(root) {
-        sandbox = sandbox.expose(state_dir, Access::ReadWrite);
+        sandbox = sandbox.expose(state_dir, AccessMode::ReadWrite);
     }
     sandbox.exposures().to_vec()
 }
@@ -4050,7 +4001,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     #[cfg(all(feature = "sandbox", target_os = "macos"))]
     if args.sandbox {
-        let root_access = if read_only { Access::ReadOnly } else { Access::ReadWrite };
+        let root_access = AccessMode::from(read_only);
         // The exposed state directory is the resolved one rather than a guess.
         // With `None` that is the backend's own `<root>/.tinio`, which the
         // root's exposure already covers, so `sandbox_exposures` returns it
@@ -4205,13 +4156,6 @@ ls /tmp/tinio-jailed/.tinio      # the confined child wrote its state here, thro
 ```
 
 Expected: the child runs under `sandbox-exec`, and the state directory contains the access log. Stop the parent — the child exits with it in this flow only because the parent is waiting on it; killing the parent hard leaves the child behind (recorded in the Self-Review as a known gap, not a bug).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-server
-git commit -m "feat(serve): run the confined server on macOS through sandbox-exec"
-```
 
 ---
 
@@ -4536,13 +4480,6 @@ And replace the `lint` job's matrix comment (its first three lines are the ones 
 
 **Linting the workspace once, from ubuntu, against Apple's target was measured and rejected — the negative result is worth keeping.** `cargo clippy --target x86_64-apple-darwin --profile ci --workspace --all-targets -- -D warnings` fails in a *dependency's* build script before it reaches any of this workspace's code: `alloca v0.4.0`, pulled in through `criterion`, has cc-rs invoke the host gcc with Darwin-only flags. Dropping `--all-targets` does not rescue it; it only moves the failure to `psm v0.1.32`, a non-dev dependency of `tinio-select`. The route becomes passable only with `CC_x86_64_apple_darwin=clang` **and** `CFLAGS_x86_64_apple_darwin=-ffreestanding`, and the second of those works only by accident: the sole C file in the graph needs nothing but `stddef.h` and `stdint.h`, so a freestanding compile of it happens to succeed — any dependency whose C code wants real libc headers would break it, and there is no apt-installable macOS SDK to fall back on. A lint gate that depends on the C files of other people's crates is a gate the next dependency breaks, so the leg lints natively.
 
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/tinio-server .github/workflows/ci.yml
-git commit -m "test(serve): prove the confined server on the macOS CI leg"
-```
-
 ---
 
 ### Task 10: The macOS verification script and its documentation
@@ -4673,13 +4610,6 @@ cargo test --doc --workspace --exclude tinio-e2e
 
 Expected: both clean. The macOS-only items' doctests are compiled only on macOS, so run this the same way on the Mac when the phase lands.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-macos/scripts docs/tests.md
-git commit -m "docs(sandbox): record the macOS verification path"
-```
-
 ---
 
 ### Task 11: Check the macOS evidence rows against the run, and run the whole gate
@@ -4744,14 +4674,28 @@ Expected: all clean. On the authoring host the macOS tests compile to empty bina
 Run: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-macos/src crates/tinio-sandbox-linux/src crates/tinio-sandbox-windows/src crates/tinio-sandbox-core/src crates/tinio/src`
 Expected: **one** line from `tinio-sandbox-macos` — the attribute on `launch::listener`, the child's rebuild from the inherited descriptor, whose `# Safety` section states the invariant (the descriptor is the launcher's, held open for the child's whole lifetime and never closed) — and no second one, which is the boundary this step enforces: the crate is `deny` with that site alone, because `BorrowedFd::borrow_raw` and `OwnedFd::from_raw_fd` are both `unsafe fn` and no safe route to the rebuild exists. Then three from `tinio-sandbox-linux` (`kernel_fork` in the user-namespace probe, the `unshare` call, and the seccomp `prctl`), **nothing** from `tinio-sandbox-core` and the facade (both stay `forbid`), and whatever `tinio-sandbox-windows` establishes if P2 has landed — one module per Win32 capability, its count taken from its implementation. Every one of them is listed in design decision 14 and its Bookkeeping; a hit outside that list is the failure this step is looking for, and a macOS hit count other than one is the same failure.
 
-- [ ] **Step 6: Commit**
+---
+
+## Commit
+
+**One commit, made by hand, at the end of the phase.** No task in this plan commits, so every change accumulates in the working tree and the phase is reviewed as one diff rather than a commit per task. `CLAUDE.md` owns the authorisation rule — git writes are asked for per operation, and the index is never written by an agent — so this section fixes the phase's **scope** and its message, and is not permission to run it.
+
+Run the full Standard acceptance block (`docs/tests.md`) first, and commit only once the phase's own review is clean. The message is a conventional header plus single-line cause-and-effect bullets: what changed and why, never where it lives. It is a starting point rather than a description of finished work — where the phase's actual run makes a line of it false, that line changes.
 
 ```bash
-git add docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "docs(sandbox): reconcile the macOS evidence with the phase's run"
-```
+git add crates/tinio-sandbox-macos crates/tinio-server .github/workflows/ci.yml Cargo.toml docs/tests.md docs/superpowers/specs/2026-09-18-sandbox-design.md
+git commit -F - <<'EOF'
+feat(sandbox-macos): confine serve with a Seatbelt profile
 
----
+- sandbox-exec applies a profile only to a process it execs, so parent stays outside
+- Sandboxed process cannot apply a second sandbox: the launcher must stay out
+- Profile rides inline in argv: no profile file to create or clean up
+- Exposed paths passed as parameters, not interpolated: no profile injection
+- Listener bound outside and handed in, so no network rule is needed to serve
+- Allowance set pruned rule by rule: each survivor is one the server needs
+- Parent stays outside but holds the listener for the child's whole life
+EOF
+```
 
 ## Self-Review
 
@@ -4797,7 +4741,7 @@ git commit -m "docs(sandbox): reconcile the macOS evidence with the phase's run"
 - The CLI flag, the `[server] sandbox` key and `TINIO_SANDBOX` (design Non-goals: they land with T066/T067). P3 reaches operators through `serve` only, exactly as P1 does on Linux (where the phase is Linux-only by construction now).
 - `TINIO_SANDBOX_MODEL` and the model selection of decision 7: Linux only. macOS has one mechanism and no fallback ladder.
 - Windows (P2) and the other-unix `chroot` fallback (P4).
-- Read-only *mode* (FR-023) as a feature: it has **landed**. `serve` resolves the mode from `[server] read_only`, the `TINIO_READ_ONLY` overlay and the `--read-only` flag, and relocates the state directory to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What is P3's is the *confinement* of it — rendering `Access::ReadOnly` on the served root and exposing the relocated state directory writable — which is why Task 8's `main` takes the state directory from the storage instead of hand-building `<root>/.tinio`.
+- Read-only *mode* (FR-023) as a feature: it has **landed**. `serve` resolves the mode from `[server] read_only`, the `TINIO_READ_ONLY` overlay and the `--read-only` flag, and relocates the state directory to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What is P3's is the *confinement* of it — rendering `AccessMode::ReadOnly` on the served root and exposing the relocated state directory writable — which is why Task 8's `main` takes the state directory from the storage instead of hand-building `<root>/.tinio`.
 - The `otel`/`--sandbox` startup conflict (decision 25): `serve` never passes an endpoint.
 - **Tying the confined child's *lifetime* to the launcher's.** Decision 20's first obligation is a Windows Job object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) and has no macOS analogue: a launcher killed with `SIGKILL` leaves a confined server running. Its *second* obligation — relaying termination signals — is in scope and is Task 3. The distinction matters at test time: Task 9 signals the child directly rather than killing the launcher, so the test does not leak a confined server into the CI leg.
 - **A guard on `argv` length**, and the earlier draft of this bullet counted the wrong quantity. The argv carries two things that grow with the exposure set: the profile **text**, which is one argv element and is not small — every rule is written with a `; tinio:<id> — <evidence>` provenance comment and the baseline's entries carry sentences — and the `-D NAME=VALUE` elements, one pair per exposure, whose value is the operator's path. Decision 24's "argv is bounded by `ARG_MAX`, an order of magnitude larger than the compiled cap" compares the text against the *compiled* object's ~6 bytes per operation, and those are not the two things to compare: the text is kilobytes before a single exposure is added and can approach `ARG_MAX` at the 4096 exposures Task 1's count guard allows. No guard is written here, deliberately and for the reason that guard's own doc comment gives — the exposure set is a handful of paths in practice, and at a size where the text did not fit, the pre-flight would refuse it as a compile failure rather than silently truncating. A byte budget for the rendered text (comments included) is a follow-up measurement, not a guess to write in now.

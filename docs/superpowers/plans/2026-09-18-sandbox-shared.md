@@ -25,11 +25,13 @@ Each row is a project rule with an owner outside this feature. A plan states its
 | Documents are not hard-wrapped: one line per paragraph, list item and table row | `docs/style.md` §Docs & scripts (the operator's global `CLAUDE.md` carries the same rule; the project's `CLAUDE.md` does not) |
 | Git writes — commit, push, merge, rebase, stash — are never automatic | `CLAUDE.md` |
 
-**The last row and a plan's `Commit` step are two different statements, and both hold.** The step fixes the *scope* of a phase — which files, one commit per task. Authorisation is `CLAUDE.md`'s and is per operation: a commit a plan specifies is still asked for before it runs, and nothing beyond it is.
+**The last row and a plan's `Commit` section are two different statements, and both hold.** The section fixes the *scope* of a phase — which files, and **one commit for the whole phase, made by hand once the phase's review is clean**. No task in a plan commits on the way: a task's last step leaves its work in the working tree beside every earlier task's, so the phase is reviewed as a single diff rather than as a commit per task, and a task that has to hand its work over mid-phase has nothing to undo. Authorisation is `CLAUDE.md`'s and is per operation: a commit a plan specifies is still asked for before it runs, and nothing beyond it is.
 
 **A plan that finds itself writing one of these rules out in full is looking at a second copy.** The `docs/cargo.md` lint bullet is the worked case: P1 Task 9 Step 4 writes it once, and P2 and P3 each verify the line rather than restating it.
 
 **The plans' own code blocks are not swept for the imports rule, and this is one instruction rather than the three it used to be.** Satisfying it is the implementer's step rather than a precondition of the plan: each task's lint step runs `cargo clippy --all-targets -- -D warnings`, and what it reports *is* the list. Most of what it finds sits in test setup and FFI plumbing, where a bare `std::fs::write` or `std::mem::size_of` reads better than a wall of imports — correct those in place as you write the code, and do not relax the rule. **Each plan states only the count its own blocks leave** — P1 about 14, P3 about 80, P2 about 125 — because the count is the only part of this that is a plan's own.
+
+**The five crates this feature builds reach each other through the workspace's aliased `extern crate`, and the three platform plans' blocks predate that form.** P0 ships it: each crate declares `#[doc(hidden)] pub extern crate tinio_… as _…;` in its own `lib.rs` and names a dependency as `crate::_core::…` (P0's Task 1, Task 2 and Task 3 blocks are the form to copy, and the three platform stubs it creates are the templates P1, P2 and P3 start from). The rule is `docs/style.md` §Imports and is not restated here — what is this section's own is the **order of events**: P1, P2 and P3's code blocks were written before those crates existed and spell `tinio_sandbox_core::…` directly, so an implementer corrects those sites in place as the lint reports them, exactly as the paragraph above says for the rest of the imports rule; the block is not the authority for this line.
 
 ## 2. The crates: one topology, two shapes
 
@@ -40,10 +42,12 @@ Each row is a project rule with an owner outside this feature. A plan states its
 | Shape | Taken by | What it costs |
 |---|---|---|
 | A crate-root `#![cfg(target_os = "…")]`, leaving the crate an empty library elsewhere | `-linux`, `-windows` | Nothing is gated per item; the whole crate exists only on its own target. |
-| The crate compiles everywhere, with each platform-specific item gated internally and a stub arm beside it | `-macos` | Every item carries its own `#[cfg]`. |
+| The crate compiles everywhere, with each platform-specific item gated internally and a stub arm beside it | **nobody, as P0 ships it** | Every item carries its own `#[cfg]`. |
 
 **Whichever shape a crate takes, every separate target repeats the gate it needs.** A crate-root `#![cfg]` does not reach `src/bin/`, `tests/` or `examples/`, so each of those files opens with its own attribute.
 
+
+**`-macos` is the row above's shape as P0 ships it, and the row for the other shape is empty on purpose.** P0 Task 3 gives the macOS stub the same crate-root `#![cfg(target_os = "macos")]` as `-linux` and `-windows`, so on this host it is an empty library like they are — the shape it will *grow into* is P3's, whose plan says the crate ends up compiling everywhere with each item gated internally and that it may drop the gate at that point. Writing `-macos` into this table as though P0 had already reshaped it was the state before this correction, and it contradicted the stub the same phase ships. The cost column is unchanged: whichever shape a crate takes, every item that needs a gate carries one, and P3 owns the transition.
 **What neither shape permits is an unconditional reference to an item that is configured out.** The measured case is `rustix`: it builds on Windows — it ships no crate-level gate and simply links a different backend — but its `mount`/`fs`/`process`/`thread` modules are absent there, so the first line of platform code naming one is `E0433: cannot find … in rustix`. That is why `tinio-sandbox-linux` takes the crate-root gate: its code uses `std::os::fd` and those modules throughout.
 
 ## 3. What the core owns, and what a launcher platform owns

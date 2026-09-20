@@ -28,17 +28,17 @@
 
 **Files:**
 - Create: `crates/tinio-sandbox-core/Cargo.toml`
-- Create: `crates/tinio-sandbox-core/src/{lib.rs,error.rs,access.rs,sandbox.rs}`
+- Create: `crates/tinio-sandbox-core/src/{lib.rs,error.rs,sandbox.rs}`
 - Modify: `Cargo.toml` (workspace root — add the workspace dependency)
 - Modify: `README.md` (crate table row)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Access`, `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures`), `Error`, `Result`.
+- Produces: `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures`), `Error`, `Result` — and, **re-exported from `tinio-core` rather than defined here**, `AccessMode`.
 
 The builder is **pure data**. Validation that needs the filesystem belongs to the platform crate's `confine`, so the whole builder is testable with no privileges on any platform.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `crates/tinio-sandbox-core/src/sandbox.rs`:
 
@@ -48,15 +48,14 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::access::Access;
 
     #[test]
     fn expose_records_path_and_access() {
-        let sandbox = Sandbox::new().expose("/srv/data", Access::ReadWrite);
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
         let exposures = sandbox.exposures();
         assert_eq!(exposures.len(), 1);
         assert_eq!(exposures[0].host, Path::new("/srv/data"));
-        assert_eq!(exposures[0].access, Access::ReadWrite);
+        assert_eq!(exposures[0].access, AccessMode::ReadWrite);
     }
 
     #[test]
@@ -64,17 +63,44 @@ mod tests {
         // `serve` exposes the served root read-write and its state directory
         // read-write again; a later narrower entry must never downgrade it.
         let sandbox = Sandbox::new()
-            .expose("/srv/data", Access::ReadWrite)
-            .expose("/srv/data", Access::ReadOnly);
+            .expose("/srv/data", AccessMode::ReadWrite)
+            .expose("/srv/data", AccessMode::ReadOnly);
         assert_eq!(sandbox.exposures().len(), 1);
-        assert_eq!(sandbox.exposures()[0].access, Access::ReadWrite);
+        assert_eq!(sandbox.exposures()[0].access, AccessMode::ReadWrite);
+    }
+
+    #[test]
+    fn from_exposures_keeps_the_most_permissive_access_too() {
+        // **The path a launcher platform takes, and the one the rule had to
+        // move onto** (the cleanup that extracted `merge_exposure`). A
+        // called-out set is assembled from somewhere else — a canonicalised
+        // rebuild of an existing set, a set merged with another, the
+        // executable's directory added — so the same path can arrive twice with
+        // different access, and a vector stored as given handed the platform
+        // both entries and left the choice of which to apply to it.
+        //
+        // Both orders, because the merge has to reach the same answer either
+        // way: `data` is widened by its second entry, `logs` arrives narrower
+        // after a wider one and must not lose it.
+        let called_out = vec![
+            Exposure { host: "/srv/data".into(), access: AccessMode::ReadWrite },
+            Exposure { host: "/srv/data".into(), access: AccessMode::ReadOnly },
+            Exposure { host: "/srv/logs".into(), access: AccessMode::ReadOnly },
+            Exposure { host: "/srv/logs".into(), access: AccessMode::ReadWrite },
+        ];
+        let sandbox = Sandbox::from_exposures(called_out, false);
+        assert_eq!(sandbox.exposures().len(), 2, "one entry per path");
+        assert_eq!(sandbox.exposures()[0].host, Path::new("/srv/data"));
+        assert_eq!(sandbox.exposures()[0].access, AccessMode::ReadWrite);
+        assert_eq!(sandbox.exposures()[1].host, Path::new("/srv/logs"));
+        assert_eq!(sandbox.exposures()[1].access, AccessMode::ReadWrite);
     }
 
     #[test]
     fn the_builder_does_not_touch_the_filesystem() {
         // Recorded verbatim, even though the path does not exist — validation
         // is the platform's job, so the builder stays testable everywhere.
-        let sandbox = Sandbox::new().expose("/no/such/path/anywhere", Access::ReadOnly);
+        let sandbox = Sandbox::new().expose("/no/such/path/anywhere", AccessMode::ReadOnly);
         assert_eq!(sandbox.exposures()[0].host, Path::new("/no/such/path/anywhere"));
     }
 
@@ -122,12 +148,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-core`
 Expected: FAIL — the package does not exist yet. Create `Cargo.toml` and an empty `src/lib.rs` first if the workspace refuses to load.
 
-- [ ] **Step 3: Write `Cargo.toml`**
+- [x] **Step 3: Write `Cargo.toml`**
 
 ```toml
 [package]
@@ -139,13 +165,15 @@ publish = false
 
 [dependencies]
 bytes.workspace = true
-derive_more = { workspace = true, features = ["debug", "display"] }
+derive_more = { workspace = true, features = ["debug"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sse-core.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
+
+tinio-core.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
@@ -168,7 +196,9 @@ unsafe_code = "forbid"
 
 The **parsing is still synchronous** and that is deliberate: `sse-core`'s `SseDecoder` is a plain state machine over a byte slice, so the frame-level logic is exercised with no runtime at all. Only the I/O around it is async.
 
-`derive_more` needs **both** features: `display` for `Access` and `debug` for `Child`'s skipped closure field. `serde` stays `workspace = true` and only the core asks for `derive` — it is the only crate here that has a wire type.
+`derive_more` needs **one** feature: `debug`, for the closure or credential-bearing field each of `Child`, `LaunchPayload` and `Adopted` skips. The `display` feature went with `access.rs` — the `Display` that needed it belonged to a type this crate no longer defines.
+
+**`tinio-core` is a workspace crate and not a new dependency**, so the dependency ledger is unchanged; what changes is one edge inside the workspace, and it is the edge this crate's whole vocabulary rests on. It exists because `AccessMode` is already the type FR-023 resolves at the `serve` call site, and the alternative — a second enum here — put a conversion between two spellings of one fact exactly where the operator's read-only decision meets the exposure set. The core is still platform-free and FFI-free; `tinio-core` is the storage contract, which the consuming server already links. `serde` stays `workspace = true` and only the core asks for `derive` — it is the only crate here that has a wire type.
 
 `bytes` is declared directly even though it arrives transitively, because the core names `BytesMut` in its own signatures and a crate that uses a type should depend on it.
 
@@ -178,7 +208,7 @@ The **parsing is still synchronous** and that is deliberate: `sse-core`'s `SseDe
 
 **There is no `getrandom` line, and no nonce.** An earlier draft carried a one-shot nonce in the payload as the child's discriminator; it was removed because it could not do that job — the parent writes the nonce to the same stdin it writes everything else to, so anything able to forge a payload already knows the value. What actually discriminates a confined child is the argv listener element plus a payload that decodes (design decision 17, amended). With the nonce gone, the core has no need for an entropy source at all.
 
-- [ ] **Step 4: Write `error.rs`**
+- [x] **Step 4: Write `error.rs`**
 
 ```rust
 //! The confinement error vocabulary, shared by every backend.
@@ -263,61 +293,11 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Write `access.rs` and `sandbox.rs`**
+- [x] **Step 5: Write `sandbox.rs`**
 
-`access.rs`:
+**There is no `access.rs`, and `AccessMode` is not this crate's type.** `tinio-core` already owns the write policy of a served plane — `tinio_core::AccessMode`, with `ReadWrite` as its `Default`, `ReadOnly`, `is_read_only(self) -> bool` and `From<bool>` (`crates/tinio-core/src/mode.rs`) — and the sandbox needs exactly that vocabulary. FR-023's read-only resolution already produces an `AccessMode` in `serve`, so a second enum here would put a conversion between two spellings of one fact at the call site: before this correction, both P1's and P3's `serve` sections had to rebuild the sandbox's own enum out of the `AccessMode` they had already resolved, and that line is what disappears.
 
-```rust
-//! The write policy of one exposed path.
-
-use derive_more::Display;
-
-/// Whether an exposed path is writable inside the confinement.
-///
-/// # Examples
-///
-/// ```
-/// use tinio_sandbox_core::Access;
-///
-/// assert_ne!(Access::ReadOnly, Access::ReadWrite);
-/// assert_eq!(Access::ReadOnly.to_string(), "read-only");
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
-#[display("{}", self.as_str())]
-pub enum Access {
-    /// The confined process may read but never write.
-    ReadOnly,
-    /// The confined process may read and write.
-    ReadWrite,
-}
-
-impl Access {
-    /// The wire and log spelling.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::ReadWrite => "read-write",
-        }
-    }
-
-    /// Whether this access allows writes — the one predicate every backend
-    /// branches on.
-    pub const fn is_writable(self) -> bool {
-        matches!(self, Self::ReadWrite)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_read_write_is_writable() {
-        assert!(Access::ReadWrite.is_writable());
-        assert!(!Access::ReadOnly.is_writable());
-    }
-}
-```
+So the core **depends on `tinio-core` and re-exports the type**, `Exposure::access` is a `tinio_core::AccessMode`, and **nothing is added to it**: the core's own `is_writable`, `as_str` and `Display` do not exist. A backend that branches writes `if !access.is_read_only()`; a tracing field renders it with `?`/`{:?}`. The variant that used to be spelled first is not the default either — `AccessMode::default()` is `ReadWrite`, which is the right default for an exposure only because `expose` always states the access explicitly.
 
 `sandbox.rs` carries `Exposure` and `Sandbox` exactly as tested in Step 1, with the doc examples from `crates/tinio-sandbox-core`:
 
@@ -326,7 +306,7 @@ mod tests {
 
 use std::path::PathBuf;
 
-use crate::access::Access;
+use crate::_core::AccessMode;
 
 /// One host path the confined process must be able to reach.
 ///
@@ -335,10 +315,10 @@ use crate::access::Access;
 /// ```
 /// use std::path::Path;
 ///
-/// use tinio_sandbox_core::{Access, Exposure};
+/// use tinio_sandbox_core::{AccessMode, Exposure};
 ///
-/// let exposure = Exposure { host: Path::new("/srv/data").into(), access: Access::ReadWrite };
-/// assert!(exposure.access.is_writable());
+/// let exposure = Exposure { host: Path::new("/srv/data").into(), access: AccessMode::ReadWrite };
+/// assert!(!exposure.access.is_read_only());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exposure {
@@ -347,7 +327,7 @@ pub struct Exposure {
     /// the program (design decision 9).
     pub host: PathBuf,
     /// Whether the confined process may write there.
-    pub access: Access,
+    pub access: AccessMode,
 }
 
 /// The set of paths a confined process may reach, plus the fixed device files.
@@ -355,10 +335,10 @@ pub struct Exposure {
 /// # Examples
 ///
 /// ```
-/// use tinio_sandbox_core::{Access, Sandbox};
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
 ///
 /// let sandbox = Sandbox::new()
-///     .expose("/srv/tinio", Access::ReadWrite)
+///     .expose("/srv/tinio", AccessMode::ReadWrite)
 ///     .device_files();
 /// assert!(sandbox.device_files_enabled());
 /// ```
@@ -378,16 +358,8 @@ impl Sandbox {
     ///
     /// Exposing the same path twice keeps the **most permissive** access: a
     /// narrower entry can never silently downgrade a wider one.
-    pub fn expose(mut self, host: impl Into<PathBuf>, access: Access) -> Self {
-        let host = host.into();
-        match self.exposures.iter_mut().find(|e| e.host == host) {
-            Some(existing) => {
-                if access.is_writable() {
-                    existing.access = Access::ReadWrite;
-                }
-            }
-            None => self.exposures.push(Exposure { host, access }),
-        }
+    pub fn expose(mut self, host: impl Into<PathBuf>, access: AccessMode) -> Self {
+        merge_exposure(&mut self.exposures, host.into(), access);
         self
     }
 
@@ -413,13 +385,19 @@ impl Sandbox {
     /// Take a set that was already built, with the device-file flag it was
     /// built with.
     ///
+    /// **It applies [`Self::expose`]'s most-permissive rule to the vector it is
+    /// given**, so a caller merging two sets — or rebuilding one it has just
+    /// transformed — cannot leave a path carrying both a read-only entry and the
+    /// read-write entry that was meant to widen it. Applying the rule to a set
+    /// that already obeys it changes nothing: the first entry for a path stays
+    /// where it was and a later, narrower duplicate merges into it.
+    ///
     /// `expose` is the only way to *add*, so a caller that must transform the
     /// whole set — the launcher platforms canonicalise paths and add the
     /// executable's directory — would otherwise iterate [`Self::exposures`] and
     /// re-`expose` each one, rebuilding the set to change it. With a dozen
-    /// exposures that is a dozen re-insertions; with the duplicate rule inside
-    /// `expose` it is also a silent re-derivation of the most-permissive
-    /// result that the caller has already computed.
+    /// exposures that is a dozen re-insertions, and a silent second application
+    /// of a rule the caller has already applied.
     ///
     /// **The device-file flag is a parameter rather than something this
     /// remembers**, and that is the whole reason the signature has two
@@ -432,9 +410,9 @@ impl Sandbox {
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_core::{Access, Sandbox};
+    /// use tinio_sandbox_core::{AccessMode, Sandbox};
     ///
-    /// let built = Sandbox::new().expose("/srv/data", Access::ReadOnly).device_files();
+    /// let built = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly).device_files();
     /// let taken = Sandbox::from_exposures(
     ///     built.exposures().to_vec(),
     ///     built.device_files_enabled(),
@@ -443,7 +421,33 @@ impl Sandbox {
     /// assert!(taken.device_files_enabled(), "the flag travels with the set");
     /// ```
     pub fn from_exposures(exposures: Vec<Exposure>, device_files: bool) -> Self {
-        Self { exposures, device_files }
+        let mut merged = Vec::with_capacity(exposures.len());
+        for exposure in exposures {
+            merge_exposure(&mut merged, exposure.host, exposure.access);
+        }
+        Self { exposures: merged, device_files }
+    }
+}
+
+/// Insert `host` with `access`, or widen the entry already there for that path.
+///
+/// **The most-permissive rule lives here rather than on the `expose` path**, so
+/// that a set rebuilt through [`Sandbox::from_exposures`] obeys it too: with the
+/// rule inside `expose` alone, a vector carrying two entries for one path
+/// arrived at the platform as it stood, and a path the caller meant to expose
+/// read-only went in with a read-write entry beside it.
+///
+/// The incoming value rather than an `AccessMode::ReadWrite` literal: the two
+/// agree while the enum has two variants, and a literal would silently coalesce
+/// whatever variant it grows.
+fn merge_exposure(exposures: &mut Vec<Exposure>, host: PathBuf, access: AccessMode) {
+    match exposures.iter_mut().find(|e| e.host == host) {
+        Some(existing) => {
+            if !access.is_read_only() {
+                existing.access = access;
+            }
+        }
+        None => exposures.push(Exposure { host, access }),
     }
 }
 
@@ -453,7 +457,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 6: Write `lib.rs`**
+- [x] **Step 6: Write `lib.rs`**
 
 ```rust
 //! The confinement contract for tinio.
@@ -461,7 +465,7 @@ mod tests {
 //! [`Sandbox`] collects the host paths a confined process must reach and the
 //! access each gets. Turning that into a jail is a platform's job: this crate
 //! holds only what more than one platform needs — the vocabulary, the
-//! [`Backend`] trait, and the launcher machinery the two child-launching
+//! `Backend` trait, and the launcher machinery the two child-launching
 //! platforms share. The platform implementations live in
 //! `tinio-sandbox-linux`, `-macos` and `-windows`, and the `tinio-sandbox`
 //! facade re-exports the one that applies.
@@ -471,34 +475,51 @@ mod tests {
 //! # Examples
 //!
 //! ```
-//! use tinio_sandbox_core::{Access, Sandbox};
+//! use tinio_sandbox_core::{AccessMode, Sandbox};
 //!
 //! let sandbox = Sandbox::new()
-//!     .expose("/srv/tinio", Access::ReadWrite)
-//!     .expose("/srv/tinio/static", Access::ReadOnly);
+//!     .expose("/srv/tinio", AccessMode::ReadWrite)
+//!     .expose("/srv/tinio/static", AccessMode::ReadOnly);
 //!
 //! assert_eq!(sandbox.exposures().len(), 2);
 //! ```
 
-pub mod access;
-pub mod error;
+#[doc(hidden)]
+pub extern crate tinio_core as _core;
+
+mod error;
 pub mod sandbox;
 
-// **The whole public surface, grouped by the module each name comes from.**
-// Grouping is not decoration: a flat list is what let `Access` drift into the
+// **The whole public surface, grouped by where each name comes from.**
+// Grouping is not decoration: a flat list is what let `AccessMode` drift into the
 // `launcher` group in an earlier draft, where it does not exist — the failure
 // reads as a missing name three phases later rather than as a wrong line here.
 //
+// `AccessMode` is the one name here that is not this crate's own: it is
+// `tinio-core`'s write policy, re-exported so a consumer of the sandbox never
+// has to know which crate the vocabulary came from, and so that a value the
+// read-only work already produced is the value an exposure takes. It is
+// therefore reached through the dependency's alias declared at the top of this
+// file — `pub use crate::_core::AccessMode`, on its own line after the
+// `self::{…}` group because `tinio-core` is a dependency and not one of this
+// crate's modules.
+//
 // The facade re-exports exactly this list, name for name, so that a consumer
-// naming `tinio_sandbox::` can reach everything the core publishes. That
-// equality is what Task 3's `the_launcher_surface_is_re_exported` test
-// enforces; see the comment there.
+// naming `tinio_sandbox::` can reach everything the core publishes. Keeping
+// that equality is a rule this file is edited under rather than something a
+// test proves: `the_launcher_surface_is_re_exported` checks the names it lists,
+// so a name added here still has to be added there by hand — see the comment on
+// that test.
 pub use self::{
-    access::Access,
     error::{Error, Result},
     sandbox::{Exposure, Sandbox},
 };
+pub use crate::_core::AccessMode;
 ```
+
+**`tinio-core` is reached through the alias, not by its own name** (`docs/style.md` §Imports, whose facade precedent is `crates/tinio/src/lib.rs:25-45`): `#[doc(hidden)] pub extern crate tinio_core as _core;` at the crate root, then `pub use crate::_core::AccessMode;`. **The public path is unchanged** — a consumer still names `tinio_sandbox_core::AccessMode`, and only the path the re-export is written through differs.
+
+**`Backend` is plain code text in the crate doc, not `[`Backend`]`, and that is a gate rather than a preference.** The trait does not exist until Task 2, and an intra-doc link to a name that is not in scope is an error under `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` — a leg of both the local Standard acceptance block (`docs/tests.md`) and CI's docs job (`.github/actions/run-test-leg/action.yml`). Rustdoc reports `unresolved link to `Backend`` and fails the crate, exit 101, on a tree whose tests, clippy and fmt are all green; the implementer's verification set does not run `cargo doc`, which is why this one is easy to miss. **Task 2's Step 7 restores the link** (`[`Backend`]`) in the same edit that adds the trait, so the crate ends the phase with the link it wanted and no intermediate state is red.
 
 Add to the root `Cargo.toml` `[workspace.dependencies]` — each external line in its own alphabetical place, and the crate among the `tinio-*` paths:
 
@@ -509,7 +530,7 @@ sse-core = { version = "0.2", default-features = false }
 tinio-sandbox-core = { path = "crates/tinio-sandbox-core" }
 ```
 
-`bytes` is already declared in a workspace where several crates use it; if so, this line already exists and only the core's reference is new. `serde` and `serde_json` are likewise **already** in `[workspace.dependencies]`, so no root edit for either.
+`bytes` is already declared in a workspace where several crates use it; if so, this line already exists and only the core's reference is new. `serde` and `serde_json` are likewise **already** in `[workspace.dependencies]`, and so is `tinio-core` — the core's `tinio-core.workspace = true` needs no root edit at all, because the pin was already there for the storage crates.
 
 `sse-core` is the plan's one genuinely new third-party dependency, and it is the one the design's Bookkeeping entry has to gain — the earlier draft claimed "No new third-party dependency" on the strength of a hand-built seccomp filter, which was true of the Linux crate and silent about the core. Pin it to `"0.2"` (current `0.2.3`); the alternative `sse-stream` is explicitly rejected in the Cargo block above, for its unconditional async dependencies.
 
@@ -523,24 +544,17 @@ Add the README row after `tinio-server`'s:
 | `tinio-sandbox*` | Process confinement: the `Backend` contract, per-platform implementations, and a facade |
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-core`
-Expected: PASS — 8 unit tests (four in `sandbox.rs`, three in `error.rs`, one in `access.rs`), 5 doc tests (the crate-level `//!` example, `Exposure`, `Sandbox`, `Sandbox::from_exposures`, `Access`).
+Expected: PASS — 8 unit tests (five in `sandbox.rs`, three in `error.rs`), 4 doc tests (the crate-level `//!` example, `Exposure`, `Sandbox`, `Sandbox::from_exposures`). The fifth `sandbox.rs` case is the one the cleanup added: `from_exposures_keeps_the_most_permissive_access_too`, which pins the rule on the path a launcher platform takes, both orders of the duplicate pair — without it, a `from_exposures` that stored the vector as given passed every other test. `AccessMode` contributes neither count: it is `tinio-core`'s type, so its unit tests and its doc example run in that crate's own suite.
 
 **Count them from the code blocks rather than from this line if they disagree**: a doc example on a `pub(crate)` item is not one of them (rustdoc would fail to compile it), and the crate-level `//!` example is.
 
-- [ ] **Step 8: Verify the workspace still lints**
+- [x] **Step 8: Verify the workspace still lints**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add Cargo.toml Cargo.lock crates/tinio-sandbox-core README.md
-git commit -m "feat(sandbox): add tinio-sandbox-core with Access, Sandbox and Error"
-```
 
 ---
 
@@ -549,6 +563,7 @@ git commit -m "feat(sandbox): add tinio-sandbox-core with Access, Sandbox and Er
 **Files:**
 - Create: `crates/tinio-sandbox-core/src/{backend.rs,event.rs,launcher/mod.rs,launcher/payload.rs,launcher/relay.rs,launcher/supervise.rs}`
 - Modify: `crates/tinio-sandbox-core/src/lib.rs`
+- Create (later, in the cleanup that moved the test fixtures): `crates/tinio-sandbox-core/src/testing.rs`
 
 **Interfaces:**
 - Consumes: `Error`, `Result`, `Sandbox`.
@@ -570,7 +585,7 @@ The child discriminator is the payload itself, never an environment variable: an
 
 **And this machinery logs what it decides**, because a launch that goes wrong has to be diagnosable from a log rather than only from a reproduction. shared §7 owns the rule, the levels and the sink; this task owns the core's share of it: `adopt`'s outcome **and why** (whether an element was present, and whether a payload decoded — never the payload's contents, which carry credentials), the relay's first terminal event, what `Child::wait` returned, and that the teardown ran. The crate installs no subscriber of its own; `serve`'s existing stderr subscriber is the sink, which is what keeps stdout free for the event protocol. One test runs an operation under a recording subscriber and asserts the event's `step` field, so "it logs" is a property a test can lose.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `crates/tinio-sandbox-core/src/launcher/payload.rs`:
 
@@ -649,6 +664,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::testing::loopback;
 
     /// A child that exits with `code`, portable across the CI matrix.
     fn exiting(script: &str) -> Command {
@@ -673,7 +689,7 @@ mod tests {
 
     /// The terminal event a relayed child would have reported.
     fn listening() -> Terminal {
-        Terminal::Listening("127.0.0.1:9000".parse().expect("addr"))
+        Terminal::Listening(loopback(9000))
     }
 
     #[test]
@@ -735,12 +751,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-core launcher::`
 Expected: FAIL — `cannot find struct 'LaunchPayload'`.
 
-- [ ] **Step 3: Write `launcher/payload.rs`**
+- [x] **Step 3: Write `launcher/payload.rs`**
 
 ```rust
 //! The launch payload: how a confined child learns it is the child.
@@ -898,13 +914,15 @@ Add to Step 1's test module, so the contract is pinned rather than merely implem
 
 with `use std::ffi::{OsStr, OsString};` added to the test module's imports.
 
-- [ ] **Step 4: Write `launcher/supervise.rs`**
+- [x] **Step 4: Write `launcher/supervise.rs`**
 
 ```rust
 //! Waiting for a confined child and undoing what its launch set up.
 
 use std::process::ExitStatus;
 use std::thread::JoinHandle;
+
+use tracing::debug;
 
 use crate::error::Result;
 use crate::launcher::Terminal;
@@ -1008,6 +1026,10 @@ impl Child {
     /// table), and a launcher that can leave one behind must deal with it before
     /// its wait closure returns.
     ///
+    /// What the wait returned is traced (`step = "wait"`) before the join, so a
+    /// launch that hangs is diagnosable from the log of what it had already
+    /// reached rather than only from a reproduction.
+    ///
     /// # Errors
     ///
     /// Whatever the platform's wait reports. A relay that panicked is not one of
@@ -1016,6 +1038,16 @@ impl Child {
     /// a caller gets for a child that never reported.
     pub fn wait(&mut self) -> Result<ExitStatus> {
         let status = (self.wait)();
+        // The child's own answer, which is what a stuck launcher needs to see:
+        // an exit code that arrived, or the platform error that stopped one.
+        match &status {
+            Ok(status) => debug!(
+                step = "wait",
+                code = status.code(),
+                success = status.success()
+            ),
+            Err(error) => debug!(step = "wait", error = %error),
+        }
         if let Some(relay) = self.relay.take() {
             // A relay that panicked recorded nothing, which is the same answer a
             // child that never reported gives — and the same one the earlier
@@ -1066,6 +1098,9 @@ impl Child {
 /// — disarming a signal handler, removing a path the launcher created — which is
 /// what both launcher platforms pass it.
 ///
+/// That the teardown ran is traced (`step = "teardown"`), because a rollback
+/// that silently did not happen is indistinguishable from one that did.
+///
 /// # Errors
 ///
 /// The child's wait failure, if it failed. A teardown that panics is not
@@ -1093,6 +1128,7 @@ impl Child {
 pub fn supervise(child: &mut Child, teardown: impl FnOnce()) -> Result<ExitStatus> {
     let status = child.wait();
     teardown();
+    debug!(step = "teardown");
     status
 }
 
@@ -1102,14 +1138,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Write `event.rs` and `launcher/relay.rs`**
+- [x] **Step 5: Write `event.rs` and `launcher/relay.rs`**
 
 The event contract (design decision 19) and the relay that makes it trustworthy on the launcher platforms. Both are core, both are exercised on Linux even though Linux never relays: the relay is tested against a plain child process, which is the only way the launcher platforms' half gets measured before those platforms exist.
 
 ```rust
 //! What the confined process reports on stdout.
 
-use std::net::SocketAddr;
+use std::{borrow::Cow, net::SocketAddr, num::NonZeroUsize};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -1118,6 +1154,21 @@ use sse_core::{SseDecoder, SseEvent};
 /// The SSE field prefixes. A frame is these two lines and a blank line.
 const DATA: &str = "data: ";
 const EVENT: &str = "event: ";
+
+/// The largest a single SSE field may be before the decoder discards the frame.
+///
+/// Pinned rather than inherited: `SseDecoder::new()` carries a 512 KiB default,
+/// which is four orders of magnitude of headroom over what this protocol ever
+/// sends (a `SocketAddr` and a short error string) and is a dependency default
+/// no document here could check. See `Observer::observe`.
+///
+/// **It lives in the protocol module rather than beside either of the two
+/// decoders it configures, and that is the point.** "How large may one frame
+/// be" is a property of the protocol, so a per-call-site answer is a second
+/// place to change it: `Event::decode` used to build the dependency's default
+/// while the relay pinned 64 KiB — the same crate, two limits, and the one this
+/// comment argues against at the site a consumer reaches.
+pub(crate) const MAX_FIELD: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
 
 /// The event name that means "the listener is bound".
 const LISTENING: &str = "listening";
@@ -1181,8 +1232,16 @@ struct Listening {
 
 /// The payload of an `error` frame.
 #[derive(Serialize, Deserialize)]
-struct Error {
-    message: String,
+struct Error<'a> {
+    /// **Borrowed for the encoding, owned for the decoding.** Borrowed, because
+    /// `encode` would otherwise clone the message into an owned payload only for
+    /// `serde_json` to allocate the serialized text again. A `Cow` rather than
+    /// the `&str` a borrowing type would ordinarily be, because `serde_json` can
+    /// only hand out a borrowed string when the payload carries no escapes: a
+    /// message with a quote or a newline in it — the two cases this module's
+    /// tests pin — would then fail to decode at all, which is a frame lost to
+    /// keep a borrow the decoding side does not need.
+    message: Cow<'a, str>,
 }
 
 impl Event {
@@ -1213,7 +1272,9 @@ impl Event {
     pub fn encode(&self) -> String {
         let payload = match self {
             Self::Listening { addr } => serde_json::to_string(&Listening { addr: *addr }),
-            Self::Error { message } => serde_json::to_string(&Error { message: message.clone() }),
+            Self::Error { message } => serde_json::to_string(&Error {
+                message: Cow::Borrowed(message.as_str()),
+            }),
         };
         // Unreachable for both payloads — a `SocketAddr` and a `String` always
         // serialize — and fail-closed if it ever were not: an empty `data:`
@@ -1244,9 +1305,11 @@ impl Event {
             LISTENING => serde_json::from_str::<Listening>(data)
                 .ok()
                 .map(|payload| Self::Listening { addr: payload.addr }),
-            ERROR => serde_json::from_str::<Error>(data)
+            ERROR => serde_json::from_str::<Error<'_>>(data)
                 .ok()
-                .map(|payload| Self::Error { message: payload.message }),
+                .map(|payload| Self::Error {
+                    message: payload.message.into_owned(),
+                }),
             _ => None,
         }
     }
@@ -1254,7 +1317,7 @@ impl Event {
     /// Decode one frame from its text, or `None` if it is not one of ours.
     ///
     /// Parsed by **`sse-core`** — the same state machine the relay runs — and
-    /// then handed to [`Self::decode_fields`], so this crate holds one SSE
+    /// then handed to `decode_fields`, so this crate holds one SSE
     /// parser rather than two. **It deliberately does not try the payloads in
     /// turn**: `{"message":…}` deserializes happily under the `listening` name,
     /// so a guess would be ambiguous exactly where the protocol is trying to be
@@ -1275,7 +1338,7 @@ impl Event {
         // reads the stream line by line holds a frame's two field lines without
         // one. Appending it is harmless for a frame that already ends in one —
         // extra blank lines dispatch nothing.
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::with_limit(MAX_FIELD);
         let mut buffer = Bytes::from(format!("{frame}\n\n"));
         match decoder.next(&mut buffer) {
             Some(Ok(SseEvent::Message(message))) => {
@@ -1297,22 +1360,17 @@ use std::net::SocketAddr;
 use bytes::BytesMut;
 use sse_core::{SseDecoder, SseEvent};
 use tokio::io::{AsyncBufRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tracing::debug;
 
-use crate::error::Result;
-use crate::event::Event;
+use crate::{
+    error::{Error, Result},
+    event::{Event, MAX_FIELD},
+};
 
 /// The chunk size each read pulls. Small enough that a stalled child cannot make
 /// the launcher hold a large buffer, large enough that an ordinary frame arrives
 /// whole.
 const CHUNK: usize = 8 * 1024;
-
-/// The largest a single SSE field may be before the decoder discards the frame.
-///
-/// Pinned rather than inherited: `SseDecoder::new()` carries a 512 KiB default,
-/// which is four orders of magnitude of headroom over what this protocol ever
-/// sends (a `SocketAddr` and a short error string) and is a dependency default
-/// no document here could check. See `Observer::observe`.
-const MAX_FIELD: usize = 64 * 1024;
 
 /// Copy every decodable event from `child_stdout` to `parent_stdout`.
 ///
@@ -1354,6 +1412,14 @@ const MAX_FIELD: usize = 64 * 1024;
 /// fail to run — it fails to compile, and rustdoc collects it anyway (`E0603`,
 /// "function `reemit` is private"). The behaviour it would have shown is pinned
 /// by the tests below, which live inside the crate and can name it.
+///
+/// **`#[cfg(test)]`, because those tests are its only callers.** Both launcher
+/// platforms drive [`Observer`] rather than this — they need the record, which
+/// is the whole reason `reemit` stays internal — so in a non-test build the
+/// function is dead code, which the workspace's `-D warnings` gate refuses.
+/// Keeping it to the build that uses it says that plainly; an
+/// `#[allow(dead_code)]` would not.
+#[cfg(test)]
 pub(crate) async fn reemit(
     reader: impl AsyncBufRead + Unpin,
     writer: impl AsyncWrite + Unpin,
@@ -1431,6 +1497,10 @@ impl<W> Observer<W> {
     /// child that started successfully would be recorded as never having
     /// started, and the launcher's "it never became ready" rule would fire on a
     /// run that had gone perfectly well up to the failure.
+    ///
+    /// That first terminal event is traced (`step = "relay"`), because it is the
+    /// fact a launcher's readiness rule reads; the frames that follow it are
+    /// relayed and not re-logged.
     pub fn record(&mut self, name: &str, data: &str) -> Option<Event> {
         let event = Event::decode_fields(name, data)?;
         if self.terminal.is_none() {
@@ -1438,6 +1508,7 @@ impl<W> Observer<W> {
                 Event::Listening { addr } => Some(Terminal::Listening(*addr)),
                 Event::Error { message } => Some(Terminal::Error(message.clone())),
             };
+            debug!(step = "relay", terminal = ?self.terminal);
         }
         Some(event)
     }
@@ -1461,21 +1532,29 @@ impl<W: AsyncWrite + Unpin> Observer<W> {
     ///
     /// **One decoder, and the payload limit is pinned here rather than inherited
     /// from the dependency** — `SseDecoder::with_limit(MAX_FIELD)`, the constant
-    /// standing beside `CHUNK`. An earlier version took the 512 KiB default that
-    /// `SseDecoder::new()` carries and argued that a smaller number would be a
-    /// number to defend; the argument for pinning is the opposite one. This
-    /// protocol's entire vocabulary is a `SocketAddr` (some 40 bytes) and a short
-    /// error string, so 512 KiB is four orders of magnitude of headroom for a
-    /// bound whose only job is to stop a runaway child — and it was a *dependency
-    /// default*, which no document in this workspace could check while every other
-    /// constant in this plan is pinned. 64 KiB is the number this crate owns, and
-    /// a frame larger than that is not a frame of this protocol.
+    /// the protocol module owns (`crate::event::MAX_FIELD`, beside the framing
+    /// it bounds) rather than one this module keeps. An earlier version took the
+    /// 512 KiB default that `SseDecoder::new()` carries and argued that a
+    /// smaller number would be a number to defend; the argument for pinning is
+    /// the opposite one. This protocol's entire vocabulary is a `SocketAddr`
+    /// (some 40 bytes) and a short error string, so 512 KiB is four orders of
+    /// magnitude of headroom for a bound whose only job is to stop a runaway
+    /// child — and it was a *dependency default*, which no document in this
+    /// workspace could check while every other constant in this plan is pinned.
+    /// 64 KiB is the number this crate owns, and a frame larger than that is not
+    /// a frame of this protocol.
     ///
     /// # Errors
     ///
-    /// The reader's or the writer's I/O error. The relay stops on the first one
-    /// rather than retrying: a pipe that has failed will not recover, and the
-    /// caller's next step is to wait for the child anyway.
+    /// The reader's or the writer's I/O error, named as [`Error::Step`] with
+    /// `step = "relay"`. The relay stops on the first one rather than retrying:
+    /// a pipe that has failed will not recover, and the caller's next step is to
+    /// wait for the child anyway.
+    ///
+    /// **Naming the step is what keeps this from reading as a failed wait.** The
+    /// crate's only `From<io::Error>` is `Error::Wait`, whose message claims the
+    /// confinement could not wait for the child — the wrong diagnosis for a
+    /// parent whose stdout has closed, and one a bare `?` would have produced.
     pub async fn observe(mut self, mut reader: impl AsyncBufRead + Unpin) -> Result<Self> {
         // **One decoder for the whole stream, and it must not be hoisted into
         // `decode`.** The decoder holds the field values of the event it has
@@ -1498,7 +1577,13 @@ impl<W: AsyncWrite + Unpin> Observer<W> {
                 match decode(&mut decoder, &mut buffer) {
                     Step::Frame(name, data) => {
                         if let Some(event) = self.record(&name, &data) {
-                            self.inner.write_all(event.encode().as_bytes()).await?;
+                            self.inner
+                                .write_all(event.encode().as_bytes())
+                                .await
+                                .map_err(|source| Error::Step {
+                                    step: "relay",
+                                    source,
+                                })?;
                             wrote = true;
                         }
                     }
@@ -1514,9 +1599,19 @@ impl<W: AsyncWrite + Unpin> Observer<W> {
             // sparse — one `Listening`, at most one `Error` — so an idle stream
             // would otherwise take a flush per chunk for nothing.
             if wrote {
-                self.inner.flush().await?;
+                self.inner.flush().await.map_err(|source| Error::Step {
+                    step: "relay",
+                    source,
+                })?;
             }
-            if reader.read_buf(&mut buffer).await? == 0 {
+            let read = reader
+                .read_buf(&mut buffer)
+                .await
+                .map_err(|source| Error::Step {
+                    step: "relay",
+                    source,
+                })?;
+            if read == 0 {
                 // EOF, and the drain above has already taken every complete
                 // frame the last read delivered. Whatever is left is half a
                 // frame: discarded, which is the standard's own rule and the
@@ -1560,17 +1655,86 @@ fn decode(decoder: &mut SseDecoder, buffer: &mut BytesMut) -> Step {
 }
 ```
 
+**`MAX_FIELD` is declared once, in `event.rs`, and that is the fix rather than a matter of taste.** It is the protocol's own bound — "how large may one frame be" — and the two places a decoder is built are `Event::decode` and `Observer::observe`; with a copy at either site the crate answered the question twice, and `decode` was building the dependency's 512 KiB default while this module pinned 64 KiB. So the constant lives beside the framing it bounds, the relay imports it (`use crate::{error::{Error, Result}, event::{Event, MAX_FIELD}}`), and both decoders take it.
+
+**`MAX_FIELD` is a `NonZeroUsize`, and the `unwrap` is a compile-time one.** The dependency decides the type rather than a preference: `sse_core 0.2.3`'s `SseDecoder::with_limit` takes a `NonZeroUsize` (`src/decode.rs:200`), so an earlier draft's `const MAX_FIELD: usize = 64 * 1024;` does not compile — the limit is a `NonZeroUsize` at the call site or the frame limit cannot be stated at all. `NonZeroUsize::new(64 * 1024).unwrap()` is evaluated in the const initializer, so a zero would fail the build rather than panic a code path, and it is the same idiom `sse-core` uses for its own 512 KiB default (`SseDecoder::new`, `src/decode.rs:167`). The alternative — a `usize` constant plus a runtime `NonZeroUsize::new(...).unwrap()` where the decoder is built — puts a genuine unwrap on a library path, which is strictly worse.
+
 These tests split across **two** test modules, and neither is `payload.rs`'s — "Step 1's test module" would send them there, where none of the names they use (`Event`, `Observer`, `reemit`, `Terminal`) exist:
 
-- **`event.rs`** takes the pure frame cases: the round trip, the pinned wire shape, the newline case, quotes and backslashes, and `anything_that_is_not_a_frame_is_ignored`. Its header is `#[cfg(test)] mod tests { use std::net::SocketAddr; use super::*; … }`.
-- **`launcher/relay.rs`** takes the ones that run through the relay: the split frame, the incomplete trailing frame, several frames in one chunk, `retry:`, the three `Observer` cases, and `the_relay_drops_what_does_not_decode` — with `use std::net::SocketAddr; use super::*; use crate::event::Event;` and `trickle` beside them.
+- **`event.rs`** takes the pure frame cases: the round trip, the pinned wire shape, the newline case, quotes and backslashes, and `anything_that_is_not_a_frame_is_ignored`. Its header is `#[cfg(test)] mod tests { use super::*; use crate::testing::loopback; … }`.
+- **`launcher/relay.rs`** takes the ones that run through the relay: the split frame, the incomplete trailing frame, several frames in one chunk, `retry:`, the three `Observer` cases, and `the_relay_drops_what_does_not_decode` — with `use super::*; use crate::{event::Event, testing::{blocking, loopback}};` and a three-byte `TRICKLE` beside them, the chunk the split-frame test passes to `blocking`.
 
-`loopback` is three lines and is defined in each module that needs it rather than shared: a `#[cfg(test)]` helper in one module is invisible to another module's tests unless it is made a crate item, which is a price a test helper should not charge.
+`loopback` and the blocking-reader adapter the relay's frame test and the supervision test both need are **one `#[cfg(test)] pub(crate) mod testing`** — `crates/tinio-sandbox-core/src/testing.rs`, declared from `lib.rs` with the line `#[cfg(test)] pub(crate) mod testing;`, beside the crate's other module declarations — and holding the two helpers below: three test modules want the address and two want the adapter, and a copy per module was the price an earlier draft preferred to a crate-visible item — "a `#[cfg(test)]` helper in one module is invisible to another module's tests unless it is made a crate item, which is a price a test helper should not charge". The ruling went the other way, because the price is smaller than the sentence suggests: the module is `#[cfg(test)]`, so it exists in no build that ships, and its items are `pub(crate)`, so no consumer can reach them. One adapter parameterised by chunk size replaces the two copies (three bytes, forcing a frame to be assembled from many reads; 1024, reading a pipe the way a runtime would).
+
+`crates/tinio-sandbox-core/src/testing.rs`:
 
 ```rust
-    fn loopback(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
+//! Helpers shared by this crate's test modules: `loopback` (the address every
+//! test's frames name) and `blocking` (a blocking reader presented as the async
+//! reader the relay asks for). Crate items rather than a copy per module,
+//! because three test modules want the address and two want the adapter.
+
+use std::{
+    io::{self, Read},
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
+
+/// `127.0.0.1:port`, the loopback address the tests' frames name.
+pub(crate) fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// A blocking `std::io::Read` presented as the `AsyncBufRead` the relay takes,
+/// handing over at most `chunk` bytes per read.
+///
+/// **Both readers a test drives are blocking ones** — a slice of frame bytes and
+/// a real child's pipe — while `Observer::observe` takes an `AsyncBufRead`.
+/// `tokio::fs::File::from_std` is how the launcher platforms bridge the two, and
+/// it is tokio's `fs` feature, which this crate's dev-dependencies deliberately
+/// stop short of; so the blocking read happens where the async one goes.
+///
+/// **Which is safe only because of where it runs**: a `poll_read` that blocks
+/// its executor is a bug anywhere else, and every caller here drives it from a
+/// thread that does nothing but wait — the relay thread a launcher spawns, whose
+/// shape the supervision test reproduces.
+///
+/// `chunk` is the caller's because the two uses want opposite things: the
+/// relay's frame tests force every frame to be assembled from many reads, while
+/// the pipe wants whole chunks.
+pub(crate) fn blocking(reader: impl Read + Unpin, chunk: usize) -> impl AsyncBufRead + Unpin {
+    struct Blocking<R> {
+        reader: R,
+        chunk: Vec<u8>,
     }
+
+    impl<R: Read + Unpin> AsyncRead for Blocking<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.as_mut().get_mut();
+            let take = buf.remaining().min(this.chunk.len());
+            let read = this.reader.read(&mut this.chunk[..take])?;
+            buf.put_slice(&this.chunk[..read]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    BufReader::new(Blocking {
+        reader,
+        chunk: vec![0; chunk],
+    })
+}
+```
+
+```rust
+    // `loopback` is `crate::testing::loopback` for every module that uses it —
+    // see the module above — and no test module defines a copy any more.
 
     #[test]
     fn an_event_survives_a_round_trip() {
@@ -1632,6 +1796,11 @@ These tests split across **two** test modules, and neither is `payload.rs`'s —
         }
     }
 
+    /// Three bytes at a time: every frame the split-frame test relays is
+    /// assembled from many reads, which is the property the resumable decoder
+    /// exists for.
+    const TRICKLE: usize = 3;
+
     #[tokio::test]
     async fn an_event_split_across_reads_is_assembled() {
         // The reason the decoding is a resumable state machine rather than a
@@ -1643,36 +1812,8 @@ These tests split across **two** test modules, and neither is `payload.rs`'s —
         // would be gone.
         let frames = Event::Listening { addr: loopback(9000) }.encode().repeat(2);
         let mut output = Vec::new();
-        reemit(trickle(frames.clone().into_bytes()), &mut output).await.unwrap();
+        reemit(blocking(frames.as_bytes(), TRICKLE), &mut output).await.unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), frames);
-    }
-
-    /// A reader that hands out at most three bytes per call, so every frame above
-    /// is assembled from many reads.
-    fn trickle(bytes: Vec<u8>) -> impl AsyncBufRead + Unpin {
-        use std::io::{self, Read as _};
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-
-        use tokio::io::{AsyncRead, BufReader, ReadBuf};
-
-        struct Trickle(io::Cursor<Vec<u8>>);
-
-        impl AsyncRead for Trickle {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                _: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<io::Result<()>> {
-                let mut chunk = [0u8; 3];
-                let take = buf.remaining().min(chunk.len());
-                let read = self.0.read(&mut chunk[..take])?;
-                buf.put_slice(&chunk[..read]);
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        BufReader::new(Trickle(io::Cursor::new(bytes)))
     }
 
     #[tokio::test]
@@ -1711,9 +1852,10 @@ These tests split across **two** test modules, and neither is `payload.rs`'s —
 
     #[tokio::test]
     async fn the_observer_records_the_listening_address() {
-        let input = format!("event: listening\ndata: {{\"addr\":\"127.0.0.1:9000\"}}\n\n");
+        let addr = loopback(9000);
+        let input = format!("event: listening\ndata: {{\"addr\":\"{addr}\"}}\n\n");
         let observer = Observer::new(Vec::new()).observe(input.as_bytes()).await.unwrap();
-        assert_eq!(observer.terminal(), Some(&Terminal::Listening(loopback(9000))));
+        assert_eq!(observer.terminal(), Some(&Terminal::Listening(addr)));
         // It recorded, and it also forwarded: the two are not alternatives.
         let relayed = String::from_utf8(observer.into_inner()).unwrap();
         assert_eq!(relayed, input);
@@ -1772,7 +1914,7 @@ These tests split across **two** test modules, and neither is `payload.rs`'s —
     }
 ```
 
-- [ ] **Step 6: Write the reconciled launcher surface — `adopt`**
+- [x] **Step 6: Write the reconciled launcher surface — `adopt`**
 
 **Where this lives.** The code block below is additional content for `crates/tinio-sandbox-core/src/launcher/mod.rs`, beside `LaunchPlan` — not a new module and not `lib.rs`. That is what makes Step 7's `pub use self::launcher::{…, Adopted, adopt, …}` resolve: `lib.rs` re-exports them from `launcher`, so `launcher` must own them.
 
@@ -1821,6 +1963,10 @@ pub struct Adopted {
 /// Arguments are taken rather than read from the environment so the whole rule
 /// is unit-testable without a subprocess.
 ///
+/// Which of those outcomes the call reached is traced (`step = "adopt"`): that
+/// an element was present and whether a payload decoded, never the payload's
+/// contents, which carry credentials.
+///
 /// # Examples
 ///
 /// ```
@@ -1838,6 +1984,7 @@ pub fn adopt(
     mut stdin: impl Read,
 ) -> Result<Option<Adopted>> {
     let Some(listener_fd) = args.into_iter().find_map(|arg| listener_fd_from_arg(&arg)) else {
+        debug!(step = "adopt", listener = false, payload = "absent");
         return Ok(None);
     };
     let mut text = String::new();
@@ -1845,14 +1992,24 @@ pub fn adopt(
     // protocol, and a failure to read is a payload failure rather than an IO
     // error the caller could act on differently.
     if stdin.read_to_string(&mut text).is_err() {
+        debug!(step = "adopt", listener = true, payload = "unreadable");
         return Ok(None);
     }
     // `serde_json::from_str` already rejects trailing bytes after the object,
     // which is the property that matters: a child must be certain the whole
     // stream was meant for it.
     match serde_json::from_str::<LaunchPayload>(&text) {
-        Ok(payload) => Ok(Some(Adopted { config: payload.config, listener_fd: Some(listener_fd) })),
-        Err(_) => Ok(None),
+        Ok(payload) => {
+            debug!(step = "adopt", listener = true, payload = "decoded");
+            Ok(Some(Adopted {
+                config: payload.config,
+                listener_fd: Some(listener_fd),
+            }))
+        }
+        Err(_) => {
+            debug!(step = "adopt", listener = true, payload = "rejected");
+            Ok(None)
+        }
     }
 }
 
@@ -1897,7 +2054,46 @@ impl Adopted {
 
 **What stays in the platform crates, and why.** The listener rebuild (`Adopted::listener_fd` → a `std::net::TcpListener`) is `from_raw_socket` on Windows and an `OwnedFd` conversion on macOS — platform syscalls, and the reason this split is where it is. So are the pipes, the handle plumbing, the `CreateProcess`/`sandbox-exec` call, and the signal relay. The **signal relay is deliberately not a core trait**: Windows drives it from a console-control event and macOS from `signal-hook`, they share no code, and the only thing that must agree is the name — each crate exports `on_stop` and `disarm`, and the facade re-exports the selected one.
 
-- [ ] **Step 7: Write `backend.rs`**
+**`adopt`'s tests, and the one the earlier draft was missing.** The rule "reads `stdin` only when `args` carries the listener element" is the task's only fail-safe against a launcher blocking forever on a real terminal, and **a reader that returns EOF cannot test it**: `io::empty()` and a `Cursor` over an empty buffer behave identically whether or not they are read. The test therefore needs a reader that is *hostile to being read at all*:
+
+```rust
+    /// A reader that fails the test if anything reads from it.
+    struct Untouchable;
+
+    impl io::Read for Untouchable {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("`adopt` read stdin without a listener element in argv");
+        }
+    }
+
+    #[test]
+    fn adopt_does_not_touch_stdin_without_the_listener_element() {
+        assert!(adopt(Vec::<OsString>::new(), Untouchable).unwrap().is_none());
+        assert!(adopt([OsString::from("--port")], Untouchable).unwrap().is_none());
+    }
+
+    #[test]
+    fn adopt_returns_the_configuration_text() {
+        // The payload travels through `adopt` here rather than only through the
+        // doc example, which never reaches it.
+        let adopted = adopt([listener_fd_arg(7)], io::Cursor::new(br#"{"config":"port = 9000"}"#.to_vec()))
+            .unwrap()
+            .expect("a listener element and a decodable payload");
+        assert_eq!(adopted.config(), "port = 9000");
+        assert_eq!(adopted.listener(), Some(7));
+    }
+```
+
+Both live in `launcher/mod.rs`'s test module. The second is not decoration: without it, the only evidence that a payload survives `adopt` is a doc example that constructs `Adopted` by hand.
+
+**Two relay cases the earlier draft left unpinned, and the reason each is worth a test rather than a reading.** `Step::Skipped` and `Step::Incomplete` are different states with the same visible effect on a quiet stream, so a test that only asserts "nothing was written" cannot tell them apart — and the difference is load-bearing in both directions:
+
+- **A `retry:` frame must not strand what follows it.** Treated as "need more data", the frame stays in the buffer and is dropped when the stream ends; treated as skipped, the decoder has already advanced past it. One chunk carrying a `retry:` line *and* a real event separates the two.
+- **A frame over `MAX_FIELD` must be skipped, and the stream must continue.** This is the only test that exercises `Some(Err(_)) => Step::Skipped` and the only one that would notice `MAX_FIELD`'s pin being wrong; the decoder discards the offending event, resynchronises at the next boundary, and the good frame behind it must still arrive.
+
+Write both, asserting the **bytes** the relay emitted rather than a count. If the observed behaviour contradicts either description, report it rather than weakening the assertion — the description comes from reading `sse-core 0.2.3`, not from running it.
+
+- [x] **Step 7: Write `backend.rs`**
 
 ```rust
 //! The trait every platform implements, and what it answers.
@@ -1925,7 +2121,7 @@ pub enum Confinement {
     /// The calling process is confined; carry on. Linux always answers this.
     InPlace,
     /// A confined child is running. Wait for it, forward its exit status, and
-    /// undo whatever the launch set up — [`crate::supervise`] does all three.
+    /// undo whatever the launch set up — [`crate::supervise()`] does all three.
     Supervise(Child),
 }
 
@@ -1972,21 +2168,30 @@ pub mod supervise;
 
 pub use self::{
     payload::{
-        LaunchPayload, LISTENER_FD_PREFIX, is_listener_fd_arg, listener_fd_arg,
+        LISTENER_FD_PREFIX, LaunchPayload, is_listener_fd_arg, listener_fd_arg,
         listener_fd_from_arg,
     },
     relay::{Observer, Terminal},
     supervise::{Child, supervise},
 };
 
-// `Adopted`, `adopt` are declared below in this module, not in a submodule, so
-// re-exporting them from `lib.rs` as `launcher::{Adopted, adopt}` compiles. A
-// `pub use self::adopt::…` would name a module that does not exist.
-pub use self::{Adopted, LaunchPlan, adopt};
+// `Adopted`, `LaunchPlan` and `adopt` are declared below in this module, not in
+// a submodule, so `lib.rs` reaches them as `launcher::{Adopted, LaunchPlan,
+// adopt}` without any re-export here — a `pub` item of a `pub` module is
+// already public at that path.
+//
+// **There must be no `pub use self::{…}` for them, and the earlier draft had
+// one.** An item declared in a module and then re-imported into that same
+// module under the same name is `E0255`, "the name `Adopted` is defined
+// multiple times" — verified with a bare `rustc` probe. The line was copied
+// from the three re-exports above, which are `pub use self::<module>::…` and
+// are correct precisely because those names live in submodules.
 
 use std::ffi::OsString;
 use std::io::Read;
 use std::net::TcpListener;
+
+use tracing::debug;
 
 use crate::error::Result;
 
@@ -2066,7 +2271,11 @@ impl LaunchPlan {
 
 ```
 
-Add to `lib.rs` — the module declarations, then one re-export group per module. **This block is where the earlier draft was wrong twice over**: it listed `Access` among the `launcher` names, which do not include it, and it omitted `Error`, `Result`, `Exposure` and `Sandbox` — all four of which the facade re-exports, so the facade could not have compiled against it:
+Add to `lib.rs` — the module declarations, then one re-export group per module. **This block is where the earlier draft was wrong twice over**: it listed `AccessMode` among the `launcher` names, which do not include it, and it omitted `Error`, `Result`, `Exposure` and `Sandbox` — all four of which the facade re-exports, so the facade could not have compiled against it.
+
+**Restore the crate-level doc's intra-doc link while you are in the file.** Step 6 wrote `Backend` as plain code text because the trait did not exist yet and an unresolvable link fails the `cargo doc` leg under `-D warnings`; this task is the one that adds the trait, so change that occurrence back to `` [`Backend`] `` in the same edit. The crate must not end the phase with the link still suppressed.
+
+**`pub use crate::_core::AccessMode;` is already in the file — Step 6 wrote it — and it must not be written a second time.** It is repeated in the block below only because this block is the authoritative statement of the whole surface; merging it into the file means leaving the existing line where it is. A second `pub use` of the same item is not a harmless duplicate: it is `E0252`, "the name `AccessMode` is defined multiple times", which the lint step then reports as an error under `-D warnings` as well. The `#[doc(hidden)] pub extern crate tinio_core as _core;` that makes the path resolve is Step 6's too, and is not repeated here either.
 
 ```rust
 pub mod backend;
@@ -2074,36 +2283,34 @@ pub mod event;
 pub mod launcher;
 
 pub use self::{
-    access::Access,
     backend::{Backend, Confinement},
     error::{Error, Result},
     event::Event,
     launcher::{
-        Adopted, Child, LaunchPayload, LaunchPlan, LISTENER_FD_PREFIX, Observer, Terminal, adopt,
+        Adopted, Child, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer, Terminal, adopt,
         is_listener_fd_arg, listener_fd_arg, listener_fd_from_arg, supervise,
     },
     sandbox::{Exposure, Sandbox},
 };
+
+// `tinio-core`'s type rather than this crate's, reached through its alias — see
+// Step 6. This block is the authoritative list.
+pub use crate::_core::AccessMode;
 ```
 
-**Read the groups, not just the names.** `Access` comes from `access`, the four vocabulary items from `error` and `sandbox`, and the launcher machinery from `launcher` — and the facade re-exports this same list name for name, which is what makes `tinio_sandbox::` a complete alias of `tinio_sandbox_core::` rather than a subset that drifts.
+**The order of the two groups is rustfmt's, not a preference**: `rustfmt` with the workspace's `reorder_imports` puts the `self::{…}` group first and the aliased dependency re-export after it. Writing them the other way round is a `cargo +nightly fmt --all -- --check` failure, not a compile error.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+**Read the groups, not just the names.** `AccessMode` comes from `tinio-core` — the one entry that is a re-export of another crate rather than a module of this one, written through that crate's alias (`#[doc(hidden)] pub extern crate tinio_core as _core;`, so `pub use crate::_core::AccessMode;`) because `docs/style.md` §Imports reaches every workspace dependency that way — the four vocabulary items from `error` and `sandbox`, and the launcher machinery from `launcher`. The facade re-exports this same list name for name, which is what makes `tinio_sandbox::` a complete alias of `tinio_sandbox_core::` rather than a subset that drifts, and `AccessMode` travels through it the same way: `tinio_sandbox::AccessMode` resolves even though the facade has no `tinio-core` dependency of its own, because the type is reachable through the core's public surface.
+
+- [x] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-core`
-Expected: PASS — the payload round trips as one JSON line, a truncated or foreign line is rejected, the five supervision cases hold on both unix and Windows (including the one whose relay sleeps past the child's exit, which fails unless the wait joins it), every event round trips including the newline case, a frame split across reads is assembled whole rather than in part, the relay drops what does not decode, `adopt` returns `None` for empty argv without touching stdin, and the observer records the first terminal event the child reported.
+Expected: PASS — the payload round trips as one JSON line, a truncated or foreign line is rejected, the six supervision cases hold on both unix and Windows (including the one whose relay sleeps past the child's exit, which fails unless the wait joins it, and `a_real_childs_frame_reaches_the_terminal_through_the_relay`, the composed seam test: a real child's frame relayed by `Observer` on a `std::thread` — the thread both launcher platforms spawn, whose runtime is that thread's own — through `Child::new(…).with_relay(…)`, `supervise` and out as `Child::terminal()`. It is written as a `#[tokio::test]` with `async fn`, as `docs/tests.md` requires, and the one `Runtime::block_on` that drives the relay stands inside the relay's own thread, which is the production shape rather than a way of writing the test; removing `Child::wait`'s join fails it, `None` against the exact `Terminal::Listening(addr)` the child printed), every event round trips including the newline case, a frame split across reads is assembled whole rather than in part, the relay drops what does not decode, `adopt` returns `None` for empty argv without touching stdin, and the observer records the first terminal event the child reported. Plus the four cases added after the first review: `adopt` leaves stdin untouched when argv carries no listener element — pinned by a reader that panics on any read, because an EOF-returning reader proves nothing — `adopt` returns the configuration text it was sent, a `retry:` frame does not strand the event behind it, and a frame larger than `MAX_FIELD` is skipped with the good frame behind it still arriving — plus one case added by the code-review fix batch: `the_field_limit_decodes_just_under_and_refuses_just_over` pins `Event::decode`'s own share of `MAX_FIELD`, one byte either side, because the public seam had been left on the dependency's 512 KiB default while only the relay pinned 64 KiB — plus one case from the tracing batch, `adopt_logs_its_outcome_and_why`: `adopt` is the operation of the traced four that needs no child process, so its outcome is the one a test can record without one. It installs a **process-wide** recorder (`tracing` caches each callsite's interest process-wide, so a thread-local one loses events a concurrent test's rebuild never saw) and asserts the `step` and `payload` fields of one event per call — `absent`, `decoded`, `rejected` — rather than any rendered text, which is what makes "it logs" a property this suite can lose.
 
-- [ ] **Step 9: Confirm the core carries no FFI**
+- [x] **Step 9: Confirm the core carries no FFI**
 
 Run: `rg -n 'unsafe|allow\(unsafe_code\)' crates/tinio-sandbox-core/src`
 Expected: no hits. The core is `forbid` and stays that way.
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add crates/tinio-sandbox-core
-git commit -m "feat(sandbox): add the Backend trait, the event stream and the launcher machinery"
-```
 
 ---
 
@@ -2116,16 +2323,17 @@ git commit -m "feat(sandbox): add the Backend trait, the event stream and the la
 - Create: `crates/tinio-sandbox-linux/{Cargo.toml,src/lib.rs}`
 - Create: `crates/tinio-sandbox-macos/{Cargo.toml,src/lib.rs}`
 - Create: `crates/tinio-sandbox-windows/{Cargo.toml,src/lib.rs}`
+- Modify: `.github/workflows/ci.yml` (the lint job's comment: the macOS crate's crate-root `#![cfg]` leaves its body unlinted on both clippy legs, and that window closes with P3)
 - Modify: `Cargo.toml` (workspace root)
 - Modify: `README.md`
 
 **Interfaces:**
 - Consumes: `Backend`, `Confinement`, `LaunchPlan`, `Sandbox`, `Error` from the core.
-- Produces: `tinio_sandbox::{Access, Sandbox, Backend, Confinement, LaunchPlan, platform, Platform}` — the facade's surface, which every consumer names and nothing else does.
+- Produces: `tinio_sandbox::{AccessMode, Sandbox, Backend, Confinement, LaunchPlan, platform, Platform}` — the facade's surface, which every consumer names and nothing else does.
 
 The macOS and Windows bodies are `Unsupported` stubs. They exist now because the trait's shape must be exercised from both shapes — an in-process backend and a launcher backend — before either platform phase is written against it; a trait with one implementor is a guess (design decision 3, §3).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox/tests/facade.rs`:
 
@@ -2133,7 +2341,12 @@ The macOS and Windows bodies are `Unsupported` stubs. They exist now because the
 //! The facade is the only crate a consumer names, so it is the only place
 //! that has to prove the platform selection actually resolves.
 
-use tinio_sandbox::{Access, Backend, LaunchPlan, Sandbox, platform};
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::process::ExitStatus;
+use std::thread::JoinHandle;
+
+use tinio_sandbox::{AccessMode, Backend, LaunchPlan, Sandbox, platform};
 
 #[test]
 fn the_facade_resolves_exactly_one_backend() {
@@ -2150,30 +2363,39 @@ fn the_facade_resolves_exactly_one_backend() {
 
 #[test]
 fn the_vocabulary_is_re_exported() {
-    let sandbox = Sandbox::new().expose("/srv/data", Access::ReadOnly);
+    let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
     assert_eq!(sandbox.exposures().len(), 1);
-    assert_eq!(sandbox.exposures()[0].access, Access::ReadOnly);
+    assert_eq!(sandbox.exposures()[0].access, AccessMode::ReadOnly);
 }
 
 /// Every item the facade publishes, named through `tinio_sandbox::`.
 ///
-/// **This test is the reason the facade's re-export list cannot quietly fall
-/// behind the core's.** The rule is that the two lists are equal — the facade
-/// re-exports the core's public surface name for name — and an earlier draft
-/// broke it in the direction that fails late: the facade named `Error`,
-/// `Result`, `Exposure` and `Sandbox` that the core did not export at all, so
-/// nothing compiled, while `Event`, `reemit`, `adopt` and `Adopted` had been
-/// missing in the other direction. Naming every item here turns both into a
-/// compile error in this crate.
+/// **This test enforces one direction, and the direction it cannot enforce is
+/// worth naming rather than implying.** Every binding below names a
+/// `tinio_sandbox::` item together with the shape the core gives it, so the
+/// facade has to supply that name with that shape: a name the facade claims
+/// while the core does not publish it — or publishes with a different
+/// signature, which the `fn`-pointer bindings catch — fails to compile here,
+/// and so does a facade that stops re-exporting one of the names listed.
+/// An earlier draft was wrong in both of those ways at once: it named `Error`,
+/// `Result`, `Exposure` and `Sandbox` that the core did not export, while
+/// `Event`, `adopt` and `Adopted` were missing from it. **`reemit` is not one of
+/// these either way**: it is `pub(crate)` and `#[cfg(test)]`, so it is a name
+/// neither list has ever had to carry.
+///
+/// **What it cannot see is a name that is not in this list.** A core item added
+/// later and never re-exported leaves the facade — and this test — compiling,
+/// so "the two lists are equal" is the rule those additions are made under
+/// rather than a property this test proves. The paths are not mirrored either:
+/// the facade publishes names flat, so `tinio_sandbox::launcher::Observer` does
+/// not exist even though `tinio_sandbox_core::launcher::Observer` does.
 ///
 /// Written as a binding per item rather than a `use` list so the failure names
 /// the missing symbol.
 #[test]
 fn the_launcher_surface_is_re_exported() {
-    use std::ffi::{OsStr, OsString};
-    use std::io;
-    use std::process::ExitStatus;
-    use std::thread::JoinHandle;
+    // The imports this test needs are at the file top, not here: `docs/style.md`
+    // says "Top `use`; never inline".
 
     // The vocabulary — Task 1's half of the surface.
     let _: fn() -> tinio_sandbox::Sandbox = tinio_sandbox::Sandbox::new;
@@ -2181,7 +2403,7 @@ fn the_launcher_surface_is_re_exported() {
         tinio_sandbox::Sandbox::exposures;
     let _: fn(Vec<tinio_sandbox::Exposure>, bool) -> tinio_sandbox::Sandbox =
         tinio_sandbox::Sandbox::from_exposures;
-    let _: fn(tinio_sandbox::Access) -> bool = tinio_sandbox::Access::is_writable;
+    let _: fn(tinio_sandbox::AccessMode) -> bool = tinio_sandbox::AccessMode::is_read_only;
     let _: fn(&tinio_sandbox::Error) -> String = |err| err.to_string();
     let _: tinio_sandbox::Result<()> = Ok(());
 
@@ -2245,12 +2467,12 @@ fn the_launcher_platforms_answer_unimplemented_for_now() {
 
 **This test is the stub's, and the phase that implements a backend is the one that changes it.** It asserts what the stub answers today, so replacing a stub with a real backend makes the assertion false on that platform — `2026-09-18-sandbox-p2-windows.md` narrows this test's `#[cfg]` to macOS as part of its Task 1 (the crate stops being a stub there), and P3 removes the test when its own backend lands. What P0 pins is that the *facade* reaches the platform's `Backend`; that any backend refuses forever was never the claim.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox`
 Expected: FAIL — the package does not exist.
 
-- [ ] **Step 3: Write the facade**
+- [x] **Step 3: Write the facade**
 
 `crates/tinio-sandbox/Cargo.toml`:
 
@@ -2297,11 +2519,23 @@ unsafe_code = "forbid"
 //! # Examples
 //!
 //! ```
-//! use tinio_sandbox::{Access, Sandbox};
+//! use tinio_sandbox::{AccessMode, Sandbox};
 //!
-//! let sandbox = Sandbox::new().expose("/srv/tinio", Access::ReadWrite);
+//! let sandbox = Sandbox::new().expose("/srv/tinio", AccessMode::ReadWrite);
 //! assert_eq!(sandbox.exposures().len(), 1);
 //! ```
+
+#[doc(hidden)]
+pub extern crate tinio_sandbox_core as _core;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub extern crate tinio_sandbox_linux as _linux;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub extern crate tinio_sandbox_macos as _macos;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub extern crate tinio_sandbox_windows as _windows;
 
 // **Exactly the core's public surface, name for name, and that equality is the
 // rule rather than an accident.** A consumer of this facade is the `serve`
@@ -2313,44 +2547,59 @@ unsafe_code = "forbid"
 //
 // The list is kept in the core's grouping (vocabulary, then launcher) so the two
 // can be compared by eye, and Task 3's `the_launcher_surface_is_re_exported`
-// binds every name so a drift is a compile error here rather than a discovery
-// three phases later.
-pub use tinio_sandbox_core::{
-    Access, Adopted, Backend, Child, Confinement, Error, Event, Exposure, LaunchPayload,
-    LaunchPlan, LISTENER_FD_PREFIX, Observer, Result, Sandbox, Terminal, adopt, is_listener_fd_arg,
+// binds every name it lists — so a name that stops resolving, or that changes
+// shape, is a compile error in that test rather than a discovery three phases
+// later. A name *added* to the core is still this list's to gain by hand: see
+// the comment on that test.
+pub use crate::_core::{
+    AccessMode, Adopted, Backend, Child, Confinement, Error, Event, Exposure, LISTENER_FD_PREFIX,
+    LaunchPayload, LaunchPlan, Observer, Result, Sandbox, Terminal, adopt, is_listener_fd_arg,
     listener_fd_arg, listener_fd_from_arg, supervise,
 };
 
-#[cfg(target_os = "linux")]
-pub use tinio_sandbox_linux::{Backend as PlatformBackend, backend};
-
-#[cfg(target_os = "macos")]
-pub use tinio_sandbox_macos::{Backend as PlatformBackend, backend};
-
-#[cfg(target_os = "windows")]
-pub use tinio_sandbox_windows::{Backend as PlatformBackend, backend};
-
-/// The backend for the platform this build targets.
-pub type Platform = PlatformBackend;
-
-/// The platform's backend, constructed with its defaults.
+/// The backend for the platform this build targets, and the constructor for it.
 ///
 /// # Examples
 ///
 /// ```
-/// let backend = tinio_sandbox::platform();
+/// let backend: tinio_sandbox::Platform = tinio_sandbox::platform();
 /// let _ = backend;
 /// ```
-pub fn platform() -> Platform {
-    backend()
-}
+#[cfg(target_os = "linux")]
+pub use crate::_linux::{Backend as Platform, backend as platform};
+
+/// The backend for the platform this build targets, and the constructor for it.
+///
+/// # Examples
+///
+/// ```
+/// let backend: tinio_sandbox::Platform = tinio_sandbox::platform();
+/// let _ = backend;
+/// ```
+#[cfg(target_os = "macos")]
+pub use crate::_macos::{Backend as Platform, backend as platform};
+
+/// The backend for the platform this build targets, and the constructor for it.
+///
+/// # Examples
+///
+/// ```
+/// let backend: tinio_sandbox::Platform = tinio_sandbox::platform();
+/// let _ = backend;
+/// ```
+#[cfg(target_os = "windows")]
+pub use crate::_windows::{Backend as Platform, backend as platform};
 ```
+
+**Each platform arm is one re-export of two names, and the doc comment is repeated per arm rather than written once.** The alias *is* the selection: a name the consumer uses must resolve on the target that selects it, and a doc comment only survives the build it is compiled in — so a comment on the Linux arm alone would leave `Platform` undocumented on the other two. `Backend as Platform` and `backend as platform` are the names the consumers already use, so there is no second name for either fact: an earlier shape re-exported `Backend as PlatformBackend` and `backend` and then re-bound them with `pub type Platform = PlatformBackend;` and `pub fn platform() -> Platform { backend() }`, which gave one item four names and a wrapper whose only job was to rename.
+
+**Every `#[cfg]` above is written twice for one reason, and both copies are load-bearing.** The alias declarations put the dependencies behind `docs/style.md`'s rule (`crate::_core::{…}`, `crate::_linux::{…}` rather than each crate's own name), and a platform alias carries the *same* gate as the re-export it feeds, because the `extern crate` it declares names a crate that exists only on that target: an ungated `pub extern crate tinio_sandbox_linux as _linux;` is `E0463: can't find crate` on the other two hosts, from the declaration rather than from a use.
 
 A platform other than the three has no selection and therefore no `platform()` — the compile error names the missing crate, which is the honest outcome for a platform the design does not support (design §2).
 
-- [ ] **Step 4: Write the three platform crates**
+- [x] **Step 4: Write the three platform crates**
 
-`crates/tinio-sandbox-linux/Cargo.toml` — the real one, whose body P1 fills (plus the `Model` enum spelled in full at the end of this script block):
+`crates/tinio-sandbox-linux/Cargo.toml` — the real one, whose body P1 fills (plus the `Mechanism` enum spelled in full at the end of this script block):
 
 ```toml
 [package]
@@ -2401,9 +2650,12 @@ For this task the crate needs only enough to satisfy the facade test:
 
 #![cfg(target_os = "linux")]
 
+#[doc(hidden)]
+pub extern crate tinio_sandbox_core as _core;
+
 use std::io;
 
-use tinio_sandbox_core::{Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox};
+use crate::_core::{Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox};
 
 /// The Linux backend.
 ///
@@ -2443,8 +2695,17 @@ impl BackendTrait for Backend {
 /// let backend = tinio_sandbox_linux::backend();
 /// let _ = backend;
 /// ```
+// **`Backend`, not `Backend::default()`** — verified on Linux, where this
+// crate's body is actually linted: `Backend` is a unit struct, so
+// `Backend::default()` trips `clippy::default_constructed_unit_structs` and
+// `-D warnings` turns it into a build failure. The macOS and Windows stubs
+// already spell it this way; this crate was the odd one out, and the
+// discrepancy is invisible on any non-Linux host because the crate-root
+// `#![cfg]` leaves their bodies unlinted there. The `# Examples` blocks above
+// keep `Backend::default()`: doctests are not linted, and the example is there
+// to show the derived `Default` exists.
 pub fn backend() -> Backend {
-    Backend::default()
+    Backend
 }
 
 /// Which confinement mechanism Linux uses (design decision 7).
@@ -2457,8 +2718,17 @@ pub fn backend() -> Backend {
 /// that simply happens to be cheap to spell in full. What P1 adds is the
 /// *behaviour* — `Resolved`, `from_env`, `resolved()` and the availability
 /// probe — not the variants.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_linux::Mechanism;
+///
+/// assert_eq!(Mechanism::default(), Mechanism::Auto);
+/// assert_ne!(Mechanism::Root, Mechanism::UserNamespace);
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Model {
+pub enum Mechanism {
     /// Prefer the user namespace; resolve the fallback at confinement time.
     #[default]
     Auto,
@@ -2496,15 +2766,19 @@ with a body that exists to be filled in:
 //! of the `Backend` contract is exercised from here onward; the implementation
 //! lands with P3 (`docs/superpowers/plans/2026-09-18-sandbox-p3-macos.md`).
 //!
-//! Behind `#![cfg(target_os = "macos")]` so the workspace builds on every host
-//! (see the Global Constraints bullet). **P3 replaces this stub and may drop the
-//! line**: that plan's shape is a crate which compiles everywhere with each
+//! Behind `#![cfg(target_os = "macos")]` so the workspace builds on every host:
+//! `members = ["crates/*"]` has no per-target form, so this crate compiles — and
+//! lints — on targets it does not serve. **P3 replaces this stub and may drop
+//! the line**: that plan's shape is a crate which compiles everywhere with each
 //! macOS-specific item gated internally, and both shapes satisfy the same rule.
 //! Separate targets repeat whichever gate they need.
 
 #![cfg(target_os = "macos")]
 
-use tinio_sandbox_core::{Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox};
+#[doc(hidden)]
+pub extern crate tinio_sandbox_core as _core;
+
+use crate::_core::{Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox};
 
 /// The macOS backend.
 ///
@@ -2540,6 +2814,8 @@ pub fn backend() -> Backend {
 
 The Windows crate is the same with `windows` for `macos`, "AppContainer" for "Seatbelt", and `#![cfg(target_os = "windows")]` as its gate.
 
+**Each of the three reaches the core through the alias, like every other crate in this workspace that depends on one** (`docs/style.md` §Imports): `#[doc(hidden)] pub extern crate tinio_sandbox_core as _core;` in the crate's own `lib.rs`, then `use crate::_core::{…}`. The alias sits **after** the crate-root `#![cfg]` — inner attributes must precede items — and it needs no gate of its own, because a false crate-root `#![cfg]` strips the whole body, this line included. **These three crates are the templates P1, P2 and P3 copy, so the form matters more here than anywhere else in the plan**: those phases' own code blocks predate it, and shared §1 says how they are corrected.
+
 Add to the root `Cargo.toml`, alphabetically:
 
 ```toml
@@ -2555,29 +2831,44 @@ Update the README row added in Task 1 to name all five:
 | `tinio-sandbox` / `-core` / `-linux` / `-macos` / `-windows` | Process confinement: the `Backend` contract, per-platform implementations, and a facade |
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox`
 Expected: PASS. On Linux the `linux_selects_the_in_process_backend` case passes; on macOS and Windows the launcher-stub case does.
 
-- [ ] **Step 6: Prove the layering has no cycle**
+- [x] **Step 6: Prove the layering has no cycle**
 
 Run: `cargo tree -p tinio-sandbox-linux`
 Expected: `tinio-sandbox-linux` → `tinio-sandbox-core` and nothing else from this workspace. If `tinio-sandbox` appears anywhere in that tree, a platform crate has picked up a facade dependency and the layering is broken.
 
-- [ ] **Step 7: Verify every crate's lint**
+- [x] **Step 7: Verify every crate's lint**
 
 Run: `rg -n 'unsafe_code' crates/tinio-sandbox*/Cargo.toml`
 Expected: `tinio-sandbox-linux` is `"deny"`; core, facade, macos and windows are `"forbid"`.
 
-- [ ] **Step 8: Commit**
+---
+
+## Commit
+
+**One commit, made by hand, at the end of the phase.** No task in this plan commits, so every change accumulates in the working tree and the phase is reviewed as one diff rather than a commit per task. `CLAUDE.md` owns the authorisation rule — git writes are asked for per operation, and the index is never written by an agent — so this section fixes the phase's **scope** and its message, and is not permission to run it.
+
+Run the full Standard acceptance block (`docs/tests.md`) first, and commit only once the phase's own review is clean. The message is a conventional header plus single-line cause-and-effect bullets: what changed and why, never where it lives. It is a starting point rather than a description of finished work — where the phase's actual run makes a line of it false, that line changes.
 
 ```bash
-git add Cargo.toml Cargo.lock crates/tinio-sandbox crates/tinio-sandbox-linux crates/tinio-sandbox-macos crates/tinio-sandbox-windows README.md
-git commit -m "feat(sandbox): add the facade and the three platform crates"
-```
+git add Cargo.toml Cargo.lock README.md crates/tinio-sandbox-core crates/tinio-sandbox crates/tinio-sandbox-linux crates/tinio-sandbox-macos crates/tinio-sandbox-windows .github/workflows/ci.yml docs/superpowers/plans/2026-09-18-sandbox-p0-core.md docs/superpowers/plans/2026-09-18-sandbox-shared.md docs/superpowers/specs/2026-09-18-sandbox-design.md
+git commit -F - <<'EOF'
+feat(sandbox): add the confinement contract and the launcher machinery
 
----
+- One trait, one method: Confinement keeps the cfg out of main
+- Builder stays pure data; validation is the platform's job
+- Payload on stdin, one JSON object: no nonce, nothing to forge
+- Listener descriptor in argv: a socket cannot ride on a stream
+- Stdout is a protocol: SSE framing survives a newline in a message
+- One decoder per stream: a per-call one drops frames split mid-value
+- Relay answer read after the join, or a healthy child reads as never ready
+- Five crates, three stubs: the trait is exercised from both shapes
+EOF
+```
 
 ## Self-Review
 
@@ -2598,7 +2889,7 @@ git commit -m "feat(sandbox): add the facade and the three platform crates"
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". One deliberate judgement call is flagged inline rather than hidden: the `ALL_CAPABILITIES`-style enumeration problems that the platform crates hit are theirs, not this plan's; the only enumeration here is the module and re-export lists, which are written out in full.
 
-**Type consistency.** This is the plan where that check matters most, because three other plans consume what it defines. `Access`, `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures(exposures, device_files)`), `Error::{Step, Unsupported, BadPath, Launch, Wait}` (Task 1) are used verbatim by Tasks 2 and 3 and by all three platform plans. `Backend`, `Confinement`, `Child` (`new`, `with_relay`, `wait`, `terminal`), `supervise(&mut Child, teardown)`, `LaunchPlan`, `LaunchPayload`, `Adopted`, `adopt`, `Event`, `Observer`, `Terminal`, `LISTENER_FD_PREFIX` and the three `listener_fd_*` helpers (Tasks 2 and 3) are the surface P1, P2 and P3 were reconciled to; the reconciliation is recorded in Task 2 Step 6, including what each platform plan had invented for itself and why it is now here instead.
+**Type consistency.** This is the plan where that check matters most, because three other plans consume what it defines. `AccessMode` (Task 1, and **spelled by `tinio-core`, not by this plan**: the two variants are `ReadWrite` and `ReadOnly`, the predicate is `is_read_only()`, and there is no `is_writable`), `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures(exposures, device_files)`), `Error::{Step, Unsupported, BadPath, Launch, Wait}` (Task 1) are used verbatim by Tasks 2 and 3 and by all three platform plans. `Backend`, `Confinement`, `Child` (`new`, `with_relay`, `wait`, `terminal`), `supervise(&mut Child, teardown)`, `LaunchPlan`, `LaunchPayload`, `Adopted`, `adopt`, `Event`, `Observer`, `Terminal`, `LISTENER_FD_PREFIX` and the three `listener_fd_*` helpers (Tasks 2 and 3) are the surface P1, P2 and P3 were reconciled to; the reconciliation is recorded in Task 2 Step 6, including what each platform plan had invented for itself and why it is now here instead.
 
 **What is deliberately *not* on that surface**, and the reason each one left it:
 

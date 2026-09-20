@@ -122,12 +122,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 2 clippy runs, both on ubuntu. The unix leg lints linux AND macos:
-        # the source has no cfg(target_os = "macos") — every macOS code path
-        # is cfg(unix) — so a native linux clippy covers it (linux + macos
-        # share this one compile). The windows-gnu leg cross-lints the
-        # cfg(windows) code; the macos/msvc-native clippy legs are dropped
-        # (their compile coverage already comes from the test-port matrix).
+        # 2 clippy runs, both on ubuntu. The unix leg lints linux and the
+        # cfg(unix) code; the windows-gnu leg cross-lints the cfg(windows)
+        # code. The macos/msvc-native clippy legs are dropped (their compile
+        # coverage already comes from the test-port matrix).
+        #
+        # **Neither of these two legs lints the macOS sandbox crate's body, and
+        # that window closes with P3.** The reason the unix leg used to stand in
+        # for macOS — "the source has no cfg(target_os = "macos"), every macOS
+        # code path is cfg(unix)" — stopped being true when
+        # crates/tinio-sandbox-macos/src/lib.rs took a crate-root
+        # `#![cfg(target_os = "macos")]`: on both legs the crate is now an empty
+        # library, so no line of it reaches clippy here. **That is this job's
+        # gap and not the workflow's**: test-port runs on macos-latest, where
+        # the gate is satisfied, and its run-test-leg compiles the crate's body
+        # and runs its doctests — what is missing is the lint, because there is
+        # no macOS clippy leg. It is the same shape that hid a real defect in
+        # tinio-sandbox-linux (clippy::default_constructed_unit_structs, seen
+        # only by running clippy on Linux). P3 drops that gate and compiles the
+        # crate on every target with per-item gating, which brings its body back
+        # under this job
+        # (docs/superpowers/plans/2026-09-18-sandbox-p3-macos.md).
         target:
           - unix
           - windows-gnu

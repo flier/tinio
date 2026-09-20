@@ -14,7 +14,7 @@
 
 **Prerequisite: `2026-09-18-sandbox-p0-core.md`.** That plan builds `tinio-sandbox-core`, the facade and the three platform-crate stubs, and it is where the launcher-shared surface is defined. This plan consumes it and adds nothing to it. In particular it relies on, from P0:
 
-- `Access`, `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures`), `Error`, `Result`
+- `AccessMode`, `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures`), `Error`, `Result`
 - `Backend`, `Confinement`, and `tinio_sandbox_linux::Backend` existing as a stub this plan fills in
 - `Event` (`encode`), `LaunchPlan`, `LaunchPayload`, the `listener_fd_*` helpers
 - the facade `tinio_sandbox` re-exporting all of it
@@ -313,13 +313,6 @@ Register `pub mod jail;` and re-export `jail_root` and `mirror_under` from `tini
 Run: `cargo test -p tinio-sandbox-linux`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-linux
-git commit -m "feat(sandbox-linux): derive the jail root and mirror host paths into it"
-```
-
 ---
 
 ### Task 2: The mount plan (Linux)
@@ -329,8 +322,8 @@ git commit -m "feat(sandbox-linux): derive the jail root and mirror host paths i
 - Modify: `crates/tinio-sandbox-linux/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `Exposure`, `Access`, `jail_root`, `mirror_under`, `Model`.
-- Produces: `MountKind { JailTmpfs, Bind, OverlayReadOnly }`, `Mount { source, target, access, kind }`, `OverlayDirs { upper, work }`, `DEVICE_FILES`, `plan(sandbox: &Sandbox, jail: &Path, model: Model, overlay: &OverlayDirs) -> Result<Vec<Mount>>`.
+- Consumes: `Exposure`, `AccessMode`, `jail_root`, `mirror_under`, `Mechanism`.
+- Produces: `MountKind { JailTmpfs, Bind, OverlayReadOnly }`, `Mount { source, target, access, kind }`, `OverlayDirs { upper, work }`, `DEVICE_FILES`, `plan(sandbox: &Sandbox, jail: &Path, model: Mechanism, overlay: &OverlayDirs) -> Result<Vec<Mount>>`.
 
 This is the pure composition of design §4's table. **What it no longer decides is which mechanism makes a read-only exposure read-only, and that is the change the design's 2026-09-19 re-measurement forced.** The rule this paragraph used to state — "a `ReadOnly` exposure under the user-namespace model needs an overlay, because an unprivileged user namespace cannot `remount,bind,ro` a bind of a host-owned superblock" — is **false**, and the design's §4 and its evidence table now carry the measurement that falsified it: an ext4 bind and a drvfs bind both take `MS_REMOUNT|MS_BIND|MS_RDONLY` under an unprivileged namespace, and a write through them then fails `EROFS`. What refuses the remount is the family a user namespace may mount itself — tmpfs, devtmpfs, procfs, sysfs, and a subdirectory of a tmpfs with them — so **the mechanism follows the filesystem and the privilege, not the model**. The design settles it, and this plan implements what the design settles: every `ReadOnly` exposure enters the table as [`MountKind::Bind`] with read-only access under either model, and Task 5's `apply_mount` is what turns it read-only — the remount first, and the `MS_RDONLY` overlay **as its fallback** where the kernel answers the remount with `EPERM`. A reader who knew the old rule should expect no model test here; this paragraph says so in full because the code will otherwise look wrong to exactly that reader.
 
@@ -341,7 +334,7 @@ This is the pure composition of design §4's table. **What it no longer decides 
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use tinio_sandbox_core::{Access, Error, Sandbox};
+    use tinio_sandbox_core::{AccessMode, Error, Sandbox};
 
     use super::*;
 
@@ -356,16 +349,16 @@ mod tests {
 
     #[test]
     fn the_jail_tmpfs_is_always_first() {
-        let sandbox = Sandbox::new().expose("/srv/deep/data", Access::ReadWrite);
-        let mounts = plan(&sandbox, Path::new(JAIL), Model::Root, &overlay()).unwrap();
+        let sandbox = Sandbox::new().expose("/srv/deep/data", AccessMode::ReadWrite);
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root, &overlay()).unwrap();
         assert_eq!(mounts[0].kind, MountKind::JailTmpfs);
         assert_eq!(mounts[0].target, PathBuf::from(JAIL));
     }
 
     #[test]
     fn read_write_exposure_is_a_plain_bind_in_both_models() {
-        let sandbox = Sandbox::new().expose("/srv/data", Access::ReadWrite);
-        for model in [Model::UserNamespace, Model::Root] {
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
+        for model in [Mechanism::UserNamespace, Mechanism::Root] {
             let mounts = plan(&sandbox, Path::new(JAIL), model, &overlay()).unwrap();
             let data = mounts.iter().find(|m| m.source == Path::new("/srv/data")).unwrap();
             assert_eq!(data.kind, MountKind::Bind);
@@ -384,33 +377,33 @@ mod tests {
         // model test would be choosing by the wrong property and would be wrong
         // on exactly the filesystems a served root lives on, which is the
         // mistake this test exists to catch.
-        let sandbox = Sandbox::new().expose("/srv/data", Access::ReadOnly);
-        for model in [Model::UserNamespace, Model::Root] {
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
+        for model in [Mechanism::UserNamespace, Mechanism::Root] {
             let mounts = plan(&sandbox, Path::new(JAIL), model, &overlay()).unwrap();
             let data = mounts.iter().find(|m| m.source == Path::new("/srv/data")).unwrap();
             assert_eq!(data.kind, MountKind::Bind, "{model:?}");
-            assert!(!data.access.is_writable(), "{model:?}");
+            assert!(data.access.is_read_only(), "{model:?}");
         }
     }
 
     #[test]
     fn writable_exposures_stay_plain_binds_even_with_a_read_only_root() {
         let sandbox = Sandbox::new()
-            .expose("/srv/data", Access::ReadOnly)
-            .expose("/home/u/.tinio/roots/h", Access::ReadWrite);
-        let mounts = plan(&sandbox, Path::new(JAIL), Model::UserNamespace, &overlay()).unwrap();
+            .expose("/srv/data", AccessMode::ReadOnly)
+            .expose("/home/u/.tinio/roots/h", AccessMode::ReadWrite);
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace, &overlay()).unwrap();
         let state = mounts
             .iter()
             .find(|m| m.source == Path::new("/home/u/.tinio/roots/h"))
             .unwrap();
         assert_eq!(state.kind, MountKind::Bind, "a writable exposure takes no read-only mechanism");
-        assert!(state.access.is_writable());
+        assert!(!state.access.is_read_only());
     }
 
     #[test]
     fn device_files_come_last_and_are_binds() {
-        let sandbox = Sandbox::new().expose("/srv/data", Access::ReadWrite).device_files();
-        let mounts = plan(&sandbox, Path::new(JAIL), Model::Root, &overlay()).unwrap();
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite).device_files();
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root, &overlay()).unwrap();
         let tail = &mounts[mounts.len() - DEVICE_FILES.len()..];
         let names: Vec<&Path> = tail.iter().map(|mount| mount.source.as_path()).collect();
         assert_eq!(names, DEVICE_FILES.map(Path::new), "the four device files, in order");
@@ -421,7 +414,7 @@ mod tests {
                 PathBuf::from(format!("{JAIL}{}", mount.source.display())),
                 "a device file is mirrored at its own absolute path"
             );
-            assert!(mount.access.is_writable(), "a device file is bound read-write");
+            assert!(!mount.access.is_read_only(), "a device file is bound read-write");
         }
     }
 
@@ -433,15 +426,15 @@ mod tests {
         // which is the user namespace's case. Refused by name here rather than
         // surfaced later as an overlayfs error.
         let sandbox = Sandbox::new()
-            .expose("/srv/data", Access::ReadOnly)
-            .expose("/srv/other", Access::ReadOnly);
-        let err = plan(&sandbox, Path::new(JAIL), Model::UserNamespace, &overlay()).unwrap_err();
+            .expose("/srv/data", AccessMode::ReadOnly)
+            .expose("/srv/other", AccessMode::ReadOnly);
+        let err = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace, &overlay()).unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
         assert!(err.to_string().contains("read-only exposure"), "{err}");
 
         // The same two exposures are fine under root, where the remount is not
         // refused and the pair is therefore never reached.
-        assert!(plan(&sandbox, Path::new(JAIL), Model::Root, &overlay()).is_ok());
+        assert!(plan(&sandbox, Path::new(JAIL), Mechanism::Root, &overlay()).is_ok());
     }
 }
 ```
@@ -458,10 +451,10 @@ Expected: FAIL — `cannot find function 'plan'`.
 
 use std::path::{Path, PathBuf};
 
-use tinio_sandbox_core::{Access, Result, Sandbox};
+use tinio_sandbox_core::{AccessMode, Result, Sandbox};
 
 use crate::jail::mirror_under;
-use crate::model::Model;
+use crate::mechanism::Mechanism;
 
 /// The four device files bound into every jail that asks for them.
 pub const DEVICE_FILES: [&str; 4] = ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
@@ -476,7 +469,7 @@ pub struct Mount {
     /// absolute path.
     pub target: PathBuf,
     /// The access the confined process gets through this mount.
-    pub access: Access,
+    pub access: AccessMode,
     /// How to perform it.
     pub kind: MountKind,
 }
@@ -514,7 +507,7 @@ pub enum MountKind {
 /// **A write *through* the mounted exposure is `EROFS`, never `ENOSPC`, and the
 /// two cases used to be written as one.** Such a write is refused at the mount
 /// — it is `MS_RDONLY` from the start, so the tmpfs is never asked — which is
-/// what `Access::ReadOnly` means on this platform. The quota is the second
+/// what `AccessMode::ReadOnly` means on this platform. The quota is the second
 /// wall, and it stands behind the other door: the overlay's own directories,
 /// which the confined process reaches because they live in the jail's tmpfs and
 /// no mount covers them.
@@ -543,32 +536,32 @@ pub struct OverlayDirs {
 /// ```
 /// use std::path::Path;
 ///
-/// use tinio_sandbox_core::{Access, Sandbox};
-/// use tinio_sandbox_linux::{Model, OverlayDirs, plan};
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
+/// use tinio_sandbox_linux::{Mechanism, OverlayDirs, plan};
 ///
-/// let sandbox = Sandbox::new().expose("/srv/data", Access::ReadWrite);
+/// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
 /// let overlay = OverlayDirs { upper: "/tmp/j/.up".into(), work: "/tmp/j/.work".into() };
-/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Model::Root, &overlay).unwrap();
+/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &overlay).unwrap();
 /// assert_eq!(mounts.len(), 2, "the jail tmpfs plus the one exposure");
 /// ```
 pub fn plan(
     sandbox: &Sandbox,
     jail: &Path,
-    model: Model,
+    model: Mechanism,
     _overlay: &OverlayDirs,
 ) -> Result<Vec<Mount>> {
     let mut mounts = vec![Mount {
         source: PathBuf::from("tmpfs"),
         target: jail.to_path_buf(),
-        access: Access::ReadWrite,
+        access: AccessMode::ReadWrite,
         kind: MountKind::JailTmpfs,
     }];
 
-    if model == Model::UserNamespace
+    if model == Mechanism::UserNamespace
         && sandbox
             .exposures()
             .iter()
-            .filter(|exposure| exposure.access == Access::ReadOnly)
+            .filter(|exposure| exposure.access == AccessMode::ReadOnly)
             .count()
             > 1
     {
@@ -602,7 +595,7 @@ pub fn plan(
             mounts.push(Mount {
                 source: PathBuf::from(device),
                 target: mirror_under(jail, Path::new(device))?,
-                access: Access::ReadWrite,
+                access: AccessMode::ReadWrite,
                 kind: MountKind::Bind,
             });
         }
@@ -624,30 +617,23 @@ Register `pub mod plan;` and re-export `Mount`, `MountKind`, `OverlayDirs`, `pla
 Run: `cargo test -p tinio-sandbox-linux`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-linux
-git commit -m "feat(sandbox-linux): compose the jail mount plan"
-```
-
 ---
 
 ### Task 3: The model and the capability policy (Linux)
 
 **Files:**
-- Create: `crates/tinio-sandbox-linux/src/{model.rs,caps.rs}`
+- Create: `crates/tinio-sandbox-linux/src/{mechanism.rs,caps.rs}`
 - Modify: `crates/tinio-sandbox-linux/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `Access`, `Error`.
-- Produces: `Model::from_env`, `Model::resolved(euid, userns) -> Resolved`, `userns_available() -> Result<bool>`, **the crate's one `unshare(flags, step_name) -> Result<()>` wrapper** — `pub(crate)`, because Task 5's `enter` imports it and a private item cannot be imported — the second of its two `unsafe` sites, declared here because the probe is its first caller — `Resolved { UserNamespace, Root, Unavailable(&'static str) }`; `Cap { Chown }`, `retained(mode: Access, local_uid_configured: bool) -> &'static [Cap]`. The `Model` enum itself is P0's, declared complete in this crate's `lib.rs` and **re-exported from `model.rs`**, which is the path every other module in the crate imports it from.
+- Consumes: `AccessMode`, `Error`.
+- Produces: `Mechanism::from_env`, `Mechanism::resolved(euid, userns) -> Resolved`, `userns_available() -> Result<bool>`, **the crate's one `unshare(flags, step_name) -> Result<()>` wrapper** — `pub(crate)`, because Task 5's `enter` imports it and a private item cannot be imported — the second of its two `unsafe` sites, declared here because the probe is its first caller — `Resolved { UserNamespace, Root, Unavailable(&'static str) }`; `Cap { Chown }`, `retained(mode: AccessMode, local_uid_configured: bool) -> &'static [Cap]`. The `Mechanism` enum itself is P0's, declared complete in this crate's `lib.rs` and **re-exported from `mechanism.rs`**, which is the path every other module in the crate imports it from.
 
 `resolved` is the adaptive rule of design decision 7's decision table, pure and tested with an injected euid and an injected probe answer, so every branch is unit-testable without privileges. It takes the probe's answer as a parameter rather than calling it, which is what keeps the table exhaustively testable **and** is why the probe lives beside it as `userns_available()`: the parent cannot attempt an `unshare` and then fall back, because the call changes the calling process for good, so the question is asked by forking a child that is discarded. **The fork is bounded at both ends** — the read and the reap share one deadline — because the design's own evidence table records what an unbounded reap costs an operator: a probe that hangs is a startup that never fails (`userns_available` carries the row and the reasoning).
 
 - [ ] **Step 1: Write the failing tests**
 
-`model.rs`:
+`mechanism.rs`:
 
 ```rust
 #[cfg(test)]
@@ -656,29 +642,29 @@ mod tests {
 
     #[test]
     fn env_selects_the_model() {
-        assert_eq!(Model::from_env(Some("userns")).unwrap(), Model::UserNamespace);
-        assert_eq!(Model::from_env(Some("root")).unwrap(), Model::Root);
-        assert_eq!(Model::from_env(None).unwrap(), Model::Auto);
-        assert_eq!(Model::from_env(Some("")).unwrap(), Model::Auto);
-        assert!(Model::from_env(Some("bogus")).is_err(), "a typo must not pick a model");
+        assert_eq!(Mechanism::from_env(Some("userns")).unwrap(), Mechanism::UserNamespace);
+        assert_eq!(Mechanism::from_env(Some("root")).unwrap(), Mechanism::Root);
+        assert_eq!(Mechanism::from_env(None).unwrap(), Mechanism::Auto);
+        assert_eq!(Mechanism::from_env(Some("")).unwrap(), Mechanism::Auto);
+        assert!(Mechanism::from_env(Some("bogus")).is_err(), "a typo must not pick a model");
     }
 
     #[test]
     fn auto_prefers_the_user_namespace_when_the_probe_grants_it() {
-        assert_eq!(Model::Auto.resolved(1000, true), Resolved::UserNamespace);
-        assert_eq!(Model::Auto.resolved(0, true), Resolved::UserNamespace);
+        assert_eq!(Mechanism::Auto.resolved(1000, true), Resolved::UserNamespace);
+        assert_eq!(Mechanism::Auto.resolved(0, true), Resolved::UserNamespace);
     }
 
     #[test]
     fn auto_falls_back_to_root_when_the_probe_fails_and_we_are_root() {
         // Design decision 7's second tier: a hardened host that forbids
         // unprivileged user namespaces still works when started as root.
-        assert_eq!(Model::Auto.resolved(0, false), Resolved::Root);
+        assert_eq!(Mechanism::Auto.resolved(0, false), Resolved::Root);
     }
 
     #[test]
     fn auto_fails_closed_when_neither_tier_is_available() {
-        let Resolved::Unavailable(detail) = Model::Auto.resolved(1000, false) else {
+        let Resolved::Unavailable(detail) = Mechanism::Auto.resolved(1000, false) else {
             panic!("expected Unavailable");
         };
         assert!(detail.contains("sudo"), "{detail}");
@@ -690,22 +676,22 @@ mod tests {
         // Even as root: forcing a model means that model or nothing, so a
         // host with no user namespaces gets a refusal rather than a silent
         // root confinement the operator did not ask for.
-        assert_eq!(Model::UserNamespace.resolved(0, true), Resolved::UserNamespace);
+        assert_eq!(Mechanism::UserNamespace.resolved(0, true), Resolved::UserNamespace);
         assert!(matches!(
-            Model::UserNamespace.resolved(0, false),
+            Mechanism::UserNamespace.resolved(0, false),
             Resolved::Unavailable(_)
         ));
     }
 
     #[test]
     fn a_forced_root_model_is_refused_when_not_root() {
-        assert_eq!(Model::Root.resolved(0, false), Resolved::Root);
-        assert!(matches!(Model::Root.resolved(1000, false), Resolved::Unavailable(_)));
+        assert_eq!(Mechanism::Root.resolved(0, false), Resolved::Root);
+        assert!(matches!(Mechanism::Root.resolved(1000, false), Resolved::Unavailable(_)));
     }
 
     #[test]
     fn the_unavailable_reason_names_a_remedy() {
-        let Resolved::Unavailable(detail) = Model::Root.resolved(1000, false) else {
+        let Resolved::Unavailable(detail) = Mechanism::Root.resolved(1000, false) else {
             panic!("expected Unavailable");
         };
         assert!(detail.contains("sudo") || detail.contains("root"), "{detail}");
@@ -730,20 +716,20 @@ mod tests {
 ```rust
 #[cfg(test)]
 mod tests {
-    use tinio_sandbox_core::Access;
+    use tinio_sandbox_core::AccessMode;
 
     use super::*;
 
     #[test]
     fn read_only_retains_nothing() {
-        assert!(retained(Access::ReadOnly, false).is_empty());
-        assert!(retained(Access::ReadOnly, true).is_empty());
+        assert!(retained(AccessMode::ReadOnly, false).is_empty());
+        assert!(retained(AccessMode::ReadOnly, true).is_empty());
     }
 
     #[test]
     fn read_write_retains_chown_only_when_a_uid_mapping_exists() {
-        assert!(retained(Access::ReadWrite, false).is_empty());
-        assert_eq!(retained(Access::ReadWrite, true), &[Cap::Chown]);
+        assert!(retained(AccessMode::ReadWrite, false).is_empty());
+        assert_eq!(retained(AccessMode::ReadWrite, true), &[Cap::Chown]);
     }
 
     #[test]
@@ -755,30 +741,30 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-**Run: `cargo test -p tinio-sandbox-linux model::` then `cargo test -p tinio-sandbox-linux caps::`**
+**Run: `cargo test -p tinio-sandbox-linux mechanism::` then `cargo test -p tinio-sandbox-linux caps::`**
 Expected: FAIL — `Resolved` and `Cap` do not exist.
 
-**Two commands rather than one filter with a `\|` in it.** Cargo's test filter is a *substring* of the test's path, not a regex: `'model::\|caps::'` is a literal no test name contains, so the run would match nothing and exit 0 — a red test that reports green, which is the one failure mode a red step exists to prevent. Either half alone is a correct substring.
+**Two commands rather than one filter with a `\|` in it.** Cargo's test filter is a *substring* of the test's path, not a regex: `'mechanism::\|caps::'` is a literal no test name contains, so the run would match nothing and exit 0 — a red test that reports green, which is the one failure mode a red step exists to prevent. Either half alone is a correct substring.
 
-- [ ] **Step 3: Write `model.rs`**
+- [ ] **Step 3: Write `mechanism.rs`**
 
 ```rust
 //! Which confinement mechanism to use, and whether it is available.
 //!
-//! The `Model` enum itself lives in this crate's `lib.rs`, where P0 declares it
+//! The `Mechanism` enum itself lives in this crate's `lib.rs`, where P0 declares it
 //! complete (all three variants) so this task's tests and Task 2's can name
 //! them without a compile-order dependency. **It is re-exported from here** —
-//! `pub use crate::Model;` below — because that is the path the rest of the
-//! crate imports it from (`crate::model::Model` in `plan.rs`, `options.rs`,
-//! `enter.rs` and Task 5's test module), and an `impl Model` block in a module
+//! `pub use crate::Mechanism;` below — because that is the path the rest of the
+//! crate imports it from (`crate::mechanism::Mechanism` in `plan.rs`, `options.rs`,
+//! `enter.rs` and Task 5's test module), and an `impl Mechanism` block in a module
 //! that does not name the type does not compile. What is added here is the
-//! behaviour: `Resolved`, `Model::from_env`, `Model::resolved` and the
+//! behaviour: `Resolved`, `Mechanism::from_env`, `Mechanism::resolved` and the
 //! availability probe that makes `Auto` mean something.
 
 use std::io;
 use std::time::{Duration, Instant};
 
-pub use crate::Model;
+pub use crate::Mechanism;
 
 use tinio_sandbox_core::{Error, Result};
 use tracing::{debug, error};
@@ -808,7 +794,7 @@ fn step<Source: Into<io::Error>>(step_name: &'static str) -> impl Fn(Source) -> 
     move |source: Source| fail(step_name, source)
 }
 
-/// What [`Model::resolved`] decided.
+/// What [`Mechanism::resolved`] decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolved {
     /// Confine with an unprivileged user namespace.
@@ -819,8 +805,8 @@ pub enum Resolved {
     Unavailable(&'static str),
 }
 
-impl Model {
-    /// Read `TINIO_SANDBOX_MODEL`. Absent or empty means [`Model::Auto`].
+impl Mechanism {
+    /// Read `TINIO_SANDBOX_MODEL`. Absent or empty means [`Mechanism::Auto`].
     ///
     /// # Errors
     ///
@@ -1095,7 +1081,7 @@ mod tests {
 //! Which capabilities the confined process keeps.
 
 use rustix::thread::CapabilitySet;
-use tinio_sandbox_core::Access;
+use tinio_sandbox_core::AccessMode;
 
 /// A capability the confinement may retain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1141,17 +1127,17 @@ impl Cap {
 /// # Examples
 ///
 /// ```
-/// use tinio_sandbox_core::Access;
+/// use tinio_sandbox_core::AccessMode;
 /// use tinio_sandbox_linux::retained;
 ///
-/// assert!(retained(Access::ReadOnly, true).is_empty());
-/// assert_eq!(retained(Access::ReadWrite, true).len(), 1);
+/// assert!(retained(AccessMode::ReadOnly, true).is_empty());
+/// assert_eq!(retained(AccessMode::ReadWrite, true).len(), 1);
 /// ```
-pub const fn retained(mode: Access, local_uid_configured: bool) -> &'static [Cap] {
+pub const fn retained(mode: AccessMode, local_uid_configured: bool) -> &'static [Cap] {
     match (mode, local_uid_configured) {
-        (Access::ReadOnly, _) => &[],
-        (Access::ReadWrite, false) => &[],
-        (Access::ReadWrite, true) => &[Cap::Chown],
+        (AccessMode::ReadOnly, _) => &[],
+        (AccessMode::ReadWrite, false) => &[],
+        (AccessMode::ReadWrite, true) => &[Cap::Chown],
     }
 }
 
@@ -1161,19 +1147,12 @@ mod tests {
 }
 ```
 
-Register `pub mod caps;` and `pub mod model;`, and add to the crate's re-exports: `pub use self::model::{Resolved, userns_available};`. **`Model` is deliberately not in that list** — P0 declares `pub enum Model` in `lib.rs`, so it is already public there, and `use`-ing it back in beside its own definition is `E0255` ("must be defined only once in the type namespace of this module"). What `model.rs`'s own `pub use crate::Model` buys is the *other* direction: the crate-internal path `crate::model::Model` that `plan.rs`, `options.rs` and `enter.rs` import, which is where the earlier spelling of this plan had the type out of scope.
+Register `pub mod caps;` and `pub mod mechanism;`, and add to the crate's re-exports: `pub use self::mechanism::{Resolved, userns_available};`. **`Mechanism` is deliberately not in that list** — P0 declares `pub enum Mechanism` in `lib.rs`, so it is already public there, and `use`-ing it back in beside its own definition is `E0255` ("must be defined only once in the type namespace of this module"). What `mechanism.rs`'s own `pub use crate::Mechanism` buys is the *other* direction: the crate-internal path `crate::mechanism::Mechanism` that `plan.rs`, `options.rs` and `enter.rs` import, which is where the earlier spelling of this plan had the type out of scope.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-linux`
 Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/tinio-sandbox-linux
-git commit -m "feat(sandbox-linux): model selection and the capability policy"
-```
 
 ---
 
@@ -1586,14 +1565,7 @@ Expected: PASS. `install()` is not called by any unit test; the install is exerc
 - [ ] **Step 5: Confirm the unsafe surface is the three enumerated functions**
 
 Run: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-linux/src`
-Expected: exactly three hits — `model::userns_available` (the probe's `kernel_fork`), `model::unshare`, and this task's `seccomp::install`. Task 3 added the first two and this task adds the third, and the count stops here: a fourth would mean a second body for one of those syscalls, which is a decision rather than a detail.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/tinio-sandbox-linux
-git commit -m "feat(sandbox-linux): build and install the seccomp outbound filter"
-```
+Expected: exactly three hits — `mechanism::userns_available` (the probe's `kernel_fork`), `mechanism::unshare`, and this task's `seccomp::install`. Task 3 added the first two and this task adds the third, and the count stops here: a fourth would mean a second body for one of those syscalls, which is a decision rather than a detail.
 
 ---
 
@@ -1619,9 +1591,9 @@ The ordering is the whole design: validate, then `unshare`, then compose, then p
 mod tests {
     use std::path::PathBuf;
 
-    use tinio_sandbox_core::{Access, Backend as BackendTrait, Error, LaunchPlan, Sandbox};
+    use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, Error, LaunchPlan, Sandbox};
 
-    use crate::model::Model;
+    use crate::mechanism::Mechanism;
     use crate::options::LinuxOptions;
     use crate::Backend;
 
@@ -1646,7 +1618,7 @@ mod tests {
         // leave the process half-confined. `Auto` is the model here because it
         // resolves on any host this test can run on, which leaves the exposure
         // loop as the only thing that can refuse.
-        let sandbox = Sandbox::new().expose("relative", Access::ReadOnly);
+        let sandbox = Sandbox::new().expose("relative", AccessMode::ReadOnly);
         let mut backend = Backend::with_options(LinuxOptions::default().with_euid(0));
         let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
         assert!(matches!(err, Error::BadPath { .. }), "{err:?}");
@@ -1654,9 +1626,9 @@ mod tests {
 
     #[test]
     fn a_missing_path_is_refused_before_anything_irreversible_happens() {
-        let sandbox = Sandbox::new().expose("/no/such/path/at/all", Access::ReadOnly);
+        let sandbox = Sandbox::new().expose("/no/such/path/at/all", AccessMode::ReadOnly);
         let mut backend =
-            Backend::with_options(LinuxOptions::default().with_model(Model::Root).with_euid(0));
+            Backend::with_options(LinuxOptions::default().with_model(Mechanism::Root).with_euid(0));
         let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
         assert!(matches!(err, Error::BadPath { reason: "does not exist", .. }), "{err:?}");
     }
@@ -1665,9 +1637,9 @@ mod tests {
     fn an_unavailable_model_is_refused() {
         // Forced root without root: decided from the injected euid alone, with
         // no probe and therefore the same answer on every host.
-        let sandbox = Sandbox::new().expose("/", Access::ReadOnly);
+        let sandbox = Sandbox::new().expose("/", AccessMode::ReadOnly);
         let mut backend = Backend::with_options(
-            LinuxOptions::default().with_model(Model::Root).with_euid(1000),
+            LinuxOptions::default().with_model(Mechanism::Root).with_euid(1000),
         );
         let err = backend.confine(&sandbox, &LaunchPlan::new()).unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
@@ -1683,10 +1655,10 @@ mod tests {
         // cannot be decided before the probe, so it is checked against the
         // **resolved** model in `enter`; no unit test can drive that path,
         // because what the probe answers is a property of the host.
-        let sandbox = Sandbox::new().expose("/", Access::ReadOnly);
+        let sandbox = Sandbox::new().expose("/", AccessMode::ReadOnly);
         let mut backend = Backend::with_options(
             LinuxOptions::default()
-                .with_model(Model::UserNamespace)
+                .with_model(Mechanism::UserNamespace)
                 .with_local_uid(true)
                 .with_euid(1000),
         );
@@ -1740,9 +1712,9 @@ Expected: FAIL — `cannot find struct 'LinuxOptions'`.
 
 use std::path::PathBuf;
 
-use tinio_sandbox_core::{Access, Result};
+use tinio_sandbox_core::{AccessMode, Result};
 
-use crate::model::Model;
+use crate::mechanism::Mechanism;
 
 /// How to confine, and the facts the backend needs that the sandbox does not
 /// own.
@@ -1750,28 +1722,28 @@ use crate::model::Model;
 /// # Examples
 ///
 /// ```
-/// use tinio_sandbox_linux::{LinuxOptions, Model};
+/// use tinio_sandbox_linux::{LinuxOptions, Mechanism};
 ///
-/// let opts = LinuxOptions::default().with_model(Model::Root);
-/// assert_eq!(opts.model(), Model::Root);
+/// let opts = LinuxOptions::default().with_model(Mechanism::Root);
+/// assert_eq!(opts.model(), Mechanism::Root);
 /// ```
 #[derive(Debug, Clone)]
 pub struct LinuxOptions {
-    model: Model,
+    model: Mechanism,
     local_uid_configured: bool,
     tmpdir: Option<PathBuf>,
     euid: Option<u32>,
-    served_root_access: Access,
+    served_root_access: AccessMode,
 }
 
 impl Default for LinuxOptions {
     fn default() -> Self {
         Self {
-            model: Model::default(),
+            model: Mechanism::default(),
             local_uid_configured: false,
             tmpdir: None,
             euid: None,
-            served_root_access: Access::ReadWrite,
+            served_root_access: AccessMode::ReadWrite,
         }
     }
 }
@@ -1782,7 +1754,7 @@ impl LinuxOptions {
     /// **This is the only thing that reads that variable.** It is what makes
     /// the two verification legs actually different — the WSL2 script sets
     /// `TINIO_SANDBOX_MODEL=userns` and `=root`, and without a caller for
-    /// `Model::from_env` both legs would run `Auto` and the root model would
+    /// `Mechanism::from_env` both legs would run `Auto` and the root model would
     /// never be exercised (design §12). `Default` stays free of the
     /// environment so it cannot fail and cannot depend on how the test process
     /// was started.
@@ -1804,11 +1776,11 @@ impl LinuxOptions {
     /// ```
     pub fn from_env() -> Result<Self> {
         let raw = std::env::var("TINIO_SANDBOX_MODEL").ok();
-        Ok(Self::default().with_model(Model::from_env(raw.as_deref())?))
+        Ok(Self::default().with_model(Mechanism::from_env(raw.as_deref())?))
     }
 
     /// The requested model (design decision 7).
-    pub fn with_model(mut self, model: Model) -> Self {
+    pub fn with_model(mut self, model: Mechanism) -> Self {
         self.model = model;
         self
     }
@@ -1839,13 +1811,13 @@ impl LinuxOptions {
     }
 
     /// The access the served root gets; decides the capability set.
-    pub fn with_served_root_access(mut self, access: Access) -> Self {
+    pub fn with_served_root_access(mut self, access: AccessMode) -> Self {
         self.served_root_access = access;
         self
     }
 
     /// The requested model.
-    pub fn model(&self) -> Model {
+    pub fn model(&self) -> Mechanism {
         self.model
     }
 
@@ -1855,7 +1827,7 @@ impl LinuxOptions {
     }
 
     /// The access the served root gets.
-    pub fn served_root_access(&self) -> Access {
+    pub fn served_root_access(&self) -> AccessMode {
         self.served_root_access
     }
 
@@ -1883,24 +1855,24 @@ mod tests {
     #[test]
     fn defaults_are_a_read_write_root_with_an_automatic_model() {
         let opts = LinuxOptions::default();
-        assert_eq!(opts.model(), Model::Auto);
-        assert_eq!(opts.served_root_access(), Access::ReadWrite);
+        assert_eq!(opts.model(), Mechanism::Auto);
+        assert_eq!(opts.served_root_access(), AccessMode::ReadWrite);
         assert!(!opts.local_uid_configured());
     }
 
     #[test]
     fn every_setter_round_trips() {
         let opts = LinuxOptions::default()
-            .with_model(Model::Root)
+            .with_model(Mechanism::Root)
             .with_local_uid(true)
             .with_tmpdir(PathBuf::from("/tmp"))
             .with_euid(1000)
-            .with_served_root_access(Access::ReadOnly);
-        assert_eq!(opts.model(), Model::Root);
+            .with_served_root_access(AccessMode::ReadOnly);
+        assert_eq!(opts.model(), Mechanism::Root);
         assert!(opts.local_uid_configured());
         assert_eq!(opts.tmpdir(), Some(&PathBuf::from("/tmp")));
         assert_eq!(opts.euid(), 1000);
-        assert_eq!(opts.served_root_access(), Access::ReadOnly);
+        assert_eq!(opts.served_root_access(), AccessMode::ReadOnly);
     }
 }
 ```
@@ -1922,13 +1894,13 @@ use rustix::mount::{
 use rustix::process::pivot_root;
 use rustix::thread::UnshareFlags;
 use tinio_sandbox_core::{
-    Access, Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox,
+    AccessMode, Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox,
 };
 use tracing::{debug, error};
 
 use crate::caps::{self, Cap};
 use crate::jail::{jail_root, mirror_under};
-use crate::model::{Model, Resolved, unshare, userns_available};
+use crate::mechanism::{Mechanism, Resolved, unshare, userns_available};
 use crate::options::LinuxOptions;
 use crate::plan::{Mount, MountKind, OverlayDirs, plan};
 use crate::seccomp;
@@ -2024,7 +1996,7 @@ impl crate::Backend {
         // whether or not this host would grant the namespace, and asking the
         // request is what makes the answer identical on every host. The other
         // half of the same rule is checked against the **resolved** model below.
-        if opts.model() == Model::UserNamespace && opts.local_uid_configured() {
+        if opts.model() == Mechanism::UserNamespace && opts.local_uid_configured() {
             return Err(refused("local_uid", local_uid_conflicts_with_userns()));
         }
 
@@ -2043,7 +2015,7 @@ impl crate::Backend {
         // nothing here. `Auto` needs the answer only when the user namespace
         // might be the choice; the forced models that do not depend on it skip
         // the fork.
-        let needs_probe = matches!(opts.model(), Model::UserNamespace | Model::Auto);
+        let needs_probe = matches!(opts.model(), Mechanism::UserNamespace | Mechanism::Auto);
         let resolved_now =
             opts.model().resolved(opts.euid(), if needs_probe { userns_available()? } else { false });
         if let Resolved::Unavailable(detail) = resolved_now {
@@ -2198,7 +2170,7 @@ impl crate::Backend {
     }
 }
 
-// `unshare` is not defined here: it is `crate::model`'s, declared there because
+// `unshare` is not defined here: it is `crate::mechanism`'s, declared there because
 // its first caller — the user-namespace probe — lives in that module, and
 // imported above. One wrapper means one safety argument (and one `unsafe`
 // site) for one syscall; a second body here would be a second place to get
@@ -2282,9 +2254,9 @@ fn apply_mount(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
             // source with no submounts the two forms are identical — so the
             // recursive call is the one to write everywhere.
             mount_bind_recursive(&entry.source, &entry.target).map_err(step("mount --bind"))?;
-            if !entry.access.is_writable() {
+            if entry.access.is_read_only() {
                 // **`mount_remount`, not `mount_change`, and this is the primary
-                // enforcement of `Access::ReadOnly`** (design decision 8).
+                // enforcement of `AccessMode::ReadOnly`** (design decision 8).
                 // `mount_change` takes `MountPropagationFlags` — `MountFlags`
                 // has no `PRIVATE`, and `RDONLY`/`BIND` are not propagation
                 // flags at all — and what it emits is
@@ -2378,11 +2350,11 @@ fn apply_mount(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     Ok(())
 }
 
-fn resolved_model(resolved: Resolved) -> Model {
+fn resolved_model(resolved: Resolved) -> Mechanism {
     match resolved {
-        Resolved::UserNamespace => Model::UserNamespace,
-        Resolved::Root => Model::Root,
-        Resolved::Unavailable(_) => Model::Root,
+        Resolved::UserNamespace => Mechanism::UserNamespace,
+        Resolved::Root => Mechanism::Root,
+        Resolved::Unavailable(_) => Mechanism::Root,
     }
 }
 
@@ -2504,9 +2476,9 @@ impl Backend {
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_linux::{Backend, LinuxOptions, Model};
+    /// use tinio_sandbox_linux::{Backend, LinuxOptions, Mechanism};
     ///
-    /// let backend = Backend::with_options(LinuxOptions::default().with_model(Model::Root));
+    /// let backend = Backend::with_options(LinuxOptions::default().with_model(Mechanism::Root));
     /// let _ = backend;
     /// ```
     pub fn with_options(options: LinuxOptions) -> Self {
@@ -2546,7 +2518,7 @@ impl BackendTrait for Backend {
 }
 ```
 
-and register `pub mod {caps, enter, jail, model, options, plan, seccomp};` with the re-exports `jail_root`, `mirror_under`, `plan`, `Mount`, `MountKind`, `OverlayDirs`, `DEVICE_FILES`, `Resolved`, `userns_available`, `Cap`, `retained`, `LinuxOptions`, `Seccomp` — and `Model`, which is P0's own `pub enum` in `lib.rs` and therefore needs no `use` line to be public (naming it in one is `E0255`; Task 3 says so in full).
+and register `pub mod {caps, enter, jail, model, options, plan, seccomp};` with the re-exports `jail_root`, `mirror_under`, `plan`, `Mount`, `MountKind`, `OverlayDirs`, `DEVICE_FILES`, `Resolved`, `userns_available`, `Cap`, `retained`, `LinuxOptions`, `Seccomp` — and `Mechanism`, which is P0's own `pub enum` in `lib.rs` and therefore needs no `use` line to be public (naming it in one is `E0255`; Task 3 says so in full).
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
@@ -2556,14 +2528,7 @@ Expected: PASS. The five `enter` tests all refuse before the first irreversible 
 - [ ] **Step 7: Confirm the unsafe surface**
 
 Run: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-linux/src`
-Expected: exactly three hits — `seccomp::install`, `model::unshare` and `model::userns_available`'s `kernel_fork`. A fourth would mean a second body for one of those syscalls, and that is a decision rather than a detail.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/tinio-sandbox-linux
-git commit -m "feat(sandbox-linux): confine in place via unshare, pivot_root and capability drop"
-```
+Expected: exactly three hits — `seccomp::install`, `mechanism::unshare` and `mechanism::userns_available`'s `kernel_fork`. A fourth would mean a second body for one of those syscalls, and that is a decision rather than a detail.
 
 ---
 
@@ -2574,7 +2539,7 @@ git commit -m "feat(sandbox-linux): confine in place via unshare, pivot_root and
 - Create: `crates/tinio-sandbox-linux/tests/jail.rs`
 
 **Interfaces:**
-- Consumes: `Backend`, `LinuxOptions`, `Model`, `Sandbox`, `Access`.
+- Consumes: `Backend`, `LinuxOptions`, `Mechanism`, `Sandbox`, `AccessMode`.
 - Produces: nothing the library uses.
 
 `pivot_root` is irreversible, so the confined process cannot also be the asserting one: the jail runs in a **separate executable** and the parent reads its report from stdout.
@@ -2583,7 +2548,7 @@ git commit -m "feat(sandbox-linux): confine in place via unshare, pivot_root and
 
 **Why `src/bin/` and not `examples/`.** Two measured facts decide it. `CARGO_BIN_EXE_<name>` is set for binary targets only — an example named in `env!(…)` is a hard *"environment variable not defined at compile time"* error, on stable and nightly alike — and, second, a filtered `cargo test --test jail` builds binary targets but **not** examples, so the walk-up-the-profile fallback an example would need panics with `NotFound` on exactly the command this task is run with. The binary target is the only shape that works under every invocation style.
 
-**The two acceptance legs run different code, and that is what `TINIO_SANDBOX_MODEL` is for.** `TINIO_SANDBOX_MODEL=userns` and `sudo -E TINIO_SANDBOX_MODEL=root` are not two spellings of one run — **but not for the reason an earlier draft of this paragraph gave, which is the rule the design's 2026-09-19 re-measurement falsified.** The mechanism that makes a read-only exposure read-only is chosen by the *filesystem*, not by the model (design §4, and Task 2's paragraph says so in full): this test's served root is a `tempfile::tempdir()` under `/tmp`, which is a tmpfs, and a tmpfs bind is one of the kernel-managed families an **unprivileged** user namespace may not remount read-only — so the `userns` leg reaches `EPERM` and takes the `MS_RDONLY` overlay, while the privileged leg's remount is accepted and it takes `remount,bind,ro`. The two legs differ because one of them is unprivileged, and the two implementations of `Access::ReadOnly` on this platform are the two that rule reaches (design §9, §12). The child therefore resolves its model from the environment through the one reader of that variable, `LinuxOptions::from_env()` — and *not* by discovering one for itself, which is what the first draft did: `Auto`, plus a hand-rolled "root when euid is 0 and the probe failed", picks the user namespace on a userns-capable host under `sudo` exactly as it does unprivileged, so both legs would run the overlay path and the remount path would never be exercised while the suite reported success. The precondition below is the other half of that: a run that did not confine **fails**, and only a host whose capability is absent before the child starts is allowed to skip.
+**The two acceptance legs run different code, and that is what `TINIO_SANDBOX_MODEL` is for.** `TINIO_SANDBOX_MODEL=userns` and `sudo -E TINIO_SANDBOX_MODEL=root` are not two spellings of one run — **but not for the reason an earlier draft of this paragraph gave, which is the rule the design's 2026-09-19 re-measurement falsified.** The mechanism that makes a read-only exposure read-only is chosen by the *filesystem*, not by the model (design §4, and Task 2's paragraph says so in full): this test's served root is a `tempfile::tempdir()` under `/tmp`, which is a tmpfs, and a tmpfs bind is one of the kernel-managed families an **unprivileged** user namespace may not remount read-only — so the `userns` leg reaches `EPERM` and takes the `MS_RDONLY` overlay, while the privileged leg's remount is accepted and it takes `remount,bind,ro`. The two legs differ because one of them is unprivileged, and the two implementations of `AccessMode::ReadOnly` on this platform are the two that rule reaches (design §9, §12). The child therefore resolves its model from the environment through the one reader of that variable, `LinuxOptions::from_env()` — and *not* by discovering one for itself, which is what the first draft did: `Auto`, plus a hand-rolled "root when euid is 0 and the probe failed", picks the user namespace on a userns-capable host under `sudo` exactly as it does unprivileged, so both legs would run the overlay path and the remount path would never be exercised while the suite reported success. The precondition below is the other half of that: a run that did not confine **fails**, and only a host whose capability is absent before the child starts is allowed to skip.
 
 - [ ] **Step 1: Write the confined child**
 
@@ -2612,21 +2577,21 @@ git commit -m "feat(sandbox-linux): confine in place via unshare, pivot_root and
 use std::fs;
 use std::path::Path;
 
-use tinio_sandbox_core::{Access, Backend as BackendTrait, Sandbox};
+use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, Sandbox};
 use tinio_sandbox_linux::{Backend, LinuxOptions};
 
 #[cfg(target_os = "linux")]
 fn main() {
     let root = std::env::var("TINIO_SANDBOX_TEST_ROOT").expect("child needs a root");
     let access = match std::env::var("TINIO_SANDBOX_TEST_ACCESS").as_deref() {
-        Ok("read-only") => Access::ReadOnly,
-        _ => Access::ReadWrite,
+        Ok("read-only") => AccessMode::ReadOnly,
+        _ => AccessMode::ReadWrite,
     };
     let state = std::env::var("TINIO_SANDBOX_TEST_STATE").ok();
 
     let mut sandbox = Sandbox::new().expose(&root, access).device_files();
     if let Some(state) = &state {
-        sandbox = sandbox.expose(state, Access::ReadWrite);
+        sandbox = sandbox.expose(state, AccessMode::ReadWrite);
     }
 
     // **The model comes from the environment, through its one reader.** The two
@@ -2638,7 +2603,7 @@ fn main() {
     // read-only. So `=userns` reaches `EPERM` and takes the `MS_RDONLY` overlay
     // fallback, while `=root` under `sudo` gets the remount the design calls
     // the primary mechanism; those two are the implementations of
-    // `Access::ReadOnly` this platform has (design §9, §12). The model read from
+    // `AccessMode::ReadOnly` this platform has (design §9, §12). The model read from
     // the environment is what decides *which of the two a leg can reach at
     // all*. A child that discovered its own model — `Auto`, or a hand-rolled
     // "root when euid is 0 and the probe failed" — would choose the *same* one
@@ -2720,7 +2685,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use tinio_sandbox_linux::Model;
+use tinio_sandbox_linux::Mechanism;
 
 /// The address the outbound assertion probes. A host with no route to it fails
 /// the test's *precondition* rather than passing the confinement check, which
@@ -2729,8 +2694,8 @@ const OUTBOUND_PROBE: &str = "1.1.1.1:53";
 
 /// The model the WSL2 script asked for, read the way the child reads it: the
 /// same variable through the same one reader.
-fn requested_model() -> Model {
-    Model::from_env(std::env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
+fn requested_model() -> Mechanism {
+    Mechanism::from_env(std::env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
         .expect("TINIO_SANDBOX_MODEL must name a model")
 }
 
@@ -2751,7 +2716,7 @@ fn requested_model() -> Model {
 /// process yet (design §10) — a libtest worker thread is not that place. The
 /// command is the one the WSL2 script gates on, so the script and the test
 /// agree by construction rather than by review.
-fn host_can_confine(model: Model) -> bool {
+fn host_can_confine(model: Mechanism) -> bool {
     // Each variant is asked for the namespaces it actually needs: `--user
     // --map-root-user` for the user-namespace model, and a bare `--mount` for
     // the root model, whose single capability is `CAP_SYS_ADMIN`. Asking the
@@ -2761,9 +2726,9 @@ fn host_can_confine(model: Model) -> bool {
     let user = || unshare_probe(&["--user", "--map-root-user"]);
     let mount = || unshare_probe(&["--mount"]);
     match model {
-        Model::UserNamespace => user(),
-        Model::Root => mount(),
-        Model::Auto => user() || mount(),
+        Mechanism::UserNamespace => user(),
+        Mechanism::Root => mount(),
+        Mechanism::Auto => user() || mount(),
     }
 }
 
@@ -2894,13 +2859,6 @@ sudo -E TINIO_SANDBOX_MODEL=root cargo test -p tinio-sandbox-linux --test jail
 ```
 Expected: PASS both times. The unprivileged run exercises the user-namespace model and the overlay read-only path; the `sudo` run exercises the root model and the remount read-only path — **for the filesystem reason the paragraph above the child gives, which is also where the fallback branch gets its end-to-end coverage**: the served root is a tempdir on a tmpfs (WSL2's `/tmp` is one, and Task 9 records the measurement), an unprivileged user namespace cannot remount a tmpfs bind read-only, and so the `userns` leg is the one run in the suite that takes `apply_mount`'s `EPERM` branch and mounts the overlay — which is the very configuration design §4's evidence table measured working, `upperdir` on the namespace-owned tmpfs and the lower left byte-for-byte untouched. No unit test can do that — the branch needs a filesystem, not a fixture (Task 5's test pins the errno reading instead). **The two runs are guaranteed to differ because the child reads the variable rather than discovering a model for itself** — without the second line, a `sudo` leg on a userns-capable host would take the same path as the first and the remount would go untested (the paragraph above the child says so in full). Both must pass — this is P1's acceptance gate (design §12).
 
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/tinio-sandbox-linux
-git commit -m "test(sandbox-linux): prove the jail confines in a subprocess"
-```
-
 ---
 
 ### Task 7: Restructure `serve` and gate it behind the feature
@@ -2910,7 +2868,7 @@ git commit -m "test(sandbox-linux): prove the jail confines in a subprocess"
 - Modify: `crates/tinio-server/examples/serve.rs`
 
 **Interfaces:**
-- Consumes: `tinio_sandbox::{Access, Backend, LaunchPlan, Sandbox, platform}`.
+- Consumes: `tinio_sandbox::{AccessMode, Backend, LaunchPlan, Sandbox, platform}`.
 - Produces: nothing the library uses.
 
 `unshare(CLONE_NEWUSER)` returns `EINVAL` in a multi-threaded process (verified), and `#[tokio::main]` builds its runtime inside `main`. The entry point therefore becomes a plain `fn main` that confines first and builds the runtime second (design §10).
@@ -2946,7 +2904,7 @@ Then the backend itself, in a target-gated table of its own:
 tinio-sandbox-linux.workspace = true
 ```
 
-**Why a second dependency rather than something on the facade.** `serve` needs `LinuxOptions` — the model and the `tmpdir` knob are platform options, deliberately outside P0's shared surface — and the facade re-exports only `Backend as PlatformBackend`, `backend` and `platform()` (P0). Naming the platform crate directly is what keeps a Linux-only options type out of the shared layer, and the target gate is the shape `tinio-fs` already uses for its own `rustix`. It only spares the *consumers* on other targets; `tinio-sandbox-linux` is still a workspace member everywhere and carries its own `#![cfg(target_os = "…")]` gate for that (P0).
+**Why a second dependency rather than something on the facade.** `serve` needs `LinuxOptions` — the model and the `tmpdir` knob are platform options, deliberately outside P0's shared surface — and the facade re-exports only `Backend as Platform` and `backend as platform` (P0). Naming the platform crate directly is what keeps a Linux-only options type out of the shared layer, and the target gate is the shape `tinio-fs` already uses for its own `rustix`. It only spares the *consumers* on other targets; `tinio-sandbox-linux` is still a workspace member everywhere and carries its own `#![cfg(target_os = "…")]` gate for that (P0).
 
 - [ ] **Step 2: Write the failing test**
 
@@ -2959,15 +2917,15 @@ fn exposures_carry_the_mode_and_skip_an_in_root_state_dir() {
     let inside = Path::new("/srv/data/.tinio");
     let outside = Path::new("/home/u/.tinio/roots/h");
 
-    let exposures = sandbox_exposures(root, inside, Access::ReadWrite);
+    let exposures = sandbox_exposures(root, inside, AccessMode::ReadWrite);
     assert_eq!(exposures.len(), 1, "an in-root state dir is already covered by the root");
     assert_eq!(exposures[0].host, root);
-    assert_eq!(exposures[0].access, Access::ReadWrite);
+    assert_eq!(exposures[0].access, AccessMode::ReadWrite);
 
-    let exposures = sandbox_exposures(root, outside, Access::ReadOnly);
+    let exposures = sandbox_exposures(root, outside, AccessMode::ReadOnly);
     assert_eq!(exposures.len(), 2, "an out-of-root state dir needs its own entry");
-    assert_eq!(exposures[0].access, Access::ReadOnly);
-    assert_eq!(exposures[1].access, Access::ReadWrite, "the state dir is always writable");
+    assert_eq!(exposures[0].access, AccessMode::ReadOnly);
+    assert_eq!(exposures[1].access, AccessMode::ReadWrite, "the state dir is always writable");
 }
 
 #[test]
@@ -3001,7 +2959,7 @@ fn the_sandbox_asks_for_the_device_files() {
     // files are not paths the operator gave). The two calls have to be checked
     // together or `.device_files()` can be dropped without a test noticing.
     let sandbox = Sandbox::new()
-        .expose(Path::new("/srv/data"), Access::ReadWrite)
+        .expose(Path::new("/srv/data"), AccessMode::ReadWrite)
         .device_files();
     assert!(
         sandbox.device_files_enabled(),
@@ -3015,7 +2973,7 @@ fn the_executable_directory_is_not_exposed_on_linux() {
     // Linux confines the process in place, so its image is already mapped and
     // needs no exposure (design decision 22).
     let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-    let exposures = sandbox_exposures(Path::new("/srv/data"), Path::new("/srv/data"), Access::ReadWrite);
+    let exposures = sandbox_exposures(Path::new("/srv/data"), Path::new("/srv/data"), AccessMode::ReadWrite);
     assert!(!exposures.iter().any(|e| e.host == exe_dir));
 }
 ```
@@ -3036,10 +2994,10 @@ In `crates/tinio-server/examples/serve.rs`, add near the other helpers:
 /// in-root state directory needs no entry of its own — the served root's
 /// exposure already covers it (design §9).
 #[cfg(feature = "sandbox")]
-fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: Access) -> Vec<Exposure> {
+fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: AccessMode) -> Vec<Exposure> {
     let mut sandbox = Sandbox::new().expose(root, root_access);
     if !state_dir.starts_with(root) {
-        sandbox = sandbox.expose(state_dir, Access::ReadWrite);
+        sandbox = sandbox.expose(state_dir, AccessMode::ReadWrite);
     }
     sandbox.exposures().to_vec()
 }
@@ -3051,7 +3009,7 @@ with, at the top of the file:
 use std::ffi::OsString;
 use std::io::{Write as _, stdout};
 
-use tinio_sandbox::{Access, Confinement, Event, Exposure, LaunchPlan, Sandbox, supervise};
+use tinio_sandbox::{AccessMode, Confinement, Event, Exposure, LaunchPlan, Sandbox, supervise};
 use tokio::sync::watch;
 ```
 
@@ -3183,7 +3141,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // the served root `ReadWrite` on a run the operator asked to be
         // read-only — losing the kernel-level half of FR-023 that design §9
         // promises, and doing it silently.
-        let root_access = if access.is_read_only() { Access::ReadOnly } else { Access::ReadWrite };
+        // No conversion, and nothing left to keep in step: `access` **is** the
+        // type the exposure set takes. This line used to rebuild an `Access`
+        // from it, because the sandbox owned a second enum for the same fact.
+        let root_access = access;
 
         // One call decides the whole exposure set — and the device-file flag is
         // an argument rather than something the rebuilt set remembers, so it is
@@ -3431,13 +3392,6 @@ cargo check -p tinio-server --no-default-features --features multipart,copy,list
 ```
 Expected: both succeed. The example is skipped by `required-features` in the first.
 
-- [ ] **Step 9: Commit**
-
-```bash
-git add crates/tinio-server
-git commit -m "feat(serve): confine the server with --sandbox behind a default-on feature"
-```
-
 ---
 
 ### Task 8: The readiness contract — the harness migration and the end-to-end test
@@ -3472,7 +3426,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use tinio_sandbox_linux::Model;
+use tinio_sandbox_linux::Mechanism;
 
 /// The `serve` example, resolved from this test binary's own location:
 /// `<target>/<profile>/deps/<test>` → the sibling `examples/` dir.
@@ -3504,8 +3458,8 @@ fn serve_bin() -> PathBuf {
 
 /// The model the run asked for, read from the same variable the example reads,
 /// so the precondition below is asked about the leg that is actually running.
-fn requested_model() -> Model {
-    Model::from_env(env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
+fn requested_model() -> Mechanism {
+    Mechanism::from_env(env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
         .expect("TINIO_SANDBOX_MODEL must name a model")
 }
 
@@ -3524,13 +3478,13 @@ fn requested_model() -> Model {
 /// capability is `CAP_SYS_ADMIN` — and `Auto` takes either. The two legs of the
 /// WSL2 script set `TINIO_SANDBOX_MODEL`, so `requested_model` is what the
 /// server will resolve, not a guess about it.
-fn host_can_confine(model: Model) -> bool {
+fn host_can_confine(model: Mechanism) -> bool {
     let user = || unshare_probe(&["--user", "--map-root-user"]);
     let mount = || unshare_probe(&["--mount"]);
     match model {
-        Model::UserNamespace => user(),
-        Model::Root => mount(),
-        Model::Auto => user() || mount(),
+        Mechanism::UserNamespace => user(),
+        Mechanism::Root => mount(),
+        Mechanism::Auto => user() || mount(),
     }
 }
 
@@ -3701,13 +3655,6 @@ Expected: PASS. This is the check that the harness migration is complete — the
 Run the test on a host that cannot confine (or with `TINIO_SANDBOX_MODEL=root` as an unprivileged user, which forces the refusal).
 Expected: a `skipping:` line on stderr and a pass — not a spurious failure, and not `#[ignore]`d, because an ignored test is a test nobody runs. **The skip happens at `host_can_confine`, before the server is spawned**, which is what makes it a statement about the host rather than about the server's ability to die quietly.
 
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/tinio-server crates/tinio-e2e
-git commit -m "test(serve): drive the confined server end to end on the event stream"
-```
-
 ---
 
 ### Task 9: The WSL2 script and the documentation
@@ -3845,14 +3792,29 @@ cargo check -p tinio-server --no-default-features --features multipart,copy,list
 
 Expected: all clean. The clippy leg is what proves the `unsafe_code` exception stayed at three sites: `rg -c 'allow\(unsafe_code\)' crates/tinio-sandbox-linux/src` must print `3`.
 
-- [ ] **Step 7: Commit**
+---
+
+## Commit
+
+**One commit, made by hand, at the end of the phase.** No task in this plan commits, so every change accumulates in the working tree and the phase is reviewed as one diff rather than a commit per task. `CLAUDE.md` owns the authorisation rule — git writes are asked for per operation, and the index is never written by an agent — so this section fixes the phase's **scope** and its message, and is not permission to run it.
+
+Run the full Standard acceptance block (`docs/tests.md`) first, and commit only once the phase's own review is clean. The message is a conventional header plus single-line cause-and-effect bullets: what changed and why, never where it lives. It is a starting point rather than a description of finished work — where the phase's actual run makes a line of it false, that line changes.
 
 ```bash
-git add crates/tinio-sandbox-linux/scripts docs/sandbox.md docs/tests.md docs/cargo.md README.md
-git commit -m "docs(sandbox): record the WSL2 verification path, the unsafe exception and the operator notes"
-```
+git add crates/tinio-sandbox-linux crates/tinio-server crates/tinio-e2e docs/cargo.md docs/tests.md docs/sandbox.md README.md
+git commit -F - <<'EOF'
+feat(sandbox-linux): confine serve in place
 
----
+- Process confines itself: no unconfined supervisor survives the jail
+- Launcher platforms cannot do this and must keep one outside
+- Runs before the runtime exists: unshare fails EINVAL once a thread is live
+- Read-only enforced by remount, or overlay where the filesystem refuses it
+- Outbound syscalls denied; filter cannot see address family, so AF_UNIX fails too
+- Filter installed last: irreversible, and a mistake cannot be repaired at runtime
+- Falls back to root when unprivileged namespaces are refused, else fails closed
+- Bounding set swept before the set is narrowed: the reverse order drops nothing
+EOF
+```
 
 ## Self-Review
 
@@ -3906,9 +3868,9 @@ git commit -m "docs(sandbox): record the WSL2 verification path, the unsafe exce
 | Every `step(…)` is generic over `impl Into<io::Error>`, because `rustix` returns `Errno`, which does not coerce to `std::io::Error`: the earlier shape did not compile at any of the ~14 syscall sites. The bounding-set errno test now compares `Errno` to `Errno` rather than an `i32` to an `Option<i32>` | Tasks 3, 5 |
 | `rustix::runtime::exit_group` (there is no `rustix::process::exit`), `Some(options.as_c_str())` (`mount`'s data parameter is `Into<Option<&CStr>>`), and `addr` passed straight to `connect` (there is no `SocketAddr::as_str`) | Tasks 3, 5, 8 |
 | The bind predicate is "is the source a directory", not `is_file()`: `/dev/null` is a character device, so the old spelling created a **directory** at `<jail>/dev/null` and then bound a chardev onto it — `ENOTDIR`, a jail that never builds, and a skip path hiding it | Task 5 `apply_mount` |
-| `Model` is re-exported from `model.rs`: `plan.rs`, `options.rs` and `enter.rs` all import `crate::model::Model`, and an `impl Model` block in a module that does not name the type does not compile. It is deliberately **not** re-exported back into `lib.rs`, where P0 defines it — that direction is `E0255` | Task 3 |
+| `Mechanism` is re-exported from `mechanism.rs`: `plan.rs`, `options.rs` and `enter.rs` all import `crate::mechanism::Mechanism`, and an `impl Mechanism` block in a module that does not name the type does not compile. It is deliberately **not** re-exported back into `lib.rs`, where P0 defines it — that direction is `E0255` | Task 3 |
 | The child honours `TINIO_SANDBOX_MODEL` through `LinuxOptions::from_env()`, so the two acceptance legs run different code; and both skip paths became a positive precondition (`unshare(1)`, asked before the child or the server starts) instead of a substring of a failure | Tasks 6, 8 |
-| `local_uid` is refused against the **resolved** model as well as the request, which is the half `Model::Auto` can reach and the request cannot describe | Task 5 |
+| `local_uid` is refused against the **resolved** model as well as the request, which is the half `Mechanism::Auto` can reach and the request cannot describe | Task 5 |
 | The x32 ABI gap in the seccomp filter is recorded beside the filter and added to the design's Risks as this phase lands | Task 4 |
 | `assert_cmd` is gone from the stack and from the manifest claim; `options.rs` is in Task 5's file list and the invented `new` is out of `LinuxOptions`; the red-test filter is two substrings rather than one regex-looking literal that matched nothing and exited 0; `install() -> Result<Seccomp>` matches its implementation | Tasks 3, 4, 5 |
 | Every core operation emits a `tracing` event with structured fields, failure events are emitted where the `Error` is built so the log's `step` and the error's cannot drift, and `serve` installs its subscriber **before** `confine` — otherwise every confinement event is dropped | shared §7; Tasks 1, 3, 4, 5, 7 |
@@ -3933,7 +3895,7 @@ git commit -m "docs(sandbox): record the WSL2 verification path, the unsafe exce
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". Two judgement calls are flagged inline rather than hidden: Task 5's `ALL_CAPABILITIES` must be filled from rustix's actual `CapabilitySet` constants — 41 of them, in kernel numbering order — and it is the only part of this crate that has to be transcribed by hand; and Task 7 is written against a file another branch is editing, so it names seams and invariants instead of line numbers, with the alignment points listed in the step.
 
-**Type consistency.** `Sandbox`, `Access`, `Exposure`, `Error` and `Result` come from P0 and are used verbatim. `Mount`, `MountKind`, `OverlayDirs`, `plan`, `DEVICE_FILES` (Task 2) are matched exhaustively in Task 5 — and `MountKind::OverlayReadOnly` is the one kind `plan` never emits, since the read-only mechanism is the filesystem's answer rather than the plan's choice (Task 5's `apply_mount` substitutes it, and `refused_remount_needs_the_overlay` is that decision in full). `jail_root`, `mirror_under` (Task 1) are used by Tasks 2 and 5. `Model`, `Resolved`, `Cap`, `retained`, `LinuxOptions` (Tasks 3, 5) are used by Tasks 2, 5, 6, 7; `Cap::set()` yields a single-bit `CapabilitySet` and never the deprecated `Capability`. `seccomp::{filter_program, install, Arch, Syscall, SockFilter}` (Task 4) is consumed by Task 5, and `Syscall` has four variants everywhere it is matched. `PROBE_TIMEOUT` (Task 3) is the probe's one deadline, shared by its read and its reap. Task 7 introduces exactly two names into `serve.rs`, `emit` and `emit_error`, and they are the file's only definitions of either — all three platforms' arms live in that one `main`, so a launcher phase calls them rather than declaring a second copy. No name is introduced twice with different meanings, and nothing is defined here that belongs on P0's surface.
+**Type consistency.** `Sandbox`, `AccessMode`, `Exposure`, `Error` and `Result` come from P0 and are used verbatim. `Mount`, `MountKind`, `OverlayDirs`, `plan`, `DEVICE_FILES` (Task 2) are matched exhaustively in Task 5 — and `MountKind::OverlayReadOnly` is the one kind `plan` never emits, since the read-only mechanism is the filesystem's answer rather than the plan's choice (Task 5's `apply_mount` substitutes it, and `refused_remount_needs_the_overlay` is that decision in full). `jail_root`, `mirror_under` (Task 1) are used by Tasks 2 and 5. `Mechanism`, `Resolved`, `Cap`, `retained`, `LinuxOptions` (Tasks 3, 5) are used by Tasks 2, 5, 6, 7; `Cap::set()` yields a single-bit `CapabilitySet` and never the deprecated `Capability`. `seccomp::{filter_program, install, Arch, Syscall, SockFilter}` (Task 4) is consumed by Task 5, and `Syscall` has four variants everywhere it is matched. `PROBE_TIMEOUT` (Task 3) is the probe's one deadline, shared by its read and its reap. Task 7 introduces exactly two names into `serve.rs`, `emit` and `emit_error`, and they are the file's only definitions of either — all three platforms' arms live in that one `main`, so a launcher phase calls them rather than declaring a second copy. No name is introduced twice with different meanings, and nothing is defined here that belongs on P0's surface.
 
 **What this plan deliberately does not do.** It adds no items to `tinio-sandbox-core`. It is tempting to put a Linux-flavoured convenience there while implementing — the crate is right there and the editor is open — but the whole reason this plan was split out of a larger one is that shared items accumulating in a platform phase is what produced three plans that disagreed about the same API. Anything shared goes to P0.
 

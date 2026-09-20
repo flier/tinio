@@ -7,7 +7,7 @@
 - Members (`tinio-*`): `path = "crates/…"`, no version.
 - `version`/`edition` from `[workspace.package]`.
 - `publish = false` except facade `tinio`.
-- `[lints.rust] unsafe_code = "forbid"` on every crate.
+- `[lints.rust] unsafe_code = "forbid"` on every crate, **except a platform backend**, which is `"deny"` with its `#[allow(unsafe_code)]` sites enumerated in design decision 14 — the lint follows the implementation, and `forbid` cannot be overridden at all, so `deny` is what makes the exception expressible where the kernel interface has to be met on its own terms and nowhere else. `tinio-sandbox-linux`, `tinio-sandbox-macos` and `tinio-sandbox-windows` are the crates this applies to.
 - `[lints.clippy] absolute_paths = "warn"` on every crate — 3+ segment paths go through `use` (`docs/style.md`).
 - Optional/target deps at the crate.
 

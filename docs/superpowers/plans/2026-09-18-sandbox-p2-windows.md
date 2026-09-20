@@ -18,7 +18,7 @@
 
 | Item | Used by |
 |---|---|
-| `Access::{ReadOnly, ReadWrite}` (with `is_writable`), `Exposure { host, access }`, `Sandbox::{new, expose, device_files, exposures, device_files_enabled, from_exposures(exposures, device_files)}` | the exposure set (Task 3), the launch (Task 9), the `serve` call site (Task 11) |
+| `AccessMode::{ReadOnly, ReadWrite}` (with `is_read_only()`; **`tinio-core`'s type**, re-exported by the core), `Exposure { host, access }`, `Sandbox::{new, expose, device_files, exposures, device_files_enabled, from_exposures(exposures, device_files)}` | the exposure set (Task 3), the launch (Task 9), the `serve` call site (Task 11) |
 | `Error::{Step, Unsupported, BadPath, Wait, Launch { operation, path, source }}`, `Result<T>` | everywhere; `Launch` is the one every launcher step reports through, and `Wait` is the one a wait closure reaches through `?` |
 | `Backend` (the trait), `Confinement::{InPlace, Supervise(Child)}` | `confine`'s return (Task 9) |
 | `Child::new(wait_closure)` + `Child::with_relay(JoinHandle<Option<Terminal>>)`, `Child::{wait, terminal}` | the platform keeps its own handle behind the closure, the relay thread goes in with `with_relay` and **returns its answer through the join**, and `wait` joins it — which is what the terminal read afterwards depends on (Task 9) |
@@ -1019,13 +1019,6 @@ Expected: PASS — the layout tests and the core's error test. The crate's other
 Run: `rg -c 'allow\(unsafe_code\)' crates/tinio-sandbox-windows/src` and `cargo clippy -p tinio-sandbox-windows --all-targets -- -D warnings`
 Expected: clippy clean; the grep prints the number of files carrying an allow — at this point `handles.rs`, plus `ffi.rs` if the mandatory `unsafe extern` keyword trips the lint in edition 2024. `lib.rs` joins them in Task 2, and it does so **without a file-level attribute**: `from_wide` is the crate root's single site and carries `#[allow(unsafe_code)]` on the function, which is the smallest scope the constitution asks for and the reason the crate's `deny` is not relaxed to cover the whole root. Keep decision 14's list of sites equal to what exists, and let it grow as the later tasks add modules: decision 14 asks for an enumerated scope, not a number fixed in advance.
 
-- [ ] **Step 9: Commit**
-
-```bash
-git add crates/tinio-sandbox-core crates/tinio-sandbox-windows docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "feat(sandbox-windows): declare the Win32 surface and the crate's unsafe boundary"
-```
-
 ---
 
 ### Task 2: The package SID and the capability SIDs
@@ -1446,14 +1439,7 @@ pub(crate) unsafe fn from_wide(text: *const u16) -> String {
 Run: `cargo test -p tinio-sandbox-windows`
 Expected: PASS — the layout tests, `handles`' recording-subscriber test, and the five SID tests. **The profile one creates a real package on the machine and needs no elevation to do it**, which is the same property the derivation had (design §6) — and it leaves nothing behind, because the last `PackageSid` of the test drops and takes the profile with it. A refused delete is a residue rather than a test failure — the next run derives the same name and takes it over (decision 21) — and the `warn!` that reports it needs a subscriber, which `cargo test` installs none of (shared §7): the residue shows up in the next run's `CreateAppContainerProfile`, not in this run's output.
 
-- [ ] **Step 5: Commit**
-
 Design §6 and decision 21 carry the change the measurement forces: the section states the mechanism, and the mechanism is "create the profile whose SID the served root derives", not "derive a SID and launch with it". Decision 21's residue story gains the second artifact while keeping its rule — identifiable, reusable, and taken back on every exit path the launcher survives.
-
-```bash
-git add crates/tinio-sandbox-windows docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "feat(sandbox-windows): create the AppContainer profile the launch needs"
-```
 
 ---
 
@@ -1464,7 +1450,7 @@ git commit -m "feat(sandbox-windows): create the AppContainer profile the launch
 - Modify: `crates/tinio-sandbox-windows/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `Access`, `Exposure`, `Sandbox`, `Error` from the core.
+- Consumes: `AccessMode`, `Exposure`, `Sandbox`, `Error` from the core.
 - Produces: `backend::{Capability, Options, exposures, canonical_exposures, merge, describe, served_root}`; `Backend` (`Default`, `with_options`, `options`).
 
 This is the half of the backend that runs before anything privileged: which paths the whitelist covers, which capabilities the container gets, and what the volume says those paths really are. The first two are functions of builder state and are testable without a filesystem and without a launch (design §12's "Unit, every platform"); the third is the one step here that has to ask the volume, so it is a function of its own — and the reason it is not folded into `exposures` is that folding it in would make the arithmetic untestable without a disk and a junction.
@@ -1478,7 +1464,7 @@ This is the half of the backend that runs before anything privileged: which path
 mod tests {
     use std::path::Path;
 
-    use tinio_sandbox_core::{Access, Exposure, Sandbox};
+    use tinio_sandbox_core::{AccessMode, Exposure, Sandbox};
 
     use super::*;
 
@@ -1486,23 +1472,23 @@ mod tests {
     fn the_executables_directory_is_exposed_read_only() {
         // Measured: without an ACE on the directory holding the binary the
         // confined child cannot load at all (design decision 22).
-        let sandbox = Sandbox::new().expose(r"E:\srv\tinio", Access::ReadWrite);
+        let sandbox = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
         let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
         let exe_dir = all
             .iter()
             .find(|e| e.host == Path::new(r"E:\build"))
             .expect("the executable's directory is exposed");
-        assert_eq!(exe_dir.access, Access::ReadOnly);
+        assert_eq!(exe_dir.access, AccessMode::ReadOnly);
     }
 
     #[test]
     fn the_callers_access_survives_the_executable_exposure() {
         // The whole-directory exposure is read-only and must never widen a path
         // the caller exposed read-write.
-        let sandbox = Sandbox::new().expose(r"E:\build", Access::ReadWrite);
+        let sandbox = Sandbox::new().expose(r"E:\build", AccessMode::ReadWrite);
         let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].access, Access::ReadWrite);
+        assert_eq!(all[0].access, AccessMode::ReadWrite);
     }
 
     #[test]
@@ -1510,20 +1496,20 @@ mod tests {
         let merged = merge(vec![
             Exposure {
                 host: r"E:\data".into(),
-                access: Access::ReadWrite,
+                access: AccessMode::ReadWrite,
             },
             Exposure {
                 host: r"E:\data".into(),
-                access: Access::ReadOnly,
+                access: AccessMode::ReadOnly,
             },
         ]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].access, Access::ReadWrite);
+        assert_eq!(merged[0].access, AccessMode::ReadWrite);
     }
 
     #[test]
     fn nothing_outside_the_exposures_is_exposed() {
-        let sandbox = Sandbox::new().expose(r"E:\srv\tinio", Access::ReadOnly);
+        let sandbox = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadOnly);
         let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
         assert!(!all.iter().any(|e| e.host == Path::new(r"E:\srv\other")));
         assert!(!all.iter().any(|e| e.host == Path::new(r"E:\")));
@@ -1576,8 +1562,8 @@ mod tests {
     #[test]
     fn the_served_root_is_the_first_exposure() {
         let sandbox = Sandbox::new()
-            .expose(r"E:\srv\tinio", Access::ReadOnly)
-            .expose(r"E:\state", Access::ReadWrite);
+            .expose(r"E:\srv\tinio", AccessMode::ReadOnly)
+            .expose(r"E:\state", AccessMode::ReadWrite);
         assert_eq!(served_root(&sandbox).unwrap(), Path::new(r"E:\srv\tinio"));
         assert!(served_root(&Sandbox::new()).is_err());
     }
@@ -1607,7 +1593,7 @@ mod tests {
 
         let exposure = |host: &Path| Exposure {
             host: host.to_path_buf(),
-            access: Access::ReadOnly,
+            access: AccessMode::ReadOnly,
         };
         let err = canonical_exposures(vec![exposure(&link)]).expect_err("a junction is refused");
         assert!(err.to_string().contains("reparse point"), "{err}");
@@ -1629,16 +1615,16 @@ mod tests {
         let all = canonical_exposures(vec![
             Exposure {
                 host: real.clone(),
-                access: Access::ReadOnly,
+                access: AccessMode::ReadOnly,
             },
             Exposure {
                 host: real.join("."),
-                access: Access::ReadWrite,
+                access: AccessMode::ReadWrite,
             },
         ])
         .expect("both spellings resolve");
         assert_eq!(all.len(), 1, "{}", describe(&all));
-        assert_eq!(all[0].access, Access::ReadWrite, "the widest access survives");
+        assert_eq!(all[0].access, AccessMode::ReadWrite, "the widest access survives");
         assert_eq!(all[0].host, std::fs::canonicalize(&real).expect("canonical"));
     }
 }
@@ -1663,7 +1649,7 @@ use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use tinio_sandbox_core::{Access, Error, Exposure, Sandbox};
+use tinio_sandbox_core::{AccessMode, Error, Exposure, Sandbox};
 
 /// A capability the container may hold.
 ///
@@ -1812,10 +1798,10 @@ impl Backend {
 /// ```
 /// use std::path::Path;
 ///
-/// use tinio_sandbox_core::{Access, Sandbox};
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
 /// use tinio_sandbox_windows::backend::exposures;
 ///
-/// let sandbox = Sandbox::new().expose(r"E:\srv\tinio", Access::ReadWrite);
+/// let sandbox = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
 /// let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
 /// assert_eq!(all.len(), 2);
 /// ```
@@ -1824,7 +1810,7 @@ pub fn exposures(sandbox: &Sandbox, program: &Path) -> Vec<Exposure> {
     if let Some(dir) = program.parent() {
         all.push(Exposure {
             host: dir.to_path_buf(),
-            access: Access::ReadOnly,
+            access: AccessMode::ReadOnly,
         });
     }
     merge(all)
@@ -1845,8 +1831,8 @@ pub fn merge(exposures: Vec<Exposure>) -> Vec<Exposure> {
             .find(|existing| existing.host == exposure.host)
         {
             Some(existing) => {
-                if exposure.access.is_writable() {
-                    existing.access = Access::ReadWrite;
+                if !exposure.access.is_read_only() {
+                    existing.access = AccessMode::ReadWrite;
                 }
             }
             None => merged.push(exposure),
@@ -1891,12 +1877,12 @@ pub fn merge(exposures: Vec<Exposure>) -> Vec<Exposure> {
 /// ```no_run
 /// use std::path::Path;
 ///
-/// use tinio_sandbox_core::{Access, Exposure};
+/// use tinio_sandbox_core::{AccessMode, Exposure};
 /// use tinio_sandbox_windows::backend::canonical_exposures;
 ///
 /// let all = canonical_exposures(vec![Exposure {
 ///     host: Path::new(r"E:\srv\tinio").to_path_buf(),
-///     access: Access::ReadWrite,
+///     access: AccessMode::ReadWrite,
 /// }])?;
 /// assert_eq!(all.len(), 1);
 /// # Ok::<(), tinio_sandbox_core::Error>(())
@@ -1995,13 +1981,6 @@ pub fn served_root(sandbox: &Sandbox) -> Result<PathBuf, Error> {
 Run: `cargo test -p tinio-sandbox-windows backend::`
 Expected: PASS — ten tests. The two that touch the volume create their own temporary tree and a junction under it; a host that refuses `mklink /J` refuses the whole suite rather than skipping quietly, because a junction is what a grant through a link would follow on every host that has one (design §6, and the test's own message says so).
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows
-git commit -m "feat(sandbox-windows): compose the exposure set and the capability list"
-```
-
 ---
 
 ### Task 4: The DACL whitelist, its rollback, and the inheritance question
@@ -2013,7 +1992,7 @@ git commit -m "feat(sandbox-windows): compose the exposure set and the capabilit
 - Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (the inheritance row)
 
 **Interfaces:**
-- Consumes: `sid::PackageSid`, `Access`.
+- Consumes: `sid::PackageSid`, `AccessMode`.
 - Produces: `acl::{ace_spec, grant_spec, icacls_binary, grant, revoke, has_ace, Grants}`, with `Grants::{new, apply, rollback, is_empty, sid_text}` and `Drop`.
 
 Grant-only, never revoke-then-grant (design decision 15): `/grant:r` replaces this SID's entry and nothing else, `/remove:g` removes exactly this SID's entries, and neither touches a foreign ACE, the permission bits or the owner. Idempotence is what makes decision 21's takeover work: a residue from a crashed run is replaced rather than duplicated, and removed by the next clean exit.
@@ -2029,7 +2008,7 @@ Grant-only, never revoke-then-grant (design decision 15): `/grant:r` replaces th
 ```rust
 #[cfg(test)]
 mod tests {
-    use tinio_sandbox_core::Access;
+    use tinio_sandbox_core::AccessMode;
 
     use super::*;
 
@@ -2038,8 +2017,8 @@ mod tests {
         // `(OI)(CI)` is the whole reason nothing has to be granted per file
         // (design §6: ReadWrite → (OI)(CI)M, ReadOnly → (OI)(CI)RX) — subject to
         // the pre-existing-child question this task settles.
-        assert_eq!(ace_spec(Access::ReadOnly), "(OI)(CI)RX");
-        assert_eq!(ace_spec(Access::ReadWrite), "(OI)(CI)M");
+        assert_eq!(ace_spec(AccessMode::ReadOnly), "(OI)(CI)RX");
+        assert_eq!(ace_spec(AccessMode::ReadWrite), "(OI)(CI)M");
     }
 
     #[test]
@@ -2062,7 +2041,7 @@ mod tests {
     fn the_grant_argument_names_the_sid_literally() {
         // The `*` prefix is what stops icacls resolving the SID as a name.
         assert_eq!(
-            grant_spec("S-1-15-2-1-2-3", Access::ReadOnly),
+            grant_spec("S-1-15-2-1-2-3", AccessMode::ReadOnly),
             "*S-1-15-2-1-2-3:(OI)(CI)RX"
         );
     }
@@ -2112,7 +2091,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use tinio_sandbox_core::{Access, Error, Result};
+use tinio_sandbox_core::{AccessMode, Error, Result};
 
 use crate::handles::step;
 use crate::sid::PackageSid;
@@ -2130,20 +2109,20 @@ use crate::sid::PackageSid;
 /// # Examples
 ///
 /// ```
-/// use tinio_sandbox_core::Access;
+/// use tinio_sandbox_core::AccessMode;
 /// use tinio_sandbox_windows::acl::ace_spec;
 ///
-/// assert_eq!(ace_spec(Access::ReadWrite), "(OI)(CI)M");
+/// assert_eq!(ace_spec(AccessMode::ReadWrite), "(OI)(CI)M");
 /// ```
-pub const fn ace_spec(access: Access) -> &'static str {
+pub const fn ace_spec(access: AccessMode) -> &'static str {
     match access {
-        Access::ReadOnly => "(OI)(CI)RX",
-        Access::ReadWrite => "(OI)(CI)M",
+        AccessMode::ReadOnly => "(OI)(CI)RX",
+        AccessMode::ReadWrite => "(OI)(CI)M",
     }
 }
 
 /// The `*<sid>:<perm>` argument `icacls` is given.
-pub fn grant_spec(sid: &str, access: Access) -> String {
+pub fn grant_spec(sid: &str, access: AccessMode) -> String {
     format!("*{sid}:{}", ace_spec(access))
 }
 
@@ -2169,7 +2148,7 @@ pub fn icacls_binary() -> PathBuf {
 ///
 /// [`Error::Launch`] naming the path and carrying `icacls`'s own diagnostic when
 /// it exits non-zero.
-pub fn grant(path: &Path, access: Access, sid: &PackageSid) -> Result<()> {
+pub fn grant(path: &Path, access: AccessMode, sid: &PackageSid) -> Result<()> {
     let spec = grant_spec(sid.as_str(), access);
     run(
         "icacls /grant:r",
@@ -2253,7 +2232,7 @@ impl Grants {
     /// # Errors
     ///
     /// [`Error::Launch`] from [`grant`].
-    pub fn apply(&mut self, path: &Path, access: Access) -> Result<()> {
+    pub fn apply(&mut self, path: &Path, access: AccessMode) -> Result<()> {
         grant(path, access, &self.sid)?;
         self.applied.push(path.to_path_buf());
         Ok(())
@@ -2361,7 +2340,7 @@ Expected: PASS — three tests, none of them touching a DACL.
 use std::path::Path;
 use std::sync::Arc;
 
-use tinio_sandbox_core::Access;
+use tinio_sandbox_core::AccessMode;
 use tinio_sandbox_windows::{
     acl,
     sid::{PackageSid, package_name},
@@ -2417,7 +2396,7 @@ fn the_directory_ace_alone_reaches_a_file_that_was_already_there() {
     assert!(!acl::has_ace(&existing, &sid).unwrap(), "no package ACE yet");
 
     let mut grants = acl::Grants::new(Arc::new(sid_for(&root)));
-    grants.apply(&root, Access::ReadWrite).expect("grant");
+    grants.apply(&root, AccessMode::ReadWrite).expect("grant");
 
     let before = icacls(&existing, &[]);
     let inherited = before.contains(&sid_text);
@@ -2472,7 +2451,7 @@ fn a_grant_leaves_a_foreign_ace_alone_and_the_rollback_removes_exactly_it() {
 
     let sid = sid_for(&root);
     let mut grants = acl::Grants::new(Arc::new(sid_for(&root)));
-    grants.apply(&root, Access::ReadWrite).expect("grant");
+    grants.apply(&root, AccessMode::ReadWrite).expect("grant");
     assert!(acl::has_ace(&root, &sid).unwrap(), "the grant landed");
 
     grants.rollback().expect("roll back");
@@ -2510,7 +2489,7 @@ fn dropping_the_grants_removes_them() {
     let sid = Arc::new(sid_for(dir.path()));
     {
         let mut grants = acl::Grants::new(Arc::clone(&sid));
-        grants.apply(dir.path(), Access::ReadOnly).expect("grant");
+        grants.apply(dir.path(), AccessMode::ReadOnly).expect("grant");
         assert!(acl::has_ace(dir.path(), &sid).unwrap());
     }
     // The oracle, not the predicate: this assertion is about the operator's
@@ -2527,13 +2506,6 @@ Expected: FAIL first (the module is there but the helper functions are not yet c
 - [ ] **Step 7: Check the test against the answer the design already records**
 
 `docs/superpowers/specs/2026-09-18-sandbox-design.md` already carries the measurement — the evidence table's inheritance rows and §6's settled paragraph were written on 2026-09-19 from the same experiment this task's test reproduces. What is left here is to confirm the test asserts what those rows claim: the pre-existing file at depth 1, the inherited `(I)` form, a file created *after* the grant, and a directory-only rollback that leaves no residue. If this run disagrees with the design, the design is what changes, in this commit.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "feat(sandbox-windows): grant and roll back the package-SID ACEs, and settle the inheritance question"
-```
 
 ---
 
@@ -2741,13 +2713,6 @@ impl Drop for Job {
 Run: `cargo test -p tinio-sandbox-windows --test job`
 Expected: PASS — two tests, each within a few seconds.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows
-git commit -m "feat(sandbox-windows): tie the confined child's lifetime to the launcher's job"
-```
-
 ---
 
 ### Task 6: The listener handoff
@@ -2943,13 +2908,6 @@ fn initialize_winsock() -> Result<()> {
 
 Run: `cargo test -p tinio-sandbox-windows --test listener`
 Expected: PASS — one round trip through a socket the parent created and the child serves on.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows
-git commit -m "feat(sandbox-windows): hand the parent's listener to the child"
-```
 
 ---
 
@@ -3232,13 +3190,6 @@ pub use tinio_sandbox_core::{LISTENER_FD_PREFIX, is_listener_fd_arg, listener_fd
 
 Run: `cargo test -p tinio-sandbox-windows --test payload`
 Expected: FAIL to compile until Task 10 provides `control::{on_stop, disarm}`; comment those two calls out and leave the rest passing, then restore them in Task 10. Everything else — the element, the stdin frame, the listener rebuild — is complete and tested now, which is what the task is for.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows
-git commit -m "feat(sandbox-windows): adopt the launch payload and rebuild the listener"
-```
 
 ---
 
@@ -3774,7 +3725,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 
-use tinio_sandbox_core::{Access, LaunchPayload};
+use tinio_sandbox_core::{AccessMode, LaunchPayload};
 use tinio_sandbox_windows::{
     acl,
     handles, launch, socket,
@@ -3869,8 +3820,8 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     // which is every fresh machine — and it does so identically for this binary
     // and for `cmd.exe`, with or without the ACEs already granted.
     let sid = Arc::new(PackageSid::derive(&package_name(&root)).expect("derive"));
-    acl::grant(&root, Access::ReadOnly, &sid).expect("grant the root");
-    acl::grant(&report_dir, Access::ReadWrite, &sid).expect("grant the report dir");
+    acl::grant(&root, AccessMode::ReadOnly, &sid).expect("grant the root");
+    acl::grant(&report_dir, AccessMode::ReadWrite, &sid).expect("grant the report dir");
 
     // The child's stdin carries the payload and its stdout carries the event
     // stream (decisions 17, 19); its listener is handed over by the argv element.
@@ -3959,13 +3910,6 @@ Run: `cargo test -p tinio-sandbox-windows --test launch`
 Expected: PASS — three tests. If `denied` reports a different `ErrorKind`, print the report and assert on the raw Win32 code (5, `Access is denied`) instead: the design's evidence row is stated in those terms. **If the launch itself fails with `CreateProcessW` and `err=2` (`ERROR_FILE_NOT_FOUND`) for a program path that plainly exists, the profile is missing** — that is the measurement Task 2 is written against, and it means `PackageSid::derive` is not creating it. Do not chase the path: nothing about the path is wrong.
 
 §11's error table gains the row this step is built on: **a refused attribute set is fatal, and the launch that would have followed is not made** — because `UpdateProcThreadAttribute` failing is invisible downstream (the child starts, unconfined, and `CreateProcessW` reports success). The design states it beside the existing Windows row, which covers a failed launch but not a launch that silently succeeded without its confinement.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "feat(sandbox-windows): launch the child inside an AppContainer"
-```
 
 ---
 
@@ -4222,7 +4166,7 @@ pub fn child_role_body(config: &str, listener: std::net::TcpListener) {
 /// one (the network suite does).
 pub fn launch_confined(
     tree: &Tree,
-    root_access: tinio_sandbox_core::Access,
+    root_access: tinio_sandbox_core::AccessMode,
     options: Options,
     bind: Option<SocketAddr>,
 ) -> Option<(Confinement, SocketAddr)> {
@@ -4240,7 +4184,7 @@ pub fn launch_confined(
 /// not the test that set one — and nothing that calls this entry wants one.
 pub fn launch_confined_at(
     path: &Path,
-    root_access: tinio_sandbox_core::Access,
+    root_access: tinio_sandbox_core::AccessMode,
     options: Options,
     bind: Option<SocketAddr>,
 ) -> Option<(Confinement, SocketAddr)> {
@@ -4258,13 +4202,13 @@ pub fn launch_confined_at(
 fn start(
     tree: &Tree,
     probe: &Path,
-    root_access: tinio_sandbox_core::Access,
+    root_access: tinio_sandbox_core::AccessMode,
     options: Options,
     bind: Option<SocketAddr>,
 ) -> Option<(Confinement, SocketAddr)> {
     let sandbox = Sandbox::new()
         .expose(&tree.root, root_access)
-        .expose(&tree.report, tinio_sandbox_core::Access::ReadWrite);
+        .expose(&tree.report, tinio_sandbox_core::AccessMode::ReadWrite);
     let listener = TcpListener::bind(bind.unwrap_or_else(|| "127.0.0.1:0".parse().expect("loopback")))
         .expect("bind the listener");
     let address = listener.local_addr().expect("address");
@@ -4284,7 +4228,7 @@ fn start(
 
 /// Start a confined child, answer one loopback connection through the inherited
 /// listener, and wait for it.
-pub fn run_confined(tree: &Tree, root_access: tinio_sandbox_core::Access) -> Option<Run> {
+pub fn run_confined(tree: &Tree, root_access: tinio_sandbox_core::AccessMode) -> Option<Run> {
     let (confinement, address) = launch_confined(tree, root_access, Options::default(), None)?;
     let Confinement::Supervise(mut child) = confinement else {
         panic!("the Windows backend must launch a child");
@@ -4333,7 +4277,7 @@ mod common;
 
 use std::path::Path;
 
-use tinio_sandbox_core::Access;
+use tinio_sandbox_core::AccessMode;
 use tinio_sandbox_windows::acl;
 
 /// The confined child. The body lives in the harness because the network and
@@ -4348,7 +4292,7 @@ fn the_whitelist_holds_the_loopback_round_trip_and_the_rollback() {
     for volume in common::volumes() {
         let (_dir, tree) = common::tree(&volume);
         let sid = common::sid_for(&tree);
-        let Some(run) = common::run_confined(&tree, Access::ReadWrite) else {
+        let Some(run) = common::run_confined(&tree, AccessMode::ReadWrite) else {
             return;
         };
         assert_eq!(run.status, 0, "on {}: {}", volume.display(), run.report);
@@ -4376,7 +4320,7 @@ fn a_read_only_root_refuses_writes_and_still_reads() {
     };
     let (_dir, tree) = common::tree(&volume);
     let sid = common::sid_for(&tree);
-    let Some(run) = common::run_confined(&tree, Access::ReadOnly) else {
+    let Some(run) = common::run_confined(&tree, AccessMode::ReadOnly) else {
         return;
     };
     assert_eq!(run.status, 0, "{}", run.report);
@@ -4396,7 +4340,7 @@ fn a_failed_launch_still_rolls_the_aces_back() {
     let (_dir, tree) = common::tree(&volume);
     let sid = common::sid_for(&tree);
 
-    let sandbox = tinio_sandbox_core::Sandbox::new().expose(&tree.root, Access::ReadWrite);
+    let sandbox = tinio_sandbox_core::Sandbox::new().expose(&tree.root, AccessMode::ReadWrite);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let plan = tinio_sandbox_core::LaunchPlan::for_launch(String::new()).with_listener(listener);
     let backend = tinio_sandbox_windows::Backend::with_options(tinio_sandbox_windows::Options {
@@ -4421,7 +4365,7 @@ fn a_dropped_supervision_also_rolls_back() {
     let (_dir, tree) = common::tree(&volume);
     let sid = common::sid_for(&tree);
     let Some((confinement, _address)) =
-        common::launch_confined(&tree, Access::ReadWrite, Default::default(), None)
+        common::launch_confined(&tree, AccessMode::ReadWrite, Default::default(), None)
     else {
         return;
     };
@@ -4476,7 +4420,7 @@ fn launcher_role() {
     let tree = PathBuf::from(std::env::var("TINIO_SANDBOX_TEST_TREE").expect("tree"));
     let Some((confinement, address)) = common::launch_confined_at(
         &tree,
-        tinio_sandbox_core::Access::ReadWrite,
+        tinio_sandbox_core::AccessMode::ReadWrite,
         Default::default(),
         None,
     ) else {
@@ -4954,7 +4898,7 @@ pub use tinio_sandbox_windows::launch::{listener as adopted_listener, on_stop};
 // rather than a shortcut.)
 ```
 
-**The two names are there because the child-side path is shared.** `serve`'s `confined` is gated by `feature = "sandbox"` alone, with no `target_os`, so it is one path across all three platforms and can name neither platform crate; the facade is where each call such a path makes gets one platform-neutral name, `#[cfg]`-selected, and nothing else from the platform's `launch` module rides along — `adopted_listener` rebuilds the inherited listener from the descriptor the payload carried, `on_stop` is the hook a forwarded stop lands on, and the names no shared call site uses (`command_args`, the launcher's own argv construction, and `disarm`, which is reached at most from an already-Windows-gated arm) stay on the platform crate. P3's facade arm is the same shape — `pub use tinio_sandbox_macos::launch::listener as adopted_listener;` — which is why the name is spelled identically in both plans. **The configuration is not on the facade**: `Options` and `Capability` are reached by naming `tinio_sandbox_windows` directly inside the launch path's `#[cfg(windows)]` block, exactly as `serve`'s Linux arm names `tinio-sandbox-linux` for `LinuxOptions` (design decision 2, and §10's "the difference is configuration rather than dispatch"). `Backend as PlatformBackend` and `backend` are P0's selection and P2 restates neither, and `confine` and `socket` stay in this crate, where any caller that has already named it can reach them.
+**The two names are there because the child-side path is shared.** `serve`'s `confined` is gated by `feature = "sandbox"` alone, with no `target_os`, so it is one path across all three platforms and can name neither platform crate; the facade is where each call such a path makes gets one platform-neutral name, `#[cfg]`-selected, and nothing else from the platform's `launch` module rides along — `adopted_listener` rebuilds the inherited listener from the descriptor the payload carried, `on_stop` is the hook a forwarded stop lands on, and the names no shared call site uses (`command_args`, the launcher's own argv construction, and `disarm`, which is reached at most from an already-Windows-gated arm) stay on the platform crate. P3's facade arm is the same shape — `pub use tinio_sandbox_macos::launch::listener as adopted_listener;` — which is why the name is spelled identically in both plans. **The configuration is not on the facade**: `Options` and `Capability` are reached by naming `tinio_sandbox_windows` directly inside the launch path's `#[cfg(windows)]` block, exactly as `serve`'s Linux arm names `tinio-sandbox-linux` for `LinuxOptions` (design decision 2, and §10's "the difference is configuration rather than dispatch"). `Backend as Platform` and `backend as platform` are P0's selection and P2 restates neither, and `confine` and `socket` stay in this crate, where any caller that has already named it can reach them.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -4969,13 +4913,6 @@ $env:TINIO_SANDBOX_TEST_VOLUMES = 'C:\;E:\'
 cargo test -p tinio-sandbox-windows -- --nocapture
 ```
 Expected: PASS on both. `Get-Volume -DriveLetter C` and `-DriveLetter E` report the filesystems; the run must show at least one NTFS and one ReFS volume, which is the design's "must run on both" (§12). If the second volume is not ReFS on this machine, the commit body records which filesystems were actually covered rather than claiming ReFS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows crates/tinio-sandbox
-git commit -m "feat(sandbox-windows): compose the confined launch and its rollback"
-```
 
 ---
 
@@ -5041,7 +4978,7 @@ fn launcher_role() {
     let tree = PathBuf::from(std::env::var("TINIO_SANDBOX_TEST_TREE").expect("tree"));
     let Some((confinement, _address)) = common::launch_confined_at(
         &tree,
-        tinio_sandbox_core::Access::ReadWrite,
+        tinio_sandbox_core::AccessMode::ReadWrite,
         Default::default(),
         None,
     ) else {
@@ -5572,13 +5509,6 @@ Expected: PASS — the relay forwards, the control case shows a targeted stop do
 
 `docs/superpowers/specs/2026-09-18-sandbox-design.md` already holds the stop-semantics rows — the console-wide Ctrl+C that does not reach a `CREATE_NEW_PROCESS_GROUP` child, the targeted `CTRL_BREAK_EVENT` that does, the forward that closes the gap, and the caveat that the API's return value is not evidence of delivery — written on 2026-09-19 from the same probe this task's tests reproduce. There is no branch left to record: the measurement is in, and what Step 6's run has to do is reproduce it. If it does **not** — if the control case shows the child reached with no relay in between — then §3 step 9, decision 20 and this task's code are wrong together, and the commit that says so deletes the relay rather than keeping it. The container row stays **unverified in this environment**, as Step 1 and the design both say.
 
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "feat(sandbox-windows): forward the launcher's stop to the confined child"
-```
-
 ---
 
 ### Task 11: `serve` on Windows, and the confined-server end-to-end test
@@ -5590,7 +5520,7 @@ git commit -m "feat(sandbox-windows): forward the launcher's stop to the confine
 - Create: `crates/tinio-server/tests/sandbox_e2e_windows.rs`
 
 **Interfaces:**
-- Consumes: `tinio_sandbox::{Access, Child, Confinement, Event, Exposure, LaunchPlan, Sandbox, adopt, adopted_listener, is_listener_fd_arg, on_stop, supervise}`; on the Windows arm `tinio_sandbox_windows::{Backend, Options}` and the `Capability` its helper parses, plus `control::send_stop` in the end-to-end test; `tracing` and `tracing_subscriber` (both already dependencies of `tinio-server` — the launcher installs the sink `serve`'s own subscriber cannot reach); `tinio_config::server::probe_read_only`.
+- Consumes: `tinio_sandbox::{AccessMode, Child, Confinement, Event, Exposure, LaunchPlan, Sandbox, adopt, adopted_listener, is_listener_fd_arg, on_stop, supervise}`; on the Windows arm `tinio_sandbox_windows::{Backend, Options}` and the `Capability` its helper parses, plus `control::send_stop` in the end-to-end test; `tracing` and `tracing_subscriber` (both already dependencies of `tinio-server` — the launcher installs the sink `serve`'s own subscriber cannot reach); `tinio_config::server::probe_read_only`.
 - Produces: nothing the library uses.
 
 Three things change in the entry point, in the design's order: the payload discriminator comes first (§10 step 1), the configuration is read as **bytes** and parsed only where it stays in the process (decision 18), and the endpoint travels as an **event** on stdout — emitted by whichever process bound the socket, exactly once (decision 19). Since the child's stdout is a pipe the parent relays, the parent's own stdout is the operator's only view of the protocol, and nothing else on this path may write to it. The macOS arm does not exist yet, so a sandbox request there must fail closed rather than serve unconfined (§11).
@@ -5685,15 +5615,15 @@ Run: `cargo test -p tinio-config probe_reads_only` — FAIL, then PASS.
         let exe_dir = exe_dir.parent().unwrap();
         #[cfg(windows)]
         {
-            let exposures = sandbox_exposures(root, root, Access::ReadWrite);
+            let exposures = sandbox_exposures(root, root, AccessMode::ReadWrite);
             assert!(
-                exposures.iter().any(|e| e.host == exe_dir && e.access == Access::ReadOnly),
+                exposures.iter().any(|e| e.host == exe_dir && e.access == AccessMode::ReadOnly),
                 "the confined child cannot load without an ACE on its own directory"
             );
         }
         #[cfg(not(windows))]
         {
-            let exposures = sandbox_exposures(root, root, Access::ReadWrite);
+            let exposures = sandbox_exposures(root, root, AccessMode::ReadWrite);
             assert!(!exposures.iter().any(|e| e.host == exe_dir));
         }
     }
@@ -5739,23 +5669,23 @@ In `crates/tinio-server/examples/serve.rs`. **`emit` and `emit_error` are the on
 
 ```rust
 #[cfg(feature = "sandbox")]
-use tinio_sandbox::{Access, Event, Exposure, LaunchPlan, Sandbox};
+use tinio_sandbox::{AccessMode, Event, Exposure, LaunchPlan, Sandbox};
 
 /// P1's exposure helper, extended with decision 22's automatic entry: on the
 /// launcher platforms the directory holding this executable is exposed
 /// read-only, because a confined child cannot load without an ACE on it.
 #[cfg(feature = "sandbox")]
-fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: Access) -> Vec<Exposure> {
+fn sandbox_exposures(root: &Path, state_dir: &Path, root_access: AccessMode) -> Vec<Exposure> {
     let mut sandbox = Sandbox::new().expose(root, root_access);
     if !state_dir.starts_with(root) {
-        sandbox = sandbox.expose(state_dir, Access::ReadWrite);
+        sandbox = sandbox.expose(state_dir, AccessMode::ReadWrite);
     }
     #[cfg(windows)]
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
-        sandbox = sandbox.expose(dir, Access::ReadOnly);
+        sandbox = sandbox.expose(dir, AccessMode::ReadOnly);
     }
     sandbox.exposures().to_vec()
 }
@@ -6045,11 +5975,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // served root `ReadWrite` on a run the operator asked to be read-only
         // (P1's arm states the same rule, and `access` would otherwise have no
         // reader in this `main` now that the launcher builds no storage).
-        let root_access = if access.is_read_only() {
-            Access::ReadOnly
-        } else {
-            Access::ReadWrite
-        };
+        // No conversion, and nothing left to keep in step: `access` **is** the
+        // type the exposure set takes. This line used to rebuild an `Access`
+        // from it, because the sandbox owned a second enum for the same fact.
+        let root_access = access;
         // **The launcher's own sink for shared §7's events, installed before it
         // grants or launches anything.** `serve` builds its subscriber inside its
         // own body at a fixed `Verbosity::Info`, and this process returns from the
@@ -6582,13 +6511,6 @@ cargo check --workspace --all-targets
 ```
 Expected: both succeed; the example and the test are skipped by `required-features`.
 
-- [ ] **Step 10: Commit**
-
-```bash
-git add crates/tinio-config crates/tinio-server
-git commit -m "feat(serve): launch the Windows server confined behind --sandbox"
-```
-
 ---
 
 ### Task 12: Settling the network question
@@ -6620,7 +6542,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
 
-use tinio_sandbox_core::{Access, Confinement};
+use tinio_sandbox_core::{AccessMode, Confinement};
 use tinio_sandbox_windows::{Capability, Options};
 
 /// The confined child. The body lives in the harness because the confinement
@@ -6660,7 +6582,7 @@ fn baseline(address: SocketAddr) -> bool {
 fn confined_outbound(volume: &Path, options: Options, target: SocketAddr) -> Option<String> {
     let (_dir, mut tree) = common::tree(volume);
     tree.target = Some(target);
-    let (confinement, address) = common::launch_confined(&tree, Access::ReadWrite, options, None)?;
+    let (confinement, address) = common::launch_confined(&tree, AccessMode::ReadWrite, options, None)?;
     let Confinement::Supervise(child) = confinement else {
         panic!("the Windows backend must launch a child");
     };
@@ -6759,7 +6681,7 @@ fn the_lan_answer_is_recorded_when_asked_for() {
         let bind = SocketAddr::from(([0, 0, 0, 0], address.port()));
         let Some((confinement, bound)) = common::launch_confined(
             &tree,
-            Access::ReadWrite,
+            AccessMode::ReadWrite,
             Options {
                 capabilities,
                 ..Default::default()
@@ -6818,13 +6740,6 @@ Expected: a `recorded:` line from each. Keep both verbatim for the next step —
 3. The **Risks** table's Windows row is marked settled, or replaced with whatever the measurement turned up.
 
 Add one sentence to §7's Windows note recording the LAN answer, phrased as an observation, and keep the design's existing statement that nothing depends on it (decision 16): the isolation claim rests on the capability set, never on the handoff.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/tinio-sandbox-windows docs/superpowers/specs/2026-09-18-sandbox-design.md
-git commit -m "test(sandbox-windows): settle the outbound guarantee and record the LAN answer"
-```
 
 ---
 
@@ -6923,14 +6838,29 @@ cargo check -p tinio-server --no-default-features
 
 Expected: all clean.
 
-- [ ] **Step 7: Commit**
+---
+
+## Commit
+
+**One commit, made by hand, at the end of the phase.** No task in this plan commits, so every change accumulates in the working tree and the phase is reviewed as one diff rather than a commit per task. `CLAUDE.md` owns the authorisation rule — git writes are asked for per operation, and the index is never written by an agent — so this section fixes the phase's **scope** and its message, and is not permission to run it.
+
+Run the full Standard acceptance block (`docs/tests.md`) first, and commit only once the phase's own review is clean. The message is a conventional header plus single-line cause-and-effect bullets: what changed and why, never where it lives. It is a starting point rather than a description of finished work — where the phase's actual run makes a line of it false, that line changes.
 
 ```bash
-git add crates/tinio-sandbox-windows/scripts docs/tests.md docs/superpowers/specs/2026-09-18-sandbox-design.md README.md
-git commit -m "docs(sandbox-windows): record the Windows verification path"
-```
+git add crates/tinio-sandbox-windows crates/tinio-sandbox crates/tinio-sandbox-core crates/tinio-server crates/tinio-config docs/tests.md docs/superpowers/specs/2026-09-18-sandbox-design.md README.md
+git commit -F - <<'EOF'
+feat(sandbox-windows): confine serve under AppContainer
 
----
+- AppContainer entered at process creation only, so a launcher stays outside
+- Launcher outlives the child; job object kills the child with it
+- Hard kill would otherwise orphan a confined server holding the listener
+- Package SID derived from a fixed name, not generated: residue stays identifiable
+- Next run takes its own ACEs over instead of accumulating orphans
+- Container profile created with the SID: a derived SID alone cannot launch
+- Grant reaches pre-existing children by inheritance; rollback on every exit path
+- Failed launch rolls back too, not only the clean exit
+EOF
+```
 
 ## Self-Review
 
@@ -6974,7 +6904,7 @@ git commit -m "docs(sandbox-windows): record the Windows verification path"
 | decision 26 (confined before the runtime) | 11 (the launcher never builds a runtime; the child builds it after adopting) |
 | **shared §7 (every core operation traced, split into `info!` for "was this process confined, and to what" and `debug!` for the per-item detail, `error!` where an `Error` is built)** | 1 (`handles::step` builds and logs in one place, with the recording-subscriber test), 2, 3, 4, 5, 8, 10, 11 (the launcher installs the sink it would otherwise never reach) |
 
-**Out of P2's scope, deliberately.** `[server] sandbox` and `TINIO_SANDBOX` land with the CLI, exactly as P1 deferred them (decision 1); `--sandbox` is the only channel that exists today, and decision 5's feature-off exit 2 belongs to the CLI, not to the example. `TINIO_SANDBOX_CAPABILITIES` in Task 11 is provisional scaffolding for that deferral, not a new contract. Decision 25's OTLP conflict is unchecked here for the same reason P1 left it: `serve` never passes an endpoint. macOS is P3 and the fallback path is P4; Task 11 only makes sure neither silently serves unconfined. The e2e harness's own readiness scrape — `crates/tinio-e2e/tests/steps/clients.rs`'s `READY` constant and `wait_for_ready` — is **not** P2's to change: the design's Bookkeeping assigns it to P1, which emits the first events, and it must move with the cucumber features that assert readiness rather than as a side effect of a sandbox task. P2's consumer-side decoding lives in `crates/tinio-server/tests/sandbox_e2e_windows.rs`. Read-only mode itself (FR-023) has **landed** and is not P2's to build: `serve` resolves it from `[server] read_only`, `TINIO_READ_ONLY` and `--read-only`, and relocates state to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What P2 owes it is the confinement — the root's `Access` comes from `probe_read_only`, and the state directory must be exposed writable where it lands outside the root (Task 11). `Sandbox::device_files()` is a Linux concept and a no-op on Windows: the exposures this crate computes are the whole whitelist. Two things the relay makes *possible* but does not itself deliver, both stated in the code comments rather than implied: the child's stop hook starts the shutdown the runtime already knows, while the bounded drain (≤10 s, state file removed) is the CLI contract's and lands with T066/T067; and `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (restricting the confined child's own child creation) stays untaken, because it would raise the OS floor to Windows 10 without a design decision behind it.
+**Out of P2's scope, deliberately.** `[server] sandbox` and `TINIO_SANDBOX` land with the CLI, exactly as P1 deferred them (decision 1); `--sandbox` is the only channel that exists today, and decision 5's feature-off exit 2 belongs to the CLI, not to the example. `TINIO_SANDBOX_CAPABILITIES` in Task 11 is provisional scaffolding for that deferral, not a new contract. Decision 25's OTLP conflict is unchecked here for the same reason P1 left it: `serve` never passes an endpoint. macOS is P3 and the fallback path is P4; Task 11 only makes sure neither silently serves unconfined. The e2e harness's own readiness scrape — `crates/tinio-e2e/tests/steps/clients.rs`'s `READY` constant and `wait_for_ready` — is **not** P2's to change: the design's Bookkeeping assigns it to P1, which emits the first events, and it must move with the cucumber features that assert readiness rather than as a side effect of a sandbox task. P2's consumer-side decoding lives in `crates/tinio-server/tests/sandbox_e2e_windows.rs`. Read-only mode itself (FR-023) has **landed** and is not P2's to build: `serve` resolves it from `[server] read_only`, `TINIO_READ_ONLY` and `--read-only`, and relocates state to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What P2 owes it is the confinement — the root's `AccessMode` comes from `probe_read_only`, and the state directory must be exposed writable where it lands outside the root (Task 11). `Sandbox::device_files()` is a Linux concept and a no-op on Windows: the exposures this crate computes are the whole whitelist. Two things the relay makes *possible* but does not itself deliver, both stated in the code comments rather than implied: the child's stop hook starts the shutdown the runtime already knows, while the bounded drain (≤10 s, state file removed) is the CLI contract's and lands with T066/T067; and `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (restricting the confined child's own child creation) stays untaken, because it would raise the OS floor to Windows 10 without a design decision behind it.
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". **Three rows that used to be open questions are settled and are now regression tests or measurements this plan is written against.** The third joined them on 2026-09-19: **a merely derived package SID cannot launch** — `CreateProcessW` fails `err=2` for this binary and for `cmd.exe` alike — so Task 2 creates the profile and Task 8's launch test is where the launch-succeeds assertion lives. The first two, each pointing at the design's evidence table rather than re-deriving the answer here: Task 4's inheritance question was measured on 2026-09-19 (one ACE per directory, no `/t` walk), and Task 10's stop semantics were measured the same day on this machine's host console (a console-wide Ctrl+C does not reach a `CREATE_NEW_PROCESS_GROUP` child; a targeted `CTRL_BREAK_EVENT` does; the relay's forward arrives). The container half of the stop claim stays **unverified in this environment** and is no longer load-bearing. What remains genuinely open is Task 12's outbound test — written to fail rather than pass when the design is wrong — Task 1's `unsafe extern` lint check, which only decides whether `ffi.rs` appears in decision 14's list, and **the ACL pass's cost per object under the served tree**, which no document has ever numbered: Task 13 Step 3 measures it on a synthetic corpus and puts the pair of seconds where §6 and the design's Risks row already promise a number, because "the filesystem walks, not the tool" is a cost as well as a fact.
 

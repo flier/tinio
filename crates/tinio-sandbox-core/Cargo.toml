@@ -1,0 +1,28 @@
+[package]
+name = "tinio-sandbox-core"
+version.workspace = true
+edition.workspace = true
+description = "The confinement contract for tinio: the Backend trait, its vocabulary, and the launcher machinery"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+derive_more = { workspace = true, features = ["debug"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sse-core.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tracing.workspace = true
+
+tinio-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+tracing-subscriber.workspace = true
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

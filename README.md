@@ -12,6 +12,7 @@ An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://
 | `tinio-fs` | Filesystem backend — object files under `<root>/<bucket>/`, redb metadata, async pipelines |
 | `tinio-mem` | In-memory reference backend (conformance oracle) |
 | `tinio-server` | The s3s data plane: routing, SigV4 auth, XML, error mapping, metrics |
+| `tinio-sandbox` / `-core` / `-linux` / `-macos` / `-windows` | Process confinement: the `Backend` contract, per-platform implementations, and a facade |
 | `tinio-api` / `tinio-cli` / `tinio-config` | Facade passthroughs, CLI, TOML config |
 | `tinio-e2e` | Cucumber BDD suites: in-process conformance, external-client interop |
 | `tinio-util` | Shared test harness (`testing` feature) |

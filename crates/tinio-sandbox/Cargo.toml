@@ -1,0 +1,24 @@
+[package]
+name = "tinio-sandbox"
+version.workspace = true
+edition.workspace = true
+description = "Process confinement for tinio: the facade over the per-platform backends"
+publish = false
+
+[dependencies]
+tinio-sandbox-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tinio-sandbox-linux.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tinio-sandbox-macos.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tinio-sandbox-windows.workspace = true
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

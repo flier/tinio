@@ -1,0 +1,51 @@
+//! Windows confinement via AppContainer. The stub exists so the launcher-shaped
+//! half of the `Backend` contract is exercised from here onward; the
+//! implementation lands with P2
+//! (`docs/superpowers/plans/2026-09-18-sandbox-p2-windows.md`).
+//!
+//! Behind `#![cfg(target_os = "windows")]` so the workspace builds on every host:
+//! `members = ["crates/*"]` has no per-target form, so this crate compiles — and
+//! lints — on targets it does not serve. **P2 replaces this stub and may drop
+//! the line**: that plan's shape is a crate which compiles everywhere with each
+//! Windows-specific item gated internally, and both shapes satisfy the same rule.
+//! Separate targets repeat whichever gate they need.
+
+#![cfg(target_os = "windows")]
+
+#[doc(hidden)]
+pub extern crate tinio_sandbox_core as _core;
+
+use crate::_core::{Backend as BackendTrait, Confinement, Error, LaunchPlan, Result, Sandbox};
+
+/// The Windows backend.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_windows::Backend;
+///
+/// let backend = Backend::default();
+/// let _ = backend;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Backend;
+
+impl BackendTrait for Backend {
+    fn confine(&mut self, _sandbox: &Sandbox, _plan: &LaunchPlan) -> Result<Confinement> {
+        Err(Error::Unsupported {
+            detail: "the Windows backend is not implemented yet",
+        })
+    }
+}
+
+/// The backend for this platform, with its defaults.
+///
+/// # Examples
+///
+/// ```
+/// let backend = tinio_sandbox_windows::backend();
+/// let _ = backend;
+/// ```
+pub fn backend() -> Backend {
+    Backend
+}
