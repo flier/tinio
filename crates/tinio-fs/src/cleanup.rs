@@ -12,7 +12,7 @@
 //! (including unpublished tombstones).
 //!
 //! Home root-state-dir GC (part of the `Full` scope per failure-handling.md
-//! §3) needs read-only-mode state relocation and lands with US2 (T076).
+//! §3) needs read-only-mode state relocation and lands with US2 (T144).
 
 use std::{
     future::Future,

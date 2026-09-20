@@ -111,6 +111,8 @@ otlp_endpoint = "http://127.0.0.1:4317"   # required when the section is present
 
 `TINIO_*` takes precedence; when absent, the corresponding `MINIO_*` variable is accepted as a fallback for credentials: `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` (legacy names) and `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` (modern names) map to the access/secret key pair.
 
+*(2026-09-20 correction, plan-audit round)* Seven of the names above are **not honoured by the CLI feature** (`docs/superpowers/specs/2026-09-20-cli-integration-design.md`): `TINIO_ACCESS_LOG`, `TINIO_ACCESS_LOG_FORMAT`, `TINIO_API_UNIX`, `TINIO_API_HTTP`, `TINIO_API_HTTPS`, `TINIO_API_HTTPS_CERT` and `TINIO_API_HTTPS_KEY`. The CLI's surface there is the `--api*` flags and the `[log]` keys, so setting one of these variables is silently ignored today — a fact this contract states rather than leaves to be discovered. The names stay listed because this contract describes the finished product; whoever wires them owns their tests, and `tasks.md`'s T146 records the debt.
+
 ## Read-only mode (`[server] read_only = true` / `--read-only` / `TINIO_READ_ONLY=1`)
 
 - All S3 mutating operations are rejected with `AccessDenied`; the storage root is never written (may be a genuinely read-only filesystem). The refusal set is *every* mutating operation — tagging, ACL and CORS writes included — and is listed in `contracts/s3-surface.md` (§Read-only mode), together with the mode's two recorded consequences: a write to a missing bucket answers `AccessDenied` rather than `NoSuchBucket`, and the root's own `.tinio/` metadata is not read.
