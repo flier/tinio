@@ -2,17 +2,17 @@
 
 **Branch**: `001-s3-local-server` | **Date**: 2026-08-21
 
-Separate from the S3 data plane (FR-018). Lives in the optional `tinio-api` crate behind the default-on `api` cargo feature; builds with `--no-default-features` omit this whole plane. Served by axum over the control channel by default: unix socket `tinio.sock` (mode 0600) in the state dir on Linux/macOS (configured via `[api.unix] path`); Windows named pipe `\\.\pipe\tinio-<sha1(canonicalize(root))[..16]>` (configured via `[api.pipe] path`; recorded in `state` as source of truth; also selectable via `--api pipe://<name>`; created with `FILE_FLAG_FIRST_PIPE_INSTANCE` so a second bind fails). The state dir is `<root>/.tinio/` normally and `~/.tinio/roots/<sha256(canonical root)16>/` in read-only mode (FR-023). A stale unix socket file is probed before bind and unlinked when no listener responds, so a crashed instance does not block a clean restart. Optionally also exposed over TCP HTTP/HTTPS via the `[api]` config section (`[api.http]` / `[api.https]` subsections — presence enables, omitted = off) or the `--api <URL>` CLI flag. Token auth: `X-Tinio-Token` header, value from `state` (CSPRNG-generated, ≥ 32 bytes). Binding the control channel enforces single-instance semantics; with the `api` feature compiled in, exactly one transport must be enabled after resolution — the local channel (`[api.unix]` on Linux/macOS or `[api.pipe]` on Windows), `[api.http]`, or `[api.https]` — three-choose-one (startup error otherwise). On graceful stop the server removes the socket file and `state`. Management-plane requests go to the operational log only — they are not written to the data-plane access log.
+Separate from the S3 data plane (FR-018). Lives in the optional `tinio-api` crate behind the default-on `api` cargo feature; builds with `--no-default-features` omit this whole plane. Served by axum over the control channel by default: unix socket `tinio-<sha1(canonicalize(root))[..16]>.sock` (mode 0600) derived per root in the state dir on Linux/macOS, so two roots sharing one state dir cannot collide (`[api.unix] path` overrides the derived default, and the resolved absolute path is what `state.control_name` records); Windows named pipe `\\.\pipe\tinio-<sha1(canonicalize(root))[..16]>` (configured via `[api.pipe] path`; recorded in `state` as source of truth; also selectable via `--api pipe://<name>`; created with `FILE_FLAG_FIRST_PIPE_INSTANCE` so a second bind fails). The state dir is `<root>/.tinio/` normally and `~/.tinio/roots/<sha256(canonical root)16>/` in read-only mode (FR-023). A stale unix socket file is probed before bind and unlinked when no listener responds, so a crashed instance does not block a clean restart. Optionally also exposed over TCP HTTP/HTTPS via the `[api]` config section (`[api.http]` / `[api.https]` subsections — presence enables, omitted = off) or the `--api <URL>` CLI flag. **A wildcard bind records the wildcard**: `state.control_name` carries the **bound** address, so `[api.http] host = "0.0.0.0"` records `0.0.0.0:<port>` — truthful, and what the token rule above follows — and a client dialling a recorded address substitutes loopback for an unspecified one, because `0.0.0.0` is a bind address and not a connect one (Windows refuses it with `WSAEADDRNOTAVAIL`), so `tinio status` reaches a wildcard-bound server on `127.0.0.1:<recorded port>`. Token auth: `X-Tinio-Token` header, value from `state` (CSPRNG-generated, ≥ 32 bytes). Binding the control channel enforces single-instance semantics; with the `api` feature compiled in, exactly one transport must be enabled after resolution — the local channel (`[api.unix]` on Linux/macOS or `[api.pipe]` on Windows), `[api.http]`, or `[api.https]` — three-choose-one (startup error otherwise). On graceful stop the server removes the socket file and `state`. Management-plane requests go to the operational log only — they are not written to the data-plane access log.
 
 ## Transport and auth matrix
 
 | Transport | Enabled by | Token required |
 |-----------|------------|----------------|
 | Unix socket / named pipe (local channel) | always | `/status`, `/stop` only; `/metrics`, `/openapi.json` open (local-only channel) |
-| TCP HTTP (`[api.http]` section present / `--api http://…`) | config or flag | ALL endpoints, including `/metrics` and `/openapi.json` |
-| TCP HTTPS (`[api.https]` section present + cert/key, or `--api https://…`) | config or flag | ALL endpoints |
+| TCP HTTP (`[api.http]` section present / `--api http://…`) | config or flag | follows the bind address: a loopback bind opens `/metrics` alone, every other bind requires it on all endpoints, `/metrics` and `/openapi.json` included |
+| TCP HTTPS (`[api.https]` section present + cert/key, or `--api https://…`) | config or flag | follows the bind address, exactly as TCP HTTP |
 
-Rationale: over TCP the read endpoints leak operational data (object counts, traffic, API schema) to anything that can reach the host/port; Prometheus scrapers support bearer tokens for `/metrics`.
+Rationale: the open side follows the **bind address**. A loopback-bound TCP port is reachable by every local user (a mode-0600 unix socket is not), so it opens `/metrics` alone — a Prometheus scrape cannot send a custom header, which is the whole reason and does not extend to `/openapi.json` or the control endpoints; every other TCP bind requires the token everywhere, since anything that can reach the host/port otherwise reads operational data (object counts, traffic, API schema). A standard scraper can send `Authorization: Bearer <token>`, so the middleware accepts that header as an alias for `X-Tinio-Token` on every transport.
 
 ## Endpoints
 
@@ -20,8 +20,8 @@ Rationale: over TCP the read endpoints leak operational data (object counts, tra
 |--------|------|------|-------------|
 | GET | `/status` | token | Server status (JSON) |
 | POST | `/stop` | token | Graceful stop: cease accepting, drain in-flight ≤ 10 s, exit |
-| GET | `/metrics` | none | Prometheus text exposition (3 metric layers) |
-| GET | `/openapi.json` | none | OpenAPI spec generated by utoipa (`axum_extras`), incl. token security scheme |
+| GET | `/metrics` | follows the bind: open on the local channel and on a loopback bind, token otherwise | Prometheus text exposition (3 metric layers); `404` when the plane carries no gauge source — the absence is served, not an empty `200` |
+| GET | `/openapi.json` | follows the bind: open on the local channel only, token on a loopback bind and over TCP | OpenAPI spec generated by utoipa (`axum_extras`), incl. token security scheme |
 
 ## Responses
 
@@ -52,7 +52,7 @@ Rationale: over TCP the read endpoints leak operational data (object counts, tra
 
 ### GET /metrics
 
-`200` `Content-Type: text/plain; version=0.0.4; charset=utf-8`. Metric families: see data-model.md (HTTP / S3 operation / storage layers; full-scan gauges TTL-cached 30 s).
+`200` `Content-Type: text/plain; version=0.0.4; charset=utf-8`. Metric families: see data-model.md (HTTP / S3 operation / storage layers). **No request scans the storage**: the full-scan gauges (buckets, objects, bytes) are published by a single background reader task that scans once at start and then once per 30 s ttl, single-flight by construction, so a scrape's cost does not depend on the root's size or on how often the endpoint is hit. `404` when the plane carries no gauge source: the absence is served, not an empty `200`.
 
 ### GET /openapi.json
 

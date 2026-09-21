@@ -22,7 +22,7 @@ A compact Rust tool serving an S3-compatible interface over local directories: b
 
 **Project Type**: CLI + local web service (binary tool: S3 data plane + management plane).
 
-**Performance Goals**: Flat memory on streaming paths regardless of object size (SC-003); ready within 1 s of start (SC-005); `status`/`stop` round-trip within 1 s (SC-007); full-scan metric gauges bounded by a 30 s TTL cache; bounded-buffer streaming with no unbounded buffering (constitution V); the background ETag scanner never blocks startup and yields to request traffic (FR-024).
+**Performance Goals**: Flat memory on streaming paths regardless of object size (SC-003); ready within 1 s of start (SC-005); `status`/`stop` round-trip within 1 s (SC-007); full-scan metric gauges published by a single reader task on a 30 s cadence (no request scans); bounded-buffer streaming with no unbounded buffering (constitution V); the background ETag scanner never blocks startup and yields to request traffic (FR-024).
 
 **Constraints**: No panics/`unwrap`/`expect` in library code (constitution II); no `unsafe` (all crates `forbid`); every dependency justified in [research.md §24](research.md); case-sensitivity follows host filesystem (no artificial enforcement); Linux unix-socket path-length limit (108 bytes) documented as a limitation; single-instance enforcement via control-channel bind (management plane only — a build without the `api` feature has no such enforcement); graceful stop with bounded (10 s) in-flight drain; cargo feature gates: `api` (management plane), `openapi` (OpenAPI endpoint), `tls` (HTTPS listener), and the S3 capability groups `multipart`/`copy`/`list-v1`/`list-v2` — all default on; `otel` (OpenTelemetry) opt-in. The S3 compatibility layer itself is always compiled; symlinks are **rejected by default** (`[storage.fs] follow_symlinks = false` — access never resolves through a link and link entries are excluded from listings) and can be opted into via `[storage.fs] follow_symlinks = true`. Allocation discipline (constitution V): streaming hot paths (file↔socket copy loops, ETag MD5 computation, multipart assembly) MUST use bounded buffers with no per-object allocation; verified by benchmark profiles.
 
@@ -133,7 +133,7 @@ crates/
 │   │   ├── lib.rs
 │   │   ├── error.rs       # Error (thiserror): startup + mapping failures
 │   │   ├── backend/       # S3 trait impl (~30 ops) over tinio-core (mod.rs + buckets/objects/listing/multipart.rs)
-│   │   ├── metrics.rs      # Prometheus registry + metric families (T023); instrumentation + TTL-cached gauges in T054/T075
+│   │   ├── metrics.rs      # Prometheus registry + metric families (T023); instrumentation + the T054/T075 gauges, published by the reader task's 30 s cadence
 │   │   ├── auth.rs         # S3Auth impl from config (SigV4 verification by s3s)
 │   │   ├── data.rs         # hyper-util + S3Service data plane wiring
 │   │   └── log.rs          # tracing layers: access-log formatter (nginx-style), fmt layers

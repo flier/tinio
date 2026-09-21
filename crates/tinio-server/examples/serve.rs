@@ -332,8 +332,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let caps = capabilities_for(&config);
 
-    // The `/metrics` scrape endpoint (F10): the plane's hook refreshes
-    // the pipeline gauges and the write-lock histograms on every scrape.
+    // The scrape-time refresh hook (F10/F49): the management plane's
+    // `/metrics` runs it on every scrape, through the CLI's
+    // `MetricsSource` adapter — no endpoint on this listener serves the
+    // path any more (the interim unauthenticated data-plane route was
+    // retired when the management plane's endpoint landed). The example
+    // still installs the hook because the data plane owns the families
+    // the scrape needs.
     let metrics_storage = storage.clone();
     let metrics_io = pipelines.io();
     let metrics_db = pipelines.db();

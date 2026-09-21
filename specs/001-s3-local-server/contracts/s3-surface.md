@@ -308,7 +308,7 @@ a 403 `AccessDenied` can now mean an ACL denial, an OS-level `PermissionDenied`,
 
 ### `/metrics`
 
-stays outside the ACL check: the management-plane pre-route interception in `data.rs` is unchanged (FR-018/FR-019) — a principal with no bucket rights can scrape the data-plane `/metrics` reserved endpoint from `serve` (documented in the server module docs).
+is **not a data-plane path at all**: the scrape endpoint is the management plane's token-gated `GET /metrics` (`tinio-api`, FR-018/FR-019, T075 — `contracts/management-api.md` carries its token rule), so it stays outside the ACL check by construction rather than by exemption, and no S3 principal can reach it. The data-plane listener intercepts nothing: `GET /metrics` there is routed as the bucket named `metrics`, like any other first path segment. The interim unauthenticated data-plane route (the F10 dev-harness exposure the `serve` example carried) was removed in the same task that landed the endpoint.
 
 ### Recorded deviations in the e2e suite
 
@@ -388,7 +388,7 @@ The cucumber suite (`crates/tinio-e2e/tests/features/`) is the executable form o
 | `.tinio` reservation at any depth; nested-root isolation | `reserved_paths.feature` | `@FR-020` |
 | Symlink policy: access through a link refused (`AccessDenied`), link entries excluded from listings (default `follow_symlinks = false`) | `reserved_paths.feature` | `@fs @FR-020` |
 | Read-only mode (FR-023): reads served unchanged (head/get/listing over a planted fixture); a write from each mutating class refused with `AccessDenied` — bucket, object, batch delete, multipart, tagging and ACL — and a write to a missing bucket refused too (403, not 404) | `read_only.feature` | `@fs @read-only @FR-023` |
-| `GET /metrics` (Prometheus text format; the three-layer set — HTTP, S3 ops, storage streaming counters) | `metrics.feature` | `@T075 @SC-008` |
+| `GET /metrics` — the management plane's endpoint (Prometheus text format; the three-layer set — HTTP, S3 ops, storage): its phase-A verification is the `tinio-api` management-plane integration suite, and `metrics.feature` carries the data-plane path's **non**-interception (routed as the bucket named `metrics`); the control-channel scenario returns with plan B's harness migration | `metrics.feature`, `crates/tinio-api/tests/management.rs` | `@T075 @SC-008` |
 | SigV4 authentication: signed requests succeed; invalid credentials rejected with `InvalidAccessKeyId` and no operation performed (US3-AS1/AS2) | `interop/journey.feature` | `@FR-008 @SC-001 @T032 @FR-025 @SC-002` |
 | Interop: mandated clients (aws cli v2, rclone) core journey + ephemeral port (T032); client tiering (FR-025) | `interop/journey.feature` | `@SC-001 @T032 @FR-025` |
 | Interop: SC-002 no-client-side-overrides | `interop/journey.feature` | `@SC-002` |

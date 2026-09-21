@@ -65,7 +65,9 @@
 - Produces: `tinio_api::state::{State, STATE_FILE, STATE_VERSION, generate_token, path, socket_path}`; `State { version: u32, pid: u32, token: String, control_name: String, port: Option<u16>, root: PathBuf, started_at: String }` with `State::new(control_name, port, root) -> Result<State, Error>`, `State::write(&self, state_dir: &Path) -> Result<(), Error>`, `State::read(state_dir: &Path) -> Result<Option<State>, Error>`, `State::remove(state_dir: &Path) -> Result<(), Error>`, and `socket_path(state_dir: &Path, root: &Path) -> Result<PathBuf, Error>` — the unix control socket's **default** path, `tinio-<sha1(canonicalize(root))[..16]>.sock` in the state dir, derived from the root exactly like the Windows pipe's name (design decision 24) so two roots sharing one state dir cannot collide. `[api.unix] path` overrides it (relative or absolute); whichever wins, its **resolved absolute path** is what goes into `state.control_name`, which is the source of truth `status`, `stop` and `doctor` read — no client re-derives the name, and no arm assumes a fixed `tinio.sock`.
 - Produces, and **not** as prose the implementer may drop — the Windows DACL pair, `#[cfg(windows)]` and both in the crate's one raw-Windows module (`crates/tinio-api/src/dacl.rs`, registered as `#[cfg(windows)] pub mod dacl;` — `pub`, not `pub(crate)`: the module doc below says why), which is what makes Step 5's "seven on Windows" and Task 10's DACL legs true: `dacl::restrict_to_current_user(path: &Path) -> Result<(), Error>` (the install every `state` write runs, before a byte is written) and its read-back twin `dacl::acl_is_current_user_only(path: &Path) -> Result<bool, Error>`, which is this same task's so the DACL can be asserted rather than trusted — it reads the file's DACL back and answers whether every ACE's trustee is the current user's SID, and Task 10's Windows-gated leg calls it. **The module is the crate's single `#[allow(unsafe_code)]` site and Tasks 2, 4 and 10 add to it rather than opening a second one** — the named pipe's creation carries a DACL too (Task 2), so the pipe would otherwise have needed a second site; the design's decision 20 pattern is one enumerated site per crate, and this is it.
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–6 ran and the review passed. Two amendments landed on `State::write`'s DACL path and the code in `crates/tinio-api/src/{state.rs,dacl.rs}` is the authority where it differs from the blocks below: the install passes `PROTECTED_DACL_SECURITY_INFORMATION` (without it Windows merges the parent directory's inheritable ACEs back in, so the file read back as *not* current-user-only), and the temp file is now created fresh under that DACL (`dacl::create_restricted`, `CREATE_NEW` after an unlink) with `restrict_to_current_user` re-asserted before the first byte, because `CreateFileW` with `CREATE_ALWAYS` applies `lpSecurityAttributes` only when it actually creates the file.
+
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/tinio-api/src/state.rs` with only this module body:
 
@@ -201,12 +203,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api state::`
 Expected: FAIL — `cannot find type State` / unresolved module `state`.
 
-- [ ] **Step 3: Add the dependencies and the error variants**
+- [x] **Step 3: Add the dependencies and the error variants**
 
 `Cargo.toml` (workspace) — add to `[workspace.dependencies]` in alphabetical position: `axum = "0.8"`, `http-body-util = "0.1"`, `rustls-pemfile = "2.2"`, `sha1 = "0.11"` (the socket name's hash — `sha1`, not the state dir's `sha256`; `Cargo.lock:3338` already carries 0.11.0), `tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }`, `utoipa = { version = "5.5", default-features = false, features = ["axum_extras", "macros"] }`, and `windows-sys = "0.61"` for the DACL and the named pipe (`Cargo.lock:4868` already has 0.61.2; its features are chosen at the `tinio-api` dependency site below — and if plan B has already pinned it, keep the single pin). **`tokio-rustls`'s default features are off on purpose**: they select `aws-lc-rs`, whose `aws-lc-sys` is a C/CMake/NASM build on every developer machine and which drags a second `windows-sys 0.52` into the lock — the same duplicate the ledger rejected `windows-service` 0.8.0 over (design decision 22) — while `ring` is a pure-Rust build with no C toolchain and leaves exactly one crypto provider compiled in, which is also what keeps `ServerConfig::builder()` from panicking on an ambiguous process-level provider. (`hyper`, `hyper-util`, `http`, `tower`, `tokio`, `serde`, `serde_json`, `prometheus`, `hex`, `time`, `moka`, `tracing`, `tempfile` are already pinned; this plan uses none of `moka`.)
 
@@ -281,7 +283,7 @@ impl axum::response::IntoResponse for Error {
 }
 ```
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Prepend to `crates/tinio-api/src/state.rs`:
 
@@ -559,12 +561,12 @@ pub fn acl_is_current_user_only(path: &Path) -> Result<bool, Error> { /* GetName
 
 Add `pub mod state;` to `crates/tinio-api/src/lib.rs` in alphabetical position, the `#[cfg(windows)] pub mod dacl;` line beside it (the module of the block above — registered here because this is the task that creates it), and `pub use self::state::State;` beside the existing `pub use`.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api state::`
 Expected: PASS — eight tests on unix, seven on Windows (the DACL arm's own assertion is Task 10's Windows-gated leg).
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings` on this host, and the second leg — `cargo clippy --target x86_64-pc-windows-gnu -p tinio-api --all-targets -- -D warnings`, the one that compiles the DACL arm — **in WSL2**, which is where `docs/tests.md:13` routes it — its `Unix/windows-gnu` line points at the Platform-gated verification (WSL2) section, `docs/tests.md:121-131`: this host does not have the `x86_64-pc-windows-gnu` target installed, and WSL2's toolchain does (verified — `rustup target add x86_64-pc-windows-gnu` + mingw-w64, `docs/tests.md:129-131`). Give the Linux-side run its own `CARGO_TARGET_DIR` (e.g. `~/.cache/tinio-wsl-target`): `/mnt/e/GitHub/tinio/target` already holds this host's Windows `msvc` artifacts, and sharing the directory mixes the two toolchains' output.
 Expected: both clean; the only lint-configuration change is `unsafe_code` going `forbid` → `deny` with the one `#[allow(unsafe_code)]` site.
@@ -580,9 +582,11 @@ Report the files pending commit. Do not run any git write.
 
 **Interfaces:**
 - Consumes: `crate::error::Error`, and (Windows only) `crate::dacl`'s pipe helper Task 1 opened the site for.
-- Produces: `tinio_api::bind::{Channel, bind_unix, reclaim_stale, bind_pipe, SUN_PATH_MAX}` where `SUN_PATH_MAX` is the `#[cfg(unix)]` `pub const` plan C's socket-length check consumes (one owner for the platform constant, no second copy), and `Channel` is `#[non_exhaustive] pub enum Channel { Unix { listener: std::os::unix::net::UnixListener, path: PathBuf }, Pipe { name: String, handle: std::os::windows::io::OwnedHandle } }`, plus `Channel::identity(&self) -> String` (the bound socket path or the pipe name, for `State::control_name`) and `Channel::socket_path(&self) -> Option<PathBuf>`. **The listeners are `std` and the pipe is a raw handle on purpose, and it is the whole reason `Plane::bind` can be the single-instance lock before the runtime exists**: `tokio::net::UnixListener::bind` and `tokio::net::TcpListener::from_std` panic outside a runtime ("there is no reactor running, must be called from the context of a Tokio 1.x runtime"), `ServerOptions::create` reaches the same `PollEvented::new` through `NamedPipeServer::from_raw_handle`, and the CLI's sequence (§1 steps a–j, then k) binds before any runtime — so each transport is *created* with a runtime-free type here and *converted* inside `serve_transport`, where a runtime exists (Tasks 4, 5, 6). The unix arm carries its own path because the bind knows it: `identity` and `socket_path` read it rather than re-deriving one from `local_addr()`. The name is authored once, at the bind; `serve_local` (Task 4) reads it off the channel instead of taking it as a parameter.
+- Produces: `tinio_api::bind::{Channel, bind_unix, reclaim_stale, bind_pipe, SUN_PATH_MAX}` where `SUN_PATH_MAX` is the `#[cfg(unix)]` `pub const` plan C's socket-length check consumes (one owner for the platform constant, no second copy), and `Channel` is `#[non_exhaustive] pub enum Channel { Unix { listener: std::os::unix::net::UnixListener, path: PathBuf }, Pipe { name: String, handle: std::os::windows::io::OwnedHandle } }`, plus `Channel::identity(&self) -> String` (the bound socket path or the pipe name, for `State::control_name`) and `Channel::socket_path(&self) -> Option<PathBuf>`. **The listeners are `std` and the pipe is a raw handle on purpose, and it is the whole reason `Plane::bind` can be the single-instance lock before the runtime exists**: `tokio::net::UnixListener::bind` and `tokio::net::TcpListener::from_std` panic outside a runtime ("there is no reactor running, must be called from the context of a Tokio 1.x runtime"), `ServerOptions::create` reaches the same `PollEvented::new` through `NamedPipeServer::from_raw_handle`, and the CLI's sequence (§1 steps a–j, then k) binds before any runtime — so each transport is *created* with a runtime-free type here and *converted* inside `serve_transport`, where a runtime exists (Tasks 4, 5, 6). The unix arm carries its own path because the bind knows it: `identity` and `socket_path` read it rather than re-deriving one from `local_addr()`. The name is authored once, at the bind; `serve_local` (Task 4) reads it off the channel instead of taking it as a parameter. (**Amended 2026-09-21 by the operator's review of `bind.rs`: the `Channel` enum above is gone — each platform now has its own `Channel` struct selected by `#[cfg]`, because the two variants were mutually exclusive and every `match` therefore had exactly one reachable arm; `Channel::identity` and `Channel::socket_path` are unchanged, and the `## Post-plan review fixes (2026-09-21)` section at the end of this file carries the full record.**)
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–5 ran and the review passed. One amendment: `create_pipe` sets `PIPE_REJECT_REMOTE_CLIENTS` in `dwPipeMode`, not in `dwOpenMode` as the block below shows — measured, an open-mode bit that is not a `FILE_FLAGS_AND_ATTRIBUTES` value makes `CreateNamedPipeW` fail with `ERROR_INVALID_PARAMETER` (87), and the flag is a `NAMED_PIPE_MODE` (windows-sys declares it so; tokio's own `ServerOptions` sets it in the pipe-mode argument).
+
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-api/src/bind.rs`:
 
@@ -686,12 +690,12 @@ mod tests {
 
 **Every test above is a plain `#[test]`, and that is the point of the shape rather than an oversight**: the bind path is `std` on unix (`std::os::unix::net::UnixListener`) and raw Windows on the pipe, so it runs with no runtime on the thread — which is exactly the property `Plane::bind` needs to be the single-instance lock before the CLI's runtime exists (§1 steps a–j precede k). If a test here ever needs `#[tokio::test]`, the bind has grown a reactor dependency again, and that is the regression to catch. (Task 4's and Task 5's tests *are* `#[tokio::test]`: they `serve`, and serving is where the conversion into tokio's types happens.)
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api bind::`
 Expected: FAIL — `cannot find function bind_unix`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/tinio-api/src/bind.rs`:
 
@@ -944,12 +948,12 @@ pub fn create_pipe(name: &str, first_instance: bool) -> io::Result<OwnedHandle> 
 
 Note for the Windows arm: `reject_remote_clients` is the named pipe's local-only rule and **it exists** — `ServerOptions::reject_remote_clients(&mut self, reject: bool)` in `tokio-1.53.1/src/net/windows/named_pipe.rs:2164` and the flag it sets at `:2318` (`PIPE_REJECT_REMOTE_CLIENTS`) — which is why `create_pipe` sets that flag explicitly: it is the same rule, asked of the same API, from the layer that can also carry the DACL. What `ServerOptions::create` cannot do is either of the two things this bind needs: it passes a null `SECURITY_ATTRIBUTES` (`named_pipe.rs:2275-2279`), and it ends in `NamedPipeServer::from_raw_handle` → `PollEvented::new` (`:128-133`), which needs the reactor the pre-runtime half does not have. Nothing is dropped, nothing is hedged.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api bind::` (unix) and, on a Windows host, the same command there.
 Expected: PASS — five `cfg(unix)` tests and one `cfg(windows)` test (`a_second_bind_on_the_same_pipe_refuses`), and **no `#[tokio::test]` among them**, which is the assertion that the bind grew no reactor dependency (the note under Step 1). The Windows arm is exercised by the `test-port` CI leg.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings` on this host, and the `--target x86_64-pc-windows-gnu` leg in WSL2 (Task 1's Step 6 has the invocation and the `CARGO_TARGET_DIR` rule) — this is the second task whose Windows arm only that leg compiles.
 Expected: both clean.
@@ -967,7 +971,9 @@ Report the files pending commit.
 - Consumes: `State` (Task 1), `Error`/`ErrorBody` (Task 1's `IntoResponse`).
 - Produces: `tinio_api::router::{Auth, Shared, Context, router, StatusBody, StopBody}`; `pub type Shared = Arc<Context>` with `Context { state: State, host: String, auth: Auth, stop: tokio::sync::watch::Sender<bool>, port: Arc<OnceLock<u16>> }` built through `Context::new(state, host, auth, stop)`; `Auth { Local, Loopback, Tcp }` with `Auth::for_bind(addr) -> Auth` and `Auth::guards(self, path) -> bool`; `router(shared: Shared) -> axum::Router`. Task 7 adds a `gauges: Option<Arc<Gauges>>` field to `Context` (`None` from `Context::new`) and a route; Task 8 adds the `openapi` route behind its feature.
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–5 ran and the review passed. One amendment: the middleware is attached with `.route_layer(...)`, not the `.layer(...)` the block below uses and the module doc's parenthetical explains — measured, `Router::layer` also wraps `fallback_router`, whose built-in catch-all serves every unmatched path, so an unrouted request reached the middleware and answered `401` instead of the contract's bare `404`. `route_layer` wraps only the routes registered before it, which is the invariant the task states; method-mismatched requests to registered paths stay guarded. Two of the brief's test loops also moved from `/metrics`/`/openapi.json` to registered paths (`/status`, `/stop`), with a comment naming Task 7/Task 8 as the owners of the deferred leg.
+
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-api/src/router.rs`:
 
@@ -1134,12 +1140,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api router::`
 Expected: FAIL — `cannot find function router`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/tinio-api/src/router.rs`:
 
@@ -1392,12 +1398,12 @@ Add `pub mod router;` to `crates/tinio-api/src/lib.rs` in alphabetical position;
 
 The transport/auth matrix's rationale sentence is rewritten in the same edit to say what the bearer alias makes true (decision 8: "the contract's token matrix gains the bind-address dimension and its rationale sentence is rewritten in the same task"). The **Errors** section (`:49-51`) needs no edit: its `404 — unknown path` row is exactly what the router now delivers for an unmatched path, and the module doc records why (the layer does not wrap axum's built-in 404).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api router::`
 Expected: PASS — nine tests (the unmatched-path rule is one test with two assertions inside it: 404 with the token and 404 without).
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings`
 Expected: clean. (`middleware::from_fn_with_state` needs the `Router`'s state type to unify; if the compiler asks, `Router::new()…with_state(shared)` before `.layer(…)` is the alternative order — take whichever compiles and note it.)
@@ -1415,7 +1421,9 @@ Report the files pending commit.
 - Consumes: `Channel` (Task 2), `router`/`Shared` (Task 3).
 - Produces: `tinio_api::transport::serve_local` with `pub async fn serve_local(channel: Channel, shared: Shared, stop: watch::Receiver<bool>) -> Result<(), Error>`. **This is where the bind's `std` listener becomes tokio's**: the conversion (`tokio::net::UnixListener::from_std`) happens here, inside the runtime, which is the only place it can happen at all (`from_std` panics without one) and the reason Task 2's bind could precede the runtime. The `stop` receiver is the same channel `/stop` and the signal handlers flip (decision 12); it is taken here rather than inside `shared` because serving — not the router — is what has to *stop*.
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–5 ran and the review passed; the unix tests' evidence comes from WSL2, since this host's `transport::` filter matches zero tests and exits 0. Two amendments, both measured: hyper 1.x's default feature set is **empty**, so the `client`/`http1` features the note below attributes to its defaults are declared at the crate; and the crate declares its own tokio features (`sync` for `watch`, `macros` for the pipe arm's `select!`) rather than inheriting them from axum's feature set. `client.rs`'s staged helpers and `until_stopped` carry `dead_code` allows whose removal points are named in the report (Task 9, and Tasks 5/6).
+
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-api/src/transport.rs`:
 
@@ -1570,12 +1578,12 @@ where
 
 Add `mod client;` to `crates/tinio-api/src/lib.rs` beside the other modules. Task 9 does the rest — promotes `RawResponse`, `get_local`, `get_http` and `exchange` to `pub` (or `pub(crate)` where no test outside the crate needs them), adds `Report`, `control`, `probe`, `status`, `stop` and `request`, and the crate keeps exactly one definition of each of the four. The alternative (a second HTTP helper in the tests) is the duplication this plan exists to avoid.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api transport::`
 Expected: FAIL — `cannot find function serve_local`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/tinio-api/src/transport.rs`:
 
@@ -1697,12 +1705,12 @@ Add `pub mod transport;` to `crates/tinio-api/src/lib.rs` in alphabetical positi
 
 Task 5's `Transport::Local { channel, identity, auth }` records the **channel's own identity** — the path or name the bind actually created — into `state.control_name`, and Task 9's client dials with that recorded name; the name is authored once, at the bind, carried by the channel, and no arm derives it a second way.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api transport::`
 Expected: PASS — **unix-only, and say so when you report it**: both tests are `#[cfg(unix)]`, so on a Windows host this exact filter matches **zero** tests and cargo exits `0` without running anything, which is not evidence. The Windows arm is not tested here; it compiles under the `windows-gnu` clippy leg (Step 5) and is exercised end to end by Task 10's pipe leg, which is Windows-gated.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings` on this host, and the `--target x86_64-pc-windows-gnu` leg — the one that compiles the pipe arm — in **WSL2**, per `docs/tests.md:13`'s Platform-gated verification section (`docs/tests.md:121-131`; WSL2's toolchain has the target installed, this host's does not). Give the Linux-side run its own `CARGO_TARGET_DIR` (e.g. `~/.cache/tinio-wsl-target`), because `/mnt/e/GitHub/tinio/target` holds this host's Windows `msvc` artifacts.
 Expected: both clean.
@@ -1721,7 +1729,9 @@ Report the files pending commit.
 
 The CLI builds `Selection` from the resolved `[api]` config and the `--api*` flags (plan B) and hands the whole thing to `Plane::bind`; the exclusivity rule lives in `select` so that two callers cannot enforce it differently.
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–5 ran and the review passed, after one fix round. Two amendments. The non-loopback test asserts the token rule on a **registered** path (`/status`) with a comment naming Task 7 as the owner of the `/metrics` leg, because an unrouted path answers the contract's bare `404` and never reaches the middleware. And `Plane::shutdown`/`Drop` now delete through one ownership-checked helper — the socket only while the file at that path still carries the `(dev, ino)` recorded at bind, the `state` file only when it reads back with this process's `pid` — because the unguarded deletion below could strip a successor that bound the reclaimed socket during this plane's shutdown window (the gate is released when the control listener closes, but `shutdown` runs after the data-plane drain). `publish` is a no-op on a second call, so the file and `/status` cannot disagree.
+
+- [x] **Step 1: Write the failing tests**
 
 Append to the `tests` module in `crates/tinio-api/src/transport.rs`:
 
@@ -1804,12 +1814,12 @@ Append to the `tests` module in `crates/tinio-api/src/transport.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api transport::`
 Expected: FAIL — `cannot find function select` / `serve_tcp`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `crates/tinio-api/src/transport.rs`:
 
@@ -2208,12 +2218,12 @@ The `select` binding happens **before** the runtime exists in the CLI's sequence
 
 One story for the plane's two files: the CLI hands the local form in as `LocalForm` (with neither `[api.unix] path` nor `[api.pipe] path` it is `state::socket_path`, and a relative `[api.unix] path` is resolved against the state dir by `Plane::bind` — the one place that guarantees the recorded name is absolute), and its sequence is `Plane::bind` → `Plane::publish(port)` → `Plane::serve(stop)` → `Plane::shutdown()` — it never creates, joins or deletes `state` or the socket itself. The contract's `[api.unix] path` line still reads "default `tinio.sock`" (`config.md:89`, `:153`): decision 24 is the ruling, the design's Bookkeeping edits those two lines of `config.md`, and the `management-api.md:5` copy of the same claim is **this plan's** — Task 3 makes that edit. An over-long socket path is refused by `bind_unix` with the remedy named (`[api.unix] path` may be absolute, so it can point at a short directory): there is **no** automatic fallback, because abstract sockets are not portable (`research.md:56`), and `doctor` reports the resolved path and its length.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api transport::` and `cargo test -p tinio-api --no-default-features transport::`
 Expected: PASS in both graphs (the `https` arms are feature-gated, and `select` without `tls` refuses an `https` selection).
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings`
 Expected: clean. (The `_` arm in `select` is an `Err`, not an `unreachable!()`, so `clippy::unreachable` has nothing to fire on and the crate keeps its no-panic rule: if the compiler can prove the arm dead after the count check, dropping it is also fine — but the count check stays, because it is what makes the refusal's *message* name the rule.)
@@ -2231,11 +2241,13 @@ Report the files pending commit.
 - Consumes: `Transport::Https`, `Shared`, `router`, Task 4's `until_stopped`.
 - Produces: `pub async fn serve_https(listener: std::net::TcpListener, cert: &Path, key: &Path, shared: Shared, stop: watch::Receiver<bool>) -> Result<(), Error>` and `struct TlsListener` implementing `axum::serve::Listener`. The `std` listener arrives bound and is converted inside, exactly as in `serve_tcp` (`select` ran before the runtime, and `from_std` panics without one).
 
-- [ ] **Step 1: Create the test-only certificate pair**
+**Execution record (2026-09-20):** steps 1–6 ran and the review passed, after one fix round. Amendments and measurements worth keeping: the committed pair pins `CA:FALSE` (openssl's default `CA:TRUE` is rejected by webpki for an end-entity leaf, even self-signed and self-trusted); the test's certificate paths had to move into an `async move` block because `&cert`/`&key` cannot be `'static` for `tokio::spawn`; the brief's `transport::https` filter matches no test (the real path is `transport::tests::https_serves_status_over_tls`); `tokio-rustls` resolves to 0.26.5, not 0.26.4; and the fixture README's regeneration fence needed a fix (`$f` where the file is `$f.pem`) — the fence must be run as *text*, not as unrolled steps, or the bug survives. The stall regression measures the full `HANDSHAKE_TIMEOUT` (≈5.01 s) with a silent socket open, and its only assertion is that `/status` answered while the test never closed its end.
+
+- [x] **Step 1: Create the test-only certificate pair**
 
 Generate a self-signed pair for `localhost` with 3650-day validity and commit both PEM files under `crates/tinio-api/tests/fixtures/`. The pair is committed and it is **marked test-only** (design decision 25), in the files and beside them: each PEM carries a header comment saying what it is — self-signed test material, valid for `localhost` only, never to be used for a real deployment — and `crates/tinio-api/tests/fixtures/README` repeats that in prose together with the exact commands that produced the pair, so it can be regenerated rather than trusted. No test outside this crate reads the key, nothing ships it (`tests/` is not packaged), and a committed test key is a key with no trust attached to it — which is what keeps the TLS legs runnable on every platform without `rcgen` or a locally installed `openssl`.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Append to the `tests` module in `crates/tinio-api/src/transport.rs`:
 
@@ -2268,12 +2280,12 @@ Append to the `tests` module in `crates/tinio-api/src/transport.rs`:
 
 `crate::test_support` is a `#[cfg(test)] pub(crate) mod` in `lib.rs` holding the fixture paths and the rustls client; it is test-only and does not ship.
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-api --features tls transport::https`
 Expected: FAIL — `cannot find function serve_https`.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Add to `crates/tinio-api/src/transport.rs`:
 
@@ -2424,14 +2436,14 @@ fn is_connection_error(err: &std::io::Error) -> bool {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api --features tls` and `cargo test -p tinio-api`
 Expected: PASS in both; without `tls` the HTTPS code does not compile in, and `select` refuses an `https` selection (Task 5's test covers that).
 
 **Add the stall regression to the same module, because it is the property the handshake timeout exists for and it is not visible in the happy path**: a second `#[cfg(feature = "tls")]` test connects a bare `std::net::TcpStream` to the bound address and sends nothing, then asserts that a real client's `/status` still answers (the plain `std` client from `test_support`, or a second `https_get`) — i.e. that the silent connection did not take the accept loop. Without the timeout that test hangs, which is exactly the failure a client with no ClientHello could produce in production; with it, the silent socket is dropped after `HANDSHAKE_TIMEOUT` and the assertion passes. Report the elapsed time in the task's report rather than asserting on it (a five-second bound is not a timing test).
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets --features tls -- -D warnings` and the same without the feature.
 Expected: both clean.
@@ -2450,7 +2462,9 @@ Report the files pending commit.
 - Consumes: the router's `Context`, and the caller's `MetricsSource` — **not** `Storage`: the trait is dyn-incompatible by design (`tinio-core/src/storage/mod.rs:23-25`: an associated `Error` plus the `where Self: Storage` category bounds), so no `Arc<dyn Storage>` exists anywhere in this workspace and this crate never holds a backend.
 - Produces: `tinio_api::metrics::{Gauges, MetricsSource, DEFAULT_TTL}` with `pub trait MetricsSource: Send + Sync { fn refresh(&self); fn counts(&self); }` — **the injection point**, defined here and implemented by the caller, split the way the cost is split: `refresh` is the cheap half (every scrape), `counts` the expensive one (one full storage scan, run by the reader task below and **never from a request**). **No number crosses this boundary** — the counts would have to be written into `tinio-server`'s three statics, which only the caller can name, and they cannot be computed here either (this crate has no storage). Plus `Gauges::new(source: Arc<dyn MetricsSource>, ttl: Duration) -> Gauges`; `pub fn refresh(&self)` (the cheap half only); `pub fn render(&self) -> Result<String, Error>`; `pub fn spawn_reader(self: &Arc<Self>, stop: watch::Receiver<bool>) -> tokio::task::JoinHandle<()>`.
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–6 ran and the review passed. Notes worth keeping: the brief's cucumber command (`--tags 'not @interop'`) **replaces** the harness's whole default filter, so it selects `@boto3`/`@parquet` scenarios this host cannot run — the canonical default-filter run (236/236 scenarios) is the evidence; five imports (not three) went dead with the removed route; the two router loops Task 3 deliberately left incomplete now assert a concrete `200` rather than `assert_ne!(401)`; and `T146` joined `traceability.rs`'s `NOT_COVERED_BY_CUCUMBER` because the plan-audit commit's `config.md` row had left that leg red at HEAD (verified read-only against `c0…`'s parent).
+
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-api/src/metrics.rs`:
 
@@ -2529,12 +2543,12 @@ mod tests {
 
 There is no storage-less constructor to fall back on: `Gauges::new` has one shape, and the whole of its input is the injected source. **The cadence is the reader task's, and there is no cache behind it** — a cache would be a second, competing mechanism for one rule ("how often may a full scan run"), and this repository's ownership checks hunt exactly that: the reader's `ttl` is the rule, the task is single-flight by construction (one task, one scan at a time), and `refresh()` — the only thing a scrape calls — touches the cheap half alone.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api metrics::`
 Expected: FAIL — unresolved module `metrics` / `cannot find type Gauges`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/tinio-api/src/metrics.rs`:
 
@@ -2682,7 +2696,7 @@ The injected source is the whole point of this shape. The three storage families
 
 **Adding a `tinio-api` → `tinio-server` dependency is forbidden, not merely discouraged**: `tinio-server` already carries `tinio-api = { optional = true }` (`crates/tinio-server/Cargo.toml:56,105`), and cargo rejects the cycle at **resolution** time — `error: cyclic package dependency` — even with that optional feature off, which was measured against a minimal two-crate workspace on 2026-09-20 (design decision 23). This task's diff must not contain that edge at all; a review that finds it has found a defect rather than a trade-off to weigh.
 
-- [ ] **Step 4: Add the route and remove the interim one**
+- [x] **Step 4: Add the route and remove the interim one**
 
 `crates/tinio-api/src/router.rs` — add `pub gauges: Option<Arc<Gauges>>` to `Context` (`None` from `Context::new`, the route's default state), have `Plane::bind` fill it from a new `Options::gauges: Option<Arc<Gauges>>` field (`crates/tinio-api/src/transport.rs` — the field is added to `Options` there and threaded into the `Context` the plane builds), add `.route("/metrics", get(metrics))` **above the `.layer(...)` line** (Task 3's note: a route added after the layer is served with no token check at all), and:
 
@@ -2740,14 +2754,14 @@ The four **live** doc comments whose F10 wording this task falsifies, all in `cr
 - `crates/tinio-server/src/metrics.rs:349-357` and `:542-543` — `refresh`'s doc and the snapshot test's comment both say the server's `/metrics` endpoint calls the refresh on every scrape; they now say the *management plane* does, through the CLI's adapter.
 - `docs/superpowers/specs/2026-09-05-s3-acl-owner-design.md:65` — the grilling ruling that `/metrics` is pre-route-intercepted in `data.rs` is a live design decision this task falsifies; it is amended to the management plane rather than left as the record of a route that no longer exists. (Historical records — `code-review-findings.md`, completed plans and their reports — are not touched: they record what was true when they were written.)
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api metrics::` and `cargo test -p tinio-server`
 Expected: PASS. A tinio-server test that asserted the data-plane route is now gone rather than failing — if the compiler reports it, that is this task's edit, not a broken test.
 Run: `cargo test -p tinio-e2e --test cucumber -- --tags 'not @interop'` and `cargo test -p tinio-e2e --test traceability`
 Expected: PASS — **with** the scenario's data-plane scrape gone. This leg must not be reported green while the scenario still points at the data-plane path: the suite failing here means the scenario was not retired, and the task is not done until it is.
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings` and `cargo clippy -p tinio-server --all-targets -- -D warnings`
 Expected: clean.
@@ -2765,7 +2779,9 @@ Report the files pending commit.
 - Consumes: `StatusBody`, `StopBody`, `Auth`.
 - Produces: `pub fn document() -> utoipa::openapi::OpenApi` and a `/openapi.json` route registered only under the feature.
 
-- [ ] **Step 1: Write the failing test**
+**Execution record (2026-09-20):** steps 1–5 ran and the review passed. Notes worth keeping, all four of them things the block below does not say: `StatusBody` and `StopBody` each need their own `#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]`, because `components(schemas(...))` cannot compile without it and `document()` is the only place those two names reach utoipa; the four `#[utoipa::path]` stubs each need `#[allow(dead_code)]`, because the macro re-emits the annotated item and never references it, so a stub without the allow is a dead-code error under `-D warnings`; the route is registered above the crate's **`.route_layer(...)`** line rather than the `.layer(...)` one the prose names — Task 3 chose `route_layer` deliberately, since `layer` also wraps the fallback router and would answer `401` for an unrouted path instead of leaking nothing with the contract's plain `404`; and the summaries the generated JSON carries come from the stubs' `///` doc comments, which is why those lines describe the endpoints rather than the stub functions they sit on.
+
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-api/src/openapi.rs`:
 
@@ -2785,12 +2801,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-api --features openapi openapi::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! The OpenAPI document (`management-api.md:59`), behind the `openapi` feature.
@@ -2848,12 +2864,12 @@ async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
 
 `crates/tinio-api/src/lib.rs` — `#[cfg(feature = "openapi")] pub mod openapi;` in alphabetical position, with `#[cfg(feature = "openapi")] pub use self::openapi::document;` beside it so a caller can name `tinio_api::document` without the module path. Both carry the same `cfg`, which is what keeps the default graph free of the module and of `utoipa`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api --features openapi` and `cargo test -p tinio-api`
 Expected: PASS in both graphs.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets --features openapi -- -D warnings` and `cargo hack check -p tinio-api --each-feature --no-dev-deps`
 Expected: clean; every feature combination compiles.
@@ -2874,7 +2890,9 @@ Two boundaries this task owns. **The client takes one state dir**, passed in: re
 
 Task 4's `mod client;` line becomes `pub mod client;`, and its three helpers are promoted in place: `RawResponse` and its two fields, `get_local` and `get_http` all go `pub(crate)` → `pub`, with the doc comments the workspace requires of public items added as they move. Everything else in this task is new here.
 
-- [ ] **Step 1: Write the failing tests**
+**Execution record (2026-09-20):** steps 1–5 ran and the review passed. Two rulings: a `200` whose body is not the contract's JSON means `running: false` rather than an error (the block below and the prose disagree; the prose, `contracts/cli.md`'s error model and the "probe fails ⇒ stopped" rule decide it), and `probe` stays body-blind — measured, it answers `true` for that same garbled server, so it and `status` differ by design and both docs say so. The block below also needs four things the crate's own gates force: `Arc` imported in the test, `rx` mutable, unix-only imports gated, and the fully-qualified paths de-qualified.
+
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-api/src/client.rs`:
 
@@ -2933,12 +2951,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-api client::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Extend the file Task 4 created. The module doc and the three helpers are already there and keep their single definition — `RawResponse` and its two fields, `get_local` and `get_http` go `pub(crate)` → `pub` and gain the doc comments the workspace requires of public items — and `Report`, `Control`, `control`, `probe`, `status`, `stop`, `request` and `exchange` are added below them.
 
@@ -3154,12 +3172,12 @@ where
 
 Two notes the implementer must not have to rediscover: `/metrics` is unauthenticated on the **local** channel and on a **loopback-bound** TCP transport (the contract's bind-address rule, decision 8 — `get_local`'s and `get_http`'s `token: None` is how Task 5's loopback leg exercises it), and **`probe` answers `false` rather than failing when nothing is listening** — a connection error is a normal answer for "is a server there?", not an error — while `status` maps both a missing file and a failed probe to `running: false` and keeps the state file it did read. The one case that is an `Err` is a state file that exists and cannot be read (`State::read`'s `Error::State`), which is what `contracts/cli.md:58` puts on the error path; a probe that reaches a server which then answers something that is not the contract's body is also `false` rather than an error, because `status` reports what answered, and a garbled answer is not a running server by the contract's definition.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-api client::`
 Expected: PASS — **unix-only, and say so when you report it**: both tests are `#[cfg(unix)]`, so on a Windows host this filter matches zero tests and cargo exits `0` without running anything. The Windows legs — the pipe client and the DACL — are Task 10's, and they are Windows-gated there.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-api --all-targets -- -D warnings`
 Expected: clean.
@@ -3177,16 +3195,18 @@ Report the files pending commit.
 - Consumes: every task above.
 - Produces: nothing the library uses — this is the phase's acceptance.
 
-- [ ] **Step 1: Write the first failing test**
+**Execution record (2026-09-20/21):** steps 1–7 ran and the review passed, after two fix rounds (a hand-written `READ_CONTROL` whose justification was false — now imported from `Win32::Storage::FileSystem` — and a follow-up-row pointer that named the wrong ID). Notes: the red state is the pre-creation `no test target named 'management'` (the first test then passed on the spot, because modules 1–9 were already green, and the report says so rather than inventing a second red); the two `cargo hack --each-feature` rows are red for a **pre-existing** reason — `tinio-server`'s `otel` feature does not compile, which no file this plan touched is reachable from — so the facade matrix is green with `--skip otel`; and the pipe accept loop's successor-instance window (a dial in the gap before the successor exists meets `ERROR_PIPE_BUSY`, which makes `tinio status` report a running server as stopped) is recorded in `docs/tests.md` with its consequence and handed to a follow-up row, **T147**, rather than redesigned here.
+
+- [x] **Step 1: Write the first failing test**
 
 Create `crates/tinio-api/tests/management.rs` with **one** test: the CLI's own sequence over the local channel — `Plane::bind(options)` → `publish(port)` → `serve(stop)` → Task 9's `stop(state_dir)` → `shutdown()` — asserting `/status` answers `200` with the token and that `shutdown` leaves neither the socket file nor `state` behind. It is the first bullet of Step 3's list, written alone because the global constraint holds here too: this task's deliverable is the suite, so its red state has to be established before the suite exists rather than assumed after it passes.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p tinio-api --test management`
 Expected: FAIL — `error: no test target named \`management\`` while the file holds no test (and, for the record, the same command with the whole suite is the phase's acceptance, Step 4).
 
-- [ ] **Step 3: Write the rest of the integration suite**
+- [x] **Step 3: Write the rest of the integration suite**
 
 `crates/tinio-api/tests/management.rs` covers T056's list, one test per bullet, and it is the **only consumer of the plane in phase A**: nothing outside a test starts one until plan B wires the CLI, so this suite is T056's acceptance rather than a nice-to-have beside a running binary (and it is T075's phase-A verification too, since Task 7 retired the cucumber scrape). Drive the plane the way the CLI will — `Plane::bind(options)` → `publish(port)` → `serve(stop)` → `shutdown()` — rather than by calling the transports directly.
 
@@ -3194,23 +3214,35 @@ The bullets: `/status` with and without the token; `/stop`'s `202` and the bound
 
 `dacl::pipe_acl_is_current_user_only(name: &str) -> Result<bool, Error>` is this task's addition to Task 1's module (the site is already open, and this is its third use): it opens the pipe for `READ_CONTROL`, reads the DACL back with `GetSecurityInfo(handle, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, …)` and walks it exactly as `acl_is_current_user_only` walks a file's — same trustee rule, same `Ok(false)` for an empty DACL, same `Error::State` mapping, same `LocalFree` on every path. It is public for the same reason the file twin is: this leg is an integration test and could not reach a `pub(crate)` helper.
 
-- [ ] **Step 4: Run the suite**
+- [x] **Step 4: Run the suite**
 
 Run: `cargo test -p tinio-api --features openapi,tls` and `cargo test -p tinio-api`
 Expected: PASS in both. The suite is the acceptance for this phase: with no runtime caller yet, a T056 bullet that only the CLI could exercise is out of scope rather than skipped, and every bullet above runs here.
 
-- [ ] **Step 5: Run the feature matrix and the workspace gate**
+- [x] **Step 5: Run the feature matrix and the workspace gate**
 
 Run: `cargo hack check -p tinio-api --each-feature --no-dev-deps` and the `docs/tests.md` Standard acceptance block in full.
 Expected: PASS. Report each command's output.
 
-- [ ] **Step 6: Bookkeeping**
+- [x] **Step 6: Bookkeeping**
 
 - `docs/tests.md`: add the management-plane legs under a `## Management plane (tinio-api)` heading in the existing compressed style.
 - `specs/001-s3-local-server/tasks.md`: tick **T056** and **T075**. The tick comments carry what each tick rests on: T056's acceptance is Step 3's suite (there is no runtime caller in this phase), and T075's phase-A verification is that same suite, because Task 7 retired the data-plane cucumber scrape and the control-channel e2e form returns with plan B's harness migration — a bare tick would read as if the e2e leg still covered it. The read-only follow-up T143 keeps its `tinio-api` half open until plan B wires the API's relocation (which this plan makes structural by taking the state dir as a parameter — note that in the same comment).
 - `crates/tinio/Cargo.toml` (the facade): add `openapi` and `tls` to `tinio-api`'s feature pass-through (`openapi = ["tinio-api/openapi"]`, `tls = ["tinio-api/tls"]`, beside the existing `api = ["dep:tinio-api", …]` line) and to the facade's `default` list (design decision 17). **This plan owns those rows and the `default` list only**: plan B owns the same crate's `[dev-dependencies]` and the `sandbox` row, and neither plan may edit the other's lines — the ownership check below is what keeps that true.
 - Run the ownership check of `docs/superpowers/README.md` against this plan and its two siblings before declaring the phase complete: name the single owner of `Plane`/`Options` (this plan, Task 5 — the same owner as `state` and the socket), of the state file's schema (`state.rs`), of the transport resolution (`transport::select`), of `/metrics`' gauge source (the injected `MetricsSource`; the family list itself stays `tinio-server`'s registry), **of the storage scan's cadence (`Gauges`'s reader task — one task, one scan at a time, and no request ever scans; the old phrasing "the TTL-gated scan" is corrected here as well as in the design)** and of the shutdown channel (the CLI creates it, the plane sends on it, both serves read it), and search the other two plans for a second statement of each.
 
-- [ ] **Step 7: Final checkpoint**
+- [x] **Step 7: Final checkpoint**
 
 Report every file pending commit, and the full acceptance output. Do not run any git write.
+
+## Post-plan review fixes (2026-09-21)
+
+These seven landed after the plan's ten tasks closed, out of the whole-branch review's fix wave and the `/simplify` pass, except the last, which came from the operator's own review of `bind.rs` and is marked as such; where any task block above differs from what the code does, the code is the authority.
+
+- **`client::dialable`** — a recorded control name whose IP is unspecified is dialled on loopback, because a wildcard bind's `0.0.0.0:port` is not a connect address (Windows refuses it with `WSAEADDRNOTAVAIL`, measured on this branch's host) and `status` maps every dial failure to `running: false`, so without the substitution a wildcard-bound server would report "stopped" deterministically; the contract carries the sentence (`management-api.md`'s wildcard-bind paragraph of the transport section) and the wildcard leg in `crates/tinio-api/tests/management.rs` pins it.
+- **`/metrics`' empty-gauge answer** became `{"error": "metrics are not attached"}` rather than a plain-text body, so the absence keeps the crate's one error shape; the `404` itself is unchanged and is still what the contract's endpoint table says the absence is served as.
+- **`get_local`/`get_http`/`exchange` take a `Call` value** (`target`, `method`, `token`) instead of three positional arguments, so `client::request`'s arms delegate to them instead of re-dialing — one carry type through all four, no duplicated argument lists, and no call site that can transpose the target and the method.
+- **`Transport::Local`'s stored `identity` and `auth` fields are gone**: `Transport::identity()` asks the channel and `Transport::auth()` derives from `Auth::for_bind`, so a transport cannot carry a rule that disagrees with the address it bound.
+- **`Context`'s `gauges` is private**, attached at construction (`Context::with_gauges`) instead of assigned afterwards — the field is readable only through the accessor the plane and the tests share.
+- **`State` has a hand-written `Debug` that redacts the token** — the struct rides inside the CLI's `Report`, so a future `?report` in a log line cannot print the bearer token; every other field renders as the derive would.
+- **The `Channel` enum is gone: each platform has its own `Channel` struct, selected by `#[cfg]`** — and this one came from the operator's review of `bind.rs` rather than from this branch's own reviews, which is why it is recorded here beside them. The enum's two variants were `#[cfg]`-selected and therefore mutually exclusive by construction, so every `match` on a channel had exactly one reachable arm per build and the `#[non_exhaustive]` attribute existed only to explain that; there is now a `#[cfg(unix)]` struct holding `listener`/`path` and a `#[cfg(windows)]` one holding `name`/`handle`, exactly one of which exists in any build. The accessors are unchanged — `identity()` and `socket_path()` are inherent on whichever struct the build has, unix answering the bound path and `Some(path)` and Windows the pipe name and `None` — the fields are crate-visible rather than public (`serve_local` destructures the channel it was handed, and nothing outside the crate reaches them), `bind_unix`/`bind_pipe` construct the struct where they built a variant before, and Task 2's Interfaces line above carries the same amendment.

@@ -1,0 +1,40 @@
+# TLS test fixtures
+
+`cert.pem` and `key.pem` are **self-signed test material**: a certificate for `CN=localhost` (SAN `DNS:localhost`, `IP:127.0.0.1`) with 3650-day validity, and its matching private key. They exist so `tinio-api`'s TLS tests can run on every platform without `rcgen` or a locally installed `openssl`.
+
+**They are never for a real deployment.** The private key is committed, so it is public, and it authenticates nothing: a deployment must generate its own pair and keep the key secret. No test outside `tinio-api` reads it, and `tests/` is not packaged, so no build of `tinio` ships either file.
+
+The pair is regenerated rather than trusted. From the repository root:
+
+```sh
+cd crates/tinio-api/tests/fixtures
+MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -noenc \
+    -subj "/CN=localhost" \
+    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -keyout key.pem -out cert.pem
+
+cat > header-cert <<'EOF'
+# tinio test fixture: SELF-SIGNED TEST MATERIAL. NEVER USE IN A REAL DEPLOYMENT.
+# Self-signed certificate for CN=localhost (SAN: DNS:localhost, IP:127.0.0.1) only.
+# It is committed so the TLS tests run on every platform; it authenticates nothing.
+EOF
+cat > header-key <<'EOF'
+# tinio test fixture: SELF-SIGNED TEST MATERIAL. NEVER USE IN A REAL DEPLOYMENT.
+# The private key of cert.pem, for CN=localhost only, trusted by no one.
+# It is committed so the TLS tests run on every platform; it protects nothing.
+EOF
+
+for f in cert key; do
+    cat "header-$f" "$f.pem" > "$f.pem.tmp" && mv "$f.pem.tmp" "$f.pem"
+    rm -f "header-$f"
+    tr -d '\r' < "$f.pem" > "$f.pem.lf" && mv "$f.pem.lf" "$f.pem"
+done
+```
+
+Notes, each one load-bearing:
+
+- **`CA:FALSE` is required, not cosmetic.** The rustls client in `test_support` trusts this certificate as its root, and webpki rejects a certificate that carries `basicConstraints CA:TRUE` when it is presented as the end-entity (`rustls-webpki-0.103.15/src/verify_cert.rs:436`, `Error::CaUsedAsEndEntity`). `openssl req -x509` defaults to `CA:TRUE`, so the override is what makes the pair usable as both leaf and trust anchor.
+- **The header sits before the `-----BEGIN` line, outside the PEM block.** RFC 7468 section 2 allows explanatory text outside the encapsulation boundaries, and `rustls-pemfile` (through `rustls-pki-types`' parser) skips every line that does not open a section, so the loader reads the file unchanged. Inside the block the same lines would be fed to the base64 decoder and fail the parse.
+- **`MSYS_NO_PATHCONV=1` is a Git Bash requirement only.** Without it, MSYS rewrites the `/CN=localhost` subject into a Windows path and `openssl` refuses the name.
+- **The `tr -d '\r'` step is defensive normalization, not a required one.** How an `openssl` ends its lines depends on the host, not on these flags: the MinGW build this pair was last generated with (`/mingw64/bin/openssl`, OpenSSL 3.5.7 on Windows) writes CRLF, while a Linux `openssl` writes LF — both measured, on their own hosts. The step pins the working tree to LF either way, which costs nothing and means the file on disk matches the blob git stores (`core.autocrlf` normalizes to LF on add). It is hygiene, not a dependency: the pair loads with either ending, and the tests were verified green against both.

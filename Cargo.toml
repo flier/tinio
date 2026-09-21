@@ -10,6 +10,7 @@ edition = "2024"
 arrow = { version = "60", default-features = false }
 assert_cmd = "2"
 async-trait = "0.1"
+axum = "0.8"
 base64 = "0.23"
 bytes = "1"
 bzip2 = "0.6"
@@ -24,11 +25,13 @@ dotenvy = "0.15"
 flate2 = "1.0"
 futures = "0.3"
 garde = "0.23"
+getrandom = "0.4"
 getset = "0.1"
 hex = "0.4"
 hmac = "0.13"
 http = "1"
 http-body = "1"
+http-body-util = "0.1"
 humantime-serde = "1.1"
 hyper = "1.1"
 hyper-util = "0.1"
@@ -51,11 +54,13 @@ rayon = "1"
 redb = "4.2"
 rust_decimal = "1"
 rustix = "1.1"
+rustls-pemfile = "2.2"
 s3s = "0.16"
 secrecy = "0.10"
 serde = "1"
 serde_ignored = "0.1"
 serde_json = "1.0"
+sha1 = "0.11"
 sha2 = "0.11"
 smart-default = "0.7"
 sqlparser = "0.63"
@@ -67,14 +72,24 @@ thiserror = "2.0"
 thread-priority = "3.1"
 time = "0.3"
 tokio = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
 toml = "1.1"
 tower = "0.5"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = "0.3"
 unicode-properties = { version = "0.1", default-features = false }
+utoipa = { version = "5.5", default-features = false, features = [
+    "axum_extras",
+    "macros",
+] }
 uuid = "1"
 winapi-util = "0.1"
+windows-sys = "0.61"
 
 tinio-api = { path = "crates/tinio-api", default-features = false }
 tinio-auth = { path = "crates/tinio-auth" }

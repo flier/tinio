@@ -30,8 +30,8 @@ use std::{
 #[cfg(feature = "cors")]
 use http::header::ORIGIN;
 use http::{
-    Method, Request, Response,
-    header::{CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT},
+    Request, Response,
+    header::{CONTENT_LENGTH, REFERER, USER_AGENT},
 };
 use hyper::{
     body::{Bytes, Incoming},
@@ -42,7 +42,6 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 use io::Error as IoError;
-use prometheus::{Encoder, TextEncoder, default_registry};
 use s3s::{
     Body as S3Body,
     auth::{S3Auth, SecretKey},
@@ -68,14 +67,30 @@ use crate::{
     readonly::S3ReadonlyBackend,
 };
 
-/// The `/metrics` scrape path (F10/F49): the hook refreshes the
+/// The scrape-time metrics refresh (F49): the hook refreshes the
 /// scrape-computed families (`tinio_server::metrics::refresh` — the
-/// server wires it to the pipelines' [`Stats`] and the storage's
-/// write-lock snapshot) before the endpoint gathers the registry.
+/// server wires it to the pipelines' `Stats` and the storage's
+/// write-lock snapshot) so that whoever gathers the registry finds them
+/// current.
+///
+/// **The scrape lives on the management plane** (`tinio-api`'s
+/// token-gated `/metrics`), which the CLI's own `MetricsSource` adapter
+/// drives: this hook is what that adapter's cheap half calls. Nothing in
+/// this file serves the path — the data-plane listener answers `/metrics`
+/// as the bucket named `metrics`, like any other first path segment (the
+/// interim unauthenticated data-plane route was removed when the
+/// management plane's endpoint landed, F10).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::MetricsRefresh;
+///
+/// // What the CLI's adapter installs with `DataPlane::with_metrics`.
+/// let refresh: MetricsRefresh = std::sync::Arc::new(|| {});
+/// refresh();
+/// ```
 pub type MetricsRefresh = Arc<dyn Fn() + Send + Sync>;
-
-/// The reserved `/metrics` endpoint path on the data-plane listener.
-pub const METRICS_PATH: &str = "/metrics";
 
 /// The single static SigV4 credential pair as an s3s auth provider.
 /// Unlike `SimpleAuth` (which answers `NotSignedUp`), an unknown access
@@ -269,11 +284,11 @@ impl DataPlane {
         }
     }
 
-    /// Attach the scrape-time metrics refresh (F10): the `/metrics`
-    /// endpoint on the data-plane listener calls the hook before
-    /// gathering the registry. `serve` wires it to
+    /// Attach the scrape-time metrics refresh (F49): the hook is what the
+    /// management plane's `/metrics` runs on every scrape, through the
+    /// CLI's `MetricsSource` adapter. `serve` wires it to
     /// `tinio_server::metrics::refresh(io.stats(), db.stats(),
-    /// storage.write_lock_stats())`.
+    /// storage.write_lock_stats())`; no endpoint on this listener calls it.
     pub fn with_metrics(mut self, refresh: MetricsRefresh) -> Self {
         Arc::get_mut(&mut self.service)
             .expect("the plane is not shared at construction")
@@ -347,42 +362,12 @@ impl Service<Request<Incoming>> for WithPeer {
     type Response = Response<CountingBody<S3Body>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        // The reserved `/metrics` scrape endpoint (F10): served here,
-        // BEFORE the S3 service — a management path on the data-plane
-        // listener, never routed to the storage plane.
-        if is_metrics_request(req.method(), req.uri()) {
-            return metrics_response(&self.service.metrics);
-        }
+        // Every request reaches the S3 service, `/metrics` included: the
+        // scrape endpoint lives on the management plane, so the path is
+        // routed as the bucket named `metrics` like any other first path
+        // segment (F10 — no request is intercepted here any more).
         self.service.call_with_peer(req, self.peer)
     }
-}
-
-/// Whether the request targets the reserved `/metrics` scrape endpoint
-/// (GET only; any other method falls through to the S3 service).
-fn is_metrics_request(method: &Method, uri: &http::Uri) -> bool {
-    method == Method::GET && uri.path() == METRICS_PATH
-}
-
-/// The `/metrics` response: refresh the scrape-computed families through
-/// the plane's hook, then gather the default registry in the Prometheus
-/// text format (F10/F49).
-fn metrics_response(metrics: &MetricsRefresh) -> ServiceFuture {
-    metrics();
-    let mut buf = Vec::new();
-    // TextEncoder::encode is infallible in practice (the error type
-    // is a placeholder) — a failure serves an empty body.
-    let _ = Encoder::encode(&TextEncoder::new(), &default_registry().gather(), &mut buf);
-    let response = Response::builder()
-        .status(200)
-        .header(CONTENT_TYPE, "text/plain; version=0.0.4")
-        .header(CONTENT_LENGTH, buf.len())
-        .body(CountingBody::new(
-            S3Body::from(buf),
-            Arc::new(AtomicU64::new(0)),
-            CountingKind::Download,
-        ))
-        .expect("a static /metrics response is always valid");
-    Box::pin(async move { Ok(response) })
 }
 
 /// The tower middleware over the s3s service: access-log events, HTTP
@@ -390,8 +375,10 @@ fn metrics_response(metrics: &MetricsRefresh) -> ServiceFuture {
 #[derive(Clone)]
 pub struct DataPlaneService {
     inner: S3Service,
-    /// The scrape-time metrics refresh (F10/F49) — a no-op until
-    /// [`DataPlane::with_metrics`] attaches the server's hook.
+    /// The scrape-time metrics refresh (F49) — the hook the management
+    /// plane's `/metrics` runs through the CLI's adapter, attached by
+    /// [`DataPlane::with_metrics`]; a no-op until then. No endpoint on
+    /// this listener calls it (F10).
     metrics: MetricsRefresh,
     /// The CORS config lookup (feature + capability double-gated; `None`
     /// when the preflight route is not armed) — read by the Task-10
@@ -740,14 +727,13 @@ mod tests {
         collections::{HashMap, VecDeque},
         fmt::Debug,
         io,
-        sync::{Mutex, atomic::AtomicUsize},
+        sync::Mutex,
         thread,
         time::Duration,
     };
 
     use futures::task;
     use http_body::{Body as _, Frame};
-    use metrics::WriteLockStats;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
@@ -763,7 +749,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{_core::pipeline::Stats, _mem::MemoryStorage};
+    use crate::_mem::MemoryStorage;
     #[cfg(feature = "cors")]
     use crate::{
         _core::{
@@ -982,68 +968,6 @@ mod tests {
             let _gauge = InFlightGauge;
         }
         assert_eq!(metrics::HTTP_IN_FLIGHT.get(), 4);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_refreshes_and_serves_the_registry() {
-        // F10/F49: GET /metrics runs the plane's refresh hook (the
-        // server wires it to the pipelines' Stats and the storage's
-        // write-lock snapshot) and answers the Prometheus text format —
-        // a management path on the data-plane listener, never routed to
-        // the S3 service.
-        let storage = MemoryStorage::new().unwrap();
-        let hook_calls = Arc::new(AtomicUsize::new(0));
-        let plane = DataPlane::new(storage, Capabilities::default()).with_metrics({
-            let hook_calls = Arc::clone(&hook_calls);
-            Arc::new(move || {
-                hook_calls.fetch_add(1, Ordering::Relaxed);
-                // The server's real hook (serve.rs): refresh the
-                // scrape-computed families — which also registers them.
-                // The write-lock data is the plain metric form (the
-                // backend conversion lives at the wiring point).
-                metrics::refresh(
-                    Stats::default(),
-                    Stats::default(),
-                    WriteLockStats::default(),
-                );
-            })
-        });
-        // The route check (a `Request<Incoming>` cannot be constructed
-        // outside hyper — its body constructors are pub(crate) — so the
-        // method/uri predicate is tested directly).
-        let metrics_uri: http::Uri = METRICS_PATH.parse().unwrap();
-        assert!(is_metrics_request(&Method::GET, &metrics_uri));
-        assert!(!is_metrics_request(&Method::POST, &metrics_uri));
-        assert!(!is_metrics_request(
-            &Method::GET,
-            &"/bucket/key".parse().unwrap()
-        ));
-        // The response side through the plane's hook.
-        let response = metrics_response(&plane.service.metrics).await.unwrap();
-        assert_eq!(response.status(), 200);
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE).unwrap(),
-            "text/plain; version=0.0.4"
-        );
-        // Drain the response body through its own poll_frame loop (the
-        // test module's shared pattern).
-        let mut body = response.into_body();
-        let mut pin = Pin::new(&mut body);
-        let mut text = String::new();
-        while let Poll::Ready(Some(Ok(frame))) = pin.as_mut().poll_frame(&mut cx()) {
-            if let Ok(chunk) = frame.into_data() {
-                text.push_str(&String::from_utf8_lossy(&chunk));
-            }
-        }
-        assert!(
-            text.contains("tinio_pipeline_queue_depth"),
-            "the refreshed pipeline gauges must be served: {text}"
-        );
-        assert!(
-            text.contains("tinio_write_lock_wait_duration_seconds"),
-            "the refreshed write-lock histograms must be served: {text}"
-        );
-        assert_eq!(hook_calls.load(Ordering::Relaxed), 1, "the hook ran once");
     }
 
     #[tokio::test]

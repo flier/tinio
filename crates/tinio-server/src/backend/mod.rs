@@ -24,9 +24,11 @@
 //! `errors::map_backend_error` maps onto `AccessDenied` and logs the
 //! storage source at debug. The wire cannot distinguish the cases;
 //! debug-level logs are the only forensic tool. **`/metrics` stays
-//! outside the ACL check** (grilling ruling): the reserved
-//! management-plane GET is intercepted pre-route in `data.rs` and is not
-//! subject to the access-layer pipeline.
+//! outside the ACL check** (grilling ruling): the scrape endpoint is the
+//! management plane's token-gated route (`tinio-api`, T075), not a
+//! data-plane path, so it never enters the access-layer pipeline — the
+//! data-plane listener routes `/metrics` as the bucket named `metrics`
+//! like any other first path segment.
 
 #[cfg(feature = "acl")]
 use s3s::auth::Credentials;

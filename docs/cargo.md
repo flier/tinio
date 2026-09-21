@@ -7,7 +7,7 @@
 - Members (`tinio-*`): `path = "crates/…"`, no version.
 - `version`/`edition` from `[workspace.package]`.
 - `publish = false` except facade `tinio`.
-- `[lints.rust] unsafe_code = "forbid"` on every crate, **except a platform backend**, which is `"deny"` with its `#[allow(unsafe_code)]` sites enumerated in design decision 14 — the lint follows the implementation, and `forbid` cannot be overridden at all, so `deny` is what makes the exception expressible where the kernel interface has to be met on its own terms and nowhere else. `tinio-sandbox-linux`, `tinio-sandbox-macos` and `tinio-sandbox-windows` are the crates this applies to.
+- `[lints.rust] unsafe_code = "forbid"` on every crate, **except a platform backend**, which is `"deny"` with its `#[allow(unsafe_code)]` sites enumerated in design decision 14 — the lint follows the implementation, and `forbid` cannot be overridden at all, so `deny` is what makes the exception expressible where the kernel interface has to be met on its own terms and nowhere else. The rule covers the three platform backends (`tinio-sandbox-linux`, `tinio-sandbox-macos`, `tinio-sandbox-windows`) and `tinio-api`; of these, `tinio-sandbox-linux` and `tinio-api` are `deny` today — `tinio-api`'s one site is `src/dacl.rs`, its single raw-Windows module (design decision 20's pattern) — while the two sandbox backends that have not landed their raw bindings stay `forbid` until their own plans flip them.
 - `[lints.clippy] absolute_paths = "warn"` on every crate — 3+ segment paths go through `use` (`docs/style.md`).
 - Optional/target deps at the crate.
 
@@ -17,7 +17,7 @@
 
 ## Features
 
-- No `features` in `[workspace.dependencies]`.
+- No `features` in `[workspace.dependencies]`; `tokio-rustls` and `utoipa` are the one deliberate exception — their `default-features = false` and feature list sit at the workspace because a member can disable default features but cannot stop another member re-enabling them, and only the workspace-level `default-features = false` keeps `aws-lc-rs` (a C/CMake/NASM build) out of every crate's graph.
 - Enable on the crate that uses them (`serde = { workspace = true, features = ["derive"] }`).
 
 ## Groups

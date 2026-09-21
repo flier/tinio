@@ -6,7 +6,8 @@
 //! write-lock duration histograms (`tinio_write_lock_*`, pipeline-spec.md
 //! §4). Families are process-wide globals, registered once on the default
 //! registry via `register_*!`. The storage-layer full-scan gauges are
-//! computed (with a 30 s TTL cache) by the management plane later (T075);
+//! computed by the management plane's reader task (T075 — one scan per
+//! ttl, no cache; the cadence lives in `tinio-api`'s `Gauges`);
 //! the pipeline gauges are refreshed from the runtimes' [`Stats`]
 //! snapshots on scrape, and the write-lock histograms are converted from
 //! a plain-data [`WriteLockStats`] (the backend snapshot conversion lives
@@ -347,14 +348,16 @@ pub fn record_s3_operation(op: &str, status: u16, duration: Duration) {
 }
 
 /// Refresh every scrape-computed family from one call (F49 — the single
-/// refresh entry point behind the `/metrics` endpoint, pipeline-spec.md
-/// §4): the pipeline gauges from two [`Stats`] snapshots and the
-/// write-lock histograms from a plain-data [`WriteLockStats`] (the
-/// conversion happens at gather, never on the write path; the backend
-/// snapshot → [`WriteLockStats`] conversion lives at the wiring point).
-/// Touching the statics registers the families with the default registry
-/// (F10 — the server's `/metrics` endpoint calls this on every scrape,
-/// so a running server's registry always contains them).
+/// refresh entry point behind the management plane's `/metrics`,
+/// pipeline-spec.md §4): the pipeline gauges from two [`Stats`]
+/// snapshots and the write-lock histograms from a plain-data
+/// [`WriteLockStats`] (the conversion happens at gather, never on the
+/// write path; the backend snapshot → [`WriteLockStats`] conversion
+/// lives at the wiring point). Touching the statics registers the
+/// families with the default registry (F10 — the management plane calls
+/// this on every scrape, through the CLI's `MetricsSource` adapter, so a
+/// running server's registry always contains them; the data-plane
+/// listener serves no `/metrics`).
 pub fn refresh(io: Stats, db: Stats, write_lock: WriteLockStats) {
     #[cfg(test)]
     let _g = test_lock::writer();
@@ -539,8 +542,8 @@ mod tests {
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
         // The write-lock histograms are always emitted (zero counts
         // before any write transaction); the refresh is also the
-        // registration path (the server's `/metrics` endpoint calls it on
-        // every scrape, F10). The refresh happens under the snapshot
+        // registration path (the management plane's `/metrics` calls it on
+        // every scrape, through the CLI's adapter, F10). The refresh happens under the snapshot
         // guard — it writes the shared snapshot, so it must not race the
         // other snapshot test's refresh+encode (a clobbered snapshot
         // fails its exact-value asserts and poisons the guard).

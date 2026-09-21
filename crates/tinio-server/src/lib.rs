@@ -44,6 +44,9 @@ pub mod readonly;
 pub use self::_auth::{Identity, User};
 pub use self::{
     backend::{Capabilities, S3Backend},
-    data::{DataPlane, PlaneConfig},
+    // `MetricsRefresh` lives in the private `mod data`, so it is re-exported here for the same
+    // reason the plane itself is: the CLI's `MetricsSource` adapter is what calls the hook, and
+    // it could not name the type otherwise.
+    data::{DataPlane, MetricsRefresh, PlaneConfig},
     error::Error,
 };

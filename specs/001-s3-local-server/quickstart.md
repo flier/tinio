@@ -68,22 +68,33 @@ tinio server /tmp/tinio-demo --anonymous &
 tinio server /tmp/tinio-demo --anonymous   # second instance → single-instance error, exit 1
 ```
 
-Metrics (Linux; on Windows the management channel is a named pipe — use `tinio status`-style client or the SDK):
+Metrics (Linux; on Windows the management channel is a named pipe — use `tinio status`-style client or the SDK). The socket path is **derived per root** (`tinio-<sha1(canonical root)[..16]>.sock`, mode 0600) unless `[api.unix] path` overrides it, so read `state.control_name` — the resolved absolute path the plane bound — rather than guessing a name:
 ```sh
-curl --unix-socket /tmp/tinio-demo/.tinio/tinio.sock http://localhost/metrics | head
-curl --unix-socket /tmp/tinio-demo/.tinio/tinio.sock http://localhost/openapi.json | head
+STATE=/tmp/tinio-demo/.tinio/state
+curl --unix-socket "$(jq -r .control_name "$STATE")" http://localhost/metrics | head
+curl --unix-socket "$(jq -r .control_name "$STATE")" http://localhost/openapi.json | head
 ```
 
-TCP exposure requires the token on ALL endpoints (start with `--api http://127.0.0.1:9001` or add the `[api.http]` section to the config, default port 9001):
+TCP exposure requires the token on **every** endpoint except `/metrics` on a **loopback** bind, which stays open — a Prometheus scrape cannot send a custom header, and that reason does not extend to `/openapi.json` or the control endpoints (start with `--api http://127.0.0.1:9001` or add the `[api.http]` section to the config, default port 9001):
 ```sh
 tinio stop /tmp/tinio-demo
 tinio server /tmp/tinio-demo --anonymous --api http://127.0.0.1:9001 &
-TOKEN=$(jq -r .token /tmp/tinio-demo/.tinio/state)
-curl -H "X-Tinio-Token: $TOKEN" http://127.0.0.1:9001/metrics | head   # 200
-curl http://127.0.0.1:9001/metrics                                      # 401 (token-less rejected)
+STATE=/tmp/tinio-demo/.tinio/state
+curl http://127.0.0.1:9001/metrics                                       # 200 (a loopback bind keeps /metrics open)
+curl -H "X-Tinio-Token: $(jq -r .token "$STATE")" http://127.0.0.1:9001/status   # 200
+curl http://127.0.0.1:9001/status                                        # 401 (token-less rejected)
 ```
 
-Expected: `tinio_http_*`, `tinio_s3_*`, `tinio_storage_*` families present; storage gauges respect the 30 s TTL cache; token-less TCP requests to `/metrics` get 401.
+The rule follows the **bind** address, so a reachable bind guards `/metrics` too — `0.0.0.0` is not a loopback bind, whatever the client dials:
+```sh
+tinio stop /tmp/tinio-demo
+tinio server /tmp/tinio-demo --anonymous --api http://0.0.0.0:9001 &
+STATE=/tmp/tinio-demo/.tinio/state
+curl http://127.0.0.1:9001/metrics                                       # 401 (token-less rejected)
+curl -H "X-Tinio-Token: $(jq -r .token "$STATE")" http://127.0.0.1:9001/metrics | head   # 200
+```
+
+Expected: `tinio_http_*`, `tinio_s3_*`, `tinio_storage_*` families present; the storage-layer full-scan gauges are refreshed by the endpoint's reader task once per `DEFAULT_TTL` (30 s) instead of by the scrape, so no request ever scans the root; token-less requests are refused with 401 everywhere except the open side of the bind-address rule — `/metrics` and `/openapi.json` on the local channel, and `/metrics` alone on a loopback bind.
 
 ## 5. Auth and error codes (FR-008/009, SC-004)
 

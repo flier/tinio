@@ -98,6 +98,11 @@ const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // checklists/compatibility.md CHK020 as the flat-memory verification
     // home; the perf script itself is not cucumber.
     "T089",
+    // T146: the debt row contracts/config.md's 2026-09-20 correction names
+    // (the seven `TINIO_ACCESS_LOG*`/`TINIO_API_*` variables the CLI
+    // feature does not honour) — the citation points at the task that owns
+    // the wiring and its unit tests, so no scenario verifies it.
+    "T146",
 ];
 
 /// Parses a spec ID at `text[i..]`: prefix `FR`/`SC`/`T`, an optional

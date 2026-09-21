@@ -4,8 +4,13 @@
 //! contract: `401 {"error": "unauthorized"}` for token failures, `404` for
 //! unknown paths, `500 {"error": "..."}` for internal failures.
 
-use std::io;
+use std::{io, path::PathBuf};
 
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::_core::storage;
@@ -44,16 +49,34 @@ pub enum Error {
     /// A storage-contract failure surfaced by the management plane.
     #[error("storage error: {0}")]
     Storage(#[from] storage::Error),
+    /// The state file could not be read, or its contents are not usable.
+    #[error("state file {path}: {message}")]
+    State { path: PathBuf, message: String },
+    /// A management transport could not be set up or resolved.
+    #[error("transport: {0}")]
+    Transport(String),
 }
 
 impl Error {
+    /// The wire contract for this error: the status and the body's message, mapped together so
+    /// the two cannot drift. `401`/`404` are the contract's; every internal failure is one
+    /// `500` whose message is deliberately generic (the detail stays in [`std::fmt::Display`]
+    /// for the server log).
+    fn contract(&self) -> (u16, &'static str) {
+        match self {
+            Self::Unauthorized => (401, "unauthorized"),
+            Self::NotFound => (404, "not found"),
+            Self::Internal(_)
+            | Self::Io(_)
+            | Self::Storage(_)
+            | Self::State { .. }
+            | Self::Transport(_) => (500, "internal server error"),
+        }
+    }
+
     /// The HTTP status of this error (401/404/500).
     pub fn status(&self) -> u16 {
-        match self {
-            Self::Unauthorized => 401,
-            Self::NotFound => 404,
-            Self::Internal(_) | Self::Io(_) | Self::Storage(_) => 500,
-        }
+        self.contract().0
     }
 
     /// The typed JSON error body.
@@ -61,17 +84,35 @@ impl Error {
     /// Internal failures expose a generic message on the wire — the detailed
     /// message stays in [`std::fmt::Display`] for the server log.
     pub fn body(&self) -> ErrorBody {
-        let error = match self {
-            Self::Unauthorized => "unauthorized".into(),
-            Self::NotFound => "not found".into(),
-            Self::Internal(_) | Self::Io(_) | Self::Storage(_) => "internal server error".into(),
-        };
-        ErrorBody { error }
+        ErrorBody {
+            error: self.contract().1.into(),
+        }
     }
 
     /// The JSON error body (`{"error":"<message>"}`).
     pub fn json_body(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&self.body())
+    }
+}
+
+impl IntoResponse for Error {
+    /// The contract's status and body (`401 {"error":"unauthorized"}`, `404`,
+    /// `500 {"error":"internal server error"}`); the detailed message is logged, not sent.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use axum::response::IntoResponse;
+    /// use tinio_api::Error;
+    ///
+    /// let response = Error::Unauthorized.into_response();
+    /// assert_eq!(response.status(), 401);
+    /// ```
+    fn into_response(self) -> Response {
+        tracing::debug!(error = %self, "management request failed");
+        let status =
+            StatusCode::from_u16(self.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(self.body())).into_response()
     }
 }
 

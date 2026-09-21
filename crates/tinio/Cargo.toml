@@ -12,8 +12,10 @@ tinio-core.workspace = true
 tinio-server.workspace = true
 
 [features]
-default = ["api", "mem", "multipart", "copy", "list-v1", "list-v2"]
+default = ["api", "mem", "multipart", "copy", "list-v1", "list-v2", "openapi", "tls"]
 api = ["dep:tinio-api", "tinio-server/api", "tinio-cli/api"]
+openapi = ["tinio-api/openapi"]
+tls = ["tinio-api/tls"]
 mem = ["tinio-cli/mem"]
 multipart = ["tinio-server/multipart"]
 copy = ["tinio-server/copy"]

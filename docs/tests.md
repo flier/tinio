@@ -118,6 +118,15 @@ Gate e2e = fs/mem/`@parquet`/traceability. `@boto3`/`@mc` need `TINIO_E2E_EXTERN
 
 - Migrate iff spec+S3 observable. No ID → Rust. Keep `tinio-util`.
 
+## Management plane (tinio-api)
+
+- `crates/tinio-api/tests/management.rs` = T056's matrix. Drives the plane the way the CLI will — `Plane::bind(options)` → `publish(port)` → `serve(stop)` → `client::status`/`stop` → `shutdown()` — never a transport directly. Nothing outside a test starts a plane in phase A, so this suite is the acceptance, not a companion to a binary.
+- Legs: `/status` with and without the token; `/stop`'s `202` + body, the bounded drain, and `shutdown`'s removal of the socket file and `state`; `/metrics` open on the local channel and on a loopback bind, `401` on a non-loopback bind, `404` with no gauges attached; `/openapi.json` under the feature; the reader task's wiring (advances with the plane, stops with it, no scrape scans); the pipe's two sequential connections and its drain; unix stale-socket reclaim and mode 0600.
+- One local `MetricsSource` double, two counting no-ops: `refresh` → `refreshes`, `counts` → `scans`. Nothing a real adapter computes crosses the boundary (the counts go into `tinio-server`'s statics), and the scan cannot run here — `Storage` is dyn-incompatible.
+- Windows-gated: first-pipe-instance refusal (a second `Plane::bind` on the same name) + `dacl::pipe_acl_is_current_user_only` and `dacl::acl_is_current_user_only` reading both DACLs back. Unix-gated: state file and socket mode 0600, stale socket reclaimed by the bind.
+- **Pipe dials and the successor window.** The serve loop creates an instance's successor only when the runtime polls it again, and `ClientOptions::open` does not wait for a free instance (`ERROR_PIPE_BUSY`, measured): a dial that follows a synchronous one with no await between meets it. Legs that dial twice back-to-back end through the channel instead — and the consequence is not only a test rule: `client::status` maps any dial failure to `running: false`, so `tinio status` prints "stopped" for a **running** server that hit the window, and `client::stop` returns an error. **T147** owns the fix (`specs/001-s3-local-server/tasks.md`); do not paper over it in a leg.
+- Facade features: `crates/tinio/Cargo.toml` forwards `openapi`/`tls` to `tinio-api` and carries both in `default`; `cargo test -p tinio-api --no-default-features` is the leg that exercises the original graph.
+
 ## Platform-gated verification (WSL2)
 
 - `#[cfg(unix)]` (copy/ETag) invisible on Win; unused-import may be CI-load-bearing (E0599).
