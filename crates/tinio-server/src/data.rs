@@ -68,8 +68,8 @@ use crate::{
 };
 
 /// The scrape-time metrics refresh (F49): the hook refreshes the
-/// scrape-computed families (`tinio_server::metrics::refresh` — the
-/// server wires it to the pipelines' `Stats` and the storage's
+/// scrape-computed families (`tinio_server::metrics::refresh` — the CLI's
+/// adapter wires it to the pipelines' `Stats` and the storage's
 /// write-lock snapshot) so that whoever gathers the registry finds them
 /// current.
 ///
@@ -86,7 +86,7 @@ use crate::{
 /// ```rust
 /// use tinio_server::MetricsRefresh;
 ///
-/// // What the CLI's adapter installs with `DataPlane::with_metrics`.
+/// // The shape the CLI's `MetricsSource` adapter holds.
 /// let refresh: MetricsRefresh = std::sync::Arc::new(|| {});
 /// refresh();
 /// ```
@@ -284,18 +284,6 @@ impl DataPlane {
         }
     }
 
-    /// Attach the scrape-time metrics refresh (F49): the hook is what the
-    /// management plane's `/metrics` runs on every scrape, through the
-    /// CLI's `MetricsSource` adapter. `serve` wires it to
-    /// `tinio_server::metrics::refresh(io.stats(), db.stats(),
-    /// storage.write_lock_stats())`; no endpoint on this listener calls it.
-    pub fn with_metrics(mut self, refresh: MetricsRefresh) -> Self {
-        Arc::get_mut(&mut self.service)
-            .expect("the plane is not shared at construction")
-            .metrics = refresh;
-        self
-    }
-
     #[cfg(feature = "cors")]
     fn from_service(service: S3Service, cors: Option<Arc<dyn cors::Lookup>>) -> Self {
         Self {
@@ -375,11 +363,6 @@ impl Service<Request<Incoming>> for WithPeer {
 #[derive(Clone)]
 pub struct DataPlaneService {
     inner: S3Service,
-    /// The scrape-time metrics refresh (F49) — the hook the management
-    /// plane's `/metrics` runs through the CLI's adapter, attached by
-    /// [`DataPlane::with_metrics`]; a no-op until then. No endpoint on
-    /// this listener calls it (F10).
-    metrics: MetricsRefresh,
     /// The CORS config lookup (feature + capability double-gated; `None`
     /// when the preflight route is not armed) — read by the Task-10
     /// decoration on every non-preflight response.
@@ -401,19 +384,12 @@ impl Drop for InFlightGauge {
 impl DataPlaneService {
     #[cfg(feature = "cors")]
     fn new(inner: S3Service, cors: Option<Arc<dyn cors::Lookup>>) -> Self {
-        Self {
-            inner,
-            metrics: Arc::new(|| {}),
-            cors,
-        }
+        Self { inner, cors }
     }
 
     #[cfg(not(feature = "cors"))]
     fn new(inner: S3Service) -> Self {
-        Self {
-            inner,
-            metrics: Arc::new(|| {}),
-        }
+        Self { inner }
     }
 
     fn call_with_peer(&self, req: Request<Incoming>, peer: SocketAddr) -> ServiceFuture {

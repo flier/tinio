@@ -20,12 +20,15 @@ Positional `DIR` argument (Minio-style, e.g. `tinio server /data`); else walk up
 
 `TINIO_*` names take precedence, with a `MINIO_*` credential fallback (`MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` legacy, `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` modern) — the full env list is in [config.md](config.md), the mapping in [minio-compat.md](minio-compat.md).
 
+**Every variable the CLI honours is one of its own arguments** (a clap argument with an `env` attribute, declared beside the flag it backs), so the environment is read in one place — the parser — and not re-derived beside it. `TINIO_STATE_DIR`, `TINIO_ACCESS_KEY` and `TINIO_SECRET_KEY` are environment-only: the flags that carry them (`--state-dir`, `--access-key`, `--secret-key`) are **hidden**, because the environment is the documented channel and a secret typed on a command line is visible in the process table. `<state dir>/.env` is loaded between the CLI's two parses, which is what makes it the chain's third level (see [config.md](config.md), Precedence).
+
 ## Commands
 
 ### `tinio server` / `tinio start`
 
 ```
 tinio server [DIR] [--address HOST:PORT] [--host HOST] [--port N] [--anonymous] [--read-only]
+             [--config PATH] [--sandbox]
              [--daemon] [--verbosity LEVEL] [--log-file PATH] [--log-format text|json]
              [--api unix://PATH] [--api pipe://NAME] [--api http://HOST:PORT] [--api https://HOST:PORT]
              [--api-cert PATH] [--api-key PATH] [--no-api-unix] [--no-follow-symlinks]
@@ -35,15 +38,25 @@ tinio server [DIR] [--address HOST:PORT] [--host HOST] [--port N] [--anonymous] 
 
 `--port` omitted → **default 9000** (Minio-compatible); `--port 0` → OS-assigned ephemeral port (for tests and multi-instance development; the actual port is printed to the operational log and recorded in `state`, visible via `status`). `--address HOST:PORT` is the Minio-style alias for `--host` + `--port` (host optional, defaults to `127.0.0.1`, e.g. `--address :9000`); `--host`/`--port` remain supported.
 
-`--read-only` (config `[server] read_only`, env `TINIO_READ_ONLY`): read-only mode (FR-023) — all S3 mutating operations are rejected with `AccessDenied`, the storage root is never written, and all state moves to `~/.tinio/roots/<sha256(canonical root)16>/` (or to the explicit state dir named by `TINIO_STATE_DIR` when that is set — see `contracts/config.md`). A pre-existing `<root>/.tinio/.tinio.toml` or `<root>/.tinio/config.toml` is still read (`.tinio.toml` wins when both exist).
+`--log-file PATH` names the operational log file a **detached** run redirects its stderr to (config `[log] server_log_file`; absent, the format-derived `server.log`/`server.json` in the state dir, following `--log-format`). The flag applies to `--daemon` and to nothing else: a foreground run writes its operational log to stderr, and the foreground file sink is `tinio-server`'s edit rather than this phase's — so `--log-file` on a foreground run is accepted and has no sink yet, a fact this contract states rather than leaves to be discovered.
 
-Management transport flags: `--api <URL>` (repeatable) configures a management transport — the URL scheme selects it: `unix://PATH` (unix socket, path relative to the state dir unless absolute), `pipe://NAME` (Windows named pipe; the pipe-analogous form of the local channel), `http://HOST:PORT` or `https://HOST:PORT` (TCP); a scheme-less `--api HOST:PORT` defaults to HTTP. TCP port defaults to **9001** (Minio's console-port convention); defaults are HTTP — HTTPS requires an explicit `https://` scheme plus cert/key from flags (`--api-cert` / `--api-key`) or config. `--no-api-unix` disables the default local channel. Flags override config **per scheme**: a flag replaces the matching transport's config subsection; unmentioned transports keep their config. Platform gating: `unix://` is a usage error on Windows and `pipe://` on unix. `--no-follow-symlinks` disables symlink following in the storage root (config: `[storage] follow_symlinks`). Flags follow the global precedence (flags > env > `.env` > config). All `--api*` options exist only in builds with the `api` cargo feature (default on); without `tls`, the `https://` scheme is rejected as a usage error.
+`--read-only` (config `[server] read_only`, env `TINIO_READ_ONLY`): read-only mode (FR-023) — all S3 mutating operations are rejected with `AccessDenied`, the storage root is never written, and all state moves to `~/.tinio/roots/<sha256(canonical root)16>/` (or to the explicit state dir named by `TINIO_STATE_DIR` when that is set — see `contracts/config.md`). A pre-existing `<root>/.tinio/.tinio.toml` or `<root>/.tinio/config.toml` is still read (`.tinio.toml` wins when both exist). The flag carries its variable directly (`env = "TINIO_READ_ONLY"`), so `TINIO_READ_ONLY=1`/`0`/`true`/`false` is accepted; the bare flag means `true`, and the variable is an **answer** rather than a suggestion — an exported `TINIO_READ_ONLY=0` beats a config file that says `read_only = true`.
 
-- Foreground by default; `--daemon` detaches (stderr → `server.log`/`server.json`). On Windows, `--daemon` spawns a detached child process (no service manager integration in v1); the systemd unit example below covers Linux.
+`--config PATH` names the configuration file explicitly, and it must name one that exists: a mistyped path is a usage error (exit 2) rather than a new config in a new place. Absent, the file is discovered under the root and then under the state dir, and a **launching** command auto-creates it on first start (below). The commands that launch nothing — `status`, `stop`, `doctor` — read the discovered file and never pass this flag, because a command asked to report on a root or to diagnose it must leave that root exactly as it found it.
+
+`--sandbox` (config `[server] sandbox`, env `TINIO_SANDBOX`) confines the server process (FR-036). The three channels follow the global precedence and any one of them is enough: `--sandbox`, then `TINIO_SANDBOX` (`1`/`true`/`0`/`false`; `.env` in the state dir is loaded into the process environment between the CLI's two parses, so the file is the same channel one level lower), then `[server] sandbox`. The flag carries its variable directly (`env = "TINIO_SANDBOX"`, with the tolerant `1`/`true`/`0`/`false` parser the mode switch uses — clap's `SetTrue` action would reject `1`) and takes an optional value, so the bare flag means `true`; an exported `TINIO_SANDBOX=0` beats a config file that says `sandbox = true`. In a build **without** the `sandbox` cargo feature the flag is not in the parser at all while the variable keeps a hidden argument of its own, so the channel still exists and still refuses (see below) rather than being silently ignored.
+
+A confinement request the build or the platform cannot honour is **refused, never ignored**: silently serving unconfined is the failure this flag exists to prevent (fail-closed). In a build without the `sandbox` cargo feature the flag is not in the parser at all and only the variable or the config key can ask, which is a usage error (exit 2) naming the build; with the feature on, a platform whose confinement backend has not landed yet is a startup error (exit 1) naming the platform. Neither refusal publishes `state`, binds a port or serves a request. The `sandbox` cargo feature is default-on in `tinio-cli`, and the facade names it as a **dependency** feature (`tinio-cli = { workspace = true, features = ["sandbox"] }`) rather than relying on its pass-through row, because the workspace pins `tinio-cli` with `default-features = false`: the shipped `tinio` binary therefore carries `--sandbox` in its parser in **every** build, `--no-default-features` included. That is deliberate — the flag is the operator's channel rather than a build-time nicety, and a product binary that lost it could still be asked for confinement through the variable or the config key while the flag silently did nothing. Only a direct `tinio-cli` build without the feature (and without the facade's dependency row) loses `--sandbox`, and there the refusal above still holds for the other two channels.
+
+Under a confinement the process is a **launcher** on macOS and Windows — it binds the listener, launches a confined child, hands it the socket and supervises it, and its own exit code is the child's — and the server itself on Linux, where the confinement applies in place, to this one process, before any runtime exists. **That is the shape each backend takes when it lands, not a capability of this build**: `tinio-sandbox-linux`, `-macos` and `-windows` are stubs today, so every confinement request is refused before either path is reached — a Linux run never serves unconfined, and the absent in-place call is what `tinio-cli`'s `sandbox::BACKEND_IS_STUB` guard keeps visible (the `--sandbox` bullet above). A launcher serves no requests and publishes no `state` of its own — the child does. What a confinement grants is the storage root at the resolved mode's access, the state directory read-write when it lives outside the root, the running executable's own directory read-only on Windows, and the platform's device files on Linux. A configured `[telemetry] otlp_endpoint` and a confinement cannot both be honoured — the confinement cuts the outbound connection the OTLP exporter is the only path to — so the combination is **warned about** through the operational log, naming both the channel and the endpoint, and the confinement proceeds: losing an observer is not grounds for refusing to serve. With confinement enabled, `tinio service`'s stop path does not drain through the launcher (FR-035); that configuration is refused by this build today, so the promise holds for every run this binary accepts.
+
+Management transport flags: `--api <URL>` (repeatable) configures a management transport — the URL scheme selects it: `unix://PATH` (unix socket, path relative to the state dir unless absolute), `pipe://NAME` (Windows named pipe; the pipe-analogous form of the local channel), `http://HOST:PORT` or `https://HOST:PORT` (TCP); a scheme-less `--api HOST:PORT` defaults to HTTP. TCP port defaults to **9001** (Minio's console-port convention); defaults are HTTP — HTTPS requires an explicit `https://` scheme plus cert/key from flags (`--api-cert` / `--api-key`) or config. `--no-api-unix` disables the default local channel. **Any `--api` flag disables every transport the flags do not name** — the local channel is the tool's default and not the operator's choice — so `--api http://127.0.0.1:9001` on an auto-created root serves one transport and not two, and a flag replaces the matching transport's config subsection where there is one. With no `--api` flag the config file is what selects transports, and a config with **no `[api]` section at all** enables the derived local channel (`state.control_name` records the resolved name). Platform gating: `unix://` is a usage error on Windows and `pipe://` on unix. `--no-follow-symlinks` disables symlink following in the storage root (config: `[storage] follow_symlinks`). Flags follow the global precedence (flags > env > `.env` > config). All `--api*` options exist only in builds with the `api` cargo feature (default on); without `tls`, the `https://` scheme is rejected as a usage error.
+
+- Foreground by default; `--daemon` detaches (stderr → `server.log`/`server.json`) and means "start in the background and **wait for ready**": the parent stays alive, waits (bounded at ~10 s) for the daemon's `state` file and an answer on the control channel that file names, prints the readiness line on stdout and exits 0 — or exits 1 with a message naming the daemon's log file and `tinio status`. On Windows, `--daemon` spawns a detached child process. `--daemon` is the no-elevation, no-supervisor route: it needs no unit, no root and no Administrator, and it does not survive a reboot. The supervised route is `tinio service` (below), which registers the server with the platform's own supervisor; on Windows the SCM has no unit file, so `tinio service install` is the only route there, while on Linux `packaging/tinio.service` remains the operator's own example beside the unit `tinio service install` renders. **`--daemon` exists only in builds with the `api` cargo feature** (default on): readiness is proved by the `state` file and by an answer on the control channel that file names, and both belong to the management plane — so a build without the feature does not carry the flag at all (an unknown argument, exit 2) rather than accepting one it would have to refuse. `--daemon` has no environment variable and no config key, so compiling it away cannot silently ignore a channel.
 - Signals: a foreground server handles SIGINT/SIGTERM (unix) and Ctrl+C / console-close events (Windows) as a graceful shutdown — identical to `POST /stop` (cease accepting, drain ≤ 10 s, remove `state` and the socket, exit 0); a second signal exits immediately without draining; `SIGHUP` is ignored and logged (no config reload in v1). `--daemon` children handle the same signals (the systemd unit relies on SIGTERM).
 - Crash recovery: after the single-instance check succeeds and before readiness, the server runs a fast, deterministic repair of the private state (itemized in failure-handling.md §3): stale `state`/socket, a full clear of `tmp/`, multipart subtrees whose bucket directory no longer exists (cross-restart uploads stay intact, quickstart §7), upload directories without a `UPLOADS` record (idle past the grace), and stale bucket records. Orphaned ETag meta entries are reclaimed in the background by the scanner. User data (bucket directories and objects) is never touched; every repair action is logged to the operational log.
 - First start: auto-creates `.tinio.toml` with generated credentials (in the state dir — `<root>/.tinio/` normally, the home state dir in read-only mode).
-- On ready: prints endpoint, storage root, credentials status to stderr (operational log).
+- On ready: the readiness line — `listening on <host>:<port>`, the single line the process writes to **stdout** and the one a harness scrapes — then the operational summary (endpoint, storage root, credentials status) on **stderr**. Readiness is the moment `state` is published, so the line and the file cannot disagree, and `--port 0` reports the bound port in both.
 - Errors (exit 1): port in use; control channel bind failure after stale-socket reclaim (second live instance on same root); `api` feature present but every management transport disabled; unreadable storage root; storage root not writable without `--read-only`; invalid config.
 - Flags override env overrides `.env` overrides config.
 - Binding a non-loopback address prints a startup warning to stderr (basic); with anonymous mode also active the warning is escalated (prominent, per the layered trust model in spec §Assumptions/Network).
@@ -51,28 +64,30 @@ Management transport flags: `--api <URL>` (repeatable) configures a management t
 ### `tinio status`
 
 ```
-tinio status [DIR]
+tinio status [DIR] [--read-only]
 ```
 
 - Reads `state` from the state dir (`<root>/.tinio/` or the home state dir in read-only mode), probes the control channel with the token.
-- Output: `running|stopped`, endpoint (host:port), storage root, PID, started time.
+- Output: `running|stopped`, endpoint (host:port), storage root, PID, started time, and the **state directory the answer came from**. That last line is what makes the answer auditable: a read-only client probes two candidates, so "running" without the directory it came from does not say which server was found.
+- `--read-only` resolves the mode exactly as the server does (config `[server] read_only`, env `TINIO_READ_ONLY`), which is what selects the candidate pair: `<root>/.tinio` leads for a read-write run and the relocated state dir leads for a read-only one, with the other directory probed second.
 - Exit 1 with message if the root is uninitialized or the probe fails (server not running).
 - Present only in builds with the `api` cargo feature (default on); builds without it do not expose this subcommand.
 
 ### `tinio stop`
 
 ```
-tinio stop [DIR]
+tinio stop [DIR] [--read-only]
 ```
 
 - Sends graceful stop over the control channel (cease accepting, drain in-flight ≤ 10 s), then waits for exit: polls the control channel until the probe fails or `state` disappears (bounded ~15 s) and reports success; on timeout it reports that exit was not confirmed.
+- `--read-only` resolves the mode exactly as the server does, and therefore the candidate pair this command searches (as `status` above).
 - Exit 1 with message if no running server is found.
 - Present only in builds with the `api` cargo feature (default on); builds without it do not expose this subcommand.
 
 ### `tinio doctor`
 
 ```
-tinio doctor [DIR] [--json] [--dry-run] [--fix]
+tinio doctor [DIR] [--read-only] [--json] [--dry-run] [--fix]
 ```
 
 Offline diagnostics of the target directory (no server required). Checks:
@@ -90,7 +105,36 @@ Output: human-readable report with per-check severity (ok / warn / error); `--js
 
 With `--read-only` (or `[server] read_only = true`), the root-writability check is skipped (read-only roots are valid) and state-dir checks target the home state dir.
 
+### `tinio service`
+
+```
+tinio service VERB [DIR] [--name NAME] [--user]
+```
+
+`VERB` is `install`, `uninstall`, `start`, `stop` or `query` (FR-035). This is the supervisor's half of running a server: the verbs register a service with the platform's own supervisor — systemd on Linux, launchd on macOS, the Service Control Manager on Windows — so the server comes back after a reboot without an operator at a shell. The command talks to the OS and to no server, so it is never dispatched through a runtime, and the `api` cargo feature does not gate it.
+
+| Argument | Meaning |
+|---|---|
+| `VERB` (positional) | `install` \| `uninstall` \| `start` \| `stop` \| `query` |
+| `DIR` (positional) | The storage root, resolved exactly as `tinio server` resolves it (canonicalised); absent: walk up from the current directory to the nearest ancestor containing `.tinio/` |
+| `--name NAME` | The service's label; default: derived from the canonical root (below) |
+| `--user` | Use the user level — a systemd user unit or a launchd agent — instead of the system level (root/Administrator); no elevation. Not available on Windows |
+
+The **label** is the service's identity to the supervisor, and it is derived from the root: `tinio-<sha256(canonical root)[..16]>`, the first 16 hex characters of the SHA-256 over the canonical storage root's path bytes — the same **shape** the derived control-channel name uses (`tinio-<sha1(canonical root)[..16]>`: shape shared, digest not — the socket and the pipe name are SHA-1 while this label is SHA-256, so the two must never be "unified"). The input is the canonical root, so `./data` and `/abs/data` name one service and not two, and several roots on one machine are several services. `--name` overrides the derivation verbatim.
+
+The **registered command** is the server argv the operator would type: `server <DIR>`, plus `--read-only` when `TINIO_READ_ONLY` selected that mode in the installing environment, plus `--state-dir <resolved>` in that same read-only case. Read-only state is `TINIO_STATE_DIR` or the installing user's home; a supervisor starts the process with neither, and the server does not take its state dir from the working directory, so the argv records the path install resolved. The unit's `WorkingDirectory=` is that same **resolved state dir** (`<root>/.tinio`, or the relocated directory in read-only mode), never the served root — a unit pointing at the root would send a read-only deployment's relative paths into the tree that mode promises to leave alone. WorkingDirectory is for those relative paths; it is not a second copy of the state-dir rule. The unit text is the repository's own — the `Type=notify` rendering `packaging/tinio.service` shows, with its `WatchdogSec=` line, in place of the crate's default `Type=simple` template, under which `READY=1` and `WATCHDOG=1` are inert — and it is **systemd's alone**: the readiness-and-watchdog protocol it declares is systemd's, and launchd has no `Type=notify` equivalent to receive it. Each backend's *service file* is its own artifact — a systemd INI unit, a launchd plist, an OpenRC/rc.d shell script — so our INI unit handed to any of the others would be written verbatim into a file that supervisor cannot load (launchd writes `contents` straight to `<label>.plist` and `launchctl load`s it). Every non-systemd backend therefore takes the crate's own template for its platform. The SCM has no file form at all, so `tinio service install` is the only route on Windows and there is nothing to keep in step there.
+
+The **level** is `--user`, and the default is the system level. `install`, `uninstall`, `start` and `stop` at the system level need root or Administrator, and a failure the supervisor reports as a **privilege denial** is answered with the remedy rather than the supervisor's own refusal text (exit 1): `tinio service install` needs root: pass `--user`, or re-run with elevation — on unix; `tinio service install` needs Administrator: run this from an elevated prompt — on Windows. A privilege denial is recognised by the error `kind` **or** by the refusal text the platform actually yields — the file-writing backends report `EACCES` as a `PermissionDenied` kind, while a supervisor that shells out (`sc.exe`, `systemctl`, `launchctl`) reports it as a command failure carrying `Access is denied` or `Permission denied`, and the SCM's is exit code **5** with `[SC] OpenSCManager FAILED 5: Access is denied.` — because that is what the three supervisors emit, not what a kind would ideally say. Everything else keeps the backend's own message, a service that is simply not installed included. At the user level the refusal names what a user unit still needs instead of a flag already in effect (ownership of the program and the state dir). `--user` on Windows is a **usage** error (exit 2): the SCM has no user-level services, so the flag cannot be honoured there.
+
+`stop` is a graceful stop, never a kill: the supervisor's stop control reaches the same shutdown channel a termination signal and `POST /stop` use, so the service ceases accepting, drains in-flight requests (≤ 10 s), removes `state` and the control socket and exits 0 — the one shutdown path of the `server` section above, with the supervisor as its fourth entry point. While the drain runs the service reports itself as stopping, so a supervisor waits inside its own bound instead of assuming a hung process. **One configuration is outside this promise:** with confinement enabled (`--sandbox`, `TINIO_SANDBOX` or `[server] sandbox`), the supervised process is a *launcher* that forks, confines and supervises a child server, and no stop reaches the child through it — the stop path does not drain through a launcher in this phase, and the supervisor ends the process at its own bound. That configuration is refused by this build today — a confinement request fails closed, with a usage error naming the build when the `sandbox` cargo feature is off and a startup error naming the platform while the platform's backend has not landed (the `--sandbox` bullet above) — so the promise above holds for every run the binary accepts; carrying a stop into the launcher arrives with the confinement backends.
+
+`query` prints `<label>: running`, `<label>: stopped` (with the supervisor's reason when it gives one) or `<label>: not installed` on stdout, and exits 0 only for `running` — the rule `tinio status` follows for a server. The four acting verbs print `<label>: installed|uninstalled|started|stopped` and exit 0. A backend failure that is not a permission denial keeps the backend's own message (exit 1).
+
+The mode the verbs resolve is the environment's: `service` reads no configuration file — the unit it installs is what will read one — so `TINIO_READ_ONLY` selects the state dir and the argv above, and `TINIO_STATE_DIR` is honoured exactly where the server honours it. Both are carried by hidden arguments (`--read-only` is the server's spelling and this command's table has none) and both are answered **before** `<state dir>/.env` is loaded, which is deliberate: a command that reads no configuration has no `.env` in its chain, and a value from that file must not decide the argv a unit records. What the unit installs is therefore the argv a server resolves in the same invoking environment: read-only includes the resolved `--state-dir`, because the supervisor will not have that environment when it starts the process.
+
 ## Example systemd unit (packaging/tinio.service)
+
+The unit is `Type=notify` because the server sends `READY=1` at readiness, `STOPPING=1` when a graceful shutdown begins and `WATCHDOG=1` on a timer at half of `WATCHDOG_USEC` (design decision 21). A `Type=simple` unit would make every one of those inert with no error anywhere, which is why this block is the rendering of the one template the `service` subcommand also installs rather than a second copy of it. `WatchdogSec=` is a default, not a policy: the cadence follows whatever the unit says, so it is the operator's to size.
 
 ```ini
 [Unit]
@@ -98,9 +142,12 @@ Description=tinio S3-compatible local storage server
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
+WatchdogSec=30
+WorkingDirectory=/srv/tinio/.tinio
 ExecStart=/usr/local/bin/tinio server /srv/tinio
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

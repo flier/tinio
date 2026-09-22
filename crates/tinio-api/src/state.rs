@@ -24,7 +24,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::Error;
 #[cfg(windows)]
-use crate::dacl;
+use crate::_winsec::{create_restricted, restrict_to_current_user};
 
 /// The file's name inside the state directory.
 ///
@@ -73,12 +73,39 @@ const TOKEN_BYTES: usize = 32;
 /// assert!(name.ends_with(".sock"), "{name}");
 /// ```
 pub fn socket_path(state_dir: &Path, root: &Path) -> Result<PathBuf, Error> {
+    Ok(state_dir.join(format!("{}.sock", channel_stem(root)?)))
+}
+
+/// The Windows named pipe's name: `tinio-<sha1(canonical root)[..16]>`, the contract's form
+/// (`contracts/management-api.md`), from the same digest [`socket_path`] derives.
+///
+/// **A name, not a path.** [`socket_path`] answers with a file inside the state directory;
+/// Windows' pipe namespace is flat, so the channel's name carries no directory — and must not,
+/// or anyone able to enumerate `\\.\pipe\` reads the server's local layout out of it.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::path::Path;
+///
+/// use tinio_api::state::pipe_name;
+///
+/// let name = pipe_name(Path::new(".")).expect("pipe name");
+/// assert!(name.starts_with("tinio-"), "{name}");
+/// assert!(!name.ends_with(".sock"), "{name}");
+/// ```
+pub fn pipe_name(root: &Path) -> Result<String, Error> {
+    channel_stem(root)
+}
+
+/// The per-root channel stem both forms share: `tinio-<sha1(canonical root)[..16]>`.
+fn channel_stem(root: &Path) -> Result<String, Error> {
     let canonical = root.canonicalize().map_err(|err| Error::State {
         path: root.to_path_buf(),
         message: format!("the served root cannot be canonicalized: {err}"),
     })?;
     let digest = hex::encode(Sha1::digest(canonical.as_os_str().as_encoded_bytes()));
-    Ok(state_dir.join(format!("tinio-{}.sock", &digest[..16])))
+    Ok(format!("tinio-{}", &digest[..16]))
 }
 
 /// What a running server records about itself.
@@ -281,12 +308,12 @@ impl State {
             .open(&tmp)
             .map_err(Error::Io)?;
         #[cfg(windows)]
-        let mut file = dacl::create_restricted(&tmp).map_err(Error::Io)?;
+        let mut file = create_restricted(&tmp).map_err(Error::Io)?;
         // Belt and braces, before a single byte is written: the install runs against the path as
         // well, so a descriptor that did not take at creation — or a DACL that somehow is not the
         // one the create call asked for — is refused here rather than published by the rename.
         #[cfg(windows)]
-        dacl::restrict_to_current_user(&tmp)?;
+        restrict_to_current_user(&tmp)?;
         file.write_all(text.as_bytes()).map_err(Error::Io)?;
         file.sync_all().map_err(Error::Io)?;
         fs::rename(&tmp, path(state_dir)).map_err(Error::Io)

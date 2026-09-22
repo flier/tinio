@@ -48,16 +48,23 @@ mod sigv4;
 /// IDs referenced by the spec documents but verified outside the cucumber
 /// suite, each with the reason (mirrored in the s3-surface.md "Automated
 /// coverage" section note).
+///
+/// **IDs leave this list when scenarios land for them**, the way FR-023 did
+/// when the read-only scenarios arrived: FR-007 (the CLI's `server`/`status`/
+/// `stop` surface — `doctor`'s legs are not scenarios yet, T057), FR-036 (the
+/// two sandbox refusals) and SC-005/SC-007 (the readiness and round-trip
+/// bounds) left it on 2026-09-22, when the process-level CLI legs became
+/// `tests/features/cli_lifecycle.feature` — the same assertions, driven through
+/// the real binary from the cucumber suite. FR-016 stays: the two scenarios
+/// that prove the environment and `.env` levels reach the parser are
+/// `cli_lifecycle.feature`'s, while the chain's flag and config-file levels are
+/// still the config layer's own tests (T018).
 const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // FR-001: meta-requirement ("serve an S3-compatible interface over
     // HTTP for a user-chosen local storage root") — verified by the suite
     // as a whole; cited in checklists/compatibility.md CHK001 only as the
     // range "FR-001–FR-015".
     "FR-001",
-    // FR-007: CLI subcommands (server/status/stop/doctor) — US2; verified
-    // by the tinio-cli lifecycle/doctor tests that stayed in Rust
-    // (tasks.md T055/T057).
-    "FR-007",
     // FR-009: anonymous mode's configuration semantics (explicit switch
     // wins over credentials, warning logged) — US3, CLI/config level, not
     // S3-observable; the anonymous-request path itself is what the whole
@@ -68,7 +75,10 @@ const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // script (T089) and the Rust streaming-mechanics tests.
     "FR-010",
     // FR-016: configuration precedence / `.env` loading — not
-    // S3-observable; verified by the tinio-config tests (T018).
+    // S3-observable; the flag and config-file levels are the tinio-config
+    // tests' (T018), and the environment and `.env` levels are the two
+    // cli_lifecycle.feature scenarios' (a child spawned with `TINIO_PORT`
+    // and a `.env` written into the state dir).
     "FR-016",
     // FR-017: access logging / OTel export — not S3-observable; verified
     // by the tinio-server log tests (T052/T053).
@@ -79,21 +89,30 @@ const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // FR-019: metric-recording overhead — a performance property;
     // verified by the metrics_overhead bench (T092).
     "FR-019",
+    // FR-035: `tinio service` (install/uninstall/start/stop/query) — US2, and not
+    // S3-observable: the verbs install a service with systemd, launchd or the SCM, which
+    // no cucumber scenario can hold (a supervisor plus elevation). The pure halves are
+    // verified by `crates/tinio-cli/tests/service.rs` (the derived label, the install
+    // context, the unit text, the remedy text) and the platform handshake by the manual
+    // legs in docs/tests.md, "Service verbs (manual)".
+    "FR-035",
     // SC-003: flat memory on 1 GB transfers — verified by the manual
     // perf script (T089).
     "SC-003",
-    // SC-005: readiness within 1 s — US2 timing criterion (T094), not
-    // observable in the in-process suite.
-    "SC-005",
-    // SC-007: status/stop round-trip within 1 s — US2 timing criterion
-    // (T094).
-    "SC-007",
     // T010/T023: foundation tasks; cited in checklists/requirements.md
     // only as part of the range "T010–T023".
     "T010", "T023",
     // T018: `.env` loading — config layer; cited in contracts/config.md;
     // not S3-observable (the FR-016 entry above).
     "T018",
+    // T087: US3's anonymous mode — `TINIO_ANONYMOUS`, the `--anonymous` flag
+    // and the semantics the requirement gives them — is not implemented in
+    // this phase, which contracts/config.md's 2026-09-20 correction states
+    // where it records the variable as unread. T087 owns the wiring and its
+    // tests, so no scenario verifies it. (Entry added 2026-09-22: the
+    // correction's citation made the ID normative, and the cross-check has
+    // been red on it since.)
+    "T087",
     // T089: the SC-003 flat-memory perf script (manual) — cited in
     // checklists/compatibility.md CHK020 as the flat-memory verification
     // home; the perf script itself is not cucumber.

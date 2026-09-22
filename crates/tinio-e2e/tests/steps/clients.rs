@@ -4,14 +4,13 @@
 //! `journey.rs`/`advanced.rs`/`boto3.rs`/`mc.rs`/`edge.rs` and the CI
 //! baseline `e2e/interop/*.sh`.
 //!
-//! The `#[before]` hook (steps/mod.rs) spawns the real `serve` example
-//! binary as a subprocess — real redb database, scanner, sweep — bound to
-//! `127.0.0.1` on an ephemeral port with no client-side addressing
-//! overrides (SC-002), then drives third-party S3 clients (aws cli v2,
-//! rclone, mc, boto3) against it. Process lifecycle is native Rust:
-//! `Child::kill` + `wait` terminate the server synchronously
-//! (TerminateProcess on Windows), so the redb lock is released before a
-//! sibling server starts.
+//! The `#[before]` hook (steps/mod.rs) spawns the real `tinio` binary as a
+//! subprocess — real redb database, scanner, sweep — bound to `127.0.0.1`
+//! on an ephemeral port with no client-side addressing overrides (SC-002),
+//! then drives third-party S3 clients (aws cli v2, rclone, mc, boto3)
+//! against it. Process lifecycle is native Rust: `Child::kill` + `wait`
+//! terminate the server synchronously (TerminateProcess on Windows), so the
+//! redb lock is released before a sibling server starts.
 //!
 //! Config passthrough (grilling Q4): the spawned binary receives the same
 //! tag→config mapping as the in-process hook (`config_from_tags` in
@@ -30,7 +29,7 @@ use std::{
     time::Duration,
 };
 
-use assert_cmd::Command as AssertCmd;
+use assert_cmd::{Command as AssertCmd, cargo::cargo_bin};
 use cucumber::{given, then, when};
 
 use super::{FsKind, World, common::deterministic_bytes, has_tag};
@@ -39,7 +38,11 @@ use crate::_server::{
     Capabilities,
 };
 
-/// The fixed MinIO-convention credential pair the serve example accepts.
+/// The fixed MinIO-convention credential pair the harness signs every
+/// request with, handed to the child in the two variables the resolution
+/// reads (`contracts/config.md:110`): the CLI serves `[auth]`, and a first
+/// start *generates* a random pair into the config it creates, so without
+/// these every scenario would be refused with `SignatureDoesNotMatch`.
 pub const ACCESS_KEY: &str = "minioadmin";
 pub const SECRET_KEY: &str = "minioadmin";
 
@@ -56,36 +59,12 @@ fn target_dir() -> PathBuf {
     p
 }
 
-/// The serve example binary. Cargo sets `CARGO_BIN_EXE_*` for bins only —
-/// not examples — so resolve it relative to this test binary's own
-/// location: `<target>/<profile>/deps/cucumber-<hash>` means the example
-/// sits in the sibling `examples/` dir of the same profile dir. The
-/// example must be built with the SAME profile as the test run (CI builds
-/// both with `--profile ci`): a profile mismatch looks in the wrong dir —
-/// or worse, finds a stale binary restored from a cache.
-fn serve_bin() -> PathBuf {
-    let name = format!("serve{}", if cfg!(windows) { ".exe" } else { "" });
-    let exe = env::current_exe().expect("current exe path");
-    let profile_dir = exe
-        .parent() // .../deps
-        .and_then(Path::parent) // .../<profile>
-        .expect("test binary lives in <target>/<profile>/deps");
-    let p = profile_dir.join("examples").join(name);
-    assert!(
-        p.exists(),
-        "serve example binary not found at {} — build it with the same profile as the tests \
-         (`cargo build -p tinio-server --example serve`; CI adds `--profile ci`)",
-        p.display()
-    );
-    p
-}
-
-/// @external scenarios only: a spawned `serve` binary + one client
+/// @external scenarios only: a spawned `tinio server` + one client
 /// session. The child is killed on drop (synchronously, so the redb lock
 /// is released before a sibling server starts).
 #[derive(Debug)]
 pub struct External {
-    /// The serve binary subprocess (killed on drop).
+    /// The `tinio server` subprocess (killed on drop).
     pub child: Child,
     /// `http://127.0.0.1:<port>` — the client-facing base URL.
     pub base_url: String,
@@ -97,7 +76,7 @@ pub struct External {
 }
 
 impl External {
-    /// Spawn the serve binary per `caps`/`fs_kind` — the tag→config
+    /// Spawn the binary per `caps`/`fs_kind` — the tag→config
     /// mapping from `config_from_tags` (steps/mod.rs), translated into the
     /// old harness's mechanisms: `Capabilities` overrides become a
     /// `--config <file>` (`[s3] checksum = true`, `[s3] max_buckets = 3`),
@@ -148,10 +127,10 @@ pub struct SpawnedServer {
     endpoint: String,
 }
 
-/// Spawn the serve binary serving `root` on `--port 0` and wait for the
-/// readiness line; returns the child and the bound endpoint
-/// (`127.0.0.1:PORT`). `scanner` sets `TINIO_SCANNER` per Some (None
-/// leaves it unset), `config` is passed through `--config`.
+/// Spawn `tinio server <root> --port 0` and wait for the readiness line;
+/// returns the child and the bound endpoint (`127.0.0.1:PORT`). `scanner`
+/// sets `TINIO_SCANNER` per Some (None leaves it unset), `config` is passed
+/// through `--config`.
 ///
 /// The child inherits this process's environment, so the three variables
 /// that would change what it serves are cleared first: a shell exporting
@@ -160,22 +139,36 @@ pub struct SpawnedServer {
 /// spawned server in read-only mode), and `TINIO_STATE_DIR` (which would
 /// relocate its state). The `scanner` argument sets its variable back
 /// afterwards.
+///
+/// **The credential pair is the one thing the CLI needs that the retired
+/// `serve` example did not.** Every client below signs with the fixed
+/// `minioadmin` pair, which the example accepted because it hard-coded it —
+/// while the CLI reads `[auth]`, and a first start *generates* a random
+/// pair into the config it creates, so a scenario would fail with
+/// `SignatureDoesNotMatch` the moment the server under test changed.
+/// `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are the two names
+/// `contracts/config.md:110` lists (not the `MINIO_*` names, which are the
+/// data plane's fallback and not this chain's), and the resolution applies
+/// them to `[auth]` — env, then `.env`, then the config file.
 fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, String) {
-    let mut cmd = Command::new(serve_bin());
-    cmd.arg(root).arg("--port").arg("0");
+    let mut cmd = Command::new(cargo_bin("tinio"));
+    cmd.arg("server").arg(root).args(["--port", "0"]);
     if let Some(config) = config {
         cmd.arg("--config").arg(config);
     }
     cmd.env_remove("TINIO_SCANNER")
         .env_remove("TINIO_READ_ONLY")
-        .env_remove("TINIO_STATE_DIR");
+        .env_remove("TINIO_STATE_DIR")
+        .env_remove("TINIO_SANDBOX")
+        .env("TINIO_ACCESS_KEY", ACCESS_KEY)
+        .env("TINIO_SECRET_KEY", SECRET_KEY);
     if let Some(s) = scanner {
         cmd.env("TINIO_SCANNER", if s { "1" } else { "0" });
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd
         .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", serve_bin().display()));
+        .unwrap_or_else(|e| panic!("failed to spawn `tinio server`: {e}"));
     let stdout = child.stdout.take().expect("piped stdout");
     let endpoint = match wait_for_ready(stdout) {
         Some(line) => line
@@ -186,9 +179,9 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
         None => {
             terminate(&mut child);
             panic!(
-                "server did not print `{READY}` — is a stale serve.exe holding this root? \
-                 ({} `--port 0`)",
-                serve_bin().display()
+                "the server did not print `{READY}` — is a stale `tinio.exe` holding this root? \
+                 ({} server --port 0)",
+                cargo_bin("tinio").display()
             );
         }
     };
@@ -216,11 +209,11 @@ impl Drop for SpawnedServer {
 }
 
 /// Read the child's stdout until the `listening on` readiness line — the
-/// only line the serve example writes there (its diagnostics, the resolved
-/// state dir included, go to stderr, which [`spawn_child`] discards) — and
-/// scanned line by line, so a preceding line would still be skipped. A
-/// reader thread keeps the pipe drained so the child never blocks on a
-/// full buffer; the thread exits when the child dies.
+/// only line the server writes there (its diagnostics go to stderr, which
+/// [`spawn_child`] discards) — and scanned line by line, so a preceding line
+/// would still be skipped. A reader thread keeps the pipe drained so the
+/// child never blocks on a full buffer; the thread exits when the child
+/// dies.
 fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<String> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -238,7 +231,7 @@ fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<String> {
 }
 
 /// The `[s3]` config text for capability overrides (grilling Q4): the
-/// spawned serve binary receives the same tag→config mapping as the
+/// spawned server receives the same tag→config mapping as the
 /// in-process hook, serialized through the config schema's own serde
 /// types — one home for the knob list (a knob the schema gains is a
 /// knob the scenarios can set). None when every knob sits at its

@@ -7,12 +7,14 @@
 //! (unknown keys collected by `serde_ignored`, value rules by `garde`,
 //! presence-gated sections, port rules, the
 //! closed access-log variable set), and source loading (`.env` via
-//! `dotenvy`; the env overlays are declared as clap `env` attributes in the
-//! CLI — FR-016, in [`sources`]).
+//! `dotenvy`, from the state dir — FR-016, in [`sources`]; every environment
+//! variable is the CLI's, declared as a clap `env` argument).
 //!
 //! Module layout: [`schema`] (structs/enums + serde/garde/smart-default
-//! attributes), [`sources`] (`.env` loading), [`state`] (state-directory
-//! resolution), [`Error`]. Validation is derive-driven
+//! attributes), [`sources`] (`.env` loading),
+//! [`discover`] (config discovery and the first-start auto-create),
+//! [`credentials`] (the generated `[auth]` pair), [`state`]
+//! (state-directory resolution), [`Error`]. Validation is derive-driven
 //! ([`garde::Validate`] on every section); [`Config::parse`] runs it
 //! after deserialization and maps the report onto [`Error`].
 //!
@@ -21,7 +23,11 @@
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
+#[cfg(windows)]
+extern crate tinio_winsec as _winsec;
 
+pub mod credentials;
+pub mod discover;
 mod error;
 pub mod schema;
 pub mod sources;

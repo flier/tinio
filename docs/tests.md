@@ -37,21 +37,24 @@ cargo bench -p tinio-fs -p tinio-server -- --test
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # e2e — scoping/env rules in Cucumber below
+cargo build -p tinio                            # the @cli scenarios spawn the binary
 cargo test -p tinio-e2e --test cucumber -- --retry 2
-TINIO_E2E_BACKEND=mem cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @parquet and not @interop and not @boto3 and not @mc' --retry 2
+TINIO_E2E_BACKEND=mem cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @parquet and not @interop and not @boto3 and not @mc' --retry 2
 cargo test -p tinio-e2e --features parquet --test cucumber -- --tags '@parquet'
 cargo test -p tinio-e2e --test traceability
 ```
 
 `--features` = `test-parquet` Rust; features job = cargo-hack check (`--no-dev-deps`).
 
+**Known red (2026-09-20)**: `cargo hack --each-feature --all-features` fails — `otel` `opentelemetry` 0.33 vs `tracing-opentelemetry` needs 0.32. Predates CLI (`2bfce2f`); fix = `otel` deps.
+
 ### CI-only legs
 
-Need extra tools/baseline; out of gate:
+Out of gate:
 
 | Leg (ci.yml job) | Command | Needs |
 |---|---|---|
-| `interop`, `interop-port` | `cargo build --profile ci -p tinio-server --example serve`, then `cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1` | aws cli v2 + rclone on `PATH` |
+| `interop`, `interop-port` | `cargo build --profile ci -p tinio`, then `cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1` | aws cli v2 + rclone on `PATH` |
 | `audit` | `cargo audit` | cargo-audit, net; parse Cargo.lock |
 | `semver` | `cargo semver-checks check-release --package tinio` | cargo-semver-checks + crates.io (no-op pre-release) |
 
@@ -61,19 +64,15 @@ Constitution VI: `audit` (dev+main), `semver` (API MUST check).
 
 - Gate: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
 - Intra-doc: `-D rustdoc::broken-intra-doc-links`, `-D rustdoc::private-intra-doc-links`.
-- **`cargo test --doc` ≠ this gate**; green `cargo test` ≠ green docs.
-- Public `//!`/`pub`: no private `[`foo`]`.
-- `foo` `pub(crate)` → `private-intra-doc-links`. Write `` `foo` ``.
-- `[0]`/`parts[0]` in prose → `broken-intra-doc-links`; `` `parts[0]` `` or `\[0\]`.
-- Re-run doc gate after fix — not just `cargo test`.
+- **`cargo test --doc` ≠ this gate**.
+- Public docs: no private `[`foo`]`; `pub(crate)` → `` `foo` ``; prose `[0]` → `` `parts[0]` `` or `\[0\]`.
+- Re-run doc gate after fix.
 
 ## CI legs
 
-- `.github/actions/run-test-leg` `run:` = unit/doc cmds; gate mirrors.
-- `features`: `--each-feature` on facade + tinio-server. No powerset.
-- Catch `use` out of `#[cfg]` / leftover path.
-- `test-parquet`: parquet-only (`parquet`/`select-parquet` off default).
-- `tests/parquet.rs` needs `required-features = ["parquet"]` or `pub mod parquet`/`[[test]]` break.
+- `.github/actions/run-test-leg` mirrors gate unit/doc cmds.
+- `features`: `--each-feature` on facade + tinio-server (no powerset). Catch cfg/`use` drift.
+- `test-parquet`: parquet-only; `tests/parquet.rs` needs `required-features = ["parquet"]`.
 - `test-port` / `e2e-port` / `interop-port`: same cmds, windows/macos.
 
 ## Cucumber (tinio-e2e)
@@ -82,15 +81,11 @@ Layout: `tests/features/`, `tests/steps/`. Tags/FR-025/WSL2: `crates/tinio-e2e/R
 
 ### Cargo
 
-- `cucumber` `"0.23"` once; `output-json`/`tracing` in `[dev-dependencies]` only (never lib).
-- Targets: `[[test]] cucumber` (`harness = false`) + `traceability`.
-- `--test cucumber` only; `traceability` rejects `--tags`/`--retry`.
-- Bare `cargo test -p tinio-e2e` OK.
-- Filter (tests/cucumber.rs): `@parquet` iff `--features parquet`.
-- `@interop`/`@boto3`/`@mc` iff `TINIO_E2E_EXTERNAL=1`.
-- `--tags` replaces whole filter — re-state exclusions.
-- Env: `TINIO_E2E_BACKEND` (`mem`; `@fs`/`@mem` win), `TINIO_E2E_EXTERNAL=1`.
-- Also: `TINIO_E2E_REPORT=<path>`, `TINIO_BOTO3_PYTHON`.
+- `cucumber` `"0.23"` once; `output-json`/`tracing` in `[dev-dependencies]` only.
+- Targets: `[[test]] cucumber` (`harness = false`) + `traceability` (rejects `--tags`/`--retry`).
+- Filter: `@parquet` iff `--features parquet`; `@unix`/`@windows` skip off-platform (else `fail_on_skipped` fails); `@interop`/`@boto3`/`@mc` iff `TINIO_E2E_EXTERNAL=1`.
+- `--tags` replaces filter — re-state every exclusion incl. `not @unix and not @windows`.
+- Env: `TINIO_E2E_BACKEND`, `TINIO_E2E_EXTERNAL=1`, `TINIO_E2E_REPORT`, `TINIO_BOTO3_PYTHON`.
 
 ```
 cargo test -p tinio-e2e                     # unscoped: the default filter applies
@@ -102,16 +97,10 @@ Gate e2e = fs/mem/`@parquet`/traceability. `@boto3`/`@mc` need `TINIO_E2E_EXTERN
 ### Gherkin
 
 - English; features = `specs/001-s3-local-server/contracts/s3-surface.md`.
-- `Given`/`When`=act, `Then`=assert; 1st-person; `And`; unanchored `{int}`/`{string}`/`{word}`.
-- S3 mods in `tests/steps/mod.rs`: `buckets`, `clients`, `common`, `conditions`, `errors`.
-- Also: `listing`, `multipart`, `objects`, `reserved_paths`.
-- `metrics`/`tagging` → `common`; shared `World`.
-- Data-driven: `Examples`; one behavior/scenario.
-- Feature tags: `@FR-xxx`/`@SC-xxx`/`@Txxx` (filter, no hook).
-- Config: `@fs`/`@mem`/`@nested-root`/`@checksum-on`.
-- Also: `@minimal-caps`/`@cold-listing`/`@max-buckets-3`/`@tagging-off`.
-- Gated: `@parquet` + `--features parquet`. Map: `config_from_tags`.
-- Ext: `@interop`/`@aws`/`@rclone`/`@boto3`/`@mc`.
+- `Given`/`When`=act, `Then`=assert; 1st-person; unanchored `{int}`/`{string}`/`{word}`.
+- Steps in `tests/steps/mod.rs`; `metrics`/`tagging` → `common`; shared `World`.
+- One behavior/scenario; `Examples` for data-driven.
+- Tags: `@FR-xxx`/`@SC-xxx`/`@Txxx`; config `@fs`/`@mem`/…; gated `@parquet`; platform `@unix`/`@windows`; CLI `@cli` (spawn own binary — hook skips); ext `@interop`/`@aws`/`@rclone`/`@boto3`/`@mc`. Map: `config_from_tags`.
 - Spec IDs: `cargo test -p tinio-e2e --test traceability`.
 
 ### Migration
@@ -120,21 +109,32 @@ Gate e2e = fs/mem/`@parquet`/traceability. `@boto3`/`@mc` need `TINIO_E2E_EXTERN
 
 ## Management plane (tinio-api)
 
-- `crates/tinio-api/tests/management.rs` = T056's matrix. Drives the plane the way the CLI will — `Plane::bind(options)` → `publish(port)` → `serve(stop)` → `client::status`/`stop` → `shutdown()` — never a transport directly. Nothing outside a test starts a plane in phase A, so this suite is the acceptance, not a companion to a binary.
-- Legs: `/status` with and without the token; `/stop`'s `202` + body, the bounded drain, and `shutdown`'s removal of the socket file and `state`; `/metrics` open on the local channel and on a loopback bind, `401` on a non-loopback bind, `404` with no gauges attached; `/openapi.json` under the feature; the reader task's wiring (advances with the plane, stops with it, no scrape scans); the pipe's two sequential connections and its drain; unix stale-socket reclaim and mode 0600.
-- One local `MetricsSource` double, two counting no-ops: `refresh` → `refreshes`, `counts` → `scans`. Nothing a real adapter computes crosses the boundary (the counts go into `tinio-server`'s statics), and the scan cannot run here — `Storage` is dyn-incompatible.
-- Windows-gated: first-pipe-instance refusal (a second `Plane::bind` on the same name) + `dacl::pipe_acl_is_current_user_only` and `dacl::acl_is_current_user_only` reading both DACLs back. Unix-gated: state file and socket mode 0600, stale socket reclaimed by the bind.
-- **Pipe dials and the successor window.** The serve loop creates an instance's successor only when the runtime polls it again, and `ClientOptions::open` does not wait for a free instance (`ERROR_PIPE_BUSY`, measured): a dial that follows a synchronous one with no await between meets it. Legs that dial twice back-to-back end through the channel instead — and the consequence is not only a test rule: `client::status` maps any dial failure to `running: false`, so `tinio status` prints "stopped" for a **running** server that hit the window, and `client::stop` returns an error. **T147** owns the fix (`specs/001-s3-local-server/tasks.md`); do not paper over it in a leg.
-- Facade features: `crates/tinio/Cargo.toml` forwards `openapi`/`tls` to `tinio-api` and carries both in `default`; `cargo test -p tinio-api --no-default-features` is the leg that exercises the original graph.
+- `crates/tinio-api/tests/management.rs` = T056. Drive via `Plane` API, never raw transport. Plane acceptance; CLI process legs → `cli_lifecycle.feature` (`@cli`).
+- Cover status/stop/metrics/openapi + pipe/unix ACL + reader lifecycle. Local `MetricsSource` double only.
+- **Pipe successor window** (`ERROR_PIPE_BUSY`): do not paper over — **T147** owns. Dial fail → false "stopped".
+- Facade forwards `openapi`/`tls` in `default`; `--no-default-features` = original graph.
+
+## CLI (tinio)
+
+- Process legs = cucumber `@cli` (`cli_lifecycle.feature` / `steps/cli.rs`); need `cargo build -p tinio` first. Assert readiness, FR-016 L2/L3, daemon, notify, status/stop/state-dir, sandbox refuse.
+- Stays Rust — `crates/tinio/tests/lifecycle.rs`: Windows console leg only (unsafe). Assert drain, not exit code.
+- Elsewhere: startup repair; service pure halves; doctor (T057); `serve_read_only.rs`.
+
+## Service verbs (manual)
+
+- Needs supervisor + elevation — no auto leg. Pure halves: `tinio-cli/tests/service.rs`. Below = verification gap.
+- Linux `--user` / system: install → notify unit + state `WorkingDirectory` + query; stop → stopped; elevated also `is-enabled` + journal `READY`/`STOPPING`. Linger for reboot. No elevation → remedy, never raw `EACCES`.
+- macOS: `install` does **not** start (`Disabled`); `start` → running; assert via `launchctl print`.
+- Windows elevated: RUNNING + path; stop = drain not kill; `state`/socket gone. Not elevated → Administrator remedy (≠ missing-service 1060); `--user` = usage exit 2.
+- Both: uninstall → not installed; second uninstall = backend error.
 
 ## Platform-gated verification (WSL2)
 
-- `#[cfg(unix)]` (copy/ETag) invisible on Win; unused-import may be CI-load-bearing (E0599).
+- `#[cfg(unix)]` invisible on Win; unused-import may be CI-load-bearing (E0599).
 - WSL2 if Win-clean/CI-red (`/mnt/e/GitHub/tinio`, ext4 `CARGO_TARGET_DIR`).
 - crates/tinio-e2e/README.md "WSL2":
   `cargo clippy --workspace --all-targets -- -D warnings`
-- Hammer tests (`wait_for`, 60s, `TINIO_TEST_WAIT_TIMEOUT_SECS`) starve on loaded CI.
-- Repro WSL2 before flaky-vs-real.
-- `lint` `windows-gnu`: ubuntu cross, no native Win. `cargo clippy --target x86_64-pc-windows-gnu
+- Hammer tests (`wait_for`, 60s, `TINIO_TEST_WAIT_TIMEOUT_SECS`) starve on loaded CI — repro WSL2 before flaky-vs-real.
+- `lint` `windows-gnu`: ubuntu cross. `cargo clippy --target x86_64-pc-windows-gnu
   --workspace --all-targets -- -D warnings` (`rustup target add
   x86_64-pc-windows-gnu` + mingw-w64).

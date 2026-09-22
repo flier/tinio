@@ -12,6 +12,7 @@ use smart_default::SmartDefault;
 /// let s = Config::default();
 /// assert_eq!(s.port, 9000); // Minio-compatible default; 0 = ephemeral
 /// assert!(!s.read_only);
+/// assert!(!s.sandbox); // confinement is opt-in, on every channel
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
@@ -28,6 +29,10 @@ pub struct Config {
     /// `~/.tinio/roots/<hash>/`.
     #[serde(default)]
     pub read_only: bool,
+    /// Process confinement (`--sandbox`, `TINIO_SANDBOX`; FR-036, design
+    /// decision 10).
+    #[serde(default)]
+    pub sandbox: bool,
 }
 
 fn host() -> String {

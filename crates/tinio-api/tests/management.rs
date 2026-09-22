@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::Method;
 // The Windows legs are the only ones that drive a connection by hand: the pipe dial in
 // `local_request` below, and the connection that is open when the stop fires.
 #[cfg(windows)]
@@ -257,7 +258,7 @@ fn bound(dir: &Path) -> SocketAddr {
 fn get<'a>(target: &'a str, token: Option<&'a str>) -> Call<'a> {
     Call {
         target,
-        method: "GET",
+        method: Method::GET,
         token,
     }
 }
@@ -299,7 +300,7 @@ async fn await_ready(dir: &Path, ready: &Ready) {
 async fn local_request(
     local: &LocalForm,
     target: &str,
-    method: &str,
+    method: Method,
     token: Option<&str>,
 ) -> RawResponse {
     let LocalForm::Unix(path) = local else {
@@ -324,7 +325,7 @@ async fn local_request(
 async fn local_request(
     local: &LocalForm,
     target: &str,
-    method: &str,
+    method: Method,
     token: Option<&str>,
 ) -> RawResponse {
     let LocalForm::Pipe(name) = local else {
@@ -401,11 +402,11 @@ async fn the_cli_sequence_answers_status_and_leaves_nothing_behind() {
 
     // With the token, the contract's `200`; without one, and with a wrong one, `401` — `/status`
     // is guarded on every transport, the local channel included.
-    let answer = local_request(&local, "/status", "GET", Some(&token)).await;
+    let answer = local_request(&local, "/status", Method::GET, Some(&token)).await;
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
     for absent in [None, Some("wrong")] {
-        let answer = local_request(&local, "/status", "GET", absent).await;
+        let answer = local_request(&local, "/status", Method::GET, absent).await;
         assert_eq!(answer.status, 401, "`/status` needs the token here too");
     }
 
@@ -426,7 +427,7 @@ async fn stop_answers_the_contracts_202_with_the_draining_body() {
     let running = Running::start(&dirs, local_selection(&local), None, Ready::State).await;
     let token = running.token();
 
-    let answer = local_request(&local, "/stop", "POST", Some(&token)).await;
+    let answer = local_request(&local, "/stop", Method::POST, Some(&token)).await;
     assert_eq!(answer.status, 202, "{}", answer.body);
     assert!(answer.body.contains("\"draining\""), "{}", answer.body);
 
@@ -448,7 +449,7 @@ async fn metrics_is_open_on_the_local_channel() {
 
     // No token, and the source is attached: the local channel serves the scrape. An unrouted
     // `/metrics` would answer `404` and a guarded one `401`, so the `200` is the rule's.
-    let answer = local_request(&local, "/metrics", "GET", None).await;
+    let answer = local_request(&local, "/metrics", Method::GET, None).await;
     assert_eq!(
         answer.status, 200,
         "the local channel keeps `/metrics` open: {}",
@@ -473,7 +474,7 @@ async fn metrics_without_a_gauge_source_is_404() {
 
     // The absence is served rather than an empty `200` (the contract's `/metrics` row), and it is
     // the handler's answer rather than an unrouted path's: the route is registered on every build.
-    let answer = local_request(&local, "/metrics", "GET", None).await;
+    let answer = local_request(&local, "/metrics", Method::GET, None).await;
     assert_eq!(answer.status, 404, "{}", answer.body);
     assert!(
         answer.body.contains(r#""error""#) && answer.body.contains("metrics are not attached"),
@@ -607,7 +608,7 @@ async fn the_document_is_served_on_the_local_channel() {
     let local = dirs.local();
     let running = Running::start(&dirs, local_selection(&local), None, Ready::State).await;
 
-    let answer = local_request(&local, "/openapi.json", "GET", None).await;
+    let answer = local_request(&local, "/openapi.json", Method::GET, None).await;
     assert_eq!(
         answer.status, 200,
         "the local channel serves the schema openly: {}",
@@ -688,7 +689,7 @@ async fn a_scrape_flood_does_not_run_the_storage_scan() {
     assert!(scanned >= 1, "the reader scanned once at start: {scanned}");
 
     for _ in 0..8 {
-        let answer = local_request(&local, "/metrics", "GET", None).await;
+        let answer = local_request(&local, "/metrics", Method::GET, None).await;
         assert_eq!(answer.status, 200, "{}", answer.body);
     }
     assert_eq!(source.scans(), scanned, "no scrape scans the storage");
@@ -757,7 +758,7 @@ async fn the_state_file_and_the_socket_are_private() {
 #[cfg(windows)]
 #[tokio::test]
 async fn the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only() {
-    use tinio_api::dacl;
+    use tinio_api::{_winsec::acl_is_current_user_only, dacl};
 
     let dirs = Dirs::new();
     let local = dirs.local();
@@ -789,8 +790,7 @@ async fn the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only
         "the control pipe grants the current user and nobody else"
     );
     assert!(
-        dacl::acl_is_current_user_only(&state::path(dirs.dir()))
-            .expect("read the file's DACL back"),
+        acl_is_current_user_only(&state::path(dirs.dir())).expect("read the file's DACL back"),
         "the state file grants the current user and nobody else"
     );
 
@@ -818,7 +818,7 @@ async fn the_pipe_serves_sequential_connections_and_answers_one_open_at_the_stop
     // Two sequential connections, both answered: the loop creates the next instance after each
     // accept, so the pipe name never disappears between them.
     for nth in ["one", "two"] {
-        let answer = local_request(&local, "/status", "GET", Some(&token)).await;
+        let answer = local_request(&local, "/status", Method::GET, Some(&token)).await;
         assert_eq!(answer.status, 200, "connection {nth}: {}", answer.body);
         assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
     }

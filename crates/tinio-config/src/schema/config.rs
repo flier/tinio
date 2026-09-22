@@ -12,7 +12,9 @@ use toml::Deserializer;
 use super::{api, auth, log, owner, pipeline, s3, scanner, server, storage, telemetry, users};
 use crate::{
     _core::acl::{DEFAULT_ROOT_ACCESS_KEY, OwnerId, derive_canonical_id},
-    Error, error,
+    Error,
+    credentials::Credentials,
+    error,
 };
 
 /// Config format version (currently only `1`).
@@ -165,6 +167,63 @@ impl Config {
     /// an unmotivated second serializer for the same format (F47).
     pub fn to_toml(&self) -> Result<String, Error> {
         toml::to_string(self).map_err(|e| error::parse(Path::new("(serialization)"), e.to_string()))
+    }
+
+    /// The config a first start writes (FR-007, design decision 15): the
+    /// defaults plus the generated credentials, with the local management
+    /// channel made explicit.
+    ///
+    /// Every presence-gated section whose absence is the default stays out —
+    /// `[log]`, `[s3]`, `[pipeline.*]`, `[owner]`, `[[users]]`, `[telemetry]`
+    /// and the transports the run does not use are all `None` — so the file
+    /// an operator opens is the shape `contracts/config.md` documents: the
+    /// sections a run needs, and no others. The keys of the sections it does
+    /// write are spelled out (the contract's example shows them uncommented),
+    /// which is what makes `[server] port`/`read_only` and the `[storage.fs]`
+    /// defaults editable in place. The local channel's
+    /// platform form is the section `[api.unix]` (unix) or `[api.pipe]`
+    /// (Windows) with an empty `path`: the derived default (decision 24),
+    /// written so the channel is visible and editable rather than implied.
+    /// Its `[server] read_only` records the mode the run resolved, so a
+    /// read-only root keeps its mode on the next start.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_config::{Config, credentials};
+    ///
+    /// let generated = Config::generated(false, credentials::generate()?).unwrap();
+    /// assert_eq!(generated.server.port, 9000);
+    /// assert!(generated.auth.is_some());
+    /// assert!(generated.log.is_none());
+    /// # Ok::<(), tinio_config::Error>(())
+    /// ```
+    pub fn generated(read_only: bool, credentials: Credentials) -> Result<Self, Error> {
+        let config = Self {
+            version: Version::default(),
+            server: server::Config {
+                read_only,
+                ..server::Config::default()
+            },
+            scanner: Some(scanner::Config::default()),
+            auth: Some(auth::Config {
+                access_key: credentials.access_key,
+                secret_key: auth::SecretKey::from(credentials.secret_key).into(),
+            }),
+            storage: Some(storage::Config::default()),
+            api: Some(api::Config {
+                #[cfg(unix)]
+                unix: Some(api::Unix::default()),
+                #[cfg(windows)]
+                pipe: Some(api::Pipe::default()),
+                ..api::Config::default()
+            }),
+            ..Self::default()
+        };
+        // A generated config the parser would reject is a bug, not a file:
+        // validate it here, where the failure can still name its key.
+        config.validate().map_err(Error::from_report)?;
+        Ok(config)
     }
 
     /// The effective `[owner]` element: the configured section, or the

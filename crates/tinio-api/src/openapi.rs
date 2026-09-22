@@ -39,6 +39,11 @@ pub fn document() -> OpenApiSchema {
             every other bind requires the token on every endpoint. The token is presented in \
             `X-Tinio-Token`, or in `Authorization: Bearer <token>` — the alias is accepted on \
             every transport, since a standard scraper can send only the latter header."),
+        // The paths stay fully qualified on purpose: utoipa's macro synthesises a
+        // `__path_<fn>` companion type from the path's last segment, so an imported name has no
+        // module to resolve it against — `paths(status_doc, …)` does not compile. The
+        // `absolute_paths` clippy lint cannot see inside a macro's token tree, which is the
+        // other half of the same fact.
         paths(
             crate::router::status_doc,
             crate::router::stop_doc,

@@ -10,6 +10,7 @@ derive_more = { workspace = true, features = ["full"] }
 dirs.workspace = true
 dotenvy.workspace = true
 garde = { workspace = true, features = ["derive", "regex", "url"] }
+getrandom.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 parse-display.workspace = true
@@ -25,6 +26,9 @@ tinio-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tinio-winsec.workspace = true
 
 [package.metadata.cargo-machete]
 # false positive: used via serde `with = "humantime_serde"` attributes (scanner.rs)

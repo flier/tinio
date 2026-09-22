@@ -246,6 +246,18 @@ jobs:
         with:
           tool: nextest
 
+      # The `tinio` binary is a PREREQUISITE of the `serve_read_only` legs
+      # `-p tinio-server` runs below: that test spawns the binary, and
+      # `assert_cmd::cargo::cargo_bin("tinio")` resolves it in the running
+      # test binary's own profile dir — so the build profile here must match
+      # the test profile (both use --profile ci), and nextest's target
+      # selection is not relied on to leave the artifact there. This job's
+      # cache is registry-only (`cache-targets: "false"`), so nothing else
+      # could: the build is the only thing that puts `target/ci/tinio` on
+      # this runner, exactly as the shared action does for the default leg.
+      - name: build the tinio binary (a serve_read_only prerequisite)
+        run: cargo build --profile ci -p tinio
+
       # Same cargo/runner profile flags as run-test-leg's default leg — the
       # feature is the only difference. nextest runs no doctests, which
       # `run-test-leg`'s separate --doc step covers for the default graph.
@@ -389,17 +401,29 @@ jobs:
       - *sccache
 
       # --- cucumber e2e suite (e2e and e2e-port) --------------------------
+      # The `tinio` binary is a PREREQUISITE of the @cli scenarios, which
+      # spawn it (`cli_lifecycle.feature`): `assert_cmd::cargo::cargo_bin`
+      # falls back to the profile dir beside the test binary and does NOT
+      # build it, exactly as crates/tinio-server/tests/serve_read_only.rs
+      # needs (the run-test-leg action's own build step). --profile ci keeps
+      # the binary in the same profile dir this leg's test binary derives
+      # from its own location.
+      - &e2e-build
+        name: build the tinio binary (a @cli scenario prerequisite)
+        run: cargo build --profile ci -p tinio
+
       # In-process scenarios; the runner's built-in default filter excludes
-      # the feature-gated (@parquet) and external-client (@interop/@boto3/
-      # @mc) tags, so the fs pass needs no --tags. The mem pass skips
-      # @fs-only scenarios (traversal,
+      # the feature-gated (@parquet), platform-bound (@unix/@windows) and
+      # external-client (@interop/@boto3/@mc) tags, so the fs pass needs no
+      # --tags. The mem pass skips @fs-only scenarios (traversal,
       # nested-root, out-of-band); backend-neutral scenarios run on mem via
       # TINIO_E2E_BACKEND. --test cucumber keeps the args from reaching the
       # plain-harness traceability target (its own step below), and an
       # explicit --tags REPLACES the runner's default filter, so the mem
-      # pass must repeat the external-tag exclusions itself. --retry 2 on
-      # both passes: ConnectionAborted flakes on loaded legs burned both
-      # retry-1 attempts in earlier runs (33764783657 fs, 33750043137 mem).
+      # pass must repeat the platform and external-tag exclusions itself.
+      # --retry 2 on both passes: ConnectionAborted flakes on loaded legs
+      # burned both retry-1 attempts in earlier runs (33764783657 fs,
+      # 33750043137 mem).
       - &e2e-fs
         name: e2e cucumber (fs backend)
         run: cargo test --profile ci -p tinio-e2e --test cucumber -- --retry 2
@@ -408,7 +432,7 @@ jobs:
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @parquet and not @interop and not @boto3 and not @mc' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @parquet and not @interop and not @boto3 and not @mc' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json
@@ -588,6 +612,7 @@ jobs:
       - *toolchain
       - *rust-cache
       - *sccache
+      - *e2e-build
       - *e2e-fs
       - *e2e-mem
       - *e2e-trace
@@ -671,7 +696,7 @@ jobs:
     name: Interop (aws cli v2 + rclone)
     # Ubuntu leg chains behind the ubuntu e2e job: both compile the same
     # tinio-e2e cucumber profile-ci test binary (e2e without @interop,
-    # this leg with), so e2e warms this leg's compile. The serve example
+    # this leg with), so e2e warms this leg's compile. The `tinio` binary
     # builds under --profile ci so it shares the chain's artifacts
     # instead of the dev profile (which nothing else builds — cold every
     # run). Windows/macos legs live in interop-port; this ubuntu job owns
@@ -704,14 +729,14 @@ jobs:
         name: client versions (interop harness)
         run: aws --version && rclone version
 
-      # The external-client cucumber steps spawn the serve example binary;
-      # serve_bin() resolves it in the running test binary's own profile
-      # dir (<target>/<profile>/examples), so the build profile here must
-      # match the test profile — both use --profile ci. The dev profile
-      # shared nothing else and recompiled cold every run.
+      # The external-client cucumber steps spawn the `tinio` binary;
+      # `assert_cmd::cargo::cargo_bin("tinio")` resolves it in the running
+      # test binary's own profile dir (<target>/<profile>), so the build
+      # profile here must match the test profile — both use --profile ci.
+      # The dev profile shared nothing else and recompiled cold every run.
       - &interop-example
-        name: build serve example (interop harness)
-        run: cargo build --profile ci -p tinio-server --example serve
+        name: build the tinio binary (interop harness)
+        run: cargo build --profile ci -p tinio
 
       # FR-025: aws cli v2 + rclone are the CI-gated clients. The cucumber
       # @interop run replaces the deleted bash scripts (e2e/interop/*.sh).

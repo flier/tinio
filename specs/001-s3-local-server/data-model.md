@@ -4,7 +4,7 @@
 
 Entities derived from the feature spec (Key Entities + FR-001..024). The filesystem is the single source of truth; every entity below maps to concrete on-disk state. `<state-dir>` below means `<root>/.tinio/` in normal mode and `~/.tinio/roots/<sha256(canonical root)16>/` in read-only mode (FR-023).
 
-**Backend seam**: `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness); `tinio-fs` implements it over the local filesystem (v1); `tinio-mem` provides the in-memory reference backend (CLI default when no directory is given); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, `meta.redb`, tmp/) are `tinio-fs` internals behind that contract.
+**Backend seam**: `tinio-core` defines the storage contract (`Storage` + `Cleanup` traits, domain newtypes in `bucket`/`object`/`etag`/`multipart`, conformance harness); `tinio-fs` implements it over the local filesystem (v1); `tinio-mem` provides the in-memory reference backend (**nothing selects it**: the CLI declares its `mem` feature and a run with no `DIR` walks up to the nearest ancestor containing `.tinio/`, so a root that cannot be found is a usage error naming the remedy — `contracts/cli.md:17` — never an in-memory server); planned backends (`tinio-s3`, `tinio-webdav`) implement the same trait. The FS-specific details in this document (meta store, sweep, `meta.redb`, tmp/) are `tinio-fs` internals behind that contract.
 
 ## Entities
 
@@ -79,8 +79,8 @@ Normal mode: `<root>/.tinio/`. Read-only mode (FR-023): `~/.tinio/roots/<sha256(
 |-------|---------|
 | `.tinio.toml` | Config file (auto-created first start; top-level `version = 1` for future format migration) |
 | `.env` | Optional env file (loaded if present; in read-only mode only the state dir's `.env` is loaded) |
-| `state` | `{version, pid, token, port, started_at, control_name}` JSON, mode 0600 |
-| `tinio.sock` | Unix socket (Linux/macOS; stale file probed + unlinked before bind; configured via `[api.unix] path`); Windows: named pipe, name in state (configured via `[api.pipe] path` / `--api pipe://`) |
+| `state` | `{version, pid, token, port, root, started_at, control_name}` JSON, mode 0600 — `root` is the canonical storage root the run serves, written beside the control channel's own name so a reader can tell which root a `state` file answers for |
+| `tinio-<sha1(canonical root)[..16]>.sock` | Unix socket (Linux/macOS), derived per root in the state dir — two roots sharing one state dir must not collide (design decision 24); stale file probed + unlinked before bind; overridden by `[api.unix] path` (relative to the state dir or absolute), and the resolved absolute path is what `state.control_name` records. Windows: named pipe, name in state (derived `tinio-<sha1(canonical root)[..16]>`, configured via `[api.pipe] path` / `--api pipe://`) |
 | `access.log` | Data-plane access log |
 | `server.log` / `server.json` | Operational log (daemon mode; json = format-selected name) |
 | `meta.redb` | The state database (redb 4.2, copy-on-write, crash-safe by default): eight tables — `OBJECT_META` (`(bucket, key)` → 8-tuple `(etag, size, mtime, file identity, tags, checksum, owner, acl)`), `BUCKETS` (name → 4-tuple `(creation time, tags, owner, acl)`), `UPLOADS` (`(bucket, upload_id)` → 5-tuple `(key, initiated_at, tags, owner, acl)`), `PARTS` (`(bucket, upload_id, part_number)` → etag), `UPLOAD_CHECKSUMS`/`PART_CHECKSUMS`, `OBJECT_PARTS`, `STATE` (`version` + `compact_needed` marker); the tag/checksum/owner/ACL wires are canonical strings — see `meta-redb-spec.md` §5.2 for the per-element rules |

@@ -8,4 +8,5 @@ Key points:
 - Never auto-commit/push/merge/rebase/stash — ask first, per operation.
 - Cargo conventions: `docs/cargo.md`.
 - Code style: `docs/style.md`.
+- Docs prose: `docs/compress.md`.
 - Tests: `docs/tests.md`.

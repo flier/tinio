@@ -7,7 +7,10 @@ use std::io;
 
 #[cfg(feature = "api")]
 use crate::_api;
-use crate::{_config, _core::storage};
+use crate::{
+    _config, _core::storage, _fs::Error as FsError, _sandbox::Error as SandboxError,
+    _server::Error as ServerError,
+};
 
 /// A CLI failure carrying its exit code.
 ///
@@ -38,6 +41,20 @@ pub enum Error {
     /// A storage-contract failure — exit code 1.
     #[error("storage error: {0}")]
     Storage(#[from] storage::Error),
+    /// A storage-backend failure — exit code 1.
+    #[error("storage error: {0}")]
+    Fs(#[from] FsError),
+    /// A data-plane failure — exit code 1.
+    #[error("server error: {0}")]
+    Server(#[from] ServerError),
+    /// A confinement failure — exit code 1.
+    #[error("sandbox error: {0}")]
+    Sandbox(#[from] SandboxError),
+    /// A logging-subscriber failure — exit code 1. The subscriber's own error is a boxed
+    /// `dyn Error` the crate's `Error` cannot convert (`tinio_server::log::build_subscriber`'s
+    /// return), so it is carried as its message rather than wrapped.
+    #[error("logging error: {0}")]
+    Log(String),
     /// A management-plane failure — exit code 1.
     #[cfg(feature = "api")]
     #[error("management error: {0}")]

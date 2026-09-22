@@ -9,6 +9,7 @@ publish = false
 axum.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = [
@@ -43,6 +44,7 @@ tower = { workspace = true, features = ["util"] }
 tinio-util = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dependencies]
+tinio-winsec.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

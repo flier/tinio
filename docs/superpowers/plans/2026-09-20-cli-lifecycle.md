@@ -72,7 +72,7 @@ Two rules this task's signatures carry, and both are the reason for their shape:
 
 The search order `resolve_path` implements is design decision 5's, first hit wins and in this exact order: `<root>/.tinio/.tinio.toml` → `<root>/.tinio/config.toml` → the state dir's own `.tinio.toml` → the state dir's `config.toml` → auto-create at `<state dir>/.tinio.toml`. The third and fourth steps are what make read-only mode coherent rather than special-cased: the state dir *is* `<root>/.tinio` in read-write mode, so the four steps collapse to two there, and in read-only mode they are the relocated `<home>/.tinio/roots/<hash>/`, which is where an earlier read-only run auto-created the file. The tests below seed all four positions and assert the winner of each pair — the primary name beats the alias in every directory, and a root-side file beats a state-dir one.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-config/src/discover.rs`:
 
@@ -228,12 +228,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-config discover::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 `crates/tinio-config/src/discover.rs`:
 
@@ -477,12 +477,12 @@ Credentials are **not** clap arguments — no flag carries them — so this over
 
 **The `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` (and `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`) names are the data plane's fallback, not this chain's**, and this overlay reads neither: `contracts/config.md:110` documents them as the legacy/modern aliases the *data plane's* credential resolution accepts, `crates/tinio-config/src/sources.rs`'s module doc already parks them with T084, and folding them into the CLI's chain would give one environment variable two owners and two precedence positions. When T084 lands they land in the data plane's own resolution (§US3), where the config reference puts them.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-config`
 Expected: PASS — the new tests plus every existing one (`[server] sandbox` defaults to `false`, so the schema change is additive; a test that constructs `tinio_config::server::Config` exhaustively needs `..Default::default()`, which is this task's edit). The two overlays' own tests follow the pattern `sources.rs` already carries: `from_var` is driven directly with the three lookup outcomes, because `env::set_var` is `unsafe` under edition 2024 and the crate is `unsafe_code = "forbid"` (`sources.rs:94-113`'s comment is the precedent), and `parse_switch` is asserted for `1`/`true`/`0`/`false`, for a rejected spelling, and for both halves of the credential pair (set together, one alone, neither).
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-config --all-targets -- -D warnings`
 Expected: clean.
@@ -500,7 +500,7 @@ Report the files pending commit.
 - Consumes: `tinio_config::discover`, `tinio_config::sources`, plan A's `tinio_api`, `tinio_fs::FsOptions` and `tinio_server::pipeline::Pipelines` (both for the `fs_options` mapping below — the crate already depends on `tinio-fs` and `tinio-server`).
 - Produces: `tinio_cli::cli::{Cli, Command, ServerArgs, DirArgs, DoctorArgs, ApiFlags, Provenance, provenance}` (the last two are how FR-016's levels 1 and 2 are told apart — see the `ArgMatches` rule below); `tinio_cli::resolve::{Resolution, resolve_root, resolve_mode, resolve_state_dir, state_dir_candidates, config_path, apply_env_file, server, for_doctor, api_options}` with `pub struct Resolution { pub root: PathBuf, pub config: Config, pub config_path: PathBuf, pub read_only: bool, pub state_dir: PathBuf, pub config_error: Option<String> }`, `Resolution::address(&self) -> Result<SocketAddr, Error>` (the resolved bind address, read from `[server]` by **field**: `config.server.host` and `config.server.port` — the public fields at `crates/tinio-config/src/schema/server.rs:22,26`, whose `host()`/`port()` at `:33`/`:37` are private serde-default fns, not accessors, and `config.server` itself is a field of `Config`, not a method), and `pub fn log_file(resolution: &Resolution, args: &ServerArgs, provenance: &Provenance) -> Result<PathBuf, Error>` (the resolved operational log file, `--log-file` → `[log] server_log_file` → the format-derived default in the state dir; Task 5's daemon redirects to it). **`config_error: Option<String>` is the load outcome beside the parsed config, and plan C requires it by that name** (`2026-09-20-cli-doctor.md:308`, consumed in its Task 3): `None` for a config that loaded, `Some(message)` when `Config::load` failed — in which case `config` is `Config::default()` and the message is what the operator is shown. It exists because "the configuration does not parse" is one of `doctor`'s findings, and a `Resolution` that could only be built for a *valid* config would make that check unreachable; **`resolve::server` propagates the failure (a server must not run on a config it could not read) while `for_doctor` records it**, which is the one place the two chains differ in error handling rather than in inputs. `pub fn server(args: &ServerArgs, provenance: &Provenance) -> Result<Resolution, Error>` (the server's chain, Task 3's entry point, failing on an unreadable config); `pub fn for_doctor(args: &DoctorArgs) -> Result<Resolution, Error>` (the same chain minus the provenance — a client command carries no env-backed flag, which is why plan C's call is unchanged — and minus the config failure, which lands in `config_error` instead of propagating) `pub fn api_options(resolution: &Resolution, args: &ServerArgs) -> Result<Selection, Error>` (the `[api]` selection, Task 3's `Plane::bind` input; `#[cfg(feature = "api")]`, because `Selection` is plan A's type and `tinio-api` is an optional dependency), and `pub fn fs_options(resolution: &Resolution, pipelines: Option<&Pipelines>) -> FsOptions` — **the one `Resolution` → `FsOptions` mapping in this CLI**, so a resolved root becomes an `FsStorage` by the same code whichever command asks: `server` passes `Some(&pipelines)` (Task 3's serving half), plan C's `doctor` passes `None`, because an offline command builds no pipelines and the configured `[pipeline.*]` values apply as they stand. A second mapping anywhere is a defect this plan's ownership check is looking for.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-cli/src/resolve.rs`:
 
@@ -758,18 +758,20 @@ let cli = Cli::from_arg_matches(&matches).map_err(clap_error)?;
 
 **The boolean switches are clap's flags and `tinio-config::sources`' variables, never both** *(the one-owner rule)*. `--read-only` and `--sandbox` carry **no** `env` attribute: `#[arg(long, env = "TINIO_READ_ONLY")] read_only: bool` compiles, but clap's `SetTrue` action parses its values with `ValueParser::bool()`, whose only accepted spellings are the literals `true` and `false` — so `TINIO_READ_ONLY=1` (the spelling `contracts/config.md:110,117` documents, `crates/tinio-config/src/sources.rs`'s `parse_read_only` accepts, and `crates/tinio-server/tests/serve_read_only.rs` drives) would die in the parser as `invalid value '1' for '--read-only'`, exit 2, before any of this crate's code ran. So the variable's tolerant `1`/`true`/`0`/`false` parse stays where it already is — `sources::env_read_only()` and `sources::env_sandbox()`, one implementation each, through `parse_var` — and `resolve_mode(config, env_flag, cli_flag)` and `sandbox::resolve_flag` are their consumers. The variable's **name** stays visible to the operator through the flag's help text (`--read-only` "config `[server] read_only`, env `TINIO_READ_ONLY`", exactly `contracts/cli.md:38`'s wording), so the flag, its variable and its help text still cannot drift apart. `pick` and `Provenance` therefore cover the **non-boolean** env-backed flags only; that is not a gap but the rule, and the task's own test drives `sources`' overlays directly for the switches (Task 1's `parse_switch` legs, no parser involved).
 
+*(2026-09-22, operator ruling — the paragraph above is **superseded**, and this note says what by.)* The switches moved onto clap's `env`: `--read-only` and `--sandbox` now declare `env = "TINIO_READ_ONLY"` / `"TINIO_SANDBOX"` with `num_args(0..=1)`, `default_missing_value("true")` and `action = ArgAction::Set` over a **custom `value_parser`** — the tolerant `1`/`true`/`0`/`false` spelling, trimmed, refused for anything else, is **the parser's now and not `sources`'**: `tinio_config::sources` reads no variable at all, and `READ_ONLY_VAR`/`SANDBOX_VAR`/`ACCESS_KEY_VAR`/`SECRET_KEY_VAR` live in `tinio_cli::cli` beside the flags whose `env` attributes spell them. `TINIO_STATE_DIR` and the credential pair became environment-only hidden arguments on the same terms, and `state::env_state_dir` is gone with them. `Provenance` therefore covers **all nine** env-backed keys — the boolean switches' `ValueSource` is what tells an explicit `TINIO_READ_ONLY=0`/`TINIO_SANDBOX=0` from silence, so `resolve_mode(config, source, read_only)` and `sandbox::resolve_flag(source, requested, file)` take it — and because clap reads the environment at parse time, the parse is **two-pass** (`lib.rs`'s `command_line`: discovery parse → `<state dir>/.env` → authoritative parse), which is what replaced the `.env` lookups this plan's `pick(.., dot_env, ..)` level performed ([`Design decision 3`'s amendment](../specs/2026-09-20-cli-integration-design.md) states the mechanism in full). Everything below in this task that names `sources::env_read_only()`, `sources::env_sandbox()`, `state::env_state_dir()` or a three-argument `resolve_flag` is the plan as it was written; the landed code is the documents' — `contracts/cli.md` and `contracts/config.md` carry the same ruling.
+
 `resolve::config_path(root, state_dir, explicit)` is the second helper: it owns the rule that an explicit `--config` must name an existing file (`Error::Usage`, exit 2), and delegates the discovery order to `tinio_config::discover::resolve_path`; `resolve::state_dir_candidates(root, resolved, read_only, override_dir, derived) -> Result<Vec<PathBuf>, Error>` is the third, the ordered pair Task 8's three client commands probe. **Its rule, stated once here and quoted by plan C's Global Constraints:** the resolved state dir leads and the **other** candidate follows; the other candidate is `<root>/.tinio` for a **read-only** run and the **home-derived** state dir (`<home>/.tinio/roots/<sha256(canonical root)16>/`) for a **read-write** one — and `TINIO_STATE_DIR`, when it is set, **replaces the home-derived candidate, in both modes**, for the "escape hatch for the environment with no writable home" reason `env_state_dir`'s own doc gives. Three consequences, each of which the shape of this function is built around:
 
-- **The pair never collapses.** A read-only run's resolved dir is already the variable when it is set, so replacing the other candidate with it would give `[X, X]` and `<root>/.tinio` would never be probed — decision 19's whole case (a read-write server found by a reader whose mode says otherwise) would be unreachable, and Task 8's `a_client_finds_the_server_in_the_other_candidate_state_dir` leg asserts exactly that fallback. So the override is consulted **only** where the other candidate would be home-derived, which is the read-write case; a read-only pair is always `[the read-only resolution, <root>/.tinio]`.
+- **The pair never collapses.** A read-only run's resolved dir is already the variable when it is set, so replacing the other candidate with it would give `[X, X]` and `<root>/.tinio` would never be probed — decision 19's whole case (a read-write server found by a reader whose mode says otherwise) would be unreachable, and Task 8's `a_client_finds_the_server_in_the_other_candidate_state_dir` leg asserts exactly that fallback. So the override is consulted **only** where the other candidate would be home-derived, which is the read-write case; a read-only pair is always `[the read-only resolution, <root>/.tinio]`. **One degenerate input sits outside that sentence and is harmless rather than a second rule** (Task 11): with `TINIO_STATE_DIR=<root>/.tinio`, in either mode, the resolved dir and the other candidate are the same path, so the pair is `[<root>/.tinio, <root>/.tinio]` and the second probe repeats the first. Nothing is lost — the fallback the rule protects *is* the first candidate here, because `<root>/.tinio` is where a read-write server for that root keeps its state — and in the read-only arm of the case a server is unreachable anyway, since a read-only run refuses an explicit state dir inside the served root (`contracts/config.md`'s hardening bullet), while a read-write run accepts the input and serves from the very directory both candidates name.
 - **The variable moves the candidate list and nothing else.** In read-write mode the served state dir stays `<root>/.tinio`, because the reserved directory is what FR-020, the `meta.redb` layout and `doctor`'s walk all assume; `resolve_state_dir(root, read_only)` is unchanged by any of this.
 - **`derived` is lazy so that no home is ever touched when the override answers** — and it is not called at all in a read-only run, where the other candidate is a join. That is what keeps a process-level test (and a container with no writable home) out of `dirs::home_dir()`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-cli resolve::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 `crates/tinio-cli/src/cli.rs` — the clap surface, one item per contract flag, with the `env` attributes carrying the names `contracts/config.md:110` lists — **for the non-boolean flags**, plus the `Provenance` reader:
 
@@ -1023,12 +1025,12 @@ Three consequences of the dispatch, stated because they are what "one runtime" m
 
 `Error::Usage` is the right stub error rather than a panic: the global constraint forbids `panic!`/`unwrap` in library code, exit 2 is what an unfinished verb honestly is, and every stub disappears in the task named in the last column — the rule this task establishes is that **a task replaces its own stub and no one else's**, which is also why Task 3 stubs `daemon`, `notify`, `signal` and the sandbox calls it composes (its own table, below).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-cli`
 Expected: PASS. The placeholder `placeholder_run_returns_success` test in `lib.rs` is **deleted** by this task: `run()` without arguments is now a usage error naming the remedy (exit 2), which is what the smoke test asserts in Task 10.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings`
 Expected: clean.
@@ -1046,7 +1048,9 @@ Report the files pending commit.
 - Consumes: `Resolution` and `resolve::api_options` (Task 2), `tinio_api::{Plane, Options, Selection, Transport, select, State, client}`, `tinio_api::metrics::{MetricsSource, Gauges, DEFAULT_TTL}` (plan A's injection point), `tinio_server::{DataPlane, PlaneConfig, MetricsRefresh, pipeline::Pipelines, log}`, `tinio_fs::{FsStorage, FsOptions, Scanner, FsCleanup}`.
 - Produces: `tinio_cli::commands::start::{run, serve, Server, Ready, ServerMetrics}`. `pub fn run(args: ServerArgs, adopted: Option<Adopted>, provenance: &Provenance) -> Result<Server, Error>` is §1's pre-runtime half and **constructs no runtime of its own** (decision 2 — the process's one is `lib.rs`'s); `pub enum Server { Launched(ExitCode), Ready(Box<Ready>) }` is what it returns — the status a launcher supervised, or the state the serving half needs — and `pub struct Ready { resolution, args, adopted, handles, storage, pipelines, plane }` is that state, built by `run` and by nothing else (the fields are Step 3's), with **the plane field behind `#[cfg(feature = "api")]`** — and no `metrics`/`gauges` field beside it: the adapter moved into the plane's registry in `run`, and the registry's reader belongs to plan A's `Plane::serve`, so this crate holds neither a second handle nor a cache — the api-off build has no `tinio-api` dependency at all and must still compile, which is what `docs/tests.md:17-19`'s `cargo check --workspace --all-targets` and `.github/actions/run-test-leg/action.yml:72`'s `--no-default-features` leg require. `pub async fn serve(ready: Ready) -> Result<ExitCode, Error>` is the serving half `lib.rs` dispatches on the one runtime, and it is where the sandbox plans' shared §4 signature lands (their `args`, `config: Option<Config>`, `storage: FsStorage`, `inherited: Option<TcpListener>`, `stop: Option<watch::Receiver<bool>>`, with `storage` **not** optional). `ServerMetrics` is the CLI's `tinio_api::metrics::MetricsSource` — the adapter this task owns because plan A's crate may not name `tinio-server` (design decision 23) — and it is specified in Step 3 below. **The test file this task writes belongs to `crates/tinio`, not `crates/tinio-cli`**: `env!("CARGO_BIN_EXE_tinio")` resolves only in the package that owns the `tinio` bin, so T055's round trip — and every other leg that spawns the binary — lives in `crates/tinio/tests/lifecycle.rs` and runs as `cargo test -p tinio --test lifecycle …`. What stays in `tinio-cli` is its unit-level surface only.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
+
+*Deviation (reviewed and accepted): the round-trip leg `a_server_starts_reports_and_stops` did not land here — it spawns `tinio status`/`tinio stop`, which are stubs until Task 8, so it moved into Task 8 beside the rest of the client legs. This task landed the two server-only legs and the shared `spawn`/`client_env` helpers.*
 
 `crates/tinio/tests/lifecycle.rs` (package `tinio`) — T055's round trip, driven through the real binary. `tinio-cli` keeps no copy of this file: its own tests are `resolve::`'s, `cli::`'s, the `#[cfg(unix)]` `signal::` unit and `sandbox::`'s, none of which spawns anything.
 
@@ -1185,14 +1189,14 @@ fn a_second_instance_on_the_same_root_fails() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio --test lifecycle`
 Expected: FAIL — `run()` returns success without serving (the test file is `crates/tinio/tests/lifecycle.rs`, hence `-p tinio`; `crates/tinio/Cargo.toml` gains `tempfile` in `[dev-dependencies]` for the `TempDir` above). Cargo builds the package's own binary for this run, so `env!("CARGO_BIN_EXE_tinio")` resolves without a separate `cargo build` — the explicit prerequisite is only needed where the harness lives in another crate (Task 10).
 
 **Every client spawn in this file gets its own state dir, and `TINIO_STATE_DIR` is how.** The `status` and `stop` legs below run the client, and the client's second state-dir candidate is the home-derived `~/.tinio/roots/<hash>/` — *created* while it is computed, by `tinio_config::state::home_state_dir`'s `ensure_roots`. So each of those spawns sets **`TINIO_STATE_DIR`** to the test's `TempDir`, which is what replaces the home-derived candidate (Task 2's rule: the variable is the escape hatch for a machine with no writable home, it replaces that one candidate in either mode, and it never moves the *served* state dir — a read-write run still serves `<root>/.tinio`). `HOME` is set beside it as the unix fallback, and `USERPROFILE` too, but neither is what makes the isolation work: `dirs 7` resolves the Windows home through `SHGetKnownFolderPath(FOLDERID_Profile)` (`dirs-sys-0.5.0/src/lib.rs:150-173`), which never reads either variable, so a spawn that relied on them would still create `%USERPROFILE%\.tinio\roots\` — the real profile. Plan C's `tests/doctor.rs` legs follow the same rule, and its Global Constraints state it against `state_dir_candidates`; the two documents must read the same, so Task 2's rule paragraph is the sentence both quote.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 `commands/start.rs` implements §1's sequence, and the two halves it must keep apart are the launcher's and the child's: `run` is the pre-runtime half — §1 steps a–j, resolve through the control-channel bind — and builds **no** runtime, `serve` is the half that runs on the process's one runtime, and the launcher arm returns from `run` with the supervised child's status without reaching either of them.
 
@@ -1550,14 +1554,16 @@ The stub the red state needs is the implementer's first act: the smallest `comma
 
 **A doc step belongs to this task, because the readiness line is its subject**: `contracts/cli.md` gains the sentence decision 11 fixes — readiness on **stdout** (the single line a harness scrapes) and the operational summary on **stderr** — replacing the "to stderr (operational log)" phrasing that left the machine-readable channel undocumented while this binary ships it.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
+
+*Deviation (reviewed and accepted): three tests were written, not two — the two server-only legs plus `a_second_instance_on_the_same_root_fails`; the round trip is Task 8's. The run below passes with the two legs this task landed.*
 
 Run: `cargo test -p tinio --test lifecycle`
 Expected: PASS — both tests (the file is `crates/tinio/tests/lifecycle.rs`; `tinio-cli`'s own tests are its unit-level ones and are run by the next command's sibling, `cargo test -p tinio-cli`).
 Run: `cargo test -p tinio-server --test serve_read_only`
 Expected: PASS unchanged (the example still exists at this point; Task 10 retires it).
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings` and `cargo clippy -p tinio --all-targets -- -D warnings`
 Expected: clean.
@@ -1571,7 +1577,7 @@ Report the files pending commit.
 - Create: `crates/tinio-cli/src/signal.rs` (replacing the stub Task 3 landed — this task replaces its own stub and leaves the registration in place)
 - Modify: `crates/tinio-cli/src/lib.rs` (`mod signal;` is already registered by Task 3's stub; what changes here is the module's content, and `lib.rs` itself only if the stub's `Handles` shape needs the real one), `crates/tinio-cli/Cargo.toml` (the `cfg(unix)`/`cfg(windows)` dependency arms, **and the manifest change below**)
 
-**The manifest change this task owes, and the crate's two enumerated exceptions.** A console handler must be an `unsafe extern "system" fn` and `windows-sys` is raw bindings, so `crates/tinio-cli/Cargo.toml`'s `[lints.rust] unsafe_code` moves from `"forbid"` to `"deny"` — the crate currently forbids it outright. The crate has **two** `#[allow(unsafe_code)]` sites when this phase closes, each with one reason and nothing else allowed:
+**The manifest change this task owes, and the crate's two enumerated exceptions.** A console handler must be an `unsafe extern "system" fn` and `windows-sys` is raw bindings, so `crates/tinio-cli/Cargo.toml`'s `[lints.rust] unsafe_code` moves from `"forbid"` to `"deny"` — the crate currently forbids it outright. The crate has **one** `#[allow(unsafe_code)]` site when this phase closes, with one reason and nothing else allowed — and the phase has three sites in total, not two (a plan-audit correction: `tinio-config`'s ACL module in Task 1, this one, and Task 10's console-event test leg, which cannot be written without one because `forbid` — the facade manifest's level until Task 10 flips it to `deny` — cannot be locally allowed):
 
 1. **this task's**: `signal.rs`'s Windows handler and its registration call, together in one block — design decision 20's enumerated exception (`docs/cargo.md`'s lint rule records the pattern, and `tinio-config` takes the same shape for its ACL block in Task 1), whose invariant is Windows's rather than this design's (the handler runs on a system thread, may not allocate or lock, and only `send`s on a channel created before it was registered);
 2. **plan C's**, in `commands/doctor.rs`: the `windows-sys` `GetDiskFreeSpaceExW` call behind the free-space probe — a raw-binding call with no safe wrapper in `std`, enumerated in that plan's own task.
@@ -1582,7 +1588,7 @@ So "one site" is not the rule; **enumerated sites are**, and no task in this pla
 - Consumes: nothing from this plan beyond `Error`.
 - Produces: `tinio_cli::signal::{install, Handles}` with `pub fn install() -> Result<Handles, Error>` where `Handles { shutdown: watch::Receiver<bool>, stopper: watch::Sender<bool> }`, plus the **private** fast-exit arm `fn second_signal_exits_immediately()`, called by the iterator thread on the second termination signal — private because nothing outside this module has a reason to reach it, and the stub Task 3 landed is the same private `fn` with an empty body.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-cli/src/signal.rs`:
 
@@ -1612,12 +1618,12 @@ mod tests {
 
 `signal_hook`'s own `raise` is deliberately not used: the point of the test is the registration path, and `nix` is the crate this design already added for unix syscalls. The process-level behaviour (graceful exit, `state` removed, second signal exits without draining) is asserted in `crates/tinio/tests/lifecycle.rs` by spawning the binary and signalling it, because a handler installed by the test process is global to it — and that file belongs to the **`tinio` package**, not to `tinio-cli` (the Global Constraints' `CARGO_BIN_EXE_tinio` rule), so this task's own module keeps only the `#[cfg(all(test, unix))]` unit above.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-cli signal::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! Termination signals, turned into the one shutdown channel (design decision 20).
@@ -1704,12 +1710,14 @@ fn signal_error(err: std::io::Error) -> Error {
 
 The Windows arm declares `SetConsoleCtrlHandler` through `windows-sys` and handles `CTRL_C_EVENT`, `CTRL_BREAK_EVENT` and `CTRL_CLOSE_EVENT` by sending on the same channel; `CTRL_CLOSE_EVENT` gets a bounded wait because Windows terminates the process shortly after the handler returns, so the drain it can afford is shorter — record the bound in the handler's doc comment and assert it in the Windows leg of `crates/tinio/tests/lifecycle.rs` (Task 10 adds that leg). This function and its registration call are the crate's **first** `#[allow(unsafe_code)]` site (the manifest change above; the second is plan C's free-space probe), and the invariant it carries is Windows's rather than this design's: the handler runs on a system thread, may not allocate or lock, and does nothing but `send` on a channel created before it was registered.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
+
+*Deviation (reviewed and accepted): run in WSL2, where the `#[cfg(all(test, unix))]` unit actually executes — 1 passed there, 0 matched on this Windows host. This task also added a `#[cfg(all(test, windows))]` unit covering the second-console-event rule, so the filter matches 1 test on Windows too.*
 
 Run: `cargo test -p tinio-cli signal::`
 Expected: PASS — **and on a Windows host this exact filter matches zero tests**. Both the unit above and its module are `#[cfg(all(test, unix))]`, so `cargo test -p tinio-cli signal::` exits 0 there having run nothing, which is not evidence of anything; say so when you report the step. The Windows arm is compiled by Step 5's `windows-gnu` clippy leg and is exercised end to end by the Windows-gated process legs in `crates/tinio/tests/lifecycle.rs` (Task 10's harness legs and the console-handler leg), never by this crate's unit tests.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings` on this host, and the second leg — `cargo clippy --target x86_64-pc-windows-gnu -p tinio-cli --all-targets -- -D warnings`, the one that compiles the `windows-sys` arm — **in WSL2**, which is where `docs/tests.md:13` routes it: its `Unix/windows-gnu` line points at the Platform-gated verification section (`docs/tests.md:121-131`), and this host does not have the `x86_64-pc-windows-gnu` target installed while WSL2's toolchain does (verified — `rustup target add x86_64-pc-windows-gnu` + mingw-w64). Give the Linux-side run its own `CARGO_TARGET_DIR` (e.g. `~/.cache/tinio-wsl-target`): `/mnt/e/GitHub/tinio/target` already holds this host's Windows `msvc` artifacts, and sharing the directory mixes the two toolchains' output.
 Expected: both clean — and `unsafe_code = "deny"` with one enumerated `allow` is what the Windows leg is there to prove, since the `windows-sys` block only compiles there.
@@ -1729,7 +1737,7 @@ Report the files pending commit.
 
 **A doc step belongs to this task, because `--daemon`'s meaning is its subject**: `contracts/cli.md`'s `--daemon` bullet gains the sentence decision 9 rules — `--daemon` means "start in the background and **wait for ready**": the parent stays alive, waits (bounded ~10 s) for the daemon's `state` file and a control-channel answer, prints the readiness line on stdout and exits 0, or exits 1 with a message naming the daemon's log file and `tinio status`. The bullet keeps its existing "no service manager integration in v1" correction to Task 7's wording, and the `stderr → server.log`/`server.json` contract stays as it is.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-cli/src/daemon.rs`:
 
@@ -1757,12 +1765,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-cli daemon::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! `--daemon`: no supervisor, no console, no readiness on stdout from the daemon (decision 9).
@@ -1837,12 +1845,14 @@ The Windows arm spawns `current_exe()` with `child_argv(std::env::args_os().skip
 
 **"The same file" is `resolve::log_file(&resolution, &args, provenance)` — one rule, one owner.** `--log-file` wins, then `[log] server_log_file` (`crates/tinio-config/src/schema/log.rs:150`), then the format-derived default **in the state dir** (`server.log` / `server.json`). The last step is the daemon's own and not the config's: an empty `server_log_file` means "stderr" for a foreground run (`schema/log.rs:129`), and a daemon has no stderr to write to, so the default is what it falls back to rather than the empty string. That is why `detach_if_requested` takes the `Provenance` (the flag's level-2 answer lives beside the config's) and why this module declares no `log_target` of its own — a second spelling of "where the log goes" is exactly the drift this plan's ownership check looks for. One consequence, stated rather than hidden: **a foreground run keeps the operational log on stderr**, which is what the subscriber writes today (`crates/tinio-server/src/log.rs:305-306`); honouring `--log-file` there needs a file sink in `build_subscriber` and is that crate's edit, not this phase's.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-cli daemon::`
 Expected: PASS.
 
-- [ ] **Step 5: Add the process-level leg and run it**
+- [x] **Step 5: Add the process-level leg and run it**
+
+*Deviations (reviewed and accepted): the legs end the daemon through plan A's `client::stop` rather than `tinio stop` (Task 8's stub), and they capture the daemon's output to files rather than through `Command::output()` — on Windows a detached child inherits the parent's std handles, so the piped form never returns. Both legs pass; the second takes the probe's full ~10 s bound by design.*
 
 Append to `crates/tinio/tests/lifecycle.rs` (the facade package's test file, where `env!("CARGO_BIN_EXE_tinio")` and the `spawn` helper from Task 3 already live):
 
@@ -1899,7 +1909,7 @@ fn a_daemon_whose_startup_fails_exits_one_and_says_so() {
 Run: `cargo test -p tinio --test lifecycle daemon`
 Expected: PASS. The second test takes the probe's full ~10 s bound, which is the behaviour it asserts.
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings`
 Expected: clean.
@@ -1917,7 +1927,7 @@ Report the files pending commit.
 - Consumes: nothing beyond `Error`.
 - Produces: `tinio_cli::notify::{ready, stopping, watchdog, unit_text}` with `pub fn unit_text(program: &Path, args: &[OsString], state_dir: &Path) -> String`. `SERVICE_NAME` is **not** here: it has one definition and Task 7's `service.rs` owns it, because that is the module that hands it to the SCM dispatcher.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-cli/src/notify.rs`:
 
@@ -1973,12 +1983,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-cli notify::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! What systemd is told, and the unit text it is told it by (design decisions 21 and 22).
@@ -2103,19 +2113,19 @@ pub fn unit_text(program: &Path, args: &[std::ffi::OsString], state_dir: &Path) 
 
 One sentence in the spec set still describes a unit that sends nothing, and it is corrected here because this step is where the unit gets its one author: `contracts/cli.md`'s "Example systemd unit" block says `Type=simple`, which is exactly the two-copies defect decision 21 names — a unit that says `simple` beside a binary that sends `READY=1` makes every notification inert with no error anywhere. The block becomes this rendering, the same text `packaging/tinio.service` carries (`Type=notify` with `WatchdogSec=`, `ExecStart=/usr/local/bin/tinio server /srv/tinio`), so the file an operator reads and the file a machine installs cannot be told apart. (The other stale sentence — "no service manager integration in v1" — is Task 7's, because Task 7 is what makes it false.)
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-cli notify::`
 Expected: PASS — three tests on unix (`the_unit_notifies_and_watches`, `the_checked_in_unit_is_this_rendering`, `notifications_are_inert_without_a_socket`); two on Windows, where the third is `#[cfg(unix)]` and the filter matches nothing for it — say so when you report the step rather than counting three.
 
-- [ ] **Step 5: The notification leg, driven through the real socket**
+- [x] **Step 5: The notification leg, driven through the real socket**
 
 Append to `crates/tinio/tests/lifecycle.rs` (package `tinio`; `env!("CARGO_BIN_EXE_tinio")` and the `spawn` helper live there) a `#[cfg(unix)]` test that binds a unix datagram socket, sets `NOTIFY_SOCKET` and `WATCHDOG_USEC` on the child, starts `tinio server --port 0`, and asserts the datagrams it receives begin with `READY=1` and that a `WATCHDOG=1` arrives within the interval; then `POST`s stop through `tinio stop` and asserts a `STOPPING=1`. The `#[cfg(unix)]` gate is required rather than cosmetic: there is no `NOTIFY_SOCKET` protocol to test on Windows, where `notify` is the `false`-returning no-op arm.
 
 Run: `cargo test -p tinio --test lifecycle notify`
 Expected: PASS on unix — one test, and it is the only leg that observes the datagrams; on a Windows host the `#[cfg(unix)]` gate makes this filter match zero tests, so report it as unrun there rather than as a pass.
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings`
 Expected: clean.
@@ -2135,7 +2145,7 @@ Report the files pending commit.
 
 **The level is the manager's, not the install context's** — and that is the crate's shape, not a preference. `service-manager 0.11.0`'s `ServiceInstallCtx` (`src/lib.rs:298-341`) is `{ label: ServiceLabel, program: PathBuf, args: Vec<OsString>, contents: Option<String>, username: Option<String>, working_directory: Option<PathBuf>, environment: Option<Vec<(String, String)>>, autostart: bool, restart_policy: RestartPolicy }` — **there is no `level` field and no `ServiceInstallCtx::new` constructor** (its only inherent methods are `cmd_iter`/`args_iter`, `:343-353`, and it derives no `Default`), so the context is a struct literal naming all nine fields, and the level travels on the manager: `TypedServiceManager::target_or_native` / `native()` (`src/typed.rs:69,95`) then `manager.set_level(level_for(args.user))?` (`src/typed.rs:57`; `ServiceManager::set_level`) before the verb. `target_or_native(None)` does not compile either — the parameter is `impl Into<Option<ServiceManagerKind>>` and a bare `None` has no type to infer — so `native()` is the call.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `crates/tinio-cli/tests/service.rs`:
 
@@ -2212,12 +2222,12 @@ fn a_permission_failure_names_the_remedy_not_the_errno() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-cli --test service`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! `tinio service` — the supervisor's half of running a server (design decision 22).
@@ -2342,18 +2352,18 @@ with `ffi_service_main` → `service_main(args)` → register the control handle
 
 **A doc step belongs to this task, because `service` is its subject** *(decision 22's round-2 ruling)*: `contracts/cli.md` gains a `service` section and flag table (the five verbs, `--name`, `--user`, the derived label `tinio-<sha256(canonical root)[..16]>`, the elevation refusals and their remedies), `specs/001-s3-local-server/spec.md` gains the corresponding FR — the command appears in no contract and no FR today, and `contracts/cli.md:42` with `research.md:143` actively say the opposite — and `research.md:210`'s rejected "a Windows service" row gets a **dated note** rather than a rewrite, because the ledger records what was decided and why. The two "no service-manager integration in v1" sentences are corrected in Step 5 below.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-cli --test service`
 Expected: PASS.
 
-- [ ] **Step 5: Record what CI cannot verify, and correct the two sentences that say this verb set does not exist**
+- [x] **Step 5: Record what CI cannot verify, and correct the two sentences that say this verb set does not exist**
 
 The verbs themselves need a supervisor and elevation. Add a `## Service verbs (manual)` block to `docs/tests.md`: the exact commands for a Linux container with systemd (`systemctl --user` for `--user`), a macOS host (`launchctl print`), and a Windows host (`sc query`), plus what to assert (`systemctl is-active`, the unit's `Type=notify` line, `sc query` reporting `RUNNING` and `STOP_PENDING` on stop). This is the phase's honest verification gap: the label, the context, the remedy text and the unit text are unit-tested, and the platform handshake is a documented manual leg.
 
 Two sentences elsewhere still assert that this phase's subject does not exist, and both are corrected in this step rather than left as a second truth: `contracts/cli.md`'s `--daemon` bullet ends "(no service manager integration in v1)" and `research.md`'s §21 Notes carries the same claim ("no service-manager integration in v1; systemd unit example covers Linux"). `tinio service` **is** that integration, so both sentences now say what is true: `--daemon` remains the no-elevation, no-supervisor, does-not-survive-a-reboot route (decision 22's operator ruling keeps both routes), and the service verbs are the supervised one; on Windows the SCM has no file form, so `tinio service install` is the only route there, while `packaging/tinio.service` stays the operator's own example on Linux — the rendered `Type=notify` unit Task 6 checks in, not the crate's `Type=simple` template.
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings`
 Expected: clean.
@@ -2371,7 +2381,7 @@ Report the files pending commit.
 - Consumes: `tinio_api::client::{status, stop, probe, Report}`, `Resolution` (Task 2) and `resolve::{resolve_mode, state_dir_candidates}`.
 - Produces: `tinio_cli::commands::{status::run, stop::run}` — both `pub async fn(DirArgs) -> Result<ExitCode, Error>`, both dispatched by `lib.rs` on the process's **one** runtime and neither constructing one of its own (design decision 2, and plan C's `doctor` is the fourth command on that same runtime), and both working through one shared `client_target(args) -> Result<(Resolution, PathBuf), Error>` that resolves root, mode and the candidate state dirs once.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 These are asserted through the binary in `crates/tinio/tests/lifecycle.rs` — the `tinio` package's test file, not `tinio-cli`'s, because `env!("CARGO_BIN_EXE_tinio")` and Task 3's `spawn` helper live there — and this task extends that file rather than creating a second one. Task 3's round trip already covers the happy path; what this task adds is the three failure shapes the contract names plus the two mode/state-dir legs, each spawning the binary:
 
@@ -2498,12 +2508,12 @@ Neither leg creates anything under the developer's real profile, and `TINIO_STAT
 
 The mode every one of these runs with is Task 2's chain and nothing new: `--read-only` beats `TINIO_READ_ONLY` beats `[server] read_only` (decision 4, and `.env` is not an input to it), which is what makes the two legs above differ only in the flag. `doctor` reaches the same resolution through the same `DirArgs` when plan C lands (decision 19), so there is one implementation of this and not three.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio --test lifecycle status`
 Expected: FAIL — the commands do not exist (the tests live in `crates/tinio/tests/lifecycle.rs`, hence `-p tinio`).
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 `status` prints the contract's five fields on one line each (`running|stopped`, endpoint, root, pid, started) and returns `ExitCode::SUCCESS` when `report.running` else `ExitCode::from(1)` — but the *message* about an uninitialised root or a failed probe goes to stdout, because the contract says the command reports the state rather than erroring out of it; only an unreadable state file is an `Err`. `stop` sends the request, then polls `client::probe` every 100 ms to a ~15 s bound, reporting success when the probe fails or `state` disappears and an unconfirmed exit otherwise; `Err(Error::Operational(...))` for "no running server" gives exit 1 through the shared mapping.
 
@@ -2512,15 +2522,15 @@ Both are `async fn`s, and both are awaited by `lib.rs` on the runtime it built �
 Both commands, and plan C's `doctor` with them, resolve the way the server does and then **probe both state-dir candidates**:
 
 - The mode is `resolve_mode` (flag > `TINIO_READ_ONLY` > `[server] read_only`), so a read-only root is looked for in its own state dir exactly as the server leaves it, and the root-writability question never enters a client command.
-- The candidates come from `resolve::state_dir_candidates(root, resolved, read_only, override_dir, derived)` (Task 2's five-argument rule): the dir the ordinary chain resolved comes first, and if it holds no live server (`State::read` finds no `state`, or `client::probe` fails), the other candidate is tried — `<root>/.tinio` when the mode relocated, and otherwise the home-derived `~/.tinio/roots/<sha256(canonical root)[..16]>/`, which `TINIO_STATE_DIR` replaces when it is set. The pair is `[X, <root>/.tinio]` whenever the resolved dir is not the root's own, so the two candidates are never the same directory. This is the client-side half of decision 19: a server started before an operator edited `read_only`, or started with `--read-only` and stopped from a plain shell, is still found, and the report names the state dir that answered (one line beside the contract's five, which Task 9's contract step adds to `status`'s output list) so the operator can see which of the two it was. `status` and `stop` never delete either file — the plane owns `state` and the socket (Task 3, decision 12, `Plane::publish`/`Plane::shutdown`) — and `crates/tinio-cli` never joins those file names itself, because a client that unlinks one cannot know whether the server behind it is still live; the one exception is `doctor --fix` (plan C), which reclaims a stale socket through `tinio_api::bind::reclaim_stale` and a stale `state` through `tinio_api::State::remove`, only after a probe has proved no server answers for that root.
+- The candidates come from `resolve::state_dir_candidates(root, resolved, read_only, override_dir, derived)` (Task 2's five-argument rule): the dir the ordinary chain resolved comes first, and if it holds no live server (`State::read` finds no `state`, or `client::probe` fails), the other candidate is tried — `<root>/.tinio` when the mode relocated, and otherwise the home-derived `~/.tinio/roots/<sha256(canonical root)[..16]>/`, which `TINIO_STATE_DIR` replaces when it is set. The pair is `[X, <root>/.tinio]` whenever the resolved dir is not the root's own; the two candidates coincide only when `TINIO_STATE_DIR` names `<root>/.tinio` itself, which Task 2's rule covers as the harmless degenerate input. This is the client-side half of decision 19: a server started before an operator edited `read_only`, or started with `--read-only` and stopped from a plain shell, is still found, and the report names the state dir that answered (one line beside the contract's five, which Task 9's contract step adds to `status`'s output list) so the operator can see which of the two it was. `status` and `stop` never delete either file — the plane owns `state` and the socket (Task 3, decision 12, `Plane::publish`/`Plane::shutdown`) — and `crates/tinio-cli` never joins those file names itself, because a client that unlinks one cannot know whether the server behind it is still live; the one exception is `doctor --fix` (plan C), which reclaims a stale socket through `tinio_api::bind::reclaim_stale` and a stale `state` through `tinio_api::State::remove`, only after a probe has proved no server answers for that root.
 - The consequence for discovery, stated because it is a contract paragraph and not a detail: a read-only root legitimately has no `.tinio/` of its own, so the walk-up from the current directory cannot find it — `status`, `stop`, `doctor` and `tinio server` all require an explicit `DIR` for a read-only root, which is what `contracts/cli.md:17` already tells the operator.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio --test lifecycle`
 Expected: PASS.
 
-- [ ] **Step 5: Lint and checkpoint**
+- [x] **Step 5: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings` and `cargo clippy -p tinio --all-targets -- -D warnings`
 Expected: clean.
@@ -2571,7 +2581,7 @@ pub const BACKEND_IS_STUB: bool = true;
 Read it as `true` **today**, for all three. The refusal names the platform from
 `std::env::consts::OS`, so the message stays true whichever arm is current.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/tinio-cli/src/sandbox.rs`:
 
@@ -2615,6 +2625,8 @@ mod tests {
 }
 ```
 
+*(2026-09-22)* The `resolve_flag` leg above is superseded like Task 2's paragraph: the landed signature is `resolve_flag(source: ValueSource, requested: bool, file: bool)` — clap's answer and its source, then the config key — and the leg drives `ValueSource::CommandLine`/`EnvVariable`/`DefaultValue` for the three channels. The refusals' own words are unchanged, and a feature-off build keeps `TINIO_SANDBOX` readable through a hidden argument, which is what `the_sandbox_variable_is_never_silently_ignored` still asserts.
+
 plus a `#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]` test asserting the facade-less build does not compile — a compile-fail assertion is not expressible in a unit test, so this task instead asserts the *runtime* refusal on the three supported platforms while their backends are stubs, as a process leg in `crates/tinio/tests/lifecycle.rs` (package `tinio`, where `tinio()` and `spawn` live):
 
 ```rust
@@ -2636,12 +2648,14 @@ fn sandbox_on_a_stub_platform_refuses_and_never_serves() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-cli sandbox::`
 Expected: FAIL — unresolved module.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
+
+*Deviation (reviewed and accepted): canonicalisation and the reparse-point refusal are **not** done in `plan` — they are `tinio-sandbox-windows`' `canonical_exposures` and `tinio-sandbox-macos`' `with_canonical_paths` (P2/P3's owning definitions). A CLI that resolved the paths first would resolve away the very link that refusal exists to catch, and would be a second definer of macOS's "add, do not replace" rule. The `start.rs` comments that cited `plan` as the canonicaliser were corrected to match. The same correction applies to the paragraph above about canonicalisation.*
 
 ```rust
 //! The `--sandbox` seam: three channels, one decision, every refusal named (decision 10).
@@ -2710,15 +2724,15 @@ pub fn resolve_flag(flag: bool, env: Option<bool>, file: bool) -> bool {
 }
 ```
 
-`plan()` folds the three channels — `resolve_flag(args.sandbox, sources::env_sandbox()?, config.server.sandbox)`, where the flag is the one input a feature-off build cannot even spell and `config.server` is the public field of `Config` (`config.server.sandbox`, never a `server()` method) — and resolves them in one place, and the split from `confine` is deliberate — the plan and the confinement call have different owners and different builds:
+`plan()` folds the three channels — landed as `resolve_flag(provenance.sandbox, args.sandbox_flag(), config.server.sandbox)` since 2026-09-22, where the source is what names the channel a refusal reports, `args.sandbox_flag()` is clap's flag-or-variable answer and `config.server` is the public field of `Config` (`config.server.sandbox`, never a `server()` method) — and resolves them in one place, and the split from `confine` is deliberate — the plan and the confinement call have different owners and different builds:
 
 - **The three static determinations are `plan()`'s, and they run before daemonization** (Task 3's `run()` calls `plan` before `detach_if_requested`), so every one of them reaches the shell: with the `sandbox` feature **off**, a `true` answer from `TINIO_SANDBOX` or `[server] sandbox` is `Error::Usage` (exit 2) naming the build; a channel this build does not honour is a startup error naming the channel; and a platform whose backend is still a stub — `BACKEND_IS_STUB` above, which is the only place that fact is recorded — is a startup error naming `std::env::consts::OS`. Putting them here rather than in the confinement call is what makes them *static* and, more importantly, makes them reachable in every build: on a Linux build Task 3's `#[cfg(any(target_os = "macos", target_os = "windows"))]` launcher arm compiles out, and the same refusals must still come from this code path — which is exactly why the stub state cannot be read off `Backend::confine`'s answer, a call that never happens on Linux.
-- With the feature **on** and a channel set, it builds the `Request`: the `exposures` set from `exposures(root, state_dir, access)`, `.device_files()` on Linux, the executable's directory read-only **on Windows only** (sandbox design decision 22), every path canonicalised and a reparse point refused, and the OTLP conflict warned about. `Request` is a plain value — the `Sandbox` is built from it inside `confine`, which is where the platform's own flags (`device_files`, the Windows exposure) are already folded in.
+- With the feature **on** and a channel set, it builds the `Request`: the `exposures` set from `exposures(root, state_dir, access)`, `.device_files()` on Linux, the executable's directory read-only **on Windows only** (sandbox design decision 22), and the OTLP conflict warned about. *(Canonicalisation and the reparse-point refusal are **not** in that list — that clause is the deviation note's, not this step's: the rule belongs to P2/P3's `canonical_exposures`/`with_canonical_paths`, and no target implements it yet.)* `Request` is a plain value — the `Sandbox` is built from it inside `confine`, which is where the platform's own flags (`device_files`, the Windows exposure) are already folded in.
 - **`confine()` stays the entry-point sequence's call** (Task 3, §1 step i) and contains no determination: it rebuilds the set the request carries — `Sandbox::from_exposures(request.exposures.clone(), request.device_files)` — and the `LaunchPlan` (the payload's configuration text plus the inherited listener), makes the facade's platform call — `tinio_sandbox::platform().confine(&sandbox, &plan)`, whose `Backend::confine(&mut self, …)` returns the `Confinement` — and answers `None` for `Confinement::InPlace` ("carry on in this process", the Linux case) and `Some(child)` for `Confinement::Supervise(child)` (macOS and Windows). Task 3's launcher arm then drives the facade's **two-argument** `tinio_sandbox::supervise(&mut child, teardown)`, which waits for the child, runs the teardown on every path, and returns the child's `ExitStatus` — the borrow rather than the by-value form is deliberate (the caller reads `Child::terminal` afterwards), and the CLI's own teardown is empty because the platform's launch owns everything it set up (the callback cannot fail by contract, and a rollback that can belongs in the platform's wait closure). Because the stub-platform determination is `plan()`'s, the refusal `crates/tinio/tests/lifecycle.rs` asserts (a `--sandbox` run on a stub platform exits non-zero naming the platform and never publishes `state`) is raised before `confine` is ever called — and stays raised on a platform where the call is compiled out.
 
 The Linux-only options (`LinuxOptions` with its model and `TINIO_SANDBOX_MODEL`) are reached inside `#[cfg(all(feature = "sandbox", target_os = "linux"))]`, exactly as the sandbox design's decision 2 draws the boundary; the facade exports no platform options — and that is the only `cfg(feature = "sandbox")` in this file: nothing else in the module is gated on the feature.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-cli`, `cargo test -p tinio-cli --no-default-features`, and `cargo test -p tinio --test lifecycle`
 Expected: PASS in all three. Four corrections to what "differ in exactly one way" would suggest: `--no-default-features` drops **three** features — `api`, `mem`, and the default-on `sandbox` this plan's Task 9 adds (the crate's default list is `["api", "mem"]` today) — and `mem` changes nothing observable in this crate's code, so the sentence must not claim it does; `api` off is **not** only the enum change Task 2's doc fixes — `tinio-api` is an optional dependency, so the plane half of `run`/`serve`/`Ready` (the bind, the state file, `publish`, `shutdown`, the metrics ticker, `api_options`) is `#[cfg(feature = "api")]` and compiles out with it, which is what makes `cargo check --workspace --all-targets` and `.github/actions/run-test-leg/action.yml`'s `--no-default-features` leg pass; `status` and `stop` become unknown subcommands (clap's own usage error at exit 2), and `doctor` keeps its whole report while `--dry-run`, `--fix` and the stale-state/socket leg are compiled out; and `sandbox` off is the difference that matters for the **refusal text** — without it the refusals are the usage error naming the build, reached through `TINIO_SANDBOX` or `[server] sandbox` because `--sandbox` is not in the clap surface at all; with it they name the platform whose backend is still a stub.
@@ -2760,7 +2774,7 @@ fn the_sandbox_variable_is_never_silently_ignored() {
 
 The two strings the branches match are the ones `plan` produces in Step 3 — the test is written against them in the same task, and the wording is fixed there rather than guessed here.
 
-- [ ] **Step 5: Write the FR and the contract prose**
+- [x] **Step 5: Write the FR and the contract prose**
 
 `specs/001-s3-local-server/spec.md` gains the FR this feature has never had (its three channels, FR-016 precedence, the fail-closed rule, the composition with FR-023); `contracts/cli.md` gains the `--sandbox` row and `--config PATH`, the `--read-only` row for `status`/`stop`/`doctor` (the doctor section already mentions the mode while the flag tables omit it), and the `status` output's state-dir line Task 8 adds; `contracts/config.md` gains `[server] sandbox`, the `.env`-never-selects-the-mode rule (decision 4), and the `/metrics`-on-the-management-plane note replacing F10's interim. Cross-check each against the code as written — the documents describe what exists, and a sentence without a task behind it is the defect this repository's plan conventions exist to catch.
 
@@ -2773,7 +2787,7 @@ The two strings the branches match are the ones `plan` produces in Step 3 — th
 - **`research.md`**: §24's dependency table gains this phase's rows — `clap`, `daemonize`, `signal-hook`, `nix`, `sd-notify`, `windows-service`, `service-manager` — **six new rows** beyond `clap`, which the ledger already carries, and the same six the design's Bookkeeping now counts (its earlier "four" counted the unix-only arms and is no longer in the document), each with the reasoning that Bookkeeping records — and `:210`'s rejected "a Windows service" row gets a dated note rather than a rewrite (Task 7's step).
 - **`plan.md:186`**'s sentence about an in-memory backend when no directory argument is given is corrected to the contract's rule (a missing root is a usage error naming the remedy, `contracts/cli.md:17`), and **`data-model.md`**'s state-file list gains the `root` field plan A writes.
 
-- [ ] **Step 6: Lint and checkpoint**
+- [x] **Step 6: Lint and checkpoint**
 
 Run: `cargo clippy -p tinio-cli --all-targets -- -D warnings`
 Expected: clean.
@@ -2791,7 +2805,7 @@ Report the files pending commit.
 - Consumes: Task 3's binary.
 - Produces: nothing the library uses; this is the phase's hand-over.
 
-- [ ] **Step 1: Switch the two harnesses, credentials included**
+- [x] **Step 1: Switch the two harnesses, credentials included**
 
 **Prerequisite: the `tinio` binary must be built before either harness runs.** Both harnesses locate a *built* binary rather than asking cargo for one: `assert_cmd::cargo::cargo_bin("tinio")` resolves the path under `target/<profile>/` and fails with its own message when the file is not there. So the leg's first command is `cargo build -p tinio` (CI adds `--profile ci`, matching the profile the tests run under). **Three CI artifacts build the example and would all break on the deletion**, and all three are this step's edit: `.github/actions/run-test-leg/action.yml`'s two `cargo build --profile ci -p tinio-server --example serve` steps (one per mode, the `--no-default-features` leg keeping its flag), and `.github/workflows/ci.yml`'s "build serve example (interop harness)" step at the top of the `interop`/`interop-port` legs (`ci.yml:707-714`), which becomes `cargo build --profile ci -p tinio`. The comment above the action's steps explains why they exist, and its reasoning is unchanged: nextest's target selection cannot be relied on to leave the artifact where the test derives it.
 
@@ -2810,14 +2824,14 @@ Both edits are assertion needles, not behavioural changes: the readiness line, t
 
 **On the readiness-timeout tension, stated so it is not read as agreement:** the harnesses allow **30 s** to see the readiness line, while Task 3's round trip asserts SC-005's **≤ 1 s**. Both are right and they measure different things — 30 s is the bounds for a loaded CI runner starting a cold binary through cucumber, 1 s is the product requirement measured on an idle host — but a run where the CLI takes 5 s to become ready would pass the harness and fail T055. Neither bound is edited here.
 
-- [ ] **Step 2: Run both suites**
+- [x] **Step 2: Run both suites**
 
 Run: `cargo build -p tinio` then `cargo test -p tinio-server --test serve_read_only`
 Expected: PASS — the same legs, now against the CLI.
 Run: `cargo test -p tinio-e2e --test cucumber -- --retry 2`
 Expected: PASS. This is the run that proves the switch: ~all of the suite's scenarios start the server through the helper that just changed.
 
-- [ ] **Step 3: The Windows console-handler leg**
+- [x] **Step 3: The Windows console-handler leg**
 
 Task 4's handler is the crate's only Windows signal path and, until this step, the only one with no leg of its own: the `#[cfg(unix)]` unit asserts the registration on unix, `docs/tests.md:129-131`'s `windows-gnu` clippy leg proves the arm *compiles*, and nothing proves it *reaches the shutdown channel* — which is the thing the contract requires of Ctrl+C and the console-close event (`contracts/cli.md:43`, T069).
 
@@ -2868,13 +2882,13 @@ fn the_console_handler_reaches_the_shutdown_path() {
 
 `windows-sys` is a dev-dependency of the facade package for this leg (with `Win32_System_Console`, the same feature the crate itself declares), and the leg is the reason Task 4's handler doc comment can say the Windows arm is exercised rather than only compiled.
 
-- [ ] **Step 4: Delete the example, and settle where the `sandbox` feature really lives**
+- [x] **Step 4: Delete the example, and settle where the `sandbox` feature really lives**
 
 Remove `crates/tinio-server/examples/serve.rs`. Unlike the `[[bench]]` blocks in that manifest, there is **no `[[example]]` block to remove**: `examples/serve.rs` is auto-discovered by cargo, and the `required-features` block the design's §8 describes does not exist in `crates/tinio-server/Cargo.toml` today — so the file's deletion is the whole of the edit there. **There is nothing to move either, and the design's §8 sentence that says otherwise is wrong about this tree**: `crates/tinio-server` has no `sandbox` feature and no `tinio-sandbox` dependency (`rg sandbox crates/tinio-server` finds no match; the manifest's optional dependency is `tinio-api`), so nothing is "dropped from that crate" — Task 9's *addition* to `tinio-cli` (the non-optional dependency and the default-on feature) is the whole of it, and the design-side sentence owes a correction that this plan records as debt in Task 11 rather than editing another plan's document. One more place names the deleted command and is **Task 11's** edit rather than this one's: `docs/tests.md`'s CI-only legs table lists `cargo build --profile ci -p tinio-server --example serve` as the interop legs' prerequisite, and the docs step there updates it to the `tinio` build.
 
 **The facade's ownership is split, and this task holds only its half.** `crates/tinio/Cargo.toml` gains the `sandbox` pass-through row, `sandbox = ["tinio-cli/sandbox"]`, beside `api` and `mem`, plus this phase's `[dev-dependencies]` (`tempfile`, for `tests/lifecycle.rs`) — the facade forwards a feature it does not own and never names `tinio-sandbox` itself, while `tinio-cli` holds the dependency and its default-on `sandbox` feature (Task 9). **Plan A owns that file's other lines**: the `tinio-api` pass-through rows (`openapi`, `tls`) and the `default` list, which its own task edits; this task edits neither, and plan A's task edits neither the `sandbox` row nor the dev-dependencies. One owner per line is what keeps one `sandbox` row from becoming two.
 
-- [ ] **Step 5: Update the binary smoke test**
+- [ ] **Step 5: Update the binary smoke test** — *not run this way (2026-09-22): the file this step edits was deleted rather than updated. `crates/tinio/tests/smoke.rs` is gone; the bare-invocation leg is `cli_lifecycle.feature`'s "A bare invocation is a usage error" scenario, driven by `crates/tinio-e2e/tests/steps/cli.rs` against the real binary, which is what the assertion below makes. `specs/001-s3-local-server/tasks.md`'s T055/T096 notes and `docs/tests.md`'s "CLI (tinio)" section record the move.*
 
 `crates/tinio/tests/smoke.rs` asserts the new contract — and the assertion **replaces** the file's existing `binary_exits_success` test rather than being added beside it: `tinio` with no arguments now exits **2**, so the old test would fail, and keeping both would leave two contradictory statements about the same invocation in one file. The file keeps its module doc and its `Command` import, drops the old body, and gains:
 
@@ -2887,12 +2901,12 @@ fn no_subcommand_is_a_usage_error() {
 }
 ```
 
-- [ ] **Step 6: Run the workspace gate**
+- [x] **Step 6: Run the workspace gate**
 
 Run the `docs/tests.md` Standard acceptance block in full.
 Expected: PASS. Report each command's output.
 
-- [ ] **Step 7: Lint and checkpoint**
+- [x] **Step 7: Lint and checkpoint**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
@@ -2907,7 +2921,7 @@ Report the files pending commit.
 - **Not** modified here: `docs/superpowers/specs/2026-09-20-cli-integration-design.md`. Its four stale sentences (Step 2 below) were corrected **on the design side**, so no task in this plan holds an edit to it — adding it to this list would claim a write this phase does not make.
 - **Not** modified here, and deliberately: `docs/superpowers/plans/2026-09-18-sandbox-p1-linux.md` and `docs/superpowers/specs/2026-09-18-sandbox-design.md`. Both files are in this workspace now (the sandbox P0 merge, `a091cce`), but they are the sandbox workstream's own, and its worktree still holds uncommitted edits to `2026-09-18-sandbox-p1-linux.md` — so an earlier ruling keeps those two edits out of this plan, and **P1 must make both redirections before that work starts**: the P1 plan's Task 7 becomes "the CLI's `start` command consumes the sandbox backend" (this plan's Task 9 lands the seam), its Task 8's harness migration runs against the `tinio` binary, and the sandbox design's §10 gains one sentence naming `crates/tinio-cli/src/commands/start.rs` as the sequence's home, its risk row "`serve` is the only entry point" is marked closed by this phase, and its Bookkeeping's "`tinio-server` gains the `tinio-sandbox` dependency" sentence moves to `tinio-cli`. This task records the debt; it does not edit the sandbox workstream's documents to pay it.
 
-- [ ] **Step 1: Tick the spec's tasks**
+- [x] **Step 1: Tick the spec's tasks**
 
 Tick **T055, T059, T066–T069, T071, T072, T078 and T143** in `specs/001-s3-local-server/tasks.md`. **T060–T065 are not this plan's and are not ticked here**: they are plan A's (`2026-09-20-cli-management-plane.md` — the state file and single-instance bind, the local channel, the TCP listeners, the router, the OpenAPI schema and the client), and plan A ticks them; the same applies to T056 (its management-plane integration test) and T075 (`/metrics`), which are plan A's ticks. Ticking another plan's tasks here would state that this phase delivered code this phase never wrote. The leftover sentence "T075 was plan A's" is the same statement and carries no action. **T087 stays unticked**: `--anonymous` is not part of this plan — US3's task wires the flag through `crates/tinio-cli/src/commands/start.rs` and `TINIO_ANONYMOUS` through `crates/tinio-config/src/sources.rs`, and this plan declares neither (Task 2's `ServerArgs` has no `--anonymous` field, and no task here touches anonymous semantics).
 
@@ -2919,13 +2933,13 @@ T143's tick is backed by the tasks, not by the tick — name each clause's owner
 - **Clause 2, the `.env` load from the relocated state dir after the mode resolution** (never before it, decision 4): Task 2's `resolve::server` order — `resolve_state_dir` first, `apply_env_file` second — with `resolve_mode`'s signature carrying no `.env` input at all, which is what makes the cycle decision 4 rules out unrepresentable rather than merely avoided.
 - **Clause 3, the api plane's `state`, control socket and logs joining the resolved state dir**: Task 3's `plane.publish`/`plane.shutdown` on `resolution.state_dir` (plan A made the plane take the dir as a parameter, so this is wiring and not a second resolver), and Task 8's clients reading the same resolved dir by the same chain.
 
-- [ ] **Step 2: Record the sandbox set's two redirections, without editing another worktree**
+- [x] **Step 2: Record the sandbox set's two redirections, without editing another worktree**
 
 The two redirections are the Files note's: P1's Task 7 and Task 8, and the sandbox design's §10 and Bookkeeping. They are **recorded here, in `specs/001-s3-local-server/tasks.md`**, as a note under the T143 paragraph — the P1 plan and the sandbox design are the sandbox workstream's (it is still editing `2026-09-18-sandbox-p1-linux.md` in its own worktree), and an earlier ruling took those two edits out of this plan, so this task's obligation is the debt row and not the cross-workstream patch. P1 makes the two redirections in its own worktree before it starts; this plan's contribution is that the requirement is written down where the next reader will find it.
 
 **Four sentences in the design document were wrong about this tree or about this phase, and all four are corrected on the design side** *(plan-audit round; this plan records them so the phase's history stays legible, and deliberately leaves no debt row pointing at a sentence somebody else has already fixed)*: §8's "the `sandbox` feature plus its `tinio-sandbox` dependency **move** to `tinio-cli`" — `crates/tinio-server` never had either (Task 10 Step 4's evidence), so it is an addition, not a move; decision 4's parenthetical asking the credentials chain for "the `MINIO_*` fallbacks" — the aliases belong to the data plane's resolution (T084), and Task 1's `env_credentials` deliberately reads only the `TINIO_*` pair; the Bookkeeping's "**four** rows" for the dependency ledger, which is six; and decision 11's sentence that the contracts "said only that the operational summary goes to stderr" — superseded by the readiness sentence this phase writes into `contracts/cli.md` (Task 3), which is an addition to that contract rather than a correction of the design.
 
-- [ ] **Step 3: The docs**
+- [x] **Step 3: The docs**
 
 `README.md`'s crate table stops calling `tinio-api`/`tinio-cli` facade passthroughs and gains a line for the `service` verbs; `CONTEXT.md` gains glossary entries for the management plane's state file, the three sandbox channels and the CLI's root discovery; `docs/tests.md` gains the CLI section (T055's legs, the notify socket leg, the daemon leg) and the manual service-verbs block from Task 7.
 
@@ -2936,17 +2950,17 @@ Two corrections belong to this step as well, because both are places where a doc
 - **`docs/tests.md`'s CI-only legs table** names `cargo build --profile ci -p tinio-server --example serve` as the `interop`/`interop-port` prerequisite. Task 10 deletes that example, so the row becomes the `tinio` build there (`cargo build --profile ci -p tinio`), matching what Task 10 Step 1 puts into `.github/actions/run-test-leg/action.yml` and `ci.yml`.
 - **`specs/001-s3-local-server/tasks.md`'s T078** still reads "Add the example systemd unit `packaging/tinio.service` (`Type=simple`, foreground)". What this phase delivers is **`Type=notify` with `WatchdogSec=`** — the unit `notify.rs` renders and `packaging/tinio.service` checks in (Task 6) — so the parenthetical is corrected to say so, and the tick's comment names Task 6 as the owner. A `Type=simple` unit beside a binary that sends `READY=1` is precisely the two-copies defect decision 21 names, and leaving the stale text ticked would recreate it in the spec set.
 
-- [ ] **Step 4: The ownership check**
+- [x] **Step 4: The ownership check**
 
 The check is the one `docs/superpowers/README.md` describes — the file is in this worktree now, having arrived with the sandbox P0 merge (`a091cce`), so it is cited as a local path. For each family below, name the single owner and search the other documents for a second statement of the same fact; a hit is a defect to fix **now**, not in a follow-up:
 
 - the shared symbols: `Plane`/`Options` (plan A), `Resolution` (this plan's Task 2), the shared `serve` signature (the sandbox plans' §4), `unit_text` (Task 6);
 - the public surfaces: `tinio-cli`'s module list and `tinio-config`'s two new modules, each declared in exactly one File Structure table;
-- the lists that must have one home rather than one copy: the transport exclusivity rule (plan A's `select`), the **local-channel absence rule** (Task 2's `api_options` — decision 7's "the tool's default"; check no other document restates it), the **state-dir candidate rule** (Task 2's `state_dir_candidates`, which plan C's Global Constraints quotes word for word — the two texts must match), the exposure set (Task 9's `exposures`), the refusal messages (Task 9's `plan`), the service label derivation (Task 7's `label_for`), the environment-variable names (`tinio-config::sources` owns the boolean switches, the flags' help text names them; clap's `env` attributes are for the non-boolean flags only) and the socket-name derivation (plan A's `state::socket_path`);
+- the lists that must have one home rather than one copy: the transport exclusivity rule (plan A's `select`), the **local-channel absence rule** (Task 2's `api_options` — decision 7's "the tool's default"; check no other document restates it), the **state-dir candidate rule** (Task 2's `state_dir_candidates`, which plan C's Global Constraints quotes word for word — the two texts must match), the exposure set (Task 9's `exposures`), the refusal messages (Task 9's `plan`), the service label derivation (Task 7's `label_for`), the environment-variable names (*2026-09-22: `tinio-cli`'s `cli.rs` owns all nine — every one of them is one of its arguments' `env` attributes, the boolean switches' through their custom parser, so the help text and the variable are the same declaration; `tinio-config` keeps only `state::STATE_DIR_VAR`, because `parse_state_dir` refuses an empty value by that name*) and the socket-name derivation (plan A's `state::socket_path`);
 - the shared files: which task owns each edit — `crates/tinio/Cargo.toml` is split by line (**this plan**: the `sandbox` row and the dev-dependencies; **plan A**: the `tinio-api` pass-through rows `openapi`/`tls` and the `default` list), and `crates/tinio-cli/src/lib.rs`, `crates/tinio-cli/src/cli.rs`, `crates/tinio/tests/lifecycle.rs` and `docs/tests.md` each have exactly one owner per edit;
-- the two enumerated `#[allow(unsafe_code)]` sites (Task 4's console handler, plan C's free-space probe) — one reason each, no third;
+- the enumerated `#[allow(unsafe_code)]` sites this phase closes with — `tinio-winsec`'s file DACLs (Task 1's; they were `tinio-config`'s ACL module until the 2026-09-22 extraction, which is why the module is gone), `tinio-api`'s `dacl.rs`, `tinio-cli`'s console handler (Task 4) and its `daemon.rs` launch-env setter, and `crates/tinio/tests/lifecycle.rs`'s console-event leg (Task 10) — **five** in all, one reason each; plan C's free-space probe is the sixth when plan C lands;
 - the type names that cross a document boundary: `MetricsSource`/`Gauges`/`DEFAULT_TTL`, `AccessMode` (one type, re-exported by the sandbox facade), `Child`/`Confinement`/`supervise`, `LaunchPlan` (Task 9's `confine` builds it), `Server`/`Ready`.
 
-- [ ] **Step 5: Final checkpoint**
+- [x] **Step 5: Final checkpoint**
 
 Report every file pending commit across both plans, and the acceptance output. Do not run any git write.

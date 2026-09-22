@@ -1,0 +1,18 @@
+{{#with Running}}
+running
+endpoint: {{endpoint}}
+root: {{root}}
+pid: {{pid}}
+started: {{started}}
+state dir: {{state_dir}}
+{{else}}
+{{#with Stopped}}
+stopped
+endpoint: -
+root: {{root}}
+pid: -
+started: -
+state dir: {{state_dir}}
+{{#if control_name}}a state file names the control channel `{{control_name}}`, and nothing answers there — it is stale{{else}}no server has run for this root (no `state` in `{{state_dir}}`){{/if}}
+{{/with}}
+{{/with}}

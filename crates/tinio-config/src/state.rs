@@ -14,12 +14,14 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{Error, error, sources};
+use crate::_core::object::RESERVED_SEGMENT;
+use crate::{Error, error};
 
 /// Length of the derived directory name, in hexadecimal characters.
 const HASH_LEN: usize = 16;
-/// The tool's home directory name.
-const BASE_DIR_NAME: &str = ".tinio";
+/// The tool's home directory name, spelled by `tinio-core`'s own constant so the home layout
+/// and the storage layout cannot diverge.
+pub(crate) const BASE_DIR_NAME: &str = RESERVED_SEGMENT;
 /// The per-root state directory parent.
 const ROOTS_DIR_NAME: &str = "roots";
 
@@ -48,28 +50,47 @@ pub fn default_home_state_dir(root: &Path) -> Result<PathBuf, Error> {
 }
 
 /// The environment variable that overrides the derived state dir (FR-023).
+///
+/// **The name lives here and the reading lives in the CLI**, which is what keeps one owner per
+/// variable: this constant is what [`parse_state_dir`] refuses an empty value by, and that
+/// parser is the `value_parser` of the CLI's environment-only `--state-dir` argument. A caller
+/// that wants the value reads it from the parse, never from the environment.
+///
+/// What the variable means is the contract's (`contracts/config.md`'s read-only section): an
+/// explicit state dir used verbatim instead of the `~/.tinio/roots/<hash>/` derivation — the
+/// escape hatch for the environments read-only mode is actually for (service accounts,
+/// containers, immutable images) where the home may be absent or unwritable, and where
+/// [`default_home_state_dir`] would otherwise fail startup outright. **It is consulted in both
+/// modes, and what it moves differs between them.** A read-only run's served state dir *is*
+/// this value when it is set, and the pair such a client probes is `[this value, <root>/.tinio]`,
+/// so the home-derived candidate is never derived there at all. A read-write run's served dir
+/// stays `<root>/.tinio` — the CLI's `resolve::resolve_state_dir` never consults it on that path
+/// — but the variable answers in place of the second derivation a client makes there, the
+/// home-derived one, which is why a machine with no usable home needs no second variable to be
+/// reported on. An exported value is therefore never silently ignored: in read-write mode it
+/// moves what `status`, `stop` and `doctor` look at second, and nothing else.
 pub const STATE_DIR_VAR: &str = "TINIO_STATE_DIR";
 
-/// The `TINIO_STATE_DIR` override, if set: an explicit state dir used
-/// verbatim instead of the `~/.tinio/roots/<hash>/` derivation — the escape
-/// hatch for the environments read-only mode is actually for (service
-/// accounts, containers, immutable images) where the home may be absent or
-/// unwritable, and where `default_home_state_dir` would otherwise fail
-/// startup outright. Consulted only in read-only mode: read-write mode
-/// never calls it, so an exported value is silently ignored there.
+/// Parse a `TINIO_STATE_DIR` value — the CLI's `--state-dir` argument's parser, and the one
+/// place the value's shape is decided.
 ///
-/// The `TINIO_STATE_DIR` lookup, handing its value to [`parse_state_dir`]
-/// (`Ok(None)` when the variable is unset).
-pub fn env_state_dir() -> Result<Option<PathBuf>, Error> {
-    sources::parse_var(STATE_DIR_VAR, parse_state_dir)
-}
-
-/// Parse a `TINIO_STATE_DIR` value.
+/// An empty value is an error, never "the current directory"; the trimmed value is the path.
+/// The path is taken verbatim: its parents are **not** created mode 0700 and no symlink check
+/// applies, because the caller chose the location explicitly — the backend still creates the
+/// leaf itself and sets it 0700.
 ///
-/// An empty value is an error, never "the current directory". The path is
-/// taken verbatim: its parents are **not** created mode 0700 and no symlink
-/// check applies, because the caller chose the location explicitly — the
-/// backend still creates the leaf itself and sets it 0700.
+/// # Examples
+///
+/// ```rust
+/// use tinio_config::state::parse_state_dir;
+///
+/// assert_eq!(
+///     parse_state_dir(" /srv/tinio-state ")
+///         .expect("a path")
+///         .to_str(),
+///     Some("/srv/tinio-state")
+/// );
+/// ```
 pub fn parse_state_dir(raw: &str) -> Result<PathBuf, Error> {
     let path = raw.trim();
     if path.is_empty() {

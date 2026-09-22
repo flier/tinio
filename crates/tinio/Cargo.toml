@@ -6,16 +6,36 @@ description = "Tinio: an S3-compatible local storage server (facade crate with t
 
 [dependencies]
 tinio-api = { workspace = true, optional = true }
-tinio-cli.workspace = true
+tinio-cli = { workspace = true, default-features = false, features = ["sandbox"] }
 tinio-config.workspace = true
 tinio-core.workspace = true
 tinio-server.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
 [features]
-default = ["api", "mem", "multipart", "copy", "list-v1", "list-v2", "openapi", "tls"]
+default = [
+    "api",
+    "mem",
+    "multipart",
+    "copy",
+    "list-v1",
+    "list-v2",
+    "openapi",
+    "tls",
+    "sandbox",
+]
 api = ["dep:tinio-api", "tinio-server/api", "tinio-cli/api"]
+sandbox = ["tinio-cli/sandbox"]
 openapi = ["tinio-api/openapi"]
-tls = ["tinio-api/tls"]
+tls = ["tinio-api/tls", "tinio-cli/tls"]
 mem = ["tinio-cli/mem"]
 multipart = ["tinio-server/multipart"]
 copy = ["tinio-server/copy"]
@@ -27,4 +47,4 @@ otel = ["tinio-server/otel"]
 absolute_paths = "warn"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

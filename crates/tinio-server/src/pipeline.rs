@@ -1020,7 +1020,8 @@ mod tests {
     async fn shutdown_orders_io_before_db() {
         // The name overstates what is observable: the IO-before-DB order
         // itself is pinned by code inspection — `Pipelines::shutdown` and
-        // `Drop` (io first, db last) plus the serve.rs call site. What
+        // `Drop` (io first, db last) plus the one caller's call site
+        // (`tinio-cli`'s `commands/start.rs`). What
         // this test actually verifies: an in-flight task on EACH pipeline
         // completes after the ordered shutdown, a queued task drops (Q3),
         // and both pipelines reject new work afterwards (R5).

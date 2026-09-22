@@ -13,7 +13,9 @@ An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://
 | `tinio-mem` | In-memory reference backend (conformance oracle) |
 | `tinio-server` | The s3s data plane: routing, SigV4 auth, XML, error mapping, metrics |
 | `tinio-sandbox` / `-core` / `-linux` / `-macos` / `-windows` | Process confinement: the `Backend` contract, per-platform implementations, and a facade |
-| `tinio-api` / `tinio-cli` / `tinio-config` | Facade passthroughs, CLI, TOML config |
+| `tinio-api` | The management plane: the `state` file and single-instance bind, the local channel / named pipe / TCP transports, `/status`, `/stop`, `/metrics`, `/openapi.json` |
+| `tinio-cli` | The CLI: `server`/`start`, `status`, `stop`, `doctor`, and the `service` verbs that register the server with systemd, launchd or the SCM |
+| `tinio-config` | TOML configuration schema, discovery and auto-create, credentials, `.env` and the environment chain |
 | `tinio-e2e` | Cucumber BDD suites: in-process conformance, external-client interop |
 | `tinio-util` | Shared test harness (`testing` feature) |
 
@@ -21,21 +23,21 @@ Workspace docs: [`docs/`](docs) — cargo conventions, code style, test guide.
 
 ## Quickstart
 
-Run the `serve` example (defaults to the fs backend over one root directory, MinIO-convention credentials `minioadmin` / `minioadmin`):
+Start the server over a directory (the fs backend; the config is auto-created under `<root>/.tinio/` on first start with a generated credential pair):
 
 ```sh
-cargo run -p tinio-server --example serve -- ./root --port 9000
+cargo run -p tinio -- server ./root --port 9000
 ```
 
-Then point any S3 client at it:
+Then point any S3 client at it, reading the generated pair out of `<root>/.tinio/.tinio.toml`:
 
 ```sh
-export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+export AWS_ACCESS_KEY_ID=<access key> AWS_SECRET_ACCESS_KEY=<secret key>
 aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://demo
 aws --endpoint-url http://127.0.0.1:9000 s3 cp file.bin s3://demo/
 ```
 
-`serve` flags: `<root> [--port N] [--address HOST:PORT] [--config <config.toml>]`. The config toggles the `[s3]` capabilities (checksum, tagging, page-size caps, strippable feature groups).
+Lifecycle: `tinio status ./root`, `tinio stop ./root`, and `tinio service install ./root` to register the server with the platform's supervisor. Run `tinio --help` for the full surface; `[s3]`-section config toggles the capabilities (checksum, tagging, page-size caps, strippable feature groups).
 
 ## Testing
 

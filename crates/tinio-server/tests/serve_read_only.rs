@@ -1,16 +1,18 @@
-//! The `serve` example binary in read-only mode (FR-023).
+//! The `tinio` binary in read-only mode (FR-023).
 //!
 //! The coverage hole this closes: every other read-only test drives the
-//! data plane in process (`tests/read_only.rs`), and the only thing that
-//! spawns the example binary is the CI-only `@interop` cucumber harness
-//! (it needs aws-cli/rclone, so no local run reaches it) — `serve.rs`'s
-//! `main`, the mode resolution and the state-dir choice included, is
-//! executed by no local test. These legs spawn the real binary and observe
-//! it from outside: its stdout, its stderr, its exit status, and the S3
-//! answers on the wire.
+//! data plane in process (`tests/read_only.rs`), and the only other thing
+//! that spawns the binary is the CI-only `@interop` cucumber harness
+//! (it needs aws-cli/rclone, so no local run reaches it) — the CLI's
+//! `server` chain, the mode resolution and the state-dir choice included,
+//! is executed by no other local test. These legs spawn the real binary and
+//! observe it from outside: its stdout, its stderr, its exit status, and
+//! the S3 answers on the wire.
 //!
-//! Signing is mandatory. The example always configures the fixed
-//! `minioadmin` pair (`plane_for`), so an unsigned request is refused with
+//! Signing is mandatory. [`Serve::spawn`] hands the child the fixed
+//! `minioadmin` pair in `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY`, which the
+//! resolution folds onto `[auth]` and the identity-backed plane the default
+//! `caps.acl` selects reads, so an unsigned request is refused with
 //! `Signature is required` before it reaches the layer under test — an
 //! unsigned probe would answer the same thing whether or not the resolved
 //! mode was wired into the plane. Every request below carries a header-auth
@@ -32,7 +34,7 @@
 mod common;
 
 use std::{
-    env, fs,
+    fs,
     io::{BufRead, BufReader, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -42,52 +44,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+use assert_cmd::cargo::cargo_bin;
 use common::{Wire, plant, send};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tinio_config::{sources::READ_ONLY_VAR, state::STATE_DIR_VAR};
+use tinio_config::state::STATE_DIR_VAR;
 use tinio_core::acl::DEFAULT_ROOT_ACCESS_KEY;
 use tinio_util::testing::wait_timeout_secs;
 use tokio::time::sleep;
 
-/// The fixed credential pair the example always accepts: the access key is
-/// the core convention constant, the secret the literal
-/// `identity::root_auth_pair` falls back to with no `[auth]` section.
+/// The fixed credential pair [`Serve::spawn`] hands the child, and the pair
+/// every request below is signed with: the access key is the core
+/// convention constant, the secret the literal `identity::root_auth_pair`
+/// falls back to with no `[auth]` section.
+const ACCESS_KEY: &str = DEFAULT_ROOT_ACCESS_KEY;
 const SECRET_KEY: &str = "minioadmin";
 
-/// The `Host` every request carries and signs. The example binds
+/// The `Host` every request carries and signs. The server binds
 /// `127.0.0.1`, and s3s verifies the signature over the `Host` header the
 /// client sent — never against the bound address — so the value is the
 /// signer's to choose (`data.rs`'s acl test picks the same one).
 const HOST: &str = "localhost";
 
-/// The one line the example writes to stdout (the harness parses it).
+/// The one line the server writes to stdout (the harness parses it).
 const READY: &str = "listening on ";
-
-/// The serve example binary: cargo sets `CARGO_BIN_EXE_*` for bins only,
-/// never for examples, so it is resolved relative to this test binary's own
-/// location (`<target>/<profile>/deps/serve_read_only-<hash>` means the
-/// example sits in the sibling `examples/` dir of the same profile dir).
-/// The example must be built with the SAME profile as the test run — a
-/// profile mismatch looks in the wrong dir, or worse, finds a stale binary.
-fn serve_bin() -> PathBuf {
-    let name = format!("serve{}", env::consts::EXE_SUFFIX);
-    let exe = env::current_exe().expect("the test binary's own path");
-    let profile_dir = exe
-        .parent() // .../deps
-        .and_then(Path::parent) // .../<profile>
-        .expect("the test binary lives in <target>/<profile>/deps");
-    let bin = profile_dir.join("examples").join(name);
-    assert!(
-        bin.is_file(),
-        "the serve example binary is missing at {} — `cargo test --test serve_read_only` alone \
-         does not build examples, so build it first with the same profile as the tests \
-         (`cargo build -p tinio-server --example serve`; CI adds `--profile ci`)",
-        bin.display()
-    );
-    bin
-}
 
 /// How long a spawned child gets to reach readiness, or to exit — the knob
 /// and default [`tinio_util::testing::wait_for`] honours, read through its
@@ -120,8 +101,8 @@ fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
     })
 }
 
-/// A spawned `serve` child with both pipes drained. Killed and reaped when
-/// it drops (see the module doc for the ordering rationale).
+/// A spawned `tinio server` child with both pipes drained. Killed and reaped
+/// when it drops (see the module doc for the ordering rationale).
 struct Serve {
     child: Child,
     stdout: Lines,
@@ -131,8 +112,8 @@ struct Serve {
 }
 
 impl Serve {
-    /// Spawn the example serving `root` (always the first argument) with
-    /// `args` after it.
+    /// Spawn `tinio server <root>` (the root is always the first argument)
+    /// with `args` after it.
     ///
     /// The child inherits this process's environment, so the three
     /// variables that would silently change what it serves are removed
@@ -141,14 +122,32 @@ impl Serve {
     /// and `TINIO_SCANNER` (which would change what it scans) — and only
     /// then is the caller's `env` applied. The rationale is `clients.rs`'s
     /// `spawn_child`; each leg here sets exactly what it means to set.
+    ///
+    /// **The credential pair is the one thing the CLI needs that the
+    /// retired example did not.** The CLI reads `[auth]`, and a first start
+    /// *generates* a random pair into the config it creates, so every
+    /// request below — signed with the fixed pair — would be refused with
+    /// `SignatureDoesNotMatch`. `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are
+    /// the two names `contracts/config.md:110` lists (not the `MINIO_*`
+    /// names, which are the data plane's fallback and not this chain's),
+    /// and the resolution folds them onto `[auth]` before the plane is
+    /// built. The caller's `env` is applied after, so a leg could still
+    /// override them.
     fn spawn(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
-        let bin = serve_bin();
+        let bin = cargo_bin("tinio");
         let mut cmd = Command::new(&bin);
-        cmd.arg(root)
+        cmd.arg("server")
+            .arg(root)
             .args(args)
-            .env_remove(READ_ONLY_VAR)
+            // Spelled rather than imported, like the scanner and sandbox names beside them:
+            // these three are the CLI's own arguments now (`tinio_cli::cli`'s constants), and
+            // what is asserted here is what a *child* does with them.
+            .env_remove("TINIO_READ_ONLY")
             .env_remove(STATE_DIR_VAR)
-            .env_remove("TINIO_SCANNER");
+            .env_remove("TINIO_SCANNER")
+            .env_remove("TINIO_SANDBOX")
+            .env("TINIO_ACCESS_KEY", ACCESS_KEY)
+            .env("TINIO_SECRET_KEY", SECRET_KEY);
         for (name, value) in env {
             cmd.env(name, value);
         }
@@ -347,7 +346,7 @@ fn authorization(
     )
 }
 
-/// One signed request with the example's fixed credential pair — no
+/// One signed request with the harness's fixed credential pair — no
 /// unsigned request reaches the layer under test, see the module doc.
 async fn signed(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Wire {
     let now = OffsetDateTime::now_utc();
@@ -365,7 +364,7 @@ async fn signed(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Wire
     );
     let payload_hash = hex::encode(Sha256::digest(body));
     let auth = authorization(
-        DEFAULT_ROOT_ACCESS_KEY,
+        ACCESS_KEY,
         SECRET_KEY,
         method,
         path,
@@ -506,9 +505,13 @@ async fn the_read_only_flag_relocates_the_state_and_refuses_writes() {
         "hello",
         "the planted object's body must arrive intact"
     );
-    // The state really moved out of the root, into the dir the diagnostic
-    // names on stderr (stdout is the harness's readiness line alone).
-    let diagnostic = format!("read-only mode: state dir {}", state.display());
+    // The state really moved out of the root, and the summary the CLI
+    // prints on stderr says which mode it is serving in (stdout is the
+    // harness's readiness line alone). The needle is that summary's
+    // mode-and-credentials tail: the line's root is the *canonical* one and
+    // the canonical spelling is not this test's to spell, while the address
+    // is — `ready` parsed it off the same line.
+    let diagnostic = format!(" on {addr} (read-only; credentials ");
     let stderr = server.stderr_containing(&diagnostic).await;
     assert!(
         stderr.contains(&diagnostic),
@@ -575,7 +578,7 @@ async fn the_read_only_env_var_turns_read_only_on() {
     let mut server = Serve::spawn(
         &root,
         &["--port", "0"],
-        &[state_var(&state), (READ_ONLY_VAR, "1")],
+        &[state_var(&state), ("TINIO_READ_ONLY", "1")],
     );
     let addr = server.ready().await;
     assert_eq!(
@@ -598,7 +601,7 @@ async fn the_env_var_beats_the_config_file() {
     let mut server = Serve::spawn(
         &root,
         &["--port", "0", "--config", config.to_str().unwrap()],
-        &[state_var(&state), (READ_ONLY_VAR, "0")],
+        &[state_var(&state), ("TINIO_READ_ONLY", "0")],
     );
     let addr = server.ready().await;
     assert_eq!(
@@ -649,7 +652,7 @@ async fn the_read_only_flag_beats_the_env_var() {
     let mut server = Serve::spawn(
         &root,
         &["--port", "0", "--read-only"],
-        &[state_var(&state), (READ_ONLY_VAR, "0")],
+        &[state_var(&state), ("TINIO_READ_ONLY", "0")],
     );
     let addr = server.ready().await;
     assert_eq!(
@@ -661,12 +664,18 @@ async fn the_read_only_flag_beats_the_env_var() {
 }
 
 /// Case 5: `--read-only` never creates the root it was told to serve — a
-/// missing root fails the process instead. Both routes the example
-/// documents are driven: with no `TINIO_STATE_DIR` the derived
-/// `<home>/.tinio/roots/<hash>/` resolution fails (it canonicalizes the
-/// root before it touches the home, which is why that route cannot leave
-/// anything in the real home either), and with `TINIO_STATE_DIR` set the
-/// backend's own canonicalization fails.
+/// missing root fails the process instead. Both routes the CLI's chain can
+/// take are driven: the derived `<home>/.tinio/roots/<hash>/` layout, and
+/// an explicit `TINIO_STATE_DIR`.
+///
+/// **The two routes converge under the CLI, and the order is why.** The
+/// root is canonicalized *first* — before the mode and before the state dir
+/// is resolved at all — so a missing root fails the same way whichever
+/// state dir would have been used, naming the root it could not
+/// canonicalize. What the two routes assert together is the case's own
+/// point (a non-zero exit that leaves the missing root missing), and what
+/// route 2 adds is that nothing reached the state dir either: the run ended
+/// during resolution.
 #[tokio::test]
 async fn a_missing_root_is_not_created_in_read_only_mode() {
     let scratch = Scratch::new();
@@ -682,16 +691,20 @@ async fn a_missing_root_is_not_created_in_read_only_mode() {
         missing.display()
     );
 
-    // Route 2: an explicit `TINIO_STATE_DIR`. The resolution succeeds — its
-    // diagnostic names the scratch dir — and the backend's canonicalization
-    // of the root fails instead, as a bare `Io` error that carries no path,
-    // so the diagnostic is the evidence that this route got that far.
+    // Route 2: an explicit `TINIO_STATE_DIR`. The same failure, for the
+    // same reason — the exported variable never comes into it, because the
+    // root is resolved before the state dir is.
     let stderr = missing_root_fails("TINIO_STATE_DIR", &missing, &[state_var(&state)]).await;
-    let diagnostic = format!("read-only mode: state dir {}", state.display());
     assert!(
-        stderr.contains(&diagnostic),
-        "the explicit state dir is resolved before the root is opened, so stderr must carry \
-         `{diagnostic}`; got:\n{stderr}"
+        names_path(&stderr, &missing),
+        "the explicit state dir changes nothing about this failure: the root is canonicalized \
+         first, so it names the same missing root {}; stderr:\n{stderr}",
+        missing.display()
+    );
+    assert!(
+        !state.exists(),
+        "the run ended during resolution, so it never reached {}",
+        state.display()
     );
 }
 
@@ -714,6 +727,12 @@ async fn missing_root_fails(label: &str, missing: &Path, env: &[(&str, &str)]) -
 }
 
 /// Case 6: an unknown argument exits with status 2, the `usage()` path.
+///
+/// Under the CLI an unknown argument is clap's own usage error, mapped to
+/// `Error::Usage` and printed by the entry point as `tinio: <clap message>`
+/// — so the text this leg looks for is the `Usage: tinio server` line clap
+/// renders, which is the CLI's one author for that line, not the example's
+/// own `usage: serve`.
 #[tokio::test]
 async fn an_unknown_argument_exits_with_the_usage_status() {
     let scratch = Scratch::new();
@@ -728,7 +747,7 @@ async fn an_unknown_argument_exits_with_the_usage_status() {
         "an unknown argument must exit 2 (usage); stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("usage: serve"),
-        "the usage text must name the binary; stderr:\n{stderr}"
+        stderr.contains("Usage: tinio server"),
+        "the usage text must name the invocation; stderr:\n{stderr}"
     );
 }

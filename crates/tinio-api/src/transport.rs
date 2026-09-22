@@ -180,6 +180,10 @@ async fn serve_pipe(
                 tracing::debug!(error = %err, "management pipe connection ended");
             }
         });
+        // Reap what has already finished: a `JoinSet` holds a completed task until it is
+        // joined, so without this the set would keep one dead entry per connection served
+        // for the process's life — and every `status`/`stop` probe is a connection.
+        while connections.try_join_next().is_some() {}
     }
 
     // The drain: every connection already accepted runs to completion before this returns.
@@ -310,9 +314,6 @@ pub enum Transport {
         listener: TcpListener,
         /// The bound address.
         addr: SocketAddr,
-        /// The token rule: [`Auth::Loopback`] for a loopback bind, [`Auth::Tcp`] otherwise
-        /// (`Auth::for_bind`).
-        auth: Auth,
     },
     /// TCP HTTPS (feature `tls`).
     #[cfg(feature = "tls")]
@@ -325,9 +326,6 @@ pub enum Transport {
         cert: PathBuf,
         /// The PEM private key.
         key: PathBuf,
-        /// The token rule: [`Auth::Loopback`] for a loopback bind, [`Auth::Tcp`] otherwise
-        /// (`Auth::for_bind`).
-        auth: Auth,
     },
 }
 
@@ -413,11 +411,7 @@ pub fn select(selection: Selection) -> Result<Transport, Error> {
             // The bound address, not the requested one: `--port 0` and a wildcard bind both
             // change the answer, and the token rule follows what was actually bound.
             let addr = listener.local_addr().map_err(Error::Io)?;
-            Ok(Transport::Tcp {
-                listener,
-                addr,
-                auth: Auth::for_bind(addr),
-            })
+            Ok(Transport::Tcp { listener, addr })
         }
         (None, None, Some(options)) => {
             #[cfg(feature = "tls")]
@@ -430,7 +424,6 @@ pub fn select(selection: Selection) -> Result<Transport, Error> {
                     addr,
                     cert: options.cert,
                     key: options.key,
-                    auth: Auth::for_bind(addr),
                 })
             }
             #[cfg(not(feature = "tls"))]
@@ -462,7 +455,10 @@ fn more_than_one() -> Error {
 /// The absolute form of the local channel's socket path: an absolute path is used verbatim, a
 /// relative one joins `state_dir` (design decision 24). `state_dir` is absolute — the caller
 /// resolved it — so the answer is too, which is what `state.control_name` needs.
-fn resolve_socket_path(path: &Path, state_dir: &Path) -> PathBuf {
+///
+/// The CLI resolves its configured path through this too, rather than joining it itself: the
+/// rule has one owner, so the path recorded in `state.control_name` is the path bound.
+pub fn resolve_socket_path(path: &Path, state_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1271,6 +1267,7 @@ mod tests {
         process,
     };
 
+    use http::Method;
     use tempfile::TempDir;
     use tokio::sync::watch;
     #[cfg(unix)]
@@ -1293,7 +1290,7 @@ mod tests {
     fn get<'a>(target: &'a str, token: Option<&'a str>) -> client::Call<'a> {
         client::Call {
             target,
-            method: "GET",
+            method: Method::GET,
             token,
         }
     }

@@ -15,6 +15,7 @@ use cucumber::{
 };
 pub mod acl;
 pub mod buckets;
+pub mod cli;
 pub mod clients;
 pub mod common;
 pub mod conditions;
@@ -28,6 +29,7 @@ pub mod sigv4;
 
 use std::collections::HashMap;
 
+pub use cli::Cli;
 pub use clients::{External, SpawnedServer};
 pub use common::{Backend, Client, FsKind, LastResponse, Server};
 use cucumber::{
@@ -81,6 +83,12 @@ pub struct World {
     /// The captured (trimmed) client output, substituted for `{captured}`
     /// in later commands (the pagination continuation token).
     pub ext_captured: String,
+    /// The `@cli` scenarios' harness (cli.rs): the scratch root, the spawned
+    /// binary and the last run's captured streams. None for every other
+    /// scenario — those spawn the binary themselves and use neither the
+    /// in-process server nor the wire client, which is why the `#[before]`
+    /// hook leaves this world alone entirely.
+    pub cli: Option<Cli>,
 }
 
 /// Whether `tags` contains exactly `tag` — the scenario-classification
@@ -160,7 +168,7 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
 /// The `#[before]` hook: spawn the scenario's server and bind the client.
 ///
 /// The `@external` branch (`@interop`/`@boto3`/`@mc`): skip the in-process
-/// server, check the client binaries, and spawn the real `serve` example
+/// server, check the client binaries, and spawn the real `tinio server`
 /// binary instead — configured from the same `config_from_tags` mapping
 /// the in-process hook uses (clients.rs translates `Capabilities` into the
 /// `--config` file and `FsKind` into the `TINIO_SCANNER` toggle).
@@ -168,6 +176,10 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
 /// The `@read-only` branch (FR-023) spawns a read-only fs plane with its
 /// state in a scratch home ([`Server::read_only`]) — every mutating
 /// operation answers `AccessDenied`.
+///
+/// The `@cli` scenarios (cli.rs) take none of the three: they spawn the real
+/// binary and observe it from outside, so the hook spawns nothing and binds
+/// nothing — the world's harness is the scenario's own `Given a storage root`.
 fn before_hook<'a>(
     _feature: &'a Feature,
     _rule: Option<&'a gherkin::Rule>,
@@ -175,6 +187,9 @@ fn before_hook<'a>(
     world: &'a mut World,
 ) -> LocalBoxFuture<'a, ()> {
     Box::pin(async move {
+        if has_tag(&scenario.tags, "cli") {
+            return;
+        }
         let (backend, caps, fs_kind) = config_from_tags(&scenario.tags);
         let external = ["interop", "boto3", "mc"]
             .iter()
@@ -217,8 +232,10 @@ fn before_hook<'a>(
 }
 
 /// The `#[after]` hook: drop the server (sends the watch-channel
-/// shutdown; the spawned serve binary is killed synchronously). The world
-/// is `None` when the scenario never initialized it.
+/// shutdown; the spawned serve binary is killed synchronously), and end what
+/// the `@cli` scenarios spawned — killed and reaped, with a daemon the
+/// scenario left behind asked to stop, because no handle here reaches it
+/// (cli.rs). The world is `None` when the scenario never initialized it.
 fn after_hook<'a>(
     _feature: &'a Feature,
     _rule: Option<&'a gherkin::Rule>,
@@ -230,6 +247,9 @@ fn after_hook<'a>(
         if let Some(world) = world {
             world.ext.take();
             world.ext_second.take();
+            if let Some(mut cli) = world.cli.take() {
+                cli.teardown();
+            }
             world.server.take();
         }
     })

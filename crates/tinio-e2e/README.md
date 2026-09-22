@@ -12,7 +12,7 @@ dedicated test target cross-checks against the spec corpus (both directions).
 |---|---|
 | `tests/cucumber.rs` | The single cucumber test binary (`[[test]] cucumber`, `harness = false`): sets the default tag filter, picks the writers, `fail_on_skipped()`. |
 | `tests/features/` | The `.feature` files (specs, one per domain; `interop/` holds the external-client features). |
-| `tests/steps/` | The `World` + domain-organized step modules (`buckets`, `clients`, `common`, `conditions`, `errors`, `listing`, `multipart`, `objects`, `reserved_paths`) and the `#[before]`/`#[after]` hooks (the `metrics`/`tagging` scenarios ride the generic `common` request steps). |
+| `tests/steps/` | The `World` + domain-organized step modules (`buckets`, `cli`, `clients`, `common`, `conditions`, `errors`, `listing`, `multipart`, `objects`, `reserved_paths`) and the `#[before]`/`#[after]` hooks (the `metrics`/`tagging` scenarios ride the generic `common` request steps; `cli` spawns the real binary). |
 | `tests/traceability.rs` | The spec↔tag cross-check — a plain-harness test target, no cucumber involvement. |
 | `scripts/wsl-interop.sh` | One-command `@interop` run inside WSL2 (Linux-side aws-cli/rclone). |
 
@@ -52,6 +52,8 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@cold-listing` | scenario | fs scanner interval 100 ms (cold-listing scenarios). |
 | `@parquet` | scenario | Parquet input; needs `--features parquet` (the reader lives behind `tinio-server/select-parquet`) — excluded by the default filter when the feature is off. |
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
+| `@cli` | scenario | The CLI scenarios (`cli_lifecycle.feature`): they spawn the real `tinio` binary and observe it from outside, so the `#[before]` hook spawns nothing for them — no in-process server, no wire client. The binary must be built first (`cargo build -p tinio`); `{root}`/`{state}` in a step's command line expand to the scenario's scratch root and relocated state dir. |
+| `@unix` `@windows` | scenario | Platform-bound: the step definitions exist only on that platform, so the default filter excludes the other platform's tag (an undefined step is a failure under `fail_on_skipped()`). Today only the notify scenario carries one (`@unix`). |
 
 The **`@external` umbrella** is `@interop` ∪ `@boto3` ∪ `@mc`.
 
@@ -59,6 +61,7 @@ The **`@external` umbrella** is `@interop` ∪ `@boto3` ∪ `@mc`.
 
 ```
 cargo test -p tinio-e2e                          # in-process suite only (default)
+cargo test -p tinio-e2e --test cucumber -- --tags '@cli and not @unix and not @windows'  # the CLI process scenarios
 cargo test -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
 cargo test -p tinio-e2e --test cucumber -- --tags '@boto3'
 cargo test -p tinio-e2e --test cucumber -- --tags '@mc'
@@ -67,12 +70,16 @@ cargo test -p tinio-e2e --test traceability      # spec↔tag cross-check
 ```
 
 - **The default run excludes what this build cannot serve**: `cargo test -p tinio-e2e` without
-  `--tags` gets a runner-composed `CUCUMBER_FILTER_TAGS` from two independent axes — `@parquet`
-  is excluded unless the binary was built `--features parquet`, and the `@external` umbrella is
-  excluded unless `TINIO_E2E_EXTERNAL=1` is set.
-- **An explicit `--tags` replaces the default filter** — a tagged run must re-state both
-  exclusions. CI's mem pass does: `--tags 'not @fs and not @parquet and not @interop and not
-  @boto3 and not @mc'` with `TINIO_E2E_BACKEND=mem`.
+  `--tags` gets a runner-composed `CUCUMBER_FILTER_TAGS` from three independent axes — `@parquet`
+  is excluded unless the binary was built `--features parquet`, the other platform's tag
+  (`@unix` on Windows, `@windows` elsewhere) is excluded because those step definitions do not
+  exist here, and the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL=1` is set.
+- **An explicit `--tags` replaces the default filter** — a tagged run must re-state all three
+  exclusions. CI's mem pass does: `--tags 'not @fs and not @unix and not @windows and not
+  @parquet and not @interop and not @boto3 and not @mc'` with `TINIO_E2E_BACKEND=mem`.
+- **The `@cli` scenarios spawn the real binary**, so it has to be built before the run
+  (`cargo build -p tinio`) — `assert_cmd::cargo::cargo_bin` resolves `<profile>/tinio` beside the
+  test binary and builds nothing. Both CI e2e jobs build it first.
 - `--retry 1` retries failed scenarios once (the CI `@interop` run uses it to mitigate
   external-client flakes).
 - A filter that matches nothing (`--tags @nonexistent`) runs 0 scenarios and exits 0.

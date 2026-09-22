@@ -15,18 +15,22 @@ base64 = "0.23"
 bytes = "1"
 bzip2 = "0.6"
 cfg-if = "1"
+clap = "4.6"
 criterion = { version = "0.8", default-features = false }
 csv = "1.3"
 cucumber = "0.23"
+daemonize = "0.5"
 delegate = "0.13"
 derive_more = "2"
 dirs = "7"
 dotenvy = "0.15"
+either = "1"
 flate2 = "1.0"
 futures = "0.3"
 garde = "0.23"
 getrandom = "0.4"
 getset = "0.1"
+handlebars = "6"
 hex = "0.4"
 hmac = "0.13"
 http = "1"
@@ -56,12 +60,15 @@ rust_decimal = "1"
 rustix = "1.1"
 rustls-pemfile = "2.2"
 s3s = "0.16"
+sd-notify = "0.5"
 secrecy = "0.10"
+service-manager = { version = "0.11", default-features = false }
 serde = "1"
 serde_ignored = "0.1"
 serde_json = "1.0"
 sha1 = "0.11"
 sha2 = "0.11"
+signal-hook = "0.4"
 smart-default = "0.7"
 sqlparser = "0.63"
 sse-core = { version = "0.2", default-features = false }
@@ -89,6 +96,7 @@ utoipa = { version = "5.5", default-features = false, features = [
 ] }
 uuid = "1"
 winapi-util = "0.1"
+windows-service = "0.8"
 windows-sys = "0.61"
 
 tinio-api = { path = "crates/tinio-api", default-features = false }
@@ -107,6 +115,7 @@ tinio-select = { path = "crates/tinio-select" }
 tinio-server = { path = "crates/tinio-server", default-features = false }
 tinio-store = { path = "crates/tinio-store" }
 tinio-util = { path = "crates/tinio-util" }
+tinio-winsec = { path = "crates/tinio-winsec" }
 
 # CI compile profile: no debug info, wide codegen parallelism, no
 # incremental — the CI cargo runs below pass --profile ci. Local dev

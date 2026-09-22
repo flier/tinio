@@ -55,9 +55,10 @@ use crate::{
 };
 
 /// The write-lock distribution snapshot as **plain data** — the metric
-/// layer is decoupled from any backend's snapshot type: the wiring point
-/// (serve.rs) converts the tinio-fs `WriteLockSnapshot` into this
-/// value, so `tinio-server` never imports a backend crate. The bucket
+/// layer is decoupled from any backend's snapshot type: the caller
+/// converts the tinio-fs `WriteLockSnapshot` into this value
+/// (`tinio-cli`'s `commands/start.rs`), so `tinio-server` never imports a
+/// backend crate. The bucket
 /// bounds are the shared tinio-core constants (positional with the
 /// fs backend's bucketing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use http::Method;
 use http_body_util::BodyExt;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
@@ -45,24 +46,25 @@ use crate::{Error, router::StatusBody, state::State};
 /// # Examples
 ///
 /// ```rust
+/// use http::Method;
 /// use tinio_api::client::Call;
 ///
 /// // `None` is a real case and not a default: the local channel and a loopback bind serve
 /// // `/metrics` openly, because a Prometheus scrape cannot send a custom header.
 /// let scrape = Call {
 ///     target: "/metrics",
-///     method: "GET",
+///     method: Method::GET,
 ///     token: None,
 /// };
 /// assert_eq!(scrape.target, "/metrics");
 /// assert!(scrape.token.is_none());
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Call<'a> {
     /// The request target, e.g. `/status`.
     pub target: &'a str,
     /// The HTTP method (`GET`, `POST`).
-    pub method: &'a str,
+    pub method: Method,
     /// The token to present in `X-Tinio-Token`; `None` sends no such header.
     pub token: Option<&'a str>,
 }
@@ -152,7 +154,7 @@ fn control(state: &State) -> Result<Control, Error> {
 /// The call this module's three CLI-shaped entry points ([`probe`], [`status`], [`stop`]) make
 /// against `state`'s own channel: the target and method are the caller's, and the token is the
 /// one `state` carries, because that channel is the plane's own.
-fn call_for<'a>(state: &'a State, target: &'a str, method: &'a str) -> Call<'a> {
+fn call_for<'a>(state: &'a State, target: &'a str, method: Method) -> Call<'a> {
     Call {
         target,
         method,
@@ -193,7 +195,7 @@ fn call_for<'a>(state: &'a State, target: &'a str, method: &'a str) -> Call<'a> 
 /// # }
 /// ```
 pub async fn probe(state: &State) -> bool {
-    request(state, call_for(state, "/status", "GET"))
+    request(state, call_for(state, "/status", Method::GET))
         .await
         .is_ok()
 }
@@ -236,7 +238,7 @@ pub async fn status(state_dir: &Path) -> Result<Report, Error> {
             status: None,
         });
     };
-    match request(&state, call_for(&state, "/status", "GET")).await {
+    match request(&state, call_for(&state, "/status", Method::GET)).await {
         Ok(raw) if raw.status == 200 => {
             // The contract's body or nothing (R29). A `200` carrying something else came from a
             // server that is not this plane — a garbled answer is not a running *tinio* server
@@ -288,7 +290,7 @@ pub async fn stop(state_dir: &Path) -> Result<(), Error> {
             "no running server for this root".to_string(),
         ));
     };
-    let raw = request(&state, call_for(&state, "/stop", "POST")).await?;
+    let raw = request(&state, call_for(&state, "/stop", Method::POST)).await?;
     if raw.status == 202 {
         Ok(())
     } else {
@@ -309,6 +311,7 @@ pub async fn stop(state_dir: &Path) -> Result<(), Error> {
 /// ```no_run
 /// use std::path::Path;
 ///
+/// use http::Method;
 /// use tinio_api::client::{Call, get_local};
 ///
 /// # async fn run() -> Result<(), tinio_api::Error> {
@@ -317,7 +320,7 @@ pub async fn stop(state_dir: &Path) -> Result<(), Error> {
 ///     Path::new("/run/tinio/tinio-0123456789abcdef.sock"),
 ///     Call {
 ///         target: "/status",
-///         method: "GET",
+///         method: Method::GET,
 ///         token: Some("the token from `state`"),
 ///     },
 /// )
@@ -351,6 +354,7 @@ pub async fn get_local(path: &Path, call: Call<'_>) -> Result<RawResponse, Error
 /// # Examples
 ///
 /// ```no_run
+/// use http::Method;
 /// use tinio_api::client::{Call, get_http};
 ///
 /// # async fn run() -> Result<(), tinio_api::Error> {
@@ -359,7 +363,7 @@ pub async fn get_local(path: &Path, call: Call<'_>) -> Result<RawResponse, Error
 ///     addr,
 ///     Call {
 ///         target: "/metrics",
-///         method: "GET",
+///         method: Method::GET,
 ///         token: None,
 ///     },
 /// )
@@ -433,6 +437,7 @@ async fn request(state: &State, call: Call<'_>) -> Result<RawResponse, Error> {
 /// # Examples
 ///
 /// ```no_run
+/// use http::Method;
 /// use hyper_util::rt::TokioIo;
 /// use tinio_api::client::{Call, exchange};
 /// use tokio::net::TcpStream;
@@ -444,7 +449,7 @@ async fn request(state: &State, call: Call<'_>) -> Result<RawResponse, Error> {
 ///     TokioIo::new(stream),
 ///     Call {
 ///         target: "/status",
-///         method: "GET",
+///         method: Method::GET,
 ///         token: None,
 ///     },
 /// )

@@ -2,12 +2,15 @@
 //! `tests/features/`; step definitions live in `tests/steps/`.
 //!
 //! Default tag filter: scenarios that cannot pass in this build are excluded
-//! unless the user passes an explicit `--tags` on the CLI. The two exclusion
+//! unless the user passes an explicit `--tags` on the CLI. The three exclusion
 //! axes are independent: `@parquet` drops out unless the binary was compiled
 //! `--features parquet` (the parquet input reader lives behind
-//! `tinio-server/select-parquet`, off by default), and the external client
-//! tags (`@interop`/`@boto3`/`@mc`) drop out unless `TINIO_E2E_EXTERNAL=1` —
-//! the same "opt-in" semantics the old `#[ignore]` integration tests had.
+//! `tinio-server/select-parquet`, off by default); the platform-bound
+//! scenarios (`@unix`/`@windows`) drop out on the platform whose step
+//! definitions do not exist, because `fail_on_skipped()` would turn their
+//! undefined steps into a failure; and the external client tags
+//! (`@interop`/`@boto3`/`@mc`) drop out unless `TINIO_E2E_EXTERNAL=1` — the
+//! same "opt-in" semantics the old `#[ignore]` integration tests had.
 //!
 //! `TINIO_E2E_REPORT=<path>` additionally writes a Cucumber-JSON report
 //! to the given file (CI uses this for the PR test report).
@@ -42,14 +45,18 @@ fn main() {
     // read by cucumber's CLI parser when no --tags is given. SAFETY: no
     // threads exist yet; the runtime is built below.
     //
-    // Two independent axes: the cargo feature decides `@parquet` (without the
-    // reader compiled in, those scenarios can only 501), the env opt-in
-    // decides the external-client tags (they need third-party binaries).
+    // Three independent axes: the cargo feature decides `@parquet` (without the
+    // reader compiled in, those scenarios can only 501), the target platform
+    // decides `@unix`/`@windows` (each platform-bound scenario's steps exist
+    // only where it can run — the systemd notify socket is a unix datagram),
+    // and the env opt-in decides the external-client tags (they need
+    // third-party binaries).
     if !env::args().any(|a| a == "--tags") {
         let mut excluded = Vec::new();
         if !cfg!(feature = "parquet") {
             excluded.push("@parquet");
         }
+        excluded.push(if cfg!(windows) { "@unix" } else { "@windows" });
         if env::var_os("TINIO_E2E_EXTERNAL").is_none() {
             excluded.extend(["@interop", "@boto3", "@mc"]);
         }

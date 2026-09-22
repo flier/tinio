@@ -11,6 +11,9 @@
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
+#[cfg(windows)]
+#[doc(hidden)]
+pub extern crate tinio_winsec as _winsec;
 #[cfg(test)]
 extern crate tinio_util as _util;
 

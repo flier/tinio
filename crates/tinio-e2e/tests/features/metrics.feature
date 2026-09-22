@@ -9,11 +9,13 @@
 # a future fixture that adds one must stay free to pass.
 #
 # The scrape endpoint now lives on the management plane (tinio-api's
-# token-gated `/metrics`, contracts/management-api.md), so SC-008's
-# three-layer assertion (HTTP, S3 operations, storage) rides Task 10's
-# management-plane integration suite for now; the control-channel form of
-# this scenario returns with plan B's harness migration, which puts this
-# suite on the `tinio` binary instead of the `serve` example.
+# token-gated `/metrics`, contracts/management-api.md). SC-008's three-layer
+# assertion (HTTP, S3 operations, storage) is carried by
+# `crates/tinio-api/tests/management.rs` — the open form on the local
+# channel, the 404 without a gauge source, and the wrap-vs-scan counting —
+# and **not here**: plan B's harness migration moved this suite onto the
+# `tinio` binary, and the control-channel scrape did not come with it, so
+# this file keeps the interception's absence alone.
 @T075 @SC-008
 Feature: Metrics endpoint
 

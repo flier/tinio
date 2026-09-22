@@ -14,8 +14,9 @@
 
 ## Docs
 
+- Prose: `docs/compress.md` — intent only; caveman; code/commands/paths exact. New or rewritten `docs/*.md` must land compressed; do not re-inflate with implementation walkthroughs.
 - Cargo conventions: `docs/cargo.md`.
-- Code style: `docs/style.md` — garde, imports (3+ segments, enum variants, `tokio::fs`), Error, lib.rs, newtypes, derives (`parse-display`, `derive_more`), compressed prose.
+- Code style: `docs/style.md` — garde, imports (3+ segments, enum variants, `tokio::fs`), Error, lib.rs, newtypes, derives (`parse-display`, `derive_more`).
 - Tests: `docs/tests.md` — async harness, cucumber/e2e cargo+run, Gherkin, migration vs unit/conformance.
 - Specs & plans: `docs/superpowers/README.md` — one definer per cross-document fact, and the ownership check that runs before a phase closes.
 - Plans track their own progress: once a task is finished and its review passes, tick that task's `- [ ]` step boxes in its plan file. A step deliberately not run keeps its box unticked and carries a one-line note saying why — a ticked box means the step happened.

@@ -1,14 +1,16 @@
 //! Command-line interface for tinio.
 //!
-//! Implements the lifecycle commands — `server`/`start`, `status`, `stop`,
-//! `doctor` — with a Minio-style invocation (positional directory argument,
-//! default ports 9000/9001). The full `run()` entry point (clap argument
-//! parsing, command dispatch, global exit-code mapping) is implemented in
-//! US2 (task T066); the placeholder below exists so the facade binary in
-//! `crates/tinio` compiles from the workspace setup phase onward.
+//! The lifecycle commands — `server`/`start`, `status`, `stop`, `doctor` and `service` — with
+//! a Minio-style invocation (positional directory argument, default ports 9000/9001), the
+//! FR-016 four-level precedence chain, and the exit-code mapping 0/1/2.
 //!
-//! The command implementations land in `commands/` (start, status, stop,
-//! doctor).
+//! [`run()`] is the process entry point and the design's §1 sequence: the confinement payload is
+//! read before any parser sees argv, the command line is parsed **twice** (design decision 3:
+//! the discovery pass answers `DIR`, `--config`, the mode and `TINIO_STATE_DIR`; `<state dir>`
+//! `.env` is loaded; the second pass is the authoritative one, and the `ArgMatches` is what
+//! carries FR-016's provenance), the command is dispatched, and the process's **one** runtime is
+//! built last — after the fork and the confinement, because forking a multi-threaded process is
+//! the hazard that order exists to avoid.
 
 #[cfg(feature = "api")]
 #[doc(hidden)]
@@ -23,42 +25,31 @@ pub extern crate tinio_fs as _fs;
 #[doc(hidden)]
 pub extern crate tinio_mem as _mem;
 #[doc(hidden)]
+pub extern crate tinio_sandbox as _sandbox;
+#[doc(hidden)]
 pub extern crate tinio_server as _server;
 #[cfg(test)]
 extern crate tinio_util as _util;
 
+#[doc(inline)]
+pub use self::{error::Error, run::run};
+
+pub mod cli;
+pub mod commands;
+/// **`api`-only, like the flag it serves.** A build without the feature has no plane, so it has
+/// no `state` file to prove readiness on and no parent-side wait that could; `--daemon` is
+/// therefore not in that build's surface at all (clap answers an unknown argument), the same
+/// shape `--sandbox` takes when its own feature is off.
+#[cfg(feature = "api")]
+mod daemon;
 mod error;
-
-use std::process::ExitCode;
-
-pub use self::error::Error;
-
-/// Entry point for the `tinio` CLI.
-///
-/// Parses command-line arguments, dispatches to the requested command, and
-/// maps every outcome onto the documented exit codes (0 success, 1
-/// operational error, 2 usage error).
-///
-/// # Examples
-///
-/// ```no_run
-/// let _ = tinio_cli::run();
-/// ```
-///
-/// # Placeholder
-///
-/// Returns success without doing anything until task T066 implements the real
-/// argument parsing and command dispatch.
-pub fn run() -> ExitCode {
-    ExitCode::SUCCESS
-}
-
-#[cfg(test)]
-mod tests {
-    use std::process::ExitCode;
-
-    #[test]
-    fn placeholder_run_returns_success() {
-        assert_eq!(super::run(), ExitCode::SUCCESS);
-    }
-}
+/// systemd's notification protocol and the unit text that asks for it. `sd-notify` cannot
+/// link on a non-unix target (`std::os::unix::*`), so the whole module is the gate — there is
+/// no Windows stub.
+#[cfg(unix)]
+mod notify;
+pub mod resolve;
+mod run;
+pub mod sandbox;
+pub mod service;
+mod signal;
