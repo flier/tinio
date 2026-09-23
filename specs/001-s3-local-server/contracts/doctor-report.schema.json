@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tinio doctor --json report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["severity", "findings"],
+  "properties": {
+    "severity": { "enum": ["ok", "warn", "error"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["check", "severity", "detail"],
+        "properties": {
+          "check": { "type": "string" },
+          "severity": { "enum": ["ok", "warn", "error"] },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -187,8 +187,9 @@ const CLOSE_DRAIN: Duration = Duration::from_secs(3);
 
 /// Declares the Windows console handler and registers it.
 ///
-/// **One of this crate's two enumerated `#[allow(unsafe_code)]` sites** — the other is
-/// `daemon.rs`'s `set_launch_env` — and it holds both halves of the exception — the
+/// **One of this crate's three enumerated `#[allow(unsafe_code)]` sites** — the others are
+/// `daemon.rs`'s `set_launch_env` and `doctor.rs`'s `space` (the `GetDiskFreeSpaceExW` disk-space
+/// probe) — and it holds both halves of the exception — the
 /// `unsafe extern "system" fn` a console handler must be and the raw `windows-sys` registration
 /// call — in one item, which is why `crates/tinio-cli/Cargo.toml`'s `unsafe_code` is `deny`
 /// rather than `forbid` (design decision 20; the same shape `tinio-winsec`'s file DACLs and

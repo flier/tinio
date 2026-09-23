@@ -48,8 +48,11 @@ mod error;
 /// no Windows stub.
 #[cfg(unix)]
 mod notify;
+pub mod report;
 pub mod resolve;
 mod run;
 pub mod sandbox;
 pub mod service;
 mod signal;
+#[cfg(test)]
+pub(crate) mod test_support;

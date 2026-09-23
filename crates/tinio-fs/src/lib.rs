@@ -46,6 +46,7 @@ pub use self::{
     backend::{FsOptions, FsStorage, StagedBody},
     cleanup::FsCleanup,
     error::Error,
+    fsutil::is_symlink_or_reparse,
     listing::FsListing,
     path::state_dir,
     scanner::{ScanSummary, Scanner, ScannerOptions},

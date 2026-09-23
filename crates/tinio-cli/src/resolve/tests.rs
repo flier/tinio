@@ -1,14 +1,11 @@
 use super::*;
-
 #[cfg(feature = "api")]
 use crate::_api::{state as api_state, transport::LocalForm};
-use crate::{
-    cli::Discovery,
-    commands::{
-        doctor,
-        start::{api::local_form, api_options},
-    },
-};
+// V1: both items live behind the `api` feature (`commands/start/mod.rs` gates the module), so the
+// import is gated with them — the `--no-default-features` graph compiles without it.
+#[cfg(feature = "api")]
+use crate::commands::start::{api::local_form, api_options};
+use crate::{cli::Discovery, commands::doctor};
 
 fn cli_matches<const N: usize>(argv: [&str; N]) -> Result<clap::ArgMatches, crate::Error> {
     let argv: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
@@ -100,7 +97,6 @@ fn args_for_log_file(root: &Path, path: &str) -> start::Args {
         ..start::Args::for_test(root)
     }
 }
-
 
 #[test]
 fn an_explicit_directory_is_the_root() {
@@ -281,11 +277,10 @@ fn the_candidates_lead_with_the_state_dir_the_chain_resolved() {
     // Read-only with the variable set: the resolved dir already *is* the variable, and the
     // pair must not collapse onto it — `<root>/.tinio` is what a reader probes second, or
     // the read-write server a read-only client is looking for is unreachable.
-    let candidates =
-        state_dir_candidates(&root, &relocated, true, Some(relocated.clone()), || {
-            Ok(dir.path().join("never"))
-        })
-        .expect("candidates");
+    let candidates = state_dir_candidates(&root, &relocated, true, Some(relocated.clone()), || {
+        Ok(dir.path().join("never"))
+    })
+    .expect("candidates");
     assert_eq!(candidates, vec![relocated.clone(), root.join(".tinio")]);
     assert_ne!(
         candidates[0], candidates[1],

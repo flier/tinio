@@ -11,7 +11,9 @@ either.workspace = true
 futures.workspace = true
 handlebars = { workspace = true, optional = true }
 hex.workspace = true
-serde = { workspace = true, optional = true, features = ["derive"] }
+parse-display.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 service-manager.workspace = true
 sha2.workspace = true
 smart-default.workspace = true
@@ -41,7 +43,7 @@ tinio-util = { workspace = true, features = ["testing"] }
 
 [target.'cfg(unix)'.dependencies]
 daemonize.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "fs"] }
 sd-notify.workspace = true
 signal-hook = { workspace = true, features = ["iterator"] }
 
@@ -49,13 +51,14 @@ signal-hook = { workspace = true, features = ["iterator"] }
 windows-service.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Threading",
 ] }
 
 [features]
 default = ["api", "mem", "sandbox"]
-api = ["dep:handlebars", "dep:serde", "dep:tinio-api"]
+api = ["dep:handlebars", "dep:tinio-api"]
 mem = ["dep:tinio-mem"]
 sandbox = []
 tls = ["api", "tinio-api/tls"]

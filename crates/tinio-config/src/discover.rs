@@ -222,10 +222,9 @@ mod tests {
     use secrecy::ExposeSecret;
     use tempfile::TempDir;
 
+    use super::*;
     #[cfg(windows)]
     use crate::_winsec::acl_is_current_user_only;
-
-    use super::*;
 
     /// Seeds `<dir>/<rel>`, parents included, and returns the path.
     fn seeded(dir: &Path, rel: &str) -> PathBuf {

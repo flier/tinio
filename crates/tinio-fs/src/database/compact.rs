@@ -22,7 +22,7 @@ pub struct Stats {
 /// Whether the database should be compacted: the fragmentation ratio
 /// `fragmented / allocated` reaches `threshold_percent` (%), but never
 /// below the 64 MiB floor (a small database gains nothing from a rewrite).
-pub(crate) fn needs_compact(stats: &Stats, threshold_percent: u8) -> bool {
+pub fn needs_compact(stats: &Stats, threshold_percent: u8) -> bool {
     if stats.allocated_bytes < MIN_ALLOCATED {
         return false;
     }

@@ -34,7 +34,7 @@ mod tables;
 #[cfg(test)]
 mod tests;
 
-pub use compact::{Compaction, Stats, compact_if_needed};
+pub use compact::{Compaction, Stats, compact_if_needed, needs_compact};
 pub use error::Error;
 pub use handle::{Handle, WriteLockSnapshot};
 pub use open::{Integrity, Open, check_integrity, open};

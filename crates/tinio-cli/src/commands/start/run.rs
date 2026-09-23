@@ -1,10 +1,10 @@
 //! §1's pre-runtime half: steps a–j, resolve through the control-channel bind.
 
+use std::fs;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::ExitCode;
 #[cfg(feature = "api")]
 use std::sync::Arc;
-use std::fs;
 
 use tracing::subscriber::set_global_default;
 
@@ -26,6 +26,7 @@ use crate::{
     _config::{
         Config,
         log::{AccessFormat, Format, Verbosity},
+        state::prepare_home_derived,
     },
     _fs::FsStorage,
     _sandbox::Adopted,
@@ -124,7 +125,10 @@ pub fn run(
     // control channel both bind below — and the storage opens under the root, so a missing state
     // dir is refused here rather than surfacing as an unresolved-path failure later. Read-only
     // mode creates the state dir and never the root: creating the root would write the one thing
-    // the mode promises to leave alone.
+    // the mode promises to leave alone. When the served dir is the home-derived leaf, harden
+    // `<home>/.tinio`/`roots` first: resolve left them unmade so clients create nothing, and a
+    // bare `create_dir_all` would inherit the umask and follow a planted symlink.
+    prepare_home_derived(&resolution.root, &resolution.state_dir)?;
     fs::create_dir_all(&resolution.state_dir)?;
     if !resolution.read_only {
         fs::create_dir_all(&resolution.root)?;

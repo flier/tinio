@@ -6,10 +6,11 @@
 //! gated (`cli::Command`'s doc states the rule). Each module owns its own resolution through
 //! `resolve`, so no command re-derives a root, a mode or a state directory.
 //!
-//! **The two client commands share one resolution and one probe** (`client_target`,
-//! `probe_pair` — both `pub(crate)`): decision 19's rule is that a client looks where the server would leave its
-//! state *and* at the other candidate, so a second implementation of either half is exactly the
-//! drift the rule exists to prevent.
+//! **The two client commands share one resolution and one probe** (`client_resolution` — the
+//! gate-independent body `status`, `stop`, `doctor` and the unit fixture all call — and
+//! `probe_pair`, the probe that follows it): decision 19's rule is that a client looks where the
+//! server would leave its state *and* at the other candidate, so a second implementation of
+//! either half is exactly the drift the rule exists to prevent.
 
 pub mod doctor;
 pub mod start;
@@ -22,11 +23,11 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{ArgAction, Args};
 
-use crate::_config::state::parse_state_dir;
-
 #[cfg(feature = "api")]
+use crate::_api::client::{self, Report};
+use crate::_config::state::parse_state_dir;
+#[cfg(any(feature = "api", test))]
 use crate::{
-    _api::client::{self, Report},
     _config::state,
     Error,
     resolve::{self, Located, Resolution},
@@ -161,7 +162,8 @@ pub(crate) fn readiness_line(address: SocketAddr) -> String {
 }
 
 /// The root, the mode and the ordered state-dir candidates a client command probes — resolved
-/// **once**, for `status`, `stop` and (through the same chain) plan C's `doctor`.
+/// **once**, for `status`, `stop` and (through the same chain) plan C's `doctor`, and reached
+/// directly by the unit fixture too, so the command and the fixture cannot drift.
 ///
 /// The chain is `resolve::for_doctor`, on the [`Located`] `lib.rs` resolved — the **client-side**
 /// resolution, not the server's:
@@ -177,17 +179,22 @@ pub(crate) fn readiness_line(address: SocketAddr) -> String {
 /// home-derived candidate whenever it is set. **The override is the discovery parse's**, taken
 /// off [`Located`] rather than read here: the file its own directory holds was located from that
 /// value, and a second read could answer differently (the `.env` load happens between the two
-/// parses). `default_home_state_dir` is passed as a closure because it *creates* what it
-/// derives: an exported variable must reach this function without a home directory being touched
-/// at all (the reason `state_dir_candidates` takes the derivation lazily).
+/// parses). `default_home_state_dir_path` is the **non-creating** form of the derivation: a
+/// client asks whether a server is there, so it must not create the home tree it is asking about
+/// — and the lazy closure is what keeps an exported `TINIO_STATE_DIR` from touching the home at
+/// all (`state_dir_candidates` takes the derivation lazily for exactly that reason).
+///
+/// The gate is `any(feature = "api", test)`: no-api builds have no client command to resolve for,
+/// but the `test` graph's fixture does, and the lib target of a no-api check would otherwise see
+/// the function as dead code under `-D warnings`.
 ///
 /// # Errors
 ///
 /// A root that does not exist or cannot be canonicalized (exit 2, the one usage error this path
 /// has), a `TINIO_STATE_DIR` that is set but empty (the parse refuses it, exit 2 as well), and a
 /// state dir that cannot be derived in read-only mode with no home to derive it from.
-#[cfg(feature = "api")]
-pub(crate) fn client_target(
+#[cfg(any(feature = "api", test))]
+pub(crate) fn client_resolution(
     args: DirArgs,
     located: Located,
 ) -> Result<(Resolution, Vec<PathBuf>), Error> {
@@ -200,7 +207,7 @@ pub(crate) fn client_target(
         &resolution.state_dir,
         resolution.read_only,
         override_dir,
-        || Ok(state::default_home_state_dir(&resolution.root)?),
+        || Ok(state::default_home_state_dir_path(&resolution.root)?),
     )?;
     Ok((resolution, candidates))
 }
@@ -241,7 +248,7 @@ impl Answer {
 /// # Errors
 ///
 /// An unreadable `state` file, on any candidate, is the one failure a probe can have
-/// (`contracts/cli.md:58`: a missing file and a failed probe are both "stopped", an unreadable
+/// (the `status` section's stopped/unreadable rule: a missing file and a failed probe are both "stopped", an unreadable
 /// one is an error). It is reported rather than skipped: a file this tool wrote and cannot read
 /// is the operator's finding, not something to paper over by answering from the other candidate.
 #[cfg(feature = "api")]

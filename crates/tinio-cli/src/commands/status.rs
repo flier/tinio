@@ -1,6 +1,6 @@
 //! `tinio status` — the thin client that reports whether a server is running for a root.
 //!
-//! Everything here is plan A's `client::status` over the two candidates `client_target` and
+//! Everything here is plan A's `client::status` over the two candidates `client_resolution` and
 //! `probe_pair` resolve (decision 19): this module renders what it is told and decides no
 //! state directory of its own. **Nothing is created and nothing is deleted**: the root and its
 //! configuration are reached through the chain that *reads* a configuration rather than writing
@@ -19,7 +19,7 @@ use handlebars::{Handlebars, no_escape};
 use serde::Serialize;
 
 pub use super::DirArgs as Args;
-use super::{Answer, client_target, probe_pair};
+use super::{Answer, client_resolution, probe_pair};
 use crate::{
     Error,
     resolve::{Located, Resolution, authority},
@@ -75,7 +75,7 @@ const TEMPLATE: &str = include_str!("status.hbs");
 /// once by `lib.rs` for this command and the server alike — and `args` is the **authoritative**
 /// parse's, so a credential pair `.env` supplied is folded exactly as the server folds it.
 pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
-    let (resolution, candidates) = client_target(args, located)?;
+    let (resolution, candidates) = client_resolution(args, located)?;
     let answer = probe_pair(&candidates).await?;
     println!("{}", render(&answer, &resolution)?);
     Ok(if answer.running() {

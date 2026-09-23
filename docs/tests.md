@@ -46,7 +46,7 @@ cargo test -p tinio-e2e --test traceability
 
 `--features` = `test-parquet` Rust; features job = cargo-hack check (`--no-dev-deps`).
 
-**Known red (2026-09-20)**: `cargo hack --each-feature --all-features` fails — `otel` `opentelemetry` 0.33 vs `tracing-opentelemetry` needs 0.32. Predates CLI (`2bfce2f`); fix = `otel` deps.
+**Otel alignment (fixed 2026-09-23)**: the `opentelemetry`/`tracing-opentelemetry` mismatch recorded here on 2026-09-20 is gone — the family is pinned together (`opentelemetry*` 0.32 with `tracing-opentelemetry` 0.33, whose own manifest requires it), so `cargo hack check --each-feature --no-dev-deps` passes for `tinio` and `tinio-server`. (`--each-feature --all-features` is not a cargo-hack combination.)
 
 ### CI-only legs
 
@@ -118,7 +118,19 @@ Gate e2e = fs/mem/`@parquet`/traceability. `@boto3`/`@mc` need `TINIO_E2E_EXTERN
 
 - Process legs = cucumber `@cli` (`cli_lifecycle.feature` / `steps/cli.rs`); need `cargo build -p tinio` first. Assert readiness, FR-016 L2/L3, daemon, notify, status/stop/state-dir, sandbox refuse.
 - Stays Rust — `crates/tinio/tests/lifecycle.rs`: Windows console leg only (unsafe). Assert drain, not exit code.
-- Elsewhere: startup repair; service pure halves; doctor (T057); `serve_read_only.rs`.
+- Doctor (T057) — `crates/tinio/tests/doctor.rs`, `cargo test -p tinio --test doctor`:
+  - store-less root → 0, meta + private-state rows `ok`, no `meta.redb` created (plain and `--dry-run`).
+  - stale `state` file (`Stopped`) and stale unix socket → warn; `--fix` reclaims both.
+  - stale-socket reclaim follows recorded `control_name`, never re-derived `socket_path` (`[api.unix] path` shape).
+  - `NoStateFile` still probes derived socket name; `Unreadable` → warn `not inspected`, `--fix` clears.
+  - live server → state row `ok`; `--fix` refuses (error finding, parseable `--json`).
+  - orphaned `OBJECT_META` row, bucket-orphaned multipart subtree, stale `BUCKETS` record → information plain, finding `--dry-run`, gone after `--fix`, `object.txt` intact.
+  - `meta.redb` integrity + fragmentation; `compact_needed` → warn, `--fix` compacts; unopenable store → error finding with the report intact.
+  - `--json` on each leg = `contracts/doctor-report.schema.json` key sets; `state` token in neither stream.
+  - `--read-only` diagnoses the relocated state dir; `--fix` on a store-less root creates the store; `--fix --read-only` repairs the relocated dir and leaves the root alone.
+  - `--fix` reports `home root-state dirs … not repaired … T144`; a plain run does not.
+  - `tokio` dev-dep + `#[tokio::test]`: the store-seeding legs drive async `tinio_fs` store constructors; `Runtime::block_on` is banned.
+- Elsewhere: startup repair; service pure halves; `serve_read_only.rs`.
 
 ## Service verbs (manual)
 

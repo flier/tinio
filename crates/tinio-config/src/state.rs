@@ -14,8 +14,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::_core::object::RESERVED_SEGMENT;
-use crate::{Error, error};
+use crate::{_core::object::RESERVED_SEGMENT, Error, error};
 
 /// Length of the derived directory name, in hexadecimal characters.
 const HASH_LEN: usize = 16;
@@ -37,16 +36,83 @@ const ROOTS_DIR_NAME: &str = "roots";
 /// the leaf is left to the backend, which creates it 0700 already
 /// (`tinio-fs`'s state-database open).
 pub fn home_state_dir(root: &Path, home: &Path) -> Result<PathBuf, Error> {
-    let canonical = root.canonicalize().map_err(|e| error::root(root, e))?;
-    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-    let name = &hex::encode(digest)[..HASH_LEN];
+    let name = derived_name(root)?;
     Ok(ensure_roots(home)?.join(name))
 }
 
-/// [`home_state_dir`] over the real home directory.
+/// [`home_state_dir`] over the real home directory — the creating form's public entry, part of
+/// the resolver interface the read-only design settles (`2026-09-18-read-only-mode-design.md`
+/// decision 16 and its interface list).
+///
+/// **No CLI path calls it**, and that is deliberate rather than dead: a client command resolves
+/// the *non-creating* [`home_state_dir_path`] (a probe must not mint the tree it is asking
+/// about), and a command that goes on to write the leaf hardens it through
+/// [`prepare_home_derived`] before its own `create_dir_all`. This is the form for a caller that
+/// wants the deriving **and** the creation in one step.
 pub fn default_home_state_dir(root: &Path) -> Result<PathBuf, Error> {
     let home = dirs::home_dir().ok_or_else(|| Error::Missing("home directory".into()))?;
     home_state_dir(root, &home)
+}
+
+/// [`home_state_dir`]'s path **without its filesystem side effects**: the same canonicalization
+/// and the same `<home>/.tinio/roots/<sha256(canonical root)16>/` computation, with nothing
+/// created, validated or chmodded.
+///
+/// A **client** command derives this candidate only to look for a server that might be there —
+/// `status`, `stop` and `doctor` must not create the home tree they are merely asking about — so
+/// the deriving half is split from `ensure_roots`. A **serving** command still resolves through
+/// [`home_state_dir`], whose creation is a write it is about to make anyway.
+pub fn home_state_dir_path(root: &Path, home: &Path) -> Result<PathBuf, Error> {
+    let name = derived_name(root)?;
+    Ok(roots_dir(home).1.join(name))
+}
+
+/// The two levels of the home layout, `(<home>/.tinio, <home>/.tinio/roots)`: the one composition
+/// [`home_state_dir_path`] and [`ensure_roots`] share, so the creating and the non-creating form
+/// cannot end up pointing at different trees.
+fn roots_dir(home: &Path) -> (PathBuf, PathBuf) {
+    let base = home.join(BASE_DIR_NAME);
+    let roots = base.join(ROOTS_DIR_NAME);
+    (base, roots)
+}
+
+/// [`home_state_dir_path`] over the real home directory.
+pub fn default_home_state_dir_path(root: &Path) -> Result<PathBuf, Error> {
+    let home = dirs::home_dir().ok_or_else(|| Error::Missing("home directory".into()))?;
+    home_state_dir_path(root, &home)
+}
+
+/// If `state_dir` is this root's home-derived leaf, create and harden `<home>/.tinio` and
+/// `roots` (0700 on unix, refuse symlinks). No-op for any other path — reserved `.tinio`, an
+/// explicit `TINIO_STATE_DIR`, etc.
+///
+/// Clients resolve through [`home_state_dir_path`] so a probe creates nothing. Serving and
+/// `--fix` still `create_dir_all` the leaf; without this call the parents inherit the umask and
+/// follow a planted symlink. Call it once, immediately before that create.
+pub fn prepare_home_derived(root: &Path, state_dir: &Path) -> Result<(), Error> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    prepare_home_derived_in(root, state_dir, &home)
+}
+
+/// [`prepare_home_derived`] with an explicit home — the tests below pin a scratch home so they
+/// never touch the developer's; production goes through [`prepare_home_derived`], which is why
+/// this is private rather than a second public entry point.
+fn prepare_home_derived_in(root: &Path, state_dir: &Path, home: &Path) -> Result<(), Error> {
+    if state_dir != home_state_dir_path(root, home)? {
+        return Ok(());
+    }
+    let _ = ensure_roots(home)?;
+    Ok(())
+}
+
+/// The per-root leaf name (`<sha256(canonical root)16>`), the one computation [`home_state_dir`]
+/// and [`home_state_dir_path`] share so the creating and the non-creating form cannot disagree.
+fn derived_name(root: &Path) -> Result<String, Error> {
+    let canonical = root.canonicalize().map_err(|e| error::root(root, e))?;
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    Ok(hex::encode(digest)[..HASH_LEN].to_string())
 }
 
 /// The environment variable that overrides the derived state dir (FR-023).
@@ -59,8 +125,10 @@ pub fn default_home_state_dir(root: &Path) -> Result<PathBuf, Error> {
 /// What the variable means is the contract's (`contracts/config.md`'s read-only section): an
 /// explicit state dir used verbatim instead of the `~/.tinio/roots/<hash>/` derivation — the
 /// escape hatch for the environments read-only mode is actually for (service accounts,
-/// containers, immutable images) where the home may be absent or unwritable, and where
-/// [`default_home_state_dir`] would otherwise fail startup outright. **It is consulted in both
+/// containers, immutable images) where the home may be absent or unwritable, and where the
+/// home-derived state dir cannot be created at all — [`prepare_home_derived`], which is what a
+/// serving or `--fix` run calls before its own `create_dir_all`, or [`default_home_state_dir`],
+/// which derives and creates in one step. **It is consulted in both
 /// modes, and what it moves differs between them.** A read-only run's served state dir *is*
 /// this value when it is set, and the pair such a client probes is `[this value, <root>/.tinio]`,
 /// so the home-derived candidate is never derived there at all. A read-write run's served dir
@@ -128,8 +196,7 @@ fn refuse_symlink(dir: &Path) -> Result<(), Error> {
 /// than a directory — a regular file left where the layout needs a
 /// directory — is an error, not a tolerated `AlreadyExists`.
 fn ensure_roots(home: &Path) -> Result<PathBuf, Error> {
-    let base = home.join(BASE_DIR_NAME);
-    let roots = base.join(ROOTS_DIR_NAME);
+    let (base, roots) = roots_dir(home);
     for dir in [&base, &roots] {
         refuse_symlink(dir)?;
         // A concurrent instance may create the same directory between the
@@ -291,6 +358,61 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         symlink(elsewhere.path(), home.path().join(".tinio")).unwrap();
         let err = home_state_dir(root.path(), home.path()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn the_non_creating_form_computes_the_same_path_and_creates_nothing() {
+        // A client derives the alternate candidate only to look: `status`, `stop` and `doctor`
+        // must not create `<home>/.tinio/roots/` merely by being run.
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let quiet = home_state_dir_path(root.path(), home.path()).unwrap();
+        assert!(
+            !home.path().join(".tinio").exists(),
+            "the deriving form must not create the home tree"
+        );
+        let loud = home_state_dir(root.path(), home.path()).unwrap();
+        assert_eq!(quiet, loud, "the two forms compute one path");
+        assert!(home.path().join(".tinio/roots").is_dir());
+    }
+
+    #[test]
+    fn prepare_home_derived_hardens_only_the_home_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let reserved = root.path().join(".tinio");
+        prepare_home_derived_in(root.path(), &reserved, home.path()).unwrap();
+        assert!(
+            !home.path().join(".tinio").exists(),
+            "a non-home leaf must not mint the home tree"
+        );
+        let derived = home_state_dir_path(root.path(), home.path()).unwrap();
+        prepare_home_derived_in(root.path(), &derived, home.path()).unwrap();
+        assert!(
+            home.path().join(".tinio/roots").is_dir(),
+            "the home leaf's parents must exist after prepare"
+        );
+        assert_eq!(
+            derived,
+            home.path()
+                .join(".tinio")
+                .join("roots")
+                .join(derived.file_name().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_home_derived_refuses_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        symlink(elsewhere.path(), home.path().join(".tinio")).unwrap();
+        let derived = home_state_dir_path(root.path(), home.path()).unwrap();
+        let err = prepare_home_derived_in(root.path(), &derived, home.path()).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
     }
 

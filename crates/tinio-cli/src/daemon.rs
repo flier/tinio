@@ -5,12 +5,6 @@
 //! channel + a launch token (so a concurrent or leftover instance cannot be mistaken for
 //! this run). `api`-only: no plane means no readiness proof, so the flag is compiled out.
 
-#[cfg(windows)]
-use std::{
-    fs::OpenOptions,
-    os::windows::process::CommandExt,
-    process::{Command, Stdio},
-};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -22,6 +16,12 @@ use std::{
 };
 #[cfg(unix)]
 use std::{fs::OpenOptions, os::unix::net::UnixStream};
+#[cfg(windows)]
+use std::{
+    fs::OpenOptions,
+    os::windows::process::CommandExt,
+    process::{Command, Stdio},
+};
 
 #[cfg(unix)]
 use daemonize::{Daemonize, Outcome};

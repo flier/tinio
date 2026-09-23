@@ -231,7 +231,13 @@ pub fn level_for(user: bool) -> ServiceLevel {
 /// let read_only = server_argv(Path::new("/srv/data"), true, Path::new("/var/lib/tinio"));
 /// assert_eq!(
 ///     read_only,
-///     ["server", "/srv/data", "--read-only", "--state-dir", "/var/lib/tinio"]
+///     [
+///         "server",
+///         "/srv/data",
+///         "--read-only",
+///         "--state-dir",
+///         "/var/lib/tinio"
+///     ]
 /// );
 /// ```
 pub fn server_argv(root: &Path, read_only: bool, state_dir: &Path) -> Vec<OsString> {

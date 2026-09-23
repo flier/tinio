@@ -9,6 +9,7 @@ publish = false
 bytes.workspace = true
 futures.workspace = true
 papaya.workspace = true
+serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
 tinio-core = { workspace = true, optional = true }
@@ -22,7 +23,7 @@ tokio = { workspace = true, features = [
 ] }
 
 [features]
-testing = ["dep:tinio-core", "tokio/time"]
+testing = ["dep:tinio-core", "dep:serde_json", "tokio/time"]
 
 [lints.clippy]
 absolute_paths = "warn"

@@ -37,10 +37,7 @@ use crate::{
         log::{self, Format},
         server, storage,
     },
-    _core::{
-        mode::AccessMode,
-        pipeline::InlineRunner,
-    },
+    _core::{mode::AccessMode, pipeline::InlineRunner},
     _fs::{Error as FsError, FsOptions, etag},
     _server::{identity, pipeline::Pipelines as ServerPipelines},
     Error,
@@ -50,12 +47,12 @@ use crate::{
 
 mod locate;
 
+use locate::chain;
+pub(crate) use locate::current_dir;
 pub use locate::{
     Located, apply_env_file, config_path, locate, pick, resolve_mode, resolve_root,
     resolve_state_dir, state_dir_candidates,
 };
-pub(crate) use locate::current_dir;
-use locate::chain;
 
 /// `[server] port`'s default — Minio's own (`contracts/cli.md:36`), and the port an
 /// `--address` without one gets. Read from the schema, which is the value's one definer, so the
@@ -79,14 +76,13 @@ fn default_port() -> u16 {
 /// ```
 pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(), FsError>>;
 
-
 /// The resolved root, config, mode and state dir — every command's starting point.
 ///
 /// `config_error` is the load outcome beside the parsed config: `None` for a config that
 /// loaded, `Some(message)` when it did not — in which case `config` is `Config::default()` and
 /// the message is what the operator is shown. It exists because "the configuration does not
 /// parse" is one of `doctor`'s findings, and a `Resolution` that could only be built for a
-/// valid config would put that check out of reach; [`server`] propagates the failure instead,
+/// valid config would put that check out of reach; [`server()`] propagates the failure instead,
 /// because a server must not run on a config it could not read.
 ///
 /// # Examples
@@ -173,7 +169,7 @@ pub(crate) fn bind_addr(key: &str, host: &str, port: u16) -> Result<SocketAddr, 
 }
 
 /// A `host:port` authority — an IPv6 literal needs its brackets back before it is one. The one
-/// spelling of that rule, for both sides of it: [`bind_addr`] parses it, `status`'s report
+/// spelling of that rule, for both sides of it: `bind_addr` parses it, `status`'s report
 /// prints it.
 pub fn authority(host: &str, port: u16) -> String {
     if host.contains(':') {
@@ -357,7 +353,7 @@ pub fn server(
 }
 
 /// The same chain for the commands that never launch a server — plan C's `doctor` and, through
-/// `commands::client_target`, `status` and `stop` — so decision 19's client-side
+/// `commands::client_resolution`, `status` and `stop` — so decision 19's client-side
 /// resolution is one implementation and not three.
 ///
 /// Three differences, all in the arguments to the shared order: [`Located::config`] is `None`
@@ -622,7 +618,6 @@ fn fold_flags(
     // authoritative parse's — `.env`'s included.
     fold_credentials(&args.env, &mut resolution.config)
 }
-
 
 /// The one `Resolution` → `FsOptions` mapping in this CLI, so a resolved root becomes an
 /// `FsStorage` by the same code whichever command asks.

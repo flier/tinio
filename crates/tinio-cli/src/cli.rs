@@ -289,20 +289,16 @@ pub fn parse(argv: &[OsString]) -> Result<(Cli, ArgMatches), Error> {
 
 /// What the user asked for.
 ///
-/// **`Status` and `Stop` are compiled out with the `api` feature**
-/// (`contracts/cli.md:60,70`: "present only in builds with the `api` cargo feature";
-/// T055 asserts the same), so their variants sit behind `#[cfg(feature = "api")]`,
-/// and without it a client command is an unknown subcommand — clap's own usage
-/// error, exit 2.
+/// **`Status` and `Stop` are compiled out with the `api` feature** (the `status` and
+/// `stop` sections say so; T055 asserts the same), so their variants sit behind
+/// `#[cfg(feature = "api")]`, and without it a client command is an unknown
+/// subcommand — clap's own usage error, exit 2.
 ///
-/// **`Doctor` deliberately does not**, and `contracts/cli.md:72-91` is where the
-/// omission is visible: it diagnoses the always-present layers (root, config,
-/// names, symlinks, free space, the `Cleanup` trait's private-state legs, the meta
-/// store), which need no plane, so the command exists in both builds — only
-/// `--dry-run`, `--fix` and the stale-state/socket leg are `api`-gated, because
-/// without a control channel the command cannot prove a server is stopped and must
-/// not offer a repair it cannot guard. Without the feature the subcommand list is
-/// `Server`, `Service` and `Doctor`.
+/// **`Doctor` deliberately does not**: it diagnoses the always-present layers (root, config,
+/// names, symlinks, free space, the `Cleanup` trait's private-state legs, the meta store), which
+/// need no plane, so the command exists in both builds. **Which of its parts are gated, and why,
+/// is the contract's doctor section's statement** — this doc keeps only the operational half —
+/// and without the feature the subcommand list is `Server`, `Service` and `Doctor`.
 ///
 /// # Examples
 ///
@@ -314,7 +310,7 @@ pub fn parse(argv: &[OsString]) -> Result<(Cli, ArgMatches), Error> {
 ///     .try_get_matches_from(["tinio", "server", "/srv/data"])
 ///     .expect("parse");
 /// let cli = Cli::from_arg_matches(&matches).expect("from matches");
-/// // `start` is the Minio-style alias `contracts/cli.md:34` names.
+/// // `start` is the Minio-style alias the contract's `server`/`start` section names.
 /// assert!(matches!(cli.command, Command::Server(_)));
 /// ```
 #[derive(Debug, Subcommand)]

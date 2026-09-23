@@ -12,7 +12,12 @@ tinio-core.workspace = true
 tinio-server.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+tinio-fs.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = [

@@ -27,7 +27,11 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// True for a symlink, and on Windows also for junctions / other reparse
 /// points (`is_symlink()` is only `IO_REPARSE_TAG_SYMLINK`).
-pub(crate) fn is_symlink_or_reparse(metadata: &Metadata) -> bool {
+///
+/// `pub` and re-exported from the crate root because the CLI's `doctor` audit walk tests the
+/// same rule this crate's own walkers use: a second copy of the Windows arm would be fixed in
+/// only one of the two places.
+pub fn is_symlink_or_reparse(metadata: &Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }

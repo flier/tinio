@@ -54,11 +54,7 @@ fn the_label_is_derived_from_the_root_and_overridable() {
 fn a_read_only_unit_records_the_resolved_state_dir() {
     // The supervisor does not keep the installing environment. Read-only state is not a
     // function of the root, so the argv the unit runs must name the path install resolved.
-    let argv = server_argv(
-        Path::new("/srv/data"),
-        true,
-        Path::new("/var/lib/tinio"),
-    );
+    let argv = server_argv(Path::new("/srv/data"), true, Path::new("/var/lib/tinio"));
     assert_eq!(
         argv,
         [
@@ -69,11 +65,7 @@ fn a_read_only_unit_records_the_resolved_state_dir() {
             OsString::from("/var/lib/tinio"),
         ]
     );
-    let read_write = server_argv(
-        Path::new("/srv/data"),
-        false,
-        Path::new("/srv/data/.tinio"),
-    );
+    let read_write = server_argv(Path::new("/srv/data"), false, Path::new("/srv/data/.tinio"));
     assert_eq!(
         read_write,
         [OsString::from("server"), OsString::from("/srv/data")]

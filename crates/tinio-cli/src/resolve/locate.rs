@@ -75,7 +75,10 @@ pub(crate) fn current_dir() -> Result<PathBuf, Error> {
 pub fn resolve_root(explicit: Option<&Path>, from: &Path) -> Result<PathBuf, Error> {
     let candidate = match explicit {
         Some(dir) => dir.to_path_buf(),
-        None => match from.ancestors().find(|dir| dir.join(RESERVED_SEGMENT).is_dir()) {
+        None => match from
+            .ancestors()
+            .find(|dir| dir.join(RESERVED_SEGMENT).is_dir())
+        {
             Some(dir) => dir.to_path_buf(),
             None => {
                 return Err(Error::Usage(format!(
@@ -136,9 +139,12 @@ pub fn resolve_mode(config: &Config, source: ValueSource, read_only: bool) -> bo
 ///
 /// Read-write it is the reserved `<root>/.tinio`; read-only it is `override_dir` — the
 /// discovery parse's `TINIO_STATE_DIR` — when that is set, else
-/// `<home>/.tinio/roots/<sha256(canonical root)16>/`. Nothing is created here — the leaf is the
-/// caller's to make — and the home derivation is reached only in read-only mode, which is what
-/// keeps a read-write run out of `dirs::home_dir()`.
+/// `<home>/.tinio/roots/<sha256(canonical root)16>/`. **Nothing is created here, in either
+/// branch**: the derivation is the non-creating [`state::home_state_dir_path`], so a client that
+/// only probes leaves the home tree alone. Serving and `--fix` call
+/// [`state::prepare_home_derived`] immediately before their `create_dir_all`, which is what
+/// restores the 0700 / no-symlink parents `ensure_roots` owns. The home derivation is reached
+/// only in read-only mode, which is what keeps a read-write run out of `dirs::home_dir()`.
 ///
 /// **The override is a parameter, never a lookup**: the variable is read once, by the
 /// discovery parse, because the file this directory holds is what the second parse has to see.
@@ -168,7 +174,9 @@ pub fn resolve_state_dir(
     }
     match override_dir {
         Some(dir) => Ok(dir.to_path_buf()),
-        None => Ok(state::default_home_state_dir(root)?),
+        // The **non-creating** derivation (V5/R28): resolving a read-only run's state dir must not
+        // mint `<home>/.tinio/roots/` merely because a client asked where it would be.
+        None => Ok(state::default_home_state_dir_path(root)?),
     }
 }
 
@@ -313,8 +321,8 @@ pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, 
 ///
 /// It exists because the chain is one order and the parse is two: everything here is resolved
 /// *before* `<state dir>/.env` is loaded, and everything the second parse then adds — the flags,
-/// the variables, `.env`'s values among them — is folded on top of it by [`server`] and
-/// [`for_doctor`].
+/// the variables, `.env`'s values among them — is folded on top of it by [`super::server()`] and
+/// [`super::for_doctor()`].
 #[derive(Debug)]
 pub struct Located {
     /// The served storage root, canonical (FR-020's walk-up included).

@@ -117,6 +117,11 @@ const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // checklists/compatibility.md CHK020 as the flat-memory verification
     // home; the perf script itself is not cucumber.
     "T089",
+    // T144: the home root-state-dir GC (FR-023's relocation residue) is not
+    // implemented — contracts/cli.md names it as this build's "not checked"
+    // leg and `doctor --fix` reports it as not repaired, and the task is US2's,
+    // so no scenario verifies it.
+    "T144",
     // T146: the debt row contracts/config.md's 2026-09-20 correction names
     // (the seven `TINIO_ACCESS_LOG*`/`TINIO_API_*` variables the CLI
     // feature does not honour) — the citation points at the task that owns

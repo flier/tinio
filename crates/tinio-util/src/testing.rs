@@ -1,9 +1,10 @@
 //! Conformance test harness for backend implementations (task T014).
 //!
 //! Every `tinio-core::Storage` implementation MUST pass
-//! [`assert_conformance`]. Backend crates enable the `testing` feature in
-//! their dev-dependencies and run the suite against a freshly constructed
-//! backend:
+//! [`assert_conformance`]. Crates enable the `testing` feature in their
+//! dev-dependencies: backend crates run the suite against a freshly constructed
+//! backend, and any test target may use the shared helpers beside it — the
+//! facade's doctor legs consume [`json_keys`]:
 //!
 //! ```toml
 //! [dev-dependencies]
@@ -90,6 +91,17 @@ pub async fn read_body(mut body: BodyStream) -> io::Result<Vec<u8>> {
 
 /// Assert that a type is `Send + Sync + 'static` (every contract type is).
 pub fn assert_send_sync<T: Send + Sync + 'static>() {}
+
+/// The key set of one JSON object, sorted.
+///
+/// The shared half of a "the JSON shape is the schema's" leg: both `tinio-cli`'s report tests
+/// and the facade's process legs compare a key set against `doctor-report.schema.json`'s
+/// `additionalProperties: false`, and one implementation keeps the two comparisons the same one.
+pub fn json_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();
+    keys.sort();
+    keys
+}
 
 /// Build a validated [`ETag`] from a wire-format hex string (harness helper).
 pub fn etag(hex: &str) -> ETag {

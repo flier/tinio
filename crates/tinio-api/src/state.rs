@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::Error;
 #[cfg(windows)]
 use crate::_winsec::{create_restricted, restrict_to_current_user};
+use crate::Error;
 
 /// The file's name inside the state directory.
 ///
@@ -333,22 +333,15 @@ impl State {
     /// assert!(state.is_some());
     /// ```
     pub fn read(state_dir: &Path) -> Result<Option<Self>, Error> {
-        let path = path(state_dir);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(Error::Io(err)),
+        let Some(state) = Self::read_any_version(state_dir)? else {
+            return Ok(None);
         };
-        let state: Self = serde_json::from_str(&text).map_err(|err| Error::State {
-            path: path.clone(),
-            message: format!("could not decode: {err}"),
-        })?;
         if state.version != STATE_VERSION {
             // The file's version and this build's, both by name, plus what the operator can
             // actually do about it: `version n is not the m this build reads` is true for an
             // older file and a newer one alike, so the remedy is named rather than guessed.
             return Err(Error::State {
-                path,
+                path: path(state_dir),
                 message: format!(
                     "version {} is not the {STATE_VERSION} this build reads: a newer tinio is \
                      needed, or remove this file if no server is running",
@@ -356,6 +349,30 @@ impl State {
                 ),
             });
         }
+        Ok(Some(state))
+    }
+
+    /// [`read`](Self::read) **without the version check**: `Some` whenever a document decoded,
+    /// whatever version it names.
+    ///
+    /// The two questions a caller can ask are not the same one. "Give me a `State` I may act on"
+    /// must refuse a foreign version, because a field this build does not know may mean something
+    /// it would misread — that is [`read`](Self::read). "What channel did the writer bind?" is
+    /// answerable from a document this build cannot otherwise use, and it is the question a probe
+    /// **has** to ask: the recorded `control_name` is the only route to a channel whose file a
+    /// *newer* server wrote, and without it a caller dials the derived name instead, misses a
+    /// server that recorded an override, and concludes the channel is silent.
+    pub fn read_any_version(state_dir: &Path) -> Result<Option<Self>, Error> {
+        let path = path(state_dir);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let state: Self = serde_json::from_str(&text).map_err(|err| Error::State {
+            path,
+            message: format!("could not decode: {err}"),
+        })?;
         Ok(Some(state))
     }
 

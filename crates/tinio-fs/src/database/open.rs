@@ -165,9 +165,10 @@ pub enum Integrity {
 }
 
 /// Run a full integrity check on the state database at `state_dir` —
-/// the fs-side mechanism behind doctor's integrity check (the CLI wiring
-/// lands with T073/T074, meta-redb-spec §5.8/§5.9). Opens the file
-/// exclusively: no server may be running.
+/// the fs-side mechanism behind doctor's integrity check, called by the
+/// doctor orchestration in `tinio-cli`'s `commands/doctor/` for both its
+/// diagnostics pass and its repair (meta-redb-spec §5.8/§5.9). Opens the
+/// file exclusively: no server may be running.
 ///
 /// # Errors
 ///

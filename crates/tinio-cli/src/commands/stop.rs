@@ -17,7 +17,7 @@ use std::{path::Path, process::ExitCode, time::Duration};
 use tokio::time::{Instant, sleep};
 
 pub use super::DirArgs as Args;
-use super::{client_target, probe_pair};
+use super::{client_resolution, probe_pair};
 use crate::{
     _api::{State, client, state},
     Error,
@@ -77,7 +77,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// `located` and `args` are `status`'s pair for the same reason: one discovery resolution for
 /// every non-launching command, and the authoritative parse's flags.
 pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
-    let (resolution, candidates) = client_target(args, located)?;
+    let (resolution, candidates) = client_resolution(args, located)?;
     // Decision 19's pair, tried in order, and the request goes only where a server answers:
     // `POST /stop` at whatever else holds a stale control name would report a transport failure
     // where the truth is "no running server".

@@ -1,16 +1,12 @@
 //! File DACLs. `tinio-api` keeps named-pipe creation and calls [`CurrentUserDacl`] for the
 //! same descriptor.
 
-
 use std::{
     ffi::OsStr,
     fs::File,
     io, iter,
     mem::size_of,
-    os::windows::{
-        ffi::OsStrExt,
-        io::FromRawHandle,
-    },
+    os::windows::{ffi::OsStrExt, io::FromRawHandle},
     path::Path,
     ptr,
 };
@@ -25,8 +21,8 @@ use windows_sys::{
             ACCESS_ALLOWED_ACE, ACL,
             Authorization::{
                 EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS,
-                SetEntriesInAclW, SetNamedSecurityInfoW,
-                TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+                SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+                TRUSTEE_W,
             },
             DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorDacl,
             GetTokenInformation, INHERIT_ONLY_ACE, InitializeSecurityDescriptor, NO_INHERITANCE,
@@ -294,7 +290,7 @@ fn full_control_acl(user: &CurrentUser) -> Result<*mut ACL, u32> {
     Ok(acl)
 }
 
-/// The [`full_control_acl`] list as the [`SECURITY_ATTRIBUTES`] a create call takes, for
+/// The `full_control_acl` list as the [`SECURITY_ATTRIBUTES`] a create call takes, for
 /// `CreateFileW` here and Task 2's `CreateNamedPipeW`.
 ///
 /// The descriptor is absolute-format and marked `SE_DACL_PROTECTED`, which is what keeps the
@@ -367,11 +363,7 @@ pub fn descriptor_is_current_user_only(
     inspect(path, descriptor, &user)
 }
 
-fn inspect(
-    path: &Path,
-    descriptor: PSECURITY_DESCRIPTOR,
-    user: &CurrentUser,
-) -> io::Result<bool> {
+fn inspect(path: &Path, descriptor: PSECURITY_DESCRIPTOR, user: &CurrentUser) -> io::Result<bool> {
     let mut present: BOOL = 0;
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut defaulted: BOOL = 0;

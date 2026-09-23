@@ -49,6 +49,24 @@ pub enum Error {
     Redb(#[from] _store::Error),
 }
 
+impl Error {
+    /// Whether this failure is "another process holds the store" — the redb lock's
+    /// `DatabaseAlreadyOpen`, which is a fact about the calling run rather than about the
+    /// database: `doctor` reports it as "not inspected", never as corruption.
+    ///
+    /// The predicate lives here because this crate owns the error and the `_store` nesting: a
+    /// consumer asking the question would otherwise have to reach `redb`'s variant through a
+    /// message string or take a dependency on `tinio-store` to match the shape.
+    pub fn is_already_open(&self) -> bool {
+        matches!(
+            self,
+            Self::Redb(_store::Error::Open(
+                redb::DatabaseError::DatabaseAlreadyOpen
+            ))
+        )
+    }
+}
+
 /// The `STATE` table version does not match.
 #[inline]
 pub(crate) fn unsupported_version(path: impl Into<PathBuf>, found: u64, expected: u64) -> Error {
