@@ -30,15 +30,10 @@ pub const DEVICE_FILES: [&str; 4] = ["/dev/null", "/dev/zero", "/dev/random", "/
 /// use std::path::Path;
 ///
 /// use tinio_sandbox_core::{AccessMode, Sandbox};
-/// use tinio_sandbox_linux::{Mechanism, Mount, OverlayDirs, plan};
+/// use tinio_sandbox_linux::{Mechanism, Mount, plan};
 ///
 /// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
-/// let overlay = OverlayDirs {
-///     upper: "/tmp/j/.up".into(),
-///     work: "/tmp/j/.work".into(),
-/// };
-/// let mounts: Vec<Mount> =
-///     plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &overlay).unwrap();
+/// let mounts: Vec<Mount> = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root).unwrap();
 /// assert_eq!(mounts[1].source, Path::new("/srv/data"));
 /// assert_eq!(mounts[1].target, Path::new("/tmp/j/srv/data"));
 /// ```
@@ -65,14 +60,10 @@ pub struct Mount {
 /// use std::path::Path;
 ///
 /// use tinio_sandbox_core::{AccessMode, Sandbox};
-/// use tinio_sandbox_linux::{Mechanism, MountKind, OverlayDirs, plan};
+/// use tinio_sandbox_linux::{Mechanism, MountKind, plan};
 ///
 /// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
-/// let overlay = OverlayDirs {
-///     upper: "/tmp/j/.up".into(),
-///     work: "/tmp/j/.work".into(),
-/// };
-/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &overlay).unwrap();
+/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root).unwrap();
 /// let data = mounts
 ///     .iter()
 ///     .find(|mount| mount.source == Path::new("/srv/data"))
@@ -164,22 +155,13 @@ pub struct OverlayDirs {
 /// use std::path::Path;
 ///
 /// use tinio_sandbox_core::{AccessMode, Sandbox};
-/// use tinio_sandbox_linux::{Mechanism, OverlayDirs, plan};
+/// use tinio_sandbox_linux::{Mechanism, plan};
 ///
 /// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
-/// let overlay = OverlayDirs {
-///     upper: "/tmp/j/.up".into(),
-///     work: "/tmp/j/.work".into(),
-/// };
-/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &overlay).unwrap();
+/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root).unwrap();
 /// assert_eq!(mounts.len(), 2, "the jail tmpfs plus the one exposure");
 /// ```
-pub fn plan(
-    sandbox: &Sandbox,
-    jail: &Path,
-    model: Mechanism,
-    _overlay: &OverlayDirs,
-) -> Result<Vec<Mount>> {
+pub fn plan(sandbox: &Sandbox, jail: &Path, model: Mechanism) -> Result<Vec<Mount>> {
     let mut mounts = vec![Mount {
         source: PathBuf::from("tmpfs"),
         target: jail.to_path_buf(),
@@ -243,17 +225,10 @@ mod tests {
 
     const JAIL: &str = "/tmp/.tinio-jail-abc";
 
-    fn overlay() -> OverlayDirs {
-        OverlayDirs {
-            upper: PathBuf::from("/tmp/.tinio-jail-abc/.overlay/upper"),
-            work: PathBuf::from("/tmp/.tinio-jail-abc/.overlay/work"),
-        }
-    }
-
     #[test]
     fn the_jail_tmpfs_is_always_first() {
         let sandbox = Sandbox::new().expose("/srv/deep/data", AccessMode::ReadWrite);
-        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root, &overlay()).unwrap();
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root).unwrap();
         assert_eq!(mounts[0].kind, MountKind::JailTmpfs);
         assert_eq!(mounts[0].target, PathBuf::from(JAIL));
     }
@@ -262,7 +237,7 @@ mod tests {
     fn read_write_exposure_is_a_plain_bind_in_both_models() {
         let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
         for model in [Mechanism::UserNamespace, Mechanism::Root] {
-            let mounts = plan(&sandbox, Path::new(JAIL), model, &overlay()).unwrap();
+            let mounts = plan(&sandbox, Path::new(JAIL), model).unwrap();
             let data = mounts
                 .iter()
                 .find(|m| m.source == Path::new("/srv/data"))
@@ -285,7 +260,7 @@ mod tests {
         // very hosts a served root lives on: the mistake this test catches.
         let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
         for model in [Mechanism::UserNamespace, Mechanism::Root] {
-            let mounts = plan(&sandbox, Path::new(JAIL), model, &overlay()).unwrap();
+            let mounts = plan(&sandbox, Path::new(JAIL), model).unwrap();
             let data = mounts
                 .iter()
                 .find(|m| m.source == Path::new("/srv/data"))
@@ -300,13 +275,7 @@ mod tests {
         let sandbox = Sandbox::new()
             .expose("/srv/data", AccessMode::ReadOnly)
             .expose("/home/u/.tinio/roots/h", AccessMode::ReadWrite);
-        let mounts = plan(
-            &sandbox,
-            Path::new(JAIL),
-            Mechanism::UserNamespace,
-            &overlay(),
-        )
-        .unwrap();
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace).unwrap();
         let state = mounts
             .iter()
             .find(|m| m.source == Path::new("/home/u/.tinio/roots/h"))
@@ -324,7 +293,7 @@ mod tests {
         let sandbox = Sandbox::new()
             .expose("/srv/data", AccessMode::ReadWrite)
             .device_files();
-        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root, &overlay()).unwrap();
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root).unwrap();
         let tail = &mounts[mounts.len() - DEVICE_FILES.len()..];
         let names: Vec<&Path> = tail.iter().map(|mount| mount.source.as_path()).collect();
         assert_eq!(
@@ -356,18 +325,12 @@ mod tests {
         let sandbox = Sandbox::new()
             .expose("/srv/data", AccessMode::ReadOnly)
             .expose("/srv/other", AccessMode::ReadOnly);
-        let err = plan(
-            &sandbox,
-            Path::new(JAIL),
-            Mechanism::UserNamespace,
-            &overlay(),
-        )
-        .unwrap_err();
+        let err = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace).unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
         assert!(err.to_string().contains("read-only exposure"), "{err}");
 
         // The same two exposures are fine under root, where the remount is not
         // refused and the pair is therefore never reached.
-        assert!(plan(&sandbox, Path::new(JAIL), Mechanism::Root, &overlay()).is_ok());
+        assert!(plan(&sandbox, Path::new(JAIL), Mechanism::Root).is_ok());
     }
 }

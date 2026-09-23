@@ -23,47 +23,17 @@ use rustix::{
 use tracing::{debug, error};
 
 use crate::_core::{Error, Result};
-
-/// Log a failure and hand it back, so every refusing `return` in this crate is
-/// one call and the log cannot drift from the error (shared §7).
-///
-/// **The crate's one failure event, and the reason it is `pub(crate)`.** §7
-/// asks for the event's `step` and the returned error's `step` to be the same
-/// string and to stay that way — and this crate grew three copies of the
-/// call: `enter.rs` said `sandbox step refused` where this one and
-/// `seccomp.rs` said `sandbox step failed`, so one failure had two events with
-/// two wordings from the moment the second copy landed. Every module now
-/// funnels through here, which is what makes the sentence one string rather
-/// than a rule to re-check.
-///
-/// The parameter is a built `Error` rather than an `io::Error` because not
-/// every refusal is a syscall's: `enter.rs`'s validation refuses with
-/// `Error::BadPath` and `Error::Unsupported`, and those are the failures an
-/// operator most needs in the log.
-pub(crate) fn refused(step: &'static str, error: Error) -> Error {
-    error!(step, error = %error, "sandbox step failed");
-    error
-}
-
-/// [`refused`] for a syscall's own error, which is what nearly every call site
-/// has.
-///
-/// Generic over the error type because the callers are not all `std`: `rustix`
-/// returns an `Errno`, which converts into `std::io::Error` through its own
-/// `From` impl but is not that type. Without the bound every one of this
-/// crate's ~14 syscall sites would need its own closure — and, worse, a
-/// `|err: io::Error| …` written at one of them does not compile at all, because
-/// nothing coerces `Errno` to `io::Error` on its own.
-pub(crate) fn fail(step: &'static str, source: impl Into<io::Error>) -> Error {
-    let source = source.into();
-    refused(step, Error::Step { step, source })
-}
-
-/// The `.map_err` shape of [`fail`], for the call sites that read better as a
-/// closure.
-pub(crate) fn step<Source: Into<io::Error>>(step_name: &'static str) -> impl Fn(Source) -> Error {
-    move |source: Source| fail(step_name, source)
-}
+// **The failure builders are the core's, and they are re-exported here rather
+// than re-imported by each module.** This file defined all three until the
+// phase-basis correction moved them to `tinio-sandbox-core`, beside the other
+// platforms' shapes — three copies of one builder being the state that precedes
+// three wordings of one log line, which this crate had already reached
+// (`enter.rs` said `sandbox step refused` where this file and `seccomp.rs` said
+// `sandbox step failed`). `enter.rs` and `seccomp.rs` go on naming them as
+// `crate::mechanism::{fail, refused, step}`, so no call site in this crate
+// changes with the move; the doc that explained the `refused` decision moved to
+// the core's function, trimmed of this crate's history.
+pub(crate) use crate::_core::{fail, refused, step};
 
 /// Which confinement mechanism Linux uses (design decision 7).
 ///

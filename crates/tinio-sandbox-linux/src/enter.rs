@@ -146,7 +146,7 @@ fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
         upper: jail.join(".overlay/upper"),
         work: jail.join(".overlay/work"),
     };
-    let mounts = plan(sandbox, &jail, model, &overlay).map_err(|error| refused("plan", error))?;
+    let mounts = plan(sandbox, &jail, model).map_err(|error| refused("plan", error))?;
 
     Ok(Prepared {
         resolved: resolved_now,

@@ -12,19 +12,18 @@
 #![cfg(target_os = "linux")]
 #![cfg(feature = "sandbox")]
 
+mod common;
+
 use std::{
     env, fs,
-    io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    io::{self, Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::Duration,
 };
 
-use tinio_sandbox::{Event, linux::Mechanism};
-use tinio_util::testing::wait_timeout_secs;
+use common::{serve_bin, wait_for_listening};
+use tinio_sandbox::linux::Mechanism;
 
 /// The one way past a missing precondition, and it is a deliberate opt-in.
 ///
@@ -35,34 +34,6 @@ use tinio_util::testing::wait_timeout_secs;
 /// it. The rule and the variable are the jail test's (`tinio-sandbox-linux`'s
 /// `tests/jail.rs`), spelled the same way so one habit covers both.
 const ALLOW_SKIP: &str = "TINIO_SANDBOX_ALLOW_SKIP";
-
-/// The `serve` example, resolved from this test binary's own location:
-/// `<target>/<profile>/deps/<test>` → the sibling `examples/` dir.
-///
-/// **Not `assert_cmd::cargo::cargo_bin`, and not `env!("CARGO_BIN_EXE_serve")`.**
-/// Cargo sets `CARGO_BIN_EXE_*` for binary targets only — naming an example in
-/// `env!(…)` is a compile error — and `assert_cmd`'s helper resolves the same
-/// set, so it would not find an example either; the crate is not a dependency
-/// of this workspace for that reason (the tech stack says so once). The e2e
-/// harness resolves the example the same way this does, for the same reason
-/// (`crates/tinio-e2e/tests/steps/clients.rs`).
-fn serve_bin() -> PathBuf {
-    let name = format!("serve{}", env::consts::EXE_SUFFIX);
-    let exe = env::current_exe().expect("current exe path");
-    let profile_dir = exe
-        .parent() // .../deps
-        .and_then(Path::parent) // .../<profile>
-        .expect("test binary lives in <target>/<profile>/deps");
-    let path = profile_dir.join("examples").join(name);
-    assert!(
-        path.exists(),
-        "serve example not found at {} — build it with the same profile first: \
-         `cargo build -p tinio-server --example serve` (a filtered `cargo test --test …` \
-         builds test targets only, not examples)",
-        path.display()
-    );
-    path
-}
 
 /// The model the run asked for, read from the same variable the example reads,
 /// so the precondition below is asked about the leg that is actually running.
@@ -123,72 +94,6 @@ fn unshare_probe(flags: &[&str]) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or_else(|err| panic!("the precondition needs util-linux's `unshare(1)`: {err}"))
-}
-
-/// How long the confined child gets to report `listening`, or the refused start
-/// that took its place. The knob and default the crate's other spawned-server
-/// wait honours, read through its own accessor: one policy for a starved runner,
-/// not a third default here.
-fn wait_timeout() -> Duration {
-    Duration::from_secs(wait_timeout_secs())
-}
-
-/// Wait for the child's `listening` event and return the address it bound, or
-/// fail with the child's own evidence.
-///
-/// **The read happens on a reader thread and the wait is bounded here.** The
-/// earlier shape read two lines straight off the pipe with no deadline, so a
-/// startup path that neither writes a frame nor exits — a `confine` that blocks,
-/// a config read on a FIFO — hung the whole workspace leg until CI times it out,
-/// with no test named: libtest has no per-test timeout, and both sibling waiters
-/// bound theirs. The thread also keeps the pipe drained, so the child cannot
-/// block on a full buffer.
-///
-/// **And it accumulates a frame rather than reading two lines.** A stray line
-/// ahead of the frame is exactly the case the framing exists to survive —
-/// `sse-core` ignores field lines it does not know and the sibling waiters
-/// tolerate them — while a fixed two-line read reported it as an unexpected
-/// frame. Lines accumulate to the blank line that closes a frame, the block is
-/// decoded, and text that is not one of our frames is skipped rather than fatal.
-///
-/// A refusal is reported as the refusal it is: an `error` frame carries the
-/// confinement's own rendering, which is worth more than any guess this side
-/// could make about why no endpoint came.
-fn wait_for_listening(child: &mut Child) -> SocketAddr {
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let mut frame = String::new();
-        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
-            if line.trim_end().is_empty() {
-                if let Some(event) = Event::decode(&frame) {
-                    // A send that fails means the wait below already gave up and
-                    // killed the child; there is nowhere left to report it.
-                    if tx.send(event).is_err() {
-                        return;
-                    }
-                }
-                frame.clear();
-            } else {
-                frame.push_str(&line);
-            }
-            line.clear();
-        }
-    });
-    let timeout = wait_timeout();
-    match rx.recv_timeout(timeout) {
-        Ok(Event::Listening { addr }) => addr,
-        Ok(Event::Error { message }) => fail(child, &format!("serve refused to start: {message}")),
-        Err(err) => fail(
-            child,
-            &format!(
-                "serve reported no `listening` event within {} s ({err})",
-                timeout.as_secs()
-            ),
-        ),
-    }
 }
 
 /// Kill and reap the child, then fail with `message` and the stderr it left.
@@ -279,7 +184,10 @@ fn a_confined_server_serves() {
     // failure — with the child killed and its stderr quoted, because an `Error`
     // frame carries the confinement's rendering and the stderr behind it
     // carries the backend's own `error!` line for whatever refused.
-    let addr = wait_for_listening(&mut child);
+    let addr = match wait_for_listening(&mut child) {
+        Ok(addr) => addr,
+        Err(message) => fail(&mut child, &message),
+    };
 
     // A plain TCP connection proves the listener is reachable from outside the
     // jail. Anything more would re-test S3, which the other suites cover.
@@ -355,7 +263,10 @@ fn a_confined_read_only_server_refuses_writes_through_the_served_root() {
     // Still serving: the jail built with a read-only served root and a
     // writable state directory, the plane opened its database inside the
     // latter, and the listener is reachable from outside.
-    let addr = wait_for_listening(&mut child);
+    let addr = match wait_for_listening(&mut child) {
+        Ok(addr) => addr,
+        Err(message) => fail(&mut child, &message),
+    };
     let mut stream = TcpStream::connect(addr).expect("connect to the confined server");
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")

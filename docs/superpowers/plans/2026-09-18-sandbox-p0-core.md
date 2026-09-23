@@ -34,7 +34,9 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures`), `Error`, `Result` — and, **re-exported from `tinio-core` rather than defined here**, `AccessMode`.
+- Produces: `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures`), `Error`, `Result`, and the four failure builders `error.rs` owns — `refused(step: &'static str, Error) -> Error`, `fail(step: &'static str, source: impl Into<io::Error>) -> Error`, `step<Source: Into<io::Error>>(step_name: &'static str) -> impl Fn(Source) -> Error` and `launch(operation: &'static str, path: impl Into<PathBuf>, source: impl Into<io::Error>) -> Error` — and, **re-exported from `tinio-core` rather than defined here**, `AccessMode`.
+
+**The four builders are landed by the phase-basis correction (Ruling 40), on top of what Step 4 wrote, and Task 1 is the task that lands them because `error.rs` is its file.** Each of the three backends had defined the same build-and-log helper for itself — `.map_err(step("…"))` on Linux and macOS, `handles::step(operation, path, source)` on Windows — and three copies of one builder is the state that precedes three wordings of one log line, which P1 had already reached. One copy now lives beside `Error` and `Result`, which is why the `step` name there is the curried form and the shape that builds `Error::Launch` is called `launch`: Rust has one arity per name, and the two shapes are both needed. The three platform plans consume them and define none.
 
 The builder is **pure data**. Validation that needs the filesystem belongs to the platform crate's `confine`, so the whole builder is testable with no privileges on any platform.
 
@@ -511,7 +513,7 @@ pub mod sandbox;
 // so a name added here still has to be added there by hand — see the comment on
 // that test.
 pub use self::{
-    error::{Error, Result},
+    error::{Error, Result, fail, launch, refused, step},
     sandbox::{Exposure, Sandbox},
 };
 pub use crate::_core::AccessMode;
@@ -547,7 +549,7 @@ Add the README row after `tinio-server`'s:
 - [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-core`
-Expected: PASS — 8 unit tests (five in `sandbox.rs`, three in `error.rs`), 4 doc tests (the crate-level `//!` example, `Exposure`, `Sandbox`, `Sandbox::from_exposures`). The fifth `sandbox.rs` case is the one the cleanup added: `from_exposures_keeps_the_most_permissive_access_too`, which pins the rule on the path a launcher platform takes, both orders of the duplicate pair — without it, a `from_exposures` that stored the vector as given passed every other test. `AccessMode` contributes neither count: it is `tinio-core`'s type, so its unit tests and its doc example run in that crate's own suite.
+Expected: PASS — 8 unit tests (five in `sandbox.rs`, three in `error.rs`), 4 doc tests (the crate-level `//!` example, `Exposure`, `Sandbox`, `Sandbox::from_exposures`). The fifth `sandbox.rs` case is the one the cleanup added: `from_exposures_keeps_the_most_permissive_access_too`, which pins the rule on the path a launcher platform takes, both orders of the duplicate pair — without it, a `from_exposures` that stored the vector as given passed every other test. `AccessMode` contributes neither count: it is `tinio-core`'s type, so its unit tests and its doc example run in that crate's own suite. **The four failure builders landed after this run** (the phase-basis correction, Ruling 40): each carries a doc example and one carries the recording-subscriber test that pins shared §7's "the log's `step` and the error's `step` are the same string", which moved out of P2's `handles` test module because the builder it pinned is this crate's now — so a run today prints **44 unit tests and 24 doc tests** — the whole crate's suite, measured on the tree the phase has built — and the two numbers above are what this step printed at the time.
 
 **Count them from the code blocks rather than from this line if they disagree**: a doc example on a `pub(crate)` item is not one of them (rustdoc would fail to compile it), and the crate-level `//!` example is.
 
@@ -2343,6 +2345,7 @@ The macOS and Windows bodies are `Unsupported` stubs. They exist now because the
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::thread::JoinHandle;
 
@@ -2406,6 +2409,14 @@ fn the_launcher_surface_is_re_exported() {
     let _: fn(tinio_sandbox::AccessMode) -> bool = tinio_sandbox::AccessMode::is_read_only;
     let _: fn(&tinio_sandbox::Error) -> String = |err| err.to_string();
     let _: tinio_sandbox::Result<()> = Ok(());
+    // The four shapes a backend builds a failure through. `fail` and `launch`
+    // take `impl Into<…>`, which the binding's own type fixes; `step` returns an
+    // opaque `impl Fn`, which no `fn`-pointer binding can name, so it is called.
+    let _: fn(&'static str, tinio_sandbox::Error) -> tinio_sandbox::Error = tinio_sandbox::refused;
+    let _: fn(&'static str, io::Error) -> tinio_sandbox::Error = tinio_sandbox::fail;
+    let _: fn(&'static str, PathBuf, io::Error) -> tinio_sandbox::Error = tinio_sandbox::launch;
+    let _: tinio_sandbox::Error =
+        tinio_sandbox::step::<io::Error>("mount")(io::Error::other("boom"));
 
     // The launcher machinery — Task 2's.
     let _: fn(
@@ -2553,8 +2564,8 @@ pub extern crate tinio_sandbox_windows as _windows;
 // the comment on that test.
 pub use crate::_core::{
     AccessMode, Adopted, Backend, Child, Confinement, Error, Event, Exposure, LISTENER_FD_PREFIX,
-    LaunchPayload, LaunchPlan, Observer, Result, Sandbox, Terminal, adopt, is_listener_fd_arg,
-    listener_fd_arg, listener_fd_from_arg, supervise,
+    LaunchPayload, LaunchPlan, Observer, Result, Sandbox, Terminal, adopt, fail, is_listener_fd_arg,
+    launch, listener_fd_arg, listener_fd_from_arg, refused, step, supervise,
 };
 
 /// The backend for the platform this build targets, and the constructor for it.
@@ -2859,7 +2870,7 @@ EOF
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". One deliberate judgement call is flagged inline rather than hidden: the `ALL_CAPABILITIES`-style enumeration problems that the platform crates hit are theirs, not this plan's; the only enumeration here is the module and re-export lists, which are written out in full.
 
-**Type consistency.** This is the plan where that check matters most, because three other plans consume what it defines. `AccessMode` (Task 1, and **spelled by `tinio-core`, not by this plan**: the two variants are `ReadWrite` and `ReadOnly`, the predicate is `is_read_only()`, and there is no `is_writable`), `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures(exposures, device_files)`), `Error::{Step, Unsupported, BadPath, Launch, Wait}` (Task 1) are used verbatim by Tasks 2 and 3 and by all three platform plans. `Backend`, `Confinement`, `Child` (`new`, `with_relay`, `wait`, `terminal`), `supervise(&mut Child, teardown)`, `LaunchPlan`, `LaunchPayload`, `Adopted`, `adopt`, `Event`, `Observer`, `Terminal`, `LISTENER_FD_PREFIX` and the three `listener_fd_*` helpers (Tasks 2 and 3) are the surface P1, P2 and P3 were reconciled to; the reconciliation is recorded in Task 2 Step 6, including what each platform plan had invented for itself and why it is now here instead.
+**Type consistency.** This is the plan where that check matters most, because three other plans consume what it defines. `AccessMode` (Task 1, and **spelled by `tinio-core`, not by this plan**: the two variants are `ReadWrite` and `ReadOnly`, the predicate is `is_read_only()`, and there is no `is_writable`), `Exposure`, `Sandbox` (`new`, `expose`, `device_files`, `exposures`, `device_files_enabled`, `from_exposures(exposures, device_files)`), `Error::{Step, Unsupported, BadPath, Launch, Wait}` (Task 1) are used verbatim by Tasks 2 and 3 and by all three platform plans, and so are the four builders that produce them — `refused`, `fail`, `step`, `launch` (Task 1's `error.rs`; landed by the phase-basis correction, Ruling 40): P1 consumes them through `mechanism`'s re-export with no call site changed, and P2 and P3 call them where their blocks used to define a `step` or a `spawn_error` of their own. `Backend`, `Confinement`, `Child` (`new`, `with_relay`, `wait`, `terminal`), `supervise(&mut Child, teardown)`, `LaunchPlan`, `LaunchPayload`, `Adopted`, `adopt`, `Event`, `Observer`, `Terminal`, `LISTENER_FD_PREFIX` and the three `listener_fd_*` helpers (Tasks 2 and 3) are the surface P1, P2 and P3 were reconciled to; the reconciliation is recorded in Task 2 Step 6, including what each platform plan had invented for itself and why it is now here instead.
 
 **What is deliberately *not* on that surface**, and the reason each one left it:
 

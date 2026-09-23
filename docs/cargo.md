@@ -4,6 +4,7 @@
 
 - No comments in `Cargo.toml` — rationale in `docs/`.
 - Pin once in root `[workspace.dependencies]`; crates use `X.workspace = true`.
+- A patched dependency lives under `vendor/`, keeps the upstream version it patches, and carries a source header naming the change; the root names it in `[patch.crates-io]` and `exclude` (`docs/superpowers/specs/2026-09-18-sandbox-design.md`).
 - Members (`tinio-*`): `path = "crates/…"`, no version.
 - `version`/`edition` from `[workspace.package]`.
 - `publish = false` except facade `tinio`.

@@ -6,7 +6,7 @@
 
 **Architecture:** P0 left `crates/tinio-sandbox-windows` as an `Unsupported` stub: `pub struct Backend` plus `backend()`, whose `confine` returns `Error::Unsupported`. P2 fills that crate in. Create the AppContainer **profile** whose package SID is derived from the served root — a merely derived SID cannot launch at all, which is the measurement Task 2 is written against — canonicalise the exposure set and refuse a reparse point in it (Task 3), grant the profile's SID `(OI)(CI)RX` or `(OI)(CI)M` on each exposed path through `icacls`, create the two pipes the child's stdin and stdout are wired to, hand the parent's listener (by handle list and argv element) and the two pipe ends to a child created with `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` + `CREATE_NEW_PROCESS_GROUP`, assign that child to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job, arm the termination relay (design §3 step 9) and the stdout event relay (decision 19), write the payload into its stdin, and return `Confinement::Supervise` with a wait closure and a teardown that removes exactly the ACEs it added. The payload frame, the event type, the event stream's decode-and-re-emit (`reemit`), the supervision loop and the exit-status forwarding are `tinio-sandbox-core`'s from P0 and are consumed, not rebuilt; what this crate drives is a thread over the child's stdout.
 
-**Tech Stack:** Rust 2024; `tinio-sandbox-core` for the trait, the vocabulary and the launcher machinery; `sha2` + `hex` for the package name; `icacls.exe` for the DACL edits; the AppContainer profile API in `userenv.dll` (Task 2); hand-declared `unsafe extern "system"` Win32 bindings (no `windows-sys`, no new dependency — design Bookkeeping); `tracing` for the events shared §7 requires, with `tracing-subscriber` in dev-dependencies so a test can assert one; `tempfile` in tests, which spawn their processes with `std::process::Command`. **`assert_cmd` is not among them**: it cannot resolve an example binary, and Task 11's `serve_bin` is what the suites use instead, for the reason that function states.
+**Tech Stack:** Rust 2024; `tinio-sandbox-core` for the trait, the vocabulary and the launcher machinery; `sha2` + `hex` for the package name; `icacls.exe` for the DACL edits; the AppContainer profile API in `userenv.dll` (Task 2); `windows-sys` for every Win32 call, named item by item at the top of the module that makes it, with a curated feature list rather than the `Win32` super-feature (design Bookkeeping — an edge on a crate the lock already resolves, not a crate added to the tree); `tracing` for the events shared §7 requires, with `tracing-subscriber` in dev-dependencies so a test can assert one; `tempfile` in tests, which spawn their processes with `std::process::Command`. **`assert_cmd` is not among them**: it cannot resolve an example binary, and Task 11's `serve_bin` is what the suites use instead, for the reason that function states — **and since Task 14's refactor that function is `crates/tinio-server/tests/common/mod.rs`'s `serve_bin`, the one home the three per-target copies were hoisted into**.
 
 **Spec:** `docs/superpowers/specs/2026-09-18-sandbox-design.md` — the design document, which is the authority for every decision cited below as `design §N` or `decision N`. Read it alongside this plan.
 
@@ -48,7 +48,7 @@
 - **This plan's imports backlog is about 125 sites**, mostly in test setup and FFI plumbing, where a bare `std::fs::write` or `std::mem::size_of` reads better than a wall of imports. Correct them in place as you write the code; do not relax the rule (shared §1).
 - **The crate topology is shared §2's**, and this crate is the edge that section warns about: `tinio-sandbox-windows` must never depend on the facade.
 - The confined child never runs `icacls` and never grants anything: the launcher is the only process that edits a DACL (design decisions 15, 17).
-- **Every core operation of this crate is traced, and the split is shared §7's.** The levels — `info!` for what answers "was this process confined, and to what", `debug!` for the per-item detail behind it, `error!` where a returned `Error` is built — the structured fields, and the reason the split exists (a `debug!`-only rule would emit nothing an operator can see, because `serve` builds its subscriber at a fixed `Verbosity::Info` with no environment filter) are stated there once and are not restated here. **What this plan's own is which operation falls on which side:** `info!` for the package name and the derived SID, the profile's creation and deletion, the exposure set the launch actually resolves, `CreateProcessW` with its pid, the Job object and its assignment, and the child's exit; `debug!` for each ACE grant and revoke, each pipe, the payload write, and each armed, disarmed or forwarded stop. The crate installs **no subscriber of its own** — the process that owns the runtime decides where the events go (shared §7) — and because `serve` builds its subscriber *inside* `serve`, the launcher arm installs one before it confines anything: a run that never reaches `serve` would otherwise leave no record at all (Task 11).
+- **Every core operation of this crate is traced, and the split is shared §7's.** The levels — `info!` for what answers "was this process confined, and to what", `debug!` for the per-item detail behind it, `error!` where a returned `Error` is built — the structured fields, and the reason the split exists (a `debug!`-only rule would emit nothing an operator can see, because `serve` builds its subscriber at a fixed `Verbosity::Info` with no environment filter) are stated there once and are not restated here. **What this plan's own is which operation falls on which side:** `info!` for the package name and the derived SID, the profile's creation and deletion, the exposure set the launch actually resolves, `CreateProcessW` with its pid, the Job object and its assignment, and the child's exit; `debug!` for each ACE grant and revoke, each pipe, the payload write, and each armed, disarmed or forwarded stop. The crate installs **no subscriber of its own** — the process that owns the runtime decides where the events go (shared §7) — **and no arm of `serve` installs one either**: `main` builds the subscriber above the Linux and Windows arms alike, so a launcher and the confined child it starts log into the same stderr and neither carries a `try_init` (Task 11 measured it; the sketch's launcher-side `try_init`, written on the belief that `serve` built its subscriber inside its own body, is not in the landed arm).
 - **A `tracing` call is not available to the console control handler.** The handler runs on a thread the system creates and must do nothing that allocates or locks (design §3 step 9), and `tracing` does both — so what carries the relay's events is the arming, the child id addressed, the delivery path and the child's own hook thread, never the handler (Task 10).
 
 ## Three decisions this plan records
@@ -68,460 +68,25 @@ Task 8's `tests/launch.rs` carries its own small copy of the probe writer becaus
 
 ---
 
-### Task 1: The crate's FFI surface and its unsafe boundary
+### Task 1: The handle plumbing and the crate's unsafe boundary
 
 **Files:**
-- Create: `crates/tinio-sandbox-windows/src/ffi.rs`
 - Create: `crates/tinio-sandbox-windows/src/handles.rs`
 - Modify: `crates/tinio-sandbox-windows/Cargo.toml`
+- Modify: `Cargo.toml` (workspace root — `windows-sys = "0.61"` in `[workspace.dependencies]`)
 - Modify: `crates/tinio-sandbox-windows/src/lib.rs`
 - Modify: `crates/tinio-sandbox/tests/facade.rs` (the stub-era assertion this phase invalidates)
 - Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (decision 14's list of `unsafe` sites)
 
 **Interfaces:**
-- Consumes: P0's `tinio-sandbox-core` in full — `Error::Launch { operation, path, source }` (constructed by `handles::step`) and `LaunchPlan`'s accessors among it.
-- Produces: `tinio_sandbox_windows::ffi` (every Win32 declaration, constant and `repr(C)` struct); `handles::{Handle, system_directory, last_error, step, mark_inheritable, inherited_stderr, Pipe, pipe, parent_end, close, write_payload}`.
+- Consumes: P0's `tinio-sandbox-core` in full — `Error::Launch { operation, path, source }` (constructed by the core's `launch`, which is not this crate's and is imported from `crate::_core`) and `LaunchPlan`'s accessors among it.
 
-Every Win32 call the crate will ever make is declared in this one module, so a reviewer reads the crate's whole ABI surface in one place, and the unsafe *calls* live only in the modules whose files carry `#[allow(unsafe_code)]`.
+**Every name this plan takes from the core is written in the crate as `crate::_core::…`**, through the alias `lib.rs` declares — `#[doc(hidden)] pub extern crate tinio_sandbox_core as _core;`, the form `docs/style.md` §Imports requires and this phase's ledger rules for. The blocks below predate it and spell `tinio_sandbox_core::…` in places; correct those sites in place as the lint reports them, exactly as `2026-09-18-sandbox-shared.md` §1 says, and do not treat a block as the authority for this line. The `launch` imports added by the phase-basis correction are already in the alias form.
+- Produces: `handles::{system_directory, last_error, mark_inheritable, inherited_stderr, Pipe, pipe, parent_end, close, write_payload}`. Every Win32 item it calls is **`windows-sys`'s**, named at the top of the module that calls it — this task produces no declaration, constant, `repr(C)` struct or type alias of its own, and the type aliases the earlier draft carried (`Handle`, `Psid`, `WideStr`, `CtrlHandler`) go with the declarations they existed for.
 
-- [ ] **Step 1: Write the failing layout tests**
+Every Win32 call the crate will ever make names a `windows_sys::…` item at the top of the module that calls it, so the ABI is a dependency's to maintain and the unsafe *calls* live only in the modules whose files carry `#[allow(unsafe_code)]`.
 
-`crates/tinio-sandbox-windows/src/ffi.rs`:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use std::mem::{offset_of, size_of};
-
-    use super::*;
-
-    #[test]
-    fn sid_and_attributes_is_sixteen_bytes_on_x64() {
-        // Verified: a stride of 8 makes CreateProcessW return
-        // ERROR_INVALID_PARAMETER (87); 16 works (design evidence table).
-        assert_eq!(size_of::<SidAndAttributes>(), 16);
-    }
-
-    #[test]
-    fn security_capabilities_matches_winnt_h() {
-        // PSID + PSID_AND_ATTRIBUTES + DWORD + DWORD.
-        assert_eq!(size_of::<SecurityCapabilities>(), 24);
-        assert_eq!(offset_of!(SecurityCapabilities, capability_count), 16);
-    }
-
-    #[test]
-    fn startup_info_has_the_layout_the_kernel_expects() {
-        assert_eq!(size_of::<StartupInfoW>(), 104);
-        assert_eq!(size_of::<StartupInfoExW>(), 112);
-        assert_eq!(offset_of!(StartupInfoExW, attribute_list), 104);
-    }
-
-    #[test]
-    fn process_information_and_job_limits_match() {
-        assert_eq!(size_of::<ProcessInformation>(), 24);
-        assert_eq!(size_of::<JobObjectBasicLimitInformation>(), 64);
-        assert_eq!(size_of::<JobObjectExtendedLimitInformation>(), 144);
-        assert_eq!(
-            offset_of!(JobObjectExtendedLimitInformation, process_memory_limit),
-            112
-        );
-    }
-
-    #[test]
-    fn security_attributes_is_twenty_four_bytes_on_x64() {
-        assert_eq!(size_of::<SecurityAttributes>(), 24);
-    }
-}
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cargo test -p tinio-sandbox-windows`
-Expected: FAIL — there is no `ffi` module yet, so `SidAndAttributes` and the rest are unresolved. The crate is `#![cfg(windows)]` from Step 4, so on a non-Windows host this suite does not exist.
-
-- [ ] **Step 3: Write `ffi.rs`**
-
-```rust
-//! The raw Win32 surface, in one module.
-//!
-//! Every declaration, constant and `repr(C)` struct the crate uses lives here,
-//! so the ABI surface is reviewable in one place and the unsafe *calls* are the
-//! only thing the FFI modules (`control`, `handles`, `job`, `process`, `sid`,
-//! `socket`) contain (design decision 14: the scope is enumerated per
-//! capability rather than promised as a count).
-//!
-//! Layout notes carry the evidence that fixed them: the design's table records
-//! that a `SID_AND_ATTRIBUTES` stride of 8 returns `ERROR_INVALID_PARAMETER`
-//! (87) from `CreateProcessW`, which is what makes the sizes below load-bearing
-//! rather than incidental.
-
-use std::ffi::c_void;
-
-/// `HANDLE` — an opaque kernel object handle.
-pub type Handle = *mut c_void;
-/// `PSID` — a security identifier.
-pub type Psid = *mut c_void;
-/// `LPCWSTR` — a NUL-terminated UTF-16 string.
-pub type WideStr = *const u16;
-
-/// `INVALID_HANDLE_VALUE`.
-pub const INVALID_HANDLE_VALUE: Handle = usize::MAX as Handle;
-
-/// `WAIT_OBJECT_0` — the only return value of `WaitForSingleObject` that means
-/// the wait succeeded.
-pub const WAIT_OBJECT_0: u32 = 0;
-/// `WAIT_OBJECT_0 + 1` — the wait that `SetEvent` releases.
-pub const WAIT_OBJECT_1: u32 = 1;
-/// `INFINITE`.
-pub const INFINITE: u32 = 0xFFFF_FFFF;
-/// `WAIT_TIMEOUT`.
-pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
-
-/// `EXTENDED_STARTUPINFO_PRESENT` — required for `STARTUPINFOEXW`.
-pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
-/// `CREATE_UNICODE_ENVIRONMENT`.
-pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
-/// `CREATE_NEW_PROCESS_GROUP` — the child becomes the leader of a new process
-/// group, which is the only way a console control event can be addressed to it
-/// alone (design §3 step 9).
-pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-/// `STARTF_USESTDHANDLES` — the child's std handles are the ones we name.
-pub const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
-
-/// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` — the attribute that makes the
-/// child an AppContainer process.
-pub const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
-/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` — the attribute that restricts
-/// inheritance to exactly the handles we name.
-pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
-
-/// `HANDLE_FLAG_INHERIT` — the flag `SetHandleInformation` sets or clears.
-pub const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
-
-/// `FILE_ATTRIBUTE_REPARSE_POINT` — a junction, a mount point or a symlink. An
-/// exposed path carrying it is refused rather than followed, because the grant
-/// would land on the link's target (Task 3, design §6).
-pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-/// `STD_INPUT_HANDLE`.
-pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
-/// `STD_OUTPUT_HANDLE`.
-pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
-/// `STD_ERROR_HANDLE`.
-pub const STD_ERROR_HANDLE: u32 = -12i32 as u32;
-
-/// `CTRL_C_EVENT`.
-pub const CTRL_C_EVENT: u32 = 0;
-/// `CTRL_BREAK_EVENT` — the only console control event that can be addressed
-/// to a process group, which is what makes the relay possible.
-pub const CTRL_BREAK_EVENT: u32 = 1;
-/// `CTRL_CLOSE_EVENT` — the console window is closing.
-pub const CTRL_CLOSE_EVENT: u32 = 2;
-/// `CTRL_LOGOFF_EVENT`.
-pub const CTRL_LOGOFF_EVENT: u32 = 5;
-/// `CTRL_SHUTDOWN_EVENT`.
-pub const CTRL_SHUTDOWN_EVENT: u32 = 6;
-
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — killing the launcher takes the
-/// confined child with it (design decision 20).
-pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-/// `JobObjectExtendedLimitInformation`.
-pub const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-/// `ERROR_INSUFFICIENT_BUFFER` — what the attribute-list size query returns.
-pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
-
-/// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` — what
-/// `CreateAppContainerProfile` returns for a profile that is already there, with
-/// the SID still filled in. A residue from a crashed run is success here rather
-/// than an error (design decision 21).
-pub const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
-
-/// `SECURITY_ATTRIBUTES`.
-#[repr(C)]
-pub struct SecurityAttributes {
-    /// `sizeof(SECURITY_ATTRIBUTES)`.
-    pub length: u32,
-    /// Always null here: no security descriptor is attached to our objects.
-    pub descriptor: *mut c_void,
-    /// Non-zero when the handle is to be inherited.
-    pub inherit: i32,
-}
-
-/// `SID_AND_ATTRIBUTES` — 16 bytes on x64, not 8.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SidAndAttributes {
-    /// The capability SID.
-    pub sid: Psid,
-    /// `SE_GROUP_ENABLED` (0) is the value the probe used and the only one a
-    /// capability entry needs.
-    pub attributes: u32,
-}
-
-/// `SECURITY_CAPABILITIES` — the value behind
-/// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. Setting this attribute is what
-/// creates the child as an AppContainer process.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SecurityCapabilities {
-    /// The package SID, derived rather than generated (design decision 21).
-    pub app_container_sid: Psid,
-    /// A contiguous array of `capability_count` `SID_AND_ATTRIBUTES`.
-    pub capabilities: *const SidAndAttributes,
-    /// How many capabilities; zero by default (design §7).
-    pub capability_count: u32,
-    /// Reserved; must be zero.
-    pub reserved: u32,
-}
-
-/// `STARTUPINFOW` — 104 bytes on x64.
-#[repr(C)]
-pub struct StartupInfoW {
-    /// `sizeof(STARTUPINFOEXW)` on the `STARTUPINFOEXW` path.
-    pub cb: u32,
-    /// Reserved.
-    pub lp_reserved: *mut u16,
-    /// The desktop, or null.
-    pub lp_desktop: *mut u16,
-    /// The title, or null.
-    pub lp_title: *mut u16,
-    /// Window position and size fields, all zero here.
-    pub dw_x: u32,
-    /// See `dw_x`.
-    pub dw_y: u32,
-    /// See `dw_x`.
-    pub dw_x_size: u32,
-    /// See `dw_x`.
-    pub dw_y_size: u32,
-    /// See `dw_x`.
-    pub dw_x_count_chars: u32,
-    /// See `dw_x`.
-    pub dw_y_count_chars: u32,
-    /// See `dw_x`.
-    pub dw_fill_attribute: u32,
-    /// `STARTF_USESTDHANDLES` when the standard handles are supplied.
-    pub dw_flags: u32,
-    /// Zero.
-    pub w_show_window: u16,
-    /// Zero.
-    pub cb_reserved2: u16,
-    /// Null.
-    pub lp_reserved2: *mut u8,
-    /// The handle the child reads as standard input.
-    pub h_std_input: Handle,
-    /// The handle the child writes as standard output.
-    pub h_std_output: Handle,
-    /// The handle the child writes as standard error.
-    pub h_std_error: Handle,
-}
-
-/// `STARTUPINFOEXW` — the `EXTENDED_STARTUPINFO_PRESENT` form.
-#[repr(C)]
-pub struct StartupInfoExW {
-    /// The plain `STARTUPINFOW`, `cb` set to the whole structure's size.
-    pub startup_info: StartupInfoW,
-    /// The attribute list from `InitializeProcThreadAttributeList`.
-    pub attribute_list: *mut c_void,
-}
-
-/// `PROCESS_INFORMATION`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ProcessInformation {
-    /// The new process; the caller closes it.
-    pub process: Handle,
-    /// The new thread; the caller closes it.
-    pub thread: Handle,
-    /// The new process id. Also the child's process-group id, because the child
-    /// is created with `CREATE_NEW_PROCESS_GROUP`.
-    pub process_id: u32,
-    /// The new thread id.
-    pub thread_id: u32,
-}
-
-/// `JOBOBJECT_BASIC_LIMIT_INFORMATION` — 64 bytes on x64.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct JobObjectBasicLimitInformation {
-    /// `LARGE_INTEGER`.
-    pub per_process_user_time_limit: i64,
-    /// `LARGE_INTEGER`.
-    pub per_job_user_time_limit: i64,
-    /// The `JOB_OBJECT_LIMIT_*` bits; only one is set here.
-    pub limit_flags: u32,
-    /// Unused.
-    pub minimum_working_set_size: usize,
-    /// Unused.
-    pub maximum_working_set_size: usize,
-    /// Unused.
-    pub active_process_limit: u32,
-    /// Unused.
-    pub affinity: usize,
-    /// Unused.
-    pub priority_class: u32,
-    /// Unused.
-    pub scheduling_class: u32,
-}
-
-/// `IO_COUNTERS`.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct IoCounters {
-    /// Unused.
-    pub read_operation_count: u64,
-    /// Unused.
-    pub write_operation_count: u64,
-    /// Unused.
-    pub other_operation_count: u64,
-    /// Unused.
-    pub read_transfer_count: u64,
-    /// Unused.
-    pub write_transfer_count: u64,
-    /// Unused.
-    pub other_transfer_count: u64,
-}
-
-/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` — what `SetInformationJobObject`
-/// takes for `KILL_ON_JOB_CLOSE`.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct JobObjectExtendedLimitInformation {
-    /// The basic limits, where the kill-on-close bit lives.
-    pub basic_limit_information: JobObjectBasicLimitInformation,
-    /// Unused.
-    pub io_info: IoCounters,
-    /// Unused.
-    pub process_memory_limit: usize,
-    /// Unused.
-    pub job_memory_limit: usize,
-    /// Unused.
-    pub peak_process_memory_used: usize,
-    /// Unused.
-    pub peak_job_memory_used: usize,
-}
-
-unsafe extern "system" {
-    /// `GetLastError`.
-    pub fn GetLastError() -> u32;
-    /// `CloseHandle`.
-    pub fn CloseHandle(handle: Handle) -> i32;
-    /// `SetHandleInformation`.
-    pub fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
-    /// `GetStdHandle`.
-    pub fn GetStdHandle(std: u32) -> Handle;
-    /// `CreatePipe`.
-    pub fn CreatePipe(
-        read: *mut Handle,
-        write: *mut Handle,
-        attributes: *const SecurityAttributes,
-        size: u32,
-    ) -> i32;
-    /// `FreeSid`.
-    pub fn FreeSid(sid: Psid) -> Psid;
-    /// `LocalFree`.
-    pub fn LocalFree(memory: *mut c_void) -> *mut c_void;
-    /// `DeriveAppContainerSidFromAppContainerName`. Returns `S_OK` (0) or a
-    /// failure `HRESULT`; the returned SID is freed with [`FreeSid`].
-    pub fn DeriveAppContainerSidFromAppContainerName(name: WideStr, sid: *mut Psid) -> i32;
-    /// `CreateAppContainerProfile` — the profile *behind* the derived SID, and
-    /// the call that makes a launch possible at all. Needs no elevation, is
-    /// idempotent (`HRESULT_ALREADY_EXISTS` still fills `sid` in), and returns
-    /// the same SID the derivation does; the SID is freed with [`FreeSid`].
-    pub fn CreateAppContainerProfile(
-        name: WideStr,
-        display_name: WideStr,
-        description: WideStr,
-        capabilities: *const SidAndAttributes,
-        capability_count: u32,
-        sid: *mut Psid,
-    ) -> i32;
-    /// `DeleteAppContainerProfile` — removes the profile, so a clean exit leaves
-    /// neither an ACE nor a profile behind (design decisions 15, 21).
-    pub fn DeleteAppContainerProfile(name: WideStr) -> i32;
-    /// `ConvertSidToStringSidW`. The returned string is freed with
-    /// [`LocalFree`].
-    pub fn ConvertSidToStringSidW(sid: Psid, string: *mut *mut u16) -> i32;
-    /// `ConvertStringSidToSidW`. The returned SID is freed with [`LocalFree`].
-    pub fn ConvertStringSidToSidW(string: WideStr, sid: *mut Psid) -> i32;
-    /// `CommandLineToArgvW`, used by the command-line quoting test as the
-    /// independent oracle for the quoting rules.
-    pub fn CommandLineToArgvW(command_line: WideStr, argc: *mut i32) -> *mut *mut u16;
-    /// `CreateJobObjectW`.
-    pub fn CreateJobObjectW(attributes: *const SecurityAttributes, name: WideStr) -> Handle;
-    /// `SetInformationJobObject`.
-    pub fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, len: u32) -> i32;
-    /// `AssignProcessToJobObject`.
-    pub fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
-    /// `TerminateJobObject`.
-    pub fn TerminateJobObject(job: Handle, code: u32) -> i32;
-    /// `TerminateProcess` — how a child that never reached the job is ended
-    /// (Task 9's two job failures).
-    pub fn TerminateProcess(process: Handle, code: u32) -> i32;
-    /// `InitializeProcThreadAttributeList`.
-    pub fn InitializeProcThreadAttributeList(
-        list: *mut c_void,
-        count: u32,
-        flags: u32,
-        size: *mut usize,
-    ) -> i32;
-    /// `UpdateProcThreadAttribute`.
-    pub fn UpdateProcThreadAttribute(
-        list: *mut c_void,
-        flags: u32,
-        attribute: usize,
-        value: *mut c_void,
-        size: usize,
-        previous: *mut c_void,
-        returned: *mut usize,
-    ) -> i32;
-    /// `DeleteProcThreadAttributeList`.
-    pub fn DeleteProcThreadAttributeList(list: *mut c_void);
-    /// `CreateProcessW`.
-    pub fn CreateProcessW(
-        application: WideStr,
-        command_line: *mut u16,
-        process_attributes: *const SecurityAttributes,
-        thread_attributes: *const SecurityAttributes,
-        inherit_handles: i32,
-        flags: u32,
-        environment: *mut c_void,
-        current_directory: WideStr,
-        startup_info: *const StartupInfoExW,
-        process_information: *mut ProcessInformation,
-    ) -> i32;
-    /// `WaitForSingleObject`.
-    pub fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
-    /// `GetExitCodeProcess`.
-    pub fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
-    /// `GetSystemDirectoryW` — where the loader says the system directory is,
-    /// which is what keeps `icacls.exe`'s location out of the environment.
-    /// Returns the length copied, or the length required when the buffer is too
-    /// small ([`crate::handles::system_directory`]).
-    pub fn GetSystemDirectoryW(buffer: *mut u16, len: u32) -> u32;
-    /// `SetConsoleCtrlHandler`. The handler runs on a thread the system
-    /// creates, and must do nothing but the one operation it exists for.
-    pub fn SetConsoleCtrlHandler(handler: Option<CtrlHandler>, add: i32) -> i32;
-    /// `GenerateConsoleCtrlEvent`.
-    pub fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
-    /// `CreateEventW`. A manual-reset event the console handler can signal,
-    /// which is the only work the handler does.
-    pub fn CreateEventW(
-        attributes: *const SecurityAttributes,
-        manual_reset: i32,
-        initial_state: i32,
-        name: WideStr,
-    ) -> Handle;
-    /// `SetEvent`.
-    pub fn SetEvent(event: Handle) -> i32;
-}
-
-/// The console control handler's shape: it receives the event and returns
-/// non-zero when it handled it.
-pub type CtrlHandler = unsafe extern "system" fn(event: u32) -> i32;
-```
-
-- [ ] **Step 4: Make the crate Windows-only and rewrite `lib.rs`**
+- [x] **Step 1: Make the crate Windows-only and rewrite `lib.rs`**
 
 P0 leaves `crates/tinio-sandbox-windows/src/lib.rs` as the stub with `pub struct Backend` and `backend()`. The crate-level `cfg` is what lets every module below use `std::os::windows` without a per-module guard, and it leaves the crate empty on Linux and macOS, where the facade never names it.
 
@@ -548,7 +113,8 @@ P0 leaves `crates/tinio-sandbox-windows/src/lib.rs` as the stub with `pub struct
 //! Three consequences are stated rather than hidden: the launcher writes ACEs
 //! onto the operator's directories and a hard kill between grant and rollback
 //! leaves them (design §6); the confined process can read its own install
-//! directory, which is exposed read-only because it cannot load without it
+//! directory, exposed read-only because the child's own loader reads what it
+//! imports under its own token — the image is opened with the launcher's
 //! (design decision 22); and the relay delivers a stop the child must still
 //! know what to do with — the drain that follows is the CLI contract's
 //! (T066/T067), and `launch::on_stop` is the hook it lands on.
@@ -558,7 +124,6 @@ P0 leaves `crates/tinio-sandbox-windows/src/lib.rs` as the stub with `pub struct
 pub mod acl;
 pub mod backend;
 pub mod control;
-pub mod ffi;
 pub mod handles;
 pub mod job;
 pub mod launch;
@@ -610,7 +175,7 @@ pub fn confine(
 }
 ```
 
-- [ ] **Step 5: Write `handles.rs`**
+- [x] **Step 2: Write `handles.rs`**
 
 ```rust
 //! The raw handle plumbing: which handles a child inherits, and how the
@@ -621,27 +186,44 @@ pub fn confine(
 //! inheritable, create a pipe, report a Win32 error and take the system
 //! directory from the kernel without an unsafe call of its own. Every unsafe
 //! block below carries its safety argument.
+//!
+//! **The failure builder is not here any more, and that is where it belongs.**
+//! This module used to carry `step(operation, path, source)`, building
+//! `Error::Launch` and emitting the `error!` event in one call; the core carries
+//! it now as `launch`, beside the other platforms' shapes, so the log's `step`
+//! and the error's `step` cannot drift between them. The
+//! recording-subscriber test that pinned that property moved with it.
+//!
+//! **The Win32 calls below are `windows_sys::…`'s**, each named at the top of
+//! this module rather than declared here or routed through an intermediate
+//! module: the ABI is a dependency's to maintain, and what this crate keeps is
+//! the safety argument for each call (design Bookkeeping).
 
 #![allow(unsafe_code)]
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
+use std::mem::size_of;
 use std::os::windows::io::FromRawHandle;
 use std::path::PathBuf;
+use std::ptr::null_mut;
+use std::slice::from_raw_parts;
 
-use tinio_sandbox_core::{Error, Result};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    SetHandleInformation,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
-use crate::ffi;
-
-/// The handle type the crate's public signatures name.
-///
-/// **Re-exported rather than imported, and that is not a style choice.**
-/// [`crate::job::Job::assign`], [`crate::process::LaunchSpec`] and
-/// [`crate::socket::handle`] are `pub`, so a private `use crate::ffi::Handle;`
-/// here would leave the type those signatures name unreachable from outside the
-/// crate — the private-in-public rule the compiler reports as `E0446` — and the
-/// integration tests, which are a separate crate, could not name it at all.
-pub use crate::ffi::Handle;
+// `launch` is the core's failure builder, in the alias form every sandbox crate
+// names the core through (`crate::_core`, `docs/style.md` §Imports and shared §1;
+// the `tinio_sandbox_core::` spelling is what these blocks used before it). `Error` left this `use` with the builder: the
+// module's own signatures name `Result`, and the two doc links below point at
+// the variant by path.
+use crate::_core::{Result, launch};
 
 /// The Win32 error the last failing call set.
 ///
@@ -659,7 +241,7 @@ pub use crate::ffi::Handle;
 pub fn last_error() -> io::Error {
     // SAFETY: GetLastError reads the calling thread's last-error value; it takes
     // no arguments and has no preconditions.
-    unsafe { io::Error::from_raw_os_error(ffi::GetLastError() as i32) }
+    unsafe { io::Error::from_raw_os_error(GetLastError() as i32) }
 }
 
 /// The system directory, as the kernel reports it rather than as an environment
@@ -693,7 +275,7 @@ pub fn system_directory() -> PathBuf {
     // SAFETY: `buffer` is a valid, writable array of `buffer.len()` UTF-16 units
     // and stays alive for the call; the call writes at most that many and touches
     // nothing else.
-    let len = unsafe { ffi::GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
     if len == 0 || len as usize >= buffer.len() {
         return PathBuf::from(r"C:\Windows\System32");
     }
@@ -704,26 +286,8 @@ pub fn system_directory() -> PathBuf {
     // Decoded here rather than through `crate::from_wide`, which lands with
     // `lib.rs` in Task 2: this module is written before it, and the length the
     // call already returned is all the conversion needs.
-    let text = unsafe { std::slice::from_raw_parts(buffer.as_ptr(), len as usize) };
+    let text = unsafe { from_raw_parts(buffer.as_ptr(), len as usize) };
     PathBuf::from(String::from_utf16_lossy(text))
-}
-
-/// A launcher-step failure about `path`, logged as it is built.
-///
-/// **The `error!` is emitted here rather than at each call site, and that is
-/// shared §7's rule made structural**: the log's `step` and the `Error::Launch`
-/// it accompanies carry the same string because one function produces both, so
-/// they cannot drift apart as call sites are added. It is also this crate's only
-/// failure-logging site, which is why `ffi.rs`, `job.rs`, `process.rs` and the
-/// rest report a Win32 error without a `tracing` call of their own.
-pub fn step(operation: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {
-    let path = path.into();
-    tracing::error!(step = operation, path = %path.display(), err = %source);
-    Error::Launch {
-        operation,
-        path,
-        source,
-    }
 }
 
 /// Make `handle` inheritable, so a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` may name
@@ -735,13 +299,18 @@ pub fn step(operation: &'static str, path: impl Into<PathBuf>, source: io::Error
 /// # Errors
 ///
 /// The Win32 error when `SetHandleInformation` refuses.
-pub fn mark_inheritable(handle: Handle) -> io::Result<()> {
+// The raw-pointer argument is this module's reason to exist rather than a hazard
+// to hide: `HANDLE` is windows-sys's public handle type (later tasks name it in
+// their signatures), and the contract — a live handle the caller owns — is
+// proven by the caller. Making this an `unsafe fn` would put an `unsafe` block
+// in every module that marks a handle inheritable, which is what design decision
+// 14 confines to this one.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn mark_inheritable(handle: HANDLE) -> io::Result<()> {
     // SAFETY: `handle` is a live handle the caller owns for the duration of the
     // call, and SetHandleInformation with HANDLE_FLAG_INHERIT only sets the
     // inherit bit on that handle.
-    let ok = unsafe {
-        ffi::SetHandleInformation(handle, ffi::HANDLE_FLAG_INHERIT, ffi::HANDLE_FLAG_INHERIT)
-    };
+    let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
     if ok == 0 {
         return Err(last_error());
     }
@@ -766,15 +335,16 @@ pub fn mark_inheritable(handle: Handle) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] when there is no standard error at all: a process with
+/// [`Error::Launch`](crate::_core::Error::Launch) when there is no standard
+/// error at all: a process with
 /// nowhere to log cannot host a confined server, and the remedy belongs in the
 /// message rather than in a child that dies on its first log write.
-pub fn inherited_stderr() -> Result<Handle> {
+pub fn inherited_stderr() -> Result<HANDLE> {
     // SAFETY: GetStdHandle takes an index and returns the process's handle for
     // it; it has no other precondition.
-    let handle = unsafe { ffi::GetStdHandle(ffi::STD_ERROR_HANDLE) };
-    if handle.is_null() || handle == ffi::INVALID_HANDLE_VALUE {
-        return Err(step(
+    let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(launch(
             "read the standard handles",
             PathBuf::from("stderr"),
             io::Error::other(
@@ -783,7 +353,7 @@ pub fn inherited_stderr() -> Result<Handle> {
         ));
     }
     mark_inheritable(handle)
-        .map_err(|source| step("mark a standard handle inheritable", "stderr", source))?;
+        .map_err(|source| launch("mark a standard handle inheritable", "stderr", source))?;
     Ok(handle)
 }
 
@@ -799,9 +369,9 @@ pub fn inherited_stderr() -> Result<Handle> {
 /// second mechanism for a guarantee `CreateProcessW` already applies.
 pub struct Pipe {
     /// The end the child reads: the payload pipe's child side (its stdin).
-    pub read: Handle,
+    pub read: HANDLE,
     /// The end the child writes: the event pipe's child side.
-    pub write: Handle,
+    pub write: HANDLE,
 }
 
 /// Create a pipe with both ends inheritable.
@@ -810,22 +380,22 @@ pub struct Pipe {
 ///
 /// The Win32 error from `CreatePipe`.
 pub fn pipe() -> io::Result<Pipe> {
-    let attributes = ffi::SecurityAttributes {
-        length: std::mem::size_of::<ffi::SecurityAttributes>() as u32,
-        descriptor: std::ptr::null_mut(),
-        inherit: 1,
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
     };
-    let mut read: Handle = std::ptr::null_mut();
-    let mut write: Handle = std::ptr::null_mut();
+    let mut read: HANDLE = null_mut();
+    let mut write: HANDLE = null_mut();
     // SAFETY: both out-parameters are valid, aligned and writable for the call,
     // and `attributes` is a correctly sized SECURITY_ATTRIBUTES that lives until
     // the call returns.
-    let ok = unsafe { ffi::CreatePipe(&mut read, &mut write, &attributes, 0) };
+    let ok = unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) };
     if ok == 0 {
         return Err(last_error());
     }
     // The caller names which std stream this pipe carries when it maps the
-    // failure above (`step("CreatePipe", "stdin"/"stdout", …)`); the event has
+    // failure above (`launch("CreatePipe", "stdin"/"stdout", …)`); the event has
     // the two handle values, which is what identifies a pipe in a log.
     tracing::debug!(step = "CreatePipe", read = ?read, write = ?write);
     Ok(Pipe { read, write })
@@ -848,7 +418,7 @@ pub fn pipe() -> io::Result<Pipe> {
 /// open, the child's stdout never reaches end-of-stream, the relay's read never
 /// returns, and `Child::wait`'s join with it never finishes. [`close`] is the
 /// call, and the launch site makes it immediately after `CreateProcessW`.
-pub fn parent_end(handle: Handle) -> File {
+pub fn parent_end(handle: HANDLE) -> File {
     // SAFETY: `handle` is one end of a pipe this process created and handed
     // over; no other `File` owns it, and nothing else closes it.
     unsafe { File::from_raw_handle(handle.cast()) }
@@ -859,10 +429,13 @@ pub fn parent_end(handle: Handle) -> File {
 /// Used for the child's own ends of the two pipes once `CreateProcessW` has
 /// duplicated them into the child: see [`parent_end`] for why leaving the event
 /// pipe's write end open is a hang rather than a leak.
-pub fn close(handle: Handle) {
+// The allow is [`mark_inheritable`]'s, for the same reason and with the same
+// contract: the caller owns the handle and gives it up exactly once, here.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn close(handle: HANDLE) {
     // SAFETY: `handle` is a live handle this process owns and is giving up; it
     // is closed exactly once, here, and nothing else holds a copy of it.
-    unsafe { ffi::CloseHandle(handle) };
+    unsafe { CloseHandle(handle) };
 }
 
 /// Write the launch frame into the child's stdin and close it (design §3 step 7).
@@ -888,89 +461,31 @@ pub fn close(handle: Handle) {
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] when the write or the flush fails — including a child that
+/// [`Error::Launch`](crate::_core::Error::Launch) when the write or the flush
+/// fails — including a child that
 /// died before reading, which a pipe write reports as a broken pipe.
-pub fn write_payload(writer: Handle, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-
+pub fn write_payload(writer: HANDLE, bytes: &[u8]) -> Result<()> {
     let mut file = parent_end(writer);
     file.write_all(bytes)
-        .map_err(|source| step("write the launch payload", "stdin", source))?;
+        .map_err(|source| launch("write the launch payload", "stdin", source))?;
     file.flush()
-        .map_err(|source| step("flush the launch payload", "stdin", source))?;
+        .map_err(|source| launch("flush the launch payload", "stdin", source))?;
     tracing::debug!(step = "write the launch payload", bytes = bytes.len());
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use std::io::Write as _;
-    use std::sync::{Arc, Mutex};
-
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::fmt::MakeWriter;
-
-    use super::*;
-
-    /// A subscriber whose writer keeps what it is given.
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Capture {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("the capture mutex").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for Capture {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Shared §7's "the log's `step` and the error's `step` are the same string",
-    /// made a property a test can lose: `step` both builds the `Error` and emits
-    /// the event, so removing one of the two breaks this test and nothing else.
-    ///
-    /// It is deliberately one test and not one per operation: the other events
-    /// this crate emits are read where they land (shared §7), while this one pins
-    /// the rule that the failure path cannot drift from the value the caller sees.
-    ///
-    /// The level is the one `serve`'s subscriber enables (`Verbosity::Info`) and
-    /// not `TRACE`, so a failure that was moved to `debug!` would stop being
-    /// recorded and this test would lose the property rather than keep it.
-    #[test]
-    fn a_step_failure_logs_the_step_it_reports() {
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-
-        let error = with_default(subscriber, || {
-            step("CreateProcessW", "program", io::Error::other("boom"))
-        });
-
-        let Error::Launch { operation, .. } = &error else {
-            panic!("step builds Error::Launch: {error:?}");
-        };
-        assert_eq!(*operation, "CreateProcessW");
-        let logged = String::from_utf8(capture.0.lock().expect("the capture mutex").clone())
-            .expect("the capture is UTF-8");
-        assert!(logged.contains("CreateProcessW"), "{logged}");
-        assert!(logged.contains("program"), "{logged}");
-    }
-}
 ```
 
-- [ ] **Step 6: Write the manifest and the lint exception**
+**There is no recorder test in this module, and its absence is the correction rather than an omission.** The property shared §7 pins — the log's `step` and the error's `step` are the same string — belongs to whatever builds both halves, and that is the core's `launch` now, not this crate: a test here would fail for code this crate does not own, and there is nothing left here for it to pin. It lives in the core's `error.rs`, beside `launch`, where the phase-basis correction put it.
+
+- [x] **Step 3: Write the manifest and the lint exception**
+
+Two manifests change: the root pins `windows-sys`, and the crate names it.
+
+`Cargo.toml` (the workspace root) gains one line in `[workspace.dependencies]`, in the external group's alphabetical place — after `winapi-util`:
+
+```toml
+windows-sys = "0.61"
+```
 
 `crates/tinio-sandbox-windows/Cargo.toml` — P0's stub becomes the real manifest:
 
@@ -989,6 +504,20 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "rt"] }
 tracing.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 tinio-sandbox-core.workspace = true
 
@@ -1003,21 +532,23 @@ absolute_paths = "warn"
 unsafe_code = "deny"
 ```
 
-**`serde_json` and `tokio`, and each is there for a named reason.** `serde_json` serializes the payload at the call site — the core has no `encode` method, because the payload is one `serde` object (decision 17). `tokio`'s `io-util` is what the core's async `reemit` is written against, `io-std` is what makes `tokio::io::stdout()` an `AsyncWrite` at all (`Stdout` and `Stderr` need that feature; neither has a `futures::io` bridge), and `rt` is what lets the relay thread build a **current-thread** runtime to poll it: this launcher is built on blocking Win32 calls and has no runtime of its own, so the relay gets the smallest one that works rather than a multi-threaded runtime nothing else would use. **`fs` is the fourth and it is the least obvious**: the core's `Observer` wants an `AsyncBufRead`, and on Windows a child's stdout is a `CreatePipe` handle with no async counterpart in tokio — `tokio::fs::File::from_std` is what reads one, and it is the same class of implementation tokio itself uses for `ChildStdout` on this platform (a blocking read on the blocking pool, not an IOCP registration). P0 leaves that choice to the platform crate by design ("the child's stdout *is* an `AsyncBufRead`"), so this crate names the feature that makes it true. All four are unconditional here rather than macOS-style target-gated, because this crate only ever compiles on Windows. **`tracing` is the fifth line and `tracing-subscriber` is the dev-dependency**, for the reason shared §7 gives: every core operation this crate performs emits an event, the crate installs no subscriber of its own, and the one subscriber it ever builds is `handles`' test recorder. `tracing` is already in `[workspace.dependencies]`, so the workspace gains no new third-party dependency from either line.
+**`windows-sys` carries twelve features and no more, and each is a module group this phase's code reaches into**: `Win32_Foundation` for `HANDLE`, `CloseHandle`, `GetLastError`, `SetHandleInformation`, `LocalFree` and the `WAIT_*`, `HANDLE_FLAG_*`, `ERROR_*` constants; `Win32_Security` for `SECURITY_ATTRIBUTES`, `SECURITY_CAPABILITIES`, `SID_AND_ATTRIBUTES`, `PSID` and `FreeSid`; `Win32_Security_Authorization` for `Convert{SidToString,StringToSid}W` (Task 2); `Win32_Security_Isolation` for the three AppContainer profile calls (Task 2); `Win32_System_Threading` for `CreateProcessW`, the proc-thread attribute list and its three calls, `STARTUPINFO{,EX}W`, `PROCESS_INFORMATION`, the `PROC_THREAD_ATTRIBUTE_{SECURITY_CAPABILITIES,HANDLE_LIST}` values, `CreateEventW`, `SetEvent`, `WaitForSingleObject`, `GetExitCodeProcess` and `TerminateProcess` (Tasks 8, 10); `Win32_System_JobObjects` for the Job API (Task 5); `Win32_System_Console` for the three control-event calls, `GetStdHandle` and the `CTRL_*`/`STD_*` constants (Tasks 1, 10); `Win32_System_Pipes` for `CreatePipe`; `Win32_System_SystemInformation` for `GetSystemDirectoryW`; **`Win32_System_SystemServices` for `SE_GROUP_ENABLED`, the one attribute the container's capability entries need (Task 12, and the only feature this list gained after Task 1 — see Task 3's correction note)**; `Win32_Storage_FileSystem` for `FILE_ATTRIBUTE_REPARSE_POINT` (Task 3); and `Win32_UI_Shell` for `CommandLineToArgvW`, the quoting test's oracle (Task 8). Listing them rather than pulling the `Win32` super-feature is the curation the design's ledger asks for; a later task that reaches into a further group adds its line in the task that does so, exactly as it adds its `pub mod` to `lib.rs`. **The version is pinned once, at the workspace, and the features are named where they are used** — `docs/cargo.md` §Features owns that split, and this crate follows it rather than repeating the list two levels up.
+
+**`serde_json` and `tokio`, and each is there for a named reason.** `serde_json` serializes the payload at the call site — the core has no `encode` method, because the payload is one `serde` object (decision 17). `tokio`'s `io-util` is what the core's async `reemit` is written against, `io-std` is what makes `tokio::io::stdout()` an `AsyncWrite` at all (`Stdout` and `Stderr` need that feature; neither has a `futures::io` bridge), and `rt` is what lets the relay thread build a **current-thread** runtime to poll it: this launcher is built on blocking Win32 calls and has no runtime of its own, so the relay gets the smallest one that works rather than a multi-threaded runtime nothing else would use. **`fs` is the fourth and it is the least obvious**: the core's `Observer` wants an `AsyncBufRead`, and on Windows a child's stdout is a `CreatePipe` handle with no async counterpart in tokio — `tokio::fs::File::from_std` is what reads one, and it is the same class of implementation tokio itself uses for `ChildStdout` on this platform (a blocking read on the blocking pool, not an IOCP registration). P0 leaves that choice to the platform crate by design ("the child's stdout *is* an `AsyncBufRead`"), so this crate names the feature that makes it true. All four are unconditional here rather than macOS-style target-gated, because this crate only ever compiles on Windows. **`tracing` is the fifth line and `tracing-subscriber` is the dev-dependency**, for the reason shared §7 gives: every core operation this crate performs emits an event, the crate installs no subscriber of its own, and only its tests build one to assert an event with. **It stays declared even though this task's module no longer carries the recorder test** — that test moved to the core with the builder it pinned — because the phase's later tasks assert events of their own — Task 11's launcher arm logs into `main`'s subscriber rather than installing one, so what builds a subscriber of its own here is a **test** asserting an event, which is what shared §7 prescribes and why the call is `try_init` — and a dev-dependency removed and re-added three tasks later is churn in a manifest this phase wants still. `tracing` is already in `[workspace.dependencies]`, so the workspace gains no new third-party dependency from either line.
 
 **`docs/cargo.md` is not edited here, and this phase must not edit it.** The lint bullet is written once, by P1 Task 9 Step 4, and `2026-09-18-sandbox-shared.md` §1 records why the line lives there and what a second copy of it costs. This plan used to carry its own version of the same bullet, worded differently and enumerating this crate's FFI modules; it was removed for that reason, and an enumeration written here would have had to list modules this phase had not yet designed.
 
 What this phase does instead is **verify the line before it starts**: `docs/cargo.md` must already carry the rule for the platform backends — each becomes `deny` as its backend lands — with the sites deferred to decision 14. If it does not, P1 has not landed and this phase stops rather than restating the rule. Where this crate's own sites are recorded is the design's decision 14 and this plan's Task 1 — not `docs/cargo.md`, which states the rule and points there.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-windows` and `cargo test -p tinio-sandbox-core`
-Expected: PASS — the layout tests and the core's error test. The crate's other modules do not exist yet, so trim `lib.rs`'s `pub mod` list to what exists and add each module back in the task that creates it.
+Expected: PASS — the crate's five doc tests (two of them `handles`', `last_error` and `system_directory`; the other three are `lib.rs`'s) and the core's error test. **The core's suite is named here because the failure builder this task used to define is the core's now**: `handles.rs` carries no test module after the phase-basis correction — and its former unit tests, the five layout assertions, went with the declarations they pinned (design Bookkeeping) — while the recorder test that pinned shared §7's step-equals-step property runs in `tinio-sandbox-core` beside `launch`. The crate's other modules do not exist yet, so trim `lib.rs`'s `pub mod` list to what exists and add each module back in the task that creates it.
 
-- [ ] **Step 8: Verify the boundary is what the docs say**
+- [x] **Step 5: Verify the boundary is what the docs say**
 
 Run: `rg -c 'allow\(unsafe_code\)' crates/tinio-sandbox-windows/src` and `cargo clippy -p tinio-sandbox-windows --all-targets -- -D warnings`
-Expected: clippy clean; the grep prints the number of files carrying an allow — at this point `handles.rs`, plus `ffi.rs` if the mandatory `unsafe extern` keyword trips the lint in edition 2024. `lib.rs` joins them in Task 2, and it does so **without a file-level attribute**: `from_wide` is the crate root's single site and carries `#[allow(unsafe_code)]` on the function, which is the smallest scope the constitution asks for and the reason the crate's `deny` is not relaxed to cover the whole root. Keep decision 14's list of sites equal to what exists, and let it grow as the later tasks add modules: decision 14 asks for an enumerated scope, not a number fixed in advance.
+Expected: clippy clean; the grep prints the number of files carrying an allow — at this point one, `handles.rs`, which is the crate's only module besides the root. `lib.rs` joins it in Task 2, and it does so **without a file-level attribute**: `from_wide` is the crate root's single site and carries `#[allow(unsafe_code)]` on the function, which is the smallest scope the constitution asks for and the reason the crate's `deny` is not relaxed to cover the whole root. Keep decision 14's list of sites equal to what exists, and let it grow as the later tasks add modules: decision 14 asks for an enumerated scope, not a number fixed in advance.
 
 ---
 
@@ -1029,14 +560,14 @@ Expected: clippy clean; the grep prints the number of files carrying an allow �
 - Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (§6's derivation sentence and decision 21: the profile is created, reused and deleted with the SID)
 
 **Interfaces:**
-- Consumes: `handles::{last_error, step}`, `ffi`.
+- Consumes: `handles::last_error`; `windows-sys`'s AppContainer profile and SID-conversion calls — `Win32::Security::Isolation`'s three profile functions and `Win32::Security::Authorization`'s two conversions — plus `Win32::Security`'s `PSID`, `SID_AND_ATTRIBUTES` and `FreeSid` and `Win32::Foundation`'s `LocalFree`; `crate::_core::launch`.
 - Produces: `sid::package_name(root: &Path) -> String`, `sid::PackageSid` with `derive(name)`, `as_str()`, `raw()` and `Drop` — the `Drop` removes the profile as well as freeing the SID; `sid::CapabilitySids` with `resolve(&[&str])`, `as_ptr()`, `len()`, `is_empty()` and `Drop`. **Nothing about the launch payload belongs here**: the payload is one JSON object owned by the core, and this module's job is the SID the confinement is built around.
 
 The SID is derived, never generated, and the name it is derived from is a function of the served root (decision 2 of this plan): a crash leaves *identifiable, reusable* ACEs (design decision 21), and two servers on different roots cannot read each other's tree through a shared package SID.
 
-**The derived SID is not enough on its own, and this is measured rather than assumed.** A SID that only `DeriveAppContainerSidFromAppContainerName` produced cannot launch anything: handing it to `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` makes `CreateProcessW` fail with `err=2 ERROR_FILE_NOT_FOUND` — for this crate's own binary and for `cmd.exe` alike, and that failure is unchanged by granting the SID an ACE on the directory holding the program. Calling `CreateAppContainerProfile` first makes the identical call succeed, needs no elevation, and returns the *same* SID the derivation does; the profile is the object the kernel checks for, and the derivation is the way to compute its name. **So the profile joins the residue story rather than sitting beside it.** It is a second artifact this run creates and must take back, and it follows exactly the rules the ACEs do: it is named from the served root, so a hard kill's profile is the next run's to take over (`CreateAppContainerProfile` reports `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` and still fills the SID in, which this module treats as success), and a clean exit removes it with `DeleteAppContainerProfile` on the same path that removes the ACEs (design decisions 15 and 21 — the ACE half is Task 4's and Task 9's, this half is the `Drop` below).
+**The derived SID is not enough on its own, and this is measured rather than assumed.** A SID that only `DeriveAppContainerSidFromAppContainerName` produced cannot launch anything: handing it to `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` makes `CreateProcessW` fail with `err=2 ERROR_FILE_NOT_FOUND` — for this crate's own binary and for `cmd.exe` alike, and that failure is unchanged by granting the SID an ACE on the directory holding the program. Calling `CreateAppContainerProfile` first makes the identical call succeed, needs no elevation, and returns the *same* SID the derivation does; the profile is the object the kernel checks for, and the derivation is the way to compute its name. **So the profile joins the residue story rather than sitting beside it.** It is a second artifact this run creates and must take back, and it follows exactly the rules the ACEs do: it is named from the served root, so a hard kill's profile is the next run's to take over (`CreateAppContainerProfile` reports `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` **without filling the SID out-parameter in** — measured on this host 2026-09-21 — which this module treats as success and answers by deriving the SID from the same name, the value the creation itself would have returned), and a clean exit removes it with `DeleteAppContainerProfile` on the same path that removes the ACEs (design decisions 15 and 21 — the ACE half is Task 4's and Task 9's, this half is the `Drop` below).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `crates/tinio-sandbox-windows/src/sid.rs`:
 
@@ -1086,17 +617,17 @@ mod tests {
         assert!(sid.as_str().starts_with("S-1-15-2-"), "{}", sid.as_str());
 
         let wide = crate::wide(&name);
-        let mut derived: Psid = ptr::null_mut();
+        let mut derived: PSID = ptr::null_mut();
         // SAFETY: `wide` is NUL-terminated and alive for the call, and `derived`
         // is a valid out-parameter; the SID is freed below with FreeSid.
         let hr = unsafe {
-            ffi::DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut derived)
+            DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut derived)
         };
         assert_eq!(hr, 0, "hr=0x{hr:08X}");
         let mut text: *mut u16 = ptr::null_mut();
         // SAFETY: `derived` is the SID just returned and `text` is a valid
         // out-parameter; the string is freed below with LocalFree.
-        let ok = unsafe { ffi::ConvertSidToStringSidW(derived, &mut text) };
+        let ok = unsafe { ConvertSidToStringSidW(derived, &mut text) };
         assert_ne!(ok, 0);
         // SAFETY: `text` is a NUL-terminated UTF-16 string the conversion just
         // allocated, and it is the last use of the buffer.
@@ -1104,18 +635,23 @@ mod tests {
         // SAFETY: `text` came from the conversion, whose documented release is
         // LocalFree, and `derived` from the derivation, whose release is FreeSid.
         unsafe {
-            ffi::LocalFree(text.cast());
-            ffi::FreeSid(derived);
+            LocalFree(text.cast());
+            FreeSid(derived);
         }
         assert_eq!(rendered, sid.as_str(), "the profile's SID is the derived SID");
 
         // The second creation is what a run after a hard kill does, and it is
-        // success with the SID filled in (decision 21's takeover).
-        let mut again: Psid = ptr::null_mut();
+        // success: `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`, reported **without**
+        // the SID out-parameter filled in — measured on this host 2026-09-21, and
+        // the Windows SDK's sample answers that code the same way. What the
+        // takeover rests on is therefore not the collision's output but the name,
+        // which the derivation below turns into the same SID (decision 21).
+        let mut again: PSID = ptr::null_mut();
         // SAFETY: as above: a null capability array with a count of zero is the
-        // documented "no capabilities", and the SID is freed below.
+        // documented "no capabilities", and whatever the out-parameter holds is
+        // freed below.
         let hr = unsafe {
-            ffi::CreateAppContainerProfile(
+            CreateAppContainerProfile(
                 wide.as_ptr(),
                 wide.as_ptr(),
                 wide.as_ptr(),
@@ -1124,10 +660,46 @@ mod tests {
                 &mut again,
             )
         };
-        assert_eq!(hr, ffi::HRESULT_ALREADY_EXISTS, "hr=0x{hr:08X}");
-        assert!(!again.is_null(), "ERROR_ALREADY_EXISTS still fills the SID in");
-        // SAFETY: `again` is this call's own allocation, freed exactly once.
-        unsafe { ffi::FreeSid(again) };
+        assert_eq!(hr, HRESULT_ALREADY_EXISTS, "hr=0x{hr:08X}");
+        // SAFETY: `again` is this call's own allocation when it handed one back at
+        // all, and the collision promises nothing about that — so the free is
+        // guarded rather than assumed.
+        if !again.is_null() {
+            unsafe { FreeSid(again) };
+        }
+
+        // The residue is *reusable*, which is the property rather than the
+        // collision's return value: the same name derives the same SID the first
+        // creation returned, so a takeover has something to launch under.
+        let mut reused: PSID = ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and alive for the call, and `reused` is
+        // a valid out-parameter; the SID is freed below with FreeSid.
+        let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut reused) };
+        assert_eq!(hr, 0, "hr=0x{hr:08X}");
+        let mut reused_text: *mut u16 = ptr::null_mut();
+        // SAFETY: `reused` is the SID just returned and `reused_text` is a valid
+        // out-parameter; the string is freed below with LocalFree.
+        let ok = unsafe { ConvertSidToStringSidW(reused, &mut reused_text) };
+        assert_ne!(ok, 0);
+        // SAFETY: `reused_text` is a NUL-terminated UTF-16 string the conversion
+        // just allocated, and it is the last use of the buffer.
+        let reused_rendered = unsafe { crate::from_wide(reused_text) };
+        // SAFETY: `reused_text` came from the conversion, whose documented release
+        // is LocalFree, and `reused` from the derivation, whose release is FreeSid.
+        unsafe {
+            LocalFree(reused_text.cast());
+            FreeSid(reused);
+        }
+        assert_eq!(
+            reused_rendered,
+            sid.as_str(),
+            "the residue is reusable: one name, one SID"
+        );
+
+        // And the module's own takeover, which is what the launcher calls: the
+        // same name while the first value still holds the profile alive.
+        let taken_over = PackageSid::derive(&name).unwrap();
+        assert_eq!(taken_over.as_str(), sid.as_str(), "the takeover keeps the SID");
     }
 
     #[test]
@@ -1144,12 +716,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-windows sid::`
 Expected: FAIL — `cannot find function 'package_name'`.
 
-- [ ] **Step 3: Write `sid.rs`**
+- [x] **Step 3: Write `sid.rs`**
 
 ```rust
 //! The AppContainer package SID, and the capability SIDs a container is created
@@ -1161,15 +733,42 @@ Expected: FAIL — `cannot find function 'package_name'`.
 
 #![allow(unsafe_code)]
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use sha2::{Digest, Sha256};
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSidToSidW,
+};
+use windows_sys::Win32::Security::Isolation::{
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+};
+use windows_sys::Win32::Security::{FreeSid, PSID, SID_AND_ATTRIBUTES};
+use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 
-use tinio_sandbox_core::Result;
+use crate::_core::{Result, launch};
+use crate::handles::last_error;
 
-use crate::ffi::{self, Psid, SidAndAttributes};
-use crate::handles::{last_error, step};
+/// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` — what `CreateAppContainerProfile`
+/// returns for a profile that is already there. A residue from a crashed run is
+/// success here rather than an error (design decision 21).
+///
+/// **The collision comes back with the SID out-parameter left null**, which this
+/// module measured on this host 2026-09-21 rather than assumed: the Windows SDK's
+/// own sample answers the same code by falling back to
+/// `DeriveAppContainerSidFromAppContainerName`, and the takeover below is that
+/// pattern. An earlier draft of this block asserted the opposite — that the
+/// creation fills the SID in anyway — and its test failed for it.
+///
+/// **It is `windows-sys`'s one gap for this crate, and the reason is that
+/// `HRESULT_FROM_WIN32` is a macro rather than a constant** — `winnt.h` expands
+/// it, so there is no item to name. This is the arithmetic for the one error
+/// code the crate tests: `FACILITY_WIN32` (`0x07`) in the high half and
+/// `ERROR_ALREADY_EXISTS` (183, which `windows_sys::Win32::Foundation` *does*
+/// export) in the low one — `0x8007_0000 | 183`.
+const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
 
 /// The AppContainer package name for `root`.
 ///
@@ -1227,7 +826,7 @@ pub fn package_name(root: &Path) -> String {
 /// profile's lifetime is the value's, which is the launcher's, which is the
 /// child's.
 pub struct PackageSid {
-    raw: Psid,
+    raw: PSID,
     text: String,
     name: String,
 }
@@ -1246,7 +845,7 @@ impl PackageSid {
     /// or malformed surfaces here, before anything has been granted.
     pub fn derive(name: &str) -> Result<Self> {
         let wide = crate::wide(name);
-        let mut raw: Psid = ptr::null_mut();
+        let mut raw: PSID = ptr::null_mut();
         // SAFETY: `wide` is a NUL-terminated UTF-16 buffer alive for the call and
         // `raw` is a valid out-parameter; the display name and the description
         // are the same buffer so the profile is identifiable, and a null
@@ -1254,7 +853,7 @@ impl PackageSid {
         // capabilities". The returned SID is freed in `Drop` with FreeSid, as the
         // API documents.
         let hr = unsafe {
-            ffi::CreateAppContainerProfile(
+            CreateAppContainerProfile(
                 wide.as_ptr(),
                 wide.as_ptr(),
                 wide.as_ptr(),
@@ -1264,39 +863,68 @@ impl PackageSid {
             )
         };
         // `ERROR_ALREADY_EXISTS` is success and not a special case: it is exactly
-        // what the run after a hard kill sees, `raw` is filled either way, and
-        // treating it as a failure would make the residue unrecoverable rather
-        // than reusable (design decision 21).
-        if hr != 0 && hr != ffi::HRESULT_ALREADY_EXISTS {
-            return Err(step(
+        // what the run after a hard kill sees, and treating it as a failure would
+        // make the residue unrecoverable rather than reusable (design decision
+        // 21). It is *not* the whole story, though — the creation reports the
+        // collision and leaves `raw` null (measured on this host 2026-09-21, and
+        // the Windows SDK's sample falls back the same way), so the takeover's
+        // SID comes from `DeriveAppContainerSidFromAppContainerName`, which is
+        // the same value the creation would have returned. That is what makes the
+        // path reusable rather than merely non-fatal.
+        let taken_over = hr == HRESULT_ALREADY_EXISTS;
+        if taken_over {
+            // SAFETY: `wide` is NUL-terminated and alive for the call and `raw`
+            // is a valid out-parameter; the SID is freed in `Drop` with FreeSid,
+            // as the API documents.
+            let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut raw) };
+            if hr != 0 {
+                return Err(launch(
+                    "DeriveAppContainerSidFromAppContainerName",
+                    name,
+                    io::Error::other(format!(
+                        "DeriveAppContainerSidFromAppContainerName: hr=0x{hr:08X}"
+                    )),
+                ));
+            }
+        } else if hr != 0 {
+            return Err(launch(
                 "CreateAppContainerProfile",
                 name,
-                std::io::Error::other(format!("CreateAppContainerProfile: hr=0x{hr:08X}")),
+                io::Error::other(format!("CreateAppContainerProfile: hr=0x{hr:08X}")),
             ));
         }
         if raw.is_null() {
-            return Err(step(
-                "CreateAppContainerProfile",
+            // Neither call leaves the out-parameter null on the success it
+            // reports, so this is the API's contract breaking rather than a
+            // condition the caller can act on — and the operation named is the
+            // one that actually ran.
+            let operation = if taken_over {
+                "DeriveAppContainerSidFromAppContainerName"
+            } else {
+                "CreateAppContainerProfile"
+            };
+            return Err(launch(
+                operation,
                 name,
-                std::io::Error::other("CreateAppContainerProfile returned no SID"),
+                io::Error::other("the package SID was not filled in"),
             ));
         }
         let mut text: *mut u16 = ptr::null_mut();
         // SAFETY: `raw` is the SID `CreateAppContainerProfile` just returned, and
         // `text` is a valid out-parameter; the string is freed below.
-        let ok = unsafe { ffi::ConvertSidToStringSidW(raw, &mut text) };
+        let ok = unsafe { ConvertSidToStringSidW(raw, &mut text) };
         if ok == 0 || text.is_null() {
             // SAFETY: `raw` is this call's own allocation and nothing else has
             // taken it.
-            unsafe { ffi::FreeSid(raw) };
-            return Err(step("render the package SID", name, last_error()));
+            unsafe { FreeSid(raw) };
+            return Err(launch("render the package SID", name, last_error()));
         }
         // SAFETY: `text` is a NUL-terminated UTF-16 string the conversion just
         // allocated.
         let rendered = unsafe { crate::from_wide(text) };
         // SAFETY: `text` is the buffer the conversion allocated for us, and the
         // copy above was its last use.
-        unsafe { ffi::LocalFree(text.cast()) };
+        unsafe { LocalFree(text.cast()) };
         // `info!`, and it is the event an operator's "was this process confined,
         // and to what" question is answered from: the name the profile was created
         // under and the SID it returned, as fields rather than a sentence. When a
@@ -1317,8 +945,8 @@ impl PackageSid {
         &self.text
     }
 
-    /// The raw SID, for [`ffi::SecurityCapabilities`].
-    pub fn raw(&self) -> Psid {
+    /// The raw SID, for the `SECURITY_CAPABILITIES` value the launch builds.
+    pub fn raw(&self) -> PSID {
         self.raw
     }
 }
@@ -1327,11 +955,11 @@ impl Drop for PackageSid {
     fn drop(&mut self) {
         // SAFETY: `raw` is this value's own allocation, produced by the profile
         // creation and freed exactly once here.
-        unsafe { ffi::FreeSid(self.raw) };
+        unsafe { FreeSid(self.raw) };
         let wide = crate::wide(&self.name);
         // SAFETY: `wide` is NUL-terminated and alive for the call, and the name
         // is the one this value created the profile under.
-        let hr = unsafe { ffi::DeleteAppContainerProfile(wide.as_ptr()) };
+        let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
         if hr != 0 {
             // A residue rather than a failure, and `Drop` has no caller to report
             // one to: the next run derives the same name and takes this profile
@@ -1350,8 +978,8 @@ impl Drop for PackageSid {
 /// list, and the kernel reads it again at `CreateProcessW` time rather than
 /// copying it.
 pub struct CapabilitySids {
-    entries: Vec<SidAndAttributes>,
-    owned: Vec<Psid>,
+    entries: Vec<SID_AND_ATTRIBUTES>,
+    owned: Vec<PSID>,
 }
 
 impl CapabilitySids {
@@ -1366,24 +994,37 @@ impl CapabilitySids {
         let mut owned = Vec::with_capacity(sids.len());
         for text in sids {
             let wide = crate::wide(text);
-            let mut raw: Psid = ptr::null_mut();
+            let mut raw: PSID = ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated and alive for the call; the
             // returned SID is freed in `Drop` with LocalFree, as documented.
-            let ok = unsafe { ffi::ConvertStringSidToSidW(wide.as_ptr(), &mut raw) };
+            let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw) };
             if ok == 0 || raw.is_null() {
-                return Err(step("resolve a capability SID", *text, last_error()));
+                return Err(launch("resolve a capability SID", *text, last_error()));
             }
             owned.push(raw);
-            entries.push(SidAndAttributes {
-                sid: raw,
-                attributes: 0,
+            entries.push(SID_AND_ATTRIBUTES {
+                Sid: raw,
+                // **Not zero, and this block said zero until Task 12 measured
+                // what that costs.** A capability SID whose entry is not
+                // `SE_GROUP_ENABLED` is placed in the child's token and then
+                // honoured by nothing — measured 2026-09-22: with `Attributes: 0`
+                // a container given `internetClient` was refused `1.1.1.1:53`
+                // (`permission denied`) exactly as if it had been given nothing,
+                // and a directory whose ACE names the capability SID stayed
+                // unreadable to it. With `SE_GROUP_ENABLED` the same child
+                // reaches the address and reads the file. Design §7's Windows
+                // row and the evidence table carry the measurement.
+                Attributes: SE_GROUP_ENABLED as u32,
             });
         }
         Ok(Self { entries, owned })
     }
 
     /// The contiguous array the `SECURITY_CAPABILITIES` value points at.
-    pub fn as_ptr(&self) -> *const SidAndAttributes {
+    ///
+    /// `*const` rather than the `*mut` that structure's field is declared with:
+    /// nothing writes through it, and the launch is where the two meet.
+    pub fn as_ptr(&self) -> *const SID_AND_ATTRIBUTES {
         self.entries.as_ptr()
     }
 
@@ -1404,7 +1045,7 @@ impl Drop for CapabilitySids {
         for sid in self.owned.drain(..) {
             // SAFETY: each `sid` came from ConvertStringSidToSidW, which
             // documents LocalFree as the release, and each is freed once.
-            unsafe { ffi::LocalFree(sid.cast()) };
+            unsafe { LocalFree(sid.cast()) };
         }
     }
 }
@@ -1434,10 +1075,10 @@ pub(crate) unsafe fn from_wide(text: *const u16) -> String {
 
 `wide` is safe and `from_wide` is not. **The attribute goes on `from_wide` and not on the file**, and that is the point rather than a detail of placement: the manifest is `unsafe_code = "deny"`, a crate-level `#![allow(unsafe_code)]` would lift that for every line of `lib.rs` — including the modules it declares and every item added to it afterwards — and the constitution asks for the smallest scope in which the exception is expressible. `lib.rs` therefore joins decision 14's list as the crate root's single site, with the attribute on the one function that needs it.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-windows`
-Expected: PASS — the layout tests, `handles`' recording-subscriber test, and the five SID tests. **The profile one creates a real package on the machine and needs no elevation to do it**, which is the same property the derivation had (design §6) — and it leaves nothing behind, because the last `PackageSid` of the test drops and takes the profile with it. A refused delete is a residue rather than a test failure — the next run derives the same name and takes it over (decision 21) — and the `warn!` that reports it needs a subscriber, which `cargo test` installs none of (shared §7): the residue shows up in the next run's `CreateAppContainerProfile`, not in this run's output.
+Expected: PASS — the five SID tests. **Two suites that an earlier draft of this line named are not in this run and cannot be**: the layout assertions went with `ffi.rs`, and `handles`' recording-subscriber test lives in `tinio-sandbox-core` beside the builder it pins — both since Task 1. **The profile one creates a real package on the machine and needs no elevation to do it**, which is the same property the derivation had (design §6) — and it leaves nothing behind, because the last `PackageSid` of the test drops and takes the profile with it. A refused delete is a residue rather than a test failure — the next run derives the same name and takes it over (decision 21) — and the `warn!` that reports it needs a subscriber, which `cargo test` installs none of (shared §7): the residue shows up in the next run's `CreateAppContainerProfile`, not in this run's output.
 
 Design §6 and decision 21 carry the change the measurement forces: the section states the mechanism, and the mechanism is "create the profile whose SID the served root derives", not "derive a SID and launch with it". Decision 21's residue story gains the second artifact while keeping its rule — identifiable, reusable, and taken back on every exit path the launcher survives.
 
@@ -1455,7 +1096,7 @@ Design §6 and decision 21 carry the change the measurement forces: the section 
 
 This is the half of the backend that runs before anything privileged: which paths the whitelist covers, which capabilities the container gets, and what the volume says those paths really are. The first two are functions of builder state and are testable without a filesystem and without a launch (design §12's "Unit, every platform"); the third is the one step here that has to ask the volume, so it is a function of its own — and the reason it is not folded into `exposures` is that folding it in would make the arithmetic untestable without a disk and a junction.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `crates/tinio-sandbox-windows/src/backend.rs`:
 
@@ -1470,8 +1111,10 @@ mod tests {
 
     #[test]
     fn the_executables_directory_is_exposed_read_only() {
-        // Measured: without an ACE on the directory holding the binary the
-        // confined child cannot load at all (design decision 22).
+        // Measured 2026-09-21: the image itself is opened with the launcher's
+        // access and loads without an ACE, but a binary that imports a DLL beside
+        // it starts and then dies `0xC0000135` without one — so the grant is for
+        // the child's own loader (design decision 22).
         let sandbox = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
         let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
         let exe_dir = all
@@ -1630,12 +1273,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-windows backend::`
 Expected: FAIL — `cannot find function 'exposures'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! The Windows backend: the whitelist it grants, the container it launches, the
@@ -1648,6 +1291,8 @@ Expected: FAIL — `cannot find function 'exposures'`.
 use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 use tinio_sandbox_core::{AccessMode, Error, Exposure, Sandbox};
 
@@ -1746,9 +1391,11 @@ impl Capability {
 pub struct Options {
     /// The container's capabilities; empty by default (design §7).
     pub capabilities: Vec<Capability>,
-    /// Override the derived package name. Tests use it; production always
-    /// derives, so a crashed run's residue is recognizable (decision 21).
-    pub package_name: Option<String>,
+    // `package_name: Option<String>` was here. **Removed on 2026-09-23**: no
+    // caller — test or production — ever set it (the field's own doc said so),
+    // and an overridable name is the one thing decision 21's takeover rests on
+    // *not* being, since a pinned name takes over a fixed profile whatever root
+    // the run was handed. `confine` now calls `package_name(&served)` directly.
     /// Override the program the launcher re-invokes. `None` means this process's
     /// own executable, which is what production uses (design §10 step 6).
     ///
@@ -1896,7 +1543,7 @@ pub fn canonical_exposures(exposures: Vec<Exposure>) -> Result<Vec<Exposure>, Er
         // 2026-09-19) — which is what lets the granted spelling *be* the resolved
         // one instead of a second spelling of it.
         let host = std::fs::canonicalize(&exposure.host)
-            .map_err(|source| crate::handles::step("resolve an exposed path", &exposure.host, source))?;
+            .map_err(|source| launch("resolve an exposed path", &exposure.host, source))?;
         // `info!`: this set is "to what" half of shared §7's question. An operator
         // whose server cannot reach a directory reads those lines to see which
         // paths the run was actually about to grant, in the spelling the volume
@@ -1935,7 +1582,7 @@ fn refuse_reparse_points(path: &Path) -> Result<(), Error> {
         let Ok(metadata) = std::fs::symlink_metadata(component) else {
             continue;
         };
-        if metadata.file_attributes() & crate::ffi::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(Error::BadPath {
                 path: component.to_path_buf(),
                 reason: "is a reparse point (a junction or a symlink), and a grant through it would land on its target rather than inside the exposed tree",
@@ -1976,10 +1623,12 @@ pub fn served_root(sandbox: &Sandbox) -> Result<PathBuf, Error> {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-windows backend::`
 Expected: PASS — ten tests. The two that touch the volume create their own temporary tree and a junction under it; a host that refuses `mklink /J` refuses the whole suite rather than skipping quietly, because a junction is what a grant through a link would follow on every host that has one (design §6, and the test's own message says so).
+
+**A correction this block earned on 2026-09-22, in `CapabilitySids::resolve` above.** The block as drafted pushed `SID_AND_ATTRIBUTES { Sid: raw, Attributes: 0 }`, and this task's own tests could not tell the difference — an empty list, a list of one, and a list of three all build and all launch, because nothing about the attribute is visible until a process is confined with it. **Task 12 measured what it costs**: a container handed `internetClient` with no attribute set carries the SID in its token and is refused `1.1.1.1:53` exactly as one handed nothing, and a directory whose ACL grants that SID read is equally unreadable to it. `SE_GROUP_ENABLED` is what makes the capability mean anything, and the value is corrected here in place rather than left for whoever next reads this block. The manifest gains `Win32_System_SystemServices` for that one constant, which is an edge on a crate the lock already resolves rather than a new dependency (the ledger below).
 
 ---
 
@@ -1993,15 +1642,15 @@ Expected: PASS — ten tests. The two that touch the volume create their own tem
 
 **Interfaces:**
 - Consumes: `sid::PackageSid`, `AccessMode`.
-- Produces: `acl::{ace_spec, grant_spec, icacls_binary, grant, revoke, has_ace, Grants}`, with `Grants::{new, apply, rollback, is_empty, sid_text}` and `Drop`.
+- Produces: `acl::{ace_spec, grant_spec, icacls_binary, grant, revoke, has_ace, Grants}`, with `Grants::{new, apply, rollback, is_empty, sid_text}` and `Drop`. **Ruling 78 (2026-09-22) reshaped this surface**: `acl::Target` (`Directory` for the caller's exposures — the ordinary spelling, and the one that propagates; `ProgramDirectory` for decision 22's non-inherited exception; `File`; kind and propagation are two dimensions) decides whether a spec carries inheritance, `grant(path, target, access, sid)` takes it, `acl::SiblingScan` is the tool's single `*.dll` name pattern *and* the file list behind it, and `Grants::apply_siblings(&SiblingScan, access)` records it as the one granted path — **two corrections of 2026-09-23**: the free-function pair `acl::{grant_siblings, revoke_siblings}` this surface landed with was removed (`apply_siblings` repeated `grant_siblings`'s body, `revoke_siblings` was outside the rollback path — `Grants::rollback` removes the recorded pattern itself — and neither had a caller outside its own doctest, so the one decision Ruling 78 turned on was stated twice with nothing executing one of the copies); and `sibling_pattern(dir)` became `SiblingScan::pattern()`, with `backend::exposures` splitting into `exposures(sandbox, program)` and `with_siblings(sandbox, &SiblingScan)` so that `confine`'s exposure set and its grant are built from *one* enumeration — the measured program directory is 5,129 entries and both readers used to walk it separately, which is a cost and a chance for the two to disagree about which files are in the set. The grant loop in `backend::exposures` produces the program directory's entry non-inherited plus the `*.dll` files directly beside the program. **The batch is the pattern, not a list**: `icacls` accepts one `name` pattern and refuses a second path. The decision, the design (§6, decision 22, its Risks row) and `tests/{acl,backend}.rs` carry the rule; this list is the interface it landed on.
 
 Grant-only, never revoke-then-grant (design decision 15): `/grant:r` replaces this SID's entry and nothing else, `/remove:g` removes exactly this SID's entries, and neither touches a foreign ACE, the permission bits or the owner. Idempotence is what makes decision 21's takeover work: a residue from a crashed run is replaced rather than duplicated, and removed by the next clean exit.
 
 **§6's open question is settled in this task's second test.** The design's evidence table admits that every ACL probe used `icacls … /t`, which applies the ACE to each child explicitly as well as to the directory, so "an inheritable ACE on the exposed directory reaches its pre-existing children" was never isolated — and §6 says P2 must settle it before the grant list is treated as final. The two outcomes are not cosmetic: **inheritance alone** keeps one ACE per exposed directory and a rollback of one `icacls /remove:g` per directory; **a walk** (`/t`) puts an ACE on every file in the operator's tree and makes the rollback a per-file undo, which is a different residue story on a hard kill (one directory versus every file).
 
-**What the tool counts and what the filesystem does are two different counts, and only the first is small.** `icacls` answers `Successfully processed 1 files` for a directory-only `/grant:r` because one path was named, and neither the launcher nor the tool walks the operator's tree — that half of §6 is true and stays true. The ACE it writes is `(OI)(CI)`, though, and the propagation is the *filesystem*'s: every descendant the directory already holds picks up an inherited copy, which is precisely what this task's second test demonstrates and why that measurement is the evidence rather than a formality. The grant pass (before `CreateProcessW`) and the rollback pass (`/remove:g`, after the child exits) each touch as many objects as the served tree contains — the whole corpus, twice per run — and **no document gives that cost a number**: an `icacls` timing, a per-object cost and a tree-size assumption are all missing, while the readiness budget this feature has to fit inside is 30 s (`crates/tinio-e2e/tests/steps/clients.rs`'s `START_TIMEOUT`). Task 13 establishes the number instead of assuming one, and states what an operator with a very large tree should do about it.
+**What the tool counts and what the filesystem does are two different counts, and only the first is small.** `icacls` answers `Successfully processed 1 files` for a directory-only `/grant:r` because one path was named, and neither the launcher nor the tool walks the operator's tree — that half of §6 is true and stays true. The ACE it writes is `(OI)(CI)`, though, and the propagation is the *filesystem*'s: every descendant the directory already holds picks up an inherited copy, which is precisely what this task's second test demonstrates and why that measurement is the evidence rather than a formality. The grant pass (before `CreateProcessW`) and the rollback pass (`/remove:g`, after the child exits) each touch as many objects as the served tree contains — the whole corpus, twice per run — and **this plan could not give that cost a number when it was written**: an `icacls` timing, a per-object cost and a tree-size assumption were all missing, while the readiness budget this feature has to fit inside is 30 s (`crates/tinio-e2e/tests/steps/clients.rs`'s `START_TIMEOUT`). **Task 13 measured it on 2026-09-22, and the number is on the side the paragraph warns about**: the grant alone is past that budget at 200,200 objects on NTFS (design §6 and its Risks row define the numbers and carry the operator's guidance; `scripts/verify-windows.ps1 -AclCost` reproduces them).
 
-- [ ] **Step 1: Write the failing unit tests**
+- [x] **Step 1: Write the failing unit tests**
 
 `crates/tinio-sandbox-windows/src/acl.rs`:
 
@@ -2013,12 +1662,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_permission_spec_is_inherited_by_children() {
-        // `(OI)(CI)` is the whole reason nothing has to be granted per file
-        // (design §6: ReadWrite → (OI)(CI)M, ReadOnly → (OI)(CI)RX) — subject to
-        // the pre-existing-child question this task settles.
-        assert_eq!(ace_spec(AccessMode::ReadOnly), "(OI)(CI)RX");
-        assert_eq!(ace_spec(AccessMode::ReadWrite), "(OI)(CI)M");
+    fn only_an_exposed_directory_propagates_its_ace() {
+        // Two dimensions, three shapes (the gate run's correction): the caller's
+        // exposed directories keep the inherited form, and the program's directory
+        // and every file take the plain one — a file's cannot carry the flags at all
+        // (an inheritance-flagged grant on a file is a silent no-op — design §6's
+        // evidence row).
+        assert_eq!(ace_spec(Target::Directory, AccessMode::ReadOnly), "(OI)(CI)RX");
+        assert_eq!(ace_spec(Target::File, AccessMode::ReadOnly), "RX");
+        // The exception decision 22 adds, renamed by Ruling 85's gate run: this
+        // block asserted `Target::Directory` twice — once with the inherited spec
+        // and once with the plain one — which was the deleted falsehood rather
+        // than a test, and the plain shape now has the variant named for it.
+        assert_eq!(
+            ace_spec(Target::ProgramDirectory, AccessMode::ReadOnly),
+            "RX"
+        );
     }
 
     #[test]
@@ -2041,19 +1700,23 @@ mod tests {
     fn the_grant_argument_names_the_sid_literally() {
         // The `*` prefix is what stops icacls resolving the SID as a name.
         assert_eq!(
-            grant_spec("S-1-15-2-1-2-3", AccessMode::ReadOnly),
-            "*S-1-15-2-1-2-3:(OI)(CI)RX"
+            grant_spec(
+                "S-1-15-2-1-2-3",
+                Target::ProgramDirectory,
+                AccessMode::ReadOnly
+            ),
+            "*S-1-15-2-1-2-3:RX"
         );
     }
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-windows acl::`
 Expected: FAIL — `cannot find function 'ace_spec'`.
 
-- [ ] **Step 3: Write `acl.rs`**
+- [x] **Step 3: Write `acl.rs`**
 
 ```rust
 //! The ACL whitelist: grant the package SID an access mode on each exposed path,
@@ -2083,47 +1746,64 @@ Expected: FAIL — `cannot find function 'ace_spec'`.
 //! it nor this module walks anything; the `(OI)(CI)` ACE is propagated by the
 //! filesystem to every descendant that path already holds. The grant pass and its
 //! rollback therefore each touch as many objects as the served tree contains —
-//! the whole corpus, twice per run — and nothing measures that yet (Task 13
-//! establishes the number; the readiness budget it competes with is 30 s).
+//! the whole corpus, twice per run. **That cost is measured now** (Task 13,
+//! 2026-09-22: 32–38 s of granting on NTFS against a 30 s readiness budget, and
+//! 8.6–8.8 s each way on ReFS) — the landed module doc carries the numbers.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use tinio_sandbox_core::{AccessMode, Error, Result};
+use crate::_core::{AccessMode, Error, Result, launch};
 
-use crate::handles::step;
 use crate::sid::PackageSid;
 
-/// The permission specification `icacls` grants for an access mode.
+/// The permission specification `icacls` grants for a target and an access mode.
 ///
 /// `M` is `FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE |
 /// DELETE` (`0x001301BF`), `RX` is the read and execute halves (`0x001200A9`),
-/// and both are inherited by children through `(OI)(CI)` — which is what makes
-/// one ACE per directory enough, as this task's second test confirms. One ACE
-/// *written* per directory, that is: how many objects the filesystem then carries
-/// it to is the module doc's subject, and it is not a count this specification
-/// can state.
+/// and `(OI)(CI)` — meaningful on a directory only — is what carries an exposed
+/// directory's ACE to the children it already holds, which is what makes one ACE
+/// per directory enough, as this task's second test confirms. One ACE *written*
+/// per directory, that is: how many objects the filesystem then carries it to is
+/// the module doc's subject, and it is not a count this specification can state.
+///
+/// **Ruling 78 (2026-09-22) corrected this mapping in place.** The block as
+/// drafted mapped `Target::{Directory, File}` alike (`"RX"`/`"M"`) and named no
+/// `Target::ProgramDirectory`, because the plain shape was then `Directory`'s —
+/// which is the deleted falsehood, not a description of what landed. The shipped
+/// `ace_spec` (`crates/tinio-sandbox-windows/src/acl.rs`) carries the three
+/// variants the two dimensions encode: `Target::Directory` is the caller's
+/// exposure and keeps the flags, while `Target::ProgramDirectory` (decision 22)
+/// and `Target::File` take the plain form.
 ///
 /// # Examples
 ///
 /// ```
 /// use tinio_sandbox_core::AccessMode;
-/// use tinio_sandbox_windows::acl::ace_spec;
+/// use tinio_sandbox_windows::acl::{Target, ace_spec};
 ///
-/// assert_eq!(ace_spec(AccessMode::ReadWrite), "(OI)(CI)M");
+/// assert_eq!(
+///     ace_spec(Target::Directory, AccessMode::ReadWrite),
+///     "(OI)(CI)M"
+/// );
+/// // Decision 22's directory and a file take the plain form.
+/// assert_eq!(ace_spec(Target::ProgramDirectory, AccessMode::ReadOnly), "RX");
+/// assert_eq!(ace_spec(Target::File, AccessMode::ReadOnly), "RX");
 /// ```
-pub const fn ace_spec(access: AccessMode) -> &'static str {
-    match access {
-        AccessMode::ReadOnly => "(OI)(CI)RX",
-        AccessMode::ReadWrite => "(OI)(CI)M",
+pub const fn ace_spec(target: Target, access: AccessMode) -> &'static str {
+    match (target, access) {
+        (Target::Directory, AccessMode::ReadOnly) => "(OI)(CI)RX",
+        (Target::Directory, AccessMode::ReadWrite) => "(OI)(CI)M",
+        (Target::ProgramDirectory | Target::File, AccessMode::ReadOnly) => "RX",
+        (Target::ProgramDirectory | Target::File, AccessMode::ReadWrite) => "M",
     }
 }
 
-/// The `*<sid>:<perm>` argument `icacls` is given.
-pub fn grant_spec(sid: &str, access: AccessMode) -> String {
-    format!("*{sid}:{}", ace_spec(access))
+/// The `*<sid>:<perm>` argument `icacls` is given for `target`.
+pub fn grant_spec(sid: &str, target: Target, access: AccessMode) -> String {
+    format!("*{sid}:{}", ace_spec(target, access))
 }
 
 /// `<system directory>\icacls.exe` — the kernel's own answer to where the system
@@ -2148,8 +1828,8 @@ pub fn icacls_binary() -> PathBuf {
 ///
 /// [`Error::Launch`] naming the path and carrying `icacls`'s own diagnostic when
 /// it exits non-zero.
-pub fn grant(path: &Path, access: AccessMode, sid: &PackageSid) -> Result<()> {
-    let spec = grant_spec(sid.as_str(), access);
+pub fn grant(path: &Path, target: Target, access: AccessMode, sid: &PackageSid) -> Result<()> {
+    let spec = grant_spec(sid.as_str(), target, access);
     run(
         "icacls /grant:r",
         path,
@@ -2253,7 +1933,7 @@ impl Grants {
     /// A failure does not stop the loop: it is kept and returned after every
     /// other path has been attempted, because a rollback that stopped at the
     /// first error would leave the rest of the residue behind. It is not printed
-    /// here either — [`step`] logged it where the `Error` was built, with the
+    /// here either — [`launch`] logged it where the `Error` was built, with the
     /// same `step` this method's caller will see (shared §7).
     ///
     /// # Errors
@@ -2302,7 +1982,7 @@ fn checked(operation: &'static str, path: &Path, flags: &[&OsStr]) -> Result<Out
     }
     let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let status = output.status.code().unwrap_or(-1);
-    Err(step(
+    Err(launch(
         operation,
         path.to_path_buf(),
         std::io::Error::other(format!("icacls exited {status}: {diagnostic}")),
@@ -2316,16 +1996,16 @@ fn invoke(path: &Path, flags: &[&OsStr]) -> Result<Output> {
     command.arg(path).args(flags);
     command
         .output()
-        .map_err(|source| step("run icacls", path.to_path_buf(), source))
+        .map_err(|source| launch("run icacls", path.to_path_buf(), source))
 }
 ```
 
-- [ ] **Step 4: Run the unit tests to verify they pass**
+- [x] **Step 4: Run the unit tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-windows acl::`
 Expected: PASS — three tests, none of them touching a DACL.
 
-- [ ] **Step 5: Write the failing integration test, inheritance question first**
+- [x] **Step 5: Write the failing integration test, inheritance question first**
 
 `crates/tinio-sandbox-windows/tests/acl.rs`:
 
@@ -2498,12 +2178,12 @@ fn dropping_the_grants_removes_them() {
 }
 ```
 
-- [ ] **Step 6: Run the test to verify it fails, then make it pass**
+- [x] **Step 6: Run the test to verify it fails, then make it pass**
 
 Run: `cargo test -p tinio-sandbox-windows --test acl`
 Expected: FAIL first (the module is there but the helper functions are not yet compiled in), then PASS — five tests. **The inheritance question this test exists for is already answered.** It was measured on 2026-09-19, on NTFS (`C:`) and ReFS (`E:`) alike, before this plan was executed: a directory-only `icacls /grant:r "*<sid>:(OI)(CI)M"` reaches a pre-existing child at depth 1 *and* at depth 2, as an inherited `(I)(M)` entry, and a directory-only `/remove:g` takes every inherited copy back. So the assertions below are a **regression test for a settled answer**, not a branch — there is no `/t` walk to switch to and no per-file rollback to design, and §6 of the design and its evidence table carry the measurement. **The same measurement is also the cost**, which the test makes visible rather than merely records: "a directory-only `/remove:g` takes every inherited copy back" is one `icacls` call walking every object under the directory, and the grant did the same on the way in. Neither the tool nor this crate walks, the filesystem does, and the bill is proportional to the served tree — Task 13 Step 3 measures it, and the module doc above states it as what it is. One outcome is still worth recording in the commit body if it happens: if `has_ace`'s oracle fails because this host's `icacls` renders an AppContainer SID as a name rather than the `S-1-15-2-…` string, move the assertion to a before/after ACL comparison and say so.
 
-- [ ] **Step 7: Check the test against the answer the design already records**
+- [x] **Step 7: Check the test against the answer the design already records**
 
 `docs/superpowers/specs/2026-09-18-sandbox-design.md` already carries the measurement — the evidence table's inheritance rows and §6's settled paragraph were written on 2026-09-19 from the same experiment this task's test reproduces. What is left here is to confirm the test asserts what those rows claim: the pre-existing file at depth 1, the inherited `(I)` form, a file created *after* the grant, and a directory-only rollback that leaves no residue. If this run disagrees with the design, the design is what changes, in this commit.
 
@@ -2517,14 +2197,14 @@ Expected: FAIL first (the module is there but the helper functions are not yet c
 - Modify: `crates/tinio-sandbox-windows/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `handles::{last_error, step}`, `ffi`.
-- Produces: `job::Job` with `create() -> Result<Job>`, `assign(&self, process: Handle) -> Result<()>`, `terminate(&self, code: u32) -> Result<()>` and `Drop`.
+- Consumes: `handles::last_error`; `windows-sys`'s Job API — `Win32::System::JobObjects`'s four calls, its `JOB_OBJECT_*` constants and the two limit structures — plus `Win32::Foundation`'s `HANDLE` and `CloseHandle`; `crate::_core::launch`.
+- Produces: `job::Job` with `create() -> Result<Job>`, `assign(&self, process: HANDLE) -> Result<()>`, `terminate(&self, code: u32) -> Result<()>` and `Drop`.
 
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is decision 20's first half: killing the launcher takes the confined server with it instead of leaving an orphan holding a listener. Its second half — the stop relay — is Task 10.
 
 **What the job does not cover is the window between the two calls that create it, and that window is recorded here rather than claimed away.** The child is created running (`CreateProcessW` without `CREATE_SUSPENDED`) and only joins the job when `AssignProcessToJobObject` returns, so a launcher that dies inside that window leaves a child the job never owned — and the same is true, for the same reason, of a failure in either call, which Task 9 handles by terminating the process on both. The window could be closed with `CREATE_SUSPENDED` plus a `ResumeThread` on the thread handle the launch closes today; it is not closed here because what the child does with the window is bounded and already designed: it has inherited the listener and the two pipe ends but **no payload**, so its stdin read reaches EOF, `adopt` reports the launcher case, and it becomes a launcher inside its own confinement — which fails closed at its first grant or bind (design §11's "payload absent or malformed" row, decision 17). What a caller must not conclude from the job is that the child is never unowned; what they can conclude is that an unowned child is a child that cannot serve.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-windows/tests/job.rs`:
 
@@ -2538,10 +2218,11 @@ use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tinio_sandbox_windows::{handles::Handle, job::Job};
+use tinio_sandbox_windows::job::Job;
+use windows_sys::Win32::Foundation::HANDLE;
 
 /// The raw process handle behind a `std::process::Child`.
-fn raw_handle(child: &Child) -> Handle {
+fn raw_handle(child: &Child) -> HANDLE {
     child.as_raw_handle().cast()
 }
 
@@ -2586,12 +2267,12 @@ fn terminating_the_job_kills_the_process() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox-windows --test job`
 Expected: FAIL — `cannot find struct 'Job'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! The Job object that ties the confined child's lifetime to the launcher's
@@ -2605,10 +2286,16 @@ Expected: FAIL — `cannot find struct 'Job'`.
 use std::ffi::c_void;
 use std::ptr;
 
-use tinio_sandbox_core::Result;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+};
 
-use crate::ffi::{self, Handle, JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation};
-use crate::handles::{last_error, step};
+use crate::_core::{Result, launch};
+
+use crate::handles::last_error;
 
 /// A job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set.
 ///
@@ -2617,7 +2304,7 @@ use crate::handles::{last_error, step};
 /// closes this handle, the last handle to the job goes with it, and the confined
 /// server dies rather than surviving as an orphan holding a listener.
 pub struct Job {
-    handle: Handle,
+    handle: HANDLE,
 }
 
 impl Job {
@@ -2630,14 +2317,14 @@ impl Job {
     pub fn create() -> Result<Self> {
         // SAFETY: a null security descriptor and a null name are both documented
         // as valid, and mean "unnamed, default security".
-        let handle = unsafe { ffi::CreateJobObjectW(ptr::null(), ptr::null()) };
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
         if handle.is_null() {
-            return Err(step("CreateJobObjectW", "job", last_error()));
+            return Err(launch("CreateJobObjectW", "job", last_error()));
         }
         let job = Self { handle };
-        let limits = JobObjectExtendedLimitInformation {
-            basic_limit_information: JobObjectBasicLimitInformation {
-                limit_flags: ffi::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 ..Default::default()
             },
             ..Default::default()
@@ -2646,15 +2333,15 @@ impl Job {
         // sized JOBOBJECT_EXTENDED_LIMIT_INFORMATION that outlives the call, and
         // the class matches the structure passed.
         let ok = unsafe {
-            ffi::SetInformationJobObject(
+            SetInformationJobObject(
                 handle,
-                ffi::JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                (&limits as *const JobObjectExtendedLimitInformation).cast::<c_void>(),
-                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
         if ok == 0 {
-            return Err(step("SetInformationJobObject", "job", last_error()));
+            return Err(launch("SetInformationJobObject", "job", last_error()));
         }
         // `info!`: the job is one of the two mechanisms that make the confinement
         // a *lifetime* rather than a permission, so it belongs on the "to what"
@@ -2673,12 +2360,12 @@ impl Job {
     /// it — and Task 9's composition is the only caller: it calls
     /// [`crate::process::LaunchedProcess::terminate`] on this error and on a
     /// failure to create the job at all, before it reports either.
-    pub fn assign(&self, process: Handle) -> Result<()> {
+    pub fn assign(&self, process: HANDLE) -> Result<()> {
         // SAFETY: both handles are live and owned by the caller for the duration
         // of the call; the job takes no ownership of the process handle.
-        let ok = unsafe { ffi::AssignProcessToJobObject(self.handle, process) };
+        let ok = unsafe { AssignProcessToJobObject(self.handle, process) };
         if ok == 0 {
-            return Err(step("AssignProcessToJobObject", "job", last_error()));
+            return Err(launch("AssignProcessToJobObject", "job", last_error()));
         }
         tracing::info!(step = "AssignProcessToJobObject", process = ?process);
         Ok(())
@@ -2692,9 +2379,9 @@ impl Job {
     /// refused.
     pub fn terminate(&self, code: u32) -> Result<()> {
         // SAFETY: `self.handle` is the job this value owns.
-        let ok = unsafe { ffi::TerminateJobObject(self.handle, code) };
+        let ok = unsafe { TerminateJobObject(self.handle, code) };
         if ok == 0 {
-            return Err(step("TerminateJobObject", "job", last_error()));
+            return Err(launch("TerminateJobObject", "job", last_error()));
         }
         Ok(())
     }
@@ -2703,12 +2390,12 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         // SAFETY: `self.handle` is this value's own job handle, closed once.
-        unsafe { ffi::CloseHandle(self.handle) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p tinio-sandbox-windows --test job`
 Expected: PASS — two tests, each within a few seconds.
@@ -2723,12 +2410,12 @@ Expected: PASS — two tests, each within a few seconds.
 - Modify: `crates/tinio-sandbox-windows/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `handles::{mark_inheritable as mark_handle_inheritable, step}`, `ffi`.
+- Consumes: `handles::mark_inheritable as mark_handle_inheritable`, `windows_sys::Win32::Foundation::HANDLE`, `crate::_core::launch`.
 - Produces: `socket::{value, handle, mark_inheritable, from_value}`.
 
 The parent binds, the child serves on a socket it never created (decision 16). This is a convenience for the port, not an isolation mechanism: the AppContainer's network policy is enforced against the process's package SID, not against whoever created the socket. Nothing in this plan depends on the handoff for security, and the LAN question the design leaves open — whether such a listener reaches the network — is recorded by Task 12, never assumed.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-windows/tests/listener.rs`:
 
@@ -2793,12 +2480,12 @@ fn an_inherited_handle_is_the_same_socket_in_the_child() {
 
 A `Command`-spawned child inherits all inheritable handles (std sets `bInheritHandles`), which is why this test needs no handle list — the list belongs to the confined path, and Task 8 covers it.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox-windows --test listener`
 Expected: FAIL — `cannot find function 'from_value'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! The inherited listener: the parent binds it, the child serves on it (design
@@ -2813,14 +2500,15 @@ Expected: FAIL — `cannot find function 'from_value'`.
 use std::net::TcpListener;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 
-use tinio_sandbox_core::Result;
+use windows_sys::Win32::Foundation::HANDLE;
 
-use crate::ffi::Handle;
-use crate::handles::{mark_inheritable as mark_handle_inheritable, step};
+use crate::_core::{Result, launch};
+
+use crate::handles::mark_inheritable as mark_handle_inheritable;
 
 /// The handle value the launch payload carries (design decision 17).
 ///
-/// Handle values survive inheritance unchanged — the probe's parent had 1040 and
+/// A handle value survives inheritance unchanged — the probe's parent had 1040 and
 /// the child saw 1040 — which is why the payload can name one at all.
 ///
 /// # Examples
@@ -2853,8 +2541,8 @@ pub fn value(listener: &TcpListener) -> u64 {
 /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 /// assert_eq!(socket::handle(&listener) as u64, socket::value(&listener));
 /// ```
-pub fn handle(listener: &TcpListener) -> Handle {
-    listener.as_raw_socket() as Handle
+pub fn handle(listener: &TcpListener) -> HANDLE {
+    listener.as_raw_socket() as HANDLE
 }
 
 /// Mark the listener inheritable.
@@ -2867,8 +2555,8 @@ pub fn handle(listener: &TcpListener) -> Handle {
 /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when
 /// `SetHandleInformation` refuses.
 pub fn mark_inheritable(listener: &TcpListener) -> Result<()> {
-    mark_handle_inheritable(listener.as_raw_socket() as Handle)
-        .map_err(|source| step("mark the listener inheritable", "listener", source))
+    mark_handle_inheritable(listener.as_raw_socket() as HANDLE)
+        .map_err(|source| launch("mark the listener inheritable", "listener", source))
 }
 
 /// Rebuild the listener from the handle value a launcher passed.
@@ -2900,11 +2588,11 @@ pub fn from_value(raw: u64) -> Result<TcpListener> {
 fn initialize_winsock() -> Result<()> {
     TcpListener::bind(("127.0.0.1", 0))
         .map(drop)
-        .map_err(|source| step("initialise Winsock", "127.0.0.1:0", source))
+        .map_err(|source| launch("initialise Winsock", "127.0.0.1:0", source))
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p tinio-sandbox-windows --test listener`
 Expected: PASS — one round trip through a socket the parent created and the child serves on.
@@ -2928,7 +2616,7 @@ The payload arrives on the child's **stdin** (decision 17): the standard streams
 
 **The argv element survives, carrying something else.** `tinio-sandbox-fd=<n>` names the inherited **listener** descriptor, because a socket cannot ride on a stream — the descriptor-passing half of decision 16 is irreducible whatever the payload does. The helpers live in `tinio-sandbox-core` and are shared with the macOS plan, so this crate consumes them and defines none of its own.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-windows/tests/payload.rs`:
 
@@ -2943,7 +2631,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use tinio_sandbox_core::{LaunchPayload, is_listener_fd_arg, listener_fd_arg, listener_fd_from_arg};
-use tinio_sandbox_windows::{handles::Handle, launch, socket};
+use tinio_sandbox_windows::{launch, socket};
+use windows_sys::Win32::Foundation::HANDLE;
 
 #[test]
 fn child_role() {
@@ -3027,7 +2716,7 @@ fn the_element_carries_a_listener_descriptor() {
     // `std::env::args_os().skip(1)` hands over — and the cast stands in for the
     // listener's handle, whose value is the only thing the element carries.
     let args = launch::command_args(
-        1040usize as Handle,
+        1040usize as HANDLE,
         &["/srv/data".into(), "--port".into(), "0".into()],
     );
     assert_eq!(args[0], element, "the element comes first");
@@ -3043,12 +2732,12 @@ fn the_element_carries_a_listener_descriptor() {
 
 The first case passes `std::io::empty()` as the stdin: core's rule must not read it when there is no element, and `empty()` cannot block — so the test would hang rather than pass if the rule were wrong about that.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox-windows --test payload`
 Expected: FAIL — `cannot find function 'listener'` in the crate's `launch` module.
 
-- [ ] **Step 3: Write `launch.rs`**
+- [x] **Step 3: Write `launch.rs`**
 
 ```rust
 //! The launcher's own plumbing: the payload write into the child's stdin, the
@@ -3070,7 +2759,8 @@ use tinio_sandbox_core::{
     Adopted, Error, LaunchPayload, Result, listener_fd_arg,
 };
 
-use crate::handles::{self, Handle};
+use windows_sys::Win32::Foundation::HANDLE;
+
 use crate::socket;
 
 /// Adopt the launch payload, if this process inherited one.
@@ -3134,7 +2824,7 @@ pub fn listener(adopted: &Adopted) -> Result<TcpListener> {
 /// executable path where the served root belongs — the child drops its `argv[0]`
 /// and filters the element, so what is left is parsed as the launcher's
 /// arguments.
-pub fn command_args(listener: Handle, args: &[OsString]) -> Vec<OsString> {
+pub fn command_args(listener: HANDLE, args: &[OsString]) -> Vec<OsString> {
     let mut child = Vec::with_capacity(args.len() + 1);
     child.push(listener_fd_arg(listener as i64));
     child.extend(args.iter().cloned());
@@ -3186,7 +2876,7 @@ pub fn disarm() -> Result<()> {
 pub use tinio_sandbox_core::{LISTENER_FD_PREFIX, is_listener_fd_arg, listener_fd_from_arg};
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-sandbox-windows --test payload`
 Expected: FAIL to compile until Task 10 provides `control::{on_stop, disarm}`; comment those two calls out and leave the rest passing, then restore them in Task 10. Everything else — the element, the stdin frame, the listener rebuild — is complete and tested now, which is what the task is for.
@@ -3202,16 +2892,16 @@ Expected: FAIL to compile until Task 10 provides `control::{on_stop, disarm}`; c
 - Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (§11's error table gains the refused-attribute row)
 
 **Interfaces:**
-- Consumes: `ffi`, `handles::{last_error, step, inherited_stderr, Pipe, pipe, parent_end, write_payload}`, `sid::CapabilitySids`, `launch::command_args`.
+- Consumes: `windows-sys`'s launch surface — `Win32::System::Threading`'s `CreateProcessW`, proc-thread attribute list, `STARTUPINFO{,EX}W`, `PROCESS_INFORMATION`, `CreateEventW`, `SetEvent`, `WaitForSingleObject`, `GetExitCodeProcess` and `TerminateProcess` with their constants, and `Win32::UI::Shell`'s `CommandLineToArgvW` — and `handles::{last_error, inherited_stderr, Pipe, pipe, parent_end, write_payload}`, `sid::CapabilitySids`, `launch::command_args`, `crate::_core::launch as launch_error`.
 - Produces: `process::command_line(program: &Path, args: &[OsString]) -> Vec<u16>`, `process::Container { package_sid, capabilities }`, `process::LaunchSpec { program, args, stdin, stdout, stderr, inherited, current_dir }`, `process::launch(spec, container) -> Result<LaunchedProcess>`, `LaunchedProcess::{handle, pid, wait, terminate}` and `Drop`.
 
 This is the step the design's evidence table measured end to end: a Rust binary runs inside an AppContainer, and the capability and handle-list attributes are what put it there.
 
-**Every attribute set is checked and fatal, and that is the whole of the confinement, not a belt beside it.** Measured on this host: an `UpdateProcThreadAttribute` handed a truncated `cbSize` fails with `err=87 ERROR_INVALID_PARAMETER` and sets *no* attribute at all — and `CreateProcessW` still succeeds, returning a child that runs **completely unconfined**. So the error `UpdateProcThreadAttribute` reports is the only signal that the container was never applied: nothing downstream notices, the child starts, serves and looks exactly like a confined one from the outside. Both calls below are therefore checked, the error is fatal, and it is reported through `step` with the attribute's own name so the log says which half of the container is missing. The design's §11 error table gains the row, because "the launch failed" and "the launch succeeded without the confinement" were previously the same row.
+**Every attribute set is checked and fatal, and that is the whole of the confinement, not a belt beside it.** Measured on this host: an `UpdateProcThreadAttribute` handed a truncated `cbSize` fails with `err=87 ERROR_INVALID_PARAMETER` and sets *no* attribute at all — and `CreateProcessW` still succeeds, returning a child that runs **completely unconfined**. So the error `UpdateProcThreadAttribute` reports is the only signal that the container was never applied: nothing downstream notices, the child starts, serves and looks exactly like a confined one from the outside. Both calls below are therefore checked, the error is fatal, and it is reported through `launch` with the attribute's own name so the log says which half of the container is missing. The design's §11 error table gains the row, because "the launch failed" and "the launch succeeded without the confinement" were previously the same row.
 
 Three things are P2's additions to that measured shape: `CREATE_NEW_PROCESS_GROUP`, without which the term relay of Task 10 has nothing to address; the standard-error handle in the list, without which the confined child has no log; and the two std-handle pipes (Task 9's, supplied here), which are what decision 17's stdin payload and decision 19's stdout event stream ride on.
 
-- [ ] **Step 1: Write the failing quoting tests**
+- [x] **Step 1: Write the failing quoting tests**
 
 `crates/tinio-sandbox-windows/src/process.rs`:
 
@@ -3228,7 +2918,7 @@ mod tests {
         let mut argc = 0i32;
         // SAFETY: `line` is NUL-terminated and alive for the call; the returned
         // argv block is freed below with LocalFree.
-        let argv = unsafe { ffi::CommandLineToArgvW(line.as_ptr(), &mut argc) };
+        let argv = unsafe { CommandLineToArgvW(line.as_ptr(), &mut argc) };
         assert!(!argv.is_null(), "CommandLineToArgvW refused the line");
         let mut parsed = Vec::new();
         for index in 0..argc as isize {
@@ -3239,7 +2929,7 @@ mod tests {
         }
         // SAFETY: the block came from CommandLineToArgvW, which documents
         // LocalFree as its release.
-        unsafe { ffi::LocalFree(argv.cast()) };
+        unsafe { LocalFree(argv.cast()) };
         parsed
     }
 
@@ -3283,12 +2973,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-windows process::`
 Expected: FAIL — `cannot find function 'command_line'`.
 
-- [ ] **Step 3: Write `process.rs`**
+- [x] **Step 3: Write `process.rs`**
 
 ```rust
 //! Launching the confined child: the attribute list, the handle list and
@@ -3296,11 +2986,16 @@ Expected: FAIL — `cannot find function 'command_line'`.
 //!
 //! This module is one of the crate's enumerated `unsafe` sites (design decision
 //! 14). Its invariants are the ones the evidence table measured:
-//! `SID_AND_ATTRIBUTES` is 16 bytes on x64 (a stride of 8 returns
-//! `ERROR_INVALID_PARAMETER`), `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` requires
-//! `bInheritHandles`, and every value named by `UpdateProcThreadAttribute`
-//! outlives the attribute list, because the kernel reads it again at
-//! `CreateProcessW` time rather than copying it.
+//! `SID_AND_ATTRIBUTES` is 16 bytes on x64, and the stride is what that row
+//! fixed — a stride of 8 makes `CreateProcessW` return `ERROR_NOACCESS` (998)
+//! and produce **no child**. The `ERROR_INVALID_PARAMETER` (87) an earlier note
+//! cited here belongs to a different failure with a worse outcome: a truncated
+//! `cbSize` passed to `UpdateProcThreadAttribute`, which sets no attribute at
+//! all and still returns a child that runs **unconfined**. Beyond the layout,
+//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` requires `bInheritHandles`, and every
+//! value named by `UpdateProcThreadAttribute` outlives the attribute list,
+//! because the kernel reads it again at `CreateProcessW` time rather than
+//! copying it.
 
 #![allow(unsafe_code)]
 
@@ -3311,16 +3006,32 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::ptr;
 
-use tinio_sandbox_core::{Error, Result};
+// **The core's builder is imported under an alias here, and it has to be.**
+// `use tinio_sandbox_core::launch;` beside this module's own `pub fn launch`
+// below is `E0255` — one name cannot bind two functions — and `launch` is what
+// both the core's builder and this module's `CreateProcessW` entry are called.
+// `launch_error` says which one it is: the builder, at every call site here.
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_OBJECT_0};
+use windows_sys::Win32::Security::{PSID, SECURITY_CAPABILITIES};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
+};
+use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use crate::ffi::{self, Handle, Psid, SecurityCapabilities, StartupInfoExW, StartupInfoW};
-use crate::handles::{last_error, step};
+use crate::_core::{Error, Result, launch as launch_error};
+
+use crate::handles::last_error;
 use crate::sid::CapabilitySids;
 
 /// The AppContainer a child is created in.
 pub struct Container {
     /// The package SID, kept alive by the caller until the launch returns.
-    pub package_sid: Psid,
+    pub package_sid: PSID,
     /// The capability SIDs. Empty is the default, and the configuration the
     /// outbound guarantee rests on (design §7).
     pub capabilities: CapabilitySids,
@@ -3334,28 +3045,28 @@ pub struct LaunchSpec<'a> {
     pub args: &'a [OsString],
     /// The child's standard input: the read end of the launcher's payload pipe
     /// (decision 17).
-    pub stdin: Handle,
+    pub stdin: HANDLE,
     /// The child's standard output: the write end of the launcher's event pipe
     /// (decision 19).
-    pub stdout: Handle,
+    pub stdout: HANDLE,
     /// The child's standard error: the launcher's own, inherited untouched.
-    pub stderr: Handle,
+    pub stderr: HANDLE,
     /// The extra handles the child inherits, on top of its standard handles —
     /// the inherited listener.
-    pub inherited: &'a [Handle],
+    pub inherited: &'a [HANDLE],
     /// The child's working directory; `None` inherits the launcher's.
     pub current_dir: Option<&'a Path>,
 }
 
 /// The child process, alive until [`LaunchedProcess::wait`] or `Drop`.
 pub struct LaunchedProcess {
-    process: Handle,
+    process: HANDLE,
     pid: u32,
 }
 
 impl LaunchedProcess {
     /// The process handle, for [`crate::job::Job::assign`].
-    pub fn handle(&self) -> Handle {
+    pub fn handle(&self) -> HANDLE {
         self.process
     }
 
@@ -3391,15 +3102,15 @@ impl LaunchedProcess {
     pub fn wait(&mut self) -> Result<ExitStatus> {
         // SAFETY: `self.process` is a live process handle owned by this value for
         // the duration of the call.
-        let waited = unsafe { ffi::WaitForSingleObject(self.process, ffi::INFINITE) };
-        if waited != ffi::WAIT_OBJECT_0 {
-            return Err(step("WaitForSingleObject", self.pid.to_string(), last_error()));
+        let waited = unsafe { WaitForSingleObject(self.process, INFINITE) };
+        if waited != WAIT_OBJECT_0 {
+            return Err(launch_error("WaitForSingleObject", self.pid.to_string(), last_error()));
         }
         let mut code: u32 = 0;
         // SAFETY: as above, and `code` is a valid out-parameter.
-        let ok = unsafe { ffi::GetExitCodeProcess(self.process, &mut code) };
+        let ok = unsafe { GetExitCodeProcess(self.process, &mut code) };
         if ok == 0 {
-            return Err(step("GetExitCodeProcess", self.pid.to_string(), last_error()));
+            return Err(launch_error("GetExitCodeProcess", self.pid.to_string(), last_error()));
         }
         // The other end of the launch's `info!` event: which child it was and how
         // it left, so a log read after the fact holds both halves of the pair
@@ -3428,14 +3139,14 @@ impl LaunchedProcess {
     ///
     /// [`Error::Launch`] when the call is refused. The caller returns the failure
     /// that *led* here rather than this one — a launch that stopped must report
-    /// why — and this error is not lost with it: [`step`] logged it where it was
+    /// why — and this error is not lost with it: [`launch`] logged it where it was
     /// built, which is the rule shared §7 states for every failure in this crate.
     pub fn terminate(&self, code: u32) -> Result<()> {
         // SAFETY: `self.process` is a live process handle owned by this value,
         // and TerminateProcess takes an exit code and dereferences nothing.
-        let ok = unsafe { ffi::TerminateProcess(self.process, code) };
+        let ok = unsafe { TerminateProcess(self.process, code) };
         if ok == 0 {
-            return Err(step("TerminateProcess", self.pid.to_string(), last_error()));
+            return Err(launch_error("TerminateProcess", self.pid.to_string(), last_error()));
         }
         // A documented degradation rather than a step that went well: the launch
         // failed and a child had to be destroyed to keep the failure from leaving
@@ -3449,7 +3160,7 @@ impl Drop for LaunchedProcess {
     fn drop(&mut self) {
         // SAFETY: `self.process` is this value's own handle, closed once.
         // Not terminating here is deliberate — see `terminate`.
-        unsafe { ffi::CloseHandle(self.process) };
+        unsafe { CloseHandle(self.process) };
     }
 }
 
@@ -3527,20 +3238,24 @@ fn append_arg(line: &mut String, arg: &OsStr) {
 /// refused attribute list, attribute, or `CreateProcessW`. The caller must roll
 /// the ACLs back on every one of them (design §11).
 pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedProcess> {
-    let capabilities = SecurityCapabilities {
-        app_container_sid: container.package_sid,
-        capabilities: container.capabilities.as_ptr(),
-        capability_count: container.capabilities.len(),
-        reserved: 0,
+    let capabilities = SECURITY_CAPABILITIES {
+        AppContainerSid: container.package_sid,
+        // `cast_mut` and not a signature change on `CapabilitySids::as_ptr`:
+        // windows-sys declares the field `*mut` where the crate's own
+        // declaration said `*const`, and nothing on either side of the boundary
+        // writes through it.
+        Capabilities: container.capabilities.as_ptr().cast_mut(),
+        CapabilityCount: container.capabilities.len(),
+        Reserved: 0,
     };
 
     // Two attributes: the container and the handle list.
     let mut size = 0usize;
     // SAFETY: a null list with a size out-parameter is the documented size query;
     // it fails with ERROR_INSUFFICIENT_BUFFER and fills `size`.
-    let probed = unsafe { ffi::InitializeProcThreadAttributeList(ptr::null_mut(), 2, 0, &mut size) };
+    let probed = unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 2, 0, &mut size) };
     if probed != 0 || size == 0 {
-        return Err(step(
+        return Err(launch_error(
             "InitializeProcThreadAttributeList",
             spec.program,
             last_error(),
@@ -3552,9 +3267,9 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
     let list_ptr: *mut c_void = list.as_mut_ptr().cast();
     // SAFETY: `list_ptr` points at `size` bytes of suitably aligned storage that
     // outlives the list's use, as the API requires.
-    let initialized = unsafe { ffi::InitializeProcThreadAttributeList(list_ptr, 2, 0, &mut size) };
+    let initialized = unsafe { InitializeProcThreadAttributeList(list_ptr, 2, 0, &mut size) };
     if initialized == 0 {
-        return Err(step(
+        return Err(launch_error(
             "InitializeProcThreadAttributeList",
             spec.program,
             last_error(),
@@ -3565,18 +3280,18 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
         // SAFETY: `list_ptr` is an initialized list, and `capabilities` is a
         // local that outlives the list's use.
         let ok = unsafe {
-            ffi::UpdateProcThreadAttribute(
+            UpdateProcThreadAttribute(
                 list_ptr,
                 0,
-                ffi::PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                (&capabilities as *const SecurityCapabilities as *mut SecurityCapabilities).cast(),
-                std::mem::size_of::<SecurityCapabilities>(),
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                (&capabilities as *const SECURITY_CAPABILITIES).cast(),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
                 ptr::null_mut(),
-                ptr::null_mut(),
+                ptr::null(),
             )
         };
         if ok == 0 {
-            return Err(step(
+            return Err(launch_error(
                 "set PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES",
                 spec.program,
                 last_error(),
@@ -3586,7 +3301,7 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
         // The child inherits its three standard streams and the listener, and
         // nothing else: `bInheritHandles` is TRUE because the handle list
         // requires it, and the list is what narrows that back down to these four.
-        let mut handles: Vec<Handle> = Vec::with_capacity(spec.inherited.len() + 3);
+        let mut handles: Vec<HANDLE> = Vec::with_capacity(spec.inherited.len() + 3);
         handles.extend_from_slice(spec.inherited);
         handles.push(spec.stdin);
         handles.push(spec.stdout);
@@ -3594,56 +3309,56 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
         // SAFETY: as above: `handles` is a contiguous, live array that outlives
         // the list's use.
         let ok = unsafe {
-            ffi::UpdateProcThreadAttribute(
+            UpdateProcThreadAttribute(
                 list_ptr,
                 0,
-                ffi::PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                handles.as_mut_ptr().cast(),
-                handles.len() * std::mem::size_of::<Handle>(),
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_mut_ptr().cast::<c_void>(),
+                handles.len() * std::mem::size_of::<HANDLE>(),
                 ptr::null_mut(),
-                ptr::null_mut(),
+                ptr::null(),
             )
         };
         if ok == 0 {
-            return Err(step(
+            return Err(launch_error(
                 "set PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
                 spec.program,
                 last_error(),
             ));
         }
 
-        let startup = StartupInfoExW {
-            startup_info: StartupInfoW {
-                cb: std::mem::size_of::<StartupInfoExW>() as u32,
-                lp_reserved: ptr::null_mut(),
-                lp_desktop: ptr::null_mut(),
-                lp_title: ptr::null_mut(),
-                dw_x: 0,
-                dw_y: 0,
-                dw_x_size: 0,
-                dw_y_size: 0,
-                dw_x_count_chars: 0,
-                dw_y_count_chars: 0,
-                dw_fill_attribute: 0,
-                dw_flags: ffi::STARTF_USESTDHANDLES,
-                w_show_window: 0,
-                cb_reserved2: 0,
-                lp_reserved2: ptr::null_mut(),
-                h_std_input: spec.stdin,
-                h_std_output: spec.stdout,
-                h_std_error: spec.stderr,
+        let startup = STARTUPINFOEXW {
+            StartupInfo: STARTUPINFOW {
+                cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+                lpReserved: ptr::null_mut(),
+                lpDesktop: ptr::null_mut(),
+                lpTitle: ptr::null_mut(),
+                dwX: 0,
+                dwY: 0,
+                dwXSize: 0,
+                dwYSize: 0,
+                dwXCountChars: 0,
+                dwYCountChars: 0,
+                dwFillAttribute: 0,
+                dwFlags: STARTF_USESTDHANDLES,
+                wShowWindow: 0,
+                cbReserved2: 0,
+                lpReserved2: ptr::null_mut(),
+                hStdInput: spec.stdin,
+                hStdOutput: spec.stdout,
+                hStdError: spec.stderr,
             },
-            attribute_list: list_ptr,
+            lpAttributeList: list_ptr,
         };
 
         let mut line = command_line(spec.program, spec.args);
         let application = wide_path(spec.program);
         let directory = spec.current_dir.map(wide_path);
-        let mut info = ffi::ProcessInformation {
-            process: ptr::null_mut(),
-            thread: ptr::null_mut(),
-            process_id: 0,
-            thread_id: 0,
+        let mut info = PROCESS_INFORMATION {
+            hProcess: ptr::null_mut(),
+            hThread: ptr::null_mut(),
+            dwProcessId: 0,
+            dwThreadId: 0,
         };
         // SAFETY: every pointer above is live for the call — the command line and
         // path buffers are locals, the attribute list is initialized, and
@@ -3652,24 +3367,30 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
         // makes the child a group leader so the relay can address it (design §3
         // step 9), and it disables Ctrl+C for that group, which is why the relay
         // sends CTRL_BREAK.
+        // `&startup` is a `STARTUPINFOEXW` and `CreateProcessW` takes a
+        // `*const STARTUPINFOW`, which is the documented shape of the extended
+        // form: the attribute list the child is created with is reached through
+        // the `STARTUPINFOEXW` these two never see. The cast is the whole of
+        // what makes the extended path work, and `EXTENDED_STARTUPINFO_PRESENT`
+        // is what tells the kernel to read it that way.
         let created = unsafe {
-            ffi::CreateProcessW(
+            CreateProcessW(
                 application.as_ptr(),
                 line.as_mut_ptr(),
                 ptr::null(),
                 ptr::null(),
                 1,
-                ffi::EXTENDED_STARTUPINFO_PRESENT
-                    | ffi::CREATE_UNICODE_ENVIRONMENT
-                    | ffi::CREATE_NEW_PROCESS_GROUP,
-                ptr::null_mut(),
+                EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_NEW_PROCESS_GROUP,
+                ptr::null(),
                 directory.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
-                &startup,
+                (&startup as *const STARTUPINFOEXW).cast(),
                 &mut info,
             )
         };
         if created == 0 {
-            return Err(step("CreateProcessW", spec.program, last_error()));
+            return Err(launch_error("CreateProcessW", spec.program, last_error()));
         }
         // `info!`, and the single most useful line in the file: the program and
         // the pid, which is also the child's process-group id (it is created with
@@ -3678,20 +3399,20 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
         tracing::info!(
             step = "CreateProcessW",
             program = %spec.program.display(),
-            pid = info.process_id
+            pid = info.dwProcessId
         );
         // The thread handle is not needed: the child runs on its own.
-        // SAFETY: `info.thread` is the handle CreateProcessW just returned and
+        // SAFETY: `info.hThread` is the handle CreateProcessW just returned and
         // nothing else owns it.
-        unsafe { ffi::CloseHandle(info.thread) };
+        unsafe { CloseHandle(info.hThread) };
         Ok(LaunchedProcess {
-            process: info.process,
-            pid: info.process_id,
+            process: info.hProcess,
+            pid: info.dwProcessId,
         })
     })();
     // SAFETY: `list_ptr` is the list initialized above, deleted exactly once
     // here, after every value it named has been used.
-    unsafe { ffi::DeleteProcThreadAttributeList(list_ptr) };
+    unsafe { DeleteProcThreadAttributeList(list_ptr) };
     result
 }
 
@@ -3704,14 +3425,14 @@ fn wide_path(path: &Path) -> Vec<u16> {
 }
 ```
 
-The `Error` import is used by `step`'s return type through `Result`; drop it from the `use` if the compiler does not ask for it.
+The `Error` import is unused by the block above — every failure in it goes through `launch_error`, which builds one — so drop it from that `use` if the compiler does not ask for it. **`launch_error` is the core's builder under an alias, not a second builder**: `use tinio_sandbox_core::launch;` beside this module's own `pub fn launch` is `E0255`, and the module's entry keeps the plain name because `process::launch` is what the rest of this plan and the facade's `confined` call.
 
-- [ ] **Step 4: Run the quoting tests to verify they pass**
+- [x] **Step 4: Run the quoting tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-windows process::`
 Expected: PASS — two tests, the round trip being the real assertion.
 
-- [ ] **Step 5: Write the failing integration test**
+- [x] **Step 5: Write the failing integration test**
 
 `crates/tinio-sandbox-windows/tests/launch.rs`:
 
@@ -3818,9 +3539,21 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     // merely derived SID, `CreateProcessW` below fails `err=2
     // ERROR_FILE_NOT_FOUND` on a machine where this profile never existed —
     // which is every fresh machine — and it does so identically for this binary
-    // and for `cmd.exe`, with or without the ACEs already granted.
+    // and for `cmd.exe`, with or without the ACEs already granted. **A second
+    // check belongs beside it, and this task's run is what put it there**: a
+    // launch failure on an existing path is also what a `SECURITY_CAPABILITIES`
+    // value the kernel refuses produces — the empty capability set's own dangling
+    // pointer fails `err=87` — and the profile is the *second* cause to check,
+    // not the first.
     let sid = Arc::new(PackageSid::derive(&package_name(&root)).expect("derive"));
+    // The third grant, and it is the exposure set's first entry: the launcher's
+    // own directory, read-only, because the child's own loader reads what it
+    // imports beside the binary (`exposures()`'s rule, design decision 22).
+    let program = std::env::current_exe().expect("current exe");
+    let launcher_dir = program.parent().expect("the launcher's directory").to_path_buf();
     acl::grant(&root, AccessMode::ReadOnly, &sid).expect("grant the root");
+    acl::grant(&launcher_dir, AccessMode::ReadOnly, &sid)
+        .expect("grant the launcher's own directory");
     acl::grant(&report_dir, AccessMode::ReadWrite, &sid).expect("grant the report dir");
 
     // The child's stdin carries the payload and its stdout carries the event
@@ -3830,9 +3563,14 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     let payload_pipe = handles::pipe().expect("the child's stdin");
     let event_pipe = handles::pipe().expect("the event pipe");
     // `command_args` puts the listener element first and the launcher's own
-    // arguments after it, so what libtest sees on the child's side is exactly
-    // `child_role --exact` — the element never reaches it (Task 7 fixes the
-    // rule, and Task 9's `confine` states the same one from the launcher's end).
+    // arguments after it (Task 7 fixes the rule, and Task 9's `confine` states
+    // the same one from the launcher's end), so libtest on the child's side
+    // receives **two** positional arguments — the element and `child_role` —
+    // beside `--exact`; a test runner matches either, so `child_role` is the one
+    // test that runs (measured 2026-09-21 by running this binary with the
+    // child's own argv: `running 1 test`, `test child_role ... ok`).
+    // The element is *not* invisible to the child's argument parsing — an
+    // earlier note here said it never reaches it, and that is false.
     let args = launch::command_args(
         socket::handle(&listener),
         &[OsString::from("child_role"), OsString::from("--exact")],
@@ -3845,7 +3583,6 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
         .expect("write the frame into the child's stdin");
     let stderr = handles::inherited_stderr().expect("the launcher's stderr");
 
-    let program = std::env::current_exe().expect("current exe");
     let mut launched = process::launch(
         &LaunchSpec {
             program: &program,
@@ -3866,6 +3603,7 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
 
     let report = std::fs::read_to_string(report_dir.join("report.txt")).expect("the report");
     acl::revoke(&root, &sid).expect("roll back");
+    acl::revoke(&launcher_dir, &sid).expect("roll back");
     acl::revoke(&report_dir, &sid).expect("roll back");
 
     assert_eq!(status.code(), Some(0), "the confined child exited non-zero: {report}");
@@ -3902,14 +3640,16 @@ fn a_bad_program_path_is_an_error_naming_the_path() {
 }
 ```
 
-The child's argv is built by `launch::command_args`, which is what the backend uses too — the child sees `tinio-sandbox-fd=<handle>` and strips it on its own side. **`command_args` takes what follows `argv[0]` and puts the element first**, so the launcher's side of the contract is `std::env::args_os().skip(1)` and nothing else — Task 9's `confine` states the same rule from the other end, where it is easy to get wrong. `command_line` then writes the program path as the child's `argv[0]`, so the child's `argv` is `<program> tinio-sandbox-fd=<handle> <the launcher's own arguments>`; `own_args` drops `argv[0]`, filters the element, and what is left is the launcher's arguments in order. For a test binary that is `["child_role", "--exact"]` and nothing else — `Options::args` follows the identical rule, so no stray argument is left for libtest to interpret.
+The child's argv is built by `launch::command_args`, which is what the backend uses too — the child sees `tinio-sandbox-fd=<handle>` and strips it on its own side. **`command_args` takes what follows `argv[0]` and puts the element first**, so the launcher's side of the contract is `std::env::args_os().skip(1)` and nothing else — Task 9's `confine` states the same rule from the other end, where it is easy to get wrong. `command_line` then writes the program path as the child's `argv[0]`, so the child's `argv` is `<program> tinio-sandbox-fd=<handle> <the launcher's own arguments>`; `own_args` drops `argv[0]`, filters the element, and what is left is the launcher's arguments in order. For a test binary that is `["child_role", "--exact"]` and nothing else — `Options::args` follows the identical rule, so nothing the *launcher* passes is left for libtest to interpret. **What libtest does meet is the element itself**: it is a positional argument to the child like any other, so the child's runner sees two filters (`tinio-sandbox-fd=<handle>` and `child_role`) and matches either, which is why `child_role` runs and nothing else does. An earlier draft of this paragraph said the element never reaches the child's own argument parsing, and this task's run falsified it (2026-09-21): the element is a filter that matches no test, not an argument that disappears.
 
-- [ ] **Step 6: Run the integration test**
+- [x] **Step 6: Run the integration test**
 
 Run: `cargo test -p tinio-sandbox-windows --test launch`
-Expected: PASS — three tests. If `denied` reports a different `ErrorKind`, print the report and assert on the raw Win32 code (5, `Access is denied`) instead: the design's evidence row is stated in those terms. **If the launch itself fails with `CreateProcessW` and `err=2` (`ERROR_FILE_NOT_FOUND`) for a program path that plainly exists, the profile is missing** — that is the measurement Task 2 is written against, and it means `PackageSid::derive` is not creating it. Do not chase the path: nothing about the path is wrong.
+Expected: PASS — four tests: the child role, the confined run with the whitelist assertions, the empty capability set's own launch, and the missing program path. If `denied` reports a different `ErrorKind`, print the report and assert on the raw Win32 code (5, `Access is denied`) instead: the design's evidence row is stated in those terms. **If the launch itself fails with `CreateProcessW` on a program path that plainly exists, two causes are worth checking and this is the order to check them in: the ACE on the launcher's own directory, and the profile behind the SID.** The first is what the confined child's own reads are checked against, and Task 3's `exposures()` grants it first of all (`program.parent()`, read-only). The second is the measurement Task 2 is written against: a merely derived SID fails `err=2` (`ERROR_FILE_NOT_FOUND`) on a machine where this profile never existed — which is every fresh machine — identically for this binary and for `cmd.exe`, with or without the ACEs already granted, so that code means `PackageSid::derive` is not creating the profile. Do not chase the path in either case: nothing about the path is wrong.
 
-§11's error table gains the row this step is built on: **a refused attribute set is fatal, and the launch that would have followed is not made** — because `UpdateProcThreadAttribute` failing is invisible downstream (the child starts, unconfined, and `CreateProcessW` reports success). The design states it beside the existing Windows row, which covers a failed launch but not a launch that silently succeeded without its confinement.
+**Neither of those two was what this task's run hit, and the failure it did hit is recorded here so the next reader does not have to search for it again** (measured 2026-09-21, this host): the launch failed **`err=87` (`ERROR_INVALID_PARAMETER`) with the image plainly readable**, and the cause was `SECURITY_CAPABILITIES.Capabilities` carrying `Vec::new().as_ptr()` — a dangling *non-null* pointer — beside `CapabilityCount: 0`, which is the **default**, empty capability set design §7's outbound guarantee rests on. The kernel reads that pointer even when the count is zero: null is the value for no capabilities, and `launch` passes it. The same run measured what the directory grant actually buys, which is not the launch: with `acl::has_ace(dir)` and `acl::has_ace(exe)` both `false` the confined child still loaded, ran and enforced the whitelist, because `CreateProcessW` opens the image with the *launcher's* access rather than the child's — decision 22's grant is what the child opens for itself, and a launch that fails naming an existing path is not it.
+
+§11's error table carries the row this step is built on — an earlier task in this phase landed it, and this one extends it with the `err=87` value case above: **a refused attribute set is fatal, and the launch that would have followed is not made** — because `UpdateProcThreadAttribute` failing is invisible downstream (the child starts, unconfined, and `CreateProcessW` reports success). The design states it beside the existing Windows row, which covers a failed launch but not a launch that silently succeeded without its confinement.
 
 ---
 
@@ -3927,7 +3667,7 @@ Expected: PASS — three tests. If `denied` reports a different `ErrorKind`, pri
 
 The order is the design's §3: resolve the served root, compute the exposure set, grant it, create the two pipes, mark the handles inheritable, launch, assign the job, write the payload into the child's stdin, spawn the thread that drives core's `Observer` over the child's stdout, then hand the caller a `Child` whose wait closure waits for the process and rolls the ACLs back. Rollback happens on every path the launcher survives: a failed grant (the `Grants` guard), a failed launch, a failed job assignment, the clean wait, and a dropped `Child` (`Child` holds the closure, and the closure owns the `Grants`, so abandoning it drops the guard).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-windows/tests/common/mod.rs`:
 
@@ -4097,7 +3837,9 @@ pub fn child_role() {
     child_role_body(adopted.config(), listener);
 }
 
-/// The role's body, so the heartbeat variant can share it (Task 10).
+/// The role's body, so the variant with a stop hook can share it
+/// ([`child_role_with_stop_hook`], which arms the hook and beats before calling
+/// this).
 ///
 /// The first parameter is the payload's configuration **text** — `Adopted::config`
 /// is a `String` in P0's surface, and this harness is the one reader that treats
@@ -4387,7 +4129,7 @@ The failed-launch test reaches the backend through `Options::program` (Task 3's 
     });
 ```
 
-- [ ] **Step 1b: Write the failing relay test**
+- [x] **Step 1b: Write the failing relay test**
 
 §12 asks for this one by name: "assert that text the child writes to stdout which is *not* a frame does **not** reach the parent's stdout — that is the relay's whole job, and a relay that forwards bytes would pass every other assertion in this list."
 
@@ -4554,12 +4296,12 @@ fn the_parent_re_emits_frames_and_drops_everything_else() {
 
 `launch_confined_at` is defined in `tests/common/mod.rs` above, not in Task 10, because both suites use it — the events suite spawns its launcher as a process, and so does the signal suite. It and `launch_confined` are two entries over one body (`start`), and the only difference between them is how the caller identifies the tree: a `Tree` it built, or a **path** it received, in which case `Tree::at` rebuilds the same three directories the layout rule fixes. Task 10's step therefore adds only the heartbeat helpers.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox-windows --test confine` and `cargo test -p tinio-sandbox-windows --test events`
 Expected: FAIL — `the method 'confine' exists but its trait bound 'Backend' is not satisfied`, because the impl does not exist yet.
 
-- [ ] **Step 3: Write the composition**
+- [x] **Step 3: Write the composition**
 
 Append to `crates/tinio-sandbox-windows/src/backend.rs`:
 
@@ -4605,7 +4347,7 @@ impl BackendTrait for Backend {
             .program
             .clone()
             .unwrap_or(std::env::current_exe().map_err(|source| {
-                handles::step("locate the launcher's own executable", "current_exe", source)
+                launch("locate the launcher's own executable", "current_exe", source)
             })?);
         // The whitelist is the caller's exposures plus this binary's own
         // directory, resolved against the volume and checked for reparse points
@@ -4617,7 +4359,7 @@ impl BackendTrait for Backend {
         // `Unsupported` is reserved for a mechanism this host does not have
         // (P0's `Error`, design §11), and a launcher platform always binds one.
         let listener = plan.listener().ok_or_else(|| {
-            handles::step(
+            launch(
                 "hand the listener over",
                 "argv",
                 io::Error::other("the launch plan carries no bound listener"),
@@ -4642,8 +4384,11 @@ impl BackendTrait for Backend {
                 .collect::<Vec<_>>(),
         )?;
 
-        // The ACLs go on before the child exists, or it cannot load at all
-        // (design §3 step 5).
+        // The ACLs go on before the child exists, and what that buys is the
+        // child's own loader rather than the launch: the image is opened with the
+        // launcher's access, while a binary that imports a DLL beside it starts
+        // and then dies `0xC0000135` when the directory carries no ACE (measured
+        // 2026-09-21, design decision 22 and §3 step 5).
         //
         // **These two lines are `eprintln!` and not a traced event, deliberately.**
         // They are the operator's runbook — Task 11 Step 8 and the end-to-end test
@@ -4651,9 +4396,10 @@ impl BackendTrait for Backend {
         // they state the two facts a human wants in one place: the SID this run
         // owns and the whole exposure set it is about to grant. The
         // machine-readable half is traced instead, one `info!` per resolved
-        // exposure (Task 3) and one for the profile (Task 2), rendered by the
-        // subscriber the launcher arm installs (Task 11); neither form replaces
-        // the other.
+        // exposure (Task 3) and one for the profile (Task 2), rendered by
+        // `main`'s subscriber — installed above this arm, so the launcher
+        // installs none of its own (Task 11's measurement); neither form
+        // replaces the other.
         eprintln!("sandbox: package SID {}", sid.as_str());
         eprintln!("sandbox: granting {}", describe(&all));
         // **The grant list is one entry per exposed path; the cost is per object
@@ -4663,9 +4409,10 @@ impl BackendTrait for Backend {
         // `(OI)(CI)`, so every descendant those paths already hold picks up an
         // inherited copy. The `rollback` in the wait closure pays the same pass
         // again on the way out, which makes a run's ACL work proportional to the
-        // served corpus twice over. **No document measures that** (Task 13
-        // establishes the number), and the budget it competes with is the e2e
-        // harness's 30 s `START_TIMEOUT` (`crates/tinio-e2e/tests/steps/clients.rs`).
+        // served corpus twice over. **Task 13 measured it** (2026-09-22), and the
+        // budget it competes with is the e2e harness's 30 s `START_TIMEOUT`
+        // (`crates/tinio-e2e/tests/steps/clients.rs`) — on NTFS the grant alone
+        // exhausts it at 200,200 objects.
         let mut grants = Grants::new(Arc::clone(&sid));
         for exposure in &all {
             // A failure here leaves the earlier grants to the guard's `Drop`,
@@ -4690,20 +4437,20 @@ impl BackendTrait for Backend {
             // Two pipes: the child's stdin carries the payload (decision 17) and
             // its stdout carries the events the parent relays (decision 19).
             let payload_pipe = handles::pipe()
-                .map_err(|source| handles::step("CreatePipe", "stdin", source))?;
+                .map_err(|source| launch("CreatePipe", "stdin", source))?;
             let event_pipe = handles::pipe()
-                .map_err(|source| handles::step("CreatePipe", "stdout", source))?;
-            // **The serializer's error goes through `step` and not through `?`.**
+                .map_err(|source| launch("CreatePipe", "stdout", source))?;
+            // **The serializer's error goes through `launch` and not through `?`.**
             // The core's only `From` impl is `Error::Wait(#[from] io::Error)`, so
             // there is nothing a `serde_json::Error` could convert into (P0's
             // `Error`), and a launcher failure wants the operation's name anyway —
-            // which is what `step` supplies and what makes the log line and the
+            // which is what `launch` supplies and what makes the log line and the
             // error agree.
             let payload = serde_json::to_vec(&LaunchPayload {
                 config: plan.config().to_owned(),
             })
             .map_err(|err| {
-                handles::step(
+                launch(
                     "serialize the launch payload",
                     "stdin",
                     std::io::Error::other(err),
@@ -4832,12 +4579,14 @@ impl BackendTrait for Backend {
                     // takes a child that outlived supervision with it (decision 20).
                     let status = launched.wait();
                     if let Err(err) = grants.rollback() {
-                        // The failure was built and logged by [`step`], with the
+                        // The failure was built and logged by [`launch`], with the
                         // `icacls` invocation as its `step`; what this event adds
                         // is the phase, which is what tells a reader of the log
                         // whether the residue came from a launch or from a
-                        // shutdown (shared §7).
-                        tracing::error!(step = "roll back after the child exited", err = %err);
+                        // shutdown (shared §7). `error` and not `err`: it is the
+                        // field the core's own failure events carry, so one
+                        // query finds every failure this crate logs.
+                        tracing::error!(step = "roll back after the child exited", error = %err);
                     }
                     let _ = &job;
                     status
@@ -4882,14 +4631,22 @@ where the read is `child.terminal()`, taken **after** the wait. The ordering is 
 
 `Child::new` takes a `FnMut() -> Result<ExitStatus>`, and the relay thread's `JoinHandle<Option<Terminal>>` reaches it through `Child::with_relay`, so the two calls above fit as written. `supervise(&mut child, || ())` then runs the wait — which joins the relay before it returns — and the `Grants` guard's `Drop` covers a `Child` that is never waited on.
 
-The facade's Windows arm in `crates/tinio-sandbox/src/lib.rs` gains **two names from this phase** — the child-side listener rebuild, under the platform-neutral name P3 also uses, and the stop hook — plus **this platform's cfg-gated alias**, which is the path a consumer names to reach the settings the shared surface deliberately does not carry (design decision 2; P1's Linux arm is the same line for `linux`), and nothing else from the platform's `launch` module:
+The facade's Windows arm in `crates/tinio-sandbox/src/lib.rs` gains **the child-side listener rebuild** — under the platform-neutral name P3 also uses — plus **this platform's cfg-gated alias**, which is the path a consumer names to reach the settings the shared surface deliberately does not carry (design decision 2; P1's Linux arm is the same line for `linux`), and nothing else from the platform's `launch` module:
 
 ```rust
 #[cfg(target_os = "windows")]
 pub use crate::_windows as windows;
 
 #[cfg(target_os = "windows")]
-pub use tinio_sandbox_windows::launch::{listener as adopted_listener, on_stop};
+pub use tinio_sandbox_windows::launch::listener as adopted_listener;
+
+// **`on_stop` is the arm's other name, and it lands in Task 10 rather than
+// here.** It is a re-export of a function this task does not define: the module
+// that implements the stop hook is `crate::control`, and Task 7 landed its
+// `launch::on_stop` wrapper nowhere on purpose — a delegating function over a
+// module that does not exist would make `launch.rs`'s own interface statement
+// false. A facade arm re-exporting a name nothing defines is a compile error,
+// which is why the pair is split across the two tasks that can each land half.
 
 // **Nothing is added to the core's re-export list here, and that is the rule
 // rather than an omission.** The items the launcher path names — `Event`,
@@ -4901,14 +4658,14 @@ pub use tinio_sandbox_windows::launch::{listener as adopted_listener, on_stop};
 // rather than a shortcut.)
 ```
 
-**The two names are there because the child-side path is shared.** `serve`'s `confined` is gated by `feature = "sandbox"` alone, with no `target_os`, so it is one path across all three platforms and can name neither platform crate; the facade is where each call such a path makes gets one platform-neutral name, `#[cfg]`-selected, and nothing else from the platform's `launch` module rides along — `adopted_listener` rebuilds the inherited listener from the descriptor the payload carried, `on_stop` is the hook a forwarded stop lands on, and the names no shared call site uses (`command_args`, the launcher's own argv construction, and `disarm`, which is reached at most from an already-Windows-gated arm) stay on the platform crate. P3's facade arm is the same shape — `pub use tinio_sandbox_macos::launch::listener as adopted_listener;` — which is why the name is spelled identically in both plans. **A platform's own settings are not on it either**, and where this arm reaches them is design decision 2's boundary to state rather than this plan's: the alias that section names is `tinio_sandbox::windows` here, and a consumer writes `tinio_sandbox::windows::Options` inside the `#[cfg(target_os = "windows")]` block it would have written anyway. `Backend as Platform` and `backend as platform` are P0's selection and P2 restates neither, and `confine` and `socket` stay in this crate, where any caller that has already named it can reach them.
+**The two names are there because the child-side path is shared** — `adopted_listener` landing here and `on_stop` in Task 10, which is the task that defines it. `serve`'s `confined` is gated by `feature = "sandbox"` alone, with no `target_os`, so it is one path across all three platforms and can name neither platform crate; the facade is where each call such a path makes gets one platform-neutral name, `#[cfg]`-selected, and nothing else from the platform's `launch` module rides along — `adopted_listener` rebuilds the inherited listener from the descriptor the payload carried, `on_stop` is the hook a forwarded stop lands on, and the names no shared call site uses (`command_args`, the launcher's own argv construction, and `disarm`, which is reached at most from an already-Windows-gated arm) stay on the platform crate. P3's facade arm is the same shape — `pub use tinio_sandbox_macos::launch::listener as adopted_listener;` — which is why the name is spelled identically in both plans. **A platform's own settings are not on it either**, and where this arm reaches them is design decision 2's boundary to state rather than this plan's: the alias that section names is `tinio_sandbox::windows` here, and a consumer writes `tinio_sandbox::windows::Options` inside the `#[cfg(target_os = "windows")]` block it would have written anyway. `Backend as Platform` and `backend as platform` are P0's selection and P2 restates neither, and `confine` and `socket` stay in this crate, where any caller that has already named it can reach them.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-windows`
 Expected: PASS — the whole crate's suite, including the volume loop.
 
-- [ ] **Step 5: Run it on both volumes**
+- [x] **Step 5: Run it on both volumes**
 
 Run:
 ```powershell
@@ -4919,27 +4676,31 @@ Expected: PASS on both. `Get-Volume -DriveLetter C` and `-DriveLetter E` report 
 
 ---
 
-### Task 10: The stop semantics, and the relay
+### Task 10: The stop semantics, and the signal relay
 
 **Files:**
 - Create: `crates/tinio-sandbox-windows/src/control.rs`
 - Modify: `crates/tinio-sandbox-windows/src/backend.rs` (one call)
-- Modify: `crates/tinio-sandbox-windows/src/launch.rs` (restore `on_stop`)
-- Create: `crates/tinio-sandbox-windows/tests/signal.rs`
-- Modify: `crates/tinio-sandbox-windows/src/lib.rs`
-- Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (the stop-semantics finding)
+- Modify: `crates/tinio-sandbox-windows/src/launch.rs` (the two delegating wrappers, `on_stop` and `disarm`)
+- Modify: `crates/tinio-sandbox-windows/src/lib.rs` (the module list)
+- Modify: `crates/tinio-sandbox/src/lib.rs` (the Windows arm gains `on_stop`)
+- Create: `crates/tinio-sandbox-windows/tests/signals.rs`
+- Modify: `crates/tinio-sandbox-windows/tests/common/mod.rs` (the two roles, the two spawns, and the files they agree on)
+- Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (decision 14 (d)'s site list: `control` is the seventh)
 
 **Interfaces:**
-- Consumes: `ffi`, `handles::step`, `process::LaunchedProcess::pid`.
-- Produces: `control::{arm, send_stop, on_stop, disarm}`.
+- Consumes: `windows-sys`'s console surface — `Win32::System::Console`'s `SetConsoleCtrlHandler`, `GenerateConsoleCtrlEvent` and the `CTRL_*` constants, plus `Win32::System::Threading`'s `CreateEventW`, `SetEvent`, `WaitForSingleObject` and `INFINITE` and `Win32::Foundation`'s `HANDLE` and `WAIT_OBJECT_0` — and `crate::_core::launch`, `process::LaunchedProcess::pid`.
+- Produces: `control::{arm, send_stop, on_stop, disarm}`; `launch::{on_stop, disarm}`; and the facade's `pub use tinio_sandbox_windows::launch::on_stop;` in the Windows arm.
+
+**`on_stop` and `disarm` land here, not in Task 7** — which listed them among the names `launch` produces, and which landed neither, because a function delegating to a module that did not exist would have made that file's own interface statement false. So this task lands the module, the two wrappers **and** the facade's re-export, and the file list above is the corrected one: the plan as drafted said "restore `launch::on_stop`'s body (Task 7 left it commented out)", which describes a state that never existed. `disarm` does **not** join the facade: shared §4 says the facade carries `on_stop` and leaves `disarm` on the platform crate, which is where a caller that has already written a Windows-only branch finds it.
 
 Design §3 step 9 and decision 20's second half. **Two obligations live in the word "forward" and this task owns both, distinctly**: the *exit-status* forwarding is §3 step 8 and already exists (the wait closure returns the child's status to `supervise`, and the call site exits with it); the *signal* relaying is this task — the stop the launcher receives while it waits is passed to the child.
 
-**Two relays, and they stay two threads.** The stdout relay of decision 19 — core's `Observer`, driven by a thread this crate spawns over the child's stdout, whose `JoinHandle` goes to `Child::with_relay` — drains the child's events and re-emits them; this task's relay forwards a stop. They are separate, deliberately: the stdout relay blocks on a pipe read and ends when the child closes its stdout, while the signal relay is woken by the console handler through an event object and must stay alive exactly as long as the child does — one thread cannot block on both without a third waitable object, and merging them would put a pipe read in the path between a stop arriving and the child hearing about it. Neither is on the handler's critical path: the handler itself makes one `GenerateConsoleCtrlEvent` call and signals one event, and the threads do everything that allocates. That is also what keeps the handler's constraint satisfied — everything it touches is a static atomic, an event handle and two integers, all reachable from a console-control or service-control callback.
+**Two relays, and they stay two threads.** The stdout relay of decision 19 — core's `Observer`, driven by a thread this crate spawns over the child's stdout, whose `JoinHandle` goes to `Child::with_relay` — drains the child's events and re-emits them; this task's relay forwards a stop. They are separate, deliberately: the stdout relay blocks on a pipe read and ends when the child closes its stdout, while the signal relay is woken by the console handler through an event object and must stay alive exactly as long as the child does — one thread cannot block on both without a third waitable object, and merging them would put a pipe read in the path between a stop arriving and the child hearing about it. Neither is on the handler's critical path: the handler itself makes one `GenerateConsoleCtrlEvent` call and signals one event, and the threads do everything that allocates. That is also what keeps the handler's constraint satisfied — everything it touches is a static atomic, an event handle and two integers, all reachable from a console-control or service-control callback. **Nothing in this module emits a `tracing` event from inside the handler** (shared §7's per-crate note): the arming, the id it addresses and the child's own hook thread carry them, and a macro that formats and allocates is exactly what a console control thread may not do.
 
 **The premise was measured before the task was written, and it is not about containers at all.** §3 step 9 originally argued the hazard from container behaviour; the measurement of 2026-09-19 shows the hazard is created by `CREATE_NEW_PROCESS_GROUP` — the flag Task 8 passes so that the relay has a group to address — and therefore holds on a plain host console too.
 
-- [ ] **Step 1: The measurement this task is written against**
+- [x] **Step 1: The measurement this task is written against**
 
 It was made on 2026-09-19, on this machine's host console, before this plan was executed. **Its rows live in the design's evidence table** (the console-control rows, and §3 step 9); what follows is the conclusion, which is what the rest of the task builds on:
 
@@ -4948,358 +4709,922 @@ It was made on 2026-09-19, on this machine's host console, before this plan was 
 - The relay's forward **does** arrive, and a handler that returns TRUE consumes the event: the forward delivers, the child's hook decides. That is the division of labour `crate::control` is built on.
 - `GenerateConsoleCtrlEvent`'s **return value is not evidence of delivery** — `CTRL_C_EVENT` addressed at a pid returns 1 with `GetLastError` 0 and delivers nothing — which is why [`send_stop`]'s documentation says so rather than promising a stop that arrived.
 
+**Re-measured on 2026-09-21, and three things the first pass left implicit are what the suite's control case rests on.** (a) A stop addressed at a process group reaches **that group and no other**: two children of one console, each its own `CREATE_NEW_PROCESS_GROUP` group, both with a handler — the addressed one's fired, the other's never did. (b) A process with **no handler** that is addressed at its own group **dies** of the event, `0xC000013A (STATUS_CONTROL_C_EXIT)` — the default disposition the child-side hook exists to replace. (c) `SetConsoleCtrlHandler(Some(routine), 0)` answers 1 for a routine that was installed — and the process then dies of the next stop, so the removal is real — and **0 with `GetLastError` 87 for one that was never installed**, which is why `disarm` reports that rather than treating a process that never armed as success. (a) and (b) together are why the control case is written as two children: **the block this task was drafted with sent the stop to the child's own group and then asserted the child was not reached, which (a) falsifies.** The row it leaned on — "the return value is not evidence of delivery" — is about a group-addressed `CTRL_C_EVENT`, and the relay sends `CTRL_BREAK_EVENT`.
+
 **So the task stands as written: the relay is built.** The branch that would have deleted it — "the child is reached anyway, so collapse the task to a comment" — was measured and is false on the host console. The one thing not measured is what a Windows *container* does with the stop: this machine has no Windows-container engine (`docker version` reports a Linux engine only, and the design's §3 step 9 says so). That row stays **unverified in this environment**, and it is no longer load-bearing, because `CREATE_NEW_PROCESS_GROUP` alone is enough to require the relay.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
-`crates/tinio-sandbox-windows/tests/signal.rs`:
+`crates/tinio-sandbox-windows/tests/signals.rs`, as landed:
 
 ```rust
-//! The relay, measured: a stop delivered to the launcher's console process group
-//! reaches the confined child only because the launcher forwards it (design §3
-//! step 9).
+//! The signal relay, measured: a stop delivered to the launcher's console
+//! process group reaches the confined child only because the launcher forwards
+//! it (design §3 step 9, decision 20's second half).
+//!
+//! **What the evidence is, and what it is not.** The child arms the hook a
+//! forwarded stop lands on ([`launch::on_stop`]) and *that hook* is what this
+//! suite asserts on: it writes a file, and the child then ends with the status
+//! that arrival announces — a stopped server's shape, and the status the
+//! launcher forwards to its own caller. A heartbeat exists, but only as
+//! scaffolding for the negative case: a child whose hook never fired can only be
+//! said to have been *missed* if it was alive and writing for the whole window,
+//! and no assertion here reads a heartbeat as evidence of a stop. Nor is
+//! `GenerateConsoleCtrlEvent`'s return value evidence of anything — it returns 1
+//! with `GetLastError` 0 for a call that delivers nothing at all (the design's
+//! evidence table has the rows).
+//!
+//! **Three processes, three addresses.** The launcher runs this binary's
+//! `launcher_role` in its own process group, which is where the stop goes; the
+//! confined child is a grandchild in a group of its own, which is the gap the
+//! relay exists to close; and the premise test's children are spawned directly
+//! in groups of their own, so a stop can be addressed at one of them and the
+//! other watched for a delivery it must not receive.
 
 #![cfg(windows)]
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{self, Child, ExitStatus},
+    thread,
+    time::{Duration, Instant},
+};
 
-use tinio_sandbox_windows::control;
+use tinio_sandbox_core::{AccessMode, Confinement, supervise};
+use tinio_sandbox_windows::{Options, control};
 
-/// The launcher's own role: run the production launch path and supervise it.
+/// How often this suite looks at a file: the resolution of every window below.
+const POLL: Duration = Duration::from_millis(50);
+
+/// What a stop is given to arrive — and what a child that must stay silent is
+/// given to stay silent.
 ///
-/// It is a separate process so that a *console control event addressed to it* has
-/// somewhere to land: sending one to the test process would test nothing.
+/// Two orders of magnitude wider than [`POLL`] and fifty times the child's own
+/// beat (200 ms), because every assertion here is about the child's hook and
+/// never about timing: a window that could be confused with a poll period would
+/// fail a test for being early rather than for being wrong.
+const WINDOW: Duration = Duration::from_secs(10);
+
+/// The launcher's own role: the production launch path, and the supervision of
+/// what it launched.
+///
+/// It is a separate process because a console control event is addressed at a
+/// **process group**: one aimed at the test process would test nothing.
+/// [`common::spawn_launcher`] starts it in a group of its own, which is both the
+/// address the stop goes to and the group the child is deliberately not in.
 #[test]
 fn launcher_role() {
-    if std::env::var_os("TINIO_SANDBOX_TEST_LAUNCHER").is_none() {
+    if env::var_os("TINIO_SANDBOX_TEST_LAUNCHER").is_none() {
         return;
     }
-    let tree = PathBuf::from(std::env::var("TINIO_SANDBOX_TEST_TREE").expect("tree"));
-    let Some((confinement, _address)) = common::launch_confined_at(
-        &tree,
-        tinio_sandbox_core::AccessMode::ReadWrite,
-        Default::default(),
-        None,
-    ) else {
-        return;
-    };
-    let tinio_sandbox_core::Confinement::Supervise(mut child) = confinement else {
+    let tree = PathBuf::from(env::var("TINIO_SANDBOX_TEST_TREE").expect("the tree path"));
+    let (confinement, _address) =
+        common::launch_confined_at(&tree, AccessMode::ReadWrite, Options::default(), None);
+    let Confinement::Supervise(mut child) = confinement else {
         panic!("the Windows backend must launch a child");
     };
-    let status = tinio_sandbox_core::supervise(&mut child, || ()).expect("supervise");
-    std::process::exit(status.code().unwrap_or(1));
+    // The relay is armed inside `Backend::confine` by the time this returns, and
+    // the child cannot have been reached before then: it reads the payload, which
+    // is written after the arming (design §3 steps 7 and 9).
+    let status = supervise(&mut child, || ()).expect("supervise the confined child");
+    // The status is the child's, forwarded the way `serve` forwards it: this
+    // process exists to be a launcher, and its exit code is what the test reads.
+    process::exit(status.code().unwrap_or(1));
 }
 
-/// The confined child, with a heartbeat the test reads instead of a log.
+/// The child role: the stop hook, and a beat while it waits.
+///
+/// Two ways in, one body. The confined child reads the probe file its launcher
+/// wrote (the payload, design decision 17); the unrelayed control case — a
+/// process this suite spawns directly, with nothing relaying to it — is handed
+/// the same file's path in the environment. A process with neither is the
+/// launcher, and plays no role at all.
 #[test]
 fn child_role() {
-    // The unrelayed control case passes the probe in the environment; the
-    // confined case receives it in the payload. Either way the body is one
-    // function, and a process with neither is the launcher.
-    if let Ok(probe) = std::env::var("TINIO_SANDBOX_TEST_PROBE") {
-        let probe = std::fs::read_to_string(&probe).expect("read the probe file");
-        common::heartbeat(&common::probe_dir(&probe).join("beat"));
+    if let Ok(probe) = env::var("TINIO_SANDBOX_TEST_PROBE") {
+        let probe = fs::read_to_string(&probe).expect("read the probe file");
+        common::unrelayed_child_role(&probe);
     }
-    common::child_role_with_heartbeat();
+    common::child_role_with_stop_hook();
 }
 
-/// Start the launcher in its own process group, so a targeted console control
-/// event reaches it and nothing else.
-fn spawn_launcher(tree: &Path) -> Child {
-    use std::os::windows::process::CommandExt;
+/// A process this suite started, and owns.
+///
+/// Every path out of a test above reaps it: the clean path waits for it, and the
+/// failing path kills and waits in `Drop`, which runs during unwinding too. No
+/// path leaves a confined child or a beating test binary behind.
+struct Owned(Option<Child>);
 
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+impl Owned {
+    /// Take ownership of a process this suite spawned.
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
 
-    Command::new(std::env::current_exe().expect("current exe"))
-        .args(["launcher_role", "--exact"])
-        .env("TINIO_SANDBOX_TEST_LAUNCHER", "1")
-        .env("TINIO_SANDBOX_TEST_TREE", tree)
-        .creation_flags(CREATE_NEW_PROCESS_GROUP)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn the launcher")
+    /// The process's id, which is also its process-group id because it was
+    /// started with `CREATE_NEW_PROCESS_GROUP` — the address a stop goes to.
+    fn group(&self) -> u32 {
+        self.child().id()
+    }
+
+    fn child(&self) -> &Child {
+        self.0.as_ref().expect("the process is still owned")
+    }
+
+    /// Wait for it to exit, or fail the test — what this cannot reap, `Drop`
+    /// kills.
+    fn exit(&mut self, within: Duration, what: &str) -> ExitStatus {
+        let child = self.0.as_mut().expect("the process is still owned");
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll the process") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("{what} was still running {within:?} after the stop");
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    /// Whether it is still running.
+    fn running(&mut self) -> bool {
+        self.0
+            .as_mut()
+            .expect("the process is still owned")
+            .try_wait()
+            .expect("poll the process")
+            .is_none()
+    }
+
+    /// Kill it and reap it.
+    fn stop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
-/// Wait for `beat` to stop growing.
-fn heartbeat_stopped(beat: &Path, within: Duration) -> bool {
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Whether `path` appears within `within`, polling every [`POLL`].
+fn appears(path: &Path, within: Duration) -> bool {
     let deadline = Instant::now() + within;
-    let mut last = std::fs::read(beat).unwrap_or_default().len();
     while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-        let now = std::fs::read(beat).unwrap_or_default().len();
-        if now == last {
+        if path.exists() {
             return true;
         }
-        last = now;
+        thread::sleep(POLL);
     }
-    false
+    path.exists()
 }
 
+/// Watch `stopped` for `within` while the child beats, failing the moment it
+/// appears, and hand back how much the child wrote in the meantime.
+///
+/// The window is what makes the negative mean something: a child that was dead
+/// for it cannot be said to have been missed.
+fn missed_while_beating(beat: &Path, stopped: &Path, within: Duration) -> u64 {
+    let before = length(beat);
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        assert!(
+            !stopped.exists(),
+            "the hook of a child in another process group fired: a stop addressed at one group \
+             reached a process in another, so the premise design §3 step 9 rests on does not hold \
+             here and the relay forwards nothing this platform would not have delivered anyway"
+        );
+        thread::sleep(POLL);
+    }
+    length(beat) - before
+}
+
+/// A file's length, or zero when it is not there yet.
+fn length(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+/// The relay, end to end: a stop addressed at the launcher's process group
+/// reaches the confined child, which is in a group of its own.
+///
+/// **A host that cannot deliver a console control event fails this test rather
+/// than skipping it.** There is nothing to fall back to — the relay is the
+/// mechanism this platform has, and a run that quietly asserts nothing is the
+/// shape of green this phase refuses.
 #[test]
 fn a_stop_addressed_at_the_launcher_reaches_the_confined_child() {
-    let Some(volume) = common::volumes().into_iter().next() else {
-        return;
-    };
-    let (_dir, tree) = common::tree(&volume);
-    let beat = tree.report.join("beat");
-    let mut launcher = spawn_launcher(&tree.path);
+    let (_dir, tree) = common::tree(&common::one_volume());
+    let armed = tree.report.join(common::ARMED);
+    let stopped = tree.report.join(common::STOPPED);
+    let mut launcher = Owned::new(common::spawn_launcher(&tree.path));
 
-    // Wait for the heartbeat to appear: the child is confined and running.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !beat.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(beat.exists(), "the confined child never started");
-
-    // Skip rather than fail where there is no console to address: a console
-    // control event needs one, and a detached test runner has none.
-    if let Err(err) = control::send_stop(launcher.id()) {
-        eprintln!("skipping: no console to deliver a stop on — {err}");
-        let _ = launcher.kill();
-        let _ = launcher.wait();
-        return;
-    }
-
+    // The child's hook is installed: from here a forwarded stop has somewhere to
+    // land instead of taking the default disposition.
     assert!(
-        heartbeat_stopped(&beat, Duration::from_secs(15)),
-        "the confined child kept running after the launcher was stopped: the relay did not forward"
+        appears(&armed, common::TIMEOUT),
+        "the confined child never armed its stop hook: nothing would have caught a forwarded stop, \
+         and this run proves nothing about the relay"
     );
-    let status = launcher.wait().expect("the launcher exits with its child's status");
-    assert!(status.code().is_some(), "the launcher reported its child's status");
+    // The stop a container sends: addressed at the launcher's own process group,
+    // which the child is not in.
+    control::send_stop(launcher.group()).expect("a console to deliver a stop on");
+
+    // The evidence: the child's own hook, which nothing but the launcher's
+    // forward can have reached. `send_stop` returning `Ok` above says only that
+    // the call was accepted.
+    assert!(
+        appears(&stopped, WINDOW),
+        "the confined child's stop hook never fired within {WINDOW:?}: the launcher did not forward \
+         the stop to the child's process group (design §3 step 9)"
+    );
+    // The hook ends the child, so the launcher's wait returns, its ACL rollback
+    // runs and it exits with the status it was handed (design §3 step 8).
+    let status = launcher.exit(common::TIMEOUT, "the launcher");
+    assert_eq!(
+        status.code(),
+        Some(common::STOPPED_EXIT),
+        "the launcher did not report the child's own status: the stop reached the child, and the \
+         exit-status forwarding did not carry the answer back"
+    );
 }
 
+/// The premise the relay rests on: a console control event addressed at one
+/// process group is delivered to that group, and to no other.
+///
+/// Without this, "the confined child's hook fired" would be consistent with the
+/// child having been reached directly — a console-wide event would need no relay
+/// at all, and `CREATE_NEW_PROCESS_GROUP` (the flag the launch itself passes,
+/// §3 step 9) is exactly the mechanism that makes one addressed stop stop short
+/// of a child in another group. Both children here have the same hook the
+/// confined child arms, so the addressed one doubles as the hook's own positive
+/// case in an unconfined process.
 #[test]
-fn the_same_stop_without_a_relay_is_not_forwarded() {
-    // The control that makes the test above mean something: the same console
-    // control event, addressed the same way, to a launcher that does *not*
-    // relay. Without this case, "the child died" would be consistent with the
-    // child having been reached directly.
-    let Some(volume) = common::volumes().into_iter().next() else {
-        return;
-    };
-    let (_dir, tree) = common::tree(&volume);
-    let beat = tree.report.join("beat");
-    // **The probe is written here because nothing else writes it in this case.**
-    // Every other test in the plan launches through `launch_confined`, and
-    // `Tree::probe` is part of launching; this child is spawned directly, so the
-    // file has to exist before the spawn — otherwise the child panics in
-    // `read_to_string` before it ever beats, and `beat.exists()` below fails for
-    // a reason that has nothing to do with the relay.
-    let probe = tree.probe();
-    let child = common::spawn_unrelayed_child_in_own_group(&probe);
+fn the_stop_reaches_the_group_it_addresses_and_reaches_no_other() {
+    let (_addressed_dir, addressed_tree) = common::tree(&common::one_volume());
+    let (_other_dir, other_tree) = common::tree(&common::one_volume());
+    let mut addressed = Owned::new(common::spawn_unrelayed_child_in_own_group(
+        &addressed_tree.probe(),
+    ));
+    let mut other = Owned::new(common::spawn_unrelayed_child_in_own_group(
+        &other_tree.probe(),
+    ));
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !beat.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
+    let addressed_stopped = addressed_tree.report.join(common::STOPPED);
+    let other_stopped = other_tree.report.join(common::STOPPED);
+    for (tree, what) in [
+        (&addressed_tree, "the addressed"),
+        (&other_tree, "the other"),
+    ] {
+        assert!(
+            appears(&tree.report.join(common::ARMED), common::TIMEOUT),
+            "the {what} child never armed its stop hook"
+        );
     }
-    assert!(beat.exists(), "the child never started");
 
-    if control::send_stop(child.id()).is_err() {
-        eprintln!("skipping: no console to deliver a stop on");
-        return;
-    }
+    control::send_stop(addressed.group()).expect("a console to deliver a stop on");
+
     assert!(
-        !heartbeat_stopped(&beat, Duration::from_secs(5)),
-        "a stop addressed at one process group reached a process in another: \
-         design §3 step 9's premise does not hold here, and the relay is not needed"
+        appears(&addressed_stopped, WINDOW),
+        "the hook of the process group the stop was addressed to never fired: the event did not \
+         reach the group it named"
     );
+    assert_eq!(
+        addressed
+            .exit(common::TIMEOUT, "the addressed child")
+            .code(),
+        Some(common::STOPPED_EXIT),
+        "the addressed child's hook fired, and the process did not end the way the hook ends it"
+    );
+
+    // The other group's child is untouched: it beats for the whole window and its
+    // hook never fires. The beat is not the evidence — the hook's silence is —
+    // and it is what makes that silence a measurement rather than an absence.
+    let written = missed_while_beating(
+        &other_tree.report.join(common::BEAT),
+        &other_stopped,
+        WINDOW,
+    );
+    assert!(
+        written > 0,
+        "the other group's child wrote nothing for {WINDOW:?}: it was not alive to be missed, so \
+         its silent hook proves nothing"
+    );
+    assert!(
+        other.running(),
+        "the other group's child is gone: it was reached after all, or it died for a reason this \
+         test has not accounted for"
+    );
+    // Spawned by this suite, reaped by it (the beat never ends on its own).
+    other.stop();
+}
+
+/// `arm` then `disarm`, in the process that runs the tests.
+///
+/// The round trip is the whole of what this asserts, and it is worth asserting
+/// because both calls report a refusal: an `arm` that cannot install the console
+/// handler and a `disarm` that cannot remove it are the two failures a process
+/// that outlives one launch would meet. What it cannot assert is the disposition
+/// `disarm` restores — witnessing that takes an event, and the only process whose
+/// death could witness it here is this one, which has to stay alive long enough to
+/// report the result.
+#[test]
+fn the_relay_arms_and_disarms_in_this_process() {
+    // Armed for this process itself: a live id rather than a placeholder, so
+    // nothing in the call is invented. **It is not a group id** — this test
+    // process was started without `CREATE_NEW_PROCESS_GROUP`, so the forward the
+    // handler would make is refused by the system (`ERROR_INVALID_PARAMETER`)
+    // rather than signalled to anybody, and the handler is installed for the
+    // length of one call besides.
+    control::arm(process::id()).expect("arm the relay");
+    control::disarm().expect("disarm the relay");
 }
 ```
 
-`spawn_unrelayed_child_in_own_group` spawns the same role with `CREATE_NEW_PROCESS_GROUP` and no `confine` in between, so the child is a grandchild in another group with nothing relaying — the control case. It lives in `common`, not in the suite, and Step 3 below is where it is written: the harness is where a role and the process that starts it agree on a contract. `common::launch_confined_at` and `common::child_role_with_heartbeat` are the other two additions this suite needs: the first takes the tree's *path* (a launcher role is its own process and cannot receive a `Tree`), and the second writes one byte to `<report>/beat` every 200 ms before doing everything `child_role` already does.
+**The evidence is the child's own hook, and the drafted block's was not.** Three things the block above changes, each of which was a defect in the plan rather than a preference:
 
-- [ ] **Step 3: Extend the harness**
+- **The suite asserts the hook's own effect — a file the hook writes, and the status the child ends with — and never a heartbeat.** A heartbeat was the draft's observable, read by a helper that compared two samples 200 ms apart against a beat whose period is exactly 200 ms: a child that was alive but starved read as stopped, and `control::on_stop`, the hook a forwarded stop lands on, had no failing test anywhere in the phase. The beat is still here, as *scaffolding*: the negative case needs it, because a child whose hook never fired can only be said to have been missed if it was alive and writing for the whole window. It is no assertion's evidence.
+- **Every child this suite spawns is waited for or killed**, on the red paths as much as the green ones. The drafted unrelayed-child helper left a beating test binary behind on every run, because nothing reaped it. `Owned` waits on the clean path and kills and waits in `Drop` — which runs while the test is unwinding too — and its `exit` is a bounded poll, so a launcher that never exits fails the test instead of hanging it.
+- **The control case is two children, not one.** See Step 1's (a): the drafted case addressed the stop at the child's own group and asserted non-delivery, and the design's own row says the event *is* delivered there. The premise it was trying to establish — that a stop reaches the group it addresses and no other — is measured directly by `the_stop_reaches_the_group_it_addresses_and_reaches_no_other`, with both children armed so the addressed one is also `on_stop`'s positive case in a plain process.
+- **The harness calls are Task 9's, not the draft's**: `common::one_volume()` is the named single-volume entry (`volumes()` asserts a usable selection and never answers an empty list), `launch_confined_at` returns its pair rather than an `Option` nothing can be `None` about, and every wait in the suite is bounded by `common::TIMEOUT`, `WINDOW` or the guard's own deadline.
 
-`crates/tinio-sandbox-windows/tests/common/mod.rs` gains the heartbeat helpers — `launch_confined_at` landed in Task 9, since the events suite uses it too:
+- [x] **Step 3: Extend the harness**
+
+`crates/tinio-sandbox-windows/tests/common/mod.rs` gains the constants the two roles agree on, the two roles, and the two spawns — `launch_confined_at` and `child_role_body` are Task 9's and are unchanged:
 
 ```rust
-// `launch_confined_at` (Task 9) already gives a launcher process a confined
-// child from a tree path; what is new here is the heartbeat.
+/// The file a child writes once the stop hook a forwarded stop lands on is
+/// installed.
+///
+/// Its existence is the parent's licence to send a stop: before it, the event
+/// would arrive with nothing to land on and take the default disposition.
+pub const ARMED: &str = "armed";
 
-/// The report directory a probe file names.
+/// The file the stop hook writes when it fires.
+///
+/// **This is the evidence the signal relay exists**, and the reason it is a file
+/// the hook itself writes rather than a liveness signal the parent samples: a
+/// child that was never reached cannot produce it.
+pub const STOPPED: &str = "stopped";
+
+/// The file a child appends to while it is alive.
+///
+/// Scaffolding, not evidence: a heartbeat is the same shape whether the child is
+/// working or starved, so what it is for is the *negative* case — a child whose
+/// hook stayed silent can only be said to have been missed if it was alive and
+/// writing for the whole window.
+pub const BEAT: &str = "beat";
+
+/// The status the stop hook leaves behind.
+///
+/// The child's hook ends the process with it, which is a stopped server's shape
+/// (it drains and leaves) and the way the parent learns the hook ran from the
+/// event protocol's other side: the launcher forwards this status to its own
+/// caller (design §3 step 8).
+pub const STOPPED_EXIT: i32 = 41;
+
+/// The flag a child and a launcher are both started with, so each is its own
+/// process **group** — the unit a console control event is addressed to, and the
+/// flag the launch itself passes (`crate::process`, design §3 step 9).
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// The volumes the suite exercises.
+///
+/// `TINIO_SANDBOX_TEST_VOLUMES` (semicolon separated) selects them; without it,
+/// the volume holding the system temp directory. The design's evidence shows
+/// ReFS and NTFS agree on every probed ACL case, so a regression that broke one
+/// would be invisible on a single-volume run — this is how both are covered.
+///
+/// **A selection that names no usable volume fails rather than answering an
+/// empty list**, because every caller either loops over this or takes its first
+/// entry: an empty answer would make those tests pass by doing nothing, which is
+/// exactly the shape of green this phase refuses.
+pub fn volumes() -> Vec<PathBuf> {
+    let Ok(raw) = env::var("TINIO_SANDBOX_TEST_VOLUMES") else {
+        return vec![env::temp_dir()];
+    };
+    let volumes: Vec<PathBuf> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty() && Path::new(entry).is_dir())
+        .map(PathBuf::from)
+        .collect();
+    assert!(
+        !volumes.is_empty(),
+        "TINIO_SANDBOX_TEST_VOLUMES={raw:?} names no directory that exists on this host, so \
+         every test looping over the volumes would run zero cases and pass"
+    );
+    volumes
+}
+
+/// The first volume, for the tests that exercise one's worth of tree.
+pub fn one_volume() -> PathBuf {
+    volumes()
+        .into_iter()
+        .next()
+        .expect("volumes() answers with at least one volume or fails")
+}
+
+/// One tree's worth of probes: what the child reads and what it writes.
+pub struct Tree {
+    /// The tree root, on the volume under test.
+    pub path: PathBuf,
+    /// The served root. Exposed with the caller's access mode.
+    pub root: PathBuf,
+    /// A sibling with no package-SID ACE, carrying `Users` instead.
+    pub denied: PathBuf,
+    /// A directory exposed read-write, where the child writes its report.
+    pub report: PathBuf,
+    /// The address the child should try to reach, when a test sets one. It
+    /// travels in the probe file, so the confined child needs no environment
+    /// channel to learn it.
+    pub target: Option<SocketAddr>,
+}
+
+impl Tree {
+    /// The tree whose directories sit under `path`, without touching the disk.
+    ///
+    /// The one rule `tree()` and [`launch_confined_at`] share: `root`, `denied`
+    /// and `report` are `path`'s three children, in that order, and nothing about
+    /// the layout is carried in a value a second process cannot receive. A
+    /// launcher role is a fresh process that got a path in an environment
+    /// variable and nothing else, so it rebuilds the same three directories from
+    /// it rather than being handed a `Tree`.
+    pub fn at(path: &Path) -> Self {
+        Self {
+            root: path.join("root"),
+            denied: path.join("denied"),
+            report: path.join("report"),
+            path: path.to_path_buf(),
+            target: None,
+        }
+    }
+
+    /// The probe text, without writing it.
+    pub fn probe_text(&self) -> String {
+        let mut text = format!(
+            "root={}\ndenied={}\nreport={}\n",
+            self.root.display(),
+            self.denied.display(),
+            self.report.join("report.txt").display()
+        );
+        if let Some(target) = self.target {
+            text.push_str(&format!("target={target}\n"));
+        }
+        text
+    }
+
+    /// Write the probe file and return its path — what the payload's config
+    /// bytes carry.
+    ///
+    /// **It goes into the report directory and not into `path`**, and that is
+    /// the difference between a suite that tests the confinement and one that
+    /// tests nothing. `path` is the tree's own directory and is exposed to
+    /// nobody; the confined child is an AppContainer, so its reads are checked
+    /// against the package SID and the user's own ACEs do not help it — a probe
+    /// written as a sibling of `root` and `report` is a file the child cannot
+    /// open, and every role that reads it panics on its first line, taking the
+    /// confined cases of Tasks 8, 9, 10 and 12 with it. The report directory is
+    /// the one path every test here grants read-write, which is what makes it the
+    /// only place a probe can live.
+    pub fn probe(&self) -> PathBuf {
+        let probe = self.report.join("probe.txt");
+        fs::write(&probe, self.probe_text()).expect("write the probe file");
+        probe
+    }
+
+    /// What the child reported, if it got that far.
+    pub fn report_text(&self) -> String {
+        fs::read_to_string(self.report.join("report.txt")).unwrap_or_default()
+    }
+}
+
+/// Build the standard tree under `volume`.
+///
+/// The `denied` sibling carries `Users` and no package-SID ACE, which is the
+/// verified row every confinement test reproduces: those ACEs do not help.
+pub fn tree(volume: &Path) -> (tempfile::TempDir, Tree) {
+    let dir = tempfile::TempDir::new_in(volume).expect("temp dir on the volume");
+    let tree = Tree::at(&dir.path().join("tree"));
+    fs::create_dir_all(&tree.root).expect("root");
+    fs::create_dir_all(&tree.denied).expect("denied");
+    fs::create_dir_all(&tree.report).expect("report");
+    // Seeded *before* the grant: this is design §6's inheritance question as the
+    // confinement suite sees it — Task 4 settled the ACL shape, and this is the
+    // functional half of the same answer.
+    fs::write(tree.root.join("granted.txt"), b"granted").expect("seed");
+    fs::write(tree.denied.join("secret.txt"), b"secret").expect("seed");
+    let granted = Command::new(acl::icacls_binary())
+        .arg(&tree.denied)
+        .args(["/grant", r"*S-1-5-32-545:(OI)(CI)R", "/q"])
+        .output()
+        .expect("grant Users on the denied tree");
+    assert!(
+        granted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+    (dir, tree)
+}
+
+/// Append one line to the report the parent reads.
+pub fn append_to_report(report: &Path, line: &str) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(report)
+        .expect("open the report");
+    writeln!(file, "{line}").expect("write the report");
+}
+
+/// The confined child's role, shared by every test binary that launches one.
+///
+/// Inert when there is no payload: that is design decision 17's discriminator,
+/// exercised by the tests exactly as production uses it, and it is why the
+/// launcher-side test functions can share a binary with this one. The early
+/// return is the discriminator rather than a skipped test — a process with no
+/// payload is the launcher, and the role it plays there is no role at all.
+pub fn child_role() {
+    let Some(adopted) =
+        launch::adopt(env::args_os(), io::stdin().lock()).expect("adopt the payload")
+    else {
+        return;
+    };
+    // Core's rule hands back a descriptor; rebuilding it is this crate's half.
+    let listener = launch::listener(&adopted).expect("the harness bound a listener");
+    child_role_body(adopted.config(), listener);
+}
+
+/// The report directory a probe file's `report=` entry names.
+///
+/// The probe carries the **report file**, because that is what the ACL probes
+/// append to; the files the signal suite's roles agree on are its siblings, so
+/// the directory is the part both ends need.
 pub fn probe_dir(probe: &str) -> PathBuf {
     probe
         .lines()
         .find_map(|line| line.strip_prefix("report="))
-        .map(|value| PathBuf::from(value))
+        .map(PathBuf::from)
         .and_then(|report| report.parent().map(Path::to_path_buf))
         .expect("the probe carries a report path")
 }
 
-/// Beat once every 200 ms into `<report>/beat`.
+/// Beat once every 200 ms into `<report>/beat`, for as long as the process lives.
 ///
-/// The file's growth is the child's liveness, and it stops the moment the process
-/// dies — which is the observable a console control event leaves behind when no
-/// handler is installed.
-pub fn heartbeat(beat: &Path) -> ! {
+/// The child's own liveness, and nothing else — see [`BEAT`] for what it is for
+/// and what it is not.
+pub fn beat(report: &Path) -> ! {
+    let beat = report.join(BEAT);
     loop {
-        append_to_report(beat, ".");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        append_to_report(&beat, ".");
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// The confined child, beating while it does everything `child_role` does.
-pub fn child_role_with_heartbeat() {
-    // The adopt guard first: this role is inert in the launcher process, and the
-    // heartbeat must not run there.
+/// Arm the hook a forwarded stop lands on, and announce it (Task 10).
+///
+/// The child-side half of the signal relay: without it a console control event
+/// takes the default disposition and the process dies where it stands, instead
+/// of draining — which is the whole reason the launcher forwards one at all
+/// (design §3 step 9). [`ARMED`] is written after the hook is installed, so the
+/// parent never sends a stop into a window where nothing would catch it.
+///
+/// **The hook writes [`STOPPED`] and then ends the process with
+/// [`STOPPED_EXIT`].** The file is the evidence; the exit is what unwinds the
+/// tree — the launcher's wait returns, its ACL rollback runs and it forwards the
+/// status — so a test that reached its hook also leaves no process behind.
+fn stop_hook(report: &Path) {
+    let stopped = report.join(STOPPED);
+    launch::on_stop(move || {
+        append_to_report(&stopped, "stopped");
+        process::exit(STOPPED_EXIT);
+    })
+    .expect("arm the stop hook");
+    append_to_report(&report.join(ARMED), "armed");
+}
+
+/// The confined child, with the stop hook armed before it does anything else.
+///
+/// The payload's configuration is the probe file's path ([`child_role_body`]'s
+/// rule), so the report directory the hook writes into is the launcher's own
+/// choice and not this process's.
+pub fn child_role_with_stop_hook() {
     let Some(adopted) =
-        tinio_sandbox_windows::launch::adopt(std::env::args_os(), std::io::stdin().lock())
-            .expect("adopt")
+        launch::adopt(env::args_os(), io::stdin().lock()).expect("adopt the payload")
     else {
         return;
     };
-    let listener = tinio_sandbox_windows::launch::listener(&adopted).expect("a listener");
-    let probe_path = adopted.config().to_owned();
-    let probe = std::fs::read_to_string(&probe_path).expect("read the probe file");
-    let beat = probe_dir(&probe).join("beat");
-    std::thread::spawn(move || heartbeat(&beat));
+    let listener = launch::listener(&adopted).expect("the harness bound a listener");
+    let probe = fs::read_to_string(adopted.config()).expect("read the probe file");
+    let report = probe_dir(&probe);
+    stop_hook(&report);
+    let beating = report.clone();
+    thread::spawn(move || beat(&beating));
     child_role_body(adopted.config(), listener);
 }
 
-/// A child in its own process group with nothing supervising it: the control case
-/// for the relay, and the case whose failure means the premise of design §3 step 9
-/// does not hold here.
+/// The unrelayed child's role: the same hook and the same beat, with no payload
+/// and no listener — never returns, so a stop that never arrives leaves it
+/// beating until the test that started it ends it.
 ///
-/// It takes the **probe file's path** rather than the tree's, because the caller
-/// has already written it (`Tree::probe`) and this function must name the same
-/// file: the child reads it, and a path that does not exist is a panic rather
-/// than a skipped case. The environment is the channel here and it is the only
-/// place in the harness that uses one — legitimate precisely because this child
-/// is *not* confined, and the test is measuring a console control event rather
-/// than a payload.
-pub fn spawn_unrelayed_child_in_own_group(probe: &Path) -> std::process::Child {
-    use std::os::windows::process::CommandExt;
+/// The probe text arrives in the **environment** here, and this is the harness's
+/// one use of that channel: the child is spawned directly rather than launched,
+/// so there is no payload for it to inherit, and the test is measuring a console
+/// control event rather than a payload. Legitimate precisely because this child
+/// is **not** confined (design decision 17 keeps the environment out of the
+/// confined path, where a marker would be forgeable).
+pub fn unrelayed_child_role(probe: &str) -> ! {
+    let report = probe_dir(probe);
+    stop_hook(&report);
+    beat(&report)
+}
 
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-    std::process::Command::new(std::env::current_exe().expect("current exe"))
+/// A child in its own process group with nothing supervising it: the group a
+/// stop can be addressed to directly, which is what the relay's own address
+/// space looks like from the outside.
+///
+/// The caller owns the returned process and must reap it — the signal suite's
+/// guard does, on every path. `stdout` is null because a test binary's banner is
+/// not this suite's evidence and the event protocol's channel is not a place to
+/// put it (design decision 19); `stderr` is inherited because that is the log
+/// channel and a child's panic has to be readable.
+pub fn spawn_unrelayed_child_in_own_group(probe: &Path) -> Child {
+    Command::new(env::current_exe().expect("the test executable"))
         .args(["child_role", "--exact"])
         .env("TINIO_SANDBOX_TEST_PROBE", probe)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn the unrelayed child")
 }
-```
 
-Three small consequences in the harness: `child_role`'s body moves into `child_role_body(config: &str, listener: TcpListener)` — **`&str` and not `Vec<u8>`**, because that is what core's `Adopted::config()` returns and what `Config::parse` takes — and core's `Adopted` is consumed by the role, which rebuilds the socket before delegating, so both roles share it; the signal suite's `child_role` test dispatches on the environment first, so the unrelayed child beats and does nothing else; and the unrelayed case is the one place the harness uses the environment channel — which is fine there precisely because that child is not confined and the test is measuring a console control event, not a payload:
-
-```rust
-#[test]
-fn child_role() {
-    // The unrelayed control case passes the probe in the environment; the
-    // confined case receives it in the payload. Either way the body is one
-    // function, and a process with neither is the launcher.
-    if let Ok(probe) = std::env::var("TINIO_SANDBOX_TEST_PROBE") {
-        let probe = std::fs::read_to_string(&probe).expect("read the probe file");
-        common::heartbeat(&common::probe_dir(&probe).join("beat"));
-    }
-    common::child_role_with_heartbeat();
+/// A launcher of this test binary in its own process group, which is the address
+/// a stop goes to.
+///
+/// The launcher role is a separate process because a console control event is
+/// addressed at a *process group*: one aimed at the test process would test
+/// nothing. `TINIO_SANDBOX_TEST_TREE` is the tree it works in — the role cannot
+/// receive a [`Tree`], it is a fresh process — and `stdout` is null for
+/// [`spawn_unrelayed_child_in_own_group`]'s reason, the launcher's banner being
+/// libtest's and not the relay's.
+pub fn spawn_launcher(tree: &Path) -> Child {
+    Command::new(env::current_exe().expect("the test executable"))
+        .args(["launcher_role", "--exact"])
+        .env("TINIO_SANDBOX_TEST_LAUNCHER", "1")
+        .env("TINIO_SANDBOX_TEST_TREE", tree)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the launcher")
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+**The harness is where a role and the process that starts it agree on a contract**, which is why the file names, the status and the two spawns live here rather than in the suite: the confined child learns the report directory from the payload, the unrelayed child is handed the probe file in the environment (the harness's one use of that channel, legitimate because that child is not confined and the test is measuring a console control event), and the two processes that start them must agree on both spellings. `stdout` is null for both spawns — a test binary's banner is not this suite's evidence and stdout is the event protocol's channel — and `stderr` is inherited, because that is the log channel and a child's panic has to be readable.
 
-Run: `cargo test -p tinio-sandbox-windows --test signal`
-Expected: FAIL — `cannot find function 'send_stop'`, and the control case failing would mean the premise does not hold (Step 1's second row).
+- [x] **Step 4: Run the tests to verify they fail**
 
-- [ ] **Step 5: Write `control.rs`**
+Run: `cargo test -p tinio-sandbox-windows --test signals`
+Expected: FAIL. **Two reds, and the second is the one that matters.** Without `control` the suite does not compile (`unresolved import tinio_sandbox_windows::control`, `cannot find function on_stop in module launch`), which proves the tests are written against an interface that does not exist yet and nothing more. With `control` landed but `control::arm` **not** yet called from `backend.rs`, `a_stop_addressed_at_the_launcher_reaches_the_confined_child` fails on its assertion — "the confined child's stop hook never fired within 10s: the launcher did not forward the stop to the child's process group (design §3 step 9)" — which is the red that gives the suite its teeth: the same test passes once the launcher arms, so the assertion is measuring the forward and not the fixture.
+
+- [x] **Step 5: Write `control.rs`**
+
+`crates/tinio-sandbox-windows/src/control.rs`, as landed:
 
 ```rust
-//! The termination relay (design §3 step 9, decision 20's second half).
-//!
-//! A Windows container signals its main process and nothing else, so on Windows
-//! the launcher is the only process that learns the server should stop — and the
-//! confined child, which is not its parent's process group, learns nothing.
-//! Without the relay the server is hard-terminated at the end of the container's
-//! grace period instead of draining, and nothing about that looks like a bug
-//! from the outside.
+//! The signal relay: the stop a launcher receives while it waits, passed to the
+//! confined child (design §3 step 9, decision 20's second half).
 //!
 //! Windows has no `SIGTERM`, so the mechanism is a console control event:
 //! `CTRL_BREAK_EVENT` is the only one that can be addressed to a process group,
 //! and the child is created with `CREATE_NEW_PROCESS_GROUP` so it has one
 //! ([`crate::process`]).
 //!
+//! **The relay is required on the host console, not only inside a container,
+//! and that is measured** (design §3 step 9 and the evidence table): the flag
+//! that gives the relay a group to address is the flag that stops a console-wide
+//! Ctrl+C from reaching the child, so a launcher that forwards nothing leaves the
+//! confined server to be terminated at the end of a grace period instead of
+//! draining — ≤10 s of in-flight drain and a removed state file traded silently
+//! for whatever a hard stop leaves behind. A Windows container adds the same
+//! requirement from the other direction, because it signals its main process and
+//! nothing else; the two do not need each other to make this module necessary.
+//!
 //! The handler does two things and nothing else, both of them one call on values
 //! that already exist: forward with `GenerateConsoleCtrlEvent` when the process
 //! is a launcher, and signal an event object when it is a child. Everything that
 //! allocates, locks or talks to a runtime happens on the thread waiting on that
-//! event, which is where a service-control callback could equally well hand off —
-//! so the handler's constraints hold whichever supervisor is asking the process
-//! to stop.
+//! event — a thread of the child's own, which is where the CLI's graceful
+//! shutdown lands ([`on_stop`]) and where a service-control callback could
+//! equally well hand off, so the handler's constraints hold whichever supervisor
+//! is asking the process to stop.
+//!
+//! **Nothing in this module emits a `tracing` event from inside the handler.**
+//! Every macro in that crate formats, allocates and can take a lock to reach its
+//! subscriber, none of which a console control thread may do (shared §7's
+//! per-crate note). The arming, the id it addresses, the delivery and the child's
+//! own hook thread carry the events instead, and each of them is emitted
+//! somewhere that may allocate.
 //!
 //! This module is one of the crate's enumerated `unsafe` sites (design decision
-//! 14).
+//! 14): every call below is a raw Win32 call, and every one of them carries its
+//! own safety argument.
 
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::{
+    io,
+    ptr::null,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
+    thread,
+};
 
-use tinio_sandbox_core::{Error, Result};
+use windows_sys::Win32::{
+    Foundation::{HANDLE, WAIT_OBJECT_0},
+    System::{
+        Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        },
+        Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject},
+    },
+};
 
-use crate::ffi::{self, Handle};
-use crate::handles::{last_error, step};
+use crate::_core::{Result, launch};
+
+use crate::handles::{self, last_error};
 
 /// The child's process id — the only state the handler reads.
 ///
 /// A process id rather than a handle: `GenerateConsoleCtrlEvent` takes a process
-/// *group* id, the child is its own group leader, and an integer needs no
-/// ownership in a handler.
+/// *group* id, the child is its own group leader because the launch created it
+/// with `CREATE_NEW_PROCESS_GROUP`, and an integer needs no ownership, no
+/// closing and no lifetime reasoning on a thread the system created. Zero means
+/// "no child addressed", which is also what a child-side hook leaves here.
 static CHILD: AtomicU32 = AtomicU32::new(0);
+
+/// The relay's event: a handle in the shape the thread that waits on it needs.
+///
+/// **The wrapper exists because `windows_sys`'s `HANDLE` is a `*mut c_void`,
+/// which is neither `Send` nor `Sync`** — so it can neither be captured by the
+/// thread [`on_stop`] spawns nor held in the `static` below. See the two marker
+/// impls for what sharing one actually asserts.
+#[derive(Clone, Copy)]
+struct Event(HANDLE);
+
+// SAFETY: a Win32 event handle is an identifier of a kernel object, not a
+// pointer into this process's memory, and nothing here dereferences one. The
+// value is created before any other thread can see it, it is never closed, and
+// `SetEvent` and `WaitForSingleObject` are calls the kernel accepts from any
+// thread of the process — which is exactly the sharing these two impls permit.
+unsafe impl Send for Event {}
+// SAFETY: as above. The cross-thread accesses this value has are the console
+// handler reading it from a thread the system created, and the hook's own thread
+// waiting on it.
+unsafe impl Sync for Event {}
+
+impl Event {
+    /// Wait until the event is signalled, and answer with what the wait said.
+    ///
+    /// **A method rather than the call at its use site, and that is a capture
+    /// rule rather than taste**: a closure that names `event.0` captures the raw
+    /// handle *field* — Rust's closures capture disjoint fields — so it would
+    /// carry a `*mut c_void`, which is not `Send` whatever the type around it
+    /// asserts. Taking `self` captures the whole `Event`, which is the value the
+    /// marker impls above are about.
+    ///
+    /// `INFINITE`, because what ends this wait is the stop itself: the hook lives
+    /// for as long as the process does.
+    fn wait(self) -> u32 {
+        // SAFETY: `self.0` is this process's own event, created before the
+        // handler was installed and never closed, and waiting on a live event
+        // handle is what the handle is for.
+        unsafe { WaitForSingleObject(self.0, INFINITE) }
+    }
+}
+
+/// The process-wide manual-reset event the handler signals.
+///
+/// One event for the process: a launcher relays, a child runs its hook, and no
+/// process is both. The handler must not create it — a console handler runs on
+/// an arbitrary thread at an arbitrary moment — so the cell is initialised by
+/// [`arm`] or [`on_stop`], both of which run on the ordinary path, and the
+/// handler only reads it.
+static EVENT: OnceLock<Event> = OnceLock::new();
 
 /// Arm the relay for `child`.
 ///
 /// Called by [`crate::backend`] once the child exists and is owned by the job,
-/// before the caller starts supervising.
+/// and before anything can stop the launcher: a stop that arrives before there
+/// is a child has nothing to forward to, and from this point on the job's
+/// kill-on-close covers the launcher dying first (design §3 step 9, decision 20).
+///
+/// **One armed relay per process, and arming twice is not one relay.** The
+/// system accepts a second registration of the same routine rather than
+/// recognising it as one (measured on this host, 2026-09-21: `add = 1` twice,
+/// both calls answer 1), so a process that launches more than once — the test
+/// harness, and a CLI that serves twice — [`disarm`]s before the next `arm`
+/// instead of leaving two entries to run the forward twice. What is armed is a
+/// console control *handler*, which lives until it is removed; this is not a
+/// per-launch registration that expires.
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] when the handler cannot be installed or the relay's event
-/// object cannot be created.
+/// [`Error::Launch`](crate::_core::Error::Launch) when the handler cannot be
+/// installed or the relay's event object cannot be created. The id is cleared on
+/// the way out, so a launch that failed here leaves the process exactly as it
+/// found it rather than addressed at a child it never supervised.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox_windows::control;
+///
+/// // The child's process id, which is also its process-group id: the launch
+/// // created it with `CREATE_NEW_PROCESS_GROUP`.
+/// control::arm(1234)?;
+/// # Ok::<(), tinio_sandbox_core::Error>(())
+/// ```
 pub fn arm(child: u32) -> Result<()> {
-    CHILD.store(child, Ordering::SeqCst);
+    // The event first, and then the id: everything the handler touches exists
+    // before it can be called, and a failure at either step leaves the process
+    // with nothing addressed rather than with an id no handler will read.
     relay_event()?;
-    // SAFETY: `console_handler` is a plain `extern "system"` function with the
-    // signature SetConsoleCtrlHandler expects, and it only touches an atomic and
-    // an event handle that live for the process's lifetime.
-    let ok = unsafe { ffi::SetConsoleCtrlHandler(Some(console_handler), 1) };
+    // The id second, before the handler is installed: a forward that arrives once
+    // the handler is in place must address this child rather than whatever a
+    // previous launch left behind.
+    CHILD.store(child, Ordering::SeqCst);
+    // SAFETY: `console_handler` is a plain `extern "system"` function whose
+    // signature is the `PHANDLER_ROUTINE` that `SetConsoleCtrlHandler` takes, and
+    // everything it touches — one atomic and one event handle created above —
+    // lives for the process's lifetime.
+    let ok = unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) };
     if ok == 0 {
-        return Err(step("SetConsoleCtrlHandler", "relay", last_error()));
+        CHILD.store(0, Ordering::SeqCst);
+        return Err(launch("SetConsoleCtrlHandler", "relay", last_error()));
     }
     // Shared §7's "armed relay", with the value the forward will address: the
     // child's process id, which is its process-group id because it was created
-    // with CREATE_NEW_PROCESS_GROUP.
-    tracing::debug!(step = "SetConsoleCtrlHandler", role = "launcher", child = child);
+    // with `CREATE_NEW_PROCESS_GROUP`.
+    tracing::debug!(
+        step = "SetConsoleCtrlHandler",
+        role = "launcher",
+        child = child
+    );
     Ok(())
 }
 
 /// Deliver a stop to `group`'s process group.
 ///
-/// This is the relay's whole action, and it is public because it is also the way
-/// to play the container's part in a test.
+/// This is what the relay forwards, and it is public because it is also how a
+/// test plays the container's part: a console control event addressed at a
+/// process group, which is the whole of what a Windows container does to the
+/// process it started.
 ///
 /// **`Ok` means the call was accepted, not that the event was delivered.**
 /// `GenerateConsoleCtrlEvent` returns 1 with `GetLastError` 0 for a
 /// group-addressed `CTRL_C_EVENT` and delivers nothing at all (measured; the
 /// design's evidence table has the rows). What this function sends is
 /// `CTRL_BREAK_EVENT`, which *is* delivered to the group addressed — and it is
-/// the only console control event that can be limited to one.
+/// the only console control event that can be limited to one. A caller that needs
+/// to know the stop arrived has to watch the far end: the child's hook, not this
+/// call's return value.
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] when there is no console to deliver on, or the call is
-/// refused.
+/// [`Error::Launch`](crate::_core::Error::Launch) when the call is refused —
+/// there is no console to deliver on, or the group does not name one that
+/// exists.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::process;
+///
+/// use tinio_sandbox_windows::control;
+///
+/// // Addressed at this process's own group, which every process in it
+/// // receives: for one that armed a relay, that is the forward.
+/// control::send_stop(process::id())?;
+/// # Ok::<(), tinio_sandbox_core::Error>(())
+/// ```
 pub fn send_stop(group: u32) -> Result<()> {
     // SAFETY: GenerateConsoleCtrlEvent takes two integers and dereferences
     // nothing.
-    let ok = unsafe { ffi::GenerateConsoleCtrlEvent(ffi::CTRL_BREAK_EVENT, group) };
+    let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) };
     if ok == 0 {
-        return Err(step(
+        return Err(launch(
             "GenerateConsoleCtrlEvent",
             group.to_string(),
             last_error(),
@@ -5308,26 +5633,24 @@ pub fn send_stop(group: u32) -> Result<()> {
     // Accepted, not delivered — the doc above is explicit about that, so the
     // event says what this function knows: the call went out, addressed at
     // `group`.
-    tracing::debug!(step = "GenerateConsoleCtrlEvent", group = group, event = "CTRL_BREAK_EVENT");
+    tracing::debug!(
+        step = "GenerateConsoleCtrlEvent",
+        group = group,
+        event = "CTRL_BREAK_EVENT"
+    );
     Ok(())
 }
 
 /// Unhook the relay, and put the process back on the default disposition.
-///
-/// Installing the handler twice would forward every event twice, so a process
-/// that lives past one launch — the test harness, and a future CLI that serves
-/// more than once — disarms before the next: the handler is removed and the
-/// child id is cleared, so a late event cannot be forwarded to a process that is
-/// already gone.
 ///
 /// **Removing it takes the same routine, and that is the whole of this function
 /// rather than a detail of it.** `console_handler` answers `TRUE` for every event
 /// it matches, and `TRUE` means *handled*: a handler left installed would go on
 /// swallowing `CTRL_C`, `CTRL_BREAK`, `CTRL_CLOSE` and the logoff and shutdown
 /// events instead of relaying them, so the process would neither be stopped by
-/// them nor act on them: it would ignore a Ctrl+C, and it would neither act on a
-/// closing window nor on a logoff or shutdown — the events that normally end a
-/// console session, and the ones the system waits on, up to its own short grace
+/// them nor act on them — it would ignore a Ctrl+C, and it would neither act on a
+/// closing window nor on a logoff or shutdown, the events that normally end a
+/// console session and the ones the system waits on, up to its own short grace
 /// period, before it stops waiting. Swallowing those is the version of this that
 /// is hardest to notice and hardest to recover from. A `NULL` routine with
 /// `add = 0` does **not** remove a registered routine: it clears the
@@ -5335,19 +5658,32 @@ pub fn send_stop(group: u32) -> Result<()> {
 /// `Some(console_handler)` back with `add = 0` is the documented removal, and
 /// after it the process behaves like one that never armed a relay.
 ///
-/// `serve`'s launcher arm never reaches this call — it forwards the status and
-/// exits — so the window this closes is the one a process that outlives its
-/// launch has: the test harness, and any future CLI that serves twice.
+/// `serve`'s launcher arm never reaches this call — it forwards the child's
+/// status and exits — so the window this closes is the one a process that
+/// outlives its launch has: the test harness, and any future CLI that serves
+/// twice. The id is cleared first, so a stop that arrives between the two calls
+/// is swallowed rather than forwarded to a child that is already gone.
 ///
 /// If the removal itself fails, the handler *is* still installed, and that is the
-/// one case this function cannot hide: the id has been cleared first, so it
+/// one case this function cannot hide: nothing is addressed any more, so it
 /// forwards nothing — but it goes on swallowing, and the returned error is the
 /// only notice of it.
 ///
+/// **A process that never armed is refused rather than answered.** Removing a
+/// routine that was never installed fails with `ERROR_INVALID_PARAMETER`
+/// (measured on this host, 2026-09-21: `add = 0` for an unregistered routine
+/// answers 0 with `GetLastError` 87, while removing one that was installed
+/// answers 1), which is the right answer rather than an inconvenience: the call
+/// is made by a process that has decided it is carrying a relay, and one that is
+/// not is a process whose own idea of its state is wrong. Removing an installed
+/// routine does restore the default disposition — the same measurement has the
+/// process die of the next stop instead of surviving it, its handler having gone
+/// with the registration.
+///
 /// # Errors
 ///
-/// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when the handler cannot
-/// be removed.
+/// [`Error::Launch`](crate::_core::Error::Launch) when the handler cannot be
+/// removed: it is not installed (above), or the call was refused.
 ///
 /// # Examples
 ///
@@ -5363,9 +5699,9 @@ pub fn disarm() -> Result<()> {
     // SAFETY: the same `console_handler` this module installs, with `add = 0`,
     // which is the documented way to remove that routine; the pointer is passed
     // through and never dereferenced.
-    let ok = unsafe { ffi::SetConsoleCtrlHandler(Some(console_handler), 0) };
+    let ok = unsafe { SetConsoleCtrlHandler(Some(console_handler), 0) };
     if ok == 0 {
-        return Err(step("SetConsoleCtrlHandler", "disarm", last_error()));
+        return Err(launch("SetConsoleCtrlHandler", "disarm", last_error()));
     }
     tracing::debug!(step = "SetConsoleCtrlHandler", role = "disarm");
     Ok(())
@@ -5374,66 +5710,124 @@ pub fn disarm() -> Result<()> {
 /// Run `handler` when this process is stopped.
 ///
 /// The child-side counterpart: the confined server needs somewhere for a
-/// forwarded stop to land, or it dies on the spot instead of draining. The
-/// handler runs on a dedicated thread rather than in the console handler, so it
-/// may take locks, allocate and talk to a runtime — which is what makes this the
-/// hook the CLI's graceful shutdown (T066/T067) lands on.
+/// forwarded stop to land, or it dies on the spot instead of draining. **The
+/// handler runs on a thread of its own rather than in the console handler**, so
+/// it may take locks, allocate, and reach a runtime — which is what makes this
+/// the hook the CLI's graceful shutdown (T066/T067) lands on, and what lets the
+/// stop hook write a file and end its process in a test.
+///
+/// One hook per process, like [`arm`]. A second call leaves two threads waiting
+/// on the same manual-reset event, and one stop runs both closures.
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] when the hook cannot be armed.
+/// [`Error::Launch`](crate::_core::Error::Launch) when the hook cannot be armed:
+/// the handler was refused, or the event object the hook's thread waits on could
+/// not be created.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox_windows::control;
+///
+/// // The child's own hook. It runs on a thread of its own, so what it does may
+/// // allocate and take locks: signal the runtime's shutdown here.
+/// control::on_stop(|| {
+///     let _ = ();
+/// })?;
+/// # Ok::<(), tinio_sandbox_core::Error>(())
+/// ```
 pub fn on_stop(handler: impl Fn() + Send + 'static) -> Result<()> {
+    // The event first, then the handler, then the thread — and the order is the
+    // one that leaves nothing behind on a failure. A stop that arrives in the gap
+    // between the two is not lost either: the event is a **manual-reset** one, so
+    // the signal the handler sets is still there when the thread starts waiting.
     let event = relay_event()?;
-    std::thread::spawn(move || {
-        // SAFETY: `event` is this process's own manual-reset event, and waiting
-        // on it is what the handle is for.
-        let waited = unsafe { ffi::WaitForSingleObject(event, ffi::INFINITE) };
-        if waited == ffi::WAIT_OBJECT_0 {
-            // **This is where a forwarded stop is traced, and the only place it
-            // can be**: the handler that sent it runs on a thread the system
-            // created and may not allocate or lock, which rules `tracing` out
-            // there (shared §7, Global Constraints). This thread is the child's
-            // own, with a stack and a runtime to come, so it is where the event
-            // belongs.
-            tracing::debug!(step = "on_stop", "the launcher forwarded a stop");
-            handler();
-        }
-    });
-    // SAFETY: the same `console_handler`, in the child: it stores nothing but
-    // the event signal, and the thread above turns that into the caller's
-    // closure. **It is named `console_handler` and not `handler` because the
-    // parameter above already took that name** — a closure cannot be handed to
-    // `SetConsoleCtrlHandler`, whose parameter is an `unsafe extern "system" fn`,
-    // and an earlier draft passed `handler` here and did not compile.
-    let ok = unsafe { ffi::SetConsoleCtrlHandler(Some(console_handler), 1) };
+    // SAFETY: the same `console_handler`, in the child: it forwards nothing
+    // (`CHILD` is zero here) and signals the event the thread below turns into
+    // the caller's closure. **It is named `console_handler` and not `handler`
+    // because the parameter above already took that name** — a closure cannot be
+    // handed to `SetConsoleCtrlHandler`, whose parameter is a `PHANDLER_ROUTINE`
+    // (`Option<unsafe extern "system" fn(u32) -> i32>`).
+    let ok = unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) };
     if ok == 0 {
-        return Err(step("SetConsoleCtrlHandler", "stop hook", last_error()));
+        return Err(launch("SetConsoleCtrlHandler", "stop hook", last_error()));
     }
+    // A thread of this process's own, with a stack: the console handler may only
+    // signal the event, and everything that cannot run there runs here.
+    thread::spawn(move || {
+        let waited = event.wait();
+        if waited != WAIT_OBJECT_0 {
+            // Nothing to return it to: this thread waits for as long as the
+            // process lives, so the caller is long gone. A wait that failed means
+            // the hook will never run, which is a degradation worth a line in the
+            // log rather than a silence (shared §7).
+            tracing::warn!(
+                step = "WaitForSingleObject",
+                wait = waited,
+                "the stop hook is dead"
+            );
+            return;
+        }
+        // **This is where a forwarded stop is traced, and the only place it can
+        // be**: the handler that sent it runs on a thread the system created and
+        // may not allocate or lock, which rules `tracing` out there. This thread
+        // is the child's own, with a stack and a runtime to come, so it is where
+        // the event belongs.
+        tracing::debug!(step = "on_stop", "the stop hook fired");
+        handler();
+    });
+    tracing::debug!(step = "SetConsoleCtrlHandler", role = "child");
     Ok(())
 }
 
-/// The process-wide manual-reset event the handler signals.
+/// Create the relay's event, once per process, and hand back **that** event.
 ///
-/// One event for the process: a launcher relays, a child runs its hook, and no
-/// process is both. The handler must not create it — a console handler runs on
-/// an arbitrary thread at an arbitrary moment — so the cell is initialised by
-/// [`arm`] or [`on_stop`], both of which run on the ordinary path, and the
-/// handler only reads it.
-static EVENT: OnceLock<Handle> = OnceLock::new();
-
-/// Create the relay's event, once per process.
-fn relay_event() -> Result<Handle> {
-    if let Some(handle) = EVENT.get() {
-        return Ok(*handle);
+/// Both [`arm`] and [`on_stop`] call it: one event serves either role, and the
+/// handle is never closed — it lives as long as the process, which is exactly
+/// what a console handler needs of it.
+///
+/// **What every caller receives is the cell's event, never a second one this call
+/// happens to have made.** That is what keeps the handler's signal and the hook's
+/// wait on the same object: a process holding two would swallow a stop into an
+/// event nobody waits on. The race that would produce one — two concurrent first
+/// calls — is not one this crate can run (the confinement is entered before any
+/// thread but the caller's exists, decision 26), so what the branch below
+/// protects is the property rather than a live window.
+///
+/// # Errors
+///
+/// [`Error::Launch`](crate::_core::Error::Launch) when the event object cannot be
+/// created.
+fn relay_event() -> Result<Event> {
+    if let Some(event) = EVENT.get() {
+        return Ok(*event);
     }
-    // SAFETY: a null security descriptor, a null name, manual reset and a
-    // non-signalled initial state are all valid for CreateEventW.
-    let handle = unsafe { ffi::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    // SAFETY: a null security descriptor and a null name are both valid for
+    // `CreateEventW`, and the three remaining arguments are integers: a
+    // manual-reset event in the non-signalled state.
+    let handle = unsafe { CreateEventW(null(), 1, 0, null()) };
     if handle.is_null() {
-        return Err(step("CreateEventW", "relay", last_error()));
+        return Err(launch("CreateEventW", "relay", last_error()));
     }
-    let _ = EVENT.set(handle);
-    Ok(handle)
+    let event = Event(handle);
+    if EVENT.set(event).is_err() {
+        // Another thread stored its event first, and the cell's is the process's:
+        // this call's handle is closed rather than kept, because nothing will
+        // ever signal it.
+        handles::close(handle);
+        // `set` answers `Err` only when the cell is already full and a `OnceLock`
+        // never empties, so this reads the winner; the error below is the answer
+        // to a state that cannot happen rather than a panic on it.
+        return EVENT.get().copied().ok_or_else(|| {
+            launch(
+                "CreateEventW",
+                "relay",
+                io::Error::other("the relay's event cell was emptied between two calls"),
+            )
+        });
+    }
+    Ok(event)
 }
 
 /// The console control handler: one forward, one signal, and nothing else.
@@ -5441,16 +5835,17 @@ fn relay_event() -> Result<Handle> {
 /// It runs on a thread the system creates, on an arbitrary stack, and it may be
 /// the last thing this process does — so it reads one atomic, makes one
 /// `GenerateConsoleCtrlEvent` call and signals one event. Everything that needs
-/// a lock, an allocation or a runtime happens on the thread that waits on that
-/// event.
+/// a lock, an allocation or a runtime has already been handed to the thread that
+/// waits on that event.
 ///
 /// **It answers `TRUE` for every event it matches, and `TRUE` means *handled*
-/// rather than *forwarded*.** Nothing else gets a say in that event: the process's
-/// default disposition does not run, so this process is not stopped by a Ctrl+C
-/// and does not end with its console window. That is what the relay wants while a
-/// child is being supervised, and it is why [`disarm`] removes this routine rather
-/// than leaving it installed — the swallowing is meant to last exactly as long as
-/// the relay does.
+/// rather than *forwarded*.** Nothing else gets a say in that event: the
+/// process's default disposition does not run, so this process is not stopped by
+/// a Ctrl+C and does not end with its console window. That is what the relay
+/// wants while a child is being supervised and what the child wants while a
+/// forwarded stop is a request to drain rather than to die — and it is why
+/// [`disarm`] removes this routine rather than leaving it installed, the
+/// swallowing being meant to last exactly as long as the relay does.
 ///
 /// **It emits no `tracing` event either, and that is a constraint rather than an
 /// oversight**: every macro in that crate formats, allocates and can take a lock
@@ -5458,26 +5853,30 @@ fn relay_event() -> Result<Handle> {
 /// traced on the child's hook thread instead ([`on_stop`]), which is the process
 /// on the other end of it, and the launcher's half — the arming and the id it
 /// addresses — was traced by [`arm`] before any event could arrive.
+///
+/// **The forward is `CTRL_BREAK_EVENT` whatever arrived.** A launcher may be
+/// stopped by any of the five events — a keypress, a closing window, a logoff, a
+/// shutdown — and only the break event can be limited to one process group, so
+/// the child is told to drain for all of them and decides the rest itself.
 unsafe extern "system" fn console_handler(event: u32) -> i32 {
     match event {
-        ffi::CTRL_C_EVENT
-        | ffi::CTRL_BREAK_EVENT
-        | ffi::CTRL_CLOSE_EVENT
-        | ffi::CTRL_LOGOFF_EVENT
-        | ffi::CTRL_SHUTDOWN_EVENT => {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
             let child = CHILD.load(Ordering::SeqCst);
             if child != 0 {
-                // A launcher: forward to the child's group.
-                // `GenerateConsoleCtrlEvent` is one of the calls a console
-                // handler may make, and this is its only use here.
+                // A launcher: forward to the child's group. This call is one a
+                // console handler is documented to be able to make, and this is
+                // its only use here. Its return value is deliberately ignored:
+                // it is not evidence of delivery (see `send_stop`), and there is
+                // nothing on this thread that could report it.
                 // SAFETY: two integers; nothing is dereferenced.
-                unsafe { ffi::GenerateConsoleCtrlEvent(ffi::CTRL_BREAK_EVENT, child) };
+                unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child) };
             }
-            if let Some(handle) = EVENT.get() {
+            if let Some(event) = EVENT.get() {
                 // A child: wake the hook's thread and let it do the real work.
                 // SAFETY: the handle is this process's own event, created before
                 // the handler was installed.
-                unsafe { ffi::SetEvent(*handle) };
+                unsafe { SetEvent(event.0) };
             }
             1
         }
@@ -5486,31 +5885,57 @@ unsafe extern "system" fn console_handler(event: u32) -> i32 {
 }
 ```
 
-- [ ] **Step 6: Arm the relay, restore the child's hook, run the tests**
+**Four things the draft's block could not carry are the ones worth naming, because each of them is the compiler or the measurement rather than taste.** (1) `static EVENT: OnceLock<HANDLE>` does not compile: `windows_sys`'s `HANDLE` is a `*mut c_void`, which is neither `Send` nor `Sync`, so the handle lives in an `Event` newtype whose two marker impls say what sharing one asserts. (2) The hook's thread waits through `Event::wait` rather than by naming `event.0`, because a closure that names the field captures the raw pointer itself — Rust's closures capture disjoint fields — and `Send` is then about `*mut c_void` rather than about the wrapper. (3) The event cell hands every caller **the** event, never a second one a racing caller made (which would be an object no signal ever reaches): the loser of that race closes its own handle and returns the winner's, and the same reasoning is what `arm` and `on_stop` order themselves by — the event before the id, the id before the handler, the handler before the thread — so a failure at any step leaves the process with nothing addressed and no parked thread. (4) The child's arming emits its own `debug!`, so "each armed, disarmed or forwarded stop" has a line for every one of them (shared §7). `disarm`'s failure case is documented from Step 1's measurement (c) rather than assumed, and its doc says what a process that never armed gets: a refusal with `ERROR_INVALID_PARAMETER`.
 
-In `backend.rs`'s closure, right after the job assignment:
+- [x] **Step 6: Arm the relay, land the facade's hook, run the tests**
+
+In `backend.rs`'s closure, right after the job assignment and **after the payload write** — as the closure's last *fallible* statement, which is what keeps `confine`'s error path from ever having a live console handler to remove:
 
 ```rust
-            // The relay is armed once the child exists and the job owns it
-            // (design §3 step 9): a stop that arrives before the child exists has
-            // nothing to forward to, and from this point on the job's
+            // The signal relay is armed once the child exists and is owned by the
+            // job (design §3 step 9): a stop that arrives before the child exists
+            // has nothing to forward to, and from this point on the job's
             // kill-on-close covers a launcher that dies first — the window before
             // the assignment is Task 5's recorded gap, not this one's.
-            crate::control::arm(launched.pid())?;
+            //
+            // **It is armed *after* the payload write, and that is the deliberate
+            // order rather than an accident of where the call landed**: this is the
+            // last fallible statement in the closure, so nothing below it can
+            // return through `?` and leave a console handler installed that
+            // `confine`'s error path does not remove (it rolls the ACLs and the
+            // profile back, not the relay). The one thing after it is a thread
+            // spawn, which panics rather than returning — a panic unwinds the
+            // whole launch, so an order that had to be safe against *that* would
+            // need the arm to be the very last statement, not merely the last
+            // fallible one.
+            //
+            // What a stop arriving in the gap between the two gets is a launcher
+            // with no relay at all: the event takes the default disposition, the
+            // launcher dies of it, and the job takes the child with it — the state
+            // this task exists to end, and one the child's own hook is already
+            // armed against on its side of the pipe.
+            control::arm(launched.pid())?;
 ```
 
-and restore `launch::on_stop`'s body (Task 7 left it commented out).
+`launch.rs` gains the two delegating wrappers, `on_stop` (the crate-level name the child side reaches for, and the one the facade carries) and `disarm`; `lib.rs` adds `control` to its module list; and the facade's Windows arm gains the second of its two child-side names:
+
+```rust
+#[cfg(target_os = "windows")]
+pub use tinio_sandbox_windows::launch::on_stop;
+```
+
+**The chain is `serve`'s child path, one name per platform**: `tinio_sandbox::on_stop` → `tinio_sandbox_windows::launch::on_stop` → `control::on_stop`, which is the shape shared §4 fixes for the pair (`on_stop` shared, `disarm` not).
 
 Run:
 ```powershell
-cargo test -p tinio-sandbox-windows --test signal -- --nocapture
+cargo test -p tinio-sandbox-windows --test signals -- --nocapture
 cargo test -p tinio-sandbox-windows
 ```
-Expected: PASS — the relay forwards, the control case shows a targeted stop does not reach another group's process, and the rest of the suite is unchanged. Both cases print their outcome; keep the output, the next step records it.
+Expected: PASS — the relay forwards (the confined child's hook fires and the launcher reports the child's status), the premise holds (an addressed group is reached and another is not, the other child still beating), and the rest of the suite is unchanged.
 
-- [ ] **Step 7: Check the tests against the rows the design already carries**
+- [x] **Step 7: Check the tests against the rows the design already carries**
 
-`docs/superpowers/specs/2026-09-18-sandbox-design.md` already holds the stop-semantics rows — the console-wide Ctrl+C that does not reach a `CREATE_NEW_PROCESS_GROUP` child, the targeted `CTRL_BREAK_EVENT` that does, the forward that closes the gap, and the caveat that the API's return value is not evidence of delivery — written on 2026-09-19 from the same probe this task's tests reproduce. There is no branch left to record: the measurement is in, and what Step 6's run has to do is reproduce it. If it does **not** — if the control case shows the child reached with no relay in between — then §3 step 9, decision 20 and this task's code are wrong together, and the commit that says so deletes the relay rather than keeping it. The container row stays **unverified in this environment**, as Step 1 and the design both say.
+`docs/superpowers/specs/2026-09-18-sandbox-design.md` already holds the stop-semantics rows — the console-wide Ctrl+C that does not reach a `CREATE_NEW_PROCESS_GROUP` child, the targeted `CTRL_BREAK_EVENT` that does, the forward that closes the gap, and the caveat that the API's return value is not evidence of delivery — written on 2026-09-19 from the same probe this task's tests reproduce. There is no branch left to record: the measurement is in, and what Step 6's run has to do is reproduce it. If it does **not** — if the control case shows the child reached with no relay in between — then §3 step 9, decision 20 and this task's code are wrong together, and the commit that says so deletes the relay rather than keeping it. The container row stays **unverified in this environment**, as Step 1 and the design both say. The design's own edit this task makes is decision 14 (d)'s site list, which gains `control` as the seventh Windows site and moves its provenance marker from the phase's eighth task to its tenth.
 
 ---
 
@@ -5528,7 +5953,7 @@ Expected: PASS — the relay forwards, the control case shows a targeted stop do
 
 Three things change in the entry point, in the design's order: the payload discriminator comes first (§10 step 1), the configuration is read as **bytes** and parsed only where it stays in the process (decision 18), and the endpoint travels as an **event** on stdout — emitted by whichever process bound the socket, exactly once (decision 19). Since the child's stdout is a pipe the parent relays, the parent's own stdout is the operator's only view of the protocol, and nothing else on this path may write to it. The macOS arm does not exist yet, so a sandbox request there must fail closed rather than serve unconfined (§11).
 
-- [ ] **Step 1: Add the targeted lookup to `tinio-config`**
+- [x] **Step 1: Add the targeted lookup to `tinio-config`**
 
 **This step is the edit; P3 verifies it and does not write it again** (`2026-09-18-sandbox-shared.md` §4). P2 is the earlier of the two phases that need the function, so the whole of it — the function and its test — lands here, in the crate that owns the schema. The launcher must not build a `Config` (decision 18), and `Config::parse` is deliberately strict — it rejects unknown keys and validates the whole document, which is not what a one-key read should do.
 
@@ -5606,7 +6031,7 @@ mod tests {
 
 Run: `cargo test -p tinio-config probe_reads_only` — FAIL, then PASS.
 
-- [ ] **Step 2: Write the failing tests in the example**
+- [x] **Step 2: Write the failing tests in the example**
 
 `crates/tinio-server/examples/serve.rs`, appended to the existing `mod tests`:
 
@@ -5646,16 +6071,16 @@ Run: `cargo test -p tinio-config probe_reads_only` — FAIL, then PASS.
     }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-server --example serve`
 Expected: FAIL — `cannot find function 'capabilities_from'`.
 
-- [ ] **Step 4: Write the example's launcher path**
+- [x] **Step 4: Write the example's launcher path**
 
-In `crates/tinio-server/examples/serve.rs`. **`emit` and `emit_error` are the one pair this list does not define, and the reason is the file**: both belong to P1 — `2026-09-18-sandbox-linux.md` Task 7 writes them beside `serve`'s signature, because that is the phase that restructures this file — and one file cannot carry two `fn emit` (`E0428`). It is the rule the plan already applies to `Args`, `parse_args`, `sandbox_exposures` and `serve`'s signature, and it costs these arms nothing: what they add to the helper is a **caller**, and the only frame they write through it is their own `Error` — a startup refusal, or a child that exited without ever reporting — because `Listening` belongs to the process that serves and the parent relays it (decision 19).
+In `crates/tinio-server/examples/serve.rs`. **`emit` and `emit_error` are the one pair this list does not define, and the reason is the file**: both belong to P1 — `2026-09-18-sandbox-linux.md` Task 7 writes them beside `serve`'s signature, because that is the phase that restructures this file — and one file cannot carry two `fn emit` (`E0428`). It is the rule the plan already applies to `Args`, `parse_args`, `sandbox_request` and `serve`'s signature, and it costs these arms nothing: what they add to the helper is a **caller**, and the only frame they write through it is their own `Error` — a startup refusal, or a child that exited without ever reporting — because `Listening` belongs to the process that serves and the parent relays it (decision 19).
 
-**`sandbox_exposures` is P1's and is not defined here either**, which the same rule settles: `2026-09-18-sandbox-shared.md` §4 gives every helper in this file one owner, P1 Task 7 writes this one, and P2 adds only its caller — `Sandbox::from_exposures(sandbox_exposures(Path::new(&args.root), &state, root_access), true)` in the arm below. **The executable's own directory is not this helper's to expose**: on Windows that entry is this crate's backend's — `backend::exposures` merges it into the whitelist and refuses to widen a path the caller exposed read-write (Task 3, decision 22, with its own tests) — so the helper stays the platform-neutral set P3 also calls, and no second copy of the rule belongs in this file.
+**`sandbox_request` is P1's and is not defined here either**, which the same rule settles: `2026-09-18-sandbox-shared.md` §4 gives every helper in this file one owner, P1 Task 7 writes this one, and P2 adds only its caller — `sandbox_request(Path::new(&args.root), &state, root_access)` in the arm below. **It is `sandbox_request` and not the `sandbox_exposures` this plan used to name**, and that correction is P1's landed shape rather than a preference: the helper returns the `Sandbox` itself (`fn sandbox_request(root: &Path, state_dir: &Path, access: AccessMode) -> Sandbox`), with the exposure rule inlined and `.device_files()` already applied, because the cleanup that landed with it deleted the `from_exposures` round trip as redundant. A caller that asked for an exposure vector and rebuilt a `Sandbox` from it would be a second definer of that rule — and the device-file flag, which is an argument of the construction rather than something a rebuilt set remembers, is exactly what such a copy loses silently. **The executable's own directory is not this helper's to expose**: on Windows that entry is this crate's backend's — `backend::exposures` merges it into the whitelist and refuses to widen a path the caller exposed read-write (Task 3, decision 22, with its own tests) — so the helper stays the platform-neutral set P3 also calls, and no second copy of the rule belongs in this file.
 
 ```rust
 #[cfg(feature = "sandbox")]
@@ -5958,21 +6383,18 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // type the exposure set takes. This line used to rebuild an `Access`
         // from it, because the sandbox owned a second enum for the same fact.
         let root_access = access;
-        // **The launcher's own sink for shared §7's events, installed before it
-        // grants or launches anything.** `serve` builds its subscriber inside its
-        // own body at a fixed `Verbosity::Info`, and this process returns from the
-        // supervision below without ever reaching it — so without this line the
-        // profile, the exposure set, the pid and the job would leave no record at
-        // all, and a confinement that leaves no visible record is the failure the
-        // requirement exists to prevent. stderr and not stdout, because stdout is
-        // the protocol's (decision 19); `INFO` and not `DEBUG`, matching what
-        // `serve` enables, because what this arm emits is the "was this process
-        // confined, and to what" half; and `try_init` rather than `init`, so a
-        // caller that installed a subscriber of its own keeps it.
-        let _ = tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_max_level(tracing::Level::INFO)
-            .try_init();
+        // **No sink here, and that is the correction this step carries.** The
+        // sketch put a `try_init` block at this point, on the belief that `serve`
+        // builds its subscriber inside its own body and that a launcher returns
+        // before reaching it. **When the task ran, the measurement came back the
+        // other way** (Task 11's report §8): P1 had hoisted that subscriber into
+        // `main`, above both the Linux arm and this one, so by the time this arm
+        // runs the process already has a sink and shared §7's events — the
+        // profile, the resolved exposures, `CreateProcessW` with its pid, the job
+        // — reach the same stderr the plain run logs to. What a second subscriber
+        // here would add is a second answer to "where does this process log",
+        // with a `try_init` race to keep the two in step; stderr and `INFO` are
+        // already `main`'s.
         // **The state directory's path, resolved for the exposure set and for
         // nothing else** — this arm is the only consumer in the parent, which is
         // why the resolution lives here rather than above it. Read-only mode
@@ -5980,7 +6402,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // so a hand-built `<root>/.tinio` would expose the wrong path and leave
         // the confined server unable to write its own state; in normal mode the
         // backend's own `<root>/.tinio` is the answer, and the root's exposure
-        // already covers it, so `sandbox_exposures` adds no second entry. The
+        // already covers it, so `sandbox_request` adds no second entry. The
         // child re-derives the identical path from its own three sources (design
         // §10).
         let state = if read_only {
@@ -5999,13 +6421,13 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                  set TINIO_STATE_DIR outside the served root"
                 .into());
         }
-        // The device-file flag is an argument of `from_exposures` rather than
-        // something the rebuilt set remembers, so it is stated here instead of
-        // being re-applied afterwards.
-        let sandbox = Sandbox::from_exposures(
-            sandbox_exposures(Path::new(&args.root), &state, root_access),
-            true,
-        );
+        // **`sandbox_request` and not a set rebuilt from an exposure vector**:
+        // the rule and the device-file flag are one function's (P1's), the flag is
+        // an argument of that construction rather than something the set
+        // remembers, and a caller that rebuilt the `Sandbox` itself would be the
+        // second definer that function exists to prevent — with the flag the
+        // silent casualty, since a rebuilt set has no memory of it.
+        let sandbox = sandbox_request(Path::new(&args.root), &state, root_access);
         // A startup failure is an event, not an absence (decision 19): a consumer
         // that decodes the stream hears about it instead of timing out.
         let mut child = match confine_or_launch(&sandbox, args.address, &config_bytes) {
@@ -6080,16 +6502,17 @@ fn parse_config(bytes: &[u8]) -> Result<Option<Config>, Box<dyn Error + Send + S
 (d) `serve` — **the one entry point all three plans call, and `2026-09-18-sandbox-shared.md` §4 is where its signature is written down**: what it takes, in what order, and which of those parameters are optional are that row's, and this plan neither repeats the declaration nor re-argues it. What is this plan's is what its own two callers do and what the body does with the two substitutions:
 
 ```rust
-    // ... the existing body, unchanged up to the bind ...
-    let listener = match inherited {
-        // The child's listener came from the launcher (decision 16), and the
-        // event is still the child's to send: `Listening` means the data plane
-        // is serving, which the launcher — outside the confinement, doing no
-        // request work — is not the process that knows (decision 19). Emitting
-        // it here as well would put the endpoint on stdout twice.
-        Some(std) => TcpListener::from_std(std)?,
-        None => TcpListener::bind(address).await?,
-    };
+    // ... the existing body, unchanged up to the bind, which converts the
+    // inherited socket itself: `inherited` is `Option<std::net::TcpListener>`
+    // and `Some(inherited) => TcpListener::from_std(inherited)?` sits in the
+    // landed body beside an untouched `None` arm (`2026-09-18-sandbox-shared.md`
+    // §4). This plan writes none of that — the conversion cannot happen at the
+    // child's call site, which is before its runtime exists ...
+    // What is this plan's is the event below, and it is still the child's to
+    // send: `Listening` means the data plane is serving, which the launcher —
+    // outside the confinement, doing no request work — is not the process that
+    // knows (decision 19). Emitting it here as well would put the endpoint on
+    // stdout twice.
     emit(&Event::Listening {
         addr: listener.local_addr()?,
     });
@@ -6119,7 +6542,7 @@ required-features = ["sandbox"]
 
 **No platform dependency is added to that manifest, and this is the one thing about the backend this step used to get backwards.** The launch path names the container's `Options` and its tests name `Capability`, and the question of how a consumer reaches a platform's own settings is **design decision 2's to answer, not this plan's**: a consumer names the facade and nothing else, and reaches them through the facade's cfg-gated alias for the platform's crate — `tinio_sandbox::windows::Options`, inside a `#[cfg(target_os = "windows")]` block it would have written anyway. An earlier draft had `tinio-server` take a `[target.'cfg(target_os = "windows")'.dependencies]` table of its own, on the argument that P1's Linux arm did the same for its own platform's options; that ruling was reversed, because by the time P3's arm exists the crate would carry one target-gated dependency per platform while every arm lives in the same function, and because reaching past the facade for a platform crate contradicts the contract the facade exists to state. `tinio-sandbox-windows` is still a workspace member everywhere and its own `#![cfg(windows)]` is what leaves it empty on the other two targets.
 
-- [ ] **Step 5: Run the example's tests, and confirm stdout is the protocol's alone**
+- [x] **Step 5: Run the example's tests, and confirm stdout is the protocol's alone**
 
 Run:
 ```powershell
@@ -6132,7 +6555,9 @@ rg -n --pcre2 '(?<!e)println!|(?<!e)print!|stdout\(\)' crates/tinio-server/examp
 
 Expected: PASS, and the only hits are inside `emit` and the endpoint substitution above — the endpoint line this step replaces was the file's only stdout writer, which is what makes reserving stdout for the protocol cheap (decision 19). Any other hit is either a log that belongs on stderr or a protocol violation, and it is resolved here rather than discovered by a consumer that cannot tell it from an event. Note that the *child's* stdout is a pipe to the parent, so even a stray write there is dropped by the relay (Task 9's `events` test) — but the launcher's own stdout has no such filter, which is why the grep is the check.
 
-- [ ] **Step 6: Write the end-to-end test**
+- [x] **Step 6: Write the end-to-end test**
+
+**The block below is what Task 11 landed at the time; Task 14's refactor has since hoisted `serve_bin`, `wait_timeout` and the frame-reading machinery into `crates/tinio-server/tests/common/mod.rs`, which this file now takes as `mod common;` — so read the copied `serve_bin` here as that task's history rather than as the file's current shape.**
 
 `crates/tinio-server/tests/sandbox_e2e_windows.rs`:
 
@@ -6195,8 +6620,11 @@ struct Run {
     launcher: Child,
     root: PathBuf,
     /// The launcher's stderr: its banner, every log the confined child writes, and
-    /// shared §7's `info!` events — the launcher installs a subscriber for them
-    /// precisely because it never reaches `serve`'s own (Task 11 Step 4).
+    /// shared §7's `info!` events. **The launcher installs no subscriber of its
+    /// own and does not need one**: `main` installs it above both arms, which is
+    /// what Task 11 measured and what this sketch's Step 4 said the other way
+    /// round ("it never reaches `serve`'s own") until that measurement corrected
+    /// it.
     log: PathBuf,
     address: std::net::SocketAddr,
 }
@@ -6434,12 +6862,12 @@ fn a_restarted_launcher_takes_the_residue_over_and_a_clean_exit_removes_it() {
 }
 ```
 
-- [ ] **Step 7: Run the test**
+- [x] **Step 7: Run the test**
 
 Run: `cargo test -p tinio-server --test sandbox_e2e_windows`
 Expected: PASS — two tests. **The first is fully portable**: it serves, checks the job's kill, and then asserts the residue a hard kill leaves — the behaviour rather than a wish — while reading shared §7's `info!` events from the launcher's log. **The second needs a console** for its second half, because a console control event cannot be delivered without one, and prints its `skipping:` line rather than failing where there is none, exactly as Task 10's suite does. If the launcher reports `no standard handle`, run it from an interactive console: the confined child inherits the launcher's **stderr**, which is where every log goes (decision 19) and the one stream a detached runner may not have.
 
-- [ ] **Step 8: Run it by hand, confined**
+- [x] **Step 8: Run it by hand, confined**
 
 Run:
 ```powershell
@@ -6447,14 +6875,14 @@ cargo run -p tinio-server --example serve -- E:\tinio-smoke --port 0 --sandbox
 ```
 Expected: `sandbox: package SID S-1-15-2-…` and `sandbox: granting …` on stderr, preceded by the traced `info!` lines this phase adds — the profile, each resolved exposure, `CreateProcessW` with its pid, and the Job object — and on stdout exactly one frame — `event: listening` then `data: {"addr":"127.0.0.1:<port>"}`, closed by a blank line — then a second terminal serves S3 against it. Ctrl-C in that console reaches the whole console group; to see the relay do its work instead, stop the *launcher* alone's process group (Task 10's `send_stop`) and watch the confined server stop with it.
 
-- [ ] **Step 9: Verify the other build graphs**
+- [x] **Step 9: Verify the other build graphs**
 
 Run:
 ```powershell
 cargo check -p tinio-server --no-default-features
 cargo check --workspace --all-targets
 ```
-Expected: both succeed; the example and the test are skipped by `required-features`.
+Expected: both succeed. **The test target is skipped by `required-features` and the example is not** — it carries none deliberately (`docs/tests.md`), because the `no-default` leg builds `--example serve --no-default-features` and an explicitly selected example whose `required-features` are unmet is a hard error (`exit 101`) rather than a skip. So the second command must compile the example under `--no-default-features` too, where `own_args`'s no-feature arm, the unconditional `parse_config` and the ungated `emit`/`emit_on_error` are what keep it whole: a "fix" that gives the example a `required-features` breaks that leg rather than tidying this one.
 
 ---
 
@@ -6470,151 +6898,451 @@ Expected: both succeed; the example and the test are skipped by `required-featur
 
 §7 records the gap and assigns it to P2: what was measured on the authoring host was loopback only, and every non-loopback refusal looked like the host's own firewall policy rather than container isolation. **A test that only checks "connect failed" proves nothing** — a machine with no route fails it too — so the harness proves the address reachable from outside the confinement first and only then asserts it is unreachable inside. The LAN question stays a recorded observation: decision 16 says nothing in the design depends on it, and the plan keeps it that way.
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
-`crates/tinio-sandbox-windows/tests/network.rs`:
+`crates/tinio-sandbox-windows/tests/network.rs`, **as landed** — and it is not the block this task was drafted with, which is the point. Task 10 retargeted the harness calls (`common::one_volume`, `common::answer`, and a `launch_confined` that returns rather than answering `None`); 2026-09-22's measurement retargeted the rest. Three changes carry the rulings this task was dispatched with, and one test is new:
+
+- **The positive control asserts.** The drafted control printed what the container reported under `internetClient` and passed either way, so a host where the capability never reached the container passed the test whose conclusion depended on it (Ruling 31). It now requires `outbound: SUCCEEDED`.
+- **A precondition this host cannot meet fails rather than printing `skipping:`** (Ruling 28), decided before anything is spawned by [`host_ready`]'s one question — whether an *unconfined* process here reaches the target — with `TINIO_SANDBOX_ALLOW_SKIP=1` as the deliberate opt-out, spelled exactly as Task 11's suite spells it.
+- **The LAN leg discovers the interface instead of waiting behind `TINIO_SANDBOX_TEST_LAN_ADDR`**, so it cannot pass by doing nothing; the variable overrides the interface rather than gating the leg. It still asserts nothing — decision 16 keeps that question recorded.
+- **A fifth test asks the capability question of an ACL rather than a socket** ([`a_granted_capability_is_enabled_in_the_container`]), which is Task 9's carry answered: it separates "the list was read from `Options`" from "it was silently emptied" without touching the network, so it still means something on a host whose own policy refuses the container every destination.
+
+**Writing the control that way is what found the defect this task existed to find, and it is the reason the drafted shape was wrong.** The control failed on its first run — `internetClient` granted, `outbound: refused (permission denied)` — exactly as the design's original probe had, and the recorded-not-asserted shape would have closed §7's row on it. `GetTokenInformation(TokenCapabilities)` against the launched child showed the list *did* reach the token, with `Attributes: 0` on every entry, and an AppContainer honours such a SID in nothing: not in the WFP filters §7's row rests on, and not in an access check against an ACL naming it. With `SE_GROUP_ENABLED` the same child reports `outbound: SUCCEEDED` and the same ACE grants the read. The fix is one attribute in `sid::CapabilitySids::resolve`; both halves are in the design's evidence table, and the crate's `sid` module carries the reasoning.
 
 ```rust
-//! The network guarantees: outbound is blocked, inbound is not, and the two
-//! questions the design left open are measured rather than assumed.
+//! The network guarantees, measured rather than assumed.
+//!
+//! Five questions are asked here and none of them is answered by looking at the
+//! code that implements it. Three are design §7's: that an AppContainer with no
+//! network capability cannot initiate an outbound connection, that the *same*
+//! container reaches one when `internetClient` is granted to it, and that a
+//! capability other than `internetClient` does not open the internet. The fourth
+//! is the question decision 16 leaves explicitly open — whether a listener the
+//! parent bound and handed in reaches the host's LAN interface.
+//!
+//! # Why the positive half is not decoration
+//!
+//! **A test that only checks "connect failed" proves nothing.** A machine with no
+//! route to the target fails it too, which is exactly the state the design's §7
+//! gap was opened in: the authoring host refused `1.1.1.1:53` identically with
+//! *and* without `internetClient` and could not say whether that was container
+//! isolation or its own firewall. Two measurements close that gap and neither is
+//! sufficient alone:
+//!
+//! 1. **The baseline**, taken outside the confinement: an ordinary process on
+//!    this host opens a TCP connection to the target. This is a property of the
+//!    *machine* — route, firewall, upstream policy — and it is decided before
+//!    anything is spawned ([`host_ready`]).
+//! 2. **The control**, taken inside it with `internetClient` granted: the same
+//!    confined child reaches the same address.
+//!
+//! With both in hand, the refusal in
+//! [`an_address_that_works_outside_is_refused_inside`] is the container's policy
+//! rather than a missing route. **The control asserts rather than records**, and
+//! it earned that the hard way: an earlier revision printed what the container
+//! reported under `internetClient` and passed either way, and on 2026-09-22 that
+//! shape would have hidden a real defect — the capability SIDs the crate handed
+//! `CreateProcessW` carried no `SE_GROUP_ENABLED`, so a container granted
+//! `internetClient` behaved exactly like one granted nothing. The failing
+//! assertion is what found it (design §7's Windows row and the evidence table
+//! carry the measurement, and `sid::CapabilitySids::resolve` carries the fix).
+//!
+//! # The one observable that does not need the network
+//!
+//! [`a_granted_capability_is_enabled_in_the_container`] reads the capability out
+//! of the container through an ACL instead of a socket, and it exists for two
+//! reasons. It is the measurement Task 9's report said could separate "the
+//! container's list was read from `Options`" from "it was silently emptied" and
+//! could not be made — and it is the only leg here that still means something on
+//! a host whose own policy refuses the container every non-loopback destination,
+//! where every socket-based reading is the same "refused" whatever the
+//! capabilities are.
+//!
+//! # Nothing here skips in silence
+//!
+//! [`host_ready`] asks the one question of the machine before the first spawn,
+//! and a host that answers no **fails with its reason named** unless the operator
+//! has deliberately set [`ALLOW_SKIP`]. That is Task 11's shape, and it is
+//! deliberate: the whole point of this suite is that a green run means the
+//! measurement was taken.
 
 #![cfg(windows)]
 
 mod common;
 
-use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
-use std::time::Duration;
+use std::{
+    env,
+    io::Read as _,
+    net::{IpAddr, SocketAddr, TcpStream, UdpSocket},
+    path::Path,
+    process::Command,
+    time::Duration,
+};
 
-use tinio_sandbox_core::{AccessMode, Confinement};
-use tinio_sandbox_windows::{Capability, Options};
+use tinio_sandbox_core::{AccessMode, Confinement, supervise};
+use tinio_sandbox_windows::{Capability, Options, acl};
 
-/// The confined child. The body lives in the harness because the confinement
-/// suite launches the same role from a different test binary.
-#[test]
-fn child_role() {
-    common::child_role();
-}
-
-/// The address the baseline and the confined attempt both use.
+/// The one way past a precondition this host cannot meet, and it is a deliberate
+/// opt-in.
 ///
-/// `1.1.1.1:53` is the default and it was measured reachable from this machine
-/// unconfined on 2026-09-19, together with `8.8.8.8:53`, `223.5.5.5:53` and
-/// `114.114.114.114:53` — which matters, because the design's §7 gap was opened
-/// by a host whose baseline was unknown. A machine that cannot reach any of them
-/// skips loudly rather than reporting a container policy it did not observe
-/// (`an_address_that_works_outside_is_refused_inside` prints the reason), and
-/// `TINIO_SANDBOX_TEST_TARGET` points the suite at whatever this host can
-/// actually reach.
+/// **A suite that certifies a confinement does not get to skip in silence.** The
+/// rule, the variable and its spelling are P1's and Task 11's
+/// (`crates/tinio-server/tests/sandbox_e2e_windows.rs`,
+/// `crates/tinio-sandbox-linux/tests/jail.rs`), kept identical so one habit
+/// covers all three. It covers the *host's* preconditions alone and nothing the
+/// product does: a failure after the first spawn is this suite's subject and no
+/// value of this variable makes it pass.
+const ALLOW_SKIP: &str = "TINIO_SANDBOX_ALLOW_SKIP";
+
+/// The capability SID `Capability::InternetClient` resolves to.
+///
+/// Spelled here rather than read from the enum so the ACL this suite writes is
+/// an independent statement of which SID it expects the container to carry: a
+/// test that asked `Capability::sid()` for the value to put in the `icacls`
+/// argument would agree with a wrong constant.
+const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
+
+/// The address the baseline and both confined attempts use.
+///
+/// `1.1.1.1:53` is the default, and it was chosen for what a refusal would mean:
+/// it is a public resolver, so a successful TCP handshake is a real round trip
+/// to the internet rather than an artefact of a closed port on a reachable host.
+/// `TINIO_SANDBOX_TEST_TARGET` points the suite at whatever address a given host
+/// actually reaches.
 fn target() -> SocketAddr {
-    std::env::var("TINIO_SANDBOX_TEST_TARGET")
+    env::var("TINIO_SANDBOX_TEST_TARGET")
         .ok()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or_else(|| "1.1.1.1:53".parse().expect("a literal"))
 }
 
-/// Whether the unconfined host can reach `address` at all.
+/// Whether an **unconfined** process on this host reaches `address`.
+///
+/// The baseline, and the only thing this suite knows about the machine rather
+/// than about the container. Five seconds is the confined child's own budget for
+/// the same attempt (the harness's `child_role_body`), so the two halves are
+/// comparable rather than one being more patient than the other.
 fn baseline(address: SocketAddr) -> bool {
     TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_ok()
+}
+
+/// Whether the operator has deliberately opted out of a precondition this host
+/// cannot meet (see [`ALLOW_SKIP`]).
+fn skip_allowed() -> bool {
+    env::var(ALLOW_SKIP).is_ok_and(|value| !value.is_empty())
+}
+
+/// **The host's precondition, probed before anything is spawned — and the only
+/// place this suite's opt-out is decided.** Returns `false` when this machine
+/// cannot do what the measurement needs *and* the operator has deliberately said
+/// so; the test then returns without asserting anything about the product.
+///
+/// One capability of the **machine** is asked about: whether an ordinary process
+/// here can reach [`target`] at all. A host that cannot reach it unconfined
+/// cannot be told apart from a container that refused it, so every leg of this
+/// suite would assert nothing — which is why this is a precondition and not a
+/// printed note.
+///
+/// **The control is not reachable from here.** Whether `internetClient` makes
+/// the container reach the target is not a property of this machine; it is the
+/// finding, and it lives in the test below where it can fail.
+fn host_ready(target: SocketAddr) -> bool {
+    if baseline(target) {
+        return true;
+    }
+    let reason = format!("an unconfined process on this host cannot reach {target}");
+    assert!(
+        skip_allowed(),
+        "this host cannot run the network suite ({reason}), so every leg would assert nothing. \
+         Set {ALLOW_SKIP}=1 to pass deliberately on a host that genuinely cannot, or \
+         TINIO_SANDBOX_TEST_TARGET to an address this host reaches (design §7)"
+    );
+    eprintln!(
+        "skipping: this host cannot run the network suite ({reason}) and {ALLOW_SKIP} is set"
+    );
+    false
 }
 
 /// What the confined child reports about reaching out.
 ///
 /// The target travels in the probe file the child already reads, so nothing about
-/// this run goes through the environment — the same rule the rest of the suite
-/// follows.
-fn confined_outbound(volume: &Path, options: Options, target: SocketAddr) -> Option<String> {
+/// this run goes through the environment — the rule every confined role in this
+/// crate follows (design decision 17), and the reason `Tree::target` exists.
+///
+/// **A launch that fails panics inside the harness with the backend's own
+/// error**, which is Task 9's rule: a test whose subject never started has
+/// nothing to report, and a value it could return `None` on would make "the
+/// backend refused to confine anything" look green.
+fn confined_outbound(volume: &Path, options: Options, target: SocketAddr) -> String {
     let (_dir, mut tree) = common::tree(volume);
     tree.target = Some(target);
-    let (confinement, address) = common::launch_confined(&tree, AccessMode::ReadWrite, options, None)?;
+    let (confinement, address) =
+        common::launch_confined(&tree, AccessMode::ReadWrite, options, None);
     let Confinement::Supervise(child) = confinement else {
         panic!("the Windows backend must launch a child");
     };
     // The child probes and reports before it accepts, so this connect both waits
-    // for it and proves inbound still works.
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(30))
-        .expect("connect to the confined child");
-    let mut pong = [0u8; 4];
-    std::io::Read::read_exact(&mut stream, &mut pong).expect("read the child's answer");
-    assert_eq!(&pong, b"pong");
+    // for it and proves inbound still works — and it is the **harness's**
+    // `common::answer`, whose connect and read are both bounded by
+    // `common::TIMEOUT`: a block spelling the same four lines without the timeout
+    // is the hazard Task 6 paid for.
+    common::answer(address);
     let mut child = child;
-    tinio_sandbox_core::supervise(&mut child, || ()).expect("supervise");
-    Some(tree.report_text())
+    // `supervise` rejoins the relay and reaps the child, so an assertion below
+    // that fails still leaves no process behind.
+    supervise(&mut child, || ()).expect("supervise the confined child");
+    tree.report_text()
 }
 
-/// The outbound guarantee, with the control the design asks for.
+/// The confined child's own role. The body lives in the harness because the
+/// confinement suite launches the same role from a different test binary.
+#[test]
+fn child_role() {
+    common::child_role();
+}
+
+/// The outbound guarantee: an address this host reaches is refused inside.
+///
+/// **The baseline passed or this test did not run**, so the refusal read out of
+/// the child's own report is the container's policy rather than a missing route,
+/// and the loopback round trip `common::answer` performed proves the confinement
+/// left inbound alone — the other half of §7's rule, and the reason a refusal
+/// cannot be explained by a child that never started.
+///
+/// **A failure here is a design finding, not a broken test.** An AppContainer
+/// with an empty capability set that reaches an address this host reaches
+/// unconfined falsifies §7's Windows row, and the row is what would change.
 #[test]
 fn an_address_that_works_outside_is_refused_inside() {
     let target = target();
-    if !baseline(target) {
-        eprintln!(
-            "skipping: this host cannot reach {target} even unconfined, so nothing would be proved by trying it confined. Set TINIO_SANDBOX_TEST_TARGET to an address this host reaches."
-        );
+    if !host_ready(target) {
         return;
     }
-    let Some(volume) = common::volumes().into_iter().next() else {
-        return;
-    };
-    let Some(report) = confined_outbound(&volume, Options::default(), target) else {
-        return;
-    };
-    // The baseline passed, so a refusal here is the container's policy rather
-    // than a missing route, and the round trip proved inbound still works.
+    let volume = common::one_volume();
+    let report = confined_outbound(&volume, Options::default(), target);
     assert!(
         report.contains("outbound: refused"),
-        "the container reached {target} with no capability: {report}"
+        "the container reached {target} with no capability, which §7's Windows row says it \
+         cannot: {report}"
     );
 }
 
-/// The positive control: the same address, with `internetClient`.
+/// The positive control: the same address, with `internetClient` granted.
 ///
-/// Recorded, not asserted. A pass shows the container's policy — not the host's
-/// firewall — is what refused the previous test; a failure on a host whose
-/// baseline works is a finding worth reading, not a broken build.
+/// **This asserts, and it is the assertion that found the capability defect.** It
+/// is the only measurement here that tells "the container's capability list was
+/// read from `Options` and honoured" from "it was silently emptied" — the two are
+/// indistinguishable from every other observable in the suite, because a
+/// container with no capabilities at all behaves exactly like one whose
+/// configured list was dropped. The pair of tests either side of it is what makes
+/// each of them mean something: same host, same address, same child, one
+/// capability between them.
+///
+/// **A failure here is a finding, never a flake.** It says the container did not
+/// reach an address this host reaches unconfined with `internetClient` granted.
+/// On 2026-09-22 it failed for exactly that reason and the cause was in this
+/// crate rather than on the host: the capability SIDs were handed to
+/// `CreateProcessW` with no attribute set, so the capability sat in the child's
+/// token and was honoured by nothing. If it fails again, the two candidates are
+/// that regression and a host whose own policy refuses the container's traffic —
+/// and [`a_granted_capability_is_enabled_in_the_container`] is what tells the two
+/// apart, because it does not touch the network.
 #[test]
 fn the_same_address_is_reached_with_internet_client() {
     let target = target();
-    if !baseline(target) {
-        eprintln!("skipping: no baseline for {target}");
+    if !host_ready(target) {
         return;
     }
-    let Some(volume) = common::volumes().into_iter().next() else {
-        return;
-    };
+    let volume = common::one_volume();
     let options = Options {
         capabilities: vec![Capability::InternetClient],
         ..Default::default()
     };
-    match confined_outbound(&volume, options, target) {
-        Some(report) => eprintln!(
-            "recorded: with internetClient the confined child reported `{}`",
-            report.trim()
-        ),
-        None => eprintln!("recorded: with internetClient the launcher did not return"),
+    let report = confined_outbound(&volume, options, target);
+    eprintln!(
+        "measured: with internetClient the confined child reported `{}`",
+        report.lines().last().unwrap_or_default()
+    );
+    assert!(
+        report.contains("outbound: SUCCEEDED"),
+        "the container did not reach {target} with internetClient granted, while this host \
+         reaches it unconfined: {report}"
+    );
+}
+
+/// A capability that is not `internetClient` does not open the internet.
+///
+/// The third arm, and the one that makes the control's reading a *policy* rather
+/// than a coincidence: `privateNetworkClientServer` is the capability §7 says a
+/// non-loopback bind needs, so it is a non-empty list that must not reach a
+/// public resolver. Together with the test above it separates three outcomes a
+/// single capability would confound: a list that is read and honoured per
+/// capability, a list that is emptied, and a container that opens the network
+/// whenever any capability is present.
+#[test]
+fn a_capability_that_is_not_internet_does_not_open_the_network() {
+    let target = target();
+    if !host_ready(target) {
+        return;
     }
+    let volume = common::one_volume();
+    let options = Options {
+        capabilities: vec![Capability::PrivateNetworkClientServer],
+        ..Default::default()
+    };
+    let report = confined_outbound(&volume, options, target);
+    assert!(
+        report.contains("outbound: refused"),
+        "the container reached {target} with privateNetworkClientServer and no internetClient, \
+         so a non-empty capability list is what granted it rather than the name of the \
+         capability: {report}"
+    );
+}
+
+/// The same question asked of an ACL instead of a socket.
+///
+/// **This is Task 9's carry, and the reason it is asked twice.** Its report
+/// records that `a_capability_from_the_options_reaches_the_container` cannot
+/// distinguish "the container's list was read from `Options`" from "it was
+/// silently emptied", that no observable in its own suite could, and that the
+/// network probe is the only measurement that can. That is true of the *network*
+/// arm above — and a network arm is exactly what a locked-down host takes away,
+/// since a host that refuses the container every destination reports the same
+/// refusal whatever its capabilities are.
+///
+/// A capability SID is also a token SID an access check consults, so granting one
+/// read on a directory and asking the child to read through it is the same
+/// question with no network in the way: the child reads the file if and only if
+/// the SID is in its token **and enabled**. Measured 2026-09-22, the second half
+/// of that is not free — with `Attributes: 0` the ACE granted nothing, and this
+/// leg is what makes a regression there fail on every host rather than only on
+/// the ones whose outbound happens to work.
+#[test]
+fn a_granted_capability_is_enabled_in_the_container() {
+    let volume = common::one_volume();
+    let granted = capability_is_visible(&volume, vec![Capability::InternetClient]);
+    let absent = capability_is_visible(&volume, Vec::new());
+    eprintln!(
+        "measured: the {INTERNET_CLIENT_SID} ACE was readable with internetClient={granted}, \
+         with no capability={absent}"
+    );
+    assert!(
+        granted,
+        "a directory whose ACL grants {INTERNET_CLIENT_SID} read was not readable by a container \
+         the operator granted internetClient, so either the list did not reach the container's \
+         token or it reached it disabled: {granted}"
+    );
+    assert!(
+        !absent,
+        "a directory whose ACL grants {INTERNET_CLIENT_SID} read was readable by a container with \
+         no capability at all, so the ACE proves nothing about the list: {absent}"
+    );
+}
+
+/// Whether the confined child reads the `denied` file when `denied` carries an
+/// ACE for the `internetClient` capability SID.
+///
+/// The harness's own tree is reused rather than a new one added: `denied` is the
+/// directory the child already tries to read and reports on, it already carries
+/// `Users` (so a pass cannot be an inherited ACE nobody meant), and the grant is
+/// the suite's own `icacls` call — the launcher never writes a capability ACE,
+/// which is the same rule that keeps the confined child out of `icacls` (design
+/// decisions 15 and 17).
+fn capability_is_visible(volume: &Path, capabilities: Vec<Capability>) -> bool {
+    let (_dir, tree) = common::tree(volume);
+    let granted = Command::new(acl::icacls_binary())
+        .arg(&tree.denied)
+        .args(["/grant", &format!("*{INTERNET_CLIENT_SID}:(OI)(CI)R"), "/q"])
+        .output()
+        .expect("grant the capability SID");
+    assert!(
+        granted.status.success(),
+        "icacls could not grant {INTERNET_CLIENT_SID} on {}: {}",
+        tree.denied.display(),
+        String::from_utf8_lossy(&granted.stderr).trim()
+    );
+    let (confinement, address) = common::launch_confined(
+        &tree,
+        AccessMode::ReadWrite,
+        Options {
+            capabilities,
+            ..Default::default()
+        },
+        None,
+    );
+    let Confinement::Supervise(child) = confinement else {
+        panic!("the Windows backend must launch a child");
+    };
+    common::answer(address);
+    let mut child = child;
+    supervise(&mut child, || ()).expect("supervise the confined child");
+    tree.report_text().contains("denied-read: READ")
+}
+
+/// The address this host would use to reach the network, when nothing says
+/// otherwise.
+///
+/// **Discovered rather than configured, so the LAN leg below cannot pass by
+/// doing nothing.** A `UdpSocket` connected to the suite's own target performs a
+/// route lookup and nothing else — no packet is sent, no name is resolved — and
+/// the address it reports is this host's own source address on the interface that
+/// route selects. On a host with no route there is no answer, and the leg reports
+/// that rather than a pass.
+///
+/// `TINIO_SANDBOX_TEST_LAN_ADDR` overrides the **interface only**; the port comes
+/// from the listener the suite binds, so two runs cannot collide on a fixed one.
+fn lan_ip() -> Option<IpAddr> {
+    if let Ok(raw) = env::var("TINIO_SANDBOX_TEST_LAN_ADDR") {
+        if let Ok(address) = raw.parse::<SocketAddr>() {
+            return Some(address.ip());
+        }
+        if let Ok(ip) = raw.parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).ok()?;
+    socket.connect(target()).ok()?;
+    let local = socket.local_addr().ok()?;
+    let ip = local.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
 }
 
 /// The LAN question decision 16 leaves open, recorded and never asserted.
 ///
-/// Set `TINIO_SANDBOX_TEST_LAN_ADDR` to this host's LAN address (for example
-/// `192.168.1.10:9000`) to record whether an inherited listener bound to `0.0.0.0`
-/// accepts a connection that arrives on the LAN interface, with and without
-/// `privateNetworkClientServer`. Nothing in the design depends on the answer; the
-/// point is to replace a guess with a measurement and to record which capability,
-/// if any, a non-loopback bind needs.
+/// **What is measured is narrower than "the LAN", and saying so is the point.**
+/// The connection below is made by this same host to this host's own interface
+/// address; it travels the local stack rather than a cable. It establishes
+/// whether the container's policy gates a connection addressed to a non-loopback
+/// interface **at all** — and it established on 2026-09-22 that it does not: a
+/// container with no capability at all answered on `192.168.1.10`. What it
+/// cannot establish is whether a client on another machine gets through, because
+/// that is a different packet arriving on the same interface from off the host,
+/// and a second machine is what would settle it. Nothing in the design depends on
+/// the answer (decision 16, §7's Windows note), which is why this leg records
+/// rather than asserts.
+///
+/// **It is run for real rather than behind an unset variable.** A leg that
+/// returned early when nobody configured it would report nothing at all, which is
+/// the shape this suite exists to avoid; the interface is discovered when nothing
+/// overrides it, and a host with no route fails with that reason named.
+///
+/// The two arms differ only in `privateNetworkClientServer`, which §7 says a
+/// non-loopback bind needs: if the answer is ever "refused without it, answered
+/// with it", that sentence is confirmed rather than asserted.
 #[test]
-fn the_lan_answer_is_recorded_when_asked_for() {
-    let Ok(lan) = std::env::var("TINIO_SANDBOX_TEST_LAN_ADDR") else {
-        eprintln!(
-            "skipped: set TINIO_SANDBOX_TEST_LAN_ADDR=<this host's LAN ip>:<port> to record whether an inherited listener reaches the network"
+fn the_lan_answer_is_recorded() {
+    let Some(ip) = lan_ip() else {
+        let reason = "this host has no non-loopback route to the suite's target, so there is no \
+                      LAN interface to measure against";
+        assert!(
+            skip_allowed(),
+            "the LAN leg cannot run ({reason}). Set {ALLOW_SKIP}=1 to pass deliberately, or \
+             TINIO_SANDBOX_TEST_LAN_ADDR=<ip> to name the interface"
         );
+        eprintln!("skipping: the LAN leg cannot run ({reason}) and {ALLOW_SKIP} is set");
         return;
     };
-    let address: SocketAddr = lan.parse().expect("a LAN address");
-    let Some(volume) = common::volumes().into_iter().next() else {
-        return;
-    };
+    let volume = common::one_volume();
     for (label, capabilities) in [
         ("no capability", Vec::new()),
         (
@@ -6623,8 +7351,10 @@ fn the_lan_answer_is_recorded_when_asked_for() {
         ),
     ] {
         let (_dir, tree) = common::tree(&volume);
-        let bind = SocketAddr::from(([0, 0, 0, 0], address.port()));
-        let Some((confinement, bound)) = common::launch_confined(
+        // The port is the wildcard bind's, so the address that reaches it is this
+        // host's own interface on the same port.
+        let bind = SocketAddr::from(([0, 0, 0, 0], 0));
+        let (confinement, bound) = common::launch_confined(
             &tree,
             AccessMode::ReadWrite,
             Options {
@@ -6632,59 +7362,70 @@ fn the_lan_answer_is_recorded_when_asked_for() {
                 ..Default::default()
             },
             Some(bind),
-        ) else {
-            return;
-        };
+        );
         let Confinement::Supervise(child) = confinement else {
             panic!("the Windows backend must launch a child");
         };
-        let reachable = match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+        let lan = SocketAddr::new(ip, bound.port());
+        let reached = match TcpStream::connect_timeout(&lan, Duration::from_secs(5)) {
             Ok(mut stream) => {
-                let _ = stream.write_all(b"ping");
-                true
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("bound the read");
+                let mut pong = [0u8; 4];
+                Some(stream.read_exact(&mut pong).is_ok() && &pong == b"pong")
             }
-            Err(_) => false,
+            Err(_) => None,
         };
         eprintln!(
-            "recorded: [{label}] bound {bound}, the LAN address {address} {} reachable while the container served",
-            if reachable { "was" } else { "was not" }
+            "recorded: [{label}] the container bound {bound}; a same-host connection to {lan} {}",
+            match reached {
+                Some(true) => "was answered by the confined child",
+                Some(false) => "connected but the confined child said something else",
+                None => "was refused, so the container did not answer on that interface",
+            }
         );
-        // The child is waiting for a connection its caller may never make. Drop
-        // the supervision rather than waiting for it: the `Child`'s closure drops
-        // with it, which closes the job handle and takes the child with it
-        // (decision 20), and the `Grants` guard rolls the ACEs back on the same
-        // path.
-        drop(child);
+        // **Every spawn is waited for or killed on every path** (Task 11's rule).
+        // A connection that was answered was also the child's `accept`, so it is
+        // on its way out and can be waited for; one that was not leaves it blocked
+        // in `accept` for a caller that is never coming, and dropping the
+        // supervision is what ends it — the `Child`'s closure drops with it,
+        // closing the job handle and taking the child with it (decision 20), and
+        // the `Grants` guard rolls the ACEs back on the same path (Task 9's
+        // `a_dropped_supervision_also_rolls_back`).
+        if reached == Some(true) {
+            let mut child = child;
+            supervise(&mut child, || ()).expect("supervise the confined child");
+        } else {
+            drop(child);
+        }
     }
 }
+
 ```
 
-`Child` exposes no `kill` in P0's surface, and this task does not add one: dropping the `Confinement` is what ends a child nobody waited for, which is also the case `a_dropped_supervision_also_rolls_back` pins in Task 9.
 
-- [ ] **Step 2: Run the outbound test**
+- [x] **Step 2: Run the outbound test**
 
 Run: `cargo test -p tinio-sandbox-windows --test network an_address_that_works_outside_is_refused_inside -- --nocapture`
-Expected: PASS on a host that reaches `1.1.1.1:53`, or a printed `skipping:` where it does not. **A failure here is a design finding, not a broken test**: it means an AppContainer with no capability reached an address this host reaches unconfined, and §7's Windows row would have to change. Do not weaken the assertion to make it pass.
+Expected: PASS on a host that reaches `1.1.1.1:53`. **A host that cannot reach it fails with that reason named** rather than skipping (Ruling 28), unless the operator sets `TINIO_SANDBOX_ALLOW_SKIP=1` deliberately. **A failure here is a design finding, not a broken test**: it means an AppContainer with no capability reached an address this host reaches unconfined, and §7's Windows row would have to change. Do not weaken the assertion to make it pass.
 
-- [ ] **Step 3: Run the positive control and the LAN diagnostic**
+- [x] **Step 3: Run the positive control and the LAN diagnostic**
 
 Run:
 ```powershell
 cargo test -p tinio-sandbox-windows --test network the_same_address_is_reached_with_internet_client -- --nocapture
-$env:TINIO_SANDBOX_TEST_LAN_ADDR = '<this host''s LAN address>:<port>'
-cargo test -p tinio-sandbox-windows --test network the_lan_answer_is_recorded_when_asked_for -- --nocapture
+cargo test -p tinio-sandbox-windows --test network -- --nocapture
 ```
-Expected: a `recorded:` line from each. Keep both verbatim for the next step — they are the evidence §7's row and its risk row are waiting for.
+Expected: `measured: with internetClient the confined child reported` `outbound: SUCCEEDED` from the control — which is an assertion and not a note: a container that does not reach the address fails the leg. The residual legs print a `measured:` line for the capability ACE and two `recorded:` lines for the LAN answer, and those are the evidence §7 and the Risks table are waiting for.
 
-- [ ] **Step 4: Record the evidence in the design**
+- [x] **Step 4: Record the evidence in the design**
 
-`docs/superpowers/specs/2026-09-18-sandbox-design.md`:
+`docs/superpowers/specs/2026-09-18-sandbox-design.md` — **done on 2026-09-22, and what it records is sharper than this step bargained for**:
 
-1. The evidence table's outbound row becomes the measured row: host, target address, the baseline result, the confined result, and the `internetClient` control.
-2. §7's **Verification gap** paragraph becomes the settled statement, including which capability, if any, a non-loopback bind needs. If the measurement contradicted the design, the row and the §7 paragraph say so and the Goal's second guarantee is re-scoped in the same edit rather than left implied.
-3. The **Risks** table's Windows row is marked settled, or replaced with whatever the measurement turned up.
-
-Add one sentence to §7's Windows note recording the LAN answer, phrased as an observation, and keep the design's existing statement that nothing depends on it (decision 16): the isolation claim rests on the capability set, never on the handoff.
+1. The evidence table's outbound row is the measured row: host, target address, the baseline, the confined result, the `internetClient` control, and the `privateNetworkClientServer` arm that makes the control's reading a policy rather than a coincidence. **Two more rows joined it**: the attribute the capability SID needs to be honoured at all, with both halves of the before-and-after, and the LAN observation with its same-host limit stated.
+2. §7's **Verification gap** paragraph is the settled statement — the row is verified, the refusal is the capability set's, and the paragraph records that reaching that answer cost a defect in this crate rather than on the host, which is why the original probe on the authoring host could not separate the two.
+3. The **Risks** table's Windows outbound row is **closed**, and its LAN row is **half-settled**: a same-host connection to the host's own interface address is answered with no capability at all, but a client on another machine is still unmeasured, and nothing in the design depends on the answer (decision 16).
 
 ---
 
@@ -6700,7 +7441,19 @@ Add one sentence to §7's Windows note recording the LAN answer, phrased as an o
 - Consumes: everything above.
 - Produces: nothing.
 
-- [ ] **Step 1: Write the verification script**
+**Added by the 2026-09-23 branch audit, and not steps of this task.** The audit's findings and what each became:
+
+- **The two unimplemented sandbox channels were silently ignored** (decision 5, §11), and it was the top finding because a run that sets `TINIO_SANDBOX=1` and serves unconfined is the failure §11 exists to prevent. `server::Config` gains a schema-known `sandbox` key, `server::probe_server_keys` reads both keys in **one** parse (a second single-key probe would be a second mirror with a second chance to drift; `probe_read_only` is now a projection of it), `sources::{SANDBOX_VAR, env_sandbox}` parse the variable strictly, and `refuse_unhonoured_channels` refuses to start on every platform and in every feature configuration, naming the channel. The refusal is framed (decision 19) at `main`'s own call site, because the launcher arm *is* `main`'s return value and so skipped `emit_on_error` — the same gap the Linux arm's `confine_in_place` had, closed with it.
+- **A case-sensitive `Path::starts_with` decided containment in `serve`** while `tinio-fs` had a case-folding comparison, and the launcher's copy is the one that grants ACEs: a state directory spelled in another case inside a read-only root took the `else` branch and was exposed **read-write**. The rule now has one definer, `tinio_util::path::path_contains`, with `tinio-fs`'s `contained_in_root` / `lower_components` / `plain` deleted in its favour. Two corrections to the audit's own text are recorded there: the drive-letter case it cites is folded by `Component::PartialEq` already (the real triggers are a normal component's case and a verbatim/plain pairing), and the first version respelled only the *root* — an operator's `\\?\`-prefixed `TINIO_STATE_DIR` still slipped through, so both sides are respelled now.
+- **`backend.rs` (1924 lines) became `backend/`** — `mod.rs` (the composition), `capability.rs`, `exposures.rs`, `tests.rs` — with the public API unchanged (checked against the rendered docs) and no behaviour edit. `SiblingScan` and `sibling_dlls` moved into `exposures.rs` where the audit said they belong: they are exposure policy, and the DACL operation that grants them is `acl`'s.
+- **`serve.rs` became `examples/serve/`** — `main` / `args` / `events` / `read_only` / `sandbox` / `serve` — with the target name unchanged, so nothing that builds `--example serve` moves.
+- **The Job object is created before `CreateProcessW`** rather than after it. The old order meant a `Job::create` failure left a live confined child the launcher had to chase with `terminate` on the error path; now that failure happens while there is no child. The microsecond gap between creation and `AssignProcessToJobObject` remains and is documented at the call site with why `PROC_THREAD_ATTRIBUTE_JOB_LIST` was not taken.
+- **`exit_launcher` disarms the console handler before exiting.** The handler answers `1` for every recognised console event, so Ctrl+C is consumed — right while the launcher is supervising, wrong once the child is stuck, since the process then cannot be terminated from its own console.
+- **`canonicalize_tolerating_a_denied_device_map` is `#[cfg(windows)]`**, with a plain-`canonicalize` arm elsewhere: the AppContainer device-map denial is a Windows confinement fact, and arming the fallback on unix would silently turn an unsearchable-ancestor `PermissionDenied` into a lexical answer.
+
+**Added by the 2026-09-23 cleanup pass, and not a step of this task:** `crates/tinio-sandbox-windows/src/testing.rs` — the harness functions `tinio-server`'s Windows e2e leg needs (`wait_for_exit`, `icacls`, `junction`), which it could not reach in this crate's `tests/`. It is an unconditional `pub mod` rather than a `testing` feature because the feature form is unusable from this crate's own tests (`#[cfg(test)]` is invisible to `tests/`, and a crate cannot enable a feature of its own — a dev-dependency on itself is a cycle), so a gated module would be reachable by `tinio-server` and not by the suite the copy lived in. `tests/common/mod.rs` now re-exports `wait_for_exit` from it rather than defining a second one.
+
+- [x] **Step 1: Write the verification script**
 
 ```powershell
 #!/usr/bin/env pwsh
@@ -6727,14 +7480,16 @@ cargo test -p tinio-sandbox-windows -- @args
 cargo test -p tinio-server --test sandbox_e2e_windows
 ```
 
-- [ ] **Step 2: Run it**
+**Three corrections landed against this block, and the landed script is what a later phase adapts to** — copy `crates/tinio-sandbox-windows/scripts/verify-windows.ps1` rather than this block: **every native command's exit status is checked** (Ruling 32 — as written, `cargo test` ran twice with no `$LASTEXITCODE` read, so a red first leg still exited 0, and a gate that cannot fail is the defect class this phase keeps meeting); **the e2e leg builds `--example serve` first**, because `--test <name>` selects one test target and builds no example, so on a clean tree that leg fails with a missing binary rather than a test result (P1's script builds for the same reason); and **Step 3's measurement is a mode of the script rather than a block to paste** (`-AclCost`), because the check that makes it a measurement belongs in code (Ruling 33).
+
+- [x] **Step 2: Run it**
 
 Run: `pwsh crates/tinio-sandbox-windows/scripts/verify-windows.ps1`
-Expected: the volume list with its filesystems, then every sandbox test green — including `tests/signal.rs`, which needs a console: run it from an interactive shell, not a detached one, or its two cases print their `skipping:` lines. A volume that is not present is skipped rather than failed — a workstation without an ReFS volume is a fact about the machine, not a broken build — so the printed filesystems are what records which ones were covered.
+Expected: the volume list with its filesystems, then every sandbox test green — including `tests/signals.rs`, whose signal relay needs a console: run it from an interactive shell, not one without a console at all. **A host that cannot deliver a console control event is a failure there, not a skip** (Task 10): the event is the only mechanism this platform has for a stop, so a run that cannot deliver one asserts nothing, and the suite says which call was refused rather than passing quietly. What "has a console" means was measured on 2026-09-21: the interactive shell here reports `GetConsoleWindow()` as **zero** — a ConPTY session, not a windowed console — and delivery still works, so the test is not keyed on a window. A volume that is not present is skipped rather than failed — a workstation without an ReFS volume is a fact about the machine, not a broken build — so the printed filesystems are what records which ones were covered.
 
-- [ ] **Step 3: Establish what the ACL pass costs, on a tree large enough to say**
+- [x] **Step 3: Establish what the ACL pass costs, on a tree large enough to say**
 
-Task 4 and Task 9 both state this cost without a number: the grant list is one `icacls` invocation per exposed path, but the ACE it writes is `(OI)(CI)`, so the filesystem's inheritance carries it to every descendant the served tree already holds — and the rollback pays the same pass on the way out, which makes a run's ACL work proportional to the corpus twice over. **Measure it here rather than assume it**, on a synthetic corpus, and record the two numbers:
+Task 4 and Task 9 both state this cost without a number: the grant list is one `icacls` invocation per exposed path, but the ACE it writes is `(OI)(CI)`, so the filesystem's inheritance carries it to every descendant the served tree already holds — **and Ruling 78 (2026-09-22) later took the launcher's own directory out of this arithmetic**, leaving the caller's exposures to pay it (decision 22; the design's §6 carries the amendment and the exposure shape) — **and Ruling 78 (2026-09-22) later took the launcher's own directory out of this arithmetic**, leaving the caller's exposures to pay it (decision 22; the design's §6 carries the amendment and the exposure shape) — and the rollback pays the same pass on the way out, which makes a run's ACL work proportional to the corpus twice over. **Measure it here rather than assume it**, on a synthetic corpus, and record the two numbers:
 
 ```powershell
 $root = Join-Path $env:TEMP 'tinio-acl-cost'
@@ -6756,23 +7511,27 @@ Remove-Item -Recurse -Force $root
 
 Expected: two numbers for one directory and 200,000 objects — the per-object cost that §6's "2N `icacls` invocations for N exposures" leaves out of the sentence. **Record them where a document already promises a number**: the design's Risks row for this ("Unquantified, and that is the risk rather than the cost itself") becomes the measured pair, and the `docs/tests.md` bullet from Step 4 gains one line saying how it was measured, so the next reader repeats it rather than trusting it. If the grant alone takes a large share of the 30 s readiness budget the harness allows (`crates/tinio-e2e/tests/steps/clients.rs`'s `START_TIMEOUT`), say so in both places — a number that strains an existing budget is the finding, not a reason to pick a smaller tree.
 
+**What it produced** (2026-09-22, the script's `-AclCost` mode at 200 × 1000 objects): **the grant alone exceeded the 30 s readiness budget on NTFS in every run (three of them, 32.3–37.8 s) and cost well under a third of it on ReFS**, and the spread between two runs of the same tree was wide enough that the numbers are magnitudes rather than constants. The block above is the sketch; the design's §6 and its Risks row are where the numbers are defined, `docs/tests.md` records the method and its checks, and `README.md` carries the operator's half — the four documents deliberately split the fact rather than repeat it (the one-definer rule).
+
 **And what it means for an operator with a very large tree belongs in the README**, next to the crate row rather than only in a plan: both passes are proportional to the number of objects under the exposed directories, they both happen before the server can report readiness, and the rollback happens again on the way out. The honest guidance is what the measurement supports rather than what is convenient — expose the narrowest directory that serves the corpus, because a parent directory holding far more than the server serves pays for all of it; and where the corpus is large enough for the two passes to matter, **measure the grant on a tree of the same object count before exposing it** (this step's block, sized to the corpus), because the cost follows object count and a small tree says nothing about a large one. If the numbers say the cost is negligible at the corpus sizes this tool is for, say that instead, with the size they were measured at.
 
-- [ ] **Step 4: Record the commands in `docs/tests.md`**
+- [x] **Step 4: Record the commands in `docs/tests.md`**
 
-Under the existing `## Platform-gated verification (WSL2)` section, in the file's compressed style:
+Under its own `## Platform-gated verification (Windows)` heading — shared §6's rule, and **not** the WSL2 one, which names another platform and is where the `Unix/windows-gnu` anchor sends readers. P2's Task 11 adds that heading with the two commands it can record; this step extends it with the script line, in the file's compressed style:
 
 ```markdown
-- Windows confinement (`--sandbox`): `pwsh crates/tinio-sandbox-windows/scripts/verify-windows.ps1` — the AppContainer/DACL suite on every volume present (locally `C:\` NTFS and `E:\` ReFS), the signal and event relays, and the `serve` e2e. **CI needs no new job**: the portable Windows legs already run `cargo nextest run --workspace --exclude tinio-e2e`, so this crate's suite is picked up the moment it is a workspace member — on NTFS only, and with no console, so the two signal cases print their `skipping:` line there. ReFS and the console cases are what the local script adds. The signal relay's two cases need a console (a console control event cannot be delivered without one) and print a `skipping:` line rather than failing where there is none.
+- Windows confinement (`--sandbox`): `pwsh crates/tinio-sandbox-windows/scripts/verify-windows.ps1` — the AppContainer/DACL suite on every volume present (locally `C:\` NTFS and `E:\` ReFS), the signal and event relays, and the `serve` e2e. **CI needs no new job**: the portable Windows legs already run `cargo nextest run --workspace --exclude tinio-e2e`, so this crate's suite is picked up the moment it is a workspace member — on NTFS only, and with whatever console that session has. ReFS is what the local script adds, and the signal suite is the one case whose console requirement is not a formality: **it fails rather than skips where a console control event cannot be delivered** (Task 10's rule — the event is the only mechanism this platform has, so a run that cannot deliver one asserts nothing). The relay itself needs no windowed console: the interactive shell this phase ran in reports `GetConsoleWindow()` as zero and delivers stops regardless (measured 2026-09-21, a ConPTY session). **The CI leg's console is therefore a fact this task records rather than assumes**, and a leg that cannot deliver a stop owes either a console or an explicit exclusion of that suite — never a green run that proved nothing.
 - The outbound assertion needs a baseline: the suite proves the target address is reachable unconfined before asserting it is unreachable confined, and skips loudly when the host cannot reach it at all (`TINIO_SANDBOX_TEST_TARGET` overrides `1.1.1.1:53`).
-- Readiness is an event, not a scraped line (decision 19): stdout carries SSE-framed JSONL (`data: {…}` and a blank line) and every log is on stderr. `crates/tinio-e2e/tests/steps/clients.rs`'s `READY`/`wait_for_ready` moves to decoding that stream — in P1, which emits the first events (design Bookkeeping), not here.
+- Readiness is an event, not a scraped line (decision 19): stdout carries SSE-framed JSONL (`data: {…}` and a blank line) and every log is on stderr. **The harness half of this landed in P1, and this bullet used to describe it as pending**: `crates/tinio-e2e/tests/steps/clients.rs`'s `READY` constant is gone and `wait_for_ready` returns `Option<Event>` — it accumulates lines to a blank line, decodes the frame and skips what is not one. What a new reader of that stream owes is the same rule stated positively, and P2's `crates/tinio-server/tests/sandbox_e2e_windows.rs` is a second instance of it: read whole frames, take the first event that is yours, and treat anything else as text to ignore rather than as a failure.
 ```
 
-- [ ] **Step 5: Record what landed**
+**What landed beyond this block** — the file is the record and this is the sketch: the ACL-cost bullet Step 3 asks for; the network suite's entry, which is Task 12's carry and the leg that settles §7's Windows row; the CI/console bullet the heading needs now that the crate is a workspace member (the runner's console is a fact recorded there rather than assumed); and the readiness bullet's third reader (`crates/tinio-server/tests/serve_read_only.rs`), since a consumer of the stream is a fact about the protocol rather than about the sandbox.
+
+- [x] **Step 5: Record what landed**
 
 The design's decision 14 site list is already equal to the crate's `#[allow(unsafe_code)]` files (Task 1, kept current by each task that adds a module). Confirm with `rg -c 'allow\(unsafe_code\)' crates/tinio-sandbox-windows/src` and correct either side if they disagree — decision 14 asks for the scope to be enumerated per capability with the count following the implementation, and the list and the code saying the same thing is what makes that checkable. Update §13's P2 row's verification column in the design to what Steps 1–2 actually produced, naming the filesystems and whether the relay's container probe was measurable here.
 
-- [ ] **Step 6: Run the full local gate**
+- [x] **Step 6: Run the full local gate**
 
 Run the **Standard acceptance (pre-push gate)** block in `docs/tests.md` in full — it is the bar, and the list this step used to carry was a shorter, divergent subset of it (shared §1). The two runs this phase adds to it are:
 
@@ -6783,6 +7542,12 @@ cargo check -p tinio-server --no-default-features
 
 Expected: all clean.
 
+**One correction the gate found, and it is a trap worth naming for P3**: `cargo fmt --all -- --check` on the **stable** toolchain exits 0 with five `Warning: can't set …, unstable features are only available in nightly channel` lines — `format_code_in_doc_comments`, `normalize_comments`, `imports_granularity`, `group_imports` and `reorder_impl_items` are all ignored, which is every option this workspace's `rustfmt.toml` sets. So a task that checks its formatting with the plain command sees a clean tree that the gate's own command, `cargo +nightly fmt --all -- --check`, rejects: ten of this phase's files (`tinio-sandbox-windows`'s `acl`, `backend`, `control`, `job`, `launch`, `process` and `socket`, the facade's `lib.rs`, `serve.rs` and `sandbox_e2e_windows.rs`) were formatted by the stable formatter and failed the nightly one on import granularity, import grouping, doc-example layout and re-export ordering. Task 13 ran `cargo +nightly fmt --all` and re-ran the gate; the lesson is the command, not the files.
+
+**And the gate found one real documentation defect in the crate.** `crates/tinio-sandbox-windows/src/control.rs`'s link to ``[`crate::backend`]`` is ambiguous — `backend` is both the module and the crate's `pub fn backend()` — which `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` rejects as `-D rustdoc::broken-intra-doc-links`; Task 13 fixed it with the same disambiguated spelling the crate root already uses for that collision (`[`backend`](mod@backend)`). Two things made it survive twelve tasks: the doc gate is not in most task-level command lists, and `cargo test --doc` — which every task did run — is a different gate that stays green (the warning `docs/tests.md` carries); Task 3 hit the identical collision in `lib.rs` and fixed it there, which is where the idiom comes from.
+
+> **Why the boxes above were unticked while the phase ran, and what closed them.** `CLAUDE.md` ticks a step once its task's review has passed, and every task in this phase left its boxes unticked — the steps ran and their evidence is Task 13's report, while the tick belonged to whoever closed the phase after the review. The whole-branch review found the record still empty (0 of 70), and the close-out ticked all seventy: **no step in this plan was deliberately left unrun**, so no box carries the "deliberately not run" note `CLAUDE.md` provides for.
+
 ---
 
 ## Commit
@@ -6791,19 +7556,23 @@ Expected: all clean.
 
 Run the full Standard acceptance block (`docs/tests.md`) first, and commit only once the phase's own review is clean. The message is a conventional header plus single-line cause-and-effect bullets: what changed and why, never where it lives. It is a starting point rather than a description of finished work — where the phase's actual run makes a line of it false, that line changes.
 
+**The `git add` set is the phase's changed paths and nothing else, and the list as first drafted was not.** It named only the crates the Windows work sits in, so a commit following it verbatim would have taken `tinio-fs`'s `src/backend/mod.rs` — which now names `soft_canonicalize` — without `crates/tinio-fs/Cargo.toml`'s dependency edge, without `Cargo.toml`/`Cargo.lock`, and without the `vendor/` tree and the `[patch.crates-io]` entry that resolve it: `E0433`, a tree that does not build. It left out three other paths the phase changed as well: `crates/tinio-sandbox-linux`'s `mechanism.rs`, `docs/cargo.md`, and the five edited plan files — every one of them a change this phase made and a commit at its end is meant to carry. **`git status --short` is the check** — the add list must be a superset of it, and the phase's own rule is that the working tree is one commit, not one per crate.
+
 ```bash
-git add crates/tinio-sandbox-windows crates/tinio-sandbox crates/tinio-sandbox-core crates/tinio-server crates/tinio-config docs/tests.md docs/superpowers/specs/2026-09-18-sandbox-design.md README.md
+git add Cargo.toml Cargo.lock crates/tinio-fs crates/tinio-sandbox-windows crates/tinio-sandbox crates/tinio-sandbox-core crates/tinio-sandbox-linux crates/tinio-server crates/tinio-config docs/cargo.md docs/tests.md docs/superpowers/specs/2026-09-18-sandbox-design.md docs/superpowers/plans README.md vendor
 git commit -F - <<'EOF'
 feat(sandbox-windows): confine serve under AppContainer
 
 - AppContainer entered at process creation only, so a launcher stays outside
 - Launcher outlives the child; job object kills the child with it
 - Hard kill would otherwise orphan a confined server holding the listener
-- Package SID derived from a fixed name, not generated: residue stays identifiable
-- Next run takes its own ACEs over instead of accumulating orphans
+- Package SID derived from the served root's path, not generated: a residue is identifiable
+- One name per root, so only the run it belongs to takes its ACEs over
 - Container profile created with the SID: a derived SID alone cannot launch
 - Grant reaches pre-existing children by inheritance; rollback on every exit path
 - Failed launch rolls back too, not only the clean exit
+- A confined token cannot name a volume in the DOS form, so root resolution falls back: vendored, the patch making the crate's own walk and containment proof resolve rather than answer lexically
+- A stop was answered only between chunk-bounded sleeps, so a clean exit took 15 s whatever the stop did; the pause now waits on the signal and the timer together
 EOF
 ```
 
@@ -6822,7 +7591,7 @@ EOF
 | §3 step 7 (the payload into the child's **stdin**, then closed; the listener's descriptor in argv) | 7, 9 |
 | §3 step 8 (emit `Listening`, relay the child's stdout events, wait, roll back, forward the exit status) | 9, 11 |
 | **§3 step 9 (forward termination signals while waiting)** | **10** |
-| §6 ACL whitelist (`(OI)(CI)M` / `(OI)(CI)RX`, ancestors untouched) | 3, 4, 9 |
+| §6 ACL whitelist (`(OI)(CI)M` / `(OI)(CI)RX` on the caller's exposures, which stay inherited — a pre-existing descendant must remain reachable; the program's directory takes the plain non-inherited `RX`, and its sibling `*.dll` files the file shape in one pattern invocation — Ruling 78; ancestors untouched) | 3, 4, 9 |
 | §6's inheritance question — measured before this plan ran, so the test is a regression test | 4 (both volumes via 9), already recorded in the design |
 | §6 residual cost (ACEs written onto the operator's directories, plus the two passes over the served tree that writing and removing them costs) | 4 (one entry per path, removed on every exit path including `Drop`), 9 (the grant list's comment), 13 (the measurement that replaces "unquantified" with a number) |
 | §7 Windows row and its verification gap | 12 |
@@ -6847,12 +7616,12 @@ EOF
 | decision 21 (derived, deterministic SID; the profile is the second artifact, reusable and removed) | 2, 4, 9, 11 (the residue and takeover e2e) |
 | decision 22 (the executable's directory) | 3 (the backend's `exposures`, which is the only place the entry is produced; Task 11 calls the helper that does not carry it) |
 | decision 26 (confined before the runtime) | 11 (the launcher never builds a runtime; the child builds it after adopting) |
-| **shared §7 (every core operation traced, split into `info!` for "was this process confined, and to what" and `debug!` for the per-item detail, `error!` where an `Error` is built)** | 1 (`handles::step` builds and logs in one place, with the recording-subscriber test), 2, 3, 4, 5, 8, 10, 11 (the launcher installs the sink it would otherwise never reach) |
+| **shared §7 (every core operation traced, split into `info!` for "was this process confined, and to what" and `debug!` for the per-item detail, `error!` where an `Error` is built)** | 1 (the core's `launch` builds and logs in one place, with the recording-subscriber test — which lives with it in `tinio-sandbox-core` after the phase-basis correction, not in `handles`), 2, 3, 4, 5, 8, 10, 11 (the launcher reaches `main`'s sink rather than installing one of its own — measured, and the sketch's `try_init` was dropped) |
 
-**Out of P2's scope, deliberately.** `[server] sandbox` and `TINIO_SANDBOX` land with the CLI, exactly as P1 deferred them (decision 1); `--sandbox` is the only channel that exists today, and decision 5's feature-off exit 2 belongs to the CLI, not to the example. `TINIO_SANDBOX_CAPABILITIES` in Task 11 is provisional scaffolding for that deferral, not a new contract. Decision 25's OTLP conflict is unchecked here for the same reason P1 left it: `serve` never passes an endpoint. macOS is P3 and the fallback path is P4; Task 11 only makes sure neither silently serves unconfined. The e2e harness's own readiness scrape — `crates/tinio-e2e/tests/steps/clients.rs`'s `READY` constant and `wait_for_ready` — is **not** P2's to change: the design's Bookkeeping assigns it to P1, which emits the first events, and it must move with the cucumber features that assert readiness rather than as a side effect of a sandbox task. P2's consumer-side decoding lives in `crates/tinio-server/tests/sandbox_e2e_windows.rs`. Read-only mode itself (FR-023) has **landed** and is not P2's to build: `serve` resolves it from `[server] read_only`, `TINIO_READ_ONLY` and `--read-only`, and relocates state to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What P2 owes it is the confinement — the root's `AccessMode` comes from `probe_read_only`, and the state directory must be exposed writable where it lands outside the root (Task 11). `Sandbox::device_files()` is a Linux concept and a no-op on Windows: the exposures this crate computes are the whole whitelist. Two things the relay makes *possible* but does not itself deliver, both stated in the code comments rather than implied: the child's stop hook starts the shutdown the runtime already knows, while the bounded drain (≤10 s, state file removed) is the CLI contract's and lands with T066/T067; and `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (restricting the confined child's own child creation) stays untaken, because it would raise the OS floor to Windows 10 without a design decision behind it.
+**Out of P2's scope, deliberately.** `[server] sandbox` and `TINIO_SANDBOX` land with the CLI, exactly as P1 deferred them (decision 1); `--sandbox` is the only channel that exists today, and decision 5's feature-off exit 2 belongs to the CLI, not to the example. `TINIO_SANDBOX_CAPABILITIES` in Task 11 is provisional scaffolding for that deferral, not a new contract. Decision 25's OTLP conflict is unchecked here for the same reason P1 left it: `serve` never passes an endpoint. macOS is P3 and the fallback path is P4; Task 11 only makes sure neither silently serves unconfined. The e2e harness's own readiness scrape was **P1's to change and P1 has changed it**: `crates/tinio-e2e/tests/steps/clients.rs`'s `READY` constant is gone — a constant that exists to be searched for has no role once the line is structured — and `wait_for_ready` returns `Option<Event>`, decoding the framed stream rather than matching a substring of a log line. P2's consumer-side decoding is the same rule applied a second time in `crates/tinio-server/tests/sandbox_e2e_windows.rs`. Read-only mode itself (FR-023) has **landed** and is not P2's to build: `serve` resolves it from `[server] read_only`, `TINIO_READ_ONLY` and `--read-only`, and relocates state to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What P2 owes it is the confinement — the root's `AccessMode` comes from `probe_read_only`, and the state directory must be exposed writable where it lands outside the root (Task 11). `Sandbox::device_files()` is a Linux concept and a no-op on Windows: the exposures this crate computes are the whole whitelist. Two things the relay makes *possible* but does not itself deliver, both stated in the code comments rather than implied: the child's stop hook starts the shutdown the runtime already knows, while the bounded drain (≤10 s, state file removed) is the CLI contract's and lands with T066/T067; and `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (restricting the confined child's own child creation) stays untaken, because it would raise the OS floor to Windows 10 without a design decision behind it.
 
-**Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". **Three rows that used to be open questions are settled and are now regression tests or measurements this plan is written against.** The third joined them on 2026-09-19: **a merely derived package SID cannot launch** — `CreateProcessW` fails `err=2` for this binary and for `cmd.exe` alike — so Task 2 creates the profile and Task 8's launch test is where the launch-succeeds assertion lives. The first two, each pointing at the design's evidence table rather than re-deriving the answer here: Task 4's inheritance question was measured on 2026-09-19 (one ACE per directory, no `/t` walk), and Task 10's stop semantics were measured the same day on this machine's host console (a console-wide Ctrl+C does not reach a `CREATE_NEW_PROCESS_GROUP` child; a targeted `CTRL_BREAK_EVENT` does; the relay's forward arrives). The container half of the stop claim stays **unverified in this environment** and is no longer load-bearing. What remains genuinely open is Task 12's outbound test — written to fail rather than pass when the design is wrong — Task 1's `unsafe extern` lint check, which only decides whether `ffi.rs` appears in decision 14's list, and **the ACL pass's cost per object under the served tree**, which no document has ever numbered: Task 13 Step 3 measures it on a synthetic corpus and puts the pair of seconds where §6 and the design's Risks row already promise a number, because "the filesystem walks, not the tool" is a cost as well as a fact.
+**Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". **Three rows that used to be open questions are settled and are now regression tests or measurements this plan is written against.** The third joined them on 2026-09-19: **a merely derived package SID cannot launch** — `CreateProcessW` fails `err=2` for this binary and for `cmd.exe` alike — so Task 2 creates the profile and Task 8's launch test is where the launch-succeeds assertion lives. The first two, each pointing at the design's evidence table rather than re-deriving the answer here: Task 4's inheritance question was measured on 2026-09-19 (one ACE per directory, no `/t` walk), and Task 10's stop semantics were measured the same day on this machine's host console (a console-wide Ctrl+C does not reach a `CREATE_NEW_PROCESS_GROUP` child; a targeted `CTRL_BREAK_EVENT` does; the relay's forward arrives). The container half of the stop claim stays **unverified in this environment** and is no longer load-bearing. **Task 12's outbound test closed on 2026-09-22 rather than staying open, and closing it found a defect in this phase's own code**: the capability SIDs the launch handed `CreateProcessW` carried `Attributes: 0`, so every capability the operator granted was inert — the container was refused the network exactly as if it had been granted nothing, which is why the original probe could not separate container isolation from host policy. `SE_GROUP_ENABLED` is the fix, §7's Windows row is verified on a host whose baseline is known, and the design's evidence table carries both halves. **The ACL pass's cost per object under the served tree was the plan's one genuinely open row, and Task 13 closed it** on 2026-09-22: a synthetic corpus of 200,200 objects, both passes timed on both filesystems, with the grant alone past the 30 s readiness budget on NTFS and well under a third of it on ReFS. The design's §6 and its Risks row are the definer; `docs/tests.md` records the method and `README.md` the operator's half, because "the filesystem walks, not the tool" is a cost as well as a fact. **What is left open on this platform is named where it is, not here**: §7's LAN half and the container half of §3 step 9's stop claim, neither of which this workspace can reach.
 
-**Type consistency.** The core's surface is P0 Task 2's, in the spellings that plan fixes, and `2026-09-18-sandbox-shared.md` §3 states the ownership of it; this plan consumes it in full, adds nothing to it, and does not repeat the list here. `PackageSid`, `CapabilitySids` (Task 2) are used by Tasks 4, 8, 9 — and the first of them is also what deletes the profile, so its `Drop` is a rollback path rather than a resource release. `handles::{Handle, system_directory, last_error, step, mark_inheritable, inherited_stderr, Pipe, pipe, parent_end, close, write_payload}` (Tasks 1, 7) are used by Tasks 6, 8, 9, and `system_directory` by `acl` (Task 4) alone — it is there so that module carries no `unsafe` of its own while still taking `icacls.exe`'s directory from the kernel rather than the environment; `Handle` is a **re-export of `ffi::Handle`** rather than a private import, because `job::Job::assign`, `process::LaunchSpec` and `socket::handle` are public and their signatures name it. `socket::{value, handle, mark_inheritable, from_value}` (Task 6) by Tasks 7, 8, 9, 11. `launch::{adopt, listener, command_args, on_stop, disarm}` (Tasks 7, 10) by Tasks 8, 9, 10, 11, of which the facade carries exactly two — `adopted_listener` (its name for `listener`) and `on_stop` (Task 9) — and no other name from that module; **`command_args` takes the arguments after `argv[0]` and puts the listener element first**, which is the one rule both launcher plans and the child's `own_args` have to agree on. `process::{command_line, Container, LaunchSpec, launch, LaunchedProcess}` (Task 8) by Tasks 9, 10, and `LaunchedProcess::terminate` by Task 9 alone (the two job failures). `acl::{ace_spec, grant_spec, icacls_binary, grant, revoke, has_ace, Grants}` (Task 4) by Tasks 8, 9, 11. `control::{arm, send_stop, on_stop, disarm}` (Task 10) by Tasks 9, 10, 11. `backend::{Backend, Options, Capability, exposures, canonical_exposures, merge, describe, served_root}` (Tasks 3, 9) by Tasks 9, 11, 12. `tests/common/mod.rs`'s `Tree::{at, probe}` and `{launch_confined, launch_confined_at, run_confined}` (Task 9) are the harness's own surface: the two launcher entries share one body, and only the path-taking one can be called from a process that never held a `Tree`. No name is introduced twice with different meanings, and the one argv element both launcher plans pass — `tinio-sandbox-fd=<n>` — is spelled once, in the core both plans consume.
+**Type consistency.** The core's surface is P0 Task 2's, in the spellings that plan fixes, and `2026-09-18-sandbox-shared.md` §3 states the ownership of it; this plan consumes it in full, adds nothing to it, and does not repeat the list here. `PackageSid`, `CapabilitySids` (Task 2) are used by Tasks 4, 8, 9 — and the first of them is also what deletes the profile, so its `Drop` is a rollback path rather than a resource release. `handles::{system_directory, last_error, mark_inheritable, inherited_stderr, Pipe, pipe, parent_end, close, write_payload}` (Tasks 1, 7) are used by Tasks 6, 8, 9, and `system_directory` by `acl` (Task 4) alone — it is there so that module carries no `unsafe` of its own while still taking `icacls.exe`'s directory from the kernel rather than the environment. The type the signatures naming a handle spell is **`windows_sys::Win32::Foundation::HANDLE`**, imported in each module that writes it — `job::Job::assign`, `process::LaunchSpec` and `socket::handle` are public and name it, and the crate declares no handle type of its own now that the ABI is a dependency's (design Bookkeeping). **`handles` carries no failure builder after the phase-basis correction**: the core's `launch` is what every task in this plan reports a launcher failure through, imported from `tinio-sandbox-core` — as `launch_error` in `process`, where the module's own `pub fn launch` owns that name. `socket::{value, handle, mark_inheritable, from_value}` (Task 6) by Tasks 7, 8, 9, 11. `launch::{adopt, listener, command_args, on_stop, disarm}` (Tasks 7, 10) by Tasks 8, 9, 10, 11, of which the facade carries exactly two — `adopted_listener` (its name for `listener`, landed by Task 9) and `on_stop` (landed by Task 10, with the `control` module that defines it) — and no other name from that module; **`command_args` takes the arguments after `argv[0]` and puts the listener element first**, which is the one rule both launcher plans and the child's `own_args` have to agree on. `process::{command_line, Container, LaunchSpec, launch, LaunchedProcess}` (Task 8) by Tasks 9, 10, and `LaunchedProcess::terminate` by Task 9 alone (the two job failures). `acl::{ace_spec, grant_spec, icacls_binary, grant, revoke, has_ace, Grants}` (Task 4) by Tasks 8, 9, 11, **plus the Ruling 78 surface — `acl::Target`, `acl::{SiblingScan, sibling_dlls}` and `Grants::apply_siblings`, whose shapes are stated above and whose rule lives in the design** (the free `grant_siblings`/`revoke_siblings` and the `sibling_pattern(dir)` spelling were removed on 2026-09-23; see the Produces line of that task). `control::{arm, send_stop, on_stop, disarm}` (Task 10) by Tasks 9, 10, 11. `backend::{Backend, Options, Capability, exposures, canonical_exposures, merge, describe, served_root}` (Tasks 3, 9) by Tasks 9, 11, 12. `tests/common/mod.rs`'s `Tree::{at, probe}` and `{launch_confined, launch_confined_at, run_confined}` (Task 9) are the harness's own surface: the two launcher entries share one body, and only the path-taking one can be called from a process that never held a `Tree`. No name is introduced twice with different meanings, and the one argv element both launcher plans pass — `tinio-sandbox-fd=<n>` — is spelled once, in the core both plans consume.
 
 **Where this plan meets its siblings.** The core is P0's in full and this plan consumes it — the payload frame, the event type, the relay's decode-and-re-emit (`Observer`), the adoption rule, the argv element helpers and the supervision loop all come from there, and P2 adds nothing to it. What is left in this crate is what only a Windows launcher can have: the program and argv, the two std-handle pipes, the listener rebuild, the thread that drives the relay, the AppContainer launch and the console-control relay. P2 agrees with P3 on the two shapes that were in question — `LaunchPlan::for_launch(config)` with the listener attached by `with_listener`, and a plan that carries no program and no argv — so the only per-platform difference left in the call site is the platform crate's own `Options`/`Capability`. **A third requirement is shared and is met differently on purpose**: an exposed path is granted in the form the kernel resolves, never in the form it happened to be written in. P3's `with_canonical_paths` *adds* the canonical spelling beside the original, because a profile naming an unresolved spelling matches nothing; Task 3's `canonical_exposures` *requires* the canonical spelling and refuses the reparse point that produced another one, because there the grant would land on the link's target. That is a rule the two plans agree on and not a function they share — neither crate imports the other's, and neither can. If P3 lands a helper this plan also names (`adopt`, `listener`, the element helpers), the mapping is mechanical and touches only the `use` lines of `backend.rs`, `launch.rs` and `examples/serve.rs`.

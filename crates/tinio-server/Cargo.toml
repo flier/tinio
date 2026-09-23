@@ -92,6 +92,10 @@ tinio-util = { workspace = true, features = ["testing"] }
 name = "sandbox_e2e"
 required-features = ["sandbox"]
 
+[[test]]
+name = "sandbox_e2e_windows"
+required-features = ["sandbox"]
+
 [[bench]]
 name = "multipart_assembly"
 harness = false

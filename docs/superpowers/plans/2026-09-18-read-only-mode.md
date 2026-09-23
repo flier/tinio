@@ -1557,15 +1557,19 @@ Then add the containment half (decision 17a) **after** `canonicalize`, in the sa
                 // exist yet, so it cannot be canonicalized here.
                 let absolute = absolute(dir)
                     .map_err(|_| invalid_value("state_dir: could not be resolved in read-only mode"))?;
-                // As shipped this comparison is `FsStorage::contained_in_root`:
-                // on unix a single case-sensitive `starts_with`, on Windows a
-                // case-insensitive component comparison over **both** path
-                // shapes — `canonicalize` answers `\\?\C:\…` while `absolute`
-                // answers `C:\…`, so comparing only the verbatim shape is a
+                // As shipped this comparison is `tinio_util::path::path_contains`
+                // — `FsStorage::contained_in_root` when this plan was written, and
+                // the rule moved to `tinio-util` on 2026-09-23 so that this guard
+                // and `serve`'s exposure set could not disagree about it (it was
+                // the launcher's copy that had no case fold). Either way the rule
+                // is the same: on unix a single case-sensitive `starts_with`, on
+                // Windows a case-insensitive component comparison over **every**
+                // spelling of the pair — `canonicalize` answers `\\?\C:\…` while
+                // `absolute` answers `C:\…`, so comparing only one shape is a
                 // silent no-op on Windows (measured), and NTFS is
                 // case-insensitive, so an in-root dir spelled in another case
                 // would otherwise evade the guard (also measured).
-                if Self::contained_in_root(&absolute, &canonical) {
+                if path_contains(&absolute, &canonical) {
                     return Err(invalid_value(
                         "state_dir: must be outside the storage root in read-only mode",
                     ));

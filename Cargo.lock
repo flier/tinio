@@ -3447,8 +3447,6 @@ dependencies = [
 [[package]]
 name = "soft-canonicalize"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80111c43bbe801bcec3679d2ccba588a4618c11de4024abbd028ff50e33436dd"
 dependencies = [
  "proc-canonicalize",
 ]
@@ -3958,6 +3956,7 @@ dependencies = [
  "redb",
  "rustix",
  "smart-default",
+ "soft-canonicalize",
  "strict-path",
  "tempfile",
  "thiserror 2.0.20",
@@ -4007,6 +4006,7 @@ dependencies = [
  "sse-core",
  "thiserror 2.0.20",
  "tinio-core",
+ "tinio-util",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4039,7 +4039,16 @@ dependencies = [
 name = "tinio-sandbox-windows"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
  "tinio-sandbox-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]

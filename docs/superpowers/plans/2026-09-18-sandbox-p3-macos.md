@@ -1015,7 +1015,7 @@ Expected: the rule bullet names the platform backends, says each becomes `deny` 
 
 **Interfaces:**
 - Consumes: `profile::{Profile, profile, with_canonical_paths}`; and from the core `Backend`, `Child`, `Confinement`, `Error`, `LaunchPayload`, `LaunchPlan`, `Result`, `Sandbox`. The signal relay is **not** consumed here: `crate::relay::on_stop` is armed in Task 3, which is the task that creates the module (Step 4 below says where the call goes).
-- Produces the crate's public surface: `tinio_sandbox_macos::{Backend, backend, command_args, confine, SANDBOX_EXEC}` from the root — `confine` is this module's function and `impl Backend`'s body is the one-line delegation to it — plus `tinio_sandbox_macos::launch::{listener, PREFLIGHT_MARKER}`. **`hand_over`, `make_inheritable`, `preflight`, `spawn_error` and `step` are private**: they are `fn`, not `pub fn`, because nothing outside the crate calls them, and the Self-Review lists them as internals rather than as surface. `with_canonical_paths` is **not** re-exported here — it stays in `profile`, where Task 1 defines it, and the crate root deliberately does not gain a second path to it. `confine(&Sandbox, &LaunchPlan) -> Result<Confinement>` is the trait-shaped entry — it is the body of `impl Backend` and the facade selects it through `platform()`; `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` is the pure argv builder, and it emits one `-D NAME=VALUE` pair per `Profile::params` entry, in order and as separate argv elements, plus the one pair the `process-exec` literal resolves to — `P`, its value being that same `program` argument — all between the profile flag and the program path; `listener(&Adopted)` rebuilds the child's socket from the descriptor `adopt` handed back, because `Adopted` is the core's type and the rebuild is platform-specific — and it is also this crate's single `#[allow(unsafe_code)]` site, since the descriptor arrives as an integer in argv and every `std` route from an integer (`BorrowedFd::borrow_raw`, `OwnedFd::from_raw_fd`) is an `unsafe fn` (decision 14). `adopt`, the descriptor predicates and the event relay are the core's, not this crate's.
+- Produces the crate's public surface: `tinio_sandbox_macos::{Backend, backend, command_args, confine, SANDBOX_EXEC}` from the root — `confine` is this module's function and `impl Backend`'s body is the one-line delegation to it — plus `tinio_sandbox_macos::launch::{listener, PREFLIGHT_MARKER}`. **`hand_over`, `make_inheritable`, `preflight` and `spawn_error` are private**, and the `step` this file used to define was not the crate's after the phase-basis correction — it is the core's, imported: they are `fn`, not `pub fn`, because nothing outside the crate calls them, and the Self-Review lists them as internals rather than as surface. `with_canonical_paths` is **not** re-exported here — it stays in `profile`, where Task 1 defines it, and the crate root deliberately does not gain a second path to it. `confine(&Sandbox, &LaunchPlan) -> Result<Confinement>` is the trait-shaped entry — it is the body of `impl Backend` and the facade selects it through `platform()`; `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` is the pure argv builder, and it emits one `-D NAME=VALUE` pair per `Profile::params` entry, in order and as separate argv elements, plus the one pair the `process-exec` literal resolves to — `P`, its value being that same `program` argument — all between the profile flag and the program path; `listener(&Adopted)` rebuilds the child's socket from the descriptor `adopt` handed back, because `Adopted` is the core's type and the rebuild is platform-specific — and it is also this crate's single `#[allow(unsafe_code)]` site, since the descriptor arrives as an integer in argv and every `std` route from an integer (`BorrowedFd::borrow_raw`, `OwnedFd::from_raw_fd`) is an `unsafe fn` (decision 14). `adopt`, the descriptor predicates and the event relay are the core's, not this crate's.
 
 Steps 1–4 are pure and run anywhere; steps 6–7 need a Mac.
 
@@ -1198,6 +1198,13 @@ mod tests {
         let sink = Sink::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(sink.clone())
+            // **Load-bearing for a field assertion, and measured rather than
+            // assumed**: the default subscriber wraps each field *name* and the
+            // equals sign after it in ANSI escapes, so a captured line carries
+            // the field only as coloured spans and never as `step=<value>`. The Linux
+            // plan's own `traced` helper carries this same line for the same
+            // reason, and so does the core's recorder test.
+            .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
             .without_time()
             .finish();
@@ -1211,7 +1218,11 @@ mod tests {
     /// property this crate can lose: the closure runs real code and the test
     /// requires the event's `step` field and the `Error::Step`'s `step` to be the
     /// same string, so a step name changed in one place and not the other fails
-    /// here rather than in a log nobody reads.
+    /// here rather than in a log nobody reads. **The builder it calls is the
+    /// core's now** (the phase-basis correction), so what this test pins for this
+    /// crate is the call this file actually makes — the curried `step` that the
+    /// pre-flight and `make_inheritable` both reach for; the core's own
+    /// recorder test covers `launch` and the property in general.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_failure_logs_the_step_it_returns() {
@@ -1271,9 +1282,21 @@ use tinio_sandbox_core::{Confinement, Error, LaunchPlan, Result, Sandbox, listen
 // The core types only the macOS arm names. Ungated, they would be `use`d names
 // the crate never resolves on a Linux or Windows build — an unused-import
 // warning at best, and an `E0432` the moment one of them came from a
-// macOS-only dependency.
+// macOS-only dependency. **`refused`, `step` and `launch` are the core's failure
+// builders and the phase-basis correction is where they arrived**: this file
+// defined its own `step` until then, and `spawn_error` is the call site that
+// shows why the core publishes both shapes — a `NotFound` from this platform's
+// spawn is a refusal the core cannot name (`refused`, with `Error::Unsupported`),
+// while everything else is a failure about a path (`launch`).
 #[cfg(target_os = "macos")]
 use tinio_sandbox_core::{Adopted, Child, LaunchPayload, Observer, is_listener_fd_arg};
+// **In the alias form, which is how every sandbox crate names the core**
+// (`crate::_core`, `docs/style.md` §Imports; this phase's ledger states the
+// alias wins over these blocks' spelling) — the `tinio_sandbox_core::` lines
+// above are corrected to it in place, while these three arrive already
+// corrected.
+#[cfg(target_os = "macos")]
+use crate::_core::{launch, refused, step};
 
 use tracing::error;
 // The other two levels are only ever emitted from macOS-gated code, so they are
@@ -1915,10 +1938,12 @@ fn make_inheritable(listener: Option<&std::net::TcpListener>) -> Result<()> {
     // `None` is legal: a caller that bound nothing is a caller whose child will
     // bind its own socket, and Linux has no listener to hand over at all.
     if let Some(socket) = listener {
-        // `rustix` reports an `Errno` and `step` maps a `std::io::Error`, which
-        // is the whole of what `into()` does here: without it the closure does
-        // not type-check, and with it the step name — and the log line `step`
-        // emits — are the ones the error carries.
+        // `rustix` reports an `Errno` and the core's `step` takes what
+        // converts into a `std::io::Error`, which is the whole of what
+        // `into()` does here: handing the `Errno` straight to `step` does not
+        // type-check without it — the bound is what lets one helper serve both
+        // error types — and with it the step name, and the log line `step`
+        // emits, are the ones the error carries.
         fcntl_setfd(socket, FdFlags::empty())
             .map_err(|err| step("fcntl(F_SETFD)")(err.into()))?;
         debug!(
@@ -1932,37 +1957,27 @@ fn make_inheritable(listener: Option<&std::net::TcpListener>) -> Result<()> {
 
 /// Map a failed spawn: a missing `sandbox-exec` is the design's accepted
 /// degradation, not a generic I/O error.
+///
+/// **The two halves are the two shapes the core publishes, and this plan
+/// defines neither of them.** A `NotFound` is a *refusal* this platform can
+/// name but the core cannot — `Error::Unsupported` with operator-facing words —
+/// so it goes through [`refused`], which logs it where the `Error` is built;
+/// everything else is something done *to a path*
+/// (`spawn /usr/bin/sandbox-exec`), which is exactly what [`launch`] builds and
+/// logs, with design §11's path and underlying failure named together. Both
+/// come from `tinio-sandbox-core` (the phase-basis correction removed the
+/// `step` this file used to define for itself).
 #[cfg(target_os = "macos")]
 fn spawn_error(source: std::io::Error) -> Error {
     if source.kind() == std::io::ErrorKind::NotFound {
-        error!(step = "spawn", path = SANDBOX_EXEC, "sandbox-exec is missing");
-        return Error::Unsupported {
-            detail: "sandbox-exec is missing; the macOS sandbox cannot be applied",
-        };
+        return refused(
+            "spawn",
+            Error::Unsupported {
+                detail: "sandbox-exec is missing; the macOS sandbox cannot be applied",
+            },
+        );
     }
-    // `Launch` rather than `Step`: the failure is something done *to a path*
-    // (`spawn /usr/bin/sandbox-exec`), and design §11 wants the path and the
-    // underlying failure named together.
-    error!(step = "spawn", path = SANDBOX_EXEC, kind = ?source.kind(), "the spawn failed");
-    Error::Launch {
-        operation: "spawn",
-        path: Path::new(SANDBOX_EXEC).to_path_buf(),
-        source,
-    }
-}
-
-/// A step-named error from an I/O error, **logged where the `Error` is built**.
-///
-/// Shared §7's rule for failures, and the reason it lives in this one helper:
-/// the caller passes the step name once, and the `error!` event and the returned
-/// `Error::Step` carry the same string, so a log line and the failure an
-/// operator sees cannot disagree about which operation failed.
-#[cfg(target_os = "macos")]
-fn step(name: &'static str) -> impl Fn(std::io::Error) -> Error {
-    move |source| {
-        error!(step = name, kind = ?source.kind(), "a launch step failed");
-        Error::Step { step: name, source }
-    }
+    launch("spawn", SANDBOX_EXEC, source)
 }
 
 #[cfg(test)]
@@ -1976,7 +1991,7 @@ Two details worth checking against the real API before you run anything: `std::n
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-macos && cargo clippy -p tinio-sandbox-macos --all-targets -- -D warnings`
-Expected: PASS everywhere, including on the authoring host (every argv test here is pure — each one exercises the `command_args` builder; `confine` itself is called only by the stub-arm test on non-macOS targets). The tracing test runs on both: on macOS through `step`, elsewhere through the stub arm's own refusal, and both require the event's `step` field to equal the error's. Confirm the lint stayed scoped to the one site the design enumerates: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-macos/src` prints exactly one line, the attribute on `listener`, and `rg -c 'unsafe \{' crates/tinio-sandbox-macos/src/launch.rs` reports exactly one, in that same function; `rg -n 'unsafe' crates/tinio-sandbox-macos/src/relay.rs crates/tinio-sandbox-macos/src/profile.rs` prints nothing. A **second** attribute or block is what this check is for — not a missing one — and `cargo clippy` is green either way, because `deny` is what makes the single allowance expressible at all.
+Expected: PASS everywhere, including on the authoring host (every argv test here is pure — each one exercises the `command_args` builder; `confine` itself is called only by the stub-arm test on non-macOS targets). The tracing test runs on both: on macOS through the core's `step`, which this file calls rather than defines, and elsewhere through the stub arm's own refusal, and both require the event's `step` field to equal the error's. Confirm the lint stayed scoped to the one site the design enumerates: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-macos/src` prints exactly one line, the attribute on `listener`, and `rg -c 'unsafe \{' crates/tinio-sandbox-macos/src/launch.rs` reports exactly one, in that same function; `rg -n 'unsafe' crates/tinio-sandbox-macos/src/relay.rs crates/tinio-sandbox-macos/src/profile.rs` prints nothing. A **second** attribute or block is what this check is for — not a missing one — and `cargo clippy` is green either way, because `deny` is what makes the single allowance expressible at all.
 
 - [ ] **Step 6: Verify against a real `sandbox-exec` on a Mac**
 
@@ -3730,6 +3745,16 @@ fn confine_or_launch(
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_writer(std::io::stderr)
+            // **Load-bearing for the one test that reads this stream back, and
+            // measured rather than assumed**: the default subscriber wraps each
+            // field *name* and the equals sign after it in ANSI escapes, so a
+            // drained line carries `step` as coloured spans and never as the
+            // `step="spawn"` the launch e2e asserts on. ANSI is on whenever the
+            // `ansi` feature is enabled and `NO_COLOR` is unset, which makes that
+            // assertion turn on the operator's environment rather than on the
+            // event. The Linux plan's `traced` helper and this plan's recorder
+            // test carry the same line for the same reason.
+            .with_ansi(false)
             .try_init();
 
         // The parent owns the port (decision 16): it binds here and the
@@ -4066,12 +4091,14 @@ Two signature changes make the above work, and **which plan holds the pen is dec
 
 ```rust
     // ... `storage.set_max_concurrent_uploads(…)` onward, unchanged ...
-    let listener = match inherited {
-        // The launcher platforms hand the bound socket over (decision 16); the
-        // child does not bind and does not need to know how it got here.
-        Some(std_listener) => TcpListener::from_std(std_listener)?,
-        None => TcpListener::bind(args.address).await?,
-    };
+    // The listener is not this plan's line either: `inherited` is
+    // `Option<std::net::TcpListener>` and the landed body converts it
+    // (`Some(inherited) => TcpListener::from_std(inherited)?`, beside an
+    // untouched `None` arm) — `2026-09-18-sandbox-shared.md` §4 owns that, and
+    // the conversion cannot happen where this plan's child rebuilds its socket,
+    // which is before any runtime exists. The launcher platforms hand the bound
+    // socket over (decision 16); the child does not bind and does not need to
+    // know how it got here.
     // The address is the one actually bound, not the one requested — with
     // `--port 0` they differ, and this event is how a consumer learns the port.
     // Emitted by the child whether or not it bound the socket itself: the event
@@ -4129,7 +4156,7 @@ Expected: the child runs under `sandbox-exec`, and the state directory contains 
 - Modify: `.github/workflows/ci.yml` (a clippy step on the `macos-latest` leg of `test-port`, and the `lint` job's false comment)
 
 **Interfaces:**
-- Consumes: the built `serve` example, located by the same `<profile>/examples/serve` rule `crates/tinio-e2e/tests/steps/clients.rs` uses (`assert_cmd::cargo::cargo_bin` cannot find it — Cargo sets `CARGO_BIN_EXE_*` for bin targets only).
+- Consumes: the built `serve` example, located by `crates/tinio-server/tests/common/mod.rs`'s `serve_bin`, which this tree's spawning targets share (this file among them, since the spawn/readiness hoist); `crates/tinio-e2e`'s harness keeps its own copy of that rule because a different crate's test tree cannot import it, and `assert_cmd::cargo::cargo_bin` finds no example in either place (Cargo sets `CARGO_BIN_EXE_*` for bin targets only).
 - Produces: the macOS leg's acceptance — "a confined server serves a request" (design §12), and the exit-status forwarding of design §3 step 8.
 
 - [ ] **Step 1: Write the failing test**
@@ -4147,40 +4174,21 @@ Expected: the child runs under `sandbox-exec`, and the state directory contains 
 #![cfg(target_os = "macos")]
 #![cfg(feature = "sandbox")]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The `serve` **example** binary.
-///
-/// The rule is `crates/tinio-e2e/tests/steps/clients.rs`'s `serve_bin` — and
-/// `2026-09-18-sandbox-linux.md` Task 8 owns its statement, including why
-/// `assert_cmd::cargo::cargo_bin` and `env!("CARGO_BIN_EXE_serve")` cannot find an
-/// example; what is here is the code, copied because a test crate cannot import
-/// another crate's test support (`2026-09-18-sandbox-p2-windows.md` Task 11
-/// carries the third copy, for its own e2e). An example is resolved relative to
-/// this test binary's own location: `<target>/<profile>/deps/<test>` means the
-/// example sits in the sibling `examples/` directory of the same profile — and
-/// the profile has to match the one the tests were built with, or this looks in
-/// the wrong directory, or worse, finds a stale binary.
-fn serve_bin() -> PathBuf {
-    let name = format!("serve{}", if cfg!(windows) { ".exe" } else { "" });
-    let exe = std::env::current_exe().expect("current exe path");
-    let profile_dir = exe
-        .parent() // .../deps
-        .and_then(Path::parent) // .../<profile>
-        .expect("the test binary lives in <target>/<profile>/deps");
-    let path = profile_dir.join("examples").join(name);
-    assert!(
-        path.exists(),
-        "the serve example is not built at {} — build it with the same profile as the tests \
-         (`cargo build -p tinio-server --example serve`)",
-        path.display()
-    );
-    path
-}
+// The example's location rule is `common::serve_bin`'s: this test tree shares it
+// — this file, the read-only suite and the two e2e suites beside it all take it
+// from `tests/common/mod.rs`, next to their HTTP helpers. `crates/tinio-e2e`'s
+// harness keeps its own copy, because a test crate cannot import another test
+// crate's support; and neither form can be `assert_cmd::cargo::cargo_bin` or
+// `env!("CARGO_BIN_EXE_serve")`, which resolve binary targets only, so neither
+// finds an example.
+use common::serve_bin;
 
 #[test]
 fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
@@ -4696,7 +4704,7 @@ EOF
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". Two places carry an explicit *procedure* instead of a value, because the value cannot be known before a Mac runs it — and both say so in the step: the baseline allowance set (Tasks 4 and 5, which measure and then require the pruning run) and the `accept` rule (Task 7, whose outcome is already measured and whose step says what to do if the machine disagrees). Task 11 forbids writing an evidence row without a pasted measurement rather than templating one.
 
-**Type consistency.** Every core item is called exactly as P0 Task 2 fixes it — that surface, and the ownership of it, is `2026-09-18-sandbox-shared.md` §3's and is not repeated here. There is no `nonce()`, no `MAGIC` and no `with_nonce` on it: the payload is one JSON object. **The crate's public surface, and nothing else**: `Backend` and `backend()` at the root (the type the facade's `platform()` selects — Task 1), `confine`, `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` and `SANDBOX_EXEC` (Task 2), `launch::listener` and `launch::PREFLIGHT_MARKER`, `profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)> }, with_canonical_paths, Allowance, RUNTIME_BASELINE, DEVICE_RULES}` (Task 1), and `relay::{on_stop, on_forwarded_stop, disarm, relay_decision, RELAYED_SIGNALS}` (Task 3) — the launcher's half and the child's half of the relay, in that order, with the facade presenting the child's as `on_stop` (Task 3 Step 4) so both launcher platforms call one name. **Everything else in those modules is private and stays private** — `validate_path`, `refuse` and `push` in `profile.rs`; `hand_over`, `make_inheritable`, `preflight`, `spawn_error`, `PREFLIGHT_TIMEOUT` and `step` in `launch.rs` — and the Self-Review says so rather than listing them as surface, because none of them is called from outside the crate. **`serve`'s signature is P1's, `2026-09-18-sandbox-shared.md` §4 owns it, and P3 changes none of it**: `confined` passes the storage it built, its listener and its stop receiver; the plain serving path passes its own storage and no platform values at all; and the launcher passes none of them because it never reaches `serve` — the placement of the two storage constructions (Step 2(e)) is what keeps the launcher from building one. `harness::{Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule, CHILD_ENV, PARAMS_ENV, LAUNCH_ENV}` is created in Task 4 and used by Tasks 5, 6 and 7. No name is introduced twice with different meanings; the test harness's `Child` is its own type and is always written `harness::Child`. The crate's lint is `unsafe_code = "deny"` with exactly one `#[allow(unsafe_code)]` site — `launch::listener`, whose `# Safety` section carries the invariant that the descriptor is the launcher's, held open for the child's whole lifetime and never closed, **and that `from_raw_fd` is called at most once per descriptor number** — and `make_inheritable` is deliberately written to need none: it clears `FD_CLOEXEC` through the socket's own `AsFd` rather than through a descriptor reconstructed from an integer, which is what keeps the crate's site count at one (decision 14, its Scope and the Bookkeeping bullet).
+**Type consistency.** Every core item is called exactly as P0 Task 2 fixes it — that surface, and the ownership of it, is `2026-09-18-sandbox-shared.md` §3's and is not repeated here. There is no `nonce()`, no `MAGIC` and no `with_nonce` on it: the payload is one JSON object. **The crate's public surface, and nothing else**: `Backend` and `backend()` at the root (the type the facade's `platform()` selects — Task 1), `confine`, `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` and `SANDBOX_EXEC` (Task 2), `launch::listener` and `launch::PREFLIGHT_MARKER`, `profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)> }, with_canonical_paths, Allowance, RUNTIME_BASELINE, DEVICE_RULES}` (Task 1), and `relay::{on_stop, on_forwarded_stop, disarm, relay_decision, RELAYED_SIGNALS}` (Task 3) — the launcher's half and the child's half of the relay, in that order, with the facade presenting the child's as `on_stop` (Task 3 Step 4) so both launcher platforms call one name. **Everything else in those modules is private and stays private** — `validate_path`, `refuse` and `push` in `profile.rs`; `hand_over`, `make_inheritable`, `preflight`, `spawn_error` and `PREFLIGHT_TIMEOUT` in `launch.rs` — and the Self-Review says so rather than listing them as surface, because none of them is called from outside the crate. **`serve`'s signature is P1's, `2026-09-18-sandbox-shared.md` §4 owns it, and P3 changes none of it**: `confined` passes the storage it built, its listener and its stop receiver; the plain serving path passes its own storage and no platform values at all; and the launcher passes none of them because it never reaches `serve` — the placement of the two storage constructions (Step 2(e)) is what keeps the launcher from building one. `harness::{Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule, CHILD_ENV, PARAMS_ENV, LAUNCH_ENV}` is created in Task 4 and used by Tasks 5, 6 and 7. No name is introduced twice with different meanings; the test harness's `Child` is its own type and is always written `harness::Child`. **The four failure builders are the core's and this crate defines none of them** — `refused`, `step` and `launch` are imported by `launch.rs` and `refused` is what `spawn_error`'s `NotFound` arm refuses with (P0 Task 1 landed them; the phase-basis correction is where this crate stopped defining its own `step`). The crate's lint is `unsafe_code = "deny"` with exactly one `#[allow(unsafe_code)]` site — `launch::listener`, whose `# Safety` section carries the invariant that the descriptor is the launcher's, held open for the child's whole lifetime and never closed, **and that `from_raw_fd` is called at most once per descriptor number** — and `make_inheritable` is deliberately written to need none: it clears `FD_CLOEXEC` through the socket's own `AsFd` rather than through a descriptor reconstructed from an integer, which is what keeps the crate's site count at one (decision 14, its Scope and the Bookkeeping bullet).
 
 **Deliberately out of P3's scope.**
 

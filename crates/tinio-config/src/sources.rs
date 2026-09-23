@@ -9,13 +9,13 @@
 //! - environment overlays are declared as clap `env` attributes on the CLI
 //!   argument definitions (after `dotenvy::dotenv()`), so
 //!   flags > env > `.env` falls out of clap's own precedence — apart from
-//!   the `TINIO_READ_ONLY` overlay below, there is no manual env overlay
-//!   here;
+//!   the `TINIO_READ_ONLY` and `TINIO_SANDBOX` overlays below, there is no
+//!   manual env overlay here;
 //! - the config file is the lowest-precedence source: parsed by
 //!   [`crate::schema::Config::parse`] as the base, overlaid by the CLI and,
 //!   in the interim ahead of the clap `env` attributes the CLI will bring
-//!   (T066/T067), by the `TINIO_READ_ONLY` overlay this module resolves
-//!   (FR-023).
+//!   (T066/T067), by the `TINIO_READ_ONLY` and `TINIO_SANDBOX` overlays this
+//!   module resolves (FR-023; design decision 5).
 //!
 //! The `MINIO_*` credential fallback (T084) and `TINIO_ANONYMOUS` (T087)
 //! extend this module in US3.
@@ -57,14 +57,7 @@ pub const READ_ONLY_VAR: &str = "TINIO_READ_ONLY";
 /// handler (`tinio-fs`'s `scanner_enabled`) ignores an unrecognised value
 /// and falls back to the `[scanner]` section gate.
 pub fn parse_read_only(raw: &str) -> Result<bool, Error> {
-    match raw.trim() {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(Error::invalid_value(
-            READ_ONLY_VAR,
-            format!("expected 0/1/true/false, got `{other}`"),
-        )),
-    }
+    parse_switch(READ_ONLY_VAR, raw)
 }
 
 /// The `TINIO_READ_ONLY` overlay (FR-023): `Some(_)` when the variable is
@@ -72,6 +65,52 @@ pub fn parse_read_only(raw: &str) -> Result<bool, Error> {
 /// and an error when it is set to something that does not parse.
 pub fn env_read_only() -> Result<Option<bool>, Error> {
     parse_var(READ_ONLY_VAR, parse_read_only)
+}
+
+/// The environment variable that selects sandbox mode — decision 1's third
+/// channel, beside the `--sandbox` flag and the `[server] sandbox` key.
+pub const SANDBOX_VAR: &str = "TINIO_SANDBOX";
+
+/// Parse a `TINIO_SANDBOX` value: `1`/`true` and `0`/`false` only. Anything
+/// else is a startup error — the same strictness as [`parse_read_only`] and
+/// for the same reason: the value decides whether the process confines
+/// itself, and a typo that fell back to the default would leave an operator
+/// who wrote `TINIO_SANDBOX=yes` serving unconfined with nothing logged
+/// (design decision 5, §11).
+pub fn parse_sandbox(raw: &str) -> Result<bool, Error> {
+    parse_switch(SANDBOX_VAR, raw)
+}
+
+/// The `TINIO_SANDBOX` overlay (design decision 1): `Some(_)` when the
+/// variable is set, `None` when it is not (the caller keeps the key's own
+/// value), and an error when it is set to something that does not parse.
+///
+/// **`Some(false)` is not the same answer as `None`**, and the caller is what
+/// makes the difference matter: no phase implements this channel, so a run
+/// that sets it to `true` must refuse to start, while one that sets it to
+/// `false` is asking for nothing and proceeds (design decision 5, §11).
+pub fn env_sandbox() -> Result<Option<bool>, Error> {
+    parse_var(SANDBOX_VAR, parse_sandbox)
+}
+
+/// The grammar [`parse_read_only`] and [`parse_sandbox`] share, with the refusal
+/// both owe: an unrecognised value is a startup error rather than a fallback,
+/// because a typo in either key decides whether the process protects its root or
+/// confines itself, and a silent default is the failure both designs exist to
+/// prevent.
+///
+/// One definer for the accepted spellings, because the next one added — or a
+/// change to the message — has to reach both keys at once; kept apart they are
+/// equal only while an author remembers they exist.
+fn parse_switch(var: &str, raw: &str) -> Result<bool, Error> {
+    match raw.trim() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => Err(Error::invalid_value(
+            var,
+            format!("expected 0/1/true/false, got `{other}`"),
+        )),
+    }
 }
 
 /// Look up `var` and parse it: `Ok(None)` when it is unset (the caller keeps
@@ -175,6 +214,26 @@ mod tests {
         for raw in ["", "yes"] {
             let err = parse_read_only(raw).unwrap_err();
             assert!(err.to_string().contains(READ_ONLY_VAR), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn sandbox_flag_parses_strictly() {
+        // The same grammar and the same strictness as `TINIO_READ_ONLY`, and
+        // for the stronger version of the same reason: this variable decides
+        // whether the run confines itself, so `TINIO_SANDBOX=yes` answering
+        // "off" would be an operator who believes they are confined and is
+        // not (design decision 5, §11).
+        for raw in ["1", "true", " 1 "] {
+            assert!(parse_sandbox(raw).unwrap(), "{raw}");
+        }
+        for raw in ["0", "false"] {
+            assert!(!parse_sandbox(raw).unwrap(), "{raw}");
+        }
+        // An empty value is an error, never "unset" or "false".
+        for raw in ["", "yes"] {
+            let err = parse_sandbox(raw).unwrap_err();
+            assert!(err.to_string().contains(SANDBOX_VAR), "{raw}: {err}");
         }
     }
 

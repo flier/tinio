@@ -2,6 +2,7 @@
 use std::os::unix::fs::symlink;
 use std::{
     fs::{read_dir, write},
+    io::ErrorKind,
     time::Duration,
 };
 
@@ -17,7 +18,7 @@ use crate::{
         object,
         storage::{BucketOps, Error as StorageError, ObjectOps},
     },
-    _util::testing::body,
+    _util::{path::path_contains, testing::body},
     bucket::name,
     database::{self, StateTable},
     testutil::fs_options,
@@ -190,70 +191,78 @@ fn read_only_refuses_an_in_root_state_dir() {
     .unwrap();
 }
 
-/// The verbatim-to-plain root mapping ([`FsStorage::plain`]): the
-/// containment rule compares the state dir against both shapes of the
-/// canonical root, so each arm is pinned — the UNC spelling, which no
-/// fixture can produce here (it needs a real UNC root), and the
-/// no-verbatim-prefix case, which must answer `None` instead of passing
-/// its input through as if it were already plain.
+/// The verbatim leg of the containment rule at the shapes the read-only
+/// guard meets: `std::fs::canonicalize` answers a verbatim root
+/// (`\\?\C:\data`, or `\\?\UNC\srv\share\data` for a UNC root, a spelling
+/// no fixture can produce here — it needs a real UNC root) while
+/// `std::path::absolute` answers the plain form (`C:\data`,
+/// `\\srv\share\data`), so a plain state dir has to match the verbatim root
+/// it is compared against. The sibling case runs against the same verbatim
+/// root, so the leg is a comparison and not a blanket `true`; an
+/// already-plain root keeps answering too, which is the shape the rule
+/// meets in the launcher, where neither path came from a canonicalizer.
+///
+/// [`path_contains`] is that rule — `tinio-util`'s one definer (FR-023,
+/// decision 17a) — so this test pins a behaviour of a dependency rather
+/// than of this crate: it is kept here because the read-only guard in
+/// [`FsStorage::resolve`] is what would lose the refusal.
 #[cfg(windows)]
 #[test]
-fn plain_strips_the_verbatim_prefix() {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
-
-    let plain = |path: &str| FsStorage::plain(Path::new(path));
-    assert_eq!(
-        plain(r"\\?\C:\data").as_deref(),
-        Some(Path::new(r"C:\data"))
-    );
-    assert_eq!(
-        plain(r"\\?\UNC\srv\share\data").as_deref(),
-        Some(Path::new(r"\\srv\share\data")),
-        "a verbatim UNC root becomes the plain UNC spelling"
-    );
-    assert_eq!(plain(r"C:\data"), None, "already plain — nothing to strip");
-    // A path `Path::to_str` cannot read (an unpaired surrogate here) has no
-    // plain form at all: `None` falls back on the verbatim comparison
-    // rather than handing the caller a path it made up.
-    let ill_formed = PathBuf::from(OsString::from_wide(&[0xD800]));
-    assert_eq!(FsStorage::plain(&ill_formed), None);
+fn a_verbatim_root_contains_the_plain_spelling_of_a_candidate() {
+    assert!(path_contains(
+        Path::new(r"C:\data\state"),
+        Path::new(r"\\?\C:\data")
+    ));
+    // A verbatim UNC root is compared in its plain UNC spelling.
+    assert!(path_contains(
+        Path::new(r"\\srv\share\data\state"),
+        Path::new(r"\\?\UNC\srv\share\data")
+    ));
+    assert!(path_contains(
+        Path::new(r"c:\DATA\state"),
+        Path::new(r"C:\data")
+    ));
+    assert!(!path_contains(
+        Path::new(r"C:\data2\state"),
+        Path::new(r"\\?\C:\data")
+    ));
+    assert!(!path_contains(
+        Path::new(r"C:\other"),
+        Path::new(r"\\?\C:\data")
+    ));
 }
 
 /// The Windows half of the containment rule: the comparison folds case,
 /// because NTFS resolves `…\DATA` and `…\data` to the same directory while
 /// [`Path::starts_with`] compares literally — and it stays component-wise,
-/// so `…\data2` is a sibling of `…\data`, not inside it.
+/// so `…\data2` is a sibling of `…\data`, not inside it. The fold is what
+/// keeps a differently-cased in-root state dir from reading as outside.
+///
+/// The rule is [`path_contains`], `tinio-util`'s one definer, and the
+/// case fold lives there: the crate compares nothing itself any more, so
+/// this test is the consumer-side net over the shared answer.
 #[cfg(windows)]
 #[test]
 fn containment_folds_case_and_stays_component_wise() {
     let root = Path::new(r"C:\data");
-    assert!(FsStorage::contained_in_root(
-        Path::new(r"c:\DATA\state"),
-        root
-    ));
+    assert!(path_contains(Path::new(r"c:\DATA\state"), root));
     assert!(
-        !FsStorage::contained_in_root(Path::new(r"C:\data2\state"), root),
+        !path_contains(Path::new(r"C:\data2\state"), root),
         "a name that merely starts with the root's is not inside it"
     );
-    assert!(!FsStorage::contained_in_root(Path::new(r"C:\other"), root));
+    assert!(!path_contains(Path::new(r"C:\other"), root));
 }
 
-/// The unix half of the same rule: `starts_with` compares
-/// case-sensitively, because unix filesystems distinguish `…/Data` from
-/// `…/data`, and still component-wise.
+/// The unix half of the same rule ([`path_contains`], the one definer):
+/// `starts_with` compares case-sensitively, because unix filesystems
+/// distinguish `…/Data` from `…/data`, and still component-wise.
 #[cfg(not(windows))]
 #[test]
 fn containment_is_case_sensitive_and_component_wise() {
     let root = Path::new("/data");
-    assert!(FsStorage::contained_in_root(Path::new("/data/state"), root));
-    assert!(!FsStorage::contained_in_root(
-        Path::new("/Data/state"),
-        root
-    ));
-    assert!(!FsStorage::contained_in_root(
-        Path::new("/data2/state"),
-        root
-    ));
+    assert!(path_contains(Path::new("/data/state"), root));
+    assert!(!path_contains(Path::new("/Data/state"), root));
+    assert!(!path_contains(Path::new("/data2/state"), root));
 }
 
 #[tokio::test]
@@ -298,6 +307,27 @@ fn new_refuses_a_file_root() {
     assert!(
         matches!(err, Error::RootNotDirectory(_)),
         "expected RootNotDirectory, got {err:?}"
+    );
+}
+
+#[test]
+fn a_root_failure_that_is_not_a_refusal_keeps_the_platform_canonicalizers_answer() {
+    // **The canonicalize fallback is for one refusal and nothing else.** It
+    // exists because a confined Windows process is refused
+    // `std::fs::canonicalize` for every path, and `soft-canonicalize` resolves
+    // the same path through calls that container grants; every other failure
+    // is the platform canonicalizer's to report. `soft_canonicalize` resolves
+    // lexically once the filesystem stops answering — a path that does not
+    // exist comes back `Ok` — so a fallback reached for a missing root would
+    // turn this constructor's `Error::Io(NotFound)` into a
+    // `RootNotDirectory` about a path that is not there at all. Windows is
+    // where the refusal is reachable; this half is every platform's.
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("no-such-root");
+    let err = FsStorage::new(&missing, fs_options()).unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == ErrorKind::NotFound),
+        "a missing root is the platform canonicalizer's own error, got {err:?}"
     );
 }
 

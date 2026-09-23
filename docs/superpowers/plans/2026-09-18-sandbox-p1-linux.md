@@ -915,46 +915,16 @@ use rustix::thread::{UnshareFlags, unshare_unsafe};
 use tinio_sandbox_core::{Error, Result};
 use tracing::{debug, error};
 
-/// Log a failure and hand it back, so every refusing `return` in this crate is
-/// one call and the log cannot drift from the error (shared §7).
-///
-/// **The crate's one failure event, and the reason it is `pub(crate)`.** §7
-/// asks for the event's `step` and the returned error's `step` to be the same
-/// string and to stay that way — and this crate grew three copies of the
-/// call: `enter.rs` said `sandbox step refused` where this one and
-/// `seccomp.rs` said `sandbox step failed`, so one failure had two events with
-/// two wordings from the moment the second copy landed. Every module now
-/// funnels through here, which is what makes the sentence one string rather
-/// than a rule to re-check.
-///
-/// The parameter is a built `Error` rather than an `io::Error` because not
-/// every refusal is a syscall's: `enter.rs`'s validation refuses with
-/// `Error::BadPath` and `Error::Unsupported`, and those are the failures an
-/// operator most needs in the log.
-pub(crate) fn refused(step: &'static str, error: Error) -> Error {
-    error!(step, error = %error, "sandbox step failed");
-    error
-}
-
-/// [`refused`] for a syscall's own error, which is what nearly every call site
-/// has.
-///
-/// Generic over the error type because the callers are not all `std`: `rustix`
-/// returns an `Errno`, which converts into `std::io::Error` through its own
-/// `From` impl but is not that type. Without the bound every one of this
-/// crate's ~14 syscall sites would need its own closure — and, worse, a
-/// `|err: io::Error| …` written at one of them does not compile at all, because
-/// nothing coerces `Errno` to `io::Error` on its own.
-pub(crate) fn fail(step: &'static str, source: impl Into<io::Error>) -> Error {
-    let source = source.into();
-    refused(step, Error::Step { step, source })
-}
-
-/// The `.map_err` shape of [`fail`], for the call sites that read better as a
-/// closure.
-pub(crate) fn step<Source: Into<io::Error>>(step_name: &'static str) -> impl Fn(Source) -> Error {
-    move |source: Source| fail(step_name, source)
-}
+// **The failure builders are the core's, and they are re-exported here rather
+// than re-imported by each module.** This file defined all three until the
+// phase-basis correction moved them to `tinio-sandbox-core`, beside the other
+// platforms' shapes — three copies of one builder being the state that precedes
+// three wordings of one log line, which this crate had already reached. `enter.rs`
+// and `seccomp.rs` go on naming them as `crate::mechanism::{fail, refused, step}`,
+// so **no call site in this crate changes with the move**; the doc that explained
+// the `refused` decision moved to the core's function, trimmed of this crate's
+// history.
+pub(crate) use crate::_core::{fail, refused, step};
 
 /// Which confinement mechanism Linux uses (design decision 7).
 ///
@@ -3960,7 +3930,7 @@ use tokio::sync::watch;
 
 **`Event` is the one import that carries no gate**, and the reason is decision 19 rather than taste: every build writes frames, feature or platform regardless, so a gate on it would take the readiness frame away from a `--no-default-features` build. The other three are gated because what they name exists only on Linux, and `sandbox_exposures`' gate is `any(target_os = "linux", test)` so the exposure rule stays a property the tests can exercise on any host.
 
-`OsString`, the `io` names and the `watch` import are additions; `std::process` is **not** — the file already imports it in its grouped `use std::{…, process, …}` and `refuse_command_line` calls `process::exit(2)`, so a second `use std::process;` would be a duplicate-import error rather than a convenience. **`use clap::Parser;` is one more addition**, and it sits with the third-party imports rather than in the `std` group. Merge the new names into the file's existing groups if you keep them grouped; `io::{Write as _, stdout}` is what `emit` writes and flushes the frame with, and `watch` is the signature's last parameter — this phase only *names* the type, because the channel is the launcher platforms' to create (and tokio's `sync` feature is already in this crate's feature list, so it is an import rather than a manifest change). **The `io` names sit in the file's existing grouped `use std::{…}` rather than on a line of their own**, which is what `imports_granularity = "Crate"` produces and what `fmt --check` requires.
+**`net::TcpListener as StdTcpListener` is one more line in the file's `std` group**, and it is the correction's rather than this step's: `serve`'s `inherited` parameter is `std`'s listener, because a launcher's child rebuilds its socket before its runtime exists and `TcpListener::from_std` panics outside one — so the child has to hand over what it has, and the body converts. `TcpListener`, unqualified, is `tokio`'s in this file, which is why the `std` one is aliased. `OsString`, the `io` names and the `watch` import are additions; `std::process` is **not** — the file already imports it in its grouped `use std::{…, process, …}` and `refuse_command_line` calls `process::exit(2)`, so a second `use std::process;` would be a duplicate-import error rather than a convenience. **`use clap::Parser;` is one more addition**, and it sits with the third-party imports rather than in the `std` group. Merge the new names into the file's existing groups if you keep them grouped; `io::{Write as _, stdout}` is what `emit` writes and flushes the frame with, and `watch` is the signature's last parameter — this phase only *names* the type, because the channel is the launcher platforms' to create (and tokio's `sync` feature is already in this crate's feature list, so it is an import rather than a manifest change). **The `io` names sit in the file's existing grouped `use std::{…}` rather than on a line of their own**, which is what `imports_granularity = "Crate"` produces and what `fmt --check` requires.
 
 - [x] **Step 5: Replace `#[tokio::main]` with the two-phase entry point**
 
@@ -4310,7 +4280,7 @@ fn emit(event: &Event) {
 }
 ```
 
-**What the subscriber shows is a level, and the level is now the crate's as well as the sink's.** `build_subscriber` is handed `Verbosity::Info` and filters on that level rather than on an environment variable, so anything below `info!` stays off stderr until the `[log]` wiring lands with the CLI. **That is why three events this phase first wrote as `debug!` are `info!` now** — the resolved model, the exposure set the jail actually applied, and the seccomp install (the `warn!` for its *skip* was already above the line) — because each answers "was this process confined, and to what", which is exactly the `info!` half shared §7 reserves, and because a successful `serve --sandbox` used to log **nothing at all** through this subscriber: the confinement's whole record was the per-item `debug!` detail that a fixed `Verbosity::Info` drops. The per-item events were left as `debug!` deliberately — each `unshare`, each map write, each mount, each drop — since a launcher window with no other subscriber may show them, and the split is what keeps the must-survive set small enough to read. The `error!` that every refusal logs where its `Error` is built is above the line too, and is now one event from one place: the crate's failure path is `mechanism.rs`'s `refused`/`fail`/`step`, imported by `enter.rs` and `seccomp.rs` rather than copied.
+**What the subscriber shows is a level, and the level is now the crate's as well as the sink's.** `build_subscriber` is handed `Verbosity::Info` and filters on that level rather than on an environment variable, so anything below `info!` stays off stderr until the `[log]` wiring lands with the CLI. **That is why three events this phase first wrote as `debug!` are `info!` now** — the resolved model, the exposure set the jail actually applied, and the seccomp install (the `warn!` for its *skip* was already above the line) — because each answers "was this process confined, and to what", which is exactly the `info!` half shared §7 reserves, and because a successful `serve --sandbox` used to log **nothing at all** through this subscriber: the confinement's whole record was the per-item `debug!` detail that a fixed `Verbosity::Info` drops. The per-item events were left as `debug!` deliberately — each `unshare`, each map write, each mount, each drop — since a launcher window with no other subscriber may show them, and the split is what keeps the must-survive set small enough to read. The `error!` that every refusal logs where its `Error` is built is above the line too, and is now one event from one place: the crate's failure path is `mechanism.rs`'s `refused`/`fail`/`step`, imported by `enter.rs` and `seccomp.rs` rather than copied — **and those three are the core's functions now, re-exported from `mechanism.rs` since the phase-basis correction moved them to `tinio-sandbox-core`**, with every call site and both import lines unchanged.
 
 Replace the hand-rolled argument loop with `clap`: a private `#[derive(Parser)] struct RawArgs` carries the flag-for-field shape, and `fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, Box<dyn Error + Send + Sync>>` — the same signature and the same `Result` — parses it and folds it into the unchanged `struct Args { root: PathBuf, address: SocketAddr, config_path: Option<PathBuf>, read_only: bool, sandbox: bool }`. **`read_only` is read-only's field and must not be dropped**, since `--read-only` is one of the flags the loop already matched. `usage()` goes with the loop; `refuse_command_line`, below, is what replaced it.
 
@@ -4502,7 +4472,7 @@ async fn serve(
     mut storage: FsStorage,
     access: AccessMode,
     pipelines: Lanes,
-    inherited: Option<TcpListener>,
+    inherited: Option<std::net::TcpListener>,
     stop: Option<watch::Receiver<bool>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // The stop channel belongs to the launcher platforms: the child is what
@@ -4524,11 +4494,14 @@ async fn serve(
 
 Everything before the moved body has moved into `main` and must not appear twice: the read-only resolution, the guarded `create_dir_all` and `ensure_chown_privilege`, the state-directory resolution **as a path**, `Config::load` and the log subscriber, which moves ahead of `confine` for the reason given in the code above. **The storage construction and the lane construction are the exception, and they sit *after* the sandbox arm rather than before it**: `Pipelines::build` starts a multi-threaded runtime per lane and `unshare(CLONE_NEWUSER)` refuses a multi-threaded caller, so building them first makes `--sandbox` fail `EINVAL` (invariant 2 above says so in full). The one exception *inside* the moved body is the endpoint line, which is the whole of decision 19 on this platform:
 
-The body's endpoint line becomes an event, and it is also where `inherited` is used — the launcher platforms' children take the listener their parent had already bound, and this process binds its own, which is the only arm that exists in this phase:
+The body's endpoint line becomes an event, and it is also where `inherited` is used — the launcher platforms' children take the listener their parent had already bound, and this process binds its own, which is the only arm that exists in this phase. **`inherited` is `std::net::TcpListener` and not `tokio`'s** (the phase-basis correction; `2026-09-18-sandbox-shared.md` §4 owns the row): `TcpListener::from_std` panics outside a runtime and the child rebuilds its socket in its pre-runtime path, so the conversion has to sit here — inside the body, which runs within the runtime by construction — rather than at a call site that cannot make it. In the file the parameter is spelled `StdTcpListener`, because `TcpListener` is `tokio`'s there:
 
 ```rust
     let listener = match inherited {
-        Some(listener) => listener,
+        // `std`'s listener becomes the async one here, and here is the first
+        // place it can: `from_std` panics outside a runtime, and a launcher's
+        // child rebuilds its socket before any runtime exists (shared §4).
+        Some(inherited) => TcpListener::from_std(inherited)?,
         None => TcpListener::bind(args.address).await?,
     };
     // stdout is a protocol channel; every log goes to stderr. `emit` above is
@@ -5424,14 +5397,14 @@ EOF
 | **The `[[example]] serve` block is gone, and `required-features` with it.** It broke a CI leg that was already there — `.github/actions/run-test-leg/action.yml`'s `no-default` mode builds `--example serve --no-default-features`, and an explicit `--example` selection with unmet `required-features` is a hard error (exit 101) — while the phase's own gate could not see it, because `cargo test --workspace --no-default-features` silently skips such a target. The removal is decisions 4 and 19 read literally: the example must build and serve in **every** feature configuration, and what the feature gates is the `--sandbox` arm's body. It also made `main`'s `#[cfg(not(feature = "sandbox"))]` refusal arm reachable for the first time, and `serve_read_only.rs` now has a test pinning it (exit 2 and an `event: error` frame) | Task 7 Step 1 (the manifest), Step 5 (the arm's comment), Step 8 (the expectation); `docs/tests.md`'s CI-legs section carries the rule |
 | **`serve` folds the capability policy into `Options`** — `sandbox_options(base, config, access)` takes the **resolved** `access` and whether a `local_uid` mapping is configured, asked of `identity::owner_uids_for`. Handing `Options::from_env()` over raw meant `caps::retained` always got `(ReadWrite, false)`: design §8's single `CAP_CHOWN` was **never retained** for an operator with a `local_uid` mapping, so the first chown of a landed object failed `EPERM`, and a `--read-only` run exposed the served root read-write inside the jail. A unit test calls the production function for both fields | Task 7 Step 4 (the helper and its doc), Step 5 (the call site), Step 2 (the test) |
 | **Three events are `info!` where the phase first wrote `debug!`** — the resolved model, the exposure set the jail applied, and the seccomp install (its *skip* was already a `warn!`). `serve` installs its subscriber at a fixed `Verbosity::Info`, so a **successful** `serve --sandbox` logged nothing at all through it, which is the failure shared §7 names as this feature's characteristic one; the per-item `debug!` events were left alone on purpose | Task 3 (`Mechanism::resolved`'s event), Task 5 (`enter`'s model and exposure-set events), Task 4 (the seccomp install), the subscriber paragraph in Task 7 Step 5 |
-| **The crate has one failure path.** `refused`/`fail`/`step` are `pub(crate)` in `mechanism.rs`, and `enter.rs` and `seccomp.rs` import them — including `install`'s refused `prctl`, which built its own `Error::Step` and its own `error!`. The duplication had already drifted on landing: `enter.rs` logged `sandbox step refused` where the other two logged `sandbox step failed`, so one failure was two events with two wordings. **This supersedes the plan's instruction to keep the copy** (Ruling 22's "the duplication stays") — a written-down prediction is worth exactly what the measurement says it is worth | Task 3 (the one definition), Task 5 (the copy removed, the import added), Task 4 (the inline `error!` routed) |
+| **The crate has one failure path.** `refused`/`fail`/`step` are `mechanism.rs`'s — **the core's functions since the phase-basis correction, re-exported there with a `pub(crate) use`** — and `enter.rs` and `seccomp.rs` import them — including `install`'s refused `prctl`, which built its own `Error::Step` and its own `error!`. The duplication had already drifted on landing: `enter.rs` logged `sandbox step refused` where the other two logged `sandbox step failed`, so one failure was two events with two wordings. **This supersedes the plan's instruction to keep the copy** (Ruling 22's "the duplication stays") — a written-down prediction is worth exactly what the measurement says it is worth | Task 3 (the one definition), Task 5 (the copy removed, the import added), Task 4 (the inline `error!` routed) |
 | **`sandbox_e2e` gained a read-only leg** — `serve --sandbox --read-only` against a pre-seeded root, asserting the server serves and that a write through the served root is refused, with `confinement_available()` as its precondition and `confined_view(pid, path)` (through `/proc/<pid>/root`) as the only probe that can see a jail from outside it. It goes red when the seam is deliberately broken to `ReadWrite`, which is the point: design §9's seam, where `serve` turns its resolved access into the exposure set, was never exercised through the real entry point. **`sandbox_e2e` is 2 passed, not 1**, and Task 9's expected results say so | Task 8 Step 1 (the file), Task 9 Step 2 (the measured result) |
 | **The manifest comment is gone from `crates/tinio-server/Cargo.toml`**, and its rationale moved into `docs/tests.md`'s CI-legs section: `docs/cargo.md` §Rules forbids comments in a `Cargo.toml`, and the `[[test]] sandbox_e2e` block is the form the tree keeps | Task 8 Step 3 |
 | **`Mechanism` lives in `mechanism.rs`, not `lib.rs`.** The crate root re-exports it (`pub use self::mechanism::{Mechanism, Resolved, userns_available}`), so callers keep `tinio_sandbox_linux::Mechanism` and in-crate modules keep `crate::Mechanism`. P0's stub no longer spells the enum; the compile-order split that put the variants in `lib.rs` and the behaviour in Task 3 is gone | Task 3 (the enum, the module doc, the re-export), Task 5 Step 5, P0 Step 4 |
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N", and **the one placeholder this plan did carry is now filled**: Task 5's `ALL_CAPABILITIES` was written as a "fill this in from rustix" instruction with two lines of the array, and it now lists all 41 `CapabilitySet` constants in kernel numbering order — the transcription happened, the review checked it constant by constant against `libcap.rs`, and a later phase reads a complete list rather than an instruction. Task 7 remains the step written against a file another branch is editing: it names seams and invariants instead of line numbers, and the landed file is the authority for the line numbers it used to quote.
 
-**Type consistency.** `Sandbox`, `AccessMode`, `Exposure`, `Error` and `Result` come from P0 and are used verbatim. `Mount`, `MountKind`, `OverlayDirs`, `plan`, `DEVICE_FILES` (Task 2) are matched exhaustively in Task 5 — and `MountKind::OverlayReadOnly` is the one kind `plan` never emits, since the read-only mechanism is the filesystem's answer rather than the plan's choice (Task 5's `apply_mount` substitutes it, and `refused_remount_needs_the_overlay` is that decision in full). `jail_root`, `mirror_under` (Task 1) are used by Tasks 2 and 5. `Mechanism`, `Resolved`, `Cap`, `retained`, `Options` (Tasks 3, 5) are used by Tasks 2, 5, 6, 7 — **`Options` and not `LinuxOptions`**, and `Mechanism` is defined in `mechanism.rs` and reached as `crate::Mechanism` through the crate-root re-export; `Cap::set()` yields a single-bit `CapabilitySet` and never the deprecated `Capability`. `seccomp::{filter_program, install, Arch, Syscall, SockFilter}` (Task 4) is consumed by Task 5, and `Syscall` has four variants everywhere it is matched. `PROBE_TIMEOUT` (Task 3) is the probe's one deadline, shared by its read and its reap. Task 7 introduces the names a launcher phase must call rather than redeclare into `serve.rs` — `parse_args`/`Args`, the private `RawArgs` behind them, `refuse_command_line`, `sandbox_request`, `sandbox_options`, `sandbox_exposures`, `emit`, `emit_error`, `emit_on_error` and the `serve` signature itself — and they are the file's only definitions of each: all three platforms' arms live in that one `main`, so a second `emit` beside this one is `E0428`. Shared §4 owns that list. No name is introduced twice with different meanings, and nothing is defined here that belongs on P0's surface.
+**Type consistency.** `Sandbox`, `AccessMode`, `Exposure`, `Error` and `Result` come from P0 and are used verbatim. **So do the four failure builders — `refused`, `fail`, `step`, `launch`** (P0 Task 1's `error.rs`, landed by the phase-basis correction): this crate consumes the first three through `mechanism.rs`'s `pub(crate) use` of the core's — which is why `enter.rs`'s import and `seccomp.rs`'s `use crate::mechanism::fail;` are unchanged, and why no call site in this crate moved — and has no call for `launch`, because Linux confines in place and builds no `Error::Launch`. `Mount`, `MountKind`, `OverlayDirs`, `plan`, `DEVICE_FILES` (Task 2) are matched exhaustively in Task 5 — and `MountKind::OverlayReadOnly` is the one kind `plan` never emits, since the read-only mechanism is the filesystem's answer rather than the plan's choice (Task 5's `apply_mount` substitutes it, and `refused_remount_needs_the_overlay` is that decision in full). `jail_root`, `mirror_under` (Task 1) are used by Tasks 2 and 5. `Mechanism`, `Resolved`, `Cap`, `retained`, `Options` (Tasks 3, 5) are used by Tasks 2, 5, 6, 7 — **`Options` and not `LinuxOptions`**, and `Mechanism` is defined in `mechanism.rs` and reached as `crate::Mechanism` through the crate-root re-export; `Cap::set()` yields a single-bit `CapabilitySet` and never the deprecated `Capability`. `seccomp::{filter_program, install, Arch, Syscall, SockFilter}` (Task 4) is consumed by Task 5, and `Syscall` has four variants everywhere it is matched. `PROBE_TIMEOUT` (Task 3) is the probe's one deadline, shared by its read and its reap. Task 7 introduces the names a launcher phase must call rather than redeclare into `serve.rs` — `parse_args`/`Args`, the private `RawArgs` behind them, `refuse_command_line`, `sandbox_request`, `sandbox_options`, `sandbox_exposures`, `emit`, `emit_error`, `emit_on_error` and the `serve` signature itself — and they are the file's only definitions of each: all three platforms' arms live in that one `main`, so a second `emit` beside this one is `E0428`. Shared §4 owns that list. No name is introduced twice with different meanings, and nothing is defined here that belongs on P0's surface.
 
 **What this plan deliberately does not do.** It adds no items to `tinio-sandbox-core`. It is tempting to put a Linux-flavoured convenience there while implementing — the crate is right there and the editor is open — but the whole reason this plan was split out of a larger one is that shared items accumulating in a platform phase is what produced three plans that disagreed about the same API. Anything shared goes to P0.
 

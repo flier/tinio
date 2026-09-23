@@ -17,6 +17,7 @@ hex.workspace = true
 md-5.workspace = true
 redb.workspace = true
 smart-default.workspace = true
+soft-canonicalize.workspace = true
 strict-path = { workspace = true, features = ["junctions"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = [

@@ -4,6 +4,7 @@
 use std::{
     ffi::{OsStr, OsString},
     io,
+    path::PathBuf,
     process::ExitStatus,
     thread::JoinHandle,
 };
@@ -68,6 +69,16 @@ fn the_launcher_surface_is_re_exported() {
     let _: fn(tinio_sandbox::AccessMode) -> bool = tinio_sandbox::AccessMode::is_read_only;
     let _: fn(&tinio_sandbox::Error) -> String = |err| err.to_string();
     let _: tinio_sandbox::Result<()> = Ok(());
+    // The four shapes a backend builds a failure through — `refused` is the
+    // primitive, `fail` and `step` build `Error::Step`, `launch` builds
+    // `Error::Launch`. The two `impl Into<…>` parameters are fixed by the
+    // binding's own type, and `step` is called rather than bound: it returns an
+    // opaque `impl Fn`, which no `fn`-pointer binding can name.
+    let _: fn(&'static str, tinio_sandbox::Error) -> tinio_sandbox::Error = tinio_sandbox::refused;
+    let _: fn(&'static str, io::Error) -> tinio_sandbox::Error = tinio_sandbox::fail;
+    let _: fn(&'static str, PathBuf, io::Error) -> tinio_sandbox::Error = tinio_sandbox::launch;
+    let _: tinio_sandbox::Error =
+        tinio_sandbox::step::<io::Error>("mount")(io::Error::other("boom"));
 
     // The launcher machinery — Task 2's.
     let _: fn(
@@ -115,7 +126,13 @@ fn linux_selects_the_in_process_backend() {
     assert!(err.to_string().contains("nothing exposed"), "{err}");
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+// **macOS alone, and Windows left this list the moment its backend stopped
+// answering `Unsupported`.** The Windows composition landed in P2's Task 9, so
+// the call below now reaches `served_root` and comes back
+// `Error::Step { step: "confine" }` — this test would be asserting the opposite
+// of the truth there, and the assertion it makes is about a stub. macOS's stub
+// stays until P3 fills it in, and this is the `#[cfg]` it is gated by.
+#[cfg(target_os = "macos")]
 #[test]
 fn the_launcher_platforms_answer_unimplemented_for_now() {
     let mut backend = platform();
