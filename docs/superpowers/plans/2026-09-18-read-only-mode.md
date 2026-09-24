@@ -466,6 +466,8 @@ fn create_dir_0700(dir: &Path) -> io::Result<()> {
 }
 ```
 
+*(2026-09-24: the `sources::parse_var` lookup above, and `env_state_dir` with it, are gone — `TINIO_STATE_DIR` is a hidden clap `env` argument; the block is this step's record.)*
+
 Add to `crates/tinio-config/src/error.rs`: a variant and its constructor, matching the file's existing shape (variant after `Env`, constructor with the other `pub(crate) fn`s):
 
 ```rust
@@ -518,7 +520,7 @@ Report the files pending commit.
 
 **Interfaces:**
 - Consumes: `crate::schema::Config` (field `server: server::Config` with `pub read_only: bool`).
-- Produces: `tinio_config::sources::READ_ONLY_VAR: &str`; `tinio_config::sources::parse_read_only(raw: &str) -> Result<bool, Error>`; `tinio_config::sources::env_read_only() -> Result<Option<bool>, Error>`.
+- Produces: `tinio_config::sources::READ_ONLY_VAR: &str`; `tinio_config::sources::parse_read_only(raw: &str) -> Result<bool, Error>`; `tinio_config::sources::env_read_only() -> Result<Option<bool>, Error>`. *(2026-09-24: `env_read_only` and the `parse_var` helper it went through were deleted from `sources.rs` — the CLI reaches the variable through clap's `env` on the `--read-only` flag, and this plan's later `env_read_only` references are its own record of how the phase ran.)*
 
 - [x] **Step 1: Write the failing test**
 
@@ -1557,15 +1559,19 @@ Then add the containment half (decision 17a) **after** `canonicalize`, in the sa
                 // exist yet, so it cannot be canonicalized here.
                 let absolute = absolute(dir)
                     .map_err(|_| invalid_value("state_dir: could not be resolved in read-only mode"))?;
-                // As shipped this comparison is `FsStorage::contained_in_root`:
-                // on unix a single case-sensitive `starts_with`, on Windows a
-                // case-insensitive component comparison over **both** path
-                // shapes — `canonicalize` answers `\\?\C:\…` while `absolute`
-                // answers `C:\…`, so comparing only the verbatim shape is a
+                // As shipped this comparison is `tinio_util::path::path_contains`
+                // — `FsStorage::contained_in_root` when this plan was written, and
+                // the rule moved to `tinio-util` on 2026-09-23 so that this guard
+                // and `serve`'s exposure set could not disagree about it (it was
+                // the launcher's copy that had no case fold). Either way the rule
+                // is the same: on unix a single case-sensitive `starts_with`, on
+                // Windows a case-insensitive component comparison over **every**
+                // spelling of the pair — `canonicalize` answers `\\?\C:\…` while
+                // `absolute` answers `C:\…`, so comparing only one shape is a
                 // silent no-op on Windows (measured), and NTFS is
                 // case-insensitive, so an in-root dir spelled in another case
                 // would otherwise evade the guard (also measured).
-                if Self::contained_in_root(&absolute, &canonical) {
+                if path_contains(&absolute, &canonical) {
                     return Err(invalid_value(
                         "state_dir: must be outside the storage root in read-only mode",
                     ));
@@ -1597,7 +1603,7 @@ Report the files pending commit.
 - Modify: `crates/tinio-server/examples/serve.rs` (arg parsing at 115-145; wiring at 152-232)
 
 **Interfaces:**
-- Consumes: `tinio_config::state::home_state_dir`, `sources::env_read_only`, `PlaneConfig::read_only`, `CleanupOptions.access`.
+- Consumes: `tinio_config::state::home_state_dir`, `sources::env_read_only` *(deleted 2026-09-24; clap's `env` on the flag is the reader)*, `PlaneConfig::read_only`, `CleanupOptions.access`.
 - Produces: a `--read-only` flag and the read-only wiring in the example.
 
 - [x] **Step 1: Add the flag and the resolution**
@@ -1608,7 +1614,9 @@ In the arg loop (115-145), add:
             "--read-only" => read_only_flag = true,
 ```
 
-with `let mut read_only_flag = false;` beside `address`/`config_path`, and extend `usage()` to print it.
+with `let mut read_only_flag = false;` beside `address`/`config_path`, and put the flag into the command line's help text.
+
+**Nothing in that snippet is spelled this way any more, and the delta is the sandbox work's rather than this plan's.** `serve` no longer hand-parses its arguments: `2026-09-18-sandbox-p1-linux.md`'s Task 7 replaced the `while let Some(arg) = args.next()` loop with `clap`, so the flag is a field on `Args` (`pub read_only: bool`, `#[derive(ClapArgs)]`, in `crates/tinio-cli/src/commands/start/args.rs`, which supersedes the private `RawArgs`), and the parser that produces it is `cli::parse` (`crates/tinio-cli/src/cli.rs`, which supersedes `parse_args`), and `usage()` is gone with the loop — the usage line an operator sees is the one clap renders into a refused command line, so there is nothing left to extend by hand. **This plan's decisions are unaffected**: the flag, its precedence against `TINIO_READ_ONLY` and the config file, and the two `if !read_only` guards are all as written below; only the loop and `usage()` named here are stale, and the flag's own documentation is `docs/sandbox.md`'s and the CLI's to carry.
 
 After the config is loaded (`serve.rs:158-161`), resolve the mode — lowest precedence first: the config file, then the environment overlay, then the flag:
 
@@ -1629,9 +1637,9 @@ After the config is loaded (`serve.rs:158-161`), resolve the mode — lowest pre
     let access = AccessMode::from(read_only);
 ```
 
-The file layer is read, not written: `env_read_only` hands back the overlay's value and the `unwrap_or` expresses the precedence in one place, so an absent `--config` needs no synthetic document to write into.
+The file layer is read, not written: `env_read_only` handed back the overlay's value and the `unwrap_or` expressed the precedence in one place, so an absent `--config` needs no synthetic document to write into. *(2026-09-24: that reader is gone; the overlay's value reaches the body as the flag's clap `env` answer now.)*
 
-The call is `sources::env_read_only`, not the fully-qualified path: `clippy::absolute_paths` rejects a 3-segment path in an expression `std` included, so `serve.rs`'s existing `use tinio_config::{Config, log::{…}, pipeline};` gains `sources` and `state`, and the rest of this task's snippets call `state::env_state_dir()`, `state::STATE_DIR_VAR` and `state::default_home_state_dir(…)`.
+The call is `sources::env_read_only` — then; that reader is gone, see above — and not the fully-qualified path: `clippy::absolute_paths` rejects a 3-segment path in an expression `std` included, so `serve.rs`'s existing `use tinio_config::{Config, log::{…}, pipeline};` gains `sources` and `state`, and the rest of this task's snippets call `state::env_state_dir()`, `state::STATE_DIR_VAR` and `state::default_home_state_dir(…)`.
 
 - [x] **Step 2: Wire the read-only behavior**
 
@@ -1975,7 +1983,7 @@ T058, T076 and T077 each carry a clause this plan does not implement (the root-s
 3. **T058** — move its trailing clause (*"pre-existing root config still read but never written"*) into that new task, then tick it: the integration test itself is Task 11.
 4. **T076** — move the tinio-api half (*"affects tinio-api (state, socket, logs)"*) into the new task, then tick the rest: the resolver, the mode-0700 parents, the fs-side relocation (`meta.redb`, multipart, tmp) and the root-never-written guarantee are this plan's Tasks 2, 9 and 10.
 
-Notes on the ticked entries: the CLI flag (T067) reuses `tinio_config::state::{home_state_dir, env_state_dir}` and `sources::env_read_only`; `TINIO_STATE_DIR` is this design's addition; and on T050/T133 the multipart denial messages are now per-operation.
+Notes on the ticked entries: the CLI flag (T067) reuses `tinio_config::state::{home_state_dir, env_state_dir}` and `sources::env_read_only` *(that reader and `state::env_state_dir` are gone as of 2026-09-24 — the CLI's channel is clap `env`)*; `TINIO_STATE_DIR` is this design's addition; and on T050/T133 the multipart denial messages are now per-operation.
 
 - [x] **Step 5: `CONTEXT.md`**
 

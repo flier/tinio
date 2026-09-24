@@ -1,6 +1,6 @@
 //! Relaying a confined child's stdout to the launcher's own.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::mpsc::Sender};
 
 use bytes::BytesMut;
 use sse_core::{SseDecoder, SseEvent};
@@ -100,6 +100,16 @@ pub enum Terminal {
 /// needs no runtime — so the unit tests below are ordinary `#[test]`s and the
 /// async surface stays a thin shell around them.
 ///
+/// **The record is final only when the stream ends; the announcement is not.** A
+/// launcher that has to *act* the moment its child becomes ready — the Windows
+/// launcher publishes the child's `state` then — cannot wait for EOF, and the
+/// record it reads after [`Child::wait`] is exactly that late. [`Self::with_notify`]
+/// is the other half: the first terminal event is also sent, once, on a channel a
+/// waiting launcher blocks on. Nothing about the record changes; the two answer
+/// different questions at different times.
+///
+/// [`Child::wait`]: crate::Child::wait
+///
 /// # Examples
 ///
 /// ```
@@ -122,6 +132,9 @@ pub enum Terminal {
 pub struct Observer<W> {
     terminal: Option<Terminal>,
     inner: W,
+    /// Where the first terminal event is announced, when a caller asked for it
+    /// (see [`Self::with_notify`]).
+    notify: Option<Sender<Terminal>>,
 }
 
 impl<W> Observer<W> {
@@ -130,7 +143,32 @@ impl<W> Observer<W> {
         Self {
             terminal: None,
             inner,
+            notify: None,
         }
+    }
+
+    /// Announce the first terminal event on `notify`, as well as recording it.
+    ///
+    /// **The one-shot, mid-stream half of "did this child become ready?"** — the
+    /// call a launcher that must act while the child is still serving makes. The
+    /// send happens inside [`Self::record`], so it happens when the frame is
+    /// *seen* rather than when the stream ends, and it happens once: a second
+    /// terminal event (`Listening` followed by `Error` is an ordinary sequence)
+    /// updates nothing and announces nothing, which is the same
+    /// first-event-wins rule the record obeys.
+    ///
+    /// **A failed send is ignored, not an error.** The only reason `send` fails is
+    /// that the waiting half is already gone — a launcher that gave up on its bound
+    /// and moved on to the wait — and there is nothing for the relay to do about a
+    /// reader that left. The relay's own job, forwarding the frames, is unaffected.
+    ///
+    /// The sender is dropped with the `Observer`, which is what tells a waiting
+    /// launcher that no announcement is coming: a child that exits without ever
+    /// reporting readiness disconnects the channel rather than leaving the wait to
+    /// run out its bound.
+    pub fn with_notify(mut self, notify: Sender<Terminal>) -> Self {
+        self.notify = Some(notify);
+        self
     }
 
     /// Record one already-parsed frame and return it when it should be
@@ -151,7 +189,9 @@ impl<W> Observer<W> {
     ///
     /// That first terminal event is traced (`step = "relay"`), because it is the
     /// fact a launcher's readiness rule reads; the frames that follow it are
-    /// relayed and not re-logged.
+    /// relayed and not re-logged. It is also announced on the channel
+    /// [`Self::with_notify`] installed, when one was — the launcher that has to act
+    /// *now* rather than at end-of-stream reads that half.
     pub fn record(&mut self, name: &str, data: &str) -> Option<Event> {
         let event = Event::decode_fields(name, data)?;
         if self.terminal.is_none() {
@@ -160,6 +200,10 @@ impl<W> Observer<W> {
                 Event::Error { message } => Some(Terminal::Error(message.clone())),
             };
             debug!(step = "relay", terminal = ?self.terminal);
+            if let (Some(terminal), Some(notify)) = (self.terminal.as_ref(), self.notify.as_ref()) {
+                // A reader that left is not this relay's problem; see `with_notify`.
+                let _ = notify.send(terminal.clone());
+            }
         }
         Some(event)
     }
@@ -309,6 +353,8 @@ fn decode(decoder: &mut SseDecoder, buffer: &mut BytesMut) -> Step {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc, time::Duration};
+
     use super::*;
     use crate::{
         event::Event,
@@ -421,6 +467,64 @@ mod tests {
         // It recorded, and it also forwarded: the two are not alternatives.
         let relayed = String::from_utf8(observer.into_inner()).unwrap();
         assert_eq!(relayed, input);
+    }
+
+    #[tokio::test]
+    async fn the_observer_announces_the_first_terminal_event_once() {
+        // **The half a launcher acts on while its child is still serving**, and the reason the
+        // announcement is not the record: a child that reports `Listening` and then fails sends
+        // two terminal events, and a launcher that published `state` on either of them would
+        // publish on a run that had already gone wrong. First event wins, exactly as the record's
+        // own rule says.
+        let (notify, announced) = mpsc::channel();
+        let addr = loopback(9000);
+        let input = concat!(
+            "event: listening\ndata: {\"addr\":\"127.0.0.1:9000\"}\n\n",
+            "event: error\ndata: {\"message\":\"the served root went away\"}\n\n",
+        );
+        Observer::new(Vec::new())
+            .with_notify(notify)
+            .observe(input.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            announced.try_iter().collect::<Vec<_>>(),
+            [Terminal::Listening(addr)],
+            "one announcement, of the first terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_observer_with_no_notifier_announces_nothing() {
+        // The default: a relay nothing is waiting on sends nowhere, and the channel half is
+        // absent rather than an extra object per relay. What is asserted here is that the *record*
+        // still happens — the two halves are independent.
+        let observer = Observer::new(Vec::new())
+            .observe(b"event: listening\ndata: {\"addr\":\"127.0.0.1:9000\"}\n\n".as_slice())
+            .await
+            .unwrap();
+        assert_eq!(
+            observer.terminal(),
+            Some(&Terminal::Listening(loopback(9000)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_announcement_is_disconnected_when_the_stream_ends_without_one() {
+        // The failure a launcher's bound would otherwise have to cover: a child that dies before
+        // reporting readiness drops the sender with the observer, so the waiting half is
+        // **disconnected** rather than left blocking. This is the property `Child::wait_for_ready`
+        // reads as "nothing reported".
+        let (notify, announced) = mpsc::channel();
+        Observer::new(Vec::new())
+            .with_notify(notify)
+            .observe(b"starting up\nfailed to bind\n".as_slice())
+            .await
+            .unwrap();
+        assert_eq!(
+            announced.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 
     #[tokio::test]

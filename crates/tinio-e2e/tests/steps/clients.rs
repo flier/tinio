@@ -22,6 +22,7 @@ use std::{
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Read},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
@@ -31,6 +32,7 @@ use std::{
 
 use assert_cmd::{Command as AssertCmd, cargo::cargo_bin};
 use cucumber::{given, then, when};
+use tinio_sandbox::Event;
 
 use super::{FsKind, World, common::deterministic_bytes, has_tag};
 use crate::_server::{
@@ -46,7 +48,8 @@ use crate::_server::{
 pub const ACCESS_KEY: &str = "minioadmin";
 pub const SECRET_KEY: &str = "minioadmin";
 
-const READY: &str = "listening on ";
+/// How long a spawned child gets to report the address it bound before the
+/// scenario fails rather than hanging on a pipe that will never carry it.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The workspace target dir (`CARGO_TARGET_DIR` override honored).
@@ -68,6 +71,10 @@ pub struct External {
     pub child: Child,
     /// `http://127.0.0.1:<port>` — the client-facing base URL.
     pub base_url: String,
+    /// The endpoint the aws steps dial (`--endpoint-url`): [`Self::base_url`] until a scenario
+    /// points the client at the ephemeral second server (`the client targets the {word} server`),
+    /// which is the only observation point that server has.
+    target_url: String,
     /// Scratch for client files (uploads, downloads, configs).
     pub workdir: tempfile::TempDir,
     /// The served storage root (`workdir/root`) — out-of-band file drops
@@ -93,9 +100,11 @@ impl External {
         });
         let scanner = Some(matches!(fs_kind, FsKind::ColdListing(_)));
         let (child, endpoint) = spawn_child(&root, scanner, config.as_deref());
+        let base_url = format!("http://{endpoint}");
         Self {
             child,
-            base_url: format!("http://{endpoint}"),
+            base_url: base_url.clone(),
+            target_url: base_url,
             workdir,
             root,
         }
@@ -124,10 +133,10 @@ fn terminate(child: &mut Child) {
 #[derive(Debug)]
 pub struct SpawnedServer {
     child: Child,
-    endpoint: String,
+    endpoint: SocketAddr,
 }
 
-/// Spawn `tinio server <root> --port 0` and wait for the readiness line;
+/// Spawn `tinio server <root> --port 0` and wait for its readiness event;
 /// returns the child and the bound endpoint (`127.0.0.1:PORT`). `scanner`
 /// sets `TINIO_SCANNER` per Some (None leaves it unset), `config` is passed
 /// through `--config`.
@@ -140,8 +149,8 @@ pub struct SpawnedServer {
 /// relocate its state). The `scanner` argument sets its variable back
 /// afterwards.
 ///
-/// **The credential pair is the one thing the CLI needs that the retired
-/// `serve` example did not.** Every client below signs with the fixed
+/// **The credential pair is one thing the spawned server needs and the
+/// retired example did not.** Every client below signs with the fixed
 /// `minioadmin` pair, which the example accepted because it hard-coded it —
 /// while the CLI reads `[auth]`, and a first start *generates* a random
 /// pair into the config it creates, so a scenario would fail with
@@ -150,7 +159,7 @@ pub struct SpawnedServer {
 /// `contracts/config.md:110` lists (not the `MINIO_*` names, which are the
 /// data plane's fallback and not this chain's), and the resolution applies
 /// them to `[auth]` — env, then `.env`, then the config file.
-fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, String) {
+fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, SocketAddr) {
     let mut cmd = Command::new(cargo_bin("tinio"));
     cmd.arg("server").arg(root).args(["--port", "0"]);
     if let Some(config) = config {
@@ -171,16 +180,22 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
         .unwrap_or_else(|e| panic!("failed to spawn `tinio server`: {e}"));
     let stdout = child.stdout.take().expect("piped stdout");
     let endpoint = match wait_for_ready(stdout) {
-        Some(line) => line
-            .trim()
-            .strip_prefix(READY)
-            .expect("ready line prefix")
-            .to_string(),
+        // The address travels as the value the child bound: it comes out of the event's typed
+        // field and goes to a URL as it stands, so nothing here can disagree with what
+        // `local_addr` reported.
+        Some(Event::Listening { addr }) => addr,
+        // **A refusal is reported as the refusal it is.** Discarding the event and reporting the
+        // missing-frame case below made a server that refused to start read as the stale-binary
+        // guess, which sends the reader after the wrong thing.
+        Some(Event::Error { message }) => {
+            terminate(&mut child);
+            panic!("the server refused to start: {message}");
+        }
         None => {
             terminate(&mut child);
             panic!(
-                "the server did not print `{READY}` — is a stale `tinio.exe` holding this root? \
-                 ({} server --port 0)",
+                "the server reported no `listening` event — is a stale `tinio.exe` holding this \
+                 root? ({} server --port 0)",
                 cargo_bin("tinio").display()
             );
         }
@@ -196,8 +211,8 @@ impl SpawnedServer {
     }
 
     /// The bound address, `127.0.0.1:PORT`.
-    fn endpoint(&self) -> &str {
-        &self.endpoint
+    fn endpoint(&self) -> SocketAddr {
+        self.endpoint
     }
 }
 
@@ -208,21 +223,31 @@ impl Drop for SpawnedServer {
     }
 }
 
-/// Read the child's stdout until the `listening on` readiness line — the
-/// only line the server writes there (its diagnostics go to stderr, which
-/// [`spawn_child`] discards) — and scanned line by line, so a preceding line
-/// would still be skipped. A reader thread keeps the pipe drained so the
-/// child never blocks on a full buffer; the thread exits when the child
-/// dies.
-fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<String> {
+/// Read the child's stdout until it reports its first event.
+///
+/// The child speaks the sandbox's event stream (design decision 19): one SSE frame per event —
+/// an `event:` line, a `data:` line, closed by a blank line. **A frame is not a line**, so this
+/// accumulates until the blank line and decodes the block; decoding line by line would hand
+/// [`Event::decode`] half a frame. Text that is not a frame — a log a dependency wrote before
+/// the subscriber was installed — does not decode and is skipped rather than fatal, which is
+/// the property the framing buys. A reader thread keeps the pipe drained so the child never
+/// blocks on a full buffer; the thread exits when the child dies.
+fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<Event> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
+        let mut frame = String::new();
         while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
-            if line.contains(READY) {
-                let _ = tx.send(line);
-                return;
+            if line.trim_end().is_empty() {
+                if let Some(event) = Event::decode(&frame) {
+                    let _ = tx.send(event);
+                    return;
+                }
+                frame.clear();
+            } else {
+                frame.push_str(line.trim_end());
+                frame.push('\n');
             }
             line.clear();
         }
@@ -522,10 +547,11 @@ fn run_external(world: &mut World, cmd: &mut AssertCmd, expect_success: bool) {
     save_output(world, &out);
 }
 
-/// The configured wrapper for a `{work}`-expanded aws command line.
+/// The configured wrapper for a `{work}`-expanded aws command line, dialled at the scenario's
+/// **current** target — the first server unless a step switched it.
 fn aws_cmd(world: &World, command: &str) -> AssertCmd {
     let ext = world.ext.as_ref().expect("external server running");
-    aws(&ext.base_url, &arg_refs(&tokenize(world, command)))
+    aws(&ext.target_url, &arg_refs(&tokenize(world, command)))
 }
 
 #[given(regex = r"I run aws (.*)")]
@@ -624,7 +650,7 @@ async fn run_boto3(world: &mut World, name: String) {
 }
 
 /// The ephemeral `--port 0` leg (journey): a second server starts while
-/// the first keeps serving; the bucket ops stay on the first server.
+/// the first keeps serving.
 #[given(expr = "I start a second server")]
 #[when(expr = "I start a second server")]
 #[then(expr = "I start a second server")]
@@ -634,10 +660,42 @@ async fn start_second_server(world: &mut World) {
     fs::create_dir_all(&root).unwrap();
     let spawned = SpawnedServer::start(&root, None, None);
     assert!(
-        !spawned.endpoint().is_empty(),
-        "second server must bind an ephemeral port"
+        spawned.endpoint().port() != 0,
+        "the second server must report the address it actually bound, not the `:0` it asked for"
     );
     world.ext_second = Some(spawned);
+}
+
+/// Point the aws steps at one of the scenario's two servers.
+///
+/// **The second server's only observation point.** `I start a second server` proves it bound an
+/// ephemeral port and nothing more, so `journey.feature`'s "serves alongside the first server"
+/// needs an op that dials *it* — and the state it then holds is what tells the two apart. An
+/// explicit target rather than "the second one from now on", because the same scenario also has
+/// to show the first still answering.
+#[given(expr = "the client targets the {word} server")]
+#[when(expr = "the client targets the {word} server")]
+#[then(expr = "the client targets the {word} server")]
+async fn client_targets(world: &mut World, which: String) {
+    let url = match which.as_str() {
+        "first" => world
+            .ext
+            .as_ref()
+            .expect("external server running")
+            .base_url
+            .clone(),
+        "second" => format!(
+            "http://{}",
+            world
+                .ext_second
+                .as_ref()
+                .expect("the scenario started a second server")
+                .endpoint()
+        ),
+        other => panic!("a client target is `first` or `second`, not {other:?}"),
+    };
+    let ext = world.ext.as_mut().expect("external server running");
+    ext.target_url = url;
 }
 
 // --- file-preparation steps ----------------------------------------------

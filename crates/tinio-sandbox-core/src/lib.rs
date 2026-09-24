@@ -25,6 +25,16 @@
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 
+/// The test-support half of `tinio-util`, reached through an alias for the same
+/// reason [`_core`](crate::_core) has one: `tests.md`'s convention is that
+/// conformance helpers live in that crate's `testing` feature rather than in a
+/// copy per suite, and this is the dev-dependency that makes it a name here
+/// (`error.rs`'s capture sink is the one user — F32's `SharedBuf`, whose three
+/// removed copies this crate held one of).
+#[cfg(test)]
+#[doc(hidden)]
+pub extern crate tinio_util as _util;
+
 pub mod backend;
 mod error;
 pub mod event;
@@ -55,10 +65,11 @@ pub(crate) mod testing;
 // that test.
 pub use self::{
     backend::{Backend, Confinement},
-    error::{Error, Result},
+    error::{Error, Result, fail, launch, refused, step},
     event::Event,
     launcher::{
-        Adopted, Child, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer, Terminal, adopt,
+        Adopted, CONTROL_FD_PREFIX, Child, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer,
+        Terminal, adopt, control_fd_arg, control_fd_from_arg, is_control_fd_arg,
         is_listener_fd_arg, listener_fd_arg, listener_fd_from_arg, supervise,
     },
     sandbox::{Exposure, Sandbox},

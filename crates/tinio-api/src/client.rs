@@ -15,6 +15,8 @@
 //! `shutdown`. A control name too long for `sun_path` cannot be dialed either, and the remedy
 //! is the one the bind names (`[api.unix] path` may point at a short directory).
 
+#[cfg(windows)]
+use std::time::Duration;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -27,13 +29,73 @@ use hyper_util::rt::TokioIo;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(windows)]
+use tokio::time::sleep;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
 use crate::{Error, router::StatusBody, state::State};
+
+/// How many dials of a **busy** control pipe are retried, and the first wait between them.
+///
+/// **`ERROR_PIPE_BUSY` is the pool's own answer, and it is momentary.** A named pipe is dialled by
+/// name, and a client only reaches an instance that is *listening*: with the channel's finite pool,
+/// a client that arrives while every instance is serving — or in the tick between one instance's
+/// drain and its re-arm — is told "there is a server here and it is busy", which is a different
+/// fact from "nothing is there". Waiting a bounded, doubling interval turns the first into an
+/// answer; the delays are 1, 2, 4, 8 and 16 ms, so the whole budget is ~31 ms — imperceptible for
+/// a `status` probe and far shorter than any caller's own timeout.
+///
+/// **Only `ERROR_PIPE_BUSY` is retried, and what is left of it is classified, not raised.** Every
+/// other failure — the name gone, access refused, the server gone mid-exchange — is reported at
+/// once, and once the retries are spent the busy dial becomes [`Error::Busy`] rather than a raw
+/// `io::Error`. That variant is what keeps the two questions this client answers distinct: a
+/// retry that ended in "the pool is full" must not reach a caller as a connection failure,
+/// because [`status`] reports a channel that answered nothing as *not running* (the "nothing
+/// answers there" report the CLI prints) while [`stop`] lets the refusal through.
+#[cfg(windows)]
+const BUSY_RETRIES: u32 = 5;
+
+/// The first wait between [`BUSY_RETRIES`]'s attempts; each later one doubles it.
+#[cfg(windows)]
+const BUSY_BACKOFF: Duration = Duration::from_millis(1);
+
+/// Dials the control pipe `name`, retrying while the pool is busy (see [`BUSY_RETRIES`]).
+///
+/// The retry lives here, at the one place a pipe is dialled for a request, rather than around the
+/// whole exchange: a request that reached a server is a request the server may have acted on, and
+/// repeating it is not this client's decision to make. A busy *dial* touched nothing.
+#[cfg(windows)]
+async fn dial_pipe(name: &str) -> Result<NamedPipeClient, Error> {
+    let mut attempt = 0;
+    loop {
+        match ClientOptions::new().open(name) {
+            Ok(client) => return Ok(client),
+            Err(err)
+                if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && attempt < BUSY_RETRIES =>
+            {
+                let delay = BUSY_BACKOFF * 2u32.pow(attempt);
+                tracing::debug!(attempt, ?delay, "the control pipe is busy; redialling");
+                sleep(delay).await;
+                attempt += 1;
+            }
+            // The channel's own report, classified: a dial that is told the pool is busy reached a
+            // pipe that is there, and that is a fact about the *channel* rather than about this
+            // request — so it travels as [`Error::Busy`] and `status` decides what it means. Every
+            // other failure — the name gone, access refused, the server gone mid-exchange — is the
+            // connection's own error, and waiting cannot change any of them.
+            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                return Err(Error::Busy(format!("{name}: {err}")));
+            }
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+}
 
 /// One management request: the path, the method and the token to present.
 ///
@@ -256,6 +318,17 @@ pub async fn status(state_dir: &Path) -> Result<Report, Error> {
                 status,
             })
         }
+        // **A channel that is there and full is a report, not a failure.** `status`'s contract has
+        // exactly one error path — a `state` file it cannot read (`contracts/cli.md:58`) — and a
+        // probe that did not complete is "stopped" there whatever stopped it: a `state` file with
+        // nothing behind the name, a server that answered something that is not the contract's
+        // body, and [`Error::Busy`] from a pool whose every instance is serving. **That is the
+        // whole point of [`dial_pipe`] classifying busy apart from every other failure**, and the
+        // reason it is matched here rather than left to `?`: raising it would make the CLI print an
+        // unhealthy server where the contract says a stopped one, and would drop the `state` file
+        // the caller needs in order to say anything about it at all. The refusal stays
+        // distinguishable where a caller can act on it — [`stop`] raises it, because "there is a
+        // server there and it is full" is what a stop needs to hear.
         _ => Ok(Report {
             running: false,
             state: Some(state),
@@ -403,7 +476,10 @@ fn dialable(addr: SocketAddr) -> SocketAddr {
 /// `state`'s own ([`call_for`]): `/status` and `/stop` are guarded on every transport.
 ///
 /// The TCP and unix arms are [`get_http`] and [`get_local`], not second copies of them: those
-/// two carry the platform refusals, so there is one definition of each and not two.
+/// two carry the platform refusals, so there is one definition of each and not two. The Windows
+/// pipe arm dials through [`dial_pipe`], which waits out a busy pool ([`BUSY_RETRIES`]) and then
+/// reports what the channel answered — a spent busy dial as [`Error::Busy`], every other failure
+/// as itself.
 async fn request(state: &State, call: Call<'_>) -> Result<RawResponse, Error> {
     match control(state)? {
         // Dialled through [`dialable`]: a wildcard bind's recorded address is what it bound and
@@ -413,7 +489,8 @@ async fn request(state: &State, call: Call<'_>) -> Result<RawResponse, Error> {
         Control::Pipe(name) => {
             #[cfg(windows)]
             {
-                let client = ClientOptions::new().open(&name).map_err(Error::Io)?;
+                // Through [`dial_pipe`], which is where a busy pool's answer is waited out.
+                let client = dial_pipe(&name).await?;
                 exchange(TokioIo::new(client), call).await
             }
             #[cfg(not(windows))]

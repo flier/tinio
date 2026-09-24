@@ -104,7 +104,7 @@ impl<S: Storage> S3Backend<S> {
             .await
             .map_err(map_backend_error)?;
         Ok(S3Response::new(CreateBucketOutput {
-            // Directory-bucket only (s3s 0.16): plain buckets carry no ARN.
+            // Directory-bucket only: plain buckets carry no ARN.
             bucket_arn: None,
             location: Some(format!("/{name}")),
         }))

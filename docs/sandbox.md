@@ -1,0 +1,15 @@
+# `--sandbox`: what an operator has to know
+
+`--sandbox` confines the server to the paths it is given — a private mount namespace, `pivot_root`, and a seccomp filter over outbound connection setup. The notes below are Linux's, because Linux is the platform that has landed, and each is a consequence of the confinement working as designed rather than a defect: all three read as bugs the first time they are met without warning.
+
+## The process has no capabilities, even when it runs as root
+
+The confinement drops every capability before the server starts, `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` among them, so the process reads files as the account it runs as rather than as the superuser it still is: under the root model it is uid 0 with an empty capability set apart from the single `CAP_CHOWN` a `local_uid` mapping needs. A file under the served root that the service account does not own and that is not readable by others is therefore refused, and an S3 client sees `AccessDenied` for objects that were readable before the flag was added. The user-namespace model states the same rule from the other side: its namespace maps exactly one uid — the invoking user's — so a file owned by any other host id is as unreadable inside the jail as a stranger's file is outside it. Run the server as the account that owns the data, or `chown -R` the served root to that account.
+
+## Outbound connections are denied, and the filter cannot see the address family
+
+The seccomp filter denies `connect`, `sendto`, `sendmsg` and `sendmmsg` by syscall number, so no address family can be let through and `connect(AF_UNIX)` is denied along with the TCP ones: inside the jail, `/dev/log` (syslog), a Docker socket and a D-Bus connection all fail with `EPERM`. This is deliberate — a filter that could see the family would be a different and larger program — and it is survivable because the server's own logs go to stderr rather than to syslog. There is no allowance to add: a Unix socket inside an exposed directory is unreachable too, because the refusal is at `connect`, not at the path.
+
+## The host's path namespace does not exist inside the jail
+
+The jail is a private mount namespace with `pivot_root`, and what it contains is the exposure set plus the four device files every `serve` jail binds in — `/dev/null`, `/dev/zero`, `/dev/random` and `/dev/urandom` — each entry at its original absolute path. Everything else is absent rather than refused: `/etc`, `/proc`, the host's `/tmp` and the operator's home do not exist in there, and a path that is neither an exposure nor one of those four fails as "no such file or directory" rather than as a permission error. This is where Linux differs from the other two platforms, which confine by policy — a Windows AppContainer's DACLs, a macOS Seatbelt profile — and in those the host's paths are visible and refused. So a configuration file, a helper binary or a data path the server needs on Linux has to be exposed, and what would have been a permission error at startup is a missing file instead.

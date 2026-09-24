@@ -33,8 +33,8 @@ use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_P
 use crate::{
     _api::state::{self as api_state, State},
     Error,
-    commands::{readiness_line, start::Args},
-    resolve,
+    commands::start::Args,
+    events, resolve,
     resolve::Resolution,
 };
 
@@ -272,7 +272,20 @@ fn await_ready(
             && let Some(port) = state.port
             && control_channel_answers(&state.control_name)
         {
-            println!("{}", endpoint(resolution, port));
+            // Decision 19: the parent speaks the child's protocol on **its own** stdout, because
+            // the daemon's stdout is the log file. The endpoint is the port the child published,
+            // on the address the resolution names — the same `SocketAddr` the child bound and
+            // emitted its own frame for.
+            match resolution.address() {
+                Ok(address) => events::ready(SocketAddr::new(address.ip(), port)),
+                // Unreachable while the child is serving — it bound this very address — and
+                // reported rather than returned, because a reporting failure must not kill a
+                // healthy daemon.
+                Err(err) => eprintln!(
+                    "tinio: the daemon is serving on port {port}, but the address to report it \
+                     on could not be resolved: {err}"
+                ),
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -322,13 +335,6 @@ fn control_channel_answers(control_name: &str) -> bool {
             .write(true)
             .open(control_name)
             .is_ok()
-    }
-}
-
-fn endpoint(resolution: &Resolution, port: u16) -> String {
-    match resolution.address() {
-        Ok(address) => readiness_line(SocketAddr::new(address.ip(), port)),
-        Err(_) => format!("listening on {}:{port}", resolution.config.server.host),
     }
 }
 

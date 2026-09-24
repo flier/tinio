@@ -212,6 +212,51 @@ fn a_config_path_that_does_not_exist_is_a_usage_error() {
     );
 }
 
+/// **A confined child resolves from the payload and does not re-validate the path its launcher
+/// read** (design decision 18), and this leg is the fix's keeper: a `--config` path the
+/// confinement cannot see is what every out-of-root configuration looks like from inside, while
+/// the unconfined run's "must be there" contract stays exactly as it was.
+#[test]
+fn an_adopted_run_reads_the_payload_not_the_explicit_config_path() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).expect("root");
+    // Never created: the path `--config` names, as the container sees it.
+    let outside = dir.path().join("outside/sandbox.toml");
+    let discovery = || Discovery {
+        dir: Some(root.clone()),
+        config: Some(outside.clone()),
+        read_only: false,
+        // Read-only relocates the state dir, and the override is what keeps this leg out of the
+        // developer's real home (`locate_resolves_the_root_the_mode_and_the_state_dir`).
+        state_dir: Some(dir.path().join("state")),
+    };
+
+    // The unconfined contract is untouched: a path that is not a file is a usage error.
+    let err = locate(discovery(), &Provenance::default()).expect_err("missing file");
+    assert!(matches!(err, Error::Usage(_)), "exit 2, not exit 1: {err}");
+    assert!(
+        format!("{err}").contains("sandbox.toml"),
+        "still names the path: {err}"
+    );
+
+    // The adopted run: the text *is* the document that path named, so the mode is the text's and
+    // the path is only carried, never asked for.
+    let located = locate_confined(
+        discovery(),
+        &Provenance::default(),
+        "version = 1\n[server]\nread_only = true\n",
+    )
+    .expect("the payload's text stands in for the path");
+    assert!(located.read_only, "the mode is the payload text's");
+    assert_eq!(
+        located.config.as_deref(),
+        Some(outside.as_path()),
+        "the path is still what the resolution names"
+    );
+    assert_eq!(located.state_dir, dir.path().join("state"));
+}
+
 #[test]
 fn the_candidates_lead_with_the_state_dir_the_chain_resolved() {
     let dir = tempfile::TempDir::new().expect("temp");

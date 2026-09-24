@@ -4,8 +4,16 @@
 use std::sync::Arc;
 use std::{fmt::Display, net::SocketAddr, process::ExitCode, time::Duration};
 
-use futures::StreamExt;
-use tokio::{net::TcpListener, sync::watch, task::JoinError, time::timeout};
+use futures::{
+    StreamExt,
+    future::{Either, select},
+};
+use tokio::{
+    net::TcpListener,
+    sync::watch,
+    task::JoinError,
+    time::{error::Elapsed, timeout},
+};
 
 use super::Ready;
 #[cfg(unix)]
@@ -24,7 +32,8 @@ use crate::{
         identity::{self, IdentityFromConfig},
     },
     Error,
-    commands::{EnvArgs, readiness_line},
+    commands::EnvArgs,
+    events,
     resolve::Resolution,
     sandbox,
 };
@@ -97,11 +106,25 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
 
     // One shutdown path, three entry points: the signal handlers flip this channel, `/stop`
     // sends on it, and every serving arm below ends on it.
-    let stop = handles.shutdown.clone();
+    let mut stop = handles.shutdown.clone();
+    // **A confined child arms the forwarded-stop relay** (design §3 step 9, decision 20): its
+    // launcher forwards a stop rather than killing it, and without this hook the stop would meet
+    // the default disposition and end the process where it stands instead of draining. Only a
+    // launched child has a launcher to forward one, which is why the arm is the payload's.
+    #[cfg(target_os = "windows")]
+    if adopted.is_some() {
+        let stopper = handles.stopper.clone();
+        sandbox::on_stop(move || {
+            let _ = stopper.send(true);
+        })?;
+    }
     let bind = resolution.address()?;
-    let listener = match adopted {
+    // **Borrowed, not taken**: the arm below asks whether this process is a launched child, which
+    // is what decides who publishes `state`. A `match adopted` binding its inner value would move
+    // it here and leave that question unanswerable at the publish site.
+    let listener = match adopted.as_ref() {
         // The listener a launcher handed this child over the inherited descriptor (Task 9).
-        Some(adopted) => sandbox::adopted_listener(&adopted)?,
+        Some(adopted) => sandbox::adopted_listener(adopted)?,
         None => TcpListener::bind(bind).await?,
     };
     let address = listener.local_addr()?;
@@ -141,10 +164,19 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     let background = tokio::spawn(scanner_and_sweeper(storage.clone(), stop.clone(), access));
 
     #[cfg(feature = "api")]
-    plane.publish(address.port())?; // `state` is written here
-    println!("{}", readiness_line(address)); // the readiness line, on stdout (§8)
-    // The operational summary, on stderr: endpoint, root and credentials status — the one-line
-    // channel stays stdout's, and this is why.
+    // **A launched child never writes `state`.** Its launcher does: the file's DACL is
+    // current-user-only and protected, so this process — inside the container, with the package
+    // SID as its identity — is refused every path-based access to it, and the launcher publishes
+    // the file once *this* process reports it is listening. The skip is not a degradation: the
+    // file exists by the time any client can act on the readiness event this line is part of.
+    // `adopted.is_none()` is every process that owns its own `state`, which is every unconfined
+    // run and every in-place platform.
+    if adopted.is_none() {
+        plane.publish(address.port())?; // `state` is written here
+    }
+    events::ready(address); // the readiness event, on stdout (§8; decision 19)
+    // The operational summary, on stderr: endpoint, root and credentials status — the event
+    // stream stays stdout's, and this is why.
     eprintln!(
         "serving {root} on {address} ({mode}; credentials {origin})",
         root = resolution.root.display(),
@@ -179,9 +211,33 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     // measured at ~15 s after an accepted `stop`, outside the promise. Do not simplify this back
     // into one `join!`; the removal window is the whole reason the three are apart.
     #[cfg(feature = "api")]
-    let drained = timeout(DRAIN_BOUND, async { tokio::join!(api, data) }).await;
+    let drain = async { tokio::join!(api, data) };
+    // Not an `async { data.await }`: the single handle is already a future, and clippy's
+    // `redundant_async_block` is a `-D warnings` error in the api-less graphs.
     #[cfg(not(feature = "api"))]
-    let drained = timeout(DRAIN_BOUND, data).await;
+    let drain = data;
+    tokio::pin!(drain);
+    let stopped = stopping(&mut stop);
+    tokio::pin!(stopped);
+    // **The bound is armed by a stop — or by a plane that ended on its own — never by the mere
+    // passage of time.** `DRAIN_BOUND` is the *drain's* limit, and a server nobody has asked to
+    // stop has no drain in flight: arming the timeout before this wait ended every idle run ~12 s
+    // after readiness (the 10 s bound here, then `BACKGROUND_BOUND`), removed `state` and exited —
+    // the defect this wait closes. The drain's own arm is the other way a drain begins: a plane
+    // that returned without a stop has already stopped serving, and `plane_arm` is what reports
+    // it, rather than a timeout that would swallow the answer.
+    //
+    // **`futures::future::select` rather than `tokio::select!`, and the future it hands back is
+    // why.** An `async` block that has already answered panics when it is polled again
+    // (resume-after-completion), and these two events are the same event: a stop flips the very
+    // channel the planes drain on, so "the stop arrived" and "the planes finished" race — a
+    // `select!` that took the stop arm with an already-complete drain arm would re-poll it in the
+    // timeout below. `select` returns the arm that did *not* finish, so the timeout only ever
+    // wraps a drain that is still pending.
+    let drained = match select(drain, stopped).await {
+        Either::Left((outcome, _)) => Ok::<_, Elapsed>(outcome),
+        Either::Right(((), drain)) => timeout(DRAIN_BOUND, drain).await,
+    };
     // **The bound is the promise's, and this is where it is enforced.** A download in flight
     // would otherwise hold `state` and the socket past the window — and past `stop`'s own 15 s
     // refusal bound, which is how the operator meets it. An arm still draining at the bound is
@@ -239,6 +295,22 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     pipelines.drain().await;
     outcome?; // the graceful path: every arm returned cleanly, and this is `Ok(())`
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolves when this process has been asked to stop: at once when the channel already says so,
+/// otherwise on the next change.
+///
+/// **`changed()` alone would not do, and the first read is why.** A `watch` receiver created
+/// *after* the flip — or one that has already marked the new value seen — would wait for the
+/// *next* change and wait forever, so the question is asked of the current value first.
+/// `borrow_and_update()` would be wrong in the other direction: it marks the value seen, which
+/// turns a stop that has already arrived into one this function waits past. `borrow()` marks
+/// nothing. A dropped sender is read as a stop: nothing is left to serve for, and every arm
+/// below treats a clean channel as the graceful path.
+async fn stopping(stop: &mut watch::Receiver<bool>) {
+    if !*stop.borrow() {
+        let _ = stop.changed().await;
+    }
 }
 
 /// `contracts/cli.md`: non-loopback bind warns on stderr. Anonymous escalation is US3 (T087)
@@ -402,5 +474,62 @@ fn credential_origin(env: &EnvArgs) -> &'static str {
         "from TINIO_ACCESS_KEY/TINIO_SECRET_KEY"
     } else {
         "from the config file"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        sync::watch,
+        time::{sleep, timeout},
+    };
+
+    use super::stopping;
+
+    /// **The drain bound is armed by a stop, never by the clock**, and this leg is the defect in
+    /// the form a unit test can hold: with the channel still `false`, [`stopping`] must not
+    /// resolve. `serve` used to arm `DRAIN_BOUND` at exactly this point, so an idle server walked
+    /// the drain path ~12 s after readiness, removed `state` and exited.
+    #[tokio::test]
+    async fn an_unstopped_server_never_reaches_its_drain() {
+        let (_sender, mut stop) = watch::channel(false);
+        assert!(
+            timeout(Duration::from_millis(50), stopping(&mut stop))
+                .await
+                .is_err(),
+            "nothing asked for a stop, so the drain must not begin"
+        );
+    }
+
+    /// **The two orders a stop can arrive in are equivalent, and the second is why the current
+    /// value is read before `changed()` is awaited**: a receiver that already saw the flip would
+    /// otherwise wait for the *next* change, which never comes.
+    #[tokio::test]
+    async fn a_stop_starts_the_drain_in_either_order() {
+        // The flip lands during the wait.
+        let (sender, mut stop) = watch::channel(false);
+        let flip = tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            let _ = sender.send(true);
+        });
+        assert!(
+            timeout(Duration::from_secs(5), stopping(&mut stop))
+                .await
+                .is_ok(),
+            "a stop that arrived during the wait must start the drain"
+        );
+        flip.await.expect("the flip task");
+
+        // The flip landed before the wait.
+        let (sender, mut stop) = watch::channel(false);
+        sender.send(true).expect("flip before the wait");
+        assert!(
+            timeout(Duration::from_millis(50), stopping(&mut stop))
+                .await
+                .is_ok(),
+            "a stop that arrived before the wait must start the drain"
+        );
     }
 }

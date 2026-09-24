@@ -28,8 +28,11 @@ pub extern crate tinio_mem as _mem;
 pub extern crate tinio_sandbox as _sandbox;
 #[doc(hidden)]
 pub extern crate tinio_server as _server;
-#[cfg(test)]
-extern crate tinio_util as _util;
+/// Not `#[cfg(test)]`, unlike its first life: the confinement's exposure rule asks
+/// `path_contains` whether a state directory is inside the served root, and that question is
+/// asked by the running server rather than only by a test.
+#[doc(hidden)]
+pub extern crate tinio_util as _util;
 
 #[doc(inline)]
 pub use self::{error::Error, run::run};
@@ -43,6 +46,10 @@ pub mod commands;
 #[cfg(feature = "api")]
 mod daemon;
 mod error;
+/// The serving path's stdout contract — readiness and startup refusals as event frames
+/// (design decision 19). Private: the frames are the protocol, not an API, and a caller inside
+/// this crate is the only thing that writes one.
+mod events;
 /// systemd's notification protocol and the unit text that asks for it. `sd-notify` cannot
 /// link on a non-unix target (`std::os::unix::*`), so the whole module is the gate — there is
 /// no Windows stub.

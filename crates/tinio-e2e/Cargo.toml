@@ -31,6 +31,7 @@ toml = { workspace = true }
 tinio-core = { path = "../tinio-core" }
 tinio-fs = { path = "../tinio-fs" }
 tinio-mem = { path = "../tinio-mem" }
+tinio-sandbox = { path = "../tinio-sandbox" }
 tinio-server = { path = "../tinio-server" }
 tinio-util = { path = "../tinio-util", features = ["testing"] }
 

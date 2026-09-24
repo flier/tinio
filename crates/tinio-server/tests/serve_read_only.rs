@@ -16,8 +16,9 @@
 //! `Signature is required` before it reaches the layer under test — an
 //! unsigned probe would answer the same thing whether or not the resolved
 //! mode was wired into the plane. Every request below carries a header-auth
-//! SigV4 signature: the compact signer `data.rs`'s `acl` test module wrote
-//! for exactly this situation, mirrored here.
+//! SigV4 signature, from [`common::signed`]: the compact signer `data.rs`'s
+//! `acl` test module wrote for exactly this situation, shared with the
+//! Windows confinement leg rather than mirrored into a second copy.
 //!
 //! The mode discriminator needs no fixture: a signed `PUT` to a bucket that
 //! does not exist answers `404 NoSuchBucket` read-write (the reference
@@ -44,38 +45,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use assert_cmd::cargo::cargo_bin;
-use common::{Wire, plant, send};
-use sha2::{Digest, Sha256};
+use common::{frame_line, plant, signed, tinio_bin, wait_timeout};
 use tempfile::TempDir;
-use time::OffsetDateTime;
 use tinio_config::state::STATE_DIR_VAR;
 use tinio_core::acl::DEFAULT_ROOT_ACCESS_KEY;
-use tinio_util::testing::wait_timeout_secs;
+use tinio_sandbox::Event;
 use tokio::time::sleep;
 
 /// The fixed credential pair [`Serve::spawn`] hands the child, and the pair
-/// every request below is signed with: the access key is the core
-/// convention constant, the secret the literal `identity::root_auth_pair`
-/// falls back to with no `[auth]` section.
+/// every request below is signed with ([`common::signed`] keeps the same two
+/// values on the signing side): the access key is the core convention
+/// constant, the secret the literal `identity::root_auth_pair` falls back to
+/// with no `[auth]` section.
 const ACCESS_KEY: &str = DEFAULT_ROOT_ACCESS_KEY;
 const SECRET_KEY: &str = "minioadmin";
-
-/// The `Host` every request carries and signs. The server binds
-/// `127.0.0.1`, and s3s verifies the signature over the `Host` header the
-/// client sent — never against the bound address — so the value is the
-/// signer's to choose (`data.rs`'s acl test picks the same one).
-const HOST: &str = "localhost";
-
-/// The one line the server writes to stdout (the harness parses it).
-const READY: &str = "listening on ";
-
-/// How long a spawned child gets to reach readiness, or to exit — the knob
-/// and default [`tinio_util::testing::wait_for`] honours, read through its
-/// own accessor: one policy for a starved runner, not a second default here.
-fn wait_timeout() -> Duration {
-    Duration::from_secs(wait_timeout_secs())
-}
 
 /// The lines a child has written to one pipe so far, shared with that
 /// pipe's draining thread (the only writer).
@@ -101,6 +84,26 @@ fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
     })
 }
 
+/// The event the child has reported on stdout, decoded from the frames buffered so far.
+///
+/// **The readiness is an event frame, not a scraped line** (decision 19): the serving path's
+/// whole stdout is `event:`/`data:`/blank-line blocks, and the framing rule that turns those
+/// lines back into an event is [`common::frame_line`]'s — the one every spawning target in this
+/// crate decodes with, so this function is only the walk over the buffered lines. A frame that
+/// is not ours does not decode and is skipped rather than fatal, which is what makes a stray
+/// write to stdout harmless.
+///
+/// **A refusal is an event too, and it is handed back rather than skipped** (decision 19): the
+/// `error` frame a startup refusal sends carries the child's own rendering of why nothing
+/// started, so a caller that sees it reports the cause where matching only
+/// [`Event::Listening`] recorded a refusal as an absence. Reading the first decodable frame is
+/// therefore right: a refusal is terminal — the child exits beside it — and no `listening`
+/// frame follows one.
+fn listening(lines: &[String]) -> Option<Event> {
+    let mut frame = String::new();
+    lines.iter().find_map(|line| frame_line(&mut frame, line))
+}
+
 /// A spawned `tinio server` child with both pipes drained. Killed and reaped
 /// when it drops (see the module doc for the ordering rationale).
 struct Serve {
@@ -115,16 +118,17 @@ impl Serve {
     /// Spawn `tinio server <root>` (the root is always the first argument)
     /// with `args` after it.
     ///
-    /// The child inherits this process's environment, so the three
+    /// The child inherits this process's environment, so the four
     /// variables that would silently change what it serves are removed
     /// first — `TINIO_READ_ONLY` (which would put every spawned server in
-    /// read-only mode), `TINIO_STATE_DIR` (which would relocate its state)
-    /// and `TINIO_SCANNER` (which would change what it scans) — and only
-    /// then is the caller's `env` applied. The rationale is `clients.rs`'s
+    /// read-only mode), `TINIO_SANDBOX` (which would put it in a confinement
+    /// this target never asks for), `TINIO_STATE_DIR` (which would relocate
+    /// its state) and `TINIO_SCANNER` (which would change what it scans) — and
+    /// only then is the caller's `env` applied. The rationale is `clients.rs`'s
     /// `spawn_child`; each leg here sets exactly what it means to set.
     ///
-    /// **The credential pair is the one thing the CLI needs that the
-    /// retired example did not.** The CLI reads `[auth]`, and a first start
+    /// **The credential pair is what this target has to supply and the data
+    /// plane's own harnesses do not.** The CLI reads `[auth]`, and a first start
     /// *generates* a random pair into the config it creates, so every
     /// request below — signed with the fixed pair — would be refused with
     /// `SignatureDoesNotMatch`. `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are
@@ -134,7 +138,7 @@ impl Serve {
     /// built. The caller's `env` is applied after, so a leg could still
     /// override them.
     fn spawn(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
-        let bin = cargo_bin("tinio");
+        let bin = tinio_bin();
         let mut cmd = Command::new(&bin);
         cmd.arg("server")
             .arg(root)
@@ -175,8 +179,13 @@ impl Serve {
         }
     }
 
-    /// Wait for the `listening on <addr>` readiness line and return the
-    /// address the child actually bound (`--port 0` makes it ephemeral).
+    /// Wait for the `listening` event and return the address the child
+    /// actually bound (`--port 0` makes it ephemeral).
+    ///
+    /// **A refusal is reported as the refusal it is** (decision 19): an `error`
+    /// frame on stdout is panicked with its own text — the child's rendering of
+    /// why nothing started — instead of the timeout the absent `listening` frame
+    /// would otherwise read as.
     ///
     /// Bounded: a child that never gets there fails this wait with its
     /// captured stderr instead of hanging the suite, and one that dies
@@ -185,11 +194,21 @@ impl Serve {
         let timeout = wait_timeout();
         let deadline = Instant::now() + timeout;
         loop {
-            for line in self.stdout.lock().expect("the stdout buffer").iter() {
-                if let Some(raw) = line.strip_prefix(READY) {
-                    return raw.parse().unwrap_or_else(|e| {
-                        panic!("cannot parse the readiness line `{line}`: {e}")
-                    });
+            // Bound before the match: the lock guard must be gone before
+            // `stop` joins the pipe drains, because one of those threads takes
+            // the same buffer.
+            let event = listening(&self.stdout.lock().expect("the stdout buffer"));
+            if let Some(event) = event {
+                match event {
+                    Event::Listening { addr } => return addr,
+                    Event::Error { message } => {
+                        // The child is on its way out beside its refusal
+                        // frame; reap it here so the leg leaves no zombie
+                        // behind — `Drop` would reap it too, but only once
+                        // the unwind begins.
+                        self.stop();
+                        panic!("the server refused to start: {message}");
+                    }
                 }
             }
             if let Some(status) = self.child.try_wait().expect("the child's status") {
@@ -197,14 +216,14 @@ impl Serve {
                 // quotes, and a live child's are not at EOF yet.
                 self.stop();
                 panic!(
-                    "the server exited ({status}) before printing `{READY}`; stderr:\n{}",
+                    "the server exited ({status}) before reporting `listening`; stderr:\n{}",
                     self.stderr_text()
                 );
             }
             if Instant::now() >= deadline {
                 self.stop();
                 panic!(
-                    "the server printed no `{READY}` line within {} s; stderr:\n{}",
+                    "the server reported no `listening` event within {} s; stderr:\n{}",
                     timeout.as_secs(),
                     self.stderr_text()
                 );
@@ -287,103 +306,6 @@ impl Drop for Serve {
         // See [`Serve::stop`] and the module doc.
         self.stop();
     }
-}
-
-/// RFC 2104 HMAC-SHA256 (SigV4's derivation needs it; the test signer skips
-/// dedicating the `hmac` crate, like `data.rs`'s acl test).
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut key_vec = key.to_vec();
-    if key_vec.len() > 64 {
-        key_vec = Sha256::digest(&key_vec).to_vec();
-    }
-    key_vec.resize(64, 0);
-    let mut inner = Vec::with_capacity(64);
-    let mut outer = Vec::with_capacity(64);
-    for byte in &key_vec {
-        inner.push(byte ^ 0x36);
-        outer.push(byte ^ 0x5c);
-    }
-    let inner_hash = Sha256::digest([inner.as_slice(), data].concat());
-    Sha256::digest([outer.as_slice(), inner_hash.as_slice()].concat()).into()
-}
-
-/// An `AWS4-HMAC-SHA256` Authorization header over the signed headers
-/// `host;x-amz-content-sha256;x-amz-date` — the canonicalization s3s
-/// verifies in `ops/signature.rs`, mirrored from `data.rs`'s acl test
-/// (`x-amz-content-sha256` is S3-specific and covers the payload).
-#[allow(clippy::too_many_arguments)]
-fn authorization(
-    access_key: &str,
-    secret: &str,
-    method: &str,
-    path: &str,
-    host: &str,
-    date8: &str,
-    amz_date: &str,
-    payload_hash: &str,
-) -> String {
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_request = format!(
-        "{method}\n{path}\n\nhost:{host}\n\
-         x-amz-content-sha256:{payload_hash}\n\
-         x-amz-date:{amz_date}\n\n\
-         {signed_headers}\n\
-         {payload_hash}"
-    );
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{date8}/us-east-1/s3/aws4_request\n{}",
-        hex::encode(Sha256::digest(canonical_request.as_bytes()))
-    );
-    let mut key = b"AWS4".to_vec();
-    key.extend_from_slice(secret.as_bytes());
-    for part in [date8.as_bytes(), b"us-east-1", b"s3", b"aws4_request"] {
-        key = hmac_sha256(&key, part).to_vec();
-    }
-    let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
-    format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{date8}/us-east-1/s3/aws4_request, \
-         SignedHeaders={signed_headers}, Signature={signature}"
-    )
-}
-
-/// One signed request with the harness's fixed credential pair — no
-/// unsigned request reaches the layer under test, see the module doc.
-async fn signed(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Wire {
-    let now = OffsetDateTime::now_utc();
-    let date8 = format!(
-        "{:04}{:02}{:02}",
-        now.year(),
-        u8::from(now.month()),
-        now.day()
-    );
-    let amz_date = format!(
-        "{date8}T{:02}{:02}{:02}Z",
-        now.hour(),
-        now.minute(),
-        now.second()
-    );
-    let payload_hash = hex::encode(Sha256::digest(body));
-    let auth = authorization(
-        ACCESS_KEY,
-        SECRET_KEY,
-        method,
-        path,
-        HOST,
-        &date8,
-        &amz_date,
-        &payload_hash,
-    );
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\n\
-         Host: {HOST}\r\n\
-         x-amz-date: {amz_date}\r\n\
-         x-amz-content-sha256: {payload_hash}\r\n\
-         Authorization: {auth}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        body.len()
-    );
-    send(addr, &head, body).await
 }
 
 /// The mode the plane serves in, observed from outside the process.
@@ -507,10 +429,10 @@ async fn the_read_only_flag_relocates_the_state_and_refuses_writes() {
     );
     // The state really moved out of the root, and the summary the CLI
     // prints on stderr says which mode it is serving in (stdout is the
-    // harness's readiness line alone). The needle is that summary's
+    // harness's readiness frame alone). The needle is that summary's
     // mode-and-credentials tail: the line's root is the *canonical* one and
     // the canonical spelling is not this test's to spell, while the address
-    // is — `ready` parsed it off the same line.
+    // is — the readiness event carried it.
     let diagnostic = format!(" on {addr} (read-only; credentials ");
     let stderr = server.stderr_containing(&diagnostic).await;
     assert!(
@@ -529,17 +451,23 @@ async fn the_read_only_flag_relocates_the_state_and_refuses_writes() {
 
     server.stop();
     // Complete now that the child is gone: stdout carried the readiness
-    // line and nothing else.
+    // frame and nothing else — the `event:` line, the `data:` line and the
+    // blank line that closes them, which is the whole of the stream's
+    // contract (decision 19).
     let stdout = server.stdout_lines();
     assert_eq!(
         stdout.len(),
-        1,
-        "stdout must carry the readiness line alone; got {stdout:?}"
+        3,
+        "stdout must carry the readiness frame alone; got {stdout:?}"
     );
     assert!(
-        stdout[0].starts_with(READY),
-        "the single stdout line must be the readiness line; got {:?}",
+        stdout[0].starts_with("event: listening"),
+        "the frame's first line names the event; got {:?}",
         stdout[0]
+    );
+    assert!(
+        listening(&stdout).is_some(),
+        "the frame must decode as the readiness event; got {stdout:?}"
     );
 }
 
@@ -731,8 +659,8 @@ async fn missing_root_fails(label: &str, missing: &Path, env: &[(&str, &str)]) -
 /// Under the CLI an unknown argument is clap's own usage error, mapped to
 /// `Error::Usage` and printed by the entry point as `tinio: <clap message>`
 /// — so the text this leg looks for is the `Usage: tinio server` line clap
-/// renders, which is the CLI's one author for that line, not the example's
-/// own `usage: serve`.
+/// renders, which is the CLI's one author for that line and not a usage text of
+/// its own.
 #[tokio::test]
 async fn an_unknown_argument_exits_with_the_usage_status() {
     let scratch = Scratch::new();

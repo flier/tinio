@@ -5,3 +5,22 @@
 [profile.ci]
 fail-fast = false
 retries = 2
+
+# The two platform confinement suites are out of THIS leg's run and nothing
+# else's: they are fail-not-skip on purpose (`docs/tests.md`, "fail, never
+# skip"), so on a runner that cannot confine they fail rather than skip —
+# ubuntu's AppArmor default refuses the unprivileged user namespace
+# `tinio-sandbox-linux::jail` needs, and a hosted Windows runner owes the
+# console `tinio-sandbox-windows::signals` delivers its stop to. Their gate is
+# the platform script on a host that owes the precondition
+# (`crates/tinio-sandbox-linux/scripts/wsl-chroot.sh` /
+# `crates/tinio-sandbox-windows/scripts/verify-windows.ps1`). Both still
+# compile and lint in every leg (a build break stays red), and a host that can
+# confine runs them with `--ignore-default-filter` — or without `--profile ci`.
+#
+# `binary(<name>)`, never `binary(<package>::<name>)`: the qualified form is
+# not a binary name, and nextest answers `failed to parse
+# profile.ci.default-filter` / `operator didn't match any binary names` — the
+# whole leg fails before a test runs (exit 96; 94 when passed via `-E`).
+# Verified against cargo-nextest 0.9.146.
+default-filter = "not binary(jail) and not binary(signals)"

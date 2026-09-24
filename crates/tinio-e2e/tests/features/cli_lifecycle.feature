@@ -1,7 +1,13 @@
 # The CLI's process surface (T055): every scenario here spawns the real `tinio`
-# binary. The readiness line, `--daemon`'s parent probe, the round trip, the
+# binary. The readiness event, `--daemon`'s parent probe, the round trip, the
 # state-dir and mode rules `status`/`stop` are held to (decision 19), the `.env`
-# level of FR-016's chain, and the two sandbox refusals.
+# level of FR-016's chain, and the two sandbox channels — refused by name where nothing can
+# honour them, honoured where the target's backend is wired. Which of the two a scenario owes is
+# dispatched, never accepted either way (`steps/cli.rs`, `owed_arm`).
+#
+# `@confinement` is the host gate on those two: they need a target that can build the confinement
+# (or, macOS, owes the refusal), which no leg can assume, so the runner runs them on macOS and
+# takes them only on `TINIO_E2E_CONFINEMENT=1` elsewhere (`tests/cucumber.rs`).
 #
 # These are the legs `crates/tinio/tests/lifecycle.rs` used to hold. That file
 # keeps only the console-handler leg, which no scenario can express: it needs
@@ -159,21 +165,19 @@ Feature: CLI lifecycle
     Then the run fails with exit code 1
     And the root holds no state directory
 
-  @cli @FR-036
-  Scenario: A sandbox that cannot be honoured refuses and never serves
+  @cli @confinement @FR-036
+  Scenario: A `--sandbox` request is never silently ignored
     Given a storage root
+    And the binary's "--sandbox" flag is probed
     When I run "tinio server {root} --port 0 --sandbox"
-    Then the run fails
-    And its stderr contains "sandbox"
-    And the root publishes no state file
+    Then the "--sandbox" request is answered, never ignored
+    And the root publishes a state file only when the run is serving
 
-  @cli @FR-036
-  Scenario: The sandbox variable is never silently ignored
+  @cli @confinement @FR-036
+  Scenario: The `TINIO_SANDBOX` variable is never silently ignored
     Given a storage root
     And the binary's "--sandbox" flag is probed
     And the child's environment holds "TINIO_SANDBOX" = "1"
     When I run "tinio server {root} --port 0"
-    Then the run fails
-    And its stderr contains "sandbox"
-    And the refusal names the platform where the flag is built in, and the build where it is not
-    And the root publishes no state file
+    Then the "TINIO_SANDBOX" request is answered, never ignored
+    And the root publishes a state file only when the run is serving

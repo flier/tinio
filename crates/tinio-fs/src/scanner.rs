@@ -12,11 +12,16 @@
 //! whole-bucket-in-memory, R1).
 //!
 //! Pacing per contracts/config.md (Minio-aligned): `delay` between entry
-//! batches (throttle), `max_wait` bounds a single sleep so shutdown is
-//! always prompt, `cycle` is the minimum interval between full-tree passes.
-//! `TINIO_SCANNER` (`0`/`1`) overrides the `[scanner]` presence gate at
-//! construction. The scanner never blocks startup (it launches after
-//! readiness) and aborts quietly on the shutdown channel.
+//! batches (throttle), `max_wait` bounds a single sleep, `cycle` is the
+//! minimum interval between full-tree passes. **Promptness on a stop is not
+//! `max_wait`'s any more**: `pacing::sleep_checked` wakes on the shutdown
+//! watch and the timer together, so the pause ends the moment a stop
+//! arrives whatever the bound is (measured 2026-09-21 — before that fix a
+//! stop was answered only between chunks, which pinned a clean exit 15 s
+//! after the child's own start). `TINIO_SCANNER` (`0`/`1`) overrides the
+//! `[scanner]` presence gate at construction. The scanner never blocks
+//! startup (it launches after readiness) and aborts quietly on the shutdown
+//! channel.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -65,8 +70,11 @@ pub struct ScannerOptions {
     pub enabled: bool,
     /// Seconds between scan batches (pacing/throttle).
     pub delay: Duration,
-    /// Max time to wait for a scan slot when throttled (bounds a single
-    /// sleep so shutdown stays prompt).
+    /// Max time to wait for a scan slot when throttled: the bound on a single
+    /// sleep. **It no longer decides when a stop is noticed** — the pacing
+    /// sleep wakes on the shutdown watch by itself, so a pause ends the moment
+    /// the channel turns whatever this is set to; what the bound still buys is
+    /// how often that loop is re-armed.
     pub max_wait: Duration,
     /// Full-tree re-scan cadence (catches out-of-band changes over time).
     pub cycle: Duration,

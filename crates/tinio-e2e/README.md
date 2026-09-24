@@ -1,7 +1,7 @@
 # tinio-e2e
 
 BDD acceptance suite: cucumber scenarios over the in-process tinio server, and — for the
-`@external` scenarios — over a spawned `serve` binary driven by third-party clients. The
+`@external` scenarios — over a spawned `tinio` binary driven by third-party clients. The
 feature files are the executable form of `specs/001-s3-local-server/contracts/s3-surface.md`;
 every scenario carries spec traceability tags (`@FR-xxx` / `@SC-xxx` / `@Txxx`) that a
 dedicated test target cross-checks against the spec corpus (both directions).
@@ -37,7 +37,7 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | Tag | Level | Effect |
 |---|---|---|
 | `@FR-xxx` `@SC-xxx` `@Txxx` | feature, some scenario | Spec traceability; cross-checked by the `traceability` target. |
-| `@interop` | scenario | External: aws cli v2 + rclone against a spawned `serve`; CI-gated. |
+| `@interop` | scenario | External: aws cli v2 + rclone against a spawned `tinio`; CI-gated. |
 | `@boto3` | scenario | External: boto3 SDK scenarios; manual tier (FR-025). |
 | `@mc` | scenario | External: MinIO mc scenarios; manual tier (FR-025). |
 | `@aws` `@rclone` | scenario | The client a specific `@interop` scenario drives. |
@@ -54,6 +54,7 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
 | `@cli` | scenario | The CLI scenarios (`cli_lifecycle.feature`): they spawn the real `tinio` binary and observe it from outside, so the `#[before]` hook spawns nothing for them — no in-process server, no wire client. The binary must be built first (`cargo build -p tinio`); `{root}`/`{state}` in a step's command line expand to the scenario's scratch root and relocated state dir. |
 | `@unix` `@windows` | scenario | Platform-bound: the step definitions exist only on that platform, so the default filter excludes the other platform's tag (an undefined step is a failure under `fail_on_skipped()`). Today only the notify scenario carries one (`@unix`). |
+| `@confinement` | scenario | Host-bound: the two sandbox scenarios of `cli_lifecycle.feature` need a target that can build the confinement, which no CI leg assumes. The default filter runs them on macOS (whose backend is the stub, so the leg is one deterministic refusal) and takes them elsewhere only with `TINIO_E2E_CONFINEMENT=1`; their real gate is the platform script on a host that owes the precondition (`docs/tests.md`, "Platform-gated verification"). |
 
 The **`@external` umbrella** is `@interop` ∪ `@boto3` ∪ `@mc`.
 
@@ -61,7 +62,7 @@ The **`@external` umbrella** is `@interop` ∪ `@boto3` ∪ `@mc`.
 
 ```
 cargo test -p tinio-e2e                          # in-process suite only (default)
-cargo test -p tinio-e2e --test cucumber -- --tags '@cli and not @unix and not @windows'  # the CLI process scenarios
+cargo test -p tinio-e2e --test cucumber -- --tags '@cli and not @unix and not @windows and not @confinement'  # the CLI process scenarios
 cargo test -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
 cargo test -p tinio-e2e --test cucumber -- --tags '@boto3'
 cargo test -p tinio-e2e --test cucumber -- --tags '@mc'
@@ -70,13 +71,24 @@ cargo test -p tinio-e2e --test traceability      # spec↔tag cross-check
 ```
 
 - **The default run excludes what this build cannot serve**: `cargo test -p tinio-e2e` without
-  `--tags` gets a runner-composed `CUCUMBER_FILTER_TAGS` from three independent axes — `@parquet`
+  `--tags` gets a runner-composed `CUCUMBER_FILTER_TAGS` from four independent axes — `@parquet`
   is excluded unless the binary was built `--features parquet`, the other platform's tag
   (`@unix` on Windows, `@windows` elsewhere) is excluded because those step definitions do not
-  exist here, and the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL=1` is set.
-- **An explicit `--tags` replaces the default filter** — a tagged run must re-state all three
+  exist here, the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL=1` is set, and
+  `@confinement` is excluded off macOS unless `TINIO_E2E_CONFINEMENT=1` is set.
+- **An explicit `--tags` replaces the default filter** — a tagged run must re-state all four
   exclusions. CI's mem pass does: `--tags 'not @fs and not @unix and not @windows and not
-  @parquet and not @interop and not @boto3 and not @mc'` with `TINIO_E2E_BACKEND=mem`.
+  @parquet and not @interop and not @boto3 and not @mc and not @confinement'` with
+  `TINIO_E2E_BACKEND=mem`.
+- **The `@confinement` pair is opt-in off macOS, and serial when it runs.** Opt in only on a host
+  that can actually build the confinement (WSL2 with an unprivileged userns, or a Windows host
+  with a console and a writable volume) — CI never opts in: ubuntu's AppArmor default refuses the
+  userns, a hosted Windows runner owes no ACE-grant budget, and either would make the leg
+  permanently red, which certifies nothing. `--concurrency 1` is the spelling to use: the pair
+  timed out twice at the default concurrency while the harness still had its 30 s bound, and one
+  launcher run's grant alone is tens of seconds (the six timings, and what they do not prove, are
+  in `docs/tests.md`, "Platform-gated verification (Windows)").
+  `TINIO_E2E_CONFINEMENT=1 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036' --concurrency 1`
 - **The `@cli` scenarios spawn the real binary**, so it has to be built before the run
   (`cargo build -p tinio`) — `assert_cmd::cargo::cargo_bin` resolves `<profile>/tinio` beside the
   test binary and builds nothing. Both CI e2e jobs build it first.
@@ -99,6 +111,7 @@ the presence check when `rclone` is missing.
 |---|---|
 | `TINIO_E2E_BACKEND` | `mem` runs the backend-neutral scenarios on the mem backend (CI mem pass). Explicit `@fs`/`@mem` scenario tags win over it; default `fs`. |
 | `TINIO_E2E_EXTERNAL` | Set to `1` to disable the default `@external` exclusion (the `@parquet` exclusion is unaffected — it follows the cargo feature; an explicit `--tags` still wins). |
+| `TINIO_E2E_CONFINEMENT` | Set to `1` to disable the `@confinement` exclusion on a non-macOS target. Only a host that can build the confinement should set it (see the tag table); CI never does. An explicit `--tags` still wins. |
 | `TINIO_E2E_REPORT` | Path of the Cucumber-JSON report written alongside the pretty stdout (CI uploads it for the PR test report). A bare filename lands in `crates/tinio-e2e/` — cargo runs test binaries with the package root as cwd. |
 | `TINIO_BOTO3_PYTHON` | Override for the boto3 venv python. Default: `<target-dir>/tinio-e2e-venv/bin/python3` (Linux) / `Scripts\python.exe` (Windows). |
 

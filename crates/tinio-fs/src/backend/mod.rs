@@ -16,7 +16,7 @@ mod objects;
 use std::{
     collections::HashMap,
     fs::{Metadata, canonicalize},
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::{Path, PathBuf, absolute},
     sync::Arc,
     time::{Duration, Instant},
@@ -27,6 +27,8 @@ use garde::Validate;
 use getset::{CopyGetters, Getters};
 use lockmap::Map;
 pub use objects::StagedBody;
+#[cfg(windows)]
+use soft_canonicalize::soft_canonicalize;
 use tokio::fs;
 
 pub use crate::error::Error;
@@ -46,7 +48,7 @@ use crate::{
         to_nanos,
     },
     _store::{bucket, decode_acl_wire, decode_owner_wire, meta, object_part, upload},
-    _util::lockmap,
+    _util::{lockmap, path::path_contains},
     bucket::Store as BucketStore,
     database::{self, Handle, compact_if_needed},
     etag, fsutil,
@@ -298,18 +300,52 @@ pub struct FsStorage {
 /// warn marks a stuck peer, not routine contention.
 const MUTATION_LOCK_WARN_THRESHOLD: Duration = Duration::from_secs(1);
 
-/// The lowercased components of a path — the case-insensitive comparison
-/// form of the read-only containment rule (Windows only; NTFS resolves
-/// case-different names to the same directory).
+/// Canonicalize `path`, with `soft-canonicalize` standing in for **one**
+/// failure: a process the platform refuses the volume-name lookup.
 ///
-/// A path whose bytes are not valid Unicode is lowercased lossily; NTFS
-/// cannot express two such names as distinct either, so the approximation
-/// cannot hide a real in-root state dir.
+/// **The refusal this exists for is a property of the process and not of the
+/// call.** A confined Windows process cannot name a volume in the DOS form —
+/// that needs a device map an AppContainer token may not read — so
+/// `std::fs::canonicalize` fails `ERROR_ACCESS_DENIED` on a path that opened
+/// perfectly well one line earlier (the sandbox design's verified-evidence row,
+/// measured 2026-09-21). `soft_canonicalize` resolves through
+/// `read_link`/`symlink_metadata`, which the container does grant.
+///
+/// **The fallback's answer is accepted only when it names a directory**, which is
+/// the judgement this function went looking for — the directory fact is what the
+/// constructor asked for. Accepting any lexical answer would report a root that is
+/// not there, and `resolve` reads the same fact one line later.
+///
+/// Every other failure is the platform canonicalizer's to report: a missing root
+/// still answers `NotFound` from `canonicalize` itself, and a fallback reached
+/// there would answer `Ok` for a path that is not on disk — which is what
+/// `tests.rs`'s missing-root case pins.
+///
+/// **The remedy is Windows-only, and the `cfg` says so rather than a comment.**
+/// The refusal it answers is the AppContainer's device map (`VOLUME_NAME_DOS`),
+/// which is a Windows confinement fact — `soft-canonicalize` is not a better
+/// canonicalizer here, it is one that resolves through calls that container
+/// grants. Leaving the fallback armed on the other two platforms would be the
+/// generic backend carrying one platform's remedy, and would silently change what
+/// a `PermissionDenied` means there: on a unix host it is an unsearchable
+/// ancestor, and a lexical answer for that path is a wrong answer rather than a
+/// remedy.
 #[cfg(windows)]
-fn lower_components(path: &Path) -> Vec<String> {
-    path.components()
-        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
-        .collect()
+fn canonicalize_tolerating_a_denied_device_map(path: &Path) -> io::Result<PathBuf> {
+    match canonicalize(path) {
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => match soft_canonicalize(path) {
+            Ok(resolved) if resolved.is_dir() => Ok(resolved),
+            _ => Err(err),
+        },
+        other => other,
+    }
+}
+
+/// [`canonicalize`], on the platforms whose `PermissionDenied` has no device map
+/// behind it.
+#[cfg(not(windows))]
+fn canonicalize_tolerating_a_denied_device_map(path: &Path) -> io::Result<PathBuf> {
+    canonicalize(path)
 }
 
 impl FsStorage {
@@ -400,7 +436,10 @@ impl FsStorage {
                 "required in read-only mode (the default `<root>/.tinio` would write the root)",
             ));
         }
-        let canonical = canonicalize(&root)?;
+        // The helper accepts its fallback only for a directory, which is the one
+        // fact this function went looking for; the check below is what reports a
+        // root that is not there, fallback or not.
+        let canonical = canonicalize_tolerating_a_denied_device_map(&root)?;
         if !canonical.is_dir() {
             return Err(root_not_directory(canonical));
         }
@@ -409,12 +448,21 @@ impl FsStorage {
         // mode promises to leave alone, and a writable root would never
         // complain. Lexical (the design's residual): the state dir need
         // not exist yet, so it cannot be canonicalized here.
+        //
+        // The rule itself is `tinio-util`'s [`path_contains`] — the one
+        // definer, shared with the server launcher's exposure set (design
+        // §9/§10), which asks the same question about the same two paths
+        // one process earlier. It is deliberately not spelled here: this
+        // guard carried its own copy once, and a second copy of a
+        // case-folding rule is how the other owner ends up comparing
+        // components literally — an in-root state dir in another case
+        // reading as outside (FR-023, decision 17a).
         if options.access.is_read_only()
             && let Some(dir) = options.state_dir.as_deref()
         {
             let absolute = absolute(dir)
                 .map_err(|_| invalid_state_dir("could not be resolved in read-only mode"))?;
-            if Self::contained_in_root(&absolute, &canonical) {
+            if path_contains(&absolute, &canonical) {
                 return Err(invalid_state_dir(
                     "must be outside the storage root in read-only mode",
                 ));
@@ -425,53 +473,6 @@ impl FsStorage {
             None => state_dir(&canonical)?,
         };
         Ok((canonical, state_dir, options))
-    }
-
-    /// Whether the (lexically absolutized) state dir lies inside the
-    /// canonical root — the read-only containment rule (FR-023, decision
-    /// 17a).
-    ///
-    /// Case-sensitively, exactly as [`Path::starts_with`] compares: unix
-    /// filesystems distinguish `…/Data` from `…/data`.
-    #[cfg(not(windows))]
-    fn contained_in_root(absolute: &Path, canonical: &Path) -> bool {
-        absolute.starts_with(canonical)
-    }
-
-    /// Whether the (lexically absolutized) state dir lies inside the
-    /// canonical root — the read-only containment rule (FR-023, decision
-    /// 17a).
-    ///
-    /// Case-**insensitively**: NTFS resolves `d:\temp\…` and `D:\Temp\…`
-    /// to the same directory while [`Path::starts_with`] compares
-    /// components literally, so a differently-cased in-root state dir is
-    /// exactly the mistake this guard exists to catch. The comparison
-    /// stays component-wise (so `…\data2` is not "inside" `…\data`), and
-    /// it runs against both shapes of the canonical root:
-    /// `std::fs::canonicalize` answers a verbatim path (`\\?\D:\data`)
-    /// while `std::path::absolute` answers the plain form (`D:\data`).
-    #[cfg(windows)]
-    fn contained_in_root(absolute: &Path, canonical: &Path) -> bool {
-        let candidate = lower_components(absolute);
-        [Some(canonical), Self::plain(canonical).as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|root| candidate.starts_with(&lower_components(root)))
-    }
-
-    /// The plain (non-verbatim) form of a canonical root:
-    /// `std::fs::canonicalize` answers a verbatim path (`\\?\C:\data`, or
-    /// `\\?\UNC\srv\share\data` for a UNC root) while
-    /// `std::path::absolute` answers the plain form (`C:\data`,
-    /// `\\srv\share\data`). `None` when the path carries no verbatim
-    /// prefix.
-    #[cfg(windows)]
-    fn plain(canonical: &Path) -> Option<PathBuf> {
-        let text = canonical.to_str()?.strip_prefix(r"\\?\")?;
-        Some(match text.strip_prefix("UNC\\") {
-            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
-            None => PathBuf::from(text),
-        })
     }
 
     fn from_resolved(

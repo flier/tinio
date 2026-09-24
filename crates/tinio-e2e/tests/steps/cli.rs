@@ -25,6 +25,7 @@ use std::io::ErrorKind;
 use std::os::unix::net::UnixDatagram;
 use std::{
     env, fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -34,13 +35,10 @@ use std::{
 use assert_cmd::cargo::cargo_bin;
 use cucumber::{gherkin::Step, given, then, when};
 use tempfile::TempDir;
+use tinio_sandbox::Event;
 use tokio::time::sleep;
 
 use super::World;
-
-/// The readiness line's prefix — `commands::readiness_line`'s text, the one line a server writes
-/// to stdout (`listening on <host>:<port>`).
-const READY: &str = "listening on ";
 
 /// How long a run may go without exiting and without reporting readiness before the harness
 /// calls it hung.
@@ -49,11 +47,20 @@ const READY: &str = "listening on ";
 /// bound before it refuses, and every scenario that cares about latency asserts it itself.
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a **confined** run may go the same way.
+///
+/// The launcher's own bound, measured rather than guessed: before `CreateProcessW` it grants the
+/// `(OI)(CI)` ACE on the served root and `RX` on the `*.dll` beside the binary (`docs/tests.md`'s
+/// Windows "Grant cost": 32.3–37.8 s on NTFS against a 30 s readiness budget), and this harness
+/// measured 4.6 s one run and past 120 s the next on one host. A bound sized for an unconfined
+/// run would read that grant as a hang.
+const CONFINED_RUN_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// How long the teardown's own client waits for the daemon it is ending — it exists to end a
 /// process, not to assert on it, so it is bounded rather than polled forever.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One poll's wait: a run's exit and its readiness line are both watched by polling, and no
+/// One poll's wait: a run's exit and its readiness event are both watched by polling, and no
 /// scenario asserts on the poll's own cadence.
 const POLL: Duration = Duration::from_millis(20);
 
@@ -98,7 +105,7 @@ pub struct Cli {
     /// Whether this binary's parser knows `--sandbox` — the probe the sandbox scenario's
     /// discrimination rests on ([`Cli::knows_flag`]).
     sandbox_flag: Option<bool>,
-    /// The endpoint the last readiness line reported, kept across runs so a later `status` run
+    /// The endpoint the last readiness event reported, kept across runs so a later `status` run
     /// can be held to the address the server actually bound.
     endpoint: Option<String>,
     /// The last run; every run replaces it.
@@ -121,9 +128,9 @@ struct Run {
     stdout: String,
     /// Everything the run wrote to stderr.
     stderr: String,
-    /// The `listening on …` line, when the run printed one.
-    readiness: Option<String>,
-    /// Spawn → readiness line, for the runs that printed one.
+    /// The endpoint the run reported as its `listening` event, when it got that far.
+    readiness: Option<SocketAddr>,
+    /// Spawn → readiness event, for the runs that reported one.
     ready_in: Option<Duration>,
     /// Spawn → exit, or spawn → readiness for a run that never exited.
     took: Duration,
@@ -231,14 +238,25 @@ impl Cli {
         words
     }
 
+    /// Whether this run asks for a confinement — the flag on the command line, or the variable a
+    /// scenario put on the child ([`Cli::vars`]). Only the *budget* rides on this: which
+    /// assertion the run owes is the step's own dispatch.
+    fn confined(&self, argv: &[String]) -> bool {
+        let flagged = argv.iter().any(|arg| arg == "--sandbox");
+        let variable = self.vars.iter().any(|(name, value)| {
+            name == "TINIO_SANDBOX" && !matches!(value.as_str(), "0" | "false")
+        });
+        flagged || variable
+    }
+
     /// Runs the operator's command line — `tinio` and all — the way the scenario's environment
     /// asks, and captures what it did.
     ///
-    /// **The loop ends at the first of three things**: the child's exit, a readiness line, or
+    /// **The loop ends at the first of three things**: the child's exit, a readiness event, or
     /// the deadline. Which of the two events counts as the end depends on the spelling: a
-    /// `--daemon` run's readiness line is the *parent*'s, and the parent exits once it has
+    /// `--daemon` run's readiness event is the *parent*'s, and the parent exits once it has
     /// proved the daemon ready, so for that command the exit is what the scenario asserts and
-    /// the line is only read afterwards. Every other run that prints the line *is* the server,
+    /// the event is only read afterwards. Every other run that reports it *is* the server,
     /// and is kept — [`Cli::children`] kills and reaps it on the way out.
     async fn run(&mut self, command: &str) {
         let argv = self.argv(command);
@@ -255,7 +273,12 @@ impl Cli {
             ));
         let started = Instant::now();
         let mut child = cmd.spawn().expect("spawn the tinio binary");
-        let deadline = started + RUN_TIMEOUT;
+        let budget = if self.confined(&argv) {
+            CONFINED_RUN_TIMEOUT
+        } else {
+            RUN_TIMEOUT
+        };
+        let deadline = started + budget;
         let mut status = None;
         let mut ready_in = None;
         loop {
@@ -272,7 +295,7 @@ impl Cli {
                 let _ = child.wait();
                 panic!(
                     "`{command}` neither exited nor became ready within {}s\nstdout:\n{}\nstderr:\n{}",
-                    RUN_TIMEOUT.as_secs(),
+                    budget.as_secs(),
                     read(&out_path),
                     read(&err_path)
                 );
@@ -281,9 +304,9 @@ impl Cli {
         }
         let took = started.elapsed();
         let (stdout, stderr) = (read(&out_path), read(&err_path));
-        let line = readiness(&stdout);
-        if let Some(endpoint) = line.as_deref().map(endpoint_of) {
-            self.endpoint = Some(endpoint);
+        let address = readiness(&stdout);
+        if let Some(endpoint) = address {
+            self.endpoint = Some(endpoint.to_string());
         }
         // A successful `--daemon` run leaves a process nothing here holds a handle to: the
         // `state` file it published is the record, and it is what the teardown stops the daemon
@@ -299,7 +322,7 @@ impl Cli {
             status,
             stdout,
             stderr,
-            readiness: line,
+            readiness: address,
             ready_in,
             took,
         });
@@ -347,15 +370,23 @@ impl Cli {
     /// the workspace pins `tinio-cli` with `default-features = false`, so a
     /// `cfg!(feature = "sandbox")` written here would answer about *tinio-e2e* and not about the
     /// binary it spawns — the two disagree in exactly the graph the sandbox scenario has to
-    /// discriminate. A flag the parser does not know is "unexpected argument"; a flag it knows
-    /// and cannot honour answers the platform's own refusal.
+    /// discriminate. A flag the parser does not know is clap's `error: unexpected argument`; a
+    /// flag it knows and cannot honour answers the platform's own refusal.
+    ///
+    /// **`--help` is what keeps the probe bounded, and it is load-bearing.** A flag this parser
+    /// knows is an honourable confinement on Linux and Windows, so the bare command line would
+    /// *serve* — and on Windows the launcher parent supervises its child and does not exit either
+    /// — leaving an unbounded `output()` waiting on a server rather than on a parse. `--help` is
+    /// reached only once every argument before it parsed, and it exits without serving anything
+    /// (no state dir, no `state` file). The discriminator stays clap's own words: the help rides
+    /// stderr in this two-pass CLI, so the phrase searched for is the *error's*, not the help's.
     fn knows_flag(&self, flag: &str) -> bool {
         let mut cmd = self.command();
         cmd.arg("server")
             .arg(&self.root)
-            .args(["--port", "0", flag]);
+            .args(["--port", "0", flag, "--help"]);
         let out = cmd.output().expect("probe the flag");
-        !String::from_utf8_lossy(&out.stderr).contains("unexpected argument")
+        !String::from_utf8_lossy(&out.stderr).contains("error: unexpected argument")
     }
 
     /// Ends everything the scenario started.
@@ -467,17 +498,17 @@ fn cli(world: &mut World) -> &mut Cli {
     world.cli.as_mut().expect("the scenario has a storage root")
 }
 
-/// The `listening on …` line in `text`, if there is one: the only line a server writes to
-/// stdout, and the only signal that a run is serving.
-fn readiness(text: &str) -> Option<String> {
-    text.lines()
-        .find(|line| line.starts_with(READY))
-        .map(str::to_string)
-}
-
-/// The bound endpoint a readiness line reports.
-fn endpoint_of(line: &str) -> String {
-    line.trim_start_matches(READY).trim().to_string()
+/// The endpoint `text` reports as its readiness event, if it holds one.
+///
+/// **The event and not a scraped line** (decision 19): the serving path's whole stdout is event
+/// frames, so the readiness point is the `listening` frame's typed address rather than text
+/// this side parses. `decode` rejects anything that is not one of our frames, which is what
+/// keeps a stray write to stdout from reading as readiness.
+fn readiness(text: &str) -> Option<SocketAddr> {
+    match Event::decode(text.trim_end()) {
+        Some(Event::Listening { addr }) => Some(addr),
+        _ => None,
+    }
 }
 
 /// The `state` file the management plane publishes for `root` (`api::state::path`: the reserved
@@ -630,32 +661,26 @@ async fn run_fails_with_code(world: &mut World, code: u64) {
     );
 }
 
-/// The line a server prints when it starts, and what it says the OS bound.
+/// The endpoint a server reports when it starts, and the port it actually bound.
 ///
-/// **Three assertions in one, because the line is one fact**: the endpoint is not empty, it is
-/// not the literal `0` a run asks for, and it is not `--port`'s 9000 default — so the port on
-/// the line is the one the *run asked for*, whichever channel supplied it (a flag, `TINIO_PORT`
-/// or the `.env` file). An unmodified default would pass a leg that only looked for
-/// `listening on`.
+/// **One assertion per fact, and the address is the typed one the event carried**: the port is
+/// not `0` — the literal a run asks for and cannot have bound — and it is not `--port`'s 9000
+/// default, so the port is the one the *run asked for*, whichever channel supplied it (a flag,
+/// `TINIO_PORT` or the `.env` file). An unmodified default would pass a leg that only looked for
+/// a readiness event.
 #[then("the readiness line reports a bound port")]
 async fn ready_line_reports_port(world: &mut World) {
     let run = cli(world).last();
-    let line = run
-        .readiness
-        .as_deref()
-        .expect("the run printed a readiness line");
-    let endpoint = endpoint_of(line);
-    assert!(
-        !endpoint.is_empty(),
-        "the line reports its endpoint: {line:?}"
+    let address = run.readiness.expect("the run reported its readiness event");
+    assert_ne!(
+        address.port(),
+        0,
+        "`--port 0` is ephemeral and reported bound: {address}"
     );
-    assert!(
-        !endpoint.ends_with(":0"),
-        "`--port 0` is ephemeral and reported bound: {line:?}"
-    );
-    assert!(
-        !endpoint.ends_with(":9000"),
-        "the port is the one the run was given, never the default: {line:?}"
+    assert_ne!(
+        address.port(),
+        9000,
+        "the port is the one the run was given, never the default: {address}"
     );
 }
 
@@ -667,7 +692,7 @@ async fn ready_within(world: &mut World, milliseconds: u64) {
     let run = cli(world).last();
     let ready_in = run
         .ready_in
-        .expect("the run printed a readiness line to time");
+        .expect("the run reported a readiness event to time");
     assert!(
         ready_in < Duration::from_millis(milliseconds),
         "ready within {milliseconds} ms, took {ready_in:?}"
@@ -705,7 +730,7 @@ async fn stderr_not_empty(world: &mut World) {
     assert!(!stderr.is_empty(), "a usage error explains itself");
 }
 
-/// `status` reports the endpoint the server actually bound — the address its readiness line
+/// `status` reports the endpoint the server actually bound — the address its readiness event
 /// named, not a re-derivation.
 #[then("its stdout names the bound endpoint")]
 async fn stdout_names_endpoint(world: &mut World) {
@@ -823,26 +848,219 @@ async fn root_unchanged(world: &mut World) {
     );
 }
 
-/// The two refusals are a matched pair, written to be told apart: the build's names the build
-/// and never the platform, the platform's names the platform and never the build — so a leg that
-/// accepted either would pass just as well if the two were swapped.
-#[then("the refusal names the platform where the flag is built in, and the build where it is not")]
-async fn refusal_reason(world: &mut World) {
-    let cli = cli(world);
-    let built_in = cli
+/// The channel a scenario asked a confinement through, and the spelling a refusal must carry.
+#[derive(Clone, Copy, Debug)]
+enum SandboxChannel {
+    /// `--sandbox`: the flag, which only a build carrying the `sandbox` feature has at all.
+    Flag,
+    /// `TINIO_SANDBOX`: the variable, which cannot be compiled away.
+    Env,
+}
+
+impl SandboxChannel {
+    /// The channel a step's own spelling names — the feature's two, and only these.
+    fn parse(spelling: &str) -> Self {
+        match spelling {
+            "--sandbox" => Self::Flag,
+            "TINIO_SANDBOX" => Self::Env,
+            other => {
+                panic!("a confinement channel is `--sandbox` or `TINIO_SANDBOX`, not {other:?}")
+            }
+        }
+    }
+
+    /// The spelling the operator used, which every refusal the crate raises carries.
+    fn spelling(self) -> &'static str {
+        match self {
+            Self::Flag => "--sandbox",
+            Self::Env => "TINIO_SANDBOX",
+        }
+    }
+}
+
+/// Which arm a requested confinement must take on this host — **predicted from the two facts a
+/// scenario cannot change**, so a run that took another one is a failure rather than an accepted
+/// alternative.
+#[derive(Clone, Copy, Debug)]
+enum Arm {
+    /// No `sandbox` feature in that binary, so nothing could be confined: clap's usage error for
+    /// the flag (not in that parser at all) and this crate's for the variable, naming the build.
+    BuildRefused,
+    /// Feature in, and this target's backend is still the stub (macOS): refused, naming the
+    /// platform.
+    PlatformRefused,
+    /// Feature in and this target's backend confines (Linux, Windows): honoured, the run serves.
+    Applied,
+}
+
+/// The arm owed here. [`Cli::sandbox_flag`] is the probe step's answer, which is the feature's
+/// own presence in the parsed binary; every scenario that runs the assertion probes first, and
+/// that is what makes the arm a prediction rather than whichever one happened.
+fn owed_arm(cli: &Cli) -> Arm {
+    if !cli
         .sandbox_flag
-        .expect("the probe step ran before this one");
-    let stderr = &cli.last().stderr;
-    let (named, other) = if built_in {
-        ("platform", "build")
+        .expect("the scenario probes `--sandbox` before it asserts the arm")
+    {
+        Arm::BuildRefused
+    } else if cfg!(target_os = "macos") {
+        // The one stub (`tinio_cli::sandbox::BACKEND_IS_STUB`: Linux P1 and Windows P2 are
+        // wired), and the spawned binary is built for this test binary's own target.
+        Arm::PlatformRefused
     } else {
-        ("build", "platform")
-    };
+        Arm::Applied
+    }
+}
+
+/// **The invariant every sandbox channel is held to, on every build: a requested confinement is
+/// never silently ignored.**
+///
+/// Where nothing can honour the channel the run refuses, names the channel that asked for it, and
+/// — because the two refusals are a matched pair, written to be told apart — names the *build*
+/// where `--sandbox` is not in this parser and the *platform* whose backend cannot honour it, and
+/// never the other one. Where this target's backend is wired the request is honoured instead, and
+/// the assertion is the readiness event **plus the absence of every refusal's words**: "confined"
+/// is the platform legs' subject (`sandbox_e2e*`), not something a reader of stdout can certify.
+///
+/// **The arm is dispatched, not accepted either way.** [`owed_arm`] says which one this host owes
+/// and the run is held to that arm's own words, so the spelling this replaces — "either refused
+/// with the channel named or applied" — can no longer pass on a run that failed for some other
+/// reason and merely mentioned `sandbox`, nor on an honour arm that never reached readiness.
+#[then(expr = "the {string} request is answered, never ignored")]
+async fn request_answered(world: &mut World, channel: String) {
+    let channel = SandboxChannel::parse(&channel);
+    let cli = cli(world);
+    let run = cli.last();
+    match owed_arm(cli) {
+        Arm::BuildRefused => refused_by_build(run, channel),
+        Arm::PlatformRefused => refused_by_platform(run, channel),
+        Arm::Applied => applied(run),
+    }
+}
+
+/// Every refusal, whichever arm raised it: the channel's own spelling, and no service.
+fn refused(run: &Run, channel: SandboxChannel) {
+    let status = run
+        .status
+        .expect("a refused run has exited — a run still serving was not refused");
     assert!(
-        stderr.contains(named),
-        "the refusal names the {named}:\n{stderr}"
+        !status.success(),
+        "a requested confinement is refused, never served unconfined:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
     );
-    assert!(!stderr.contains(other), "and not the {other}:\n{stderr}");
+    assert!(
+        run.readiness.is_none(),
+        "a refusal that then served is not a refusal:\nstdout:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains(channel.spelling()),
+        "the refusal names the channel that asked for it (`{}`):\n{}",
+        channel.spelling(),
+        run.stderr
+    );
+}
+
+/// The build's refusal: the feature is not in that binary, so the run cannot confine and says so
+/// rather than serving unconfined. The flag is not in that parser at all — clap answers it, in
+/// clap's words — while the variable, which cannot be compiled away, is refused by the crate
+/// itself: a usage error (2) naming the **build**, never the platform, which is the other arm's
+/// half of the pair.
+fn refused_by_build(run: &Run, channel: SandboxChannel) {
+    refused(run, channel);
+    assert_eq!(
+        run.status.and_then(|status| status.code()),
+        Some(2),
+        "a capability this build does not carry is a usage error:\n{}",
+        run.stderr
+    );
+    match channel {
+        SandboxChannel::Flag => assert!(
+            run.stderr.contains("unexpected argument"),
+            "with no `sandbox` feature the flag is not in the parser, so clap is what refuses \
+             it:\n{}",
+            run.stderr
+        ),
+        SandboxChannel::Env => {
+            assert!(
+                run.stderr.contains("no `sandbox` feature"),
+                "the variable cannot be compiled away, so the crate names the build:\n{}",
+                run.stderr
+            );
+            assert!(
+                !run.stderr.contains("platform"),
+                "and not the platform — this is the build's half of the pair:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// The platform's refusal: the feature is in and this target's backend is the stub. A startup
+/// error (1) naming `std::env::consts::OS`, and never the build — telling the two apart is what
+/// the pair exists for.
+fn refused_by_platform(run: &Run, channel: SandboxChannel) {
+    refused(run, channel);
+    assert_eq!(
+        run.status.and_then(|status| status.code()),
+        Some(1),
+        "a stub backend is a startup error:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("platform"),
+        "the refusal names the platform whose backend cannot honour it:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("build"),
+        "and not the build — the feature is compiled in:\n{}",
+        run.stderr
+    );
+}
+
+/// The honour arm: the request reached a run that serves, and **no refusal's words are anywhere
+/// in its stream** — without that absence a run that refused and somehow still reported readiness
+/// would pass as the honoured one.
+fn applied(run: &Run) {
+    assert!(
+        run.readiness.is_some(),
+        "an honoured confinement is a run that serves: nothing was refused and no readiness \
+         event arrived\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.status.is_none(),
+        "the run that serves is the one the scenario drives, not an exit: {:?}\nstderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    for refusal in ["asked for a confinement", "unexpected argument"] {
+        assert!(
+            !run.stderr.contains(refusal),
+            "an honoured confinement carries no refusal ({refusal:?}):\n{}",
+            run.stderr
+        );
+    }
+}
+
+/// The publication half, per shape: a refusal leaves no `state` file, and a run that serves has
+/// one — so the file tracks *serving* rather than the channel, and a refusal stays
+/// distinguishable from a run.
+#[then("the root publishes a state file only when the run is serving")]
+async fn state_file_tracks_serving(world: &mut World) {
+    let cli = cli(world);
+    let file = state_file(cli.root());
+    let published = file.exists();
+    let serving = cli.last().readiness.is_some();
+    assert_eq!(
+        published,
+        serving,
+        "`state` is the serving process's record: published={published}, serving={serving}\n\
+         stderr:\n{}",
+        cli.last().stderr
+    );
 }
 
 /// A datagram of this tag arrived — bounded by [`NOTIFY_DEADLINE`], which is generous on

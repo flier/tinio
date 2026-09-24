@@ -13,7 +13,7 @@
 //! conversion into tokio's types is `serve_transport`'s job, inside the runtime.
 
 #[cfg(windows)]
-use std::os::windows::io::OwnedHandle;
+use std::os::windows::io::{AsRawHandle as _, OwnedHandle, RawHandle};
 #[cfg(unix)]
 use std::{
     fs,
@@ -62,7 +62,15 @@ pub struct Channel {
 }
 
 /// A bound control channel, before it is served. This is the Windows form: the pipe name and the
-/// bound first instance the runtime adopts.
+/// instances the runtime adopts.
+///
+/// **The channel binds a pool, not one instance, and the pool is what keeps the name answering.**
+/// A named pipe is dialled by name, so a client only ever finds an instance that is *listening*:
+/// with a single instance the name goes deaf for as long as that instance is connected, and it
+/// goes deaf for good inside an AppContainer, where the process that serves cannot create the next
+/// one at all (see [`bind_pipe`]). `INSTANCES` instances are created here, the first with the
+/// single-instance claim, and `transport::serve_pipe` runs one accept loop per instance, so while
+/// any one of them is serving a connection another is still listening.
 ///
 /// The struct owns what it bound, and dropping the channel is what releases the single-instance
 /// claim: the pipe ceases to exist with its last handle. The fields are crate-visible and no
@@ -86,11 +94,11 @@ pub struct Channel {
 pub struct Channel {
     /// The pipe name (`\\.\pipe\tinio-<sha1(root)[..16]>`, or `[api.pipe] path`).
     pub(crate) name: String,
-    /// The bound first instance, created with its DACL and adopted inside the runtime
-    /// (`dacl::adopt_pipe`, Task 4): an `OwnedHandle` rather than tokio's
-    /// `NamedPipeServer`, because creating the latter needs the reactor the CLI does not
-    /// have yet, and because it is `Send` where a raw pointer is not.
-    pub(crate) handle: OwnedHandle,
+    /// The bound instances, created with their DACL and adopted inside the runtime
+    /// (`dacl::adopt_pipe`, Task 4): `OwnedHandle`s rather than tokio's `NamedPipeServer`,
+    /// because creating the latter needs the reactor the CLI does not have yet, and because
+    /// they are `Send` where a raw pointer is not. The first carries the single-instance claim.
+    pub(crate) handles: Vec<OwnedHandle>,
 }
 
 #[cfg(unix)]
@@ -175,6 +183,47 @@ impl Channel {
     /// ```
     pub fn socket_path(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// Every bound instance as the raw handle a **launcher** hands to the child it confines
+    /// (sandbox design decision 16, extended to the control channel).
+    ///
+    /// **Why a launcher needs them at all.** Inside a container the process's identity is
+    /// the package SID and not the user, so a child that called [`bind_pipe`] itself would
+    /// have `CreateNamedPipeW` refused — the DACL these instances are created with grants the
+    /// current user and nobody else. The launcher runs unconfined, binds the pool here, and
+    /// passes every handle; the child serves on the objects it inherited and never creates one.
+    /// The DACL is therefore unchanged and the single-instance claim is still made exactly
+    /// once, by the launcher's first create.
+    ///
+    /// **All of the pool and not just the first**, because a child holding one instance is back
+    /// where it started: the name answers once and then goes deaf, which is the defect this
+    /// handoff exists to remove. `INSTANCES` spells the count on both sides of the handoff.
+    ///
+    /// The handles are **borrowed**, never given up: the channel keeps ownership, so the
+    /// caller must hold it for as long as the handoff needs and the child's own duplicated
+    /// handles are what keep the pipe alive afterwards. `unsafe` appears nowhere here — a
+    /// borrow of the handle is safe, and the one conversion back is
+    /// [`dacl::adopted_pipe`]'s.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(windows)]
+    /// # {
+    /// use tinio_api::bind::bind_pipe;
+    ///
+    /// let channel = bind_pipe("tinio-mine").expect("bind");
+    /// // The values a `LaunchPlan::with_controls(..)` carries to the child.
+    /// let handles = channel.raw_handles();
+    /// assert!(handles.iter().all(|handle| !handle.is_null()));
+    /// # }
+    /// ```
+    pub fn raw_handles(&self) -> Vec<RawHandle> {
+        self.handles
+            .iter()
+            .map(|handle| handle.as_raw_handle())
+            .collect()
     }
 }
 
@@ -311,8 +360,34 @@ pub fn bind_unix(path: &Path) -> Result<Channel, Error> {
     })
 }
 
-/// Binds the named pipe `name`, refusing when another instance already owns it, and keeps the
-/// name on the channel (`NamedPipeServer` will not hand it back).
+/// How many instances the bind creates.
+///
+/// **Two is the minimum that keeps the name answering, and the count is a contract rather than a
+/// tuning knob.** One instance is connected for as long as it serves a client, and a client only
+/// ever finds a *listening* instance, so one instance means the name is deaf while a request is in
+/// flight — and, inside an AppContainer, deaf for good, because the serving process cannot create
+/// its own successor (`create_pipe` is refused there; see [`bind_pipe`]). Two lets
+/// `transport::serve_pipe` rotate: while one instance serves, the other is listening.
+///
+/// **The number travels with the handles, and the handoff end is checked.** [`bind_pipe`] creates
+/// exactly this many, a launcher passes every one of them ([`Channel::raw_handles`] is what it
+/// hands over), and `Plane::adopt` **refuses a handoff shorter than this constant** — so a launcher
+/// that under-delivered fails the child's startup with a message about the deaf name rather than
+/// serving a channel that answers once and then stops. Raising this number raises that floor with
+/// it, which is why there is one constant here rather than a literal at each site.
+#[cfg(windows)]
+pub(crate) const INSTANCES: usize = 2;
+
+/// Binds the named pipe `name` **as a pool of `INSTANCES` instances**, refusing when another
+/// server already owns the name, and keeps the name on the channel (`NamedPipeServer` will not
+/// hand it back).
+///
+/// **The first instance carries `FILE_FLAG_FIRST_PIPE_INSTANCE`, the rest do not**, and that is
+/// the whole single-instance rule: the claim is made exactly once, by the process that binds, and
+/// a second server's own first create is refused — while this channel's successors are ordinary
+/// instances of a name it already owns. **Every instance comes from the same [`dacl::create_pipe`]
+/// call**, so each carries the identical current-user-only DACL; nothing here widens a permission
+/// or asks for one.
 ///
 /// **The pipe is created raw, with a current-user-only DACL, and this is a deliberate
 /// departure from `ServerOptions::create` on both counts.** The DACL is Task 1's reason
@@ -337,23 +412,41 @@ pub fn bind_unix(path: &Path) -> Result<Channel, Error> {
 #[cfg(windows)]
 pub fn bind_pipe(name: &str) -> Result<Channel, Error> {
     let name = pipe_name(name);
-    let handle = dacl::create_pipe(&name, true).map_err(|err| match err.kind() {
-        // `FILE_FLAG_FIRST_PIPE_INSTANCE` answers ERROR_ACCESS_DENIED when the name is taken;
-        // `AlreadyExists` is matched too so the refusal does not depend on one mapping.
-        io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists => {
-            Error::Transport(format!("another server is already listening on {name}"))
-        }
-        _ => Error::Transport(format!("could not create {name}: {err}")),
-    })?;
-    Ok(Channel { name, handle })
+    let mut handles = Vec::with_capacity(INSTANCES);
+    for nth in 0..INSTANCES {
+        // The claim belongs to the first create and to nothing else. Re-asserting it on a
+        // successor would refuse this channel's own pool, and dropping it from the first would
+        // leave the single-instance gate open.
+        let handle = dacl::create_pipe(&name, nth == 0).map_err(|err| match err.kind() {
+            // `FILE_FLAG_FIRST_PIPE_INSTANCE` answers ERROR_ACCESS_DENIED when the name is taken;
+            // `AlreadyExists` is matched too so the refusal does not depend on one mapping. The
+            // successors carry no flag, so this answer is the first create's alone — but the
+            // mapping is harmless on them and the message is the truthful one for a name someone
+            // else owns.
+            io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists if nth == 0 => {
+                Error::Transport(format!("another server is already listening on {name}"))
+            }
+            _ => Error::Transport(format!("could not create {name}: {err}")),
+        })?;
+        handles.push(handle);
+    }
+    Ok(Channel { name, handles })
 }
 
 /// The full form of a pipe name: `[api.pipe] path` may be written bare (`tinio-mine`), and the
 /// client classifies `state.control_name` by its `\\.\pipe\` prefix (Task 9), while
 /// `CreateNamedPipeW` wants the full form — so the bind owns the normalisation and every reader
 /// downstream sees one shape.
+///
+/// **Two callers, one normalisation**: [`bind_pipe`] creates the pool under this name,
+/// and `Plane::adopt` records it as the inherited channel's identity, so the child's
+/// `state.control_name` is the name its launcher actually bound rather than a second derivation
+/// that could disagree. `pub(crate)` and not private for exactly that second caller, and it
+/// carries no example of its own for the reason every `pub(crate)` item here does not: a doctest
+/// is compiled against the public API alone. The rule it applies is asserted from the outside by
+/// `a_second_bind_on_the_same_pipe_refuses`, which reads the normalised name off a real bind.
 #[cfg(windows)]
-fn pipe_name(name: &str) -> String {
+pub(crate) fn pipe_name(name: &str) -> String {
     const PREFIX: &str = r"\\.\pipe\";
     if name.starts_with(PREFIX) {
         name.to_string()

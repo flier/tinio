@@ -1,6 +1,6 @@
 //! Waiting for a confined child and undoing what its launch set up.
 
-use std::{process::ExitStatus, thread::JoinHandle};
+use std::{process::ExitStatus, sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
 
 use tracing::debug;
 
@@ -19,6 +19,16 @@ use crate::{error::Result, launcher::Terminal};
 /// shared cell. Without both halves the "parent emits `Event::Error` when the
 /// child never became ready" rule (design decision 19) would have nothing to
 /// consult, and the parent would be guessing.
+///
+/// **That answer is final only once the child is gone, and one caller cannot wait
+/// that long.** A launcher that has to *act* the moment its child becomes ready —
+/// the Windows launcher publishes the child's `state` then, because the file's
+/// DACL is current-user-only and the confined child cannot write it — needs the
+/// announcement while the child is still serving. [`Self::with_ready`] carries the
+/// mid-stream half: the same first terminal event, sent once by the relay's
+/// `Observer` as it records it, read by [`Self::wait_for_ready`]. Two channels
+/// rather than one because they answer at different times: "is it up?" versus "did
+/// it ever come up?".
 ///
 /// There is no slot to create first, and that is the simplification the join
 /// bought: with the answer travelling through `JoinHandle`, nothing has to exist
@@ -68,6 +78,10 @@ pub struct Child {
     /// Filled in by [`Self::wait`] from the join. `None` until then, which is
     /// also what a caller reads for a child that never reported.
     terminal: Option<Terminal>,
+    /// The relay's **mid-stream** announcement, when the platform wired one (see
+    /// [`Self::with_ready`]). `None` for a child nothing is waiting on — the core's
+    /// own tests, and every platform that has no reason to act before the wait.
+    ready: Option<Receiver<Terminal>>,
 }
 
 impl Child {
@@ -81,6 +95,7 @@ impl Child {
             wait: Box::new(wait),
             relay: None,
             terminal: None,
+            ready: None,
         }
     }
 
@@ -89,6 +104,79 @@ impl Child {
     pub fn with_relay(mut self, relay: JoinHandle<Option<Terminal>>) -> Self {
         self.relay = Some(relay);
         self
+    }
+
+    /// Hand over the **readiness announcement** the relay's `Observer` fills, so a
+    /// launcher can act the moment the child reports (see [`Self::wait_for_ready`]).
+    ///
+    /// The platform is what wires it: it builds the relay thread and the `Observer`
+    /// inside it, so it is the only layer that can install the sender the thread
+    /// announces on — and the receiver it keeps is this value's other half. A
+    /// platform that has no use for the announcement simply never calls this, and
+    /// [`Self::wait_for_ready`] then answers `None` at once rather than waiting for
+    /// something no one will send.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpsc;
+    ///
+    /// use tinio_sandbox_core::Child;
+    ///
+    /// let (_tx, rx) = mpsc::channel();
+    /// let child = Child::new(|| unreachable!("this child is never waited for")).with_ready(rx);
+    /// // The shape is all this shows; `wait_for_ready`'s own example drives the value.
+    /// assert!(child.terminal().is_none());
+    /// ```
+    pub fn with_ready(mut self, ready: Receiver<Terminal>) -> Self {
+        self.ready = Some(ready);
+        self
+    }
+
+    /// The first terminal event the child reported, **while it is still running** —
+    /// `None` when it reported none, and `None` once `bound` elapses.
+    ///
+    /// **The wait for a launcher that has to act before the child exits**, and the
+    /// reason it is not [`Self::wait`] plus [`Self::terminal`]: the record is final
+    /// only after the relay has been joined, which happens when the child is gone.
+    /// `Some(Terminal::Listening(addr))` is the child saying its listener is up —
+    /// the moment a Windows launcher publishes the child's `state`, because the
+    /// file's DACL is current-user-only and the confined child cannot write it
+    /// itself.
+    ///
+    /// **A child that dies without reporting does not hold this call for the whole
+    /// bound.** The relay's sender is dropped with the relay's `Observer`, so the
+    /// channel disconnects and this answers `None` at the child's exit; the bound is
+    /// for a child that is *still there* and simply has not reported — which the
+    /// caller then hands to [`Self::wait`], whose answer is the status.
+    ///
+    /// **Reading it twice is not a second wait**, and that is the channel's
+    /// property rather than a rule: the announcement is sent once and the receiver
+    /// consumes it, so a second call answers what is left (nothing, once the first
+    /// took it). A caller that needs the answer again reads [`Self::terminal`] after
+    /// the wait, which is final.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{sync::mpsc, time::Duration};
+    ///
+    /// use tinio_sandbox_core::{Child, Terminal};
+    ///
+    /// let (tx, rx) = mpsc::channel();
+    /// let child = Child::new(|| unreachable!("this child is never waited for")).with_ready(rx);
+    /// let addr = "127.0.0.1:9000".parse().expect("addr");
+    /// tx.send(Terminal::Listening(addr)).expect("send");
+    /// assert_eq!(
+    ///     child.wait_for_ready(Duration::from_secs(1)),
+    ///     Some(Terminal::Listening(addr))
+    /// );
+    /// ```
+    pub fn wait_for_ready(&self, bound: Duration) -> Option<Terminal> {
+        // `ok()` folds the two failures into the one answer this API has: the bound elapsed, or
+        // the relay ended without announcing — both are "nothing reported", and the caller's next
+        // step is the same one either way.
+        self.ready.as_ref()?.recv_timeout(bound).ok()
     }
 
     /// Block until the child exits, then until its relay has finished.
@@ -152,6 +240,11 @@ impl Child {
     /// panicked is reported the same way — a bug in our own code rather than a
     /// condition to propagate, and a child whose relay died has certainly not
     /// reported readiness.
+    ///
+    /// **[`Self::wait_for_ready`] is the other half, and the difference is the
+    /// clock**: that one answers while the child is still running, for a caller
+    /// that must act on readiness rather than only report on it afterwards. This
+    /// one is the final word, and the only one that can say "it never reported".
     pub fn terminal(&self) -> Option<&Terminal> {
         self.terminal.as_ref()
     }
@@ -220,6 +313,7 @@ mod tests {
         io,
         net::SocketAddr,
         process::{Child as ProcessChild, ChildStdout, Command, ExitStatus, Stdio},
+        sync::mpsc,
         thread,
         time::Duration,
     };
@@ -395,6 +489,35 @@ mod tests {
             Some(&listening()),
             "the relay's answer must be final once the wait has returned"
         );
+    }
+
+    #[test]
+    fn wait_for_ready_answers_the_announcement_and_the_absent_cases() {
+        // The three answers this API has, in one test because they are one decision: a child whose
+        // relay announced readiness, one nothing is waiting on, and one that announced nothing —
+        // the first is `Some`, the other two are `None` rather than a wait on something that will
+        // not come.
+        let (tx, rx) = mpsc::channel();
+        let announced = Child::new(|| unreachable!("never waited for")).with_ready(rx);
+        tx.send(listening()).expect("announce");
+        assert_eq!(
+            announced.wait_for_ready(Duration::from_secs(1)),
+            Some(listening())
+        );
+
+        let unwired = Child::new(|| unreachable!("never waited for"));
+        assert_eq!(
+            unwired.wait_for_ready(Duration::from_secs(1)),
+            None,
+            "a platform that wired no channel answers at once"
+        );
+
+        // The relay ended without announcing: the sender is gone with the observer, so this is
+        // the disconnected arm rather than the bound elapsing.
+        let (tx, rx) = mpsc::channel::<Terminal>();
+        drop(tx);
+        let quiet = Child::new(|| unreachable!("never waited for")).with_ready(rx);
+        assert_eq!(quiet.wait_for_ready(Duration::from_secs(1)), None);
     }
 
     #[tokio::test]

@@ -34,7 +34,17 @@ Feature: Interop journey (third-party S3 clients)
   @interop @aws @FR-008 @SC-002
   Scenario: An ephemeral --port 0 start serves alongside the first server
     When I start a second server
+    And the client targets the second server
     And I run aws s3 mb s3://ephemeral-bucket
+    Then the external client output contains "ephemeral-bucket"
+    And I run aws s3 ls
+    Then the external client output contains "ephemeral-bucket"
+    When the client targets the first server
+    And I run aws s3 ls
+    Then the external client output does not contain "ephemeral-bucket"
+    And I run aws s3 mb s3://first-bucket
+    And I run aws s3 rb s3://first-bucket
+    When the client targets the second server
     And I run aws s3 rb s3://ephemeral-bucket
 
   @interop @aws @FR-008

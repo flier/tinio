@@ -455,8 +455,9 @@ impl DataPlaneService {
         let cors = self.cors.clone();
         let future = TowerService::call(&mut service, req);
         Box::pin(async move {
-            // s3s's `HttpError` is not a `std::error::Error` — box its
-            // Display form.
+            // Its `Debug` form, boxed: s3s 0.17 made `HttpError` an `Error` (with
+            // `into_std_error` to unwrap it without the extra box), so the cheaper
+            // spelling exists — the text this records is deliberately unchanged.
             let result = future
                 .await
                 .map_err(|e| IoError::other(format!("{e:?}")).into());
@@ -1067,7 +1068,7 @@ mod tests {
     async fn preflight_invalid_bucket_name_is_403_from_the_route() {
         // s3s 0.15 parsed the path in `prepare` (AwsNameValidation) BEFORE
         // route matching — an invalid bucket (uppercase) was a 400
-        // InvalidBucketName and this route never ran. s3s 0.16 matches the
+        // InvalidBucketName and this route never ran. s3s matches the
         // custom route FIRST and lets it claim the request: a matched route
         // skips path classification, so `PreflightRoute` answers — 403
         // AccessDenied, the CORS mismatch message, never a 400. The route

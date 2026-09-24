@@ -6,7 +6,15 @@ description = "Command-line interface for tinio: server/start, status, stop, doc
 publish = false
 
 [dependencies]
-clap = { workspace = true, features = ["derive", "env"] }
+clap = { workspace = true, features = [
+    "derive",
+    "env",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+] }
 either.workspace = true
 futures.workspace = true
 handlebars = { workspace = true, optional = true }
@@ -36,6 +44,7 @@ tinio-fs.workspace = true
 tinio-mem = { workspace = true, optional = true }
 tinio-sandbox.workspace = true
 tinio-server = { workspace = true, features = ["acl"] }
+tinio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -60,7 +69,7 @@ windows-sys = { workspace = true, features = [
 default = ["api", "mem", "sandbox"]
 api = ["dep:handlebars", "dep:tinio-api"]
 mem = ["dep:tinio-mem"]
-sandbox = []
+sandbox = ["api"]
 tls = ["api", "tinio-api/tls"]
 
 [lints.clippy]

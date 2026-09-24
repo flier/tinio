@@ -175,7 +175,7 @@ impl S3Route for PreflightRoute {
     ) -> bool {
         // A true preflight: browsers send Origin + Access-Control-Request-
         // Method. Bare OPTIONS (non-browser probes) fall through to s3s —
-        // 501 as today. (s3s 0.16 matches routes BEFORE path validation: a
+        // 501 as today. (s3s matches routes BEFORE path validation: a
         // matched route claims the request and skips `AwsNameValidation`, so
         // an invalid bucket name reaches `call` and is denied here — 403,
         // not the 400 `InvalidBucketName` s3s 0.15 raised first.)
@@ -212,7 +212,7 @@ impl S3Route for PreflightRoute {
             .filter(|h| !h.is_empty())
             .collect();
         // The route's own parse — the ONLY name check on this path (s3s
-        // 0.16 skips its `AwsNameValidation` for a matched route). Reads the
+        // skips its `AwsNameValidation` for a matched route). Reads the
         // RAW `req.uri`: a percent-encoded bucket name that decodes to a
         // legal one is denied here (403) instead of accepted — s3s 0.15
         // decoded and validated before the route matched. Impact nil (legal

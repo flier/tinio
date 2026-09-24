@@ -431,3 +431,57 @@ fn win32_error(path: &Path, call: &str, status: u32) -> io::Error {
 pub fn to_wide(name: impl AsRef<OsStr>) -> Vec<u16> {
     name.as_ref().encode_wide().chain(iter::once(0)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env, fs,
+        process::{self, Command},
+    };
+
+    use super::{acl_is_current_user_only, create_restricted};
+
+    /// **The create-time descriptor keeps an inheriting parent's ACEs out on its own**, which is
+    /// the property a confined `state` write depends on.
+    ///
+    /// `CurrentUserDacl` marks the descriptor `SE_DACL_PROTECTED`, and that is what makes the
+    /// create call sufficient. It is load-bearing rather than tidy: a file that inherited the
+    /// exposure set's `(OI)(CI)M` (the launcher grants it to the container's package SID) could
+    /// not be repaired from inside the confinement, because `SetNamedSecurityInfoW` needs
+    /// `WRITE_DAC` and `M` deliberately excludes it — which is why `tinio-api`'s `State::write`
+    /// **verifies** the descriptor instead of re-installing it, and why that verification is only
+    /// sound while this test passes.
+    ///
+    /// The ACE is installed through `icacls` rather than through this crate, because it has to be
+    /// one this crate would never install: an inheritable grant for a principal that is not the
+    /// current user. `*S-1-5-32-545` is BUILTIN\Users by SID, so nothing here depends on the
+    /// machine's display language.
+    #[test]
+    fn a_created_file_keeps_an_inheriting_parents_aces_out() {
+        let dir = env::temp_dir().join(format!("tinio-winsec-inherit-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch directory");
+        let granted = Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)M", "/q"])
+            .status()
+            .expect("icacls runs");
+        assert!(
+            granted.success(),
+            "the scratch directory takes the inheritable ACE"
+        );
+
+        let path = dir.join("state.tmp");
+        drop(create_restricted(&path).expect("a restricted file"));
+        // Read back **without** `restrict_to_current_user`: what is asserted is what the create
+        // call installed, not what a later repair could impose.
+        let verdict = acl_is_current_user_only(&path).expect("read the DACL back");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            verdict,
+            "a file created with `create_restricted` must not inherit the parent's ACEs: one that \
+             did would be left unrepairable inside the confinement"
+        );
+    }
+}

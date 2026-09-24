@@ -16,14 +16,24 @@
 
 #[cfg(any(unix, feature = "tls"))]
 use std::fs;
-#[cfg(feature = "tls")]
+#[cfg(any(windows, feature = "tls"))]
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
-use std::os::windows::io::OwnedHandle;
-#[cfg(feature = "tls")]
+use std::os::windows::io::{OwnedHandle, RawHandle};
+// `tls` bounds the handshake; `windows` bounds the pipe drain ([`DRAIN_LIMIT`]). One import for
+// both, because the default graph has both and an `use` twice over does not compile.
+#[cfg(any(feature = "tls", windows))]
 use std::time::Duration;
+// The named-pipe pool's own imports: the stream wrapper behind the per-connection bridge.
+#[cfg(windows)]
+use std::{
+    future::poll_fn,
+    pin::Pin,
+    sync::MutexGuard,
+    task::{Context as TaskContext, Poll},
+};
 use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
@@ -43,13 +53,21 @@ use hyper_util::{
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-#[cfg(windows)]
-use tokio::task::JoinSet;
 #[cfg(feature = "tls")]
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
+#[cfg(windows)]
+use tokio::time::timeout;
+#[cfg(windows)]
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::windows::named_pipe::NamedPipeServer,
+    task::JoinSet,
+};
 use tokio::{net::TcpListener as TokioTcpListener, sync::watch};
 #[cfg(feature = "tls")]
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig, server::TlsStream};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
 
 #[cfg(windows)]
 use crate::dacl;
@@ -60,6 +78,37 @@ use crate::{
     router::{Auth, Context, Shared, router},
     state::{State, remove_if_present},
 };
+
+/// The upper bound on [`wait_for_peer_close`]: how long one instance keeps waiting for a client
+/// that is still attached **after its response has been written**, before the instance is
+/// force-reclaimed.
+///
+/// **The waiting it bounds is at kernel speed, and the bound is ~1 400× its worst measurement.**
+/// On a client that hangs up after reading, which is every client this crate ships, the wait ends
+/// the moment the client's handle closes: measured over 201 sequential dials on this branch's host
+/// (`the_pipe_pool_serves_back_to_back_dials_with_no_gap`), 80 µs to 181 µs — p50 97 µs, p99
+/// 177 µs, max 181 µs. A quarter of a second is four orders of magnitude above the mean, so a
+/// **healthy** client cannot reach this bound, whatever the scheduler does to it.
+///
+/// **What the bound buys, and what it costs.** A client that completes an exchange and then holds
+/// its handle open — measured with both instances wedged, `two_stalled_clients_do_not_deafen_the_name`
+/// — otherwise parks that instance forever: `DisconnectNamedPipe` is only safe after the peer is
+/// gone, so the loop waits, and with `bind::INSTANCES` of them wedged the *name* goes deaf, which
+/// no retry can repair. At the limit the instance is disarmed anyway, which discards whatever the
+/// pipe still holds unread — and that is exactly what cannot be lost: the response has already
+/// been **written**, and `tokio`'s write on a pipe handle is `WriteFile` + `FlushFileBuffers`,
+/// which blocks until the client has consumed it. What a wedged client holding the connection open
+/// has taken is the whole response; what it is holding is the *connection*, and nothing this
+/// server sends after it — `keep_alive(false)` means there is nothing after it. So the discarded
+/// bytes are at most what that client already chose not to read, and it is the client that is
+/// wrong, not the response that is lost.
+///
+/// **It is not a request timeout and must not become one.** The wait starts *after* hyper has
+/// returned the connection, so no request is in flight inside it; a request that is slow to be
+/// answered is slow in the handler, which this constant does not touch. The plane's own shutdown
+/// stays the CLI's ≤ 10 s bound (decision 12) — this is a per-instance liveness backstop under it.
+#[cfg(windows)]
+const DRAIN_LIMIT: Duration = Duration::from_millis(250);
 
 /// Serves `shared` over a bound local channel until `stop` flips, then drains and returns.
 ///
@@ -111,9 +160,10 @@ pub async fn serve_local(
     }
     #[cfg(windows)]
     {
-        // The pipe form carries its own name, so the identity is passed on rather than re-derived.
-        let Channel { name, handle } = channel;
-        serve_pipe(handle, &name, shared, stop).await
+        // The pipe form carries its own name and its whole pool, so the identity is passed on
+        // rather than re-derived and no instance is created here.
+        let Channel { name, handles } = channel;
+        serve_pipe(handles, &name, shared, stop).await
     }
 }
 
@@ -126,69 +176,353 @@ pub(crate) async fn until_stopped(mut stop: watch::Receiver<bool>) {
     let _ = stop.changed().await;
 }
 
-/// The named-pipe accept loop: one connection at a time, HTTP/1 keep-alive off, and the
-/// shutdown channel watched while no client is connecting.
+/// The named-pipe accept side: **one accept loop per bound instance**, HTTP/1 keep-alive off, and
+/// the shutdown channel watched while no client is connecting.
+///
+/// **The pool is the name's liveness, and the pool comes from the bind or from a launcher.**
+/// Every client dials the one name, so it can only reach an instance that is *listening*: the
+/// channel is served by the instances `bind_pipe` created, and while one of them serves a
+/// connection another is still waiting for the next client. That is what makes a second
+/// `status` after a first answer rather than `ERROR_PIPE_BUSY`.
+///
+/// **Nothing here creates an instance, and that is the point.** Inside an AppContainer this
+/// process's identity is the package SID, so `CreateNamedPipeW` with the channel's
+/// current-user-only DACL ([`dacl::create_pipe`]) is refused `ERROR_ACCESS_DENIED`: a child that
+/// made its own successor would answer once and then stop listening. The unconfined bind creates
+/// the pool ([`crate::bind::bind_pipe`]) and a confined launcher creates it and hands every
+/// handle over ([`Plane::adopt`]), so this loop only ever serves instances that already exist.
+///
+/// **Reusing one instance was measured and rejected.** `DisconnectNamedPipe` then
+/// `ConnectNamedPipe` on the instance in hand leaves a tick in which it is neither connected nor
+/// listening; because `client::exchange` returns as soon as it has the response while the
+/// server's disarm runs later, a client's *next* dial lands in that tick and is killed
+/// mid-request — measured as `Transport("/status: connection error")`, the same "Pipe is broken"
+/// the confined run reports, where this rotation reports zero retries over two hundred dials.
 #[cfg(windows)]
 async fn serve_pipe(
-    handle: OwnedHandle,
+    handles: Vec<OwnedHandle>,
     identity: &str,
     shared: Shared,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
 ) -> Result<(), Error> {
-    // The raw handle becomes tokio's own type here, inside the runtime — the constructor needs
-    // the reactor, and `dacl` is the crate's one raw-Windows module (Task 2's note).
-    let mut pipe = dacl::adopt_pipe(handle).map_err(Error::Io)?;
-    // In-flight connections, so "cease accepting" is not "drop the requests already answered".
-    let mut connections = JoinSet::new();
-    // Built once, above the loop: nothing about the router varies per connection, and its clone
-    // is an `Arc` bump (`axum::Router` keeps its state behind one), so a per-connection rebuild
-    // would re-derive what this one already holds.
+    if handles.is_empty() {
+        return Err(Error::Transport(
+            "the control channel was bound with no instances: nothing could ever answer on it"
+                .to_string(),
+        ));
+    }
+    // Built once, below the loops: nothing about the router varies per instance, and its clone is
+    // an `Arc` bump (`axum::Router` keeps its state behind one), so a per-instance rebuild would
+    // re-derive what this one already holds.
     let app = router(shared);
+    // One task per instance, and the set is also the drain: a stop ends the accept side, and
+    // every connection already accepted runs to completion before this returns.
+    let mut listeners = JoinSet::new();
+    for handle in handles {
+        // The raw handle becomes tokio's own type here, inside the runtime — the constructor
+        // needs the reactor, which is why the bind could only hand over an `OwnedHandle`
+        // (`dacl` is the crate's one raw-Windows module, Task 2's note).
+        let pipe = dacl::adopt_pipe(handle).map_err(Error::Io)?;
+        listeners.spawn(pipe_instance_loop(
+            pipe,
+            app.clone(),
+            stop.clone(),
+            identity.to_string(),
+        ));
+    }
 
+    while let Some(served) = listeners.join_next().await {
+        match served {
+            Ok(Ok(())) => {}
+            // One instance's accept loop failing is the channel failing: the pool exists to keep
+            // the name answering, and a loop that cannot `connect` any more is that guarantee
+            // gone. The rest are aborted so the plane reports one error rather than hanging on
+            // instances that are still waiting for clients that will never be served faithfully.
+            Ok(Err(err)) => {
+                listeners.shutdown().await;
+                return Err(err);
+            }
+            Err(err) => {
+                listeners.shutdown().await;
+                return Err(Error::Internal(format!(
+                    "a management pipe instance loop: {err}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One instance's whole life: wait for a client, serve it to the end, disarm, wait again.
+///
+/// **One task per instance is what preserves the drain.** A stop observed while this task is
+/// *waiting* ends it; a stop observed while it is *serving* cannot, because the connection is not
+/// a branch of the `select!` — so the client that got in before the shutdown is still answered
+/// (`management.rs`'s leg with a connection open at the stop is the assertion), which is the same
+/// property the previous single-instance loop got from its `JoinSet`.
+#[cfg(windows)]
+async fn pipe_instance_loop(
+    mut pipe: NamedPipeServer,
+    app: axum::Router,
+    mut stop: watch::Receiver<bool>,
+    identity: String,
+) -> Result<(), Error> {
     loop {
         tokio::select! {
             _ = stop.changed() => break,
             connected = pipe.connect() => {
+                eprintln!("PROBE: instance connected");
                 connected.map_err(|err| Error::Transport(format!("{identity}: pipe connect: {err}")))?;
             }
         }
-        let connected = pipe;
-        // The next instance must exist before this connection is served, or the pipe name
-        // disappears between two connections. `first_pipe_instance` is false here: the
-        // single-instance claim was made by the bind, and re-asserting it would refuse our
-        // own successor.
-        let next = dacl::create_pipe(identity, false).map_err(Error::Io)?;
-        pipe = dacl::adopt_pipe(next).map_err(Error::Io)?;
+        pipe = serve_pipe_connection(pipe, app.clone(), &identity).await?;
+        eprintln!("PROBE: instance released back to the loop");
+    }
+    Ok(())
+}
 
-        let app = app.clone();
-        connections.spawn(async move {
-            // `http1` borrows the builder mutably (`hyper-util`'s
-            // `auto::Builder::http1(&mut self)`), so the binding is `mut`.
-            let mut builder = auto::Builder::new(TokioExecutor::new());
-            // axum's `Router` is a tower service and this loop is hyper's own, so the bridge is
-            // explicit — `serve_connection` wants `hyper::service::Service`, and axum wraps with
-            // exactly this adapter in its own server (`axum-0.8.9/src/serve/mod.rs:388`).
-            let service = TowerToHyperService::new(app);
-            // The pipe has no half-close, so keep-alive would let a client wait forever for
-            // a response delimitation TCP would have provided (`research.md:99`).
-            if let Err(err) = builder
-                .http1()
-                .keep_alive(false)
-                .serve_connection(TokioIo::new(connected), service)
-                .await
-            {
-                tracing::debug!(error = %err, "management pipe connection ended");
+/// Serves **one** connection on `pipe`, drains it, and gives the instance back to its loop.
+///
+/// **The disarm is why the instance comes back at all, and the drain is why the disarm is safe.**
+/// `DisconnectNamedPipe` discards whatever the instance still holds unread, while
+/// `keep_alive(false)` lets hyper return as soon as it has *written* the response — not when the
+/// client has read it. Disarming straight after the connection therefore destroys responses under
+/// load: measured on this host, the first two dials succeed and every dial after them fails its
+/// exchange while the server accepts and serves each one. [`wait_for_peer_close`] is the fix, and
+/// it is not optional.
+///
+/// The handover is forced by `hyper`: `serve_connection` consumes its stream and bounds it
+/// `Io: 'static`, while tokio implements `AsyncRead`/`AsyncWrite` for `NamedPipeServer` itself
+/// rather than for `&NamedPipeServer` — so the connection owns the instance through [`Pool`] and
+/// its end is where the loop gets it back.
+#[cfg(windows)]
+async fn serve_pipe_connection(
+    pipe: NamedPipeServer,
+    app: axum::Router,
+    identity: &str,
+) -> Result<NamedPipeServer, Error> {
+    // `http1` borrows the builder mutably (`hyper-util`'s `auto::Builder::http1(&mut self)`), so
+    // the binding is `mut`.
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // axum's `Router` is a tower service and this loop is hyper's own, so the bridge is explicit —
+    // `serve_connection` wants `hyper::service::Service`, and axum wraps with exactly this adapter
+    // in its own server (`axum-0.8.9/src/serve/mod.rs:388`).
+    let service = TowerToHyperService::new(app);
+    // The stream the connection is served on: `hyper`'s bridge over [`Pool`], which owns the
+    // instance for the connection's life. The slot this frame shares with the stream is what lets
+    // the instance come back out once the connection is over.
+    let io = TokioIo::new(Pool::new(pipe));
+    let slot = io.inner().slot();
+    eprintln!("PROBE: serving a connection");
+    if let Err(err) = builder
+        .http1()
+        // The pipe has no half-close, so keep-alive would let a client wait forever for a
+        // response delimitation TCP would have provided (`research.md:99`).
+        .keep_alive(false)
+        .serve_connection(io, service)
+        .await
+    {
+        // A connection-level failure is the client's, not the channel's: the instance is still
+        // returned below and the instance's next `connect` works.
+        tracing::debug!(%identity, error = %err, "management pipe connection ended");
+    }
+    let mut pipe = Pool::release(slot).ok_or_else(|| {
+        Error::Internal("the connection's stream still holds the pipe instance".to_string())
+    })?;
+    // Before the disarm, and never after it: this is the drain that keeps the response the client
+    // has not read yet from being thrown away (see this function's doc).
+    wait_for_peer_close(&mut pipe, identity).await;
+    // Back to the listening state, so this instance's next `connect` can accept. `ERROR_NO_DATA`
+    // is the client having hung up first: the instance is disconnected either way, which is the
+    // state the next `connect` wants, so it is not a failure.
+    if let Err(err) = pipe.disconnect()
+        && err.raw_os_error() != Some(ERROR_NO_DATA as i32)
+    {
+        return Err(Error::Transport(format!(
+            "{identity}: pipe disconnect: {err}"
+        )));
+    }
+    Ok(pipe)
+}
+
+/// Waits until the client's end is gone, so the [`DisconnectNamedPipe`] that follows has nothing
+/// left to discard — **bounded by [`DRAIN_LIMIT`]**, after which the instance is reclaimed anyway
+/// and the reclaim is reported as an event.
+///
+/// A zero-length read is `Ok` in tokio's `poll_read` spelling; the broken-pipe error is the same
+/// news on an abrupt close, and any other failure is the client's own teardown. The wait is
+/// wrapped in a `timeout` rather than given a deadline of its own so the cancellation is the
+/// usual one: the read is simply dropped, which loses nothing it had consumed (it reads one byte
+/// and nothing else), and the disarm below follows either way.
+///
+/// A client that connects and never lets go holds this instance **for at most the limit** — the
+/// measurement and the argument that nothing it could still be owed is discarded are on
+/// [`DRAIN_LIMIT`]. The other instances of the pool keep listening while this one waits, which is
+/// still the property the pool exists for; the bound is what keeps the *name* from going deaf
+/// when every instance is held at once.
+///
+/// **The event is the observability, and it is `warn` on purpose.** A forced reclaim means a
+/// client is sitting on a connection it has already been answered on — a client bug or a wedged
+/// process, never normal traffic — so it is worth a line in the log rather than a debug detail,
+/// and it costs one event on a path that is otherwise silent.
+///
+/// [`DisconnectNamedPipe`]: https://learn.microsoft.com/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe
+#[cfg(windows)]
+async fn wait_for_peer_close(pipe: &mut NamedPipeServer, identity: &str) {
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    let closed = timeout(
+        DRAIN_LIMIT,
+        poll_fn(|cx| {
+            let mut read = ReadBuf::new(&mut buf);
+            match Pin::new(&mut *pipe).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) => Poll::Ready(()),
+                Poll::Ready(Err(err)) if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => {
+                    Poll::Ready(())
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(()),
+                Poll::Pending => Poll::Pending,
             }
-        });
-        // Reap what has already finished: a `JoinSet` holds a completed task until it is
-        // joined, so without this the set would keep one dead entry per connection served
-        // for the process's life — and every `status`/`stop` probe is a connection.
-        while connections.try_join_next().is_some() {}
+        }),
+    )
+    .await;
+    if closed.is_err() {
+        tracing::warn!(
+            %identity,
+            limit = ?DRAIN_LIMIT,
+            waited = ?started.elapsed(),
+            "the client did not close after its response; reclaiming the pipe instance"
+        );
+    }
+}
+
+/// The instance one connection is served on, **handing it back when the connection ends**.
+///
+/// **Every part of this shape is forced by `serve_connection`.** It takes its stream by value and
+/// bounds it `Io: 'static`, so the instance cannot be borrowed from a frame that must use it again
+/// — the connection has to own it. It also consumes the stream, so the owner cannot read the value
+/// back out of the same binding afterwards. So the instance travels in a slot both that frame and
+/// the connection hold ([`Arc`]), the connection's end drops the stream and leaves the instance in
+/// the slot, and [`Pool::release`] is the frame taking it back out.
+///
+/// **The traits are tokio's, not `hyper`'s.** tokio implements `AsyncRead`/`AsyncWrite` for
+/// `NamedPipeServer` itself, so the value in the slot is one, and `hyper_util::rt::TokioIo` is the
+/// one bridge to `hyper`'s traits that `serve_connection` wants — putting the slot behind a second
+/// `TokioIo` would mean going tokio -> `TokioIo` -> tokio -> `TokioIo`, which is why this wrapper
+/// implements the tokio side and lets one `TokioIo` sit on top of it.
+#[cfg(windows)]
+struct Pool {
+    /// `Some` until the connection's stream is dropped; `None` only once it has been taken out.
+    slot: Arc<Mutex<Option<NamedPipeServer>>>,
+}
+
+#[cfg(windows)]
+impl Pool {
+    /// Wraps `inner` for one connection.
+    fn new(inner: NamedPipeServer) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(Some(inner))),
+        }
     }
 
-    // The drain: every connection already accepted runs to completion before this returns.
-    while connections.join_next().await.is_some() {}
-    Ok(())
+    /// The shared slot, for the frame that outlives the connection.
+    fn slot(&self) -> Arc<Mutex<Option<NamedPipeServer>>> {
+        Arc::clone(&self.slot)
+    }
+
+    /// Closes the slot and gives the instance back: the last `Arc` handle, with the connection's
+    /// stream already dropped, is the one that can. `None` means the stream outlived the
+    /// connection, which its `await` rules out.
+    fn release(slot: Arc<Mutex<Option<NamedPipeServer>>>) -> Option<NamedPipeServer> {
+        Arc::try_unwrap(slot).ok()?.into_inner().ok()?.take()
+    }
+
+    /// The inner stream, for the poll that is running now. The mutex's poison case is a bug
+    /// rather than a state this loop can be in: no crate code panics while holding the guard.
+    fn held(&self) -> MutexGuard<'_, Option<NamedPipeServer>> {
+        self.slot
+            .lock()
+            .expect("the instance slot is not poisoned while a connection is served")
+    }
+}
+
+#[cfg(windows)]
+impl AsyncRead for Pool {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut held = self.held();
+        eprintln!("PROBE: server poll_read");
+        let out = Pin::new(
+            held.as_mut()
+                .expect("the instance is in the slot for the connection's life"),
+        )
+        .poll_read(cx, buf);
+        eprintln!("PROBE: server poll_read -> {out:?}");
+        out
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for Pool {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut held = self.held();
+        eprintln!("PROBE: server poll_write {} bytes", buf.len());
+        let out = Pin::new(
+            held.as_mut()
+                .expect("the instance is in the slot for the connection's life"),
+        )
+        .poll_write(cx, buf);
+        eprintln!("PROBE: server poll_write -> {out:?}");
+        out
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let mut held = self.held();
+        Pin::new(
+            held.as_mut()
+                .expect("the instance is in the slot for the connection's life"),
+        )
+        .poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let mut held = self.held();
+        Pin::new(
+            held.as_mut()
+                .expect("the instance is in the slot for the connection's life"),
+        )
+        .poll_shutdown(cx)
+    }
+
+    /// Forwarded rather than left to the default, which buffers: the pipe has a vectored write of
+    /// its own, and one copy of a response is enough.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let mut held = self.held();
+        Pin::new(
+            held.as_mut()
+                .expect("the instance is in the slot for the connection's life"),
+        )
+        .poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.held()
+            .as_ref()
+            .is_some_and(AsyncWrite::is_write_vectored)
+    }
 }
 
 /// The local channel's platform form, as the caller resolved it.
@@ -826,6 +1160,7 @@ impl Transport {
 ///     host: "127.0.0.1".to_string(),
 ///     stop,
 ///     gauges: None,
+///     token: None,
 /// };
 /// let plane = Plane::bind(options)?;
 /// plane.publish(9000)?;
@@ -855,6 +1190,37 @@ pub struct Options {
     /// decision 23 — cargo refuses the cycle). The **reader task** that runs the source's
     /// expensive half starts with the plane, in [`Plane::serve`].
     pub gauges: Option<Arc<Gauges>>,
+    /// The token this plane serves with, when the caller supplies one instead of letting the
+    /// plane generate it.
+    ///
+    /// **`Some` is the launcher's token, and the launcher is also the process that wrote
+    /// `state`** — which is why the caller has it to pass: a confined child on Windows cannot
+    /// create that file, so the unrestricted launcher does, generating the token with the file.
+    /// This plane then verifies `/status` and `/stop` against [`State::with_token`]'s value
+    /// rather than a fresh one, so the token a client reads out of that file is the token that
+    /// opens the channel (see the field's doc there for what a child that minted its own would
+    /// answer). `None` is every plane that owns its `state` file, which is every unconfined run
+    /// and every in-place platform — and it is what [`Plane::publish`] is for.
+    pub token: Option<String>,
+}
+
+/// The `state` this plane serves under: the control channel's identity, the served root, and
+/// **the caller's token when it supplied one** ([`Options::token`]) — a fresh one otherwise.
+///
+/// **One rule, two binds.** `Plane::bind` and `Plane::adopt` both build the state, and the
+/// choice between "the launcher's token" and "one of my own" is the same choice in both — so it
+/// is stated once here rather than twice, where a later edit to one of them could silently
+/// leave the other minting a token for a file it does not own. The port is `None` at this point
+/// in both: it is the data plane's, and `publish` is where it arrives.
+fn state_for(
+    token: Option<String>,
+    control_name: impl Into<String>,
+    root: &Path,
+) -> Result<State, Error> {
+    match token {
+        Some(token) => State::with_token(control_name, None, root, token),
+        None => State::new(control_name, None, root),
+    }
 }
 
 /// The socket file the bind created, as the deletion path must still find it: the path, and the
@@ -951,6 +1317,7 @@ impl SocketFile {
 ///     host: "127.0.0.1".to_string(),
 ///     stop,
 ///     gauges: None,
+///     token: None,
 /// })?;
 /// plane.publish(9000)?;
 /// plane.serve(rx).await?;
@@ -970,6 +1337,151 @@ pub struct Plane {
 }
 
 impl Plane {
+    /// [`Plane::bind`]'s mirror for a process a launcher **confined**: the control channel
+    /// is already created, and this process serves on the instances it inherited.
+    ///
+    /// **Why adoption rather than a second bind.** The launcher binds the channel because
+    /// only it can: the pipe's DACL grants the current user and nobody else, and inside a
+    /// container this process's identity is the package SID — so its own
+    /// `CreateNamedPipeW` is refused `ERROR_ACCESS_DENIED`, and a child that tried would
+    /// fail its startup with a message about a second server. The launcher instead creates
+    /// the pool, keeps the single-instance claim, and passes every handle the way it passes
+    /// the data plane's listener (sandbox design decision 16, extended to the control
+    /// channel); nothing about the DACL, the identity of the claimant, or the refusal a
+    /// genuinely concurrent start gets changes.
+    ///
+    /// **The whole pool and not one handle**: `raws` is what the launcher handed over, and
+    /// each element becomes an instance of the channel `serve` rotates (`crate::bind::INSTANCES`
+    /// is the count both sides of that handoff use). A child given one instance is back to the
+    /// defect this exists to remove — the name answers once and then goes deaf — so a handoff that
+    /// carries too few is refused here rather than served as a channel that would stop answering.
+    ///
+    /// **The name is resolved here and not derived a second time.** `options.selection` is
+    /// the same `Selection` the launcher bound — both processes resolve it through the
+    /// CLI's one `api_options` rule against the same root — and `crate::bind::pipe_name`
+    /// normalises it exactly as [`crate::bind::bind_pipe`] did,
+    /// so `state.control_name` records the name the pipe actually carries. The local form
+    /// must be a [`LocalForm::Pipe`]: this platform's channel is a pipe, and a selection
+    /// that names none is the launcher's own contradiction rather than a run this process
+    /// may serve.
+    ///
+    /// The rest is [`Plane::bind`]'s, deliberately in the same order: the identity is
+    /// recorded from the channel, the `state` file is built around it, and the router is
+    /// built with the token rule for the local channel. No socket file is recorded —
+    /// [`Channel::socket_path`] answers `None` here — which is why [`Plane::shutdown`]
+    /// removes only the `state` file on this platform.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Transport`] for a selection with no pipe channel in it or a handoff
+    /// shorter than `crate::bind::INSTANCES`, and [`crate::Error::Io`] when an inherited handle
+    /// is not one — a null value, which no real handoff produces. An unreadable served root is
+    /// [`crate::Error::State`], as in the bind.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(windows)]
+    /// # {
+    /// use std::os::windows::io::RawHandle;
+    ///
+    /// use tinio_api::{
+    ///     Options, Plane,
+    ///     transport::{LocalForm, Selection},
+    /// };
+    /// use tokio::sync::watch;
+    ///
+    /// # fn main() -> Result<(), tinio_api::Error> {
+    /// let (stop, _rx) = watch::channel(false);
+    /// // The handles a launcher put on the child's argv — the values `Adopted::controls()`
+    /// // carried, one instance each. `crate::bind::INSTANCES` of them: `adopt` refuses fewer,
+    /// // because one instance makes the name deaf after its first answer.
+    /// # let inherited: [RawHandle; 2] = [0x1000usize as _, 0x1004usize as _];
+    /// let plane = Plane::adopt(
+    ///     Options {
+    ///         selection: Selection {
+    ///             local: Some(LocalForm::Pipe(r"\\.\pipe\tinio-mine".to_string())),
+    ///             ..Selection::default()
+    ///         },
+    ///         state_dir: "/run/tinio".into(),
+    ///         root: "/srv/data".into(),
+    ///         host: "127.0.0.1".to_string(),
+    ///         stop,
+    ///         gauges: None,
+    ///         // The launcher's token, when this plane is the child it confined.
+    ///         token: None,
+    ///     },
+    ///     &inherited,
+    /// )?;
+    /// // **No `publish` here, and that is the ruling rather than an omission**: this plane's
+    /// // `state` file is the launcher's — it wrote it, with the token above — and this process
+    /// // could not write it if it tried (the file's DACL names the user, and a confined child's
+    /// // token does not). The plane serves; the launcher publishes.
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(windows)]
+    pub fn adopt(options: Options, raws: &[RawHandle]) -> Result<Self, Error> {
+        // The local form, resolved for its **name** alone — the handles are the objects, and
+        // this name is what the state file records. Same rule, same definer as the bind's.
+        let selection = options.selection;
+        let Some(LocalForm::Pipe(name)) = selection.local.as_ref() else {
+            return Err(Error::Transport(
+                "a confined child must be handed a named-pipe control channel: this selection \
+                 names none, so there is nothing to adopt"
+                    .to_string(),
+            ));
+        };
+        // **Fewer instances than the channel needs is a refused handoff, not a channel to serve.**
+        // A client only ever reaches a *listening* instance, and this process cannot create the
+        // next one — `CreateNamedPipeW` on the channel's current-user-only DACL is refused inside
+        // the container — so a pool of one answers its first client and is then connected for as
+        // long as it serves: the name goes deaf, which is exactly the defect the pool exists to
+        // remove. `bind::INSTANCES` is the floor and the same constant the bind creates and the
+        // launcher hands over, so a future change to the pool size moves this check with it
+        // instead of leaving a silent downgrade behind. More than the floor is fine: extra
+        // instances only mean more listeners.
+        if raws.len() < bind::INSTANCES {
+            return Err(Error::Transport(format!(
+                "a confined child must be handed the control channel's whole pool: {} instance(s) \
+                 were handed over and {} are needed — one instance makes the name deaf after its \
+                 first answer, and this process cannot create the next one",
+                raws.len(),
+                bind::INSTANCES
+            )));
+        }
+        let name = bind::pipe_name(name);
+        // The raw conversion, and it is `dacl`'s: this crate's designated `unsafe` site, where
+        // the launcher's handoff is the safety argument. One instance per inherited handle.
+        let mut handles = Vec::with_capacity(raws.len());
+        for raw in raws {
+            handles.push(dacl::adopted_pipe(*raw)?);
+        }
+        let transport = Transport::Local {
+            channel: Channel { name, handles },
+        };
+        let state = state_for(options.token.clone(), transport.identity(), &options.root)?;
+        // No socket file to record, and the `match` is `bind`'s rather than a second rule:
+        // `Channel::socket_path` is `None` on this platform by construction.
+        let socket = match &transport {
+            Transport::Local { channel } => {
+                channel.socket_path().map(SocketFile::at).transpose()?
+            }
+            _ => None,
+        };
+        let shared = Arc::new(
+            Context::new(state, options.host, transport.auth(), options.stop)
+                .with_gauges(options.gauges),
+        );
+        Ok(Self {
+            transport: Mutex::new(Some(transport)),
+            shared,
+            state_dir: options.state_dir,
+            socket,
+        })
+    }
+
     /// Applies the three-choose-one rule and binds the winner — which **is** the
     /// single-instance lock (decision 12) — then builds the router around it.
     ///
@@ -1001,6 +1513,7 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     gauges: None,
+    ///     token: None,
     /// })?;
     /// plane.publish(9000)?;
     /// # Ok(())
@@ -1012,7 +1525,7 @@ impl Plane {
             *path = resolve_socket_path(path, &options.state_dir);
         }
         let transport = select(selection)?;
-        let state = State::new(transport.identity(), None, &options.root)?;
+        let state = state_for(options.token.clone(), transport.identity(), &options.root)?;
         // The identity is recorded here, at the bind, because that is the only moment it is
         // certainly this plane's file: `remove_owned` compares against it later.
         let socket = match &transport {
@@ -1063,6 +1576,7 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     gauges: None,
+    ///     token: None,
     /// })?;
     /// // `/stop` sends on the very channel this awaits: the plane can end its own serve,
     /// // and the CLI's signal handlers flip the same one.
@@ -1114,6 +1628,7 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     gauges: None,
+    ///     token: None,
     /// })?;
     /// // The data plane's port, and the moment `status` can find this server.
     /// plane.publish(9000)?;
@@ -1164,6 +1679,7 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     gauges: None,
+    ///     token: None,
     /// })?;
     /// plane.publish(9000)?;
     /// plane.serve(rx).await?;
@@ -1257,6 +1773,11 @@ mod tests {
     use std::net::TcpStream;
     #[cfg(unix)]
     use std::time::Duration;
+    // The pipe tests' own imports: the raw dial, the silent connection the drain is asserted
+    // on, and the completed-but-unclosed one the bound is. Nothing else in this module names
+    // them.
+    #[cfg(windows)]
+    use std::time::Duration;
     #[cfg(feature = "tls")]
     use std::time::Instant;
     // No `Arc` here: the module's own import carries it in through `super::*`, and only the unix
@@ -1268,10 +1789,15 @@ mod tests {
     };
 
     use http::Method;
+    #[cfg(windows)]
+    use hyper::{Request, client::conn::http1};
     use tempfile::TempDir;
     use tokio::sync::watch;
     #[cfg(unix)]
     use tokio::time::sleep;
+    // The pipe tests' own import: the raw dial. Nothing else in this module names it.
+    #[cfg(windows)]
+    use tokio::{net::windows::named_pipe::ClientOptions, time::sleep};
 
     use super::*;
     #[cfg(feature = "tls")]
@@ -1328,6 +1854,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             stop,
             gauges: None,
+            token: None,
         })
         .expect("a TCP bind needs no runtime")
     }
@@ -1449,10 +1976,32 @@ mod tests {
         );
     }
 
+    /// **The two answers `state_for` has, and why the difference is load-bearing.** A plane that
+    /// supplies a token is the confined child of a launcher that already published `state` with
+    /// that token: minting a fresh one here would leave every client that found the server
+    /// refused `401` by it. A plane that supplies none owns its `state` file, and generates the
+    /// token it is about to write into it.
+    #[test]
+    fn a_supplied_token_is_the_one_the_plane_serves_with() {
+        let dir = TempDir::new().expect("temp dir");
+        let token = "ab".repeat(32);
+        let adopted = state_for(Some(token.clone()), "127.0.0.1:9001", dir.path()).expect("state");
+        assert_eq!(adopted.token, token, "the caller's token, verbatim");
+
+        let own = state_for(None, "127.0.0.1:9001", dir.path()).expect("state");
+        assert_eq!(own.token.len(), 64, "a fresh token, as `State::new` writes");
+        assert_ne!(own.token, token);
+    }
+
     /// The gate is released before the deletions: `serve` returns the moment the shared channel
     /// flips, and the CLI still has the data plane's drain to await before it calls `shutdown`
     /// (decision 12's sequence). A successor that passes the gate in that window has published
     /// its own `state`, so the predecessor must remove the file only while it is still its own.
+    ///
+    /// **This is also the launcher-written file's test, and the pid is what makes it one.** The
+    /// confined child's plane reads a `state` file that names the launcher — not itself — and
+    /// this is that same shape: the guard holds, so `shutdown` leaves the file alone and the
+    /// child never even attempts the deletion its confinement would refuse.
     #[tokio::test]
     async fn a_state_file_from_another_process_survives_shutdown() {
         let dir = TempDir::new().expect("temp dir");
@@ -1492,6 +2041,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             stop,
             gauges: None,
+            token: None,
         })
         .expect("bind");
         assert!(path.exists(), "the bind created the socket file");
@@ -1676,5 +2226,202 @@ mod tests {
         // prove nothing about what released the loop.
         drop(silent);
         serving.abort();
+    }
+
+    /// **The pool answers every dial, back to back, with no client retry.** This is the property
+    /// the confined run's `status`/`stop` depend on: every client dials the one name, and
+    /// `bind_pipe` binds a pool, so while one instance is connected another is listening. The
+    /// retry in [`dial`] exists only to *measure* that — it is asserted to be zero, which is the
+    /// count the rejected single-instance reuse could never reach (it needed retries on every run,
+    /// and the next dial was killed mid-request when it did not get one).
+    ///
+    /// The stop half is the drain: a connection established and silent when the channel flips is
+    /// still answered, and only after the client lets go does the serve future return. That is the
+    /// property the previous single-instance loop got from its `JoinSet`, now through one task per
+    /// instance — the serving task is not the one watching the shutdown channel.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_pipe_pool_serves_back_to_back_dials_with_no_gap() {
+        const DIALS: usize = 200;
+        let name = bind::pipe_name(&format!(r"\\.\pipe\tinio-pool-{}", process::id()));
+        // The production bind, pool included: its instances are what `serve_local` rotates.
+        let channel = bind::bind_pipe(&name).expect("bind");
+        let (tx, rx) = watch::channel(false);
+        let state = State::new(name.clone(), Some(9000), Path::new("/srv/data")).expect("state");
+        let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::Local, tx.clone()));
+        let token = shared.state.token.clone();
+
+        let serving = tokio::spawn(serve_local(channel, shared, rx));
+        let mut retried = 0usize;
+        for nth in 1..=DIALS {
+            let (answer, attempts) = dial(&name, &token, nth).await;
+            retried += attempts;
+            assert_eq!(answer.status, 200, "dial {nth}: {}", answer.body);
+            assert!(
+                answer.body.contains("\"running\":true"),
+                "dial {nth}: {}",
+                answer.body
+            );
+        }
+        assert_eq!(
+            retried, 0,
+            "a dial landed in a gap the instance pool exists to close"
+        );
+        eprintln!("pipe pool: {DIALS} sequential dials, {retried} retries");
+
+        // A connection established and silent when the stop fires.
+        let stream = ClientOptions::new()
+            .open(&name)
+            .expect("dial the control pipe");
+        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // The instance whose `connect` this dial completed has been handed the connection by now.
+        sleep(Duration::from_millis(100)).await;
+        tx.send(true).expect("the instance loops are listening");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("x-tinio-token", &token)
+            .body(String::new())
+            .expect("request");
+        let response = sender
+            .send_request(request)
+            .await
+            .expect("the drain answers the connection that was open when the stop fired");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the open connection was abandoned rather than drained"
+        );
+        // Only when the client lets go does the serving instance's loop see the stop — and only
+        // then does `serve_local` return, which is the drain this awaits rather than aborts.
+        drop(sender);
+        serving
+            .await
+            .expect("the serve task ends rather than panicking")
+            .expect("serve returns Ok");
+    }
+
+    /// The same sequential dials through `Plane`: the path `management.rs` drives, kept here so a
+    /// regression in `Plane::serve`'s wiring is diagnosable without the integration suite.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_plane_serves_sequential_pipe_connections() {
+        let dir = TempDir::new().expect("temp dir");
+        let name = bind::pipe_name(&format!(r"\\.\pipe\tinio-plane-{}", process::id()));
+        let (stop, rx) = watch::channel(false);
+        let plane = Arc::new(
+            Plane::bind(Options {
+                selection: Selection {
+                    local: Some(LocalForm::Pipe(name.clone())),
+                    ..Selection::default()
+                },
+                state_dir: dir.path().to_path_buf(),
+                root: dir.path().to_path_buf(),
+                host: "127.0.0.1".to_string(),
+                stop,
+                gauges: None,
+                token: None,
+            })
+            .expect("bind"),
+        );
+        plane.publish(9000).expect("publish");
+        let token = plane.shared.state.token.clone();
+        let serving = tokio::spawn({
+            let plane = Arc::clone(&plane);
+            async move { plane.serve(rx).await }
+        });
+
+        for nth in 1..=4 {
+            let (answer, _) = dial(&name, &token, nth).await;
+            assert_eq!(answer.status, 200, "dial {nth}: {}", answer.body);
+        }
+        // The crate's own client, twice: `management.rs`'s two steps, which is where the
+        // integration suite diverges from the raw dials above.
+        for nth in 1..=2 {
+            let report = client::status(dir.path()).await.expect("status reads");
+            assert!(report.running, "client status {nth} did not report running");
+        }
+        assert!(!serving.is_finished(), "the plane is still serving");
+        serving.abort();
+    }
+
+    /// One dial of `name`, retrying a connection that lands in a gap. **Zero retries is the
+    /// expected count**: the bind's pool means a listening instance is always there, so the retry
+    /// exists only to make a regression a reported number rather than a broken pipe — and to make
+    /// this helper assert nothing about the loop it is measuring.
+    ///
+    /// The crate's own pipe client makes a single `open` with no wait — the right shape for a
+    /// `status` probe, which is why any waiting belongs to this test.
+    #[cfg(windows)]
+    async fn dial(name: &str, token: &str, nth: usize) -> (client::RawResponse, usize) {
+        use tokio::{net::windows::named_pipe::ClientOptions, task::yield_now};
+
+        for attempt in 0.. {
+            assert!(
+                attempt < 1_000,
+                "dial {nth}: the pool never had a listening instance"
+            );
+            if let Ok(stream) = ClientOptions::new().open(name) {
+                match client::exchange(TokioIo::new(stream), get("/status", Some(token))).await {
+                    Ok(answer) => return (answer, attempt),
+                    // The connection was killed between the open and the answer: the gap again.
+                    Err(_) => continue,
+                }
+            }
+            // Every instance busy: `ERROR_PIPE_BUSY`, which is momentary with a pool — the
+            // instances' `connect` calls run on this very runtime. Yielding is what lets them.
+            yield_now().await;
+        }
+        unreachable!("the loop above returns or asserts")
+    }
+
+    /// A handoff with fewer instances than the channel needs is **refused, not served**: one
+    /// instance answers its first client and is then connected for as long as it serves, and a
+    /// confined child cannot create the next one — so the name would go deaf, which is the defect
+    /// the pool removes. The refusal happens before any handle is converted, which is why the
+    /// value below never has to name a real object.
+    #[cfg(windows)]
+    #[test]
+    fn adopting_fewer_instances_than_the_pool_needs_is_refused() {
+        let (stop, _rx) = watch::channel(false);
+        let options = || Options {
+            selection: Selection {
+                local: Some(LocalForm::Pipe(r"\\.\pipe\tinio-adopt".to_string())),
+                ..Selection::default()
+            },
+            state_dir: PathBuf::from("/run/tinio"),
+            root: PathBuf::from("/srv/data"),
+            host: "127.0.0.1".to_string(),
+            stop: stop.clone(),
+            gauges: None,
+            token: None,
+        };
+
+        for short in [
+            Vec::new(),
+            vec![0x1000usize as RawHandle; bind::INSTANCES - 1],
+        ] {
+            let rendered = Plane::adopt(options(), &short)
+                .expect_err("a handoff shorter than the pool is refused")
+                .to_string();
+            assert!(
+                rendered.contains("whole pool"),
+                "names the refusal: {rendered}"
+            );
+            assert!(
+                rendered.contains("deaf"),
+                "names what a single instance costs: {rendered}"
+            );
+            assert!(
+                rendered.contains(&bind::INSTANCES.to_string()),
+                "names the count the channel needs: {rendered}"
+            );
+        }
     }
 }

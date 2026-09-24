@@ -23,7 +23,7 @@ use sha1::{Digest, Sha1};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[cfg(windows)]
-use crate::_winsec::{create_restricted, restrict_to_current_user};
+use crate::_winsec::{acl_is_current_user_only, create_restricted, restrict_to_current_user};
 use crate::Error;
 
 /// The file's name inside the state directory.
@@ -248,10 +248,52 @@ impl State {
         port: Option<u16>,
         root: &Path,
     ) -> Result<Self, Error> {
+        Self::with_token(control_name, port, root, generate_token()?)
+    }
+
+    /// Records this process as the server for `root`, with **the caller's** token.
+    ///
+    /// **For the plane that does not own its `state` file.** A confined child on Windows
+    /// cannot create or write that file — its DACL is current-user-only and protected, and the
+    /// child's identity inside the container is the package SID — so the **launcher** creates
+    /// it and generates the token that guards `/status` and `/stop`. The child adopts the same
+    /// token here, which is what makes the value a client reads out of that file the value this
+    /// plane verifies against: the two would otherwise be two answers to one question, and every
+    /// client that found the server would be refused `401` by it.
+    ///
+    /// `pid` is this process's either way, and it is deliberately **not** what the caller's file
+    /// carries: the launcher's file names the launcher, so `Plane::shutdown`'s guard — `state.pid
+    /// == process::id()`, the check that keeps a plane from deleting a file it did not write —
+    /// holds by construction and the child never attempts a deletion its confinement would refuse.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use tinio_api::state::State;
+    ///
+    /// let token = "00".repeat(32);
+    /// let state = State::with_token(
+    ///     "/run/tinio/tinio-0123456789abcdef.sock",
+    ///     Some(9000),
+    ///     Path::new("."),
+    ///     token.clone(),
+    /// )
+    /// .expect("state");
+    /// assert_eq!(state.token, token);
+    /// assert_eq!(state.pid, std::process::id());
+    /// ```
+    pub fn with_token(
+        control_name: impl Into<String>,
+        port: Option<u16>,
+        root: &Path,
+        token: String,
+    ) -> Result<Self, Error> {
         Ok(Self {
             version: STATE_VERSION,
             pid: process::id(),
-            token: generate_token()?,
+            token,
             control_name: control_name.into(),
             port,
             root: root.to_path_buf(),
@@ -309,11 +351,20 @@ impl State {
             .map_err(Error::Io)?;
         #[cfg(windows)]
         let mut file = create_restricted(&tmp).map_err(Error::Io)?;
-        // Belt and braces, before a single byte is written: the install runs against the path as
-        // well, so a descriptor that did not take at creation — or a DACL that somehow is not the
-        // one the create call asked for — is refused here rather than published by the rename.
+        // **Verified rather than re-asserted, and the difference is what a confined run can do.**
+        // `create_restricted` already installs the protected current-user-only DACL at creation —
+        // `CurrentUserDacl` marks the descriptor `SE_DACL_PROTECTED`, which is what keeps the
+        // parent directory's inheritable ACEs out — while installing one again through
+        // `SetNamedSecurityInfoW` needs `WRITE_DAC`. A confined child does not hold that right and
+        // must not: the launcher grants the state directory `(OI)(CI)M`, whose `M` deliberately
+        // excludes it (design §9, decision 14). So the descriptor the create call installed is read
+        // back, and repaired only when it did not take. **The promise is unchanged**: nothing is
+        // published by the rename unless it is current-user-only, and a descriptor that really
+        // failed to take ends in the same refusal rather than in a published token.
         #[cfg(windows)]
-        restrict_to_current_user(&tmp)?;
+        if !acl_is_current_user_only(&tmp).map_err(Error::Io)? {
+            restrict_to_current_user(&tmp)?;
+        }
         file.write_all(text.as_bytes()).map_err(Error::Io)?;
         file.sync_all().map_err(Error::Io)?;
         fs::rename(&tmp, path(state_dir)).map_err(Error::Io)

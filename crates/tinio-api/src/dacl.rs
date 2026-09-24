@@ -15,7 +15,7 @@
 use std::{
     ffi::OsStr,
     io,
-    os::windows::io::{AsRawHandle as _, FromRawHandle, IntoRawHandle, OwnedHandle},
+    os::windows::io::{AsRawHandle as _, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle},
     path::Path,
     ptr,
 };
@@ -111,6 +111,55 @@ pub(crate) fn adopt_pipe(handle: OwnedHandle) -> io::Result<NamedPipeServer> {
     // alone — and `NamedPipeServer`'s constructor closes the handle itself when it cannot build,
     // so no path here leaks it.
     unsafe { NamedPipeServer::from_raw_handle(handle.into_raw_handle()) }
+}
+
+/// Adopts a named-pipe handle a **launcher** created and handed to this process, as the
+/// owned handle the channel carries ([`create_pipe`]'s return type, and this function's
+/// mirror image).
+///
+/// **The conversion is the whole function, and it lives here because `unsafe` does.**
+/// `dacl` is the crate's one raw-Windows module (its own module doc says so), and
+/// `OwnedHandle::from_raw_handle` is unsafe by construction: it promises that the value
+/// names a live handle of the right kind and that ownership moves with it. Both halves of
+/// that promise are the *launcher's* here rather than this crate's. The launcher ran
+/// unconfined, created the pipe with [`create_pipe`] and passed the raw value across
+/// `CreateProcessW`; this process inherited it, nothing else in this process has touched
+/// it, and no second owner of the value exists — which is what makes the conversion sound.
+///
+/// **Why the child needs it at all**: inside a container this process's identity is the
+/// package SID, not the user, so `CreateNamedPipeW` on a current-user-only DACL is refused
+/// (`ERROR_ACCESS_DENIED`) — the child cannot make these objects, so it adopts the ones its
+/// launcher made. See `bind::Channel::raw_handles` for the launcher's half; one call per
+/// instance, because the channel is a pool and the child serves on every instance it was
+/// handed.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidInput`] for a null handle: a value that names no object is not
+/// an inherited pipe, and adopting it would put a garbage handle into the channel. Nothing
+/// else here can fail — the kernel performs no work in this conversion.
+// `clippy::not_unsafe_ptr_arg_deref` is allowed **deliberately, and this is a place its premise
+// does not hold**: the lint reads any public function taking a raw pointer as one that might be
+// handed a caller's dangling value and dereferences it, while what happens here is
+// `from_raw_handle`, which *stores* the value — this function dereferences nothing, and the
+// kernel's handle table is what the value is later resolved against. Marking it `unsafe` would
+// move the launcher's handoff proof out of the doc above and into the signature of every
+// caller, `Plane::adopt` included, which is a safe operation for exactly the same reason.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn adopted_pipe(raw: RawHandle) -> io::Result<OwnedHandle> {
+    if raw.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the launch handed over no control-channel handle",
+        ));
+    }
+    // SAFETY: `raw` is the pipe handle the confined child's launcher created and passed
+    // through the handle list `CreateProcessW` was given, so it names a live named-pipe
+    // server handle this process now owns and no other `OwnedHandle` in this process
+    // wraps: `Channel::raw_handles` only borrows the launcher's own, and those values never
+    // cross the process boundary. The null case is refused above, so this is never
+    // `INVALID_HANDLE_VALUE`'s invalid-input spelling of "no object".
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
 /// Reads the named pipe's DACL back and answers whether every ACE names the current user's SID

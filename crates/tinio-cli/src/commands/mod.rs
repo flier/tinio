@@ -19,7 +19,7 @@ pub mod status;
 #[cfg(feature = "api")]
 pub mod stop;
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{ArgAction, Args};
 
@@ -151,14 +151,6 @@ pub(crate) fn parse_switch(raw: &str) -> Result<bool, String> {
         "0" | "false" => Ok(false),
         other => Err(format!("expected 0/1/true/false, got `{other}`")),
     }
-}
-
-/// The readiness line: **the one author** of the string a harness scrapes off stdout, shared by
-/// the two processes that print it — the serving half (`start::serve`, at the readiness point)
-/// and a `--daemon` parent, which prints it on its daemon's behalf. `SocketAddr` is what formats
-/// the pair, so an IPv6 host keeps its brackets.
-pub(crate) fn readiness_line(address: SocketAddr) -> String {
-    format!("listening on {address}")
 }
 
 /// The root, the mode and the ordered state-dir candidates a client command probes — resolved

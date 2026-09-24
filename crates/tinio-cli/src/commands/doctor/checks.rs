@@ -17,9 +17,6 @@ use rustix::fs as rustix_fs;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-#[cfg(all(feature = "api", unix))]
-use crate::commands::start;
-
 use super::audit::walk_findings;
 #[cfg(feature = "api")]
 use crate::_api::{State, client, state::STATE_VERSION};
@@ -29,6 +26,8 @@ use crate::_api::{
     state::socket_path,
     transport::{LocalForm, resolve_socket_path},
 };
+#[cfg(all(feature = "api", unix))]
+use crate::commands::start;
 use crate::{
     _core::cleanup::{self, Cleanup},
     _fs::{

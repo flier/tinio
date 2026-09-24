@@ -4,6 +4,9 @@
 //! - [`lockmap`] — the evicting per-key lock map (multipart part-write
 //!   locks, per-object conditional-PUT locks, per-bucket directory
 //!   mutation locks).
+//! - [`path`] — the containment rule ("is this path inside that root?"),
+//!   the one definer the filesystem backend's read-only guard and the
+//!   server launcher's exposure set share.
 //! - `testing` — the conformance test harness (behind the `testing`
 //!   feature: requires `tinio-core` types).
 
@@ -12,6 +15,7 @@
 pub extern crate tinio_core as _core;
 
 pub mod lockmap;
+pub mod path;
 
 #[cfg(feature = "testing")]
 pub mod testing;

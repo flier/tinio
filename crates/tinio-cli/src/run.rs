@@ -14,6 +14,7 @@ use crate::{
     Error,
     cli::{self, Cli, Command, Provenance},
     commands::{doctor, start, start::Server},
+    events,
     resolve::{self, Located},
     sandbox, service,
 };
@@ -59,7 +60,9 @@ fn try_run() -> Result<ExitCode, Error> {
     // authoritative parse — see [`command_line`] for the order and for what each pass answers.
     // The two arms are the two answers it can give, and the dispatch below runs on the
     // **authoritative** parse: every value and `ValueSource` from here on is that one's.
-    let parsed = command_line(&argv)?;
+    // `adopted`'s text travels with it: a confined child's discovery must not re-validate the
+    // explicit `--config`, whose file may lie outside every exposure (see [`command_line`]).
+    let parsed = command_line(&argv, adopted.as_ref().map(|adopted| adopted.config()))?;
 
     match parsed {
         // `service`, answered by the discovery parse alone (`command_line`'s doc states why).
@@ -75,9 +78,20 @@ fn try_run() -> Result<ExitCode, Error> {
                 // returns before a runtime exists, and the arm builds the process's one for
                 // the half it leaves (decision 2). A launcher returns its child's status and
                 // never reaches it.
-                Command::Server(args) => match start::run(args, located, adopted, &provenance)? {
-                    Server::Launched(code) => Ok(code),
-                    Server::Ready(ready) => on_runtime(start::serve(*ready)),
+                // Decision 19's other half, and the reason the frame sits here rather than in
+                // `run`'s error arm: **only the serving path owes stdout a frame.** A refusal
+                // before the readiness point is an `Error` frame beside the `tinio: …` line
+                // stderr carries, so a harness waiting for a frame learns why nothing started
+                // instead of timing out; `status`, `stop` and `doctor` keep their own stdout,
+                // where a report is not a frame. A failure *after* the readiness frame is not
+                // framed — that is the serving phase, not a startup refusal.
+                Command::Server(args) => match start::run(args, located, adopted, &provenance) {
+                    Ok(Server::Launched(code)) => Ok(code),
+                    Ok(Server::Ready(ready)) => on_runtime(start::serve(*ready)),
+                    Err(err) => {
+                        events::emit_error(&err.to_string());
+                        Err(err)
+                    }
                 },
                 #[cfg(feature = "api")]
                 Command::Status(args) => on_runtime(status::run(args, located)),
@@ -115,19 +129,31 @@ fn try_run() -> Result<ExitCode, Error> {
 /// unit's argv. Its two channels are the invoking environment's, which is also what makes the
 /// argv a unit records the argv the server resolves in the same environment.
 ///
+/// **`adopted` is the confined child's own fact**, and it changes one thing in the discovery
+/// resolution: a child's `--config` names the file its launcher read and forwarded as text, and
+/// that path may sit outside every exposure — so the child resolves the mode from the text
+/// instead of re-validating a path it may not be able to see (`resolve::locate_confined`'s doc
+/// states the ruling). `None` is every other process, which keeps the explicit-path contract
+/// exactly as it was: `--config` must name a file that is there, and a mistyped one is a usage
+/// error.
+///
 /// # Errors
 ///
 /// A usage error from either parse (exit 2) and whatever [`locate`](crate::resolve::locate) or
 /// the `.env` load refuses.
 pub(crate) fn command_line(
     argv: &[OsString],
+    adopted: Option<&str>,
 ) -> Result<Either<Box<Resolved>, service::Args>, Error> {
     let (discovery, matches) = cli::parse(argv)?;
     let provenance = cli::provenance(&matches);
     match discovery.command {
         Command::Service(args) => Ok(Right(args)),
         command => {
-            let located = resolve::locate(command.discovery(), &provenance)?;
+            let located = match adopted {
+                Some(text) => resolve::locate_confined(command.discovery(), &provenance, text)?,
+                None => resolve::locate(command.discovery(), &provenance)?,
+            };
             resolve::apply_env_file(&located.state_dir)?;
             let (cli, matches) = cli::parse(argv)?;
             let provenance = cli::provenance(&matches);

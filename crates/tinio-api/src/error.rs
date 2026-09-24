@@ -55,6 +55,19 @@ pub enum Error {
     /// A management transport could not be set up or resolved.
     #[error("transport: {0}")]
     Transport(String),
+    /// The local control channel is **there and busy** — Windows' `ERROR_PIPE_BUSY`, which a dial
+    /// is refused with while every instance of the pipe pool is serving.
+    ///
+    /// **It is its own variant because it is its own fact.** "Nothing is behind this name" and
+    /// "something is behind it and cannot take a connection right now" are different states of the
+    /// world, and the caller that has to tell them apart is [`crate::client::status`]: a channel
+    /// nobody serves and a channel that is momentarily full both mean no server answered its
+    /// probe, while a *failure* would have the CLI report an unhealthy server where the contract
+    /// says report a stopped one (`contracts/cli.md:58`). Carrying the fact in the type is what
+    /// lets the client decide, rather than re-deriving it from an `io::Error`'s OS code at every
+    /// call site.
+    #[error("the control channel is busy: {0}")]
+    Busy(String),
 }
 
 impl Error {
@@ -70,7 +83,8 @@ impl Error {
             | Self::Io(_)
             | Self::Storage(_)
             | Self::State { .. }
-            | Self::Transport(_) => (500, "internal server error"),
+            | Self::Transport(_)
+            | Self::Busy(_) => (500, "internal server error"),
         }
     }
 
@@ -129,6 +143,10 @@ mod tests {
         assert_eq!(Error::NotFound.status(), 404);
         assert_eq!(Error::Internal("boom".into()).status(), 500);
         assert_eq!(Error::Io(IoError::other("x")).status(), 500);
+        assert_eq!(
+            Error::Busy("\\\\.\\pipe\\tinio-x: busy".into()).status(),
+            500
+        );
         assert_eq!(Error::Storage(NoSuchKey("k".into())).status(), 500);
     }
 
@@ -185,6 +203,28 @@ mod tests {
         assert_eq!(
             Error::Storage(NoSuchKey("k".into())).body().error,
             "internal server error"
+        );
+    }
+
+    /// **`Busy` is a state of the world, and its detail does not reach the wire.** The variant
+    /// exists so [`crate::client::status`] can tell a full pool from a channel nobody serves —
+    /// never so a client could be told the server's pipe namespace, which is why its body is the
+    /// same generic `500` every other internal failure carries. The detail stays in `Display`, for
+    /// the log, exactly as [`Error::Internal`]'s does.
+    #[test]
+    fn a_busy_channel_is_an_internal_failure_on_the_wire_and_names_itself_in_the_log() {
+        let err = Error::Busy(r"\\.\pipe\tinio-0123456789abcdef: pipe busy".into());
+        assert_eq!(err.status(), 500);
+        assert_eq!(err.body().error, "internal server error");
+        assert!(
+            !err.body().error.contains("pipe"),
+            "the wire body names no namespace"
+        );
+        let printed = err.to_string();
+        assert!(printed.contains("busy"), "{printed}");
+        assert!(
+            printed.contains(r"\\.\pipe\tinio-"),
+            "the log keeps what the wire drops: {printed}"
         );
     }
 }

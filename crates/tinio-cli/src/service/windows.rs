@@ -214,7 +214,9 @@ fn run_service(
     let argv: Vec<OsString> = iter::once(OsString::from("tinio"))
         .chain(arguments)
         .collect();
-    let Either::Left(resolved) = command_line(&argv)? else {
+    // `None`: a service is the SCM's process, never a confinement's child, so its explicit
+    // `--config` keeps the must-exist contract `command_line`'s own doc states.
+    let Either::Left(resolved) = command_line(&argv, None)? else {
         return Err(not_a_server());
     };
     let Resolved {
@@ -251,12 +253,13 @@ fn run_service(
             // for every other configuration, and that qualifier is where it is written down.
             // Carrying a stop *into* the launcher (so the child drains too) is the sandbox
             // plans' work — their shared §4 serving signature is what takes a `stop` channel —
-            // and the configuration is unreachable until a platform backend exists at all:
-            // `sandbox::plan` refuses every confinement request today, with the two refusals
-            // `contracts/cli.md`'s `--sandbox` bullet specifies (a usage error naming the build
-            // when the `sandbox` feature is off, a startup error naming the platform while the
-            // backend is a stub), and `sandbox::BACKEND_IS_STUB` is `true` on all three targets,
-            // so `confine` is never reached and this arm is not taken.
+            // and this target reaches the arm without it: `sandbox::plan` refuses a confinement
+            // only where it cannot honour one, with the two refusals `contracts/cli.md`'s
+            // `--sandbox` bullet specifies (a usage error naming the build when the `sandbox`
+            // feature is off, a startup error naming the platform while the backend is a stub),
+            // and `sandbox::BACKEND_IS_STUB` is `false` on Linux and Windows and `true` on macOS
+            // — so here `confine` is reached and the arm is taken, while macOS refuses every
+            // confinement request before it.
             tracing::debug!("the confined child has already exited");
             Ok(())
         }

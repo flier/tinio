@@ -18,6 +18,7 @@ tracing.workspace = true
 tinio-core.workspace = true
 
 [dev-dependencies]
+tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 tracing-subscriber.workspace = true
 

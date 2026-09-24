@@ -172,6 +172,9 @@ impl Running {
                 host: "127.0.0.1".to_string(),
                 stop: stop.clone(),
                 gauges,
+                // This harness's plane owns its `state` file, so it generates its own token —
+                // the launcher-supplied case is the confined child's, not this one's.
+                token: None,
             })
             .expect("bind"),
         );
@@ -776,6 +779,7 @@ async fn the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only
         host: "127.0.0.1".to_string(),
         stop,
         gauges: None,
+        token: None,
     });
     let err = refused.expect_err("a second instance is refused");
     assert!(
@@ -794,17 +798,17 @@ async fn the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only
         "the state file grants the current user and nobody else"
     );
 
-    // Ended through the channel rather than by a second `client::stop` dial, and that is a
-    // measurement rather than a convenience: **the loop creates an instance's successor only
-    // when the runtime polls it again**, and `ClientOptions::open` does not wait for a free
-    // instance — it answers `ERROR_PIPE_BUSY` when every existing one is connected. The
-    // read-back above dials synchronously, so this leg is exactly the case with no await between
-    // two dials; measured here, the second one is refused. The CLI's own stop path is the story
-    // leg's and the `202` leg's, both of which reach it after a full round trip.
+    // Ended through the channel rather than by a second `client::stop` dial: this leg is about the
+    // DACL and the single-instance refusal, and the read-back above has already dialled the pipe
+    // once (a client connect, which is how `READ_CONTROL` reaches the object). The stop path over
+    // that channel is the story leg's and the `202` leg's, both of which reach it after a full
+    // round trip. With the instance pool the read-back costs the leg no listening instance — the
+    // pool's other instance still is one — so this is a choice about the leg's subject rather than
+    // the old limitation where the only instance was consumed by that dial.
     running.end(&dirs).await;
 }
 
-/// Task 4's pipe arm, made real: the successor instance keeps the channel dialable for a second
+/// Task 4's pipe arm, made real: the instance pool keeps the channel dialable for a second
 /// connection, and a connection that is open when the plane stops is still answered — the drain,
 /// not just the accept loop.
 #[cfg(windows)]
@@ -815,16 +819,16 @@ async fn the_pipe_serves_sequential_connections_and_answers_one_open_at_the_stop
     let running = Running::start(&dirs, local_selection(&local), None, Ready::State).await;
     let token = running.token();
 
-    // Two sequential connections, both answered: the loop creates the next instance after each
-    // accept, so the pipe name never disappears between them.
+    // Two sequential connections, both answered: the bind's pool means a listening instance is
+    // there while another one serves, so the pipe name never goes deaf between them.
     for nth in ["one", "two"] {
         let answer = local_request(&local, "/status", Method::GET, Some(&token)).await;
         assert_eq!(answer.status, 200, "connection {nth}: {}", answer.body);
         assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
     }
 
-    // A connection that is open when the stop fires. It is established and silent: the accept loop
-    // has handed it to a serving task, and that task is parked on the request head.
+    // A connection that is open when the stop fires. It is established and silent: the instance's
+    // own accept loop has taken it and is parked on the request head.
     let LocalForm::Pipe(name) = &local else {
         unreachable!("the Windows leg binds a pipe");
     };

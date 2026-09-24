@@ -413,14 +413,17 @@ jobs:
         run: cargo build --profile ci -p tinio
 
       # In-process scenarios; the runner's built-in default filter excludes
-      # the feature-gated (@parquet), platform-bound (@unix/@windows) and
-      # external-client (@interop/@boto3/@mc) tags, so the fs pass needs no
-      # --tags. The mem pass skips @fs-only scenarios (traversal,
-      # nested-root, out-of-band); backend-neutral scenarios run on mem via
-      # TINIO_E2E_BACKEND. --test cucumber keeps the args from reaching the
-      # plain-harness traceability target (its own step below), and an
-      # explicit --tags REPLACES the runner's default filter, so the mem
-      # pass must repeat the platform and external-tag exclusions itself.
+      # the feature-gated (@parquet), platform-bound (@unix/@windows),
+      # external-client (@interop/@boto3/@mc) and host-bound (@confinement
+      # off macOS) tags, so the fs pass needs no --tags. That is why the fs
+      # pass is the one macOS leg that runs the refusal half of the
+      # confinement scenarios. The mem pass skips @fs-only scenarios
+      # (traversal, nested-root, out-of-band); backend-neutral scenarios run
+      # on mem via TINIO_E2E_BACKEND. --test cucumber keeps the args from
+      # reaching the plain-harness traceability target (its own step below),
+      # and an explicit --tags REPLACES the runner's default filter, so the
+      # mem pass must repeat the platform, external-tag and confinement
+      # exclusions itself.
       # --retry 2 on both passes: ConnectionAborted flakes on loaded legs
       # burned both retry-1 attempts in earlier runs (33764783657 fs,
       # 33750043137 mem).
@@ -432,7 +435,7 @@ jobs:
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @parquet and not @interop and not @boto3 and not @mc' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json

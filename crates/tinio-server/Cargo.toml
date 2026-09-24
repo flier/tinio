@@ -57,12 +57,19 @@ tinio-api = { workspace = true, optional = true }
 tinio-auth = { workspace = true, optional = true }
 tinio-config.workspace = true
 tinio-core.workspace = true
+tinio-sandbox.workspace = true
 tinio-select = { workspace = true, optional = true }
 tinio-util.workspace = true
 
 [dev-dependencies]
-assert_cmd.workspace = true
 bytes.workspace = true
+clap = { workspace = true, features = [
+    "derive",
+    "error-context",
+    "std",
+    "suggestions",
+    "usage",
+] }
 criterion = { workspace = true, features = [
     "async_tokio",
     "rayon",
@@ -80,6 +87,14 @@ tinio-fs.workspace = true
 tinio-mem.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 
+[[test]]
+name = "sandbox_e2e"
+required-features = ["sandbox"]
+
+[[test]]
+name = "sandbox_e2e_windows"
+required-features = ["sandbox"]
+
 [[bench]]
 name = "multipart_assembly"
 harness = false
@@ -93,7 +108,8 @@ name = "pipeline"
 harness = false
 
 [features]
-default = ["multipart", "copy", "list-v1", "list-v2", "cors", "select", "acl"]
+default = ["multipart", "copy", "list-v1", "list-v2", "cors", "select", "acl", "sandbox"]
+sandbox = []
 multipart = []
 copy = []
 list-v1 = []

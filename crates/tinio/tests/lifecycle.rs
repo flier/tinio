@@ -2,7 +2,7 @@
 //! cucumber scenario.
 //!
 //! **The rest of the process surface moved.** Every leg that spawns the `tinio` binary and
-//! reads what it did — the readiness line, `TINIO_PORT` and the `.env` file's two keys, the
+//! reads what it did — the readiness event, `TINIO_PORT` and the `.env` file's two keys, the
 //! second instance on one root, `--daemon`'s parent probe (both its ready and its timeout
 //! path), the systemd notifications, the `server` → `status` → `stop` round trip, the five
 //! state-dir and mode legs `status`/`stop` are held to, and the two sandbox refusals — is a
@@ -130,9 +130,16 @@ fn the_console_handler_reaches_the_shutdown_path() {
 
     // Readiness, out of the file the server is writing: bounded, so a server that never gets
     // there fails this leg with its own stderr instead of hanging it, and one that dies first
-    // fails immediately rather than burning the whole bound.
+    // fails immediately rather than burning the whole bound. **The readiness is an event frame
+    // rather than a printed line** (decision 19): the serving path's whole stdout is the frame,
+    // which is what the launcher platforms and this leg both decode.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !fs::read_to_string(&stdout).is_ok_and(|text| text.starts_with("listening on ")) {
+    while !fs::read_to_string(&stdout).is_ok_and(|text| {
+        matches!(
+            tinio_sandbox::Event::decode(text.trim_end()),
+            Some(tinio_sandbox::Event::Listening { .. })
+        )
+    }) {
         if serving.0.try_wait().expect("status").is_some() {
             panic!(
                 "the server exited before it was ready; stderr:\n{}",

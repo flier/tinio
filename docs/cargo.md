@@ -4,10 +4,11 @@
 
 - No comments in `Cargo.toml` — rationale in `docs/`.
 - Pin once in root `[workspace.dependencies]`; crates use `X.workspace = true`.
+- A patched dependency lives under `vendor/`, keeps the upstream version it patches, and carries a source header naming the change; the root names it in `[patch.crates-io]` and `exclude` (`docs/superpowers/specs/2026-09-18-sandbox-design.md`).
 - Members (`tinio-*`): `path = "crates/…"`, no version.
 - `version`/`edition` from `[workspace.package]`.
 - `publish = false` except facade `tinio`.
-- `[lints.rust] unsafe_code = "forbid"` by default; `"deny"` + enumerated `#[allow(unsafe_code)]` only where raw platform API forces it. Reasons live here, not in manifests.
+- `[lints.rust] unsafe_code = "forbid"` by default; `"deny"` + enumerated `#[allow(unsafe_code)]` only where raw platform API forces it — the sandbox backends go `"deny"` **as each lands**, sites enumerated in the sandbox design's decision 14 (`docs/superpowers/specs/2026-09-18-sandbox-design.md`); a stub with no site yet stays `forbid`. Reasons live here, not in manifests.
 - `[lints.clippy] absolute_paths = "warn"` on every crate — 3+ segment paths via `use` (`docs/style.md`).
 - Optional/target deps at the crate.
 
@@ -17,7 +18,7 @@
 
 ## Features
 
-- No `features` in `[workspace.dependencies]`; exception: `tokio-rustls` / `utoipa` pin `default-features = false` at workspace so members cannot re-enable heavy native crypto into the graph.
+- No `features` in `[workspace.dependencies]`; exception: `tokio-rustls` / `utoipa` pin `default-features = false` at workspace so members cannot re-enable heavy native crypto into the graph; `clap` pins it so its default set (`color` included) is not inherited and each member lists what it actually uses (`tinio-cli`: `derive`/`env` plus the help and error renderer; `tinio-server`'s example: the refusal renderer only).
 - Enable on the crate that uses them (`serde = { workspace = true, features = ["derive"] }`).
 
 ## Groups

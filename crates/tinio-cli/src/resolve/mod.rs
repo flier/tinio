@@ -50,8 +50,8 @@ mod locate;
 use locate::chain;
 pub(crate) use locate::current_dir;
 pub use locate::{
-    Located, apply_env_file, config_path, locate, pick, resolve_mode, resolve_root,
-    resolve_state_dir, state_dir_candidates,
+    Located, apply_env_file, config_path, locate, locate_confined, pick, resolve_mode,
+    resolve_root, resolve_state_dir, state_dir_candidates,
 };
 
 /// `[server] port`'s default — Minio's own (`contracts/cli.md:36`), and the port an
@@ -347,7 +347,67 @@ pub fn server(
     args: &start::Args,
     provenance: &Provenance,
 ) -> Result<Resolution, Error> {
-    let mut resolution = resume(located, Chain::Serving)?;
+    server_with(located, args, provenance, None)
+}
+
+/// [`server`] for a process a confinement launched: the configuration is the **payload's
+/// text**, never a second read of the file it came from (design decision 18).
+///
+/// The launcher's resolution created a missing file, parsed the document and forwarded its
+/// text; the file itself may sit outside every exposure, so a child that read the path again
+/// would be denied by the confinement it is running under — and where the launcher generated
+/// the file, a second `load_or_create` would mint a second credential pair.
+///
+/// The flags and the environment fold on top exactly as they did in the launcher: the child's
+/// argv and environment are the launcher's own, so no level of the chain can disagree.
+///
+/// # Errors
+///
+/// A payload that does not parse, and every failure [`fold_flags`] reports.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_cli::{
+///     cli::{Discovery, Provenance},
+///     commands::start::Args,
+///     resolve::{locate, server_confined},
+/// };
+///
+/// # fn main() -> Result<(), tinio_cli::Error> {
+/// let discovery = Discovery {
+///     dir: Some("/srv/data".into()),
+///     config: None,
+///     read_only: false,
+///     state_dir: None,
+/// };
+/// let located = locate(discovery, &Provenance::default())?;
+/// let args = Args {
+///     dir: Some("/srv/data".into()),
+///     ..Args::default()
+/// };
+/// let resolution = server_confined(located, &args, &Provenance::default(), "version = 1\n")?;
+/// assert_eq!(resolution.root, std::path::Path::new("/srv/data"));
+/// # Ok(())
+/// # }
+/// ```
+pub fn server_confined(
+    located: Located,
+    args: &start::Args,
+    provenance: &Provenance,
+    config_text: &str,
+) -> Result<Resolution, Error> {
+    server_with(located, args, provenance, Some(config_text))
+}
+
+/// [`server`] and [`server_confined`]'s one body: the chain, then the flag fold.
+fn server_with(
+    located: Located,
+    args: &start::Args,
+    provenance: &Provenance,
+    adopted: Option<&str>,
+) -> Result<Resolution, Error> {
+    let mut resolution = resume(located, Chain::Serving, adopted)?;
     fold_flags(args, provenance, &mut resolution)?;
     Ok(resolution)
 }
@@ -396,7 +456,7 @@ pub fn server(
 /// # }
 /// ```
 pub fn for_doctor(located: Located, args: &DirArgs) -> Result<Resolution, Error> {
-    let mut resolution = resume(located, Chain::Reading)?;
+    let mut resolution = resume(located, Chain::Reading, None)?;
     fold_credentials(&args.env, &mut resolution.config)?;
     Ok(resolution)
 }
@@ -434,7 +494,11 @@ enum Chain {
 /// A file that is absent, or present and unparseable, contributes nothing here; the failure
 /// itself is the load's to report ([`Chain::Serving`] as an error, [`Chain::Reading`] as
 /// `config_error`), and only the serving arm may write the file it did not find.
-fn resume(located: Located, chain: Chain) -> Result<Resolution, Error> {
+///
+/// **`adopted` replaces the load outright when it is `Some`**: that is the confined child's
+/// run, whose document is the text its launcher forwarded (design decision 18) — no path is
+/// read and nothing is created, which is the whole reason the text travels.
+fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resolution, Error> {
     let Located {
         root,
         read_only,
@@ -442,12 +506,24 @@ fn resume(located: Located, chain: Chain) -> Result<Resolution, Error> {
         config: explicit,
         state_dir_override: _,
     } = located;
-    let path = config_path(&root, &state_dir, explicit.as_deref())?;
-    let loaded = match chain {
-        Chain::Serving => {
+    // **The path is derived, not validated, when the document is already in hand** (design
+    // decision 18): an adopted child's `--config` may name a file outside every exposure, and the
+    // launcher — which could read it, and did — has already made the "it must be there" decision.
+    // The path is still derived, so `Resolution::config_path` names the file the document came
+    // from. Everywhere else the contract stands unchanged: `config_path` refuses an explicit path
+    // that is not a file (usage error, exit 2), which is what a mistyped `--config` must hear.
+    let path = match adopted {
+        Some(_) => {
+            discover::resolve_path(&root, &state_dir, explicit.as_deref()).map_err(Error::from)?
+        }
+        None => config_path(&root, &state_dir, explicit.as_deref())?,
+    };
+    let loaded = match (adopted, chain) {
+        (Some(text), _) => Config::parse(text),
+        (None, Chain::Serving) => {
             discover::load_or_create(&root, &path, read_only).map(|(config, _)| config)
         }
-        Chain::Reading => load_existing(&path),
+        (None, Chain::Reading) => load_existing(&path),
     };
     let (mut config, config_error) = match loaded {
         Ok(config) => (config, None),
@@ -533,11 +609,26 @@ fn load_existing(path: &Path) -> Result<Config, _config::Error> {
 /// turns out to be — in read-write mode the state dir *is* `<root>/.tinio`, and in read-only
 /// mode the root-side file is the one FR-023 keeps readable — so a hand-written config that
 /// says `read_only = true` still selects the relocated state dir on the next run.
+///
+/// **A confined child reads no path here when `--config` named one** (design decision 18): the
+/// payload's text *is* that file's content — the launcher read it and resolved this same mode
+/// from it — so the text is the file level and the path is never asked for. Inside the
+/// confinement that path may sit outside every exposure, which is why [`config_path`]'s
+/// existence check does not apply to an adopted run; asking for it again is what refused a
+/// confined `--config`-outside-the-root run before it could serve. Without `--config` the
+/// root-side pair above is inside the served root and therefore readable, so that shape is
+/// unchanged.
 fn mode_config(
     root: &Path,
     root_state_dir: &Path,
     explicit: Option<&Path>,
+    adopted: Option<&str>,
 ) -> Result<Option<Config>, Error> {
+    if let Some(text) = adopted
+        && explicit.is_some()
+    {
+        return Ok(Config::parse(text).ok());
+    }
     let path = config_path(root, root_state_dir, explicit)?;
     if !path.is_file() {
         return Ok(None);

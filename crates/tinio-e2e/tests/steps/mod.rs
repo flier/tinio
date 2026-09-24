@@ -71,7 +71,7 @@ pub struct World {
     /// The last ListObjectsV2 request's parameters (listing.rs: the
     /// pagination step resumes from these).
     pub last_listing: ListingState,
-    /// @external scenarios only: a spawned `serve` binary + one client
+    /// @external scenarios only: a spawned `tinio server` + one client
     /// session (clients.rs); None for the in-process scenarios.
     pub ext: Option<External>,
     /// The ephemeral `--port 0` second server (journey feature).

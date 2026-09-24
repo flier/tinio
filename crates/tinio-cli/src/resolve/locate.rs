@@ -293,14 +293,70 @@ pub fn state_dir_candidates(
 /// assert!(located.state_dir.ends_with(".tinio"));
 /// ```
 pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, Error> {
+    locate_with(discovery, provenance, None)
+}
+
+/// [`locate`] for a process a confinement launched: the configuration **text** the payload
+/// carries stands in for the file an explicit `--config` named (design decision 18).
+///
+/// **The path is neither re-validated nor read.** The launcher read that file, resolved the mode
+/// from it and forwarded its text; inside the confinement the path may sit outside every
+/// exposure, so a child that asked for it again would be refused by its own jail — which is
+/// exactly how a confined run with `--config` outside the served root used to die before it
+/// served anything, with [`config_path`]'s "must be there" usage error. The mode's file level is
+/// the text instead, which *is* that file's content, so the child and the launcher that resolved
+/// it cannot disagree about the mode.
+///
+/// # Errors
+///
+/// Whatever [`resolve_root`] refuses (a root that cannot be canonicalized is a usage error).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_cli::{
+///     cli::{Discovery, Provenance},
+///     resolve::locate_confined,
+/// };
+///
+/// // The current directory is the root here, as it is for `locate`'s own leg: a root has to
+/// // exist to be canonicalized.
+/// let discovery = Discovery {
+///     dir: Some(".".into()),
+///     config: None,
+///     read_only: false,
+///     state_dir: None,
+/// };
+/// let located =
+///     locate_confined(discovery, &Provenance::default(), "version = 1\n").expect("a root");
+/// assert!(!located.read_only);
+/// ```
+pub fn locate_confined(
+    discovery: Discovery,
+    provenance: &Provenance,
+    config_text: &str,
+) -> Result<Located, Error> {
+    locate_with(discovery, provenance, Some(config_text))
+}
+
+/// [`locate`] and [`locate_confined`]'s one body: the mode's file level is the only thing the
+/// payload changes.
+fn locate_with(
+    discovery: Discovery,
+    provenance: &Provenance,
+    adopted: Option<&str>,
+) -> Result<Located, Error> {
     let root = resolve_root(discovery.dir.as_deref(), &current_dir()?)?;
     // The config the **mode** is read from, before the state dir is known: `<root>/.tinio`'s own
     // pair, which is readable whatever the mode turns out to be (the root-side file is the one
-    // FR-023 keeps readable in read-only mode too).
+    // FR-023 keeps readable in read-only mode too). A confined child holding the payload's text
+    // is the one caller whose file level is that text rather than a path — `mode_config` states
+    // the two shapes and why neither of them reads `--config` for such a process.
     let file_mode = super::mode_config(
         &root,
         &root.join(RESERVED_SEGMENT),
         discovery.config.as_deref(),
+        adopted,
     )?;
     let read_only = resolve_mode(
         file_mode.as_ref().unwrap_or(&Config::default()),

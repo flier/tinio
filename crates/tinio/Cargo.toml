@@ -17,6 +17,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 tinio-fs.workspace = true
+tinio-sandbox.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dev-dependencies]
