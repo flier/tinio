@@ -16,16 +16,26 @@
 //! ([`wait_timeout`]) and of the framing rule a child's event stream is decoded
 //! with ([`frame_line`] — what `serve_read_only.rs`'s `listening` and
 //! `support/serve_spawn.rs`'s `stdout_event` walk their buffered lines with, and
-//! what [`events`] pumps a pipe into for the two sandbox legs). **A fix to the
+//! what [`stdout_lines`] pumps a pipe into for the sandbox legs). **A fix to the
 //! resolution landing in one copy and silently not the others** is the failure
 //! those names exist to remove.
 //!
-//! The two sandbox targets — `sandbox_e2e.rs` and `sandbox_e2e_windows.rs` —
-//! also carried the readiness handshake twice ([`wait_for_listening`]), which is
-//! the same read under the same framing rule in both. What genuinely differs
-//! between them is the failure: a launcher's log survives the kill that a
-//! child's stderr pipe does not, so each leg keeps its own `fail` and this hands
-//! it the message.
+//! The sandbox targets — `sandbox_e2e.rs`, `sandbox_e2e_windows.rs` and
+//! `sandbox_macos_e2e.rs` — also carried the readiness handshake three times
+//! ([`wait_for_listening`] for the first two, and the macOS leg's own raw-line
+//! copy), which is the same read under the same framing rule in all three. What
+//! genuinely differs between them is the failure: a launcher's log survives the
+//! kill that a child's stderr pipe does not, so each leg keeps its own `fail` and
+//! this hands it the message. The macOS leg is also why the read is split —
+//! [`wait_for_listening_in`] takes the raw lines so that a caller can keep them,
+//! and [`wait_for_listening`] is the child-taking wrapper for the other two.
+//!
+//! Two more names belong to those targets and are here for the same reason:
+//! [`answer`], with the [`PROBE`] bytes it sends, is the "the listener answers"
+//! exchange the Linux leg and the Windows harness had each spelled out, and
+//! [`sweep_confined_grandchild`] is the macOS sweep for the confined grandchild a
+//! killed launcher leaves behind (design decision 20's accepted gap), which a
+//! failing leg needs before it joins the stderr drain the grandchild holds open.
 //!
 //! Each target declares `mod common;` and takes what it uses, so none of them
 //! uses everything: hence the module-wide `dead_code` allow. Nothing here
@@ -36,15 +46,19 @@
 
 #![allow(dead_code)]
 
+// The grandchild sweep's own tool, and macOS's alone: no other target compiles a
+// caller of it, since the helper is `cfg`'d for the same reason.
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::{
     env, fs,
-    io::{self, BufRead, BufReader, Read},
-    net::SocketAddr,
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
     process::Child,
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
@@ -388,20 +402,21 @@ pub fn frame_line(frame: &mut String, line: &str) -> Option<Event> {
 /// Read a spawned child's event stream until `listening` arrives, and hand back
 /// the endpoint it bound — or the message the caller's own `fail` renders.
 ///
-/// **`Ok`/`Err` rather than a `fail` of its own, because the two suites that call
+/// **`Ok`/`Err` rather than a `fail` of its own, because the suites that call
 /// this fail differently and both differences are real**: the Windows leg kills a
-/// launcher whose log survives the kill and quotes that file, while the Linux leg
-/// kills the child and reads the stderr pipe behind it. What the two do *not*
-/// differ in is this handshake, which is why it is here and the failures stay
-/// with the legs.
+/// launcher whose log survives the kill and quotes that file, while the Linux and
+/// macOS legs kill the child and read the stderr pipe behind it. What the three
+/// do *not* differ in is this handshake — [`wait_for_listening_in`] is the read,
+/// and this is its child-taking wrapper for the legs that do not keep the raw
+/// lines.
 ///
 /// **The read happens on a thread of its own and the wait is bounded here.** The
 /// earlier shape read lines straight off the pipe with no deadline, so a startup
 /// path that neither writes a frame nor exits — a `confine` that blocks, a config
 /// read on a FIFO — hung the whole workspace leg until CI times it out, with no
-/// test named: libtest has no per-test timeout. The thread is [`events`]'s and it
-/// keeps the pipe drained, so the child cannot block on a full buffer. The budget
-/// is the crate's own readiness knob, read through its accessor
+/// test named: libtest has no per-test timeout. The thread is [`stdout_lines`]'s
+/// and it keeps the pipe drained, so the child cannot block on a full buffer. The
+/// budget is the crate's own readiness knob, read through its accessor
 /// ([`wait_timeout`]), because a starved runner is one policy and not a second
 /// default here.
 ///
@@ -421,21 +436,56 @@ pub fn wait_for_listening(child: &mut Child) -> Result<SocketAddr, String> {
         // talking about running.
         return Err("the child's stdout was not piped, so no event stream can be read".to_string());
     };
-    let rx = events(stdout);
+    wait_for_listening_in(&stdout_lines(stdout))
+}
+
+/// The readiness read itself, over [`stdout_lines`]' raw stream: the lines are
+/// walked until one closes a `listening` frame, and the endpoint that frame
+/// carries comes back.
+///
+/// **A receiver rather than a child, because one caller keeps the lines.** The
+/// macOS leg draws two facts out of the same stream: this handshake, and the
+/// assertion that nothing outside a frame reached the consumer (design §12) —
+/// which a pump that decoded in its reader thread could not make, since it drops
+/// a stray line by construction. So the raw lines are the caller's, and both
+/// readers go through [`frame_line`]'s one rule.
+///
+/// A refusal is the `Err` [`Event::Error`] renders, and everything else that ends
+/// the read — the budget, or a pipe that closed without a frame — is the `Err`
+/// the caller's `fail` reports. Neither is skipped: a server that cannot start is
+/// the subject.
+pub fn wait_for_listening_in(lines: &mpsc::Receiver<String>) -> Result<SocketAddr, String> {
     let timeout = wait_timeout();
-    match rx.recv_timeout(timeout) {
-        Ok(Event::Listening { addr }) => Ok(addr),
-        Ok(Event::Error { message }) => Err(format!("serve refused to start: {message}")),
-        Err(err) => Err(format!(
-            "serve reported no `listening` event within {} s ({err})",
-            timeout.as_secs()
-        )),
+    let deadline = Instant::now() + timeout;
+    let mut frame = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) => {
+                if let Some(event) = frame_line(&mut frame, &line) {
+                    return match event {
+                        Event::Listening { addr } => Ok(addr),
+                        Event::Error { message } => {
+                            Err(format!("serve refused to start: {message}"))
+                        }
+                    };
+                }
+            }
+            // The budget, or a pipe that closed with no frame in it: both are
+            // "this side got no endpoint", and the error names which.
+            Err(err) => {
+                return Err(format!(
+                    "serve reported no `listening` event within {} s ({err})",
+                    timeout.as_secs()
+                ));
+            }
+        }
     }
 }
 
-/// Decode a spawned child's event stream off `pipe`, on a thread of its own,
-/// handing back each event as it arrives; the caller's wait on the returned
-/// channel is what stays bounded.
+/// A spawned child's event stream, **one raw line at a time**, off `pipe` on a
+/// thread of its own; the caller's wait on the returned channel is what stays
+/// bounded.
 ///
 /// The thread is what keeps the pipe drained: a child with more to say than the
 /// pipe holds would otherwise block on it, which reads as a hung server rather
@@ -443,22 +493,109 @@ pub fn wait_for_listening(child: &mut Child) -> Result<SocketAddr, String> {
 /// confined child that neither reports nor exits would otherwise hang the leg
 /// with no test named, libtest having no per-test timeout ([`wait_timeout`] is
 /// what every caller here uses).
-pub fn events(pipe: impl Read + Send + 'static) -> mpsc::Receiver<Event> {
+///
+/// **Raw lines rather than decoded events.** [`wait_for_listening`] is the
+/// decoded reader for the legs whose subject is the endpoint; macOS keeps this
+/// stream and walks it after the child has exited, asserting that every line
+/// that reached the consumer was part of a frame — which is the half a pump that
+/// decoded in this thread could not report, since it drops a stray line by
+/// construction.
+pub fn stdout_lines(pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
-        let mut frame = String::new();
-        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
-            if let Some(event) = frame_line(&mut frame, &line) {
-                // A send that fails means the caller's wait already gave up and
-                // killed the child; there is nowhere left to report it.
-                if tx.send(event).is_err() {
-                    return;
-                }
+        loop {
+            // A fresh buffer per line: `mem::take` would be the other way to
+            // recycle one, and its path is one the crates' `absolute_paths`
+            // lint refuses inline.
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
             }
-            line.clear();
+            // A send that fails means the caller gave up and killed the child;
+            // there is nowhere left to report it.
+            if tx.send(line).is_err() {
+                return;
+            }
         }
     });
     rx
+}
+
+/// The one plain probe request a leg sends to prove a listener answers: the
+/// smallest well-formed HTTP/1.1 exchange, closed by `Connection: close` so the
+/// read ends at EOF.
+///
+/// **The bytes and the read are one helper because three legs had written them
+/// out.** The Windows harness's `answer`, the Linux e2e leg's inline exchange
+/// (twice) and the macOS leg's `request` each spelled the same request, the same
+/// read and the same accepted answer (`starts_with("HTTP/1.1 ")`), and nothing
+/// forced the three together. A fourth spelling survives on purpose, and it is
+/// not in a Rust test tree: `crates/tinio-sandbox-macos/scripts/verify-product-run.py`
+/// speaks the same probe to a confined server from outside this workspace's test
+/// targets, so it keeps its own copy rather than reaching in for one.
+pub const PROBE: &str = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+/// Connect to `addr`, send [`PROBE`], and return the whole answer — or the
+/// message the caller's own failure path renders.
+///
+/// **`Result` rather than a panic, because the callers fail differently and both
+/// differences are real** (the rule [`wait_for_listening`] states): the Windows
+/// harness panics, while the legs whose subject is a confined child hand the
+/// message to a `fail` that kills the process before it reports. So the
+/// expectation stays with the leg and this hands back the text.
+///
+/// **Both bounds are [`wait_timeout`]'s**, and they are not decoration: a server
+/// that accepted the connection and then went quiet would otherwise hang the leg
+/// with no test named, libtest having no per-test timeout.
+pub fn answer(addr: SocketAddr) -> Result<String, String> {
+    let timeout = wait_timeout();
+    let mut stream = StdTcpStream::connect_timeout(&addr, timeout)
+        .map_err(|err| format!("connect to the server at {addr}: {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("bound the read of the answer: {err}"))?;
+    stream
+        .write_all(PROBE.as_bytes())
+        .map_err(|err| format!("send the probe request: {err}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("read the server's answer: {err}"))?;
+    Ok(response)
+}
+
+/// Sweep the confined **grandchild** a killed launcher leaves behind, by the
+/// served root its own argv names.
+///
+/// **macOS has no job object** (design decision 20's accepted gap): a kill that
+/// reaches a launcher leaves the process `sandbox-exec` exec'd running, and that
+/// grandchild inherits the launcher's stderr — the pipe a failing leg is about to
+/// read to EOF — so the leg hangs instead of reporting (measured on macOS 15.8,
+/// 2026-09-25). The pattern is the leg's own served root, which is unique to it
+/// and is named in both processes' argv.
+///
+/// **A caller must have confined something before it sweeps.** This is a
+/// `pkill -f` over the whole process table, so a leg that spawned no confined
+/// server would be matching a pattern it never created; the leg this exists for,
+/// the macOS e2e leg's `fail`, is reached only after its own launcher exists.
+///
+/// **The `cfg` is why the sweep is not a no-op elsewhere.** Every platform but
+/// macOS needs no sweep — the process a kill ends *is* the server — so on any
+/// other target this function does not exist and a call site cannot forget the
+/// gate. The e2e crate's CLI harness has its own copy for the same reason this
+/// module exists: two `tests/` trees are not importable from each other.
+#[cfg(target_os = "macos")]
+pub fn sweep_confined_grandchild(root: &Path) {
+    // A root that is not UTF-8 cannot be matched by a command line, and the
+    // legs that call this build theirs from a pid and a name (see the macOS e2e
+    // leg's fixture) — so the guard is a fact about the fixture rather than a
+    // silent skip.
+    let Some(root) = root.to_str() else {
+        return;
+    };
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("tinio server {root}")])
+        .status();
 }

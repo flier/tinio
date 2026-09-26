@@ -30,17 +30,21 @@ fn discovery_for(root: &Path) -> Discovery {
 
 /// A `Resolution` for `config_text`, as `server`'s chain would have produced it.
 fn resolution_with(root: &Path, state_dir: &Path, config_text: &str) -> Resolution {
-    let config = Config::parse(&platform_config(config_text)).expect("config");
+    let text = platform_config(config_text);
+    let config = Config::parse(&text).expect("config");
     // The mode is read **from** the parsed config rather than assumed: the two are the same
     // value in a `Resolution` `resume` built (it pins them together), so a fixture that
     // hard-coded `false` beside a config saying `read_only = true` would be a `Resolution` no
-    // production path can produce.
+    // production path can produce. `config_text` is the text the config was parsed from — the
+    // chain keeps both, because the launch payload carries the text.
     Resolution {
         root: root.to_path_buf(),
         read_only: config.server.read_only,
         config,
+        config_text: text,
         config_path: state_dir.join(discover::CONFIG_FILE),
         state_dir: state_dir.to_path_buf(),
+        state_dir_override: None,
         config_error: None,
     }
 }

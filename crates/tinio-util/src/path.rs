@@ -2,7 +2,7 @@
 //! volume that will serve it resolves the two?
 //!
 //! [`path_contains`] is the *definer* of the question, and it is the only
-//! one. It has two readers, and they are the two places a wrong answer is
+//! one. It has three readers, and they are the places a wrong answer is
 //! expensive:
 //!
 //! - the filesystem backend's read-only state-dir guard (`FR-023`,
@@ -11,20 +11,34 @@
 //! - the server launcher's exposure set (design §9/§10) — a state
 //!   directory judged outside the root is granted a read-write entry, and
 //!   one judged outside a **read-only** root is a hole in the exposure
-//!   set rather than a storage error.
+//!   set rather than a storage error;
+//! - `tinio-config`'s discovery guard, one process earlier — the same
+//!   read-only refusal at the config path, whose leaf a run has not
+//!   created yet.
 //!
-//! **The two copies are what this module is for.** While each reader
-//! carried its own comparison, the Windows case folding below lived in
-//! one of them only, and the other compared components literally — so on
+//! **The copies this module replaced are why it exists.** While each
+//! reader carried its own comparison, the Windows case folding below lived
+//! in one of them only, and the other compared components literally — so on
 //! NTFS a state directory spelled in another case (`E:\data\.tinio`
 //! against a root given as `E:\Data`, and both of those spellings of one
 //! directory) read as *outside*, and the guard that exists to catch
 //! exactly that mistake let it through. A rule with two owners is a rule
-//! with one owner's bugs; the fix is one definer, called twice.
+//! with one owner's bugs; the fix is one definer, called by every reader,
+//! and no reader keeps a copy of it now.
+//!
+//! The resolution step is the other half of the same defect: a guard comparing the spelling a path
+//! was *written* with answers `false` for a state directory spelled through a symlink, so the
+//! resolved spelling is compared beside it. **The pairings are not the caller's decision any more**
+//! — the four-pairing rule is [`contains_under_any_spelling`], which every guard calls, and the
+//! resolution behind it is private: a public half-step was an invitation to compose a fifth
+//! pairing set, which is the divergence this module exists to end. `tinio-config` was the last call
+//! site to stop composing its own, on 2026-09-26, when the `tinio-util` edge landed and its private
+//! copy went with it.
 
-#[cfg(windows)]
-use std::path::PathBuf;
-use std::path::{Component, Path};
+use std::{
+    fs::canonicalize,
+    path::{Component, Path, PathBuf},
+};
 
 /// Whether `candidate` lies inside `root`, the way the serviced volume
 /// sees it.
@@ -101,6 +115,146 @@ pub fn path_contains(candidate: &Path, root: &Path) -> bool {
                 .any(|root| candidate.is_within(&lower_components(root)))
         })
     }
+}
+
+/// `path`'s resolved spelling: its nearest existing ancestor canonicalized,
+/// with the components below that ancestor joined back on. `None` when
+/// nothing along the path resolves at all.
+///
+/// **The ancestor walk is what makes this reachable, and the leaf is where
+/// the first spelling of it failed.** The paths that need a second spelling
+/// are leaves a run has not created yet — a state directory, the config file
+/// inside one — so [`canonicalize`] on the path itself answers `ENOENT` for
+/// exactly the shape the guards see, and a version that resolved the leaf
+/// answered `false` for the exploit it was written to catch (measured on
+/// macOS 15.8, 2026-09-25, in the launcher's copy of this rule). The
+/// components below the nearest existing ancestor cannot be links — a
+/// symlink is a component of a path that exists — so the joined answer names
+/// the same directory the leaf would.
+///
+/// **This is the resolution and not the comparison.** The rule a resolved
+/// spelling feeds is [`path_contains`]'s, and comparing it widens which
+/// *spellings* of one path a guard accepts, never which paths one contains:
+/// `None` here contributes nothing, so the literal answer the caller already
+/// had stands, and a path that does not exist cannot be inside an existing
+/// root through a symlink.
+///
+/// **Which pairings get compared is the caller's, because the callers
+/// differ.** The read-only guards compare two — the candidate as written and
+/// this resolution of it — while the launcher, which receives both paths as
+/// written, compares four, substituting each side's resolved spelling in
+/// turn. That difference is why this step is public on its own rather than
+/// wrapped in one containment function: a shared wrapper would have to pick
+/// one pairing set and serve it to a caller that needs the other.
+///
+/// **The rejoin is in the written order, and that is a correction this
+/// module carries rather than a detail.** Each private copy of this rule
+/// this module replaced collected the components below the ancestor and
+/// *reversed* them before pushing, so `…/state/absent/meta.redb` came back
+/// as `…/state/meta.redb/absent` (measured on this host, 2026-09-26, by
+/// `an_absent_leaf_joins_onto_its_nearest_existing_ancestor` below).
+/// Containment survives a permutation while the suffix holds only names —
+/// every spelling still sits under the same existing ancestor — and stops
+/// surviving it as soon as the suffix holds a `..`: with the root spelled
+/// through a symlink, a state directory written
+/// `…/link/x/y/../../.tinio` resolves to `<root>/.tinio` in the written
+/// order (in-root, refused) and to a directory beside the root in the
+/// reversed one, so the caller that compares with [`path_contains`] — whose
+/// lexical resolution is what pops the `..` — answers **served**: the
+/// writable subtree inside a read-only root this module exists to close.
+/// The `..`-bearing leg is
+/// `a_rejoin_in_the_written_order_keeps_an_in_root_state_directory`.
+///
+/// **A prefix comparison does not see that permutation, and saying so keeps
+/// the claim exact.** `Path::starts_with`, which `tinio-config`'s guard
+/// compared with before it was widened to the shared rule, never lets a `..`
+/// escape the prefix it matched, so that form answered in-root for every
+/// `..`-bearing spelling probed on macOS 15.8, 2026-09-26 — and the refusal a
+/// full `tinio server --read-only` run prints for those spellings still comes
+/// from the config guard before either `path_contains` guard is reached,
+/// because discovery runs first.
+///
+/// The walk is bounded by the path's own depth, and the suffix is iterated
+/// rather than collected: `ancestors` yields the path first and then its
+/// prefixes, so the first ancestor that canonicalizes is the nearest one,
+/// and the components below it are pushed in the order they are written.
+fn resolved_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        // The path itself is tried first, and fails for the absent-leaf case
+        // above; the first `Ok` is the nearest existing ancestor.
+        let Ok(base) = canonicalize(ancestor) else {
+            continue;
+        };
+        // `Some` by `ancestors`' own contract; a shape that broke it would
+        // skip this ancestor rather than answer `None` for the whole walk.
+        let Some(below) = path.strip_prefix(ancestor).ok() else {
+            continue;
+        };
+        let mut resolved = base;
+        for component in below.components() {
+            resolved.push(component.as_os_str());
+        }
+        return Some(resolved);
+    }
+    None
+}
+
+/// Whether `candidate` is at or below `root` **under any spelling of either side** — the one
+/// containment rule every guard in this workspace asks — the one public spelling of it, with the
+/// resolution behind it private so nobody composes a different pairing set again.
+///
+/// **Four pairings, and the widening is the safe direction.** The literal pair; the resolved
+/// candidate against the literal root; the literal candidate against the resolved root; both
+/// resolved. A `true` refuses (or skips an exposure) and a `false` is what grants a read-write
+/// state directory inside a read-only root, so a spelling this misses is a hole rather than a
+/// nuisance: measured on macOS 15.8, 2026-09-25, a state directory spelled `/tmp/<root>/.tinio`
+/// under the canonical root `/private/tmp/<root>` compared as unrelated and the run served a
+/// writable subtree inside a read-only root.
+///
+/// **A root that is already canonical is answered by the two-pairing form**, and the body returns
+/// that answer early rather than computing the other two: on an existing canonical path the
+/// resolution is the identity, so the last two pairings repeat the first two, and two of the three
+/// callers hand in exactly that root. The extra pairings — and the extra walk — are what a caller
+/// handed **both** paths as written needs.
+///
+/// **The resolved arm is load-bearing for the shapes the guards see.** The paths that need a
+/// second spelling are leaves a run has not created yet (a state directory, the config file inside
+/// one), which is why `resolved_path` walks to the nearest existing ancestor instead of
+/// canonicalizing the leaf, and why it rejoins the suffix in written order: a `..` below that
+/// ancestor resolves to a directory beside the root under a reversed rejoin, which was measured as
+/// the served writable subtree this rule exists to close. `None` from either resolution
+/// contributes nothing, so the literal answer stands and a path that does not exist cannot leak
+/// through a symlink either.
+pub fn contains_under_any_spelling(candidate: &Path, root: &Path) -> bool {
+    // Bound rather than inlined: both resolved forms are owned, and every comparison below borrows
+    // a side. `None` is "nothing along this path resolves" rather than "resolve it again" — a path
+    // with no resolvable ancestor keeps the literal answer it already had.
+    let resolved_candidate = resolved_path(candidate);
+    let resolved_root = resolved_path(root);
+    // The canonical-root case first, because it is the common one and the two-pairing answer is
+    // the same answer: `None` means the root has no resolvable ancestor (so the last two pairings
+    // contribute nothing), and `Some(root)` means the resolution was the identity (so they repeat
+    // the first two). Either way the walks and comparisons below are skipped.
+    if resolved_root
+        .as_deref()
+        .is_none_or(|resolved| resolved == root)
+    {
+        return path_contains(candidate, root)
+            || resolved_candidate
+                .as_deref()
+                .is_some_and(|candidate| path_contains(candidate, root));
+    }
+    path_contains(candidate, root)
+        || resolved_candidate
+            .as_deref()
+            .is_some_and(|candidate| path_contains(candidate, root))
+        || resolved_root
+            .as_deref()
+            .is_some_and(|root| path_contains(candidate, root))
+        || resolved_candidate
+            .as_deref()
+            .zip(resolved_root.as_deref())
+            .is_some_and(|(candidate, root)| path_contains(candidate, root))
 }
 
 /// A path reduced to the names that decide containment, and whether it was
@@ -279,7 +433,152 @@ fn plain(root: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, fs, process};
+
     use super::*;
+
+    /// A scratch directory this test owns and removes.
+    ///
+    /// `tinio-util` carries no `tempfile` dev-dependency, so the name is the
+    /// mechanism: the process id keeps concurrent runs apart, the caller's
+    /// suffix keeps the tests apart, and the removal makes the run repeatable
+    /// (`tinio-winsec`'s unit tests hand-roll theirs the same way).
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("tinio-util-path-{}-{name}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// An existing path resolves to its canonical spelling — the prefix
+    /// included, which is the whole reason the resolved spelling exists: a
+    /// host's temp directory is spelled through a link or a verbatim prefix
+    /// (`/var` → `/private/var` on macOS, `\\?\C:\…` on Windows), so the
+    /// literal and resolved spellings of one directory agree on no prefix at
+    /// all.
+    #[test]
+    fn an_existing_path_resolves_to_its_canonical_spelling() {
+        let dir = scratch("existing");
+
+        assert_eq!(
+            resolved_path(&dir).expect("an existing directory resolves"),
+            canonicalize(&dir).expect("canonicalize"),
+        );
+
+        fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// **The `ENOENT`-leaf case, which is the bug the walk was written for.**
+    /// A leaf a run has not created — `<state>/absent/meta.redb` — has no
+    /// canonical spelling of its own, and the first version of this operation
+    /// resolved the leaf, failed, and let the guard through. So the assertion
+    /// that `canonicalize` refuses the leaf is half this test: without it the
+    /// leg could pass through the leaf branch rather than the ancestor walk.
+    /// The nearest existing ancestor's canonical spelling with the absent
+    /// components joined back on is the answer.
+    #[test]
+    fn an_absent_leaf_joins_onto_its_nearest_existing_ancestor() {
+        let dir = scratch("absent-leaf");
+        let present = dir.join("state");
+        fs::create_dir_all(&present).expect("the ancestor that exists");
+
+        // Two components below the ancestor, so the rejoin is not a single push.
+        let leaf = present.join("absent").join("meta.redb");
+        assert!(
+            canonicalize(&leaf).is_err(),
+            "the leaf is the absent half: {leaf:?}"
+        );
+        assert_eq!(
+            resolved_path(&leaf),
+            Some(
+                canonicalize(&present)
+                    .expect("canonicalize the ancestor")
+                    .join("absent")
+                    .join("meta.redb")
+            ),
+        );
+
+        // And a leaf directly inside the scratch directory, which is the shape
+        // a state directory beside a served root has: the walk stops at the
+        // first existing ancestor and rejoins one name.
+        let shallow = dir.join("config.toml");
+        assert!(canonicalize(&shallow).is_err());
+        assert_eq!(
+            resolved_path(&shallow),
+            Some(
+                canonicalize(&dir)
+                    .expect("canonicalize")
+                    .join("config.toml")
+            ),
+        );
+
+        fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// **Nothing to resolve is answered rather than guessed at.** The empty
+    /// path is the portable shape: it is its own only ancestor and
+    /// `canonicalize` refuses it on both hosts, so the walk ends with no `Ok`
+    /// at all rather than with a spelling that was never checked.
+    ///
+    /// **No absolute path reaches this branch**, because every one of them has
+    /// a resolvable ancestor wherever its volume exists — which is why the
+    /// product call sites, whose paths are absolute by the time a guard sees
+    /// them, had no leg for it, and why the operation had to move here to be
+    /// tested at all. A path on a volume that does *not* exist would reach it
+    /// too, and that shape is deliberately not asserted: naming a free drive
+    /// letter is not something a hermetic test can do.
+    #[test]
+    fn a_path_with_nothing_to_resolve_answers_none() {
+        assert_eq!(resolved_path(Path::new("")), None);
+    }
+
+    /// **The rejoin's order decides a containment answer, and getting it
+    /// wrong is a fail-open.** This is the leg the reversed rejoin would lose:
+    /// the root is spelled through a symlink (what macOS's `/tmp` is, and what
+    /// an operator's `TINIO_STATE_DIR` carries), the suffix below the nearest
+    /// existing ancestor holds absent names and a `..` that climbs back over
+    /// them, and the state directory the run would create is *inside* the
+    /// root. The written order resolves it there and answers in-root; a
+    /// reversed rejoin walks the `..`s into the wrong names and answers
+    /// outside, which is the read-write subtree inside a read-only root this
+    /// module exists to refuse.
+    ///
+    /// The literal clause is asserted `false` first, because that is the whole
+    /// reason the resolved spelling is consulted: without it the leg would pass
+    /// on the first clause and prove nothing about this operation.
+    #[cfg(unix)]
+    #[test]
+    fn a_rejoin_in_the_written_order_keeps_an_in_root_state_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("rejoin-order");
+        let real = dir.join("real");
+        fs::create_dir_all(&real).expect("the served root");
+        let root = canonicalize(&real).expect("canonicalize the served root");
+        let link = dir.join("link");
+        symlink(&real, &link).expect("symlink");
+
+        // The exploit's shape: the root through the link, then two absent
+        // names and the `..`s that climb back over them.
+        let spelled = link
+            .join("x")
+            .join("y")
+            .join("..")
+            .join("..")
+            .join(".tinio");
+        assert!(
+            !path_contains(&spelled, &root),
+            "the leg is vacuous unless the literal clause answers `false`: {spelled:?} vs {root:?}"
+        );
+        let resolved = resolved_path(&spelled).expect("an existing ancestor resolves");
+        assert!(
+            path_contains(&resolved, &root),
+            "the written order resolves to the in-root state directory the run would create: \
+             {resolved:?} vs {root:?}"
+        );
+
+        fs::remove_dir_all(&dir).expect("clean");
+    }
 
     /// The platform-neutral half: a candidate under the root is inside it
     /// (the root itself included), a sibling that merely shares the root's

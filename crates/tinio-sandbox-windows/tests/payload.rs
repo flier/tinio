@@ -20,7 +20,7 @@ use std::{
 };
 
 use tinio_sandbox_core::{
-    Adopted, LaunchPayload, is_control_fd_arg, is_listener_fd_arg, listener_fd_arg,
+    Adopted, LaunchPayload, is_launcher_fd_arg, is_listener_fd_arg, listener_fd_arg,
     listener_fd_from_arg,
 };
 use tinio_sandbox_windows::{launch, socket};
@@ -81,6 +81,7 @@ fn a_child_reads_the_frame_the_parent_wrote() {
     let frame = serde_json::to_vec(&LaunchPayload {
         config: "version = 1\n".into(),
         token: None,
+        confinement: None,
     })
     .expect("the payload serializes");
     child
@@ -171,7 +172,7 @@ fn the_control_elements_ride_beside_the_listener_element() {
     assert_eq!(args[2], "tinio-sandbox-control-fd=1048");
     let kept: Vec<String> = args
         .iter()
-        .filter(|arg| !is_listener_fd_arg(arg) && !is_control_fd_arg(arg))
+        .filter(|arg| !is_launcher_fd_arg(arg))
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     assert_eq!(
@@ -190,7 +191,7 @@ fn a_launch_that_named_no_listener_is_an_error_not_a_socket() {
     // it, so this is the hand-built `Adopted` a caller reaches through
     // `Adopted::new`: what the rule does about it is report it, rather than rebuild
     // a socket from a value no launch chose.
-    let adopted = Adopted::new(String::new(), None, Vec::new(), None);
+    let adopted = Adopted::new(String::new(), None, Vec::new(), None, None);
     let error = launch::listener(&adopted).expect_err("no descriptor, no socket");
     let rendered = error.to_string();
     assert!(rendered.contains("rebuild the listener"), "{rendered}");

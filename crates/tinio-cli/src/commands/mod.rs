@@ -168,13 +168,15 @@ pub(crate) fn parse_switch(raw: &str) -> Result<bool, String> {
 /// The candidates are [`resolve::state_dir_candidates`]'s five-argument rule: the resolved
 /// directory first, then the **other** one — `<root>/.tinio` for a read-only run and the
 /// home-derived directory for a read-write one, with `TINIO_STATE_DIR` replacing that
-/// home-derived candidate whenever it is set. **The override is the discovery parse's**, taken
-/// off [`Located`] rather than read here: the file its own directory holds was located from that
-/// value, and a second read could answer differently (the `.env` load happens between the two
-/// parses). `default_home_state_dir_path` is the **non-creating** form of the derivation: a
-/// client asks whether a server is there, so it must not create the home tree it is asking about
-/// — and the lazy closure is what keeps an exported `TINIO_STATE_DIR` from touching the home at
-/// all (`state_dir_candidates` takes the derivation lazily for exactly that reason).
+/// home-derived candidate whenever it is set. **The override is the discovery parse's, and it is
+/// read off the resolution it produced** ([`Resolution::state_dir_override`], carried there
+/// rather than taken off [`Located`] before the move): the file its own directory holds was
+/// located from that value, and a second read could answer differently (the `.env` load happens
+/// between the two parses). `default_home_state_dir_path` is the **non-creating** form of the
+/// derivation: a client asks whether a server is there, so it must not create the home tree it
+/// is asking about — and the lazy closure is what keeps an exported `TINIO_STATE_DIR` from
+/// touching the home at all (`state_dir_candidates` takes the derivation lazily for exactly that
+/// reason).
 ///
 /// The gate is `any(feature = "api", test)`: no-api builds have no client command to resolve for,
 /// but the `test` graph's fixture does, and the lib target of a no-api check would otherwise see
@@ -190,15 +192,12 @@ pub(crate) fn client_resolution(
     args: DirArgs,
     located: Located,
 ) -> Result<(Resolution, Vec<PathBuf>), Error> {
-    // The override is taken before the resolution consumes `located`: the pair needs the value
-    // the state dir was resolved from, not the directory it produced.
-    let override_dir = located.state_dir_override.clone();
     let resolution = resolve::for_doctor(located, &args)?;
     let candidates = resolve::state_dir_candidates(
         &resolution.root,
         &resolution.state_dir,
         resolution.read_only,
-        override_dir,
+        resolution.state_dir_override.clone(),
         || Ok(state::default_home_state_dir_path(&resolution.root)?),
     )?;
     Ok((resolution, candidates))

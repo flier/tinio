@@ -117,7 +117,7 @@ pub const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
 /// hashing the raw spelling would split `E:\Data` from `e:/data` and
 /// `\\?\E:\data` from `E:\data` — one directory each — and a second name is a
 /// second profile, a second ACE and a residue no run ever takes over (decision 21).
-/// What those units are folded by is [`fold_unit`]'s business, and it is not
+/// What those units are folded by is `fold_unit`'s business, and it is not
 /// `str::to_lowercase`: that doc carries the many-to-one mapping which is the
 /// reason the lossy half could not be the whole digest.
 ///

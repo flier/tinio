@@ -97,7 +97,7 @@ pub fn adopt(
 /// use tinio_sandbox_core::Adopted;
 /// use tinio_sandbox_windows::launch;
 ///
-/// let adopted = Adopted::new(String::new(), Some(1040), Vec::new(), None);
+/// let adopted = Adopted::new(String::new(), Some(1040), Vec::new(), None, None);
 /// let listener = launch::listener(&adopted)?;
 /// // The child serves on the socket the launcher bound; it never binds one.
 /// let _ = listener;

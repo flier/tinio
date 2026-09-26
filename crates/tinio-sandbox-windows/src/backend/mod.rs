@@ -407,11 +407,13 @@ fn spawn_supervised_child(
     // a pipe at all, so the handles it is handed are the whole of what it can ever serve on.
     // Marked inheritable for the reason the listener is: a handle list cannot name a handle
     // without the bit, and `spawn_supervised_child` is the last point before `CreateProcessW`
-    // at which it can be set.
+    // at which it can be set. **The value comes off the plan's own accessor**, which is where
+    // this platform keeps the handle number the launcher's channel owns; Windows needs no clear
+    // for the handoff, so nothing here has to reach an object the way macOS's launcher does.
     let controls: Vec<HANDLE> = plan
         .controls()
         .iter()
-        .map(|handle| *handle as HANDLE)
+        .map(|handle| handle.value() as HANDLE)
         .collect();
     for control in &controls {
         handles::mark_inheritable(*control)
@@ -419,19 +421,24 @@ fn spawn_supervised_child(
     }
     let payload_pipe = handles::pipe().map_err(|source| launch("CreatePipe", "stdin", source))?;
     let event_pipe = handles::pipe().map_err(|source| launch("CreatePipe", "stdout", source))?;
-    let payload = serde_json::to_vec(&LaunchPayload {
-        config: plan.config().to_owned(),
-        // The launcher's token, when it has one: the child adopts it instead of minting its
-        // own, so the value a client reads out of `state` is the value the plane verifies.
-        token: plan.token().map(str::to_owned),
-    })
-    .map_err(|err| {
-        launch(
-            "serialize the launch payload",
-            "stdin",
-            io::Error::other(err),
-        )
-    })?;
+    // **Serialized from borrows** (`LaunchPayload::encode_frame`): the configuration text and the
+    // plan's token go straight into the frame, where an owned `LaunchPayload` would have copied
+    // both first — and this is the path that blocks until the child drains its stdin.
+    //
+    // The token is the launcher's, when it has one: the child adopts it instead of minting its
+    // own, so the value a client reads out of `state` is the value the plane verifies. **The
+    // confinement is absent on Windows by construction**: this platform's confinement is the
+    // container the child was created in, so there is nothing for the child to apply to itself —
+    // the field is the in-process mechanism's command, and a launcher that resolves one is the
+    // only writer of it.
+    let payload =
+        LaunchPayload::encode_frame(plan.config(), plan.token(), None).map_err(|err| {
+            launch(
+                "serialize the launch payload",
+                "stdin",
+                io::Error::other(err),
+            )
+        })?;
     // `skip(1)`: `command_args` inserts the listener element at index 1, and the
     // child drops `argv[0]` before reading it.
     let argv = options

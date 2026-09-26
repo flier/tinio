@@ -1,12 +1,11 @@
 # AGENTS.md
 
-Project rules and conventions live in [CLAUDE.md](CLAUDE.md) — read it before working in this repository.
+Project rules live in [CLAUDE.md](CLAUDE.md) — read it before working here. CLAUDE = pointers; named `docs/*.md` = source of truth.
 
-Key points:
-
-- English only for docs, artifacts, comments, commits, PRs.
-- Never auto-commit/push/merge/rebase/stash — ask first, per operation.
-- Cargo conventions: `docs/cargo.md`.
-- Code style: `docs/style.md`.
+- English only: `docs/compress.md`.
+- Git (ask first, never auto, leave unstaged): `docs/git.md`.
+- Cargo: `docs/cargo.md`.
+- Style: `docs/style.md`.
 - Docs prose: `docs/compress.md`.
-- Tests: `docs/tests.md`.
+- Tests / scripts / concurrency: `docs/tests.md`.
+- Specs/plans: `docs/superpowers/README.md`.

@@ -29,6 +29,138 @@ pub extern crate tinio_sandbox_macos as _macos;
 #[doc(hidden)]
 pub extern crate tinio_sandbox_windows as _windows;
 
+// The platform items each launcher crate answers, bound under one alias per platform so the
+// facade's own bodies call a two-segment path: `clippy::absolute_paths` is `warn` for this
+// crate, and a path written straight from the crate root is three segments or more. The
+// `disarm` pair is not one alias for one body, because their answers differ — see
+// [`disarm_signal_relay`]. The rest are the adopted names' platform halves, which the facade
+// maps into the shared shape — see [`adopted_listener`].
+#[cfg(target_os = "macos")]
+use std::{net::TcpListener, os::unix::net::UnixListener};
+
+#[cfg(target_os = "macos")]
+use crate::_macos::launch::{control as macos_control, listener as macos_listener};
+#[cfg(target_os = "macos")]
+use crate::_macos::relay::on_forwarded_stop as macos_on_stop;
+
+/// The child-side **control-channel** rebuild: the unix socket the launcher bound,
+/// under the platform-neutral name the shared child path drives.
+///
+/// **The second of the two handoffs a macOS launch performs, and the same shape as
+/// [`adopted_listener`]**: the profile grants the confined child no `network-bind`
+/// at all, so a unix `bind()` inside the confinement is refused — the launcher
+/// binds the control socket itself, clears its `FD_CLOEXEC`, and writes the
+/// descriptor number into the child's argv, and this is the rebuild on the other
+/// side. One socket, so one inherited descriptor; the channel is the child's
+/// whole control plane, and the macOS wrapper in `tinio-cli` is the caller.
+///
+/// The name is the platform-neutral one for the same reason the listener's is
+/// (design decision 2, §10): the child path can name no platform crate, so the
+/// facade selects the implementation. Nothing here is re-exported on a target
+/// that does not launch a child.
+///
+/// **The facade is where the platforms' shapes meet**, and this name carries the
+/// same one return type as [`adopted_listener`] and [`on_stop`] for the reason
+/// stated there: the platform crate answers its own error type (macOS's
+/// `std::io::Result`, here and for the listener and the hook), and the facade maps
+/// it into the shared [`Result`] so that `?` in a caller's function converts the
+/// same way on every platform the caller builds for.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox::{Adopted, Error, adopted_control};
+///
+/// let adopted = Adopted::new(String::new(), Some(3), vec![4], None, None);
+/// let socket = adopted_control(&adopted)?;
+/// # let _ = socket;
+/// # Ok::<(), Error>(())
+/// ```
+#[cfg(target_os = "macos")]
+pub fn adopted_control(adopted: &Adopted) -> Result<UnixListener> {
+    macos_control(adopted).map_err(step("rebuild the control channel"))
+}
+/// The child-side listener rebuild, under the platform-neutral name the shared
+/// child path drives.
+///
+/// **The macOS half of the pair above, and the same name for the same reason**:
+/// the CLI's serving path gates its child arm by `feature = "sandbox"` alone, so
+/// it names this one name on every platform and the facade selects the
+/// implementation (design decision 2, §10). What differs is where the socket
+/// comes from. The macOS launcher binds with `std`, clears the descriptor's
+/// close-on-exec flag so it survives `execve`, and this rebuild is what turns the
+/// inherited descriptor back into a `TcpListener`; **on unix a `std` socket is
+/// already non-blocking**, so unlike the Windows arm there is no mode to
+/// correct after the conversion.
+///
+/// **The facade is where the platforms' shapes meet, and the three adopted names
+/// are one rule because of it.** The two platform crates answer what their
+/// mechanism returns — macOS's rebuild is a `BorrowedFd`/`OwnedFd` conversion and
+/// answers `std::io::Result`, the Windows crate's descriptor reconstruction
+/// answers the core's [`Result`] — so a caller that writes the child path once
+/// and builds it for both would convert one error at its `?` and not the other,
+/// and a leg on one target could not see the disagreement. Neither platform's
+/// signature changes here (each is its mechanism's own); the mapping is the
+/// facade's, and this arm's `io::Error` becomes the core's [`Error`] through
+/// [`step`] — a refusal that names the step and keeps the platform's error as its
+/// source. A single [`Result`] is the whole surface of the rule: [`adopted_control`],
+/// [`adopted_listener`] and [`on_stop`] each answer `Result<T>` on every platform
+/// that publishes them.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox::{Adopted, Error, adopted_listener};
+///
+/// let adopted = Adopted::new(String::new(), Some(3), Vec::new(), None, None);
+/// // The child serves on the socket the launcher bound; it never binds one.
+/// let listener = adopted_listener(&adopted)?;
+/// # let _ = listener;
+/// # Ok::<(), Error>(())
+/// ```
+#[cfg(target_os = "macos")]
+pub fn adopted_listener(adopted: &Adopted) -> Result<TcpListener> {
+    macos_listener(adopted).map_err(step("rebuild the adopted listener"))
+}
+/// The child-side stop hook: where a stop the launcher forwards lands, under the
+/// platform-neutral name the shared child path drives (design §3 step 9,
+/// decision 20's second half).
+///
+/// **The macOS half of the pair above, and the same name for the same reason**:
+/// the CLI's confined child is gated by the feature alone and can name no platform
+/// crate, so the facade is where each call that path makes gets one
+/// `#[cfg]`-selected spelling. What travels behind it differs — the macOS relay
+/// delivers a real signal into the confined child, so the child needs its own
+/// registration for the forwarded stop to land anywhere — and what the child sees
+/// does not: a closure that runs on a thread of its own and starts the shutdown.
+///
+/// **One return type with the other two, mapped here rather than in the platform
+/// crate** ([`adopted_listener`] states the rule): macOS's `io::Result` is what
+/// the signal registration answers, and the facade turns its refusal into the
+/// core's [`Error`] so that a caller's `?` is one conversion on every platform.
+///
+/// **`disarm` deliberately does not ride along.** It is for a process that
+/// outlives one launch — the test harness, a CLI that serves twice — so the
+/// launcher's own teardown is the one call site that wants it, and no shared path
+/// names it today; [`disarm_signal_relay`] is that name, and it is a function
+/// rather than a re-export because the platforms do not agree on a return type.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox::{Error, on_stop};
+///
+/// // The hook runs on a thread of its own, so what it does may allocate and
+/// // take locks: starting the runtime's shutdown here is what it is for.
+/// on_stop(|| {
+///     let _ = ();
+/// })?;
+/// # Ok::<(), Error>(())
+/// ```
+#[cfg(target_os = "macos")]
+pub fn on_stop(hook: impl Fn() + Send + 'static) -> Result<()> {
+    macos_on_stop(hook).map_err(step("install stop-signal handling"))
+}
 // **Exactly the core's public surface, name for name, and that equality is the
 // rule rather than an accident.** The consumers are `crates/tinio-cli` (the
 // serving process, which reaches this crate through the `sandbox` feature its
@@ -54,13 +186,20 @@ pub extern crate tinio_sandbox_windows as _windows;
 /// construction and `disarm` have no shared call site — and the core's names,
 /// `adopt` among them, are already re-exported above rather than here.
 ///
+/// **This arm is the identity of the shared shape**, and that is the only
+/// difference between the two: the Windows launcher's descriptor reconstruction
+/// already answers the core's [`Result`], so the facade has nothing to map — where
+/// the macOS arm has to carry its `io::Error` across. [`adopted_listener`] there
+/// states the rule the three adopted names share, and the mapping is why the
+/// facade exists at all: one name, one return type, whichever platform builds it.
+///
 /// # Examples
 ///
 /// ```no_run
 /// use tinio_sandbox::{Adopted, Error, adopted_listener};
 ///
 /// # fn main() -> Result<(), Error> {
-/// let adopted = Adopted::new(String::new(), Some(1040), Vec::new(), None);
+/// let adopted = Adopted::new(String::new(), Some(1040), Vec::new(), None, None);
 /// // The child serves on the socket the launcher bound; it never binds one.
 /// let listener = adopted_listener(&adopted)?;
 /// # let _ = listener;
@@ -80,6 +219,11 @@ pub use tinio_sandbox_windows::launch::listener as adopted_listener;
 /// where it stands. Both are named by the CLI's confined child, which is gated by the
 /// feature alone and can name no platform crate — so the facade is where each
 /// call that path makes gets one `#[cfg]`-selected spelling.
+///
+/// **One return type with the other two, and here it is the platform's already**
+/// ([`adopted_listener`] states the rule): the Windows hook answers the core's
+/// [`Result`] natively, so this arm is the identity while the macOS arm maps its
+/// `io::Result` — and a caller's `?` is one conversion either way.
 ///
 /// **`disarm` deliberately does not ride along.** It is for a process that
 /// outlives one launch — the test harness, a CLI that serves twice — and no
@@ -104,11 +248,60 @@ pub use tinio_sandbox_windows::launch::listener as adopted_listener;
 #[cfg(target_os = "windows")]
 pub use tinio_sandbox_windows::launch::on_stop;
 
+#[cfg(target_os = "macos")]
+use crate::_macos::relay::disarm as macos_relay_disarm;
+#[cfg(target_os = "windows")]
+use crate::_windows::launch::disarm as windows_relay_disarm;
+
+/// Disarm the launcher's signal relay, if this platform has one.
+///
+/// **A function rather than a third re-export, because the two platforms do not
+/// agree on a shape**: the Windows launcher's `launch::disarm` reports a failure
+/// through the core's `Result`, while the macOS relay's `disarm` is the teardown
+/// `supervise` already takes and answers `()`. A caller that outlives one launch
+/// — the test harness, and any CLI that serves twice — wants one name and no
+/// branch, so the facade is where the disagreement stops (design decision 2).
+///
+/// **This is the rule [`adopted_listener`] states, in the one shape a mapping
+/// cannot fix.** There the disagreement is the error type and the facade maps it
+/// into one [`Result`]; here the platforms disagree about the *success* shape
+/// itself — one answers `()`, the other an error — and the one error is one this
+/// teardown has no reporter for, so the shared name answers `()` on every
+/// platform and the Windows arm discards what it was told (the next paragraphs
+/// give the reason). A caller reads the same name and writes no `#[cfg]` either
+/// way.
+///
+/// **The in-place platform has nothing to disarm**: Linux confines this process
+/// and relays no signal, so its arm is the empty body and the call is a no-op
+/// rather than a `#[cfg]` at the call site.
+///
+/// **A failure is not reported**, and that is deliberate rather than an omission:
+/// the one caller is a teardown, the relay is the launcher's own, and a process on
+/// its way out has no one to tell.
+///
+/// # Examples
+///
+/// ```
+/// // Nothing to disarm on a host whose platform confines in place, and on a
+/// // launcher platform this puts the process back on the default disposition.
+/// tinio_sandbox::disarm_signal_relay();
+/// ```
+pub fn disarm_signal_relay() {
+    // **Two statements rather than one expression both platforms share**, because their `disarm`
+    // answers different things: the macOS relay answers `()`, the Windows launcher a `Result`
+    // this teardown has no reporter for. Each alias is bound by the `#[cfg]` above.
+    #[cfg(target_os = "macos")]
+    macos_relay_disarm();
+    #[cfg(target_os = "windows")]
+    let _ = windows_relay_disarm();
+}
+
 pub use crate::_core::{
-    AccessMode, Adopted, Backend, CONTROL_FD_PREFIX, Child, Confinement, Error, Event, Exposure,
-    LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer, Result, Sandbox, Terminal, adopt,
-    control_fd_arg, control_fd_from_arg, fail, is_control_fd_arg, is_listener_fd_arg, launch,
-    listener_fd_arg, listener_fd_from_arg, refused, step, supervise,
+    AccessMode, Adopted, Backend, CONTROL_FD_PREFIX, Child, Confinement, ControlHandle, Error,
+    Event, Exposure, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer, Result, Sandbox,
+    Terminal, adopt, control_fd_arg, control_fd_from_arg, fail, is_control_fd_arg,
+    is_launcher_fd_arg, is_listener_fd_arg, launch, listener_fd_arg, listener_fd_from_arg, refused,
+    step, supervise,
 };
 /// The Linux backend's own crate, for the settings the shared surface does not
 /// carry — its `Options` (the model and the `tmpdir` knob) and its `Seccomp`
@@ -141,6 +334,31 @@ pub use crate::_linux as linux;
 /// ```
 #[cfg(target_os = "linux")]
 pub use crate::_linux::{Backend as Platform, backend as platform};
+/// The macOS backend's own crate, for the settings the shared surface does not
+/// carry — its `Options`, which holds the mechanism (`Mechanism`), and the
+/// `apply` module the confined child reaches its own confinement through.
+///
+/// **The same shape the Linux arm above takes, and the same reason**: the
+/// mechanism is macOS's own vocabulary, so a consumer writes
+/// `tinio_sandbox::macos::Options` inside the `#[cfg(target_os = "macos")]` block
+/// it would have written anyway — and names **one** crate rather than one per
+/// platform. The re-export does not widen the *shared* surface: these are still
+/// the platform's own types in the platform's own crate (design decision 2, §10).
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(target_os = "macos")]
+/// # fn main() {
+/// use tinio_sandbox::macos::{Mechanism, Options};
+///
+/// assert_eq!(Options::default().mechanism(), Mechanism::SandboxExec);
+/// # }
+/// # #[cfg(not(target_os = "macos"))]
+/// # fn main() {}
+/// ```
+#[cfg(target_os = "macos")]
+pub use crate::_macos as macos;
 /// The backend for the platform this build targets, and the constructor for it.
 ///
 /// # Examples

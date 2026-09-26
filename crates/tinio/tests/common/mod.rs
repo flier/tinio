@@ -16,12 +16,17 @@
 // each one; this is a test crate and the absolute paths are the point (they name the module, not a
 // local alias), the same shape `commands::doctor::tests` uses.
 
+// **The gated imports in this block are `pub use` because the glob is how the legs read this
+// module.** `doctor.rs` takes everything here through `use common::*`, and a glob re-exports only
+// `pub` items — as private imports the unix socket legs could not name them (`E0433`/`E0425`),
+// which the Windows build never reports because the gate is false there and the legs are compiled
+// out with it. The gate itself is unchanged: these are re-exported exactly where they exist at all.
 #[cfg(all(feature = "api", unix))]
-use std::os::unix::net::UnixListener;
+pub use std::os::unix::net::UnixListener;
 use std::{path::Path, process::Command};
 
 #[cfg(all(feature = "api", unix))]
-use tinio_api::state::socket_path;
+pub use tinio_api::state::socket_path;
 
 /// The token the fixture writes into the `state` file: distinctive on purpose, because the
 /// redaction leg asserts this exact string reaches neither stdout nor stderr, in either rendering.

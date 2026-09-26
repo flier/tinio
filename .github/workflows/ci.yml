@@ -72,8 +72,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y lld
 
-      # Plain stable toolchain, shared by every job except lint (which
-      # adds the clippy component — see the lint job below).
+      # Plain stable toolchain, shared by every job except lint and the macOS
+      # clippy step in test-port — each adds the clippy component itself
+      # (both below).
       - &toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -122,27 +123,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 2 clippy runs, both on ubuntu. The unix leg lints linux and the
-        # cfg(unix) code; the windows-gnu leg cross-lints the cfg(windows)
-        # code. The macos/msvc-native clippy legs are dropped (their compile
-        # coverage already comes from the test-port matrix).
-        #
-        # **Neither of these two legs lints the macOS sandbox crate's body, and
-        # that window closes with P3.** The reason the unix leg used to stand in
-        # for macOS — "the source has no cfg(target_os = "macos"), every macOS
-        # code path is cfg(unix)" — stopped being true when
-        # crates/tinio-sandbox-macos/src/lib.rs took a crate-root
-        # `#![cfg(target_os = "macos")]`: on both legs the crate is now an empty
-        # library, so no line of it reaches clippy here. **That is this job's
-        # gap and not the workflow's**: test-port runs on macos-latest, where
-        # the gate is satisfied, and its run-test-leg compiles the crate's body
-        # and runs its doctests — what is missing is the lint, because there is
-        # no macOS clippy leg. It is the same shape that hid a real defect in
-        # tinio-sandbox-linux (clippy::default_constructed_unit_structs, seen
-        # only by running clippy on Linux). P3 drops that gate and compiles the
-        # crate on every target with per-item gating, which brings its body back
-        # under this job
-        # (docs/superpowers/plans/2026-09-18-sandbox-p3-macos.md).
+        # 2 clippy runs, both on ubuntu. The unix leg lints linux, and that
+        # does NOT cover macos: the workspace carries macOS-only code behind
+        # cfg(target_os = "macos") — crates/tinio-fs/src/fsutil.rs's o_nofollow()
+        # today, and the whole tinio-sandbox-macos backend — which a
+        # linux compile never builds, so the macos-latest leg of test-port lints
+        # it natively instead. The windows-gnu leg cross-lints the cfg(windows)
+        # code; the msvc-native clippy legs are dropped (their compile coverage
+        # already comes from the test-port matrix).
         target:
           - unix
           - windows-gnu
@@ -204,8 +192,9 @@ jobs:
       - *checkout
       - *lld
 
-      # Plain stable toolchain, shared by every job except lint (which
-      # adds the clippy component — see the lint job above).
+      # Plain stable toolchain, shared by every job except lint and the macOS
+      # clippy step in test-port — each adds the clippy component itself
+      # (lint above, that step below).
       - *toolchain
 
       # Chain head: test keeps its full target dir (the e2e/interop/
@@ -343,6 +332,21 @@ jobs:
 
       - *sccache
 
+      # macOS-only code is invisible to the ubuntu clippy job (see the lint
+      # job's own comment), so this leg lints the workspace as well as testing
+      # it. Native, not a cross-lint: the runner is already a Mac, so no SDK
+      # and no cross toolchain is involved — the cross-lint route was measured
+      # and rejected (a dependency's build script fails before this workspace's
+      # code is reached; the measurement and the negative result are in
+      # docs/superpowers/plans/2026-09-18-sandbox-p3-macos.md, Task 9 Step 7).
+      # Gated to the default leg so it does not run twice, and the toolchain
+      # anchor installs without clippy, hence the component add.
+      - name: clippy (-D warnings, macOS-only code)
+        if: matrix.os == 'macos-latest' && matrix.target == 'default'
+        run: |
+          rustup component add clippy
+          cargo clippy --profile ci --workspace --all-targets -- -D warnings
+
       - uses: ./.github/actions/run-test-leg
         with:
           mode: ${{ matrix.target }}
@@ -416,12 +420,16 @@ jobs:
       # the feature-gated (@parquet), platform-bound (@unix/@windows),
       # external-client (@interop/@boto3/@mc) and host-bound (@confinement
       # off macOS) tags, so the fs pass needs no --tags. That is why the fs
-      # pass is the one macOS leg that runs the refusal half of the
-      # confinement scenarios. The mem pass skips @fs-only scenarios
-      # (traversal, nested-root, out-of-band); backend-neutral scenarios run
-      # on mem via TINIO_E2E_BACKEND. --test cucumber keeps the args from
-      # reaching the plain-harness traceability target (its own step below),
-      # and an explicit --tags REPLACES the runner's default filter, so the
+      # pass is the one macOS leg that runs the confinement scenarios at all,
+      # and there it takes the honour arm rather than a refusal: the backend
+      # is landed on every target, so steps/cli.rs's owed_arm has no macOS
+      # refusal branch. docs/tests.md's CLI section owns that coverage
+      # consequence and this comment does not restate it. The mem pass skips
+      # @fs-only scenarios (traversal, nested-root, out-of-band);
+      # backend-neutral scenarios run on mem via TINIO_E2E_BACKEND. --test
+      # cucumber keeps the args from reaching the plain-harness traceability
+      # target (its own step below), and an explicit --tags REPLACES the
+      # runner's default filter, so the
       # mem pass must repeat the platform, external-tag and confinement
       # exclusions itself.
       # --retry 2 on both passes: ConnectionAborted flakes on loaded legs

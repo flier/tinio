@@ -257,9 +257,8 @@ fn run_service(
             // only where it cannot honour one, with the two refusals `contracts/cli.md`'s
             // `--sandbox` bullet specifies (a usage error naming the build when the `sandbox`
             // feature is off, a startup error naming the platform while the backend is a stub),
-            // and `sandbox::BACKEND_IS_STUB` is `false` on Linux and Windows and `true` on macOS
-            // — so here `confine` is reached and the arm is taken, while macOS refuses every
-            // confinement request before it.
+            // and `sandbox::BACKEND_IS_STUB` is `false` on every target this workspace confines
+            // on — Linux, macOS and Windows — so here `confine` is reached and the arm is taken.
             tracing::debug!("the confined child has already exited");
             Ok(())
         }

@@ -33,6 +33,8 @@ use hyper::{Request, client::conn::http1};
 #[cfg(windows)]
 use hyper_util::rt::TokioIo;
 use tempfile::TempDir;
+#[cfg(unix)]
+use tinio_api::bind::bind_unix;
 use tinio_api::{
     Error, Options, Plane,
     client::{self, Call, RawResponse, Report},
@@ -157,26 +159,31 @@ struct Running {
 impl Running {
     /// The CLI's own startup, in order: bind (the single-instance lock) → publish (the readiness
     /// point) → serve, then wait until the channel answers.
-    async fn start(
+    ///
+    /// **One body for both legs, because the two differ in the bind and in nothing else**, and
+    /// `bind` is that difference: `Plane::bind` for the CLI's own path, `Plane::adopt` for the
+    /// confined child's. The plane is built with `token: None` — this harness's plane owns its
+    /// `state` file, so it generates its own token, and the launcher-supplied case is the confined
+    /// child's.
+    async fn start_with(
         dirs: &Dirs,
         selection: Selection,
         gauges: Option<Arc<Gauges>>,
         ready: Ready,
+        bind: impl FnOnce(Options) -> Result<Plane, Error>,
     ) -> Self {
         let (stop, rx) = watch::channel(false);
         let plane = Arc::new(
-            Plane::bind(Options {
+            bind(Options {
                 selection,
                 state_dir: dirs.dir().to_path_buf(),
                 root: dirs.root().to_path_buf(),
                 host: "127.0.0.1".to_string(),
                 stop: stop.clone(),
                 gauges,
-                // This harness's plane owns its `state` file, so it generates its own token —
-                // the launcher-supplied case is the confined child's, not this one's.
                 token: None,
             })
-            .expect("bind"),
+            .expect("the plane is built"),
         );
         plane.publish(9000).expect("publish");
         let serving = tokio::spawn({
@@ -197,6 +204,31 @@ impl Running {
             rx,
             report,
         }
+    }
+
+    /// [`Running::start_with`] on [`Plane::bind`]: the CLI's own single-instance path.
+    async fn start(
+        dirs: &Dirs,
+        selection: Selection,
+        gauges: Option<Arc<Gauges>>,
+        ready: Ready,
+    ) -> Self {
+        Self::start_with(dirs, selection, gauges, ready, Plane::bind).await
+    }
+
+    /// [`Running::start_with`]'s **adopted** twin, and the shape a confined child runs: the
+    /// launcher already bound the control channel, and this plane serves on the socket it was
+    /// handed (`Plane::adopt`) instead of binding one of its own.
+    ///
+    /// The launcher-token half of the same path (`state` written by the launcher, the child
+    /// verifying against the value in it) is what the macOS end-to-end leg drives with a real
+    /// confining launcher.
+    #[cfg(unix)]
+    async fn start_adopted(dirs: &Dirs, selection: Selection, inherited: StdUnixListener) -> Self {
+        Self::start_with(dirs, selection, None, Ready::State, |options| {
+            Plane::adopt(options, inherited)
+        })
+        .await
     }
 
     fn token(&self) -> String {
@@ -727,6 +759,56 @@ async fn a_stale_socket_file_is_reclaimed_by_the_bind() {
 
     running.stop(&dirs).await;
     assert!(!socket.exists(), "and `shutdown` removes it");
+}
+
+/// **The adopted half of that same channel**, and the property the macOS profile now depends on:
+/// the launcher binds the control socket — it is the process that may — and the child serves on
+/// the descriptor it inherited, so the confinement needs no `network-bind` grant. Nothing about
+/// the single-instance claim moves: the launcher's bind is still what a second server meets, and
+/// the plane records the path that bind created, so `state.control_name` names the socket the
+/// child actually answers on.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_adopted_socket_serves_on_the_channel_the_launcher_bound() {
+    let dirs = Dirs::new();
+    let socket = dirs.socket();
+    // The launcher's half: the bind that reclaims the path and makes the single-instance claim.
+    let channel = bind_unix(&socket).expect("the launcher binds the control channel");
+    // The child's half: a descriptor for the same socket. This is what crosses the exec in
+    // production — the launcher clears `FD_CLOEXEC` on `Channel::socket` and spells the number
+    // into argv, and the platform crate rebuilds the listener from it.
+    let inherited = StdUnixListener::from(
+        channel
+            .socket()
+            .try_clone_to_owned()
+            .expect("a descriptor for the inherited socket"),
+    );
+
+    let local = LocalForm::Unix(socket.clone());
+    let running = Running::start_adopted(&dirs, local_selection(&local), inherited).await;
+    assert_eq!(
+        running.report.state.as_ref().expect("state").control_name,
+        socket.to_string_lossy(),
+        "the adopted channel records the path the launcher bound"
+    );
+
+    // The claim is still the launcher's: its bind is what a second server meets, and the probe
+    // refuses rather than unlinking a live socket.
+    assert!(
+        bind_unix(&socket).is_err(),
+        "another server is already listening on the adopted channel"
+    );
+
+    let token = running.token();
+    let answer = local_request(&local, "/status", Method::GET, Some(&token)).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
+
+    running.stop(&dirs).await;
+    // The plane removes the socket file it recorded, exactly as the binding half does, and the
+    // launcher's own copy is the last owner of the object this leg drops.
+    assert!(!socket.exists(), "`shutdown` removes the adopted socket");
+    drop(channel);
 }
 
 /// Both of the plane's files are private on unix: the socket's mode is set at the bind, the state

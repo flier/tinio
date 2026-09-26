@@ -39,20 +39,31 @@
 //!
 //! This module is a deliberately panicking test harness (assert-style);
 //! unwraps here are assertion plumbing, not library error handling.
+//!
+//! Three names here are not the conformance suite's and are shared across crates
+//! beyond it: [`wait_timeout_secs`] (the readiness budget every spawned-child
+//! harness reads), [`wait_for`] (its async poll) and [`wait_for_exit`] — the one
+//! spelling of "every spawned process is waited for or killed on every path",
+//! which the two launcher platforms' legs need and only a crate both of them
+//! build can hold.
 
 use std::{
     env, io,
-    process::id,
+    process::{Child, ExitStatus, id},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::time::{Instant, sleep};
+// `Instant` is std's here, because the module now carries a sync poll
+// (`wait_for_exit`) beside the async one; tokio's timer-aware instant is named
+// for its crate so the two cannot be swapped by a `use` nobody looked at.
+use tokio::time::{Instant as TokioInstant, sleep};
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
@@ -2595,13 +2606,70 @@ pub fn wait_timeout_secs() -> u64 {
 /// across tinio-fs testutil and the tinio-server pipeline tests (F30).
 pub async fn wait_for(mut cond: impl FnMut() -> bool) {
     let secs = wait_timeout_secs();
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let deadline = TokioInstant::now() + Duration::from_secs(secs);
     while !cond() {
         assert!(
-            Instant::now() < deadline,
+            TokioInstant::now() < deadline,
             "condition not met within {secs} s"
         );
         sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Wait for `child` to exit, or kill it and fail the test rather than block on
+/// it.
+///
+/// **Every spawned process is waited for or killed on every path, red ones
+/// included**, and this is the one function that rule is spelled in — which is
+/// why it is shared rather than copied per suite. The failing path kills before
+/// it panics: a child left running keeps `target/<profile>/deps/<suite>-<hash>`
+/// open for the rest of the run, which breaks a later build with `LNK1104` on
+/// Windows, and it keeps writing its own libtest output into the parent's.
+///
+/// **It lives here because the launcher platforms build one crate each.** The
+/// rule was `tinio-sandbox-windows::testing`'s, and that crate's root is
+/// `#![cfg(target_os = "windows")]` — so a macOS leg could not import it and
+/// re-spelled the deadline/poll/kill rule for itself (the server's macOS e2e leg
+/// and the macOS crate's own suites), which is the drift one definer exists to
+/// remove. This module already owns the two knobs such a wait is written
+/// against — [`wait_timeout_secs`] and [`wait_for`]'s poll — so the rule joins
+/// them, and `tinio-sandbox-windows::testing` re-exports the name so its own
+/// callers (and the server harness's wrapper) keep working unchanged.
+///
+/// `try_wait` polls rather than `wait_with_output` waiting, which is the price
+/// of the bound: nothing here needs the child's captured output, since a child
+/// that inherits this process's streams has already written it where the reader
+/// of a red log will see it. `what` names the process whose exit is being waited
+/// for, because a suite has more than one.
+pub fn wait_for_exit(child: &mut Child, within: Duration, what: &str) -> ExitStatus {
+    poll_exit(child, within).unwrap_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "{what} did not exit within {within:?} — whatever it did is in the output above; \
+             it has been killed"
+        )
+    })
+}
+
+/// The bounded `try_wait` poll both wait shapes are written on: `Some` when the child exits inside
+/// `within`, `None` when the deadline passes with it still running.
+///
+/// **The poll is shared and the failing path is not, which is why this half is public.** Above,
+/// `None` means kill the child and panic. A launcher leg cannot do only that: the confined
+/// **grandchild** outlives a launcher that never exits (the accepted no-job-object gap), so the leg
+/// has to sweep that process before it fails — [`wait_for_exit`] cannot reach it and the leg cannot
+/// use [`wait_for_exit`]. One poll, two endings, neither expressible as the other.
+pub fn poll_exit(child: &mut Child, within: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

@@ -92,6 +92,7 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     let frame = serde_json::to_vec(&LaunchPayload {
         config: probe.to_string_lossy().into_owned(),
         token: None,
+        confinement: None,
     })
     .expect("the payload serializes");
     handles::write_payload(payload_pipe.write, &frame)

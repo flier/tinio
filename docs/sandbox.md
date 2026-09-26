@@ -1,6 +1,12 @@
 # `--sandbox`: what an operator has to know
 
-`--sandbox` confines the server to the paths it is given — a private mount namespace, `pivot_root`, and a seccomp filter over outbound connection setup. The notes below are Linux's, because Linux is the platform that has landed, and each is a consequence of the confinement working as designed rather than a defect: all three read as bugs the first time they are met without warning.
+`--sandbox` confines the server to the paths it is given — a private mount namespace, `pivot_root`, and a seccomp filter over outbound connection setup. The notes below are Linux's, because Linux's is the mechanism they describe (the first of the three platforms to land; macOS and Windows have landed since), and each is a consequence of the confinement working as designed rather than a defect: all three read as bugs the first time they are met without warning.
+
+## macOS: two mechanisms, `sandbox-exec` by default
+
+`TINIO_SANDBOX_MACOS_MECHANISM` selects how the profile reaches the confined child. `sandbox-exec` is the default and wraps the child's `exec` with Apple's deprecated-but-shipped helper. `sandbox-init` invokes no helper at all: the launcher hands the rendered profile to the child on the launch payload and the child applies it to itself with `sandbox_init_with_parameters` before it serves. Either name is accepted and nothing else is — a typo is a usage error (exit 2) naming the variable and its two values, never a silent run under the default.
+
+Two consequences are the operator's. On `sandbox-init` the confinement is **one-shot and irreversible** in the child, and a process confined that way can neither fork nor exec anything afterwards, so a profile that turns out to be wrong costs a restart of the run rather than a repair. And the rendered profile is **one rule shorter** there: the `process-exec` rule exists only for `sandbox-exec`, whose helper cannot exec the child without it, so a `sandbox-init` run's `rules=4` against the helper's `rules=5` is the measurement rather than a missing grant (design decision 6).
 
 ## The process has no capabilities, even when it runs as root
 

@@ -16,6 +16,9 @@
 //! contains/omits/equals) live here too, so a new feature does not have
 //! to hunt for them in a feature-specific step module.
 
+/// Not used on every target: the sweep below is macOS's alone.
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::{
     io,
     io::ErrorKind,
@@ -559,6 +562,39 @@ pub(super) async fn plant_in_root(world: &super::World, rel: impl AsRef<Path>, b
 #[given(expr = "the served root holds bucket {string} with object {string} and body {string}")]
 async fn served_root_holds(world: &mut super::World, bucket: String, key: String, body: String) {
     plant_in_root(world, Path::new(&bucket).join(&key), &body).await;
+}
+
+/// Sweep the confined grandchild a killed launcher leaves behind, by the scratch
+/// root its own argv names.
+///
+/// **The precondition is the caller's and it is not optional.** Seatbelt has no
+/// job object — a `SIGKILL`ed launcher leaves its confined child running, an
+/// accepted gap the launcher's own module records
+/// (`crates/tinio-cli/src/sandbox/macos.rs`) — and this harness holds no handle to
+/// that grandchild. The pattern is the scenario's own root, which is unique to
+/// the scenario and is named in the child's argv, so it reaches that one process
+/// and nothing else. **A scenario that confined nothing must not sweep**: this is
+/// a `pkill -f` over the whole process table, and a pattern no process of this
+/// scenario's ever carried would be matching someone else's — hence
+/// `Cli::confined_spawned`'s gate at the call site, where the fact is known.
+///
+/// **There is no non-macOS spelling, and that is why this is `cfg`'d rather than
+/// stubbed.** Every other platform needs no sweep at all, because the process a
+/// kill ends *is* the server; a no-op here would let a call site read as if it
+/// swept. The server crate's e2e module keeps its own copy of the three lines
+/// for the same reason this module exists at all: a `tests/` tree is not
+/// importable from another crate.
+#[cfg(target_os = "macos")]
+pub fn sweep_confined_grandchild(root: &Path) {
+    // A root that is not UTF-8 cannot be matched by a command line; the harness
+    // builds this one from a scratch directory it made itself, so the guard is
+    // a fact about the fixture rather than a silent skip.
+    let Some(root) = root.to_str() else {
+        return;
+    };
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("tinio server {root}")])
+        .status();
 }
 
 /// The generic response assertions — one home, so a new feature does not

@@ -353,9 +353,11 @@ mod tests {
         Resolution {
             root: root.to_path_buf(),
             config: Config::default(),
+            config_text: String::new(),
             config_path: root.join(".tinio/.tinio.toml"),
             read_only: false,
             state_dir: root.join(".tinio"),
+            state_dir_override: None,
             config_error: None,
         }
     }

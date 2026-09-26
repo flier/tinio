@@ -11,7 +11,7 @@
 //!   are one parser's answers and one precedence, expressed in one place rather than
 //!   re-implemented beside it. The parse is two-pass for exactly that reason — `.env` is
 //!   loaded between the passes, and the second one sees the file;
-//! - [`parse_read_only`] and [`parse_sandbox`] (both through [`parse_switch`]) are **pure syntax
+//! - [`parse_read_only`] and [`parse_sandbox`] (both through `parse_switch`) are **pure syntax
 //!   helpers**: the tolerant `1`/`true`/`0`/`false` grammar, with [`READ_ONLY_VAR`] and
 //!   [`SANDBOX_VAR`] naming the variables they belong to. No code path here reads an
 //!   environment variable — the CLI's `--read-only`/`--sandbox` flags carry the same grammar in

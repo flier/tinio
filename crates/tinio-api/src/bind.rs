@@ -17,10 +17,13 @@ use std::os::windows::io::{AsRawHandle as _, OwnedHandle, RawHandle};
 #[cfg(unix)]
 use std::{
     fs,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
+    os::{
+        fd::{AsFd as _, BorrowedFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
     },
     path::Path,
 };
@@ -143,6 +146,43 @@ impl Channel {
     /// ```
     pub fn socket_path(&self) -> Option<PathBuf> {
         Some(self.path.clone())
+    }
+
+    /// The bound socket itself, borrowed — what a **launcher** hands the child it confines
+    /// (sandbox design decision 16, extended to the control channel).
+    ///
+    /// **Why a launcher binds this at all.** The confined child's own `bind()` is a network
+    /// operation the profile grants nothing for, so the launcher — which is unconfined — binds
+    /// the channel and the child serves on the socket it inherits. A unix descriptor crosses
+    /// `execve` for the same reason the data plane's listener does, and its `FD_CLOEXEC` has to
+    /// be cleared for it to cross at all; **the clear is the launcher's half and cannot be the
+    /// child's**, because with the flag set there is no descriptor left on the other side to act
+    /// on. This borrow is that object: the fcntl takes it (`AsFd`), and
+    /// [`BorrowedFd::as_raw_fd`](std::os::fd::AsRawFd::as_raw_fd) is the number
+    /// `tinio_sandbox_core::control_fd_arg` spells into the child's argv — the element
+    /// `Adopted::controls` reads back on the other side.
+    ///
+    /// **The single-instance claim stays the launcher's**, exactly as `bind_pipe`'s is: the
+    /// bind that created this socket is what claimed the path, and the child adopts rather than
+    /// binding, so nothing about "one server per root" is made weaker by the handoff.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(unix)]
+    /// # {
+    /// use std::{os::fd::AsRawFd as _, path::Path};
+    ///
+    /// use tinio_api::bind::bind_unix;
+    ///
+    /// let channel = bind_unix(Path::new("/run/tinio/tinio-0123456789abcdef.sock")).expect("bind");
+    /// // The object a launcher clears `FD_CLOEXEC` on, and the descriptor it spells for the
+    /// // child.
+    /// assert!(channel.socket().as_raw_fd() >= 0);
+    /// # }
+    /// ```
+    pub fn socket(&self) -> BorrowedFd<'_> {
+        self.listener.as_fd()
     }
 }
 

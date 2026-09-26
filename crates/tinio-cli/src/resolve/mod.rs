@@ -22,8 +22,9 @@
 //! is the only level [`pick`] still reads, because it is the only one clap has no answer for.
 
 #[cfg(test)]
-use std::{cell::Cell, ffi::OsString, fs};
+use std::{cell::Cell, ffi::OsString};
 use std::{
+    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -43,6 +44,7 @@ use crate::{
     Error,
     cli::{self, Provenance},
     commands::{DirArgs, EnvArgs, start},
+    sandbox::StateDirSource,
 };
 
 mod locate;
@@ -85,6 +87,25 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 /// valid config would put that check out of reach; [`server()`] propagates the failure instead,
 /// because a server must not run on a config it could not read.
 ///
+/// **`config_text` is the document that config was parsed from, and it is here because the
+/// launcher forwards it** (design decision 18): a confined child may not be able to read the file
+/// at all — its path can sit outside every exposure the confinement grants — so the text travels
+/// as the launch payload instead of the path, and `sandbox::launch::prepare` used to get it by
+/// reading the file a **third** time in one start (`resolve::mode_config` and this chain's own
+/// load are the other two). The text is the read's own bytes rather than a serialization of the
+/// parsed config, and a serving `Resolution` always carries one: the chain that reads or creates a
+/// document is the one every launching command runs, and a failure to read it is an error rather
+/// than an empty string. A [`for_doctor`] resolution carries whatever that command read, which no
+/// launcher asks for.
+///
+/// **`state_dir_override` is the discovery parse's `TINIO_STATE_DIR`, carried rather than dropped**
+/// — the *path* it named, and therefore the source [`state_dir_source`](Self::state_dir_source)
+/// reads. Both live here for one reason: `Located` is consumed by the chain that builds this value,
+/// so a caller that wanted either had to take it off `Located` **before** the move, and two callers
+/// did exactly that with the same comment. A value a resolution answers is the resolution's to
+/// carry, and the guard that needs the source (macOS's read-only rule) reads it where it already
+/// is.
+///
 /// # Examples
 ///
 /// ```rust
@@ -96,9 +117,11 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 /// let resolution = Resolution {
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
+///     config_text: String::new(),
 ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
 ///     read_only: false,
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
+///     state_dir_override: None,
 ///     config_error: None,
 /// };
 /// assert_eq!(resolution.address().expect("address").port(), 9000);
@@ -109,12 +132,19 @@ pub struct Resolution {
     pub root: PathBuf,
     /// The effective configuration: the file, with the flags and `.env` folded in.
     pub config: Config,
+    /// The text [`config`](Self::config) was parsed from — the launch payload's own bytes (design
+    /// decision 18), read once by the chain that built this resolution.
+    pub config_text: String,
     /// The file [`config`](Self::config) was read from.
     pub config_path: PathBuf,
     /// The resolved mode (decision 4).
     pub read_only: bool,
     /// The resolved state directory.
     pub state_dir: PathBuf,
+    /// `TINIO_STATE_DIR` as the discovery parse read it: the directory's **source**, and the
+    /// candidate pair's other element for the client commands
+    /// ([`crate::resolve::state_dir_candidates`]).
+    pub state_dir_override: Option<PathBuf>,
     /// The config load's failure, when it had one and the caller tolerates it.
     pub config_error: Option<String>,
 }
@@ -135,9 +165,11 @@ impl Resolution {
     ///     root: PathBuf::from("/srv/data"),
     ///     config: Config::parse("version = 1\n[server]\nhost = \"0.0.0.0\"\nport = 8080\n")
     ///         .expect("config"),
+    ///     config_text: String::new(),
     ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
     ///     read_only: false,
     ///     state_dir: PathBuf::from("/srv/data/.tinio"),
+    ///     state_dir_override: None,
     ///     config_error: None,
     /// };
     /// assert_eq!(
@@ -151,6 +183,43 @@ impl Resolution {
             &self.config.server.host,
             self.config.server.port,
         )
+    }
+
+    /// Where the state directory came from: named by the operator, or derived by the resolution.
+    ///
+    /// **A view of [`state_dir_override`](Self::state_dir_override) rather than a second field**,
+    /// so the two cannot answer differently: the whole of what [`StateDirSource`] says is whether
+    /// that value is there. The reader is [`crate::sandbox::plan`]'s read-only macOS refusal, which
+    /// takes it off the resolution instead of having it threaded through every caller.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::path::PathBuf;
+    ///
+    /// use tinio_cli::{resolve::Resolution, sandbox::StateDirSource};
+    /// use tinio_config::Config;
+    ///
+    /// let mut resolution = Resolution {
+    ///     root: PathBuf::from("/srv/data"),
+    ///     config: Config::default(),
+    ///     config_text: String::new(),
+    ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
+    ///     read_only: false,
+    ///     state_dir: PathBuf::from("/srv/data/.tinio"),
+    ///     state_dir_override: None,
+    ///     config_error: None,
+    /// };
+    /// assert!(resolution.state_dir_source().is_derived());
+    /// resolution.state_dir_override = Some(PathBuf::from("/srv/state"));
+    /// assert_eq!(resolution.state_dir_source(), StateDirSource::Named);
+    /// ```
+    pub fn state_dir_source(&self) -> StateDirSource {
+        if self.state_dir_override.is_some() {
+            StateDirSource::Named
+        } else {
+            StateDirSource::Derived
+        }
     }
 }
 
@@ -266,9 +335,11 @@ fn spell_authority(authority: &str, default_port: u16) -> Result<String, Error> 
 /// let resolution = Resolution {
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
+///     config_text: String::new(),
 ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
 ///     read_only: false,
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
+///     state_dir_override: None,
 ///     config_error: None,
 /// };
 /// let path = log_file(&resolution, &Args::default())?;
@@ -350,7 +421,7 @@ pub fn server(
     server_with(located, args, provenance, None)
 }
 
-/// [`server`] for a process a confinement launched: the configuration is the **payload's
+/// [`server()`] for a process a confinement launched: the configuration is the **payload's
 /// text**, never a second read of the file it came from (design decision 18).
 ///
 /// The launcher's resolution created a missing file, parsed the document and forwarded its
@@ -363,7 +434,7 @@ pub fn server(
 ///
 /// # Errors
 ///
-/// A payload that does not parse, and every failure [`fold_flags`] reports.
+/// A payload that does not parse, and every failure `fold_flags` reports.
 ///
 /// # Examples
 ///
@@ -498,13 +569,18 @@ enum Chain {
 /// **`adopted` replaces the load outright when it is `Some`**: that is the confined child's
 /// run, whose document is the text its launcher forwarded (design decision 18) — no path is
 /// read and nothing is created, which is the whole reason the text travels.
+///
+/// **The two facts that used to be taken off [`Located`] before it was consumed are carried on**
+/// (the discovery parse's `TINIO_STATE_DIR`, and the config text the document was read from):
+/// both are attached to the [`Resolution`] below, so a caller reads them off the value it holds
+/// rather than off the one this function moves.
 fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resolution, Error> {
     let Located {
         root,
         read_only,
         state_dir,
         config: explicit,
-        state_dir_override: _,
+        state_dir_override,
     } = located;
     // **The path is derived, not validated, when the document is already in hand** (design
     // decision 18): an adopted child's `--config` may name a file outside every exposure, and the
@@ -518,12 +594,31 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
         }
         None => config_path(&root, &state_dir, explicit.as_deref())?,
     };
-    let loaded = match (adopted, chain) {
-        (Some(text), _) => Config::parse(text),
-        (None, Chain::Serving) => {
-            discover::load_or_create(&root, &path, read_only).map(|(config, _)| config)
+    // **The document's text is kept beside the configuration it parses to**, because the launch
+    // payload carries the text and never the path (decision 18): `sandbox::launch::prepare` read
+    // the file a third time for it — this chain's own read is the second — and the text it found
+    // there could differ from the one this resolution is built on.
+    let (loaded, text) = match (adopted, chain) {
+        // The payload's text **is** the document: no path is read and nothing is created.
+        (Some(text), _) => (Config::parse(text), text.to_owned()),
+        // The serving chain **creates** the file it did not find (`contracts/cli.md:45`: it is
+        // generated "on first start"), and the text of a document that call created is the text
+        // that call wrote — `to_toml`'s own bytes, from the value it serialized them from.
+        (None, Chain::Serving) if !path.is_file() => {
+            let (config, _) = discover::load_or_create(&root, &path, read_only)?;
+            let text = config.to_toml()?;
+            (Ok(config), text)
         }
-        (None, Chain::Reading) => load_existing(&path),
+        // A **non-launching** command reads what is there and leaves the root exactly as it found
+        // it (decisions 14 and 26): an absent file contributes nothing, and nothing is written.
+        // The empty text is that absence spelled out, and no launcher ever reads it — the chain
+        // that launches is [`Chain::Serving`], whose absent-file arm above creates the document.
+        (None, Chain::Reading) if !path.is_file() => (Ok(Config::default()), String::new()),
+        // Every other run reads the document **once** and keeps both answers.
+        (None, _) => match document(&path) {
+            Ok((config, text)) => (Ok(config), text),
+            Err(err) => (Err(err), String::new()),
+        },
     };
     let (mut config, config_error) = match loaded {
         Ok(config) => (config, None),
@@ -538,9 +633,11 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
     Ok(Resolution {
         root,
         config,
+        config_text: text,
         config_path: path,
         read_only,
         state_dir,
+        state_dir_override,
         config_error,
     })
 }
@@ -583,23 +680,34 @@ fn fold_credentials(env: &EnvArgs, config: &mut Config) -> Result<(), Error> {
     }
 }
 
-/// The configuration a **non-launching** command reads: the file when it is there, the defaults
-/// when it is not.
+/// The document `path` holds: **the text**, and the configuration parsed from it — one read for
+/// both answers.
 ///
-/// `discover::load_or_create` is deliberately not called on this path. It *writes* the file —
-/// and a generated credential pair inside it — whenever the path is absent, which is the one
-/// thing a command that was asked to report on a root, or to diagnose it, must not do: the
-/// configuration is generated "on first start" and only there (`contracts/cli.md:45`, design
-/// decisions 14 and 26). What an absent file contributes is nothing anyway, and [`Config::default`]
-/// is that same nothing: the keys a client reads — the mode, the transports — keep their documented
-/// defaults until a server's first start writes them down.
+/// [`Config::load`] answers only the second of them, and the text has to survive the call: it is
+/// what the launch payload carries (design decision 18), because the file may sit outside every
+/// exposure the launcher's confinement grants. `sandbox::launch::prepare` re-read the path for it
+/// until this function existed, which was the **third** read of one start — `resolve::mode_config`
+/// is the first, this is the second — and a second answer to what the document says: a file edited
+/// between the resolution and the launch would have served a configuration the resolution never
+/// saw. What this reads is the file as it is, and the parse is the one `Config::load` runs, so the
+/// two answers cannot drift.
 ///
-/// `path` is already [`config_path`]'s answer, so this decides only what its absence means.
-fn load_existing(path: &Path) -> Result<Config, _config::Error> {
-    if path.is_file() {
-        Config::load(path)
-    } else {
-        Ok(Config::default())
+/// **A refusal still names the file.** `Config::parse` labels the document it is handed `(inline)`
+/// — the payload's case, where no file is behind the text — and this one came off a disk, so the
+/// parse's own message is re-spelled with the path it came from rather than with a spelling that
+/// would leave the operator hunting for which file is broken.
+fn document(path: &Path) -> Result<(Config, String), _config::Error> {
+    let text = fs::read_to_string(path).map_err(|source| _config::Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    match Config::parse(&text) {
+        Ok(config) => Ok((config, text)),
+        Err(_config::Error::Parse { message, .. }) => Err(_config::Error::Parse {
+            path: path.to_path_buf(),
+            message,
+        }),
+        Err(err) => Err(err),
     }
 }
 
@@ -732,9 +840,11 @@ fn fold_flags(
 /// let resolution = Resolution {
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
+///     config_text: String::new(),
 ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
 ///     read_only: false,
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
+///     state_dir_override: None,
 ///     config_error: None,
 /// };
 /// let options = fs_options(&resolution, None);

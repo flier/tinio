@@ -573,9 +573,11 @@ fn resolution(root: &Path, config: &str) -> Resolution {
     Resolution {
         root: root.to_path_buf(),
         config: crate::_config::Config::parse(config).expect("config"),
+        config_text: config.to_owned(),
         config_path: state_dir.join(".tinio.toml"),
         read_only: false,
         state_dir,
+        state_dir_override: None,
         config_error: None,
     }
 }

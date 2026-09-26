@@ -2,7 +2,7 @@
 
 use std::process;
 
-use super::{refuse_in_root_state_dir, sandbox_request};
+use super::sandbox_request;
 use crate::{
     _config::Config,
     _core::mode::AccessMode,
@@ -66,27 +66,23 @@ pub(super) fn confine_in_place(resolution: &Resolution, access: AccessMode) -> R
     // operator asked to be read-only — losing the kernel-level half of FR-023 that design §9
     // promises, and doing it silently.
     //
-    // **Design §9's refused combination, refused before the exposure set is built**, because the
-    // entry it would add is the hole the guard exists to close. With no caller on this platform,
-    // an in-root state directory travelled into the confinement and was answered by `FsStorage` a
-    // process later — the "a process too late" the guard's own doc names as the reason the
-    // refusal lives in the arm rather than inside the confinement. The rule was never
-    // Windows-specific; only its first caller was.
+    // **Design §9's refused combination and the exposure set it stands in front of, in one call**:
+    // the guard the arm used to spell here is now `sandbox_request`'s own first step — the refusal
+    // runs *before* the set is built, which is the order that matters, because the entry the guard
+    // exists to close is one the set would otherwise carry. With no caller on this platform, an
+    // in-root state directory travelled into the confinement and was answered by `FsStorage` a
+    // process later — the "a process too late" the guard's own doc names as the reason the refusal
+    // lives in the arm rather than inside the confinement. The rule was never Windows-specific;
+    // only its first caller was.
     //
-    // **The two arguments are the pair `sandbox_request` is handed on the next line, plus the
-    // mode that built it**, so the guard decides about the paths the exposure set will actually
-    // carry. The root is the one **as written** — the spelling the exposure set holds rather than
-    // a canonical form — and `state_dir` is the directory this arm both exposes and hands on to
-    // the storage; in the only runs the guard can refuse (read-only ones) it is always the
-    // resolved relocation, because `resolve` substitutes the `<root>/.tinio` default only in
-    // read-write mode, where the mode's own conjunct has already answered.
-    refuse_in_root_state_dir(
-        access.is_read_only(),
-        &resolution.root,
-        &resolution.state_dir,
-    )
-    .map_err(|err| Error::Operational(err.to_string()))?;
-    let sandbox = sandbox_request(&resolution.root, &resolution.state_dir, access);
+    // **The pair the guard decides about is the pair the exposure set is built from**, because
+    // they are one argument now: the resolution the run produced, which is the root the operator's
+    // shell spelled (canonicalised by `resolve::resolve_root`) and the state directory the
+    // resolution produced. `state_dir` is the directory this arm both exposes and hands on to the
+    // storage; in the only runs the guard can refuse (read-only ones) it is always the resolved
+    // relocation, because `resolve` substitutes the `<root>/.tinio` default only in read-write
+    // mode, where the mode's own conjunct has already answered.
+    let sandbox = sandbox_request(resolution, access)?;
 
     // **Neither refusal below frames itself, and that is the caller's job** — see this
     // function's doc.

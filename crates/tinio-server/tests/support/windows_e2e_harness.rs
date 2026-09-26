@@ -4,8 +4,7 @@
 
 use std::{
     env, fs,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::SocketAddr,
     os::windows::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -22,7 +21,7 @@ use tinio_sandbox::{
     },
 };
 
-use super::common::{SECRET_KEY, tinio_bin, wait_for_listening};
+use super::common::{SECRET_KEY, answer as probe, tinio_bin, wait_for_listening};
 
 /// `CREATE_NEW_PROCESS_GROUP` — the launcher is spawned as the leader of its own
 /// process group, which is what makes a console control event addressed at *it*
@@ -527,18 +526,20 @@ pub fn without_ansi(text: &str) -> String {
 ///
 /// A plain TCP exchange proves the listener is reachable from outside the
 /// confinement. Anything more would re-test S3, which the other suites cover.
-/// Both bounds are [`exit_timeout`]'s — the same knob, because the same host
-/// property ([`exit_timeout`]'s doc) is what can make either one too tight.
+///
+/// **The probe is [`common::answer`]'s and this is the suite's face on it**: the
+/// request bytes ([`common::PROBE`]), the read to EOF and the bound were the same
+/// exchange the Linux leg had also written out, so they live in one place now.
+/// What stays here is what this suite's callers rely on — a panic rather than a
+/// `Result` (the neighbouring legs' failures are all panics) and the acceptance
+/// assertion, which is the leg's expectation and not the helper's.
+///
+/// **The bound moved with the definition, and it is the same family.** It was
+/// [`exit_timeout`]'s 15 s and it is now [`common::wait_timeout`]'s readiness
+/// budget (60 s, `TINIO_TEST_WAIT_TIMEOUT_SECS`): a host slow enough to make one
+/// too tight is slow for the other, both are the operator's to move, and a leg
+/// that hangs still fails rather than passing.
 pub fn answer(address: SocketAddr) {
-    let mut stream = TcpStream::connect_timeout(&address, exit_timeout())
-        .expect("connect to the confined server");
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .expect("write");
-    stream
-        .set_read_timeout(Some(exit_timeout()))
-        .expect("bound the read");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
+    let response = probe(address).unwrap_or_else(|message| panic!("{message}"));
     assert!(response.starts_with("HTTP/1.1 "), "{response}");
 }

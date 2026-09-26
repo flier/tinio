@@ -68,9 +68,10 @@ pub use self::{
     error::{Error, Result, fail, launch, refused, step},
     event::Event,
     launcher::{
-        Adopted, CONTROL_FD_PREFIX, Child, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer,
-        Terminal, adopt, control_fd_arg, control_fd_from_arg, is_control_fd_arg,
-        is_listener_fd_arg, listener_fd_arg, listener_fd_from_arg, supervise,
+        Adopted, CONTROL_FD_PREFIX, Child, ControlHandle, LISTENER_FD_PREFIX, LaunchPayload,
+        LaunchPlan, Observer, SandboxSpec, Terminal, adopt, control_fd_arg, control_fd_from_arg,
+        is_control_fd_arg, is_launcher_fd_arg, is_listener_fd_arg, listener_fd_arg,
+        listener_fd_from_arg, supervise,
     },
     sandbox::{Exposure, Sandbox},
 };

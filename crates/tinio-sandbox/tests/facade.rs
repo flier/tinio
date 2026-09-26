@@ -1,6 +1,12 @@
 //! The facade is the only crate a consumer names, so it is the only place
 //! that has to prove the platform selection actually resolves.
 
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::net::TcpListener;
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixListener;
 use std::{
     ffi::{OsStr, OsString},
     io,
@@ -59,6 +65,21 @@ fn the_vocabulary_is_re_exported() {
 fn the_launcher_surface_is_re_exported() {
     // The imports this test needs are at the file top, not here: `docs/style.md`
     // says "Top `use`; never inline".
+    //
+    // `control` is the one local helper, because the owned control handle's constructor takes a
+    // real descriptor on the platform that duplicates one and a value on the platform that does
+    // not — and this test's subject is the facade's list of names, not that difference.
+    let control = || -> tinio_sandbox::ControlHandle {
+        #[cfg(unix)]
+        {
+            let source = File::open("/dev/null").expect("a descriptor to duplicate");
+            tinio_sandbox::ControlHandle::duplicate(&source).expect("duplicate a descriptor")
+        }
+        #[cfg(windows)]
+        {
+            tinio_sandbox::ControlHandle::inherited(1040)
+        }
+    };
 
     // The vocabulary — Task 1's half of the surface.
     let _: fn() -> tinio_sandbox::Sandbox = tinio_sandbox::Sandbox::new;
@@ -101,12 +122,19 @@ fn the_launcher_surface_is_re_exported() {
     let _: fn(&OsStr) -> Option<i64> = tinio_sandbox::listener_fd_from_arg;
     let _: &str = tinio_sandbox::LISTENER_FD_PREFIX;
     // The control channel's quartet, beside the listener's: the second inherited
-    // descriptor a launcher hands over, spelled by the same four shapes (the Windows
-    // launcher's own handoff, and the reason the core grew a second prefix).
+    // descriptor a launcher hands over, spelled by the same four shapes — the Windows
+    // launcher's pipe pool and the macOS launcher's single unix socket, both of which
+    // are why the core grew a second prefix.
     let _: fn(i64) -> OsString = tinio_sandbox::control_fd_arg;
     let _: fn(&OsStr) -> bool = tinio_sandbox::is_control_fd_arg;
     let _: fn(&OsStr) -> Option<i64> = tinio_sandbox::control_fd_from_arg;
     let _: &str = tinio_sandbox::CONTROL_FD_PREFIX;
+    // The owned handle a plan carries and the platform clears the flag on: the value the
+    // child's element is spelled from, on the platform where the clear has to happen after
+    // the profile pre-flight. `with_control` is a builder rather than a `fn`-pointer shape,
+    // so it is called with the plan it consumes.
+    let planned = tinio_sandbox::LaunchPlan::default().with_control(control());
+    let _: i64 = planned.controls()[0].value();
     let _: tinio_sandbox::Child = tinio_sandbox::Child::new(|| unreachable!("not waited"));
     let _: fn(
         tinio_sandbox::Child,
@@ -121,6 +149,55 @@ fn the_launcher_surface_is_re_exported() {
     let _: fn(&mut tinio_sandbox::LaunchPayload) -> &mut String = |payload| &mut payload.config;
 }
 
+/// The **launch-failure pair** — the killer a launcher may hand over, and the call that runs it —
+/// resolves through the facade, and the closure handed to the builder is the one the action
+/// reaches.
+///
+/// **Its own test rather than two bindings in the list above, because neither half is a `fn`
+/// pointer.** `with_kill` is generic over the closure the caller writes and `kill` is an inherent
+/// method rather than a free function, so what resolves is the name at the shape the macOS launcher
+/// writes (`crates/tinio-cli/src/sandbox/macos.rs`'s `retract`: install the platform's kill, then
+/// call it on the failure path). **The pair is reachable on every target and only *used* on the
+/// launcher platforms**: `tinio-sandbox-core`'s `Child` carries both methods unconditionally, while
+/// the `Option` is `None` for every child whose platform already owns the process's lifetime — see
+/// `crates/tinio-sandbox-core/src/launcher/supervise.rs` for why a dropped child is not an ended
+/// one where no job object exists.
+#[test]
+fn the_launch_failure_surface_is_re_exported() {
+    let mut ended: tinio_sandbox::Child =
+        tinio_sandbox::Child::new(|| unreachable!("not waited")).with_kill(|| Ok(()));
+    let _: fn(&mut tinio_sandbox::Child) -> io::Result<()> = tinio_sandbox::Child::kill;
+    ended
+        .kill()
+        .expect("the child reaches the killer `with_kill` installed");
+}
+
+/// **The three adopted names answer one type on every platform that publishes
+/// them** — the rule [`tinio_sandbox::adopted_listener`] states, pinned the way
+/// `the_launcher_surface_is_re_exported` pins the core's surface: a `fn`-pointer
+/// binding per name, at the shared [`tinio_sandbox::Result`].
+///
+/// **Why the arms repeat and why that is not a copy.** Each name is
+/// `#[cfg]`-selected — the child path that calls them is gated by `feature = "sandbox"`
+/// alone — so one binding cannot cover both platforms, and what the pair proves is
+/// the fact no single-target leg can see: the platform crate's own error
+/// (`std::io::Result` on macOS, the core's `Result` on Windows) does not reach a
+/// caller of the facade. An arm that went back to it stops compiling here.
+///
+/// `on_stop` is bound by instantiating its `impl Fn()` parameter with `fn()`
+/// (`fn()` is `Fn() + Send + 'static`), which is the only shape a `fn`-pointer
+/// binding can name.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn the_adopted_names_answer_one_error_type() {
+    let _: fn(&tinio_sandbox::Adopted) -> tinio_sandbox::Result<TcpListener> =
+        tinio_sandbox::adopted_listener;
+    let _: fn(fn()) -> tinio_sandbox::Result<()> = tinio_sandbox::on_stop;
+    #[cfg(target_os = "macos")]
+    let _: fn(&tinio_sandbox::Adopted) -> tinio_sandbox::Result<UnixListener> =
+        tinio_sandbox::adopted_control;
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_selects_the_in_process_backend() {
@@ -133,18 +210,55 @@ fn linux_selects_the_in_process_backend() {
     assert!(err.to_string().contains("nothing exposed"), "{err}");
 }
 
-// **macOS alone, and Windows left this list the moment its backend stopped
-// answering `Unsupported`.** The Windows composition landed in P2's Task 9, so
-// the call below now reaches `served_root` and comes back
-// `Error::Step { step: "confine" }` — this test would be asserting the opposite
-// of the truth there, and the assertion it makes is about a stub. macOS's stub
-// stays until P3 fills it in, and this is the `#[cfg]` it is gated by.
+// **macOS alone, until P3's backend landed — and the assertion is now the opposite one.** The
+// Windows composition landed in P2's Task 9 and this test left that platform the moment its
+// backend stopped answering `Unsupported`; P3's macOS composition has now landed, so the same
+// thing is true here. What is asserted is the *composition* rather than a launch: a backend that
+// reaches `confine` at all has replaced the stub, and an exposure it cannot express is the one
+// refusal this call can produce without spawning `sandbox-exec` (a tree with no `sandbox-exec`
+// answers `Unsupported`, which would make the assertion below vacuous).
 #[cfg(target_os = "macos")]
 #[test]
-fn the_launcher_platforms_answer_unimplemented_for_now() {
+fn macos_selects_a_launcher_backend_rather_than_the_stub() {
     let mut backend = platform();
     let err = backend
-        .confine(&Sandbox::new(), &LaunchPlan::new())
-        .expect_err("the stub backends are not implemented yet");
-    assert!(err.to_string().contains("not implemented"), "{err}");
+        .confine(
+            &Sandbox::new().expose("relative/path", AccessMode::ReadOnly),
+            &LaunchPlan::new(),
+        )
+        .expect_err("a relative exposure cannot be expressed in a profile");
+    assert!(
+        matches!(err, tinio_sandbox::Error::BadPath { .. }),
+        "the macOS backend validates its exposures: {err}"
+    );
+    assert!(
+        !err.to_string().contains("not implemented"),
+        "the stub is gone: {err}"
+    );
+}
+
+/// **The macOS mechanism is reachable through this facade, and the backend this
+/// facade builds is the default one.**
+///
+/// The two halves are one fact stated from the two sides the CLI's arm needs: the
+/// platform's vocabulary (`Options`, `Mechanism`) is at `tinio_sandbox::macos::…`,
+/// so that arm writes one crate rather than a target-gated dependency of its own
+/// (design decision 2), and the default mechanism is **`sandbox-exec`** — the one
+/// every allowance was measured against and the one a run that sets no variable
+/// gets. A facade that stopped re-exporting the module, or a `Options::default`
+/// that answered the other mechanism, fails here rather than in a launch.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_publishes_the_mechanism_and_defaults_to_the_helper() {
+    use tinio_sandbox::macos::{Mechanism, Options};
+
+    assert_eq!(Options::default().mechanism(), Mechanism::SandboxExec);
+    assert_eq!(
+        Mechanism::from_env(None).expect("absent means the default"),
+        Mechanism::SandboxExec
+    );
+    assert_eq!(
+        Mechanism::from_env(Some("sandbox-init")).expect("the alternative"),
+        Mechanism::SandboxInit
+    );
 }

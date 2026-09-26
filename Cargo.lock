@@ -4323,6 +4323,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tinio-core",
+ "tinio-util",
  "tinio-winsec",
  "toml",
 ]
@@ -4469,7 +4470,18 @@ dependencies = [
 name = "tinio-sandbox-macos"
 version = "0.1.0"
 dependencies = [
+ "handlebars",
+ "libc",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
  "tinio-sandbox-core",
+ "tinio-util",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4482,6 +4494,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tinio-sandbox-core",
+ "tinio-util",
  "tokio",
  "tracing",
  "tracing-subscriber",

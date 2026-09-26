@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Progress, 2026-09-25**: the step boxes are ticked where the step's outcome is in the tree or recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 — the measurement record the follow-ups file's findings moved into; that file is now a settled-record pointer and holds no results. The one left unticked is Task 7 Step 3 (conditional, never triggered), carrying its own note; Task 9 Step 6's selection run was recorded on 2026-09-26 and its box is ticked. **The gate script is green as of 2026-09-26, both mechanisms**: `macos-sandbox-verify.sh` runs 1→4 to `rc=0`, its prune experiment now has its own log window (reported, never asserted on), `rg` is no longer required (`grep -oE` + `sed`), and two `EXPECTED` entries were corrected against measurement — the trace-device probe is `file-read-data` (the spelling the shipped profile produces; the write face would mean the profile had begun granting the read), and the six `sysctl-read` names the loader's startup probes are refused are enumerated in the rule rather than left to redden the gate. **The body below is the plan as written before Task 5's allowance audit**, so every `DEVICE_RULES` reference in it is the target it was written against: the table was deleted with the device literals, `HOME_GRANT` and the `H` parameter went with the home measurement, and the tree's `profile.rs` renders `RUNTIME_BASELINE` alone (design §5's audit and `home` paragraphs).
+
 **Goal:** Fill in `tinio-sandbox-macos` so `--sandbox` confines the tinio server on macOS with a Seatbelt (SBPL) profile: text generated as a pure function of the exposure set, applied by `sandbox-exec -p` to a child that inherits the parent's listener, with `(deny default)` supplying both the filesystem boundary and the network cut-off.
 
 **Architecture:** The core owns the trait, the vocabulary and the launcher machinery (the payload type, the listener-descriptor argv element, the event stream and its relay, the supervision loop, exit-status forwarding). This crate owns the SBPL text (`profile.rs`, pure and unit-testable on any platform) and the launch (`launch.rs`: clear `FD_CLOEXEC` on the listener, pre-flight the profile with its `-D` parameters, spawn `sandbox-exec -p <profile> -D NAME=VALUE … <self> <argv…>`, write the payload to the child's stdin, relay its stdout events, return `Confinement::Supervise`). The consumer (`serve`) binds the listener, computes the exposure set, and in whichever process serves — the confined child here — adopts the payload, emits the `Listening` event and builds its runtime.
@@ -25,12 +27,13 @@
 **The conventions the four plans share are stated once, in `2026-09-18-sandbox-shared.md` — *shared* from here on — §1 of which owns test-first, the panic rule, the doc-example rule, imports, the manifest rules, the per-crate lint allocation, English only, attribution, hard-wrapping and git writes. Shared §2 owns the crate topology and the two shapes, §3 the list of what a launcher platform owns, §4 the names two documents must spell alike, and §5 the three relays. What is left here is this plan's own:
 
 - **On a Mac the first run of an implementation task is expected to fail**, for a reason the task explains — shared §1's Red-Green-Refactor cycle with this phase's local consequence, which the Verification Posture above states in full.
-- `unsafe_code = "deny"` in `tinio-sandbox-macos`, with exactly **one** `#[allow(unsafe_code)]` site — `launch::listener`, the child's rebuild of its `TcpListener` from the descriptor number the launcher passed in argv, whose invariant lives in its `# Safety` section (the descriptor is inherited from the launcher, which holds it open for the child's whole lifetime and never closes it). The design's Scope and Bookkeeping enumerate it that way: every backend crate is `deny` with its sites enumerated, while `tinio-sandbox-core` and the facade keep `forbid`. **No FFI here**: the one site is `std`'s `OwnedFd::from_raw_fd`, not an `extern` block, and every other macOS need is met by `std` or by `rustix`'s safe surface — `rustix::io::fcntl_setfd` is handed the socket's own `AsFd`, so the parent reconstructs no descriptor from an integer (Task 2 Step 5 says which functions, and why they are safe). The count is **per capability and established by the implementation**, never asserted ahead of it — the earlier claim that this crate needed no `unsafe` at all did not survive contact with `rustc` — so a second site arrives only with the observation that requires it and an entry in design decision 14, never to shorten a call.
+- `unsafe_code = "deny"` in `tinio-sandbox-macos`, with exactly **one** `#[allow(unsafe_code)]` site — `launch::inherited_fd`, the private helper that turns the descriptor number the launcher passed in argv into an `OwnedFd`, which its two safe callers `launch::listener` and `launch::control` build their sockets from, and whose invariant lives in its `# Safety` section (the descriptor is inherited from the launcher, which holds it open for the child's whole lifetime and never closes it). The design's Scope and Bookkeeping enumerate it that way: every backend crate is `deny` with its sites enumerated, while `tinio-sandbox-core` and the facade keep `forbid`. **No FFI here**: the one site is `std`'s `OwnedFd::from_raw_fd`, not an `extern` block, and every other macOS need is met by `std` or by `rustix`'s safe surface — `rustix::io::fcntl_setfd` is handed the socket's own `AsFd`, so the parent reconstructs no descriptor from an integer (Task 2 Step 5 says which functions, and why they are safe). The count is **per capability and established by the implementation**, never asserted ahead of it — the earlier claim that this crate needed no `unsafe` at all did not survive contact with `rustc` — so a second site arrives only with the observation that requires it and an entry in design decision 14, never to shorten a call.
 - `tinio-sandbox-macos` may depend on `tinio-sandbox-core`. It must **never** depend on the facade `tinio-sandbox` — the facade selects a platform implementation, so that edge is the cycle shared §2 exists to prevent.
 - **This crate takes the second of shared §2's two shapes**: it compiles on **every** target, all macOS-only code behind `#[cfg(target_os = "macos")]` with a stub arm beside it, because `cargo check --workspace` builds this member on Linux and Windows too. Every separate target repeats that gate.
 - `sandbox-exec` is **deprecated by Apple and still shipped**. Every comment that names it says so; nothing in the code or docs may present it as a supported, versioned API. Its removal is the design's accepted degradation: "no sandbox available, fail closed", which the error table of design §11 already covers.
 - The profile is passed **only** as a single argv element to `-p`, and the exposed paths travel beside it as `-D NAME=VALUE` parameters that the text refers to as `(param "E<i>")` (decision 24). No profile file may be created — not in `$TMPDIR`, not anywhere — and Task 2 has a test that fails if one is.
 - The generated profile never contains `network-outbound`, and never contains `network-bind` (decision 16, design §7). Task 1's unit test asserts both, on the generated text.
+- **Dated note, 2026-09-25: this constraint was contradicted by the revision that landed, and the fix restores it rather than relaxing it.** The generated profile emitted `(allow network-bind)` for the confined child's own local management control socket (`<state dir>/tinio-<16 hex>.sock`): its `bind()` is gated by the sandbox, and without the rule the child dies `could not bind …/.tinio/tinio-<hash>.sock: Operation not permitted (os error 1)`. The text therefore carried the operation this bullet forbids, and the record is this note rather than an amendment to the bullet — **the fix is the one the constraint always implied**: bind that socket outside the sandbox and hand it in, as the launcher already hands in the data plane's listener, which leaves the generated profile with no bind rule at all. Read the bullet above as the target, not as a description of the tree, until a real Mac's profile shows the rule gone. **That Mac's profile has since shown it gone, 2026-09-25**: the launcher binds the control socket and hands the descriptor over, so the generated text carries no bind rule — the bullet above is now a description of the tree (design §5's network paragraph).
 - The profile **is** visible in the process list; its contents are paths, not credentials (decision 24). That is accepted, not mitigated.
 - Exposures: `ReadOnly` is `(allow file-read* …)` and `ReadWrite` is `(allow file-read* file-write* …)` — the whole of decision 8's "read-only is the absence of a write permission" on this platform.
 - **stdout is a protocol channel and carries `Event` frames and nothing else; every log goes to stderr** (decision 19), and the child's stderr is inherited untouched and unmediated (shared §3). The launcher never prints on its own behalf: it **decodes and re-emits** the child's frames through the core's `Observer`, so anything the child or a dependency writes that is not one of our events is dropped rather than passed to an operator who could not tell it apart from a real event. On this platform that includes `sandbox-exec`'s own diagnostics, which is where a refused profile shows up.
@@ -64,12 +67,12 @@ P2 (`2026-09-18-sandbox-p2-windows.md`) is the other launcher, and it lands firs
 | `Adopted { config, listener_fd }` + `adopt(args, stdin)` | `adopt(env::args_os(), std::io::stdin().lock())` | Tasks 4, 8 |
 | `Child::{new, with_relay, wait, terminal}`, `supervise(&mut Child, teardown)` | `Child::new(move \|\| Ok(child.wait()?)).with_relay(relay)` — the constructor takes the wait closure **only**, and the terminal record is the relay's return value that `Child::wait` keeps after joining it; `supervise(&mut child, teardown)`; `child.terminal()` read **after** the wait for the never-became-ready case | Tasks 2, 4, 8 |
 | `Event::{Listening, Error}` + `encode()` / `decode()`, `Observer::new(w).observe(r)` (async) | `Event::Listening{..}.encode()` in `emit`; `Observer::new(tokio::io::stdout()).observe(reader).await` in the relay thread, whose **return value is the terminal** the `Child` keeps after the join; `Event::decode(&frame)` in the e2e | Tasks 2, 8, 9 |
-| `listener_fd_arg`, `is_listener_fd_arg` — and, on the core's side of the same contract, `LISTENER_FD_PREFIX` and `listener_fd_from_arg` | `command_args` appends `listener_fd_arg(fd)`; `confine`, `serve`'s `own_args` and the harness filter with `is_listener_fd_arg`. `listener_fd_from_arg` is called inside core's `adopt`, not here; the prefix constant is referenced in docs only | Tasks 2, 4, 8 |
+| `listener_fd_arg`, `is_listener_fd_arg` — and, on the core's side of the same contract, `LISTENER_FD_PREFIX` and `listener_fd_from_arg` | `command_args` appends `listener_fd_arg(fd)`; `confine`, `serve`'s `own_args` and the harness filter with `is_launcher_fd_arg` — the one name for the listener element and the control element alike. `listener_fd_from_arg` is called inside core's `adopt`, not here; the prefix constant is referenced in docs only | Tasks 2, 4, 8 |
 | `nonce()`, `MAGIC`, `with_nonce` | **do not exist**: the payload is one JSON object and the nonce is gone (decision 17, amended) | — |
 
 **What this phase owns instead** — **the macOS deltas on `2026-09-18-sandbox-shared.md` §3's list**, plus the wiring only this launcher can have, all of it inside `crates/tinio-sandbox-macos` and none of it a core addition:
 
-- the **profile**: its text, its empirical allowance set, and the pre-flight that proves `sandbox-exec` accepts it.
+- the **profile**: its text, its empirical allowance set, and the pre-flight that proves `sandbox-exec` accepts it — in a debug build or under a `debug` log level; a release build proves it at the real spawn instead (design §5's operational-limits paragraph).
 - the **descriptor work**: clearing `FD_CLOEXEC` on the listener and turning `plan.listener()`'s `&TcpListener` into the argv element's number.
 - the argv filtering — `std::env::args_os().skip(1)`, with the listener element appended — and `hand_over`, the payload write to the child's stdin and its close (shared §3).
 - the process handle, and the thread that drives the core's `Observer` over the child's stdout (shared §3), plus the signal relay this plan's Task 3 owns.
@@ -94,7 +97,7 @@ Task 8 (the `serve` wiring) is where these meet the call site. Where P2 has alre
 | `crates/tinio-sandbox-macos/scripts/prune-profile.sh` | the one-rule-at-a-time necessity run that settles the baseline |
 | `crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh` | the local macOS acceptance run |
 | `crates/tinio-config/src/schema/server.rs` | `probe_read_only`: the targeted single-key lookup of decision 18 — **P2's edit**, verified here (Task 8 Step 1) |
-| `crates/tinio-server/examples/serve.rs` | the launcher path on macOS: bind, expose, confine, supervise; the child's adoption and its `Listening` event |
+| `crates/tinio-cli/src/commands/start/serve.rs` | the serving entry point the macOS launcher path lands in — bind, expose, confine and supervise live in `crates/tinio-cli/src/sandbox/macos.rs` and `crates/tinio-cli/src/commands/start/run.rs`, and the child's adoption with its `Listening` event is this file's. The retired `crates/tinio-server/examples/serve.rs` this row first named is gone |
 | `crates/tinio-server/tests/sandbox_macos_e2e.rs` | the confined server serving a request, on the CI macOS leg |
 | `docs/tests.md` | the macOS verification section |
 | `docs/superpowers/specs/2026-09-18-sandbox-design.md` | the macOS evidence rows, flipped from `(unverified)` with the command that produced each |
@@ -102,6 +105,8 @@ Task 8 (the `serve` wiring) is where these meet the call site. Where P2 has alre
 ---
 
 ### Task 1: The SBPL profile as a pure function of the exposure set
+
+**Result, 2026-09-25: recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile"), in its audit and `home` paragraphs.** Do not read this plan's `RUNTIME_BASELINE`/`DEVICE_RULES`/`HOME_GRANT` passages as the result; the section named above is the record.
 
 **Files:**
 - Modify: `crates/tinio-sandbox-macos/Cargo.toml`
@@ -115,13 +120,13 @@ Task 8 (the `serve` wiring) is where these meet the call site. Where P2 has alre
 
 This is the whole profile policy. It is pure, so it is testable on the machine this plan is written on — which matters, because everything else in P3 needs a Mac.
 
-- [ ] **Step 1: Read the core surface and fix the `use` block**
+- [x] **Step 1: Read the core surface and fix the `use` block**
 
 Run: `cargo doc -p tinio-sandbox-core --no-deps --open` (or read `crates/tinio-sandbox-core/src/{lib,sandbox,access,error}.rs`).
 
 Confirm the names in the "Depends on P0" table above — `Sandbox::exposures`, `Exposure { host, access }`, `AccessMode::is_read_only()` (the type is `tinio-core`'s, re-exported by the core, so `tinio_sandbox_core::AccessMode` and `tinio_core::AccessMode` name the same type and either path works), `Error::BadPath { path, reason }`. Write the `use` block against what is actually there, and adjust the calls in Step 3 to match. Record any rename in the commit body.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 `crates/tinio-sandbox-macos/src/profile.rs`, at the bottom:
 
@@ -355,12 +360,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-macos profile::`
 Expected: FAIL — `cannot find function 'profile'` (compile error), because the module does not exist yet.
 
-- [ ] **Step 4: Write the crate manifest**
+- [x] **Step 4: Write the crate manifest**
 
 `crates/tinio-sandbox-macos/Cargo.toml` in full (P0 Task 3 creates a stub manifest; this is the shape it must end up with):
 
@@ -397,7 +402,7 @@ unsafe_code = "deny"
 | Operation | Level | Where |
 |---|---|---|
 | the rendered profile's rule and parameter counts | `info!` | `profile::profile`, and again in `confine` for the profile the child will actually run under |
-| the pre-flight and its outcome | `info!` on acceptance, `error!` on refusal or when its deadline expires | `launch::preflight` |
+| the pre-flight and its outcome | `info!` on acceptance, `info!` with `verdict="skipped"` when it does not run (a release build, or a level below `debug`), `error!` on refusal or when its deadline expires | `launch::preflight` |
 | the spawn, with the child's pid and the listener descriptor | `info!` | `confine`, immediately after the spawn |
 | the close-on-exec change | `debug!` | `launch::make_inheritable` |
 | the payload write, with its size | `debug!` | `launch::hand_over` |
@@ -416,7 +421,7 @@ The split follows what `serve` actually enables rather than taste: it builds its
 
 `rustix` is target-gated because only `launch.rs` and `relay.rs` use it, and only on macOS. Its one feature is set here rather than at the workspace, as `docs/cargo.md` requires: `process`, for `kill_process` and the `Pid`/`Signal` types (Task 3). There is **no `rand` here**: the payload is one JSON object owned by the core, and the nonce that once wanted an entropy source is gone (design decision 17, amended). `rustix::io::fcntl_setfd` needs no feature — it ships in the crate's default surface, and it is `#[cfg(not(windows))]`, which is why every call site is macOS-gated. Task 3 adds one more line to the same block (`signal-hook`). No other dependency: the profile generator is text composition, and the launch is `std::process`.
 
-- [ ] **Step 5: Write `profile.rs`**
+- [x] **Step 5: Write `profile.rs`**
 
 ```rust
 //! The Seatbelt (SBPL) profile, as a pure function of the exposure set.
@@ -878,7 +883,7 @@ The guard itself is the one already written at the top of `profile` in Step 5 �
 
 `an_exposure_set_past_the_profile_limit_is_refused` (Step 2) is the test that holds it, and it asserts both halves: the reason, and that the path named is the 4097th exposure — the first the profile cannot express — rather than the first of the set.
 
-- [ ] **Step 6: Write `lib.rs`**
+- [x] **Step 6: Write `lib.rs`**
 
 ```rust
 //! macOS confinement for tinio: a Seatbelt (SBPL) profile applied by
@@ -978,17 +983,17 @@ Both modules are public, and that is deliberate rather than incidental: `launch:
 
 `SANDBOX_EXEC` is exported because the pruning experiment (`tests/harness/mod.rs`) launches `sandbox-exec` directly; it is a constant, not a second code path.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-macos`
 Expected: PASS — the whole `profile` module, 0 failures, on any host. No count is pinned here: the module gains a test whenever a rule gains a reason. Run it on the authoring host first; if the profile generator does not pass here, nothing downstream can.
 
-- [ ] **Step 8: Verify the workspace still builds and lints**
+- [x] **Step 8: Verify the workspace still builds and lints**
 
 Run: `cargo check --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean. `cargo check` builds this member on Linux and Windows too, which is why the crate takes shared §2's second shape: `lib.rs`'s `Backend` and `profile.rs` both compile everywhere, and the macOS-only code arrives in Task 2 behind its gates. The `tracing` dependency added in Step 4 is not a macOS-only one — and it could not be: `profile.rs` emits on every target, and the crate's other must be gated per import rather than by target-dependency, which Task 2 does.
 
-- [ ] **Step 9: Verify the lint rule was already updated, and do not rewrite it**
+- [x] **Step 9: Verify the lint rule was already updated, and do not rewrite it**
 
 `docs/cargo.md` was edited by **P1**, not here: its Task 9 Step 4 writes the `unsafe_code` rule bullet once, naming all three backends and saying each becomes `"deny"` as its backend lands. `2026-09-18-sandbox-shared.md` §1 records why the line lives there rather than in each plan.
 
@@ -1008,6 +1013,8 @@ Expected: the rule bullet names the platform backends, says each becomes `deny` 
 
 ### Task 2: The `sandbox-exec -p` launch
 
+**Result, 2026-09-25: recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile"), in its `home` and `state` paragraphs.** This plan does not restate the run's findings.
+
 **Files:**
 - Create: `crates/tinio-sandbox-macos/src/launch.rs`
 - Modify: `crates/tinio-sandbox-macos/src/lib.rs` (the `pub mod launch;` declaration, the `pub use` of this module's root names, and the body of `impl Backend`)
@@ -1019,7 +1026,7 @@ Expected: the rule bullet names the platform backends, says each becomes `deny` 
 
 Steps 1–4 are pure and run anywhere; steps 6–7 need a Mac.
 
-- [ ] **Step 1: Read P0's core surface and confirm the names**
+- [x] **Step 1: Read P0's core surface and confirm the names**
 
 Run: `cargo doc -p tinio-sandbox-core --no-deps --open` (or read `crates/tinio-sandbox-core/src/{backend.rs,launcher/mod.rs,launcher/payload.rs,launcher/supervise.rs}`).
 
@@ -1027,7 +1034,7 @@ The core owns the whole interface this task implements against: the `Backend` tr
 
 Three consequences to build against rather than discover. The child is **this binary re-invoked**, so `program` is `std::env::current_exe()` and `argv` is `std::env::args_os().skip(1)` — no `LaunchPlan` extension is needed. The listener's descriptor number has to be *converted into* the argv element the core names: the plan owns the socket (`for_launch(config)?` then `.with_listener(listener)`), `plan.listener()` lends it as `Option<&TcpListener>`, and this launcher derives the number with `i64::from(socket.as_raw_fd())`. The payload deliberately carries no descriptor — a socket cannot ride on the stdin stream, and holding the number in both places would be two sources of truth for one fact (§3 step 7). And the payload now goes on **stdin** (decision 17), which means this launcher writes a frame and closes a stream instead of creating a pipe and clearing a close-on-exec flag.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 `crates/tinio-sandbox-macos/src/launch.rs`, at the bottom:
 
@@ -1253,12 +1260,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox-macos launch::`
 Expected: FAIL — `cannot find function 'command_args'`.
 
-- [ ] **Step 4: Write `launch.rs`**
+- [x] **Step 4: Write `launch.rs`**
 
 ```rust
 //! `sandbox-exec -p` — the launch, the profile pre-flight and the descriptor
@@ -1988,12 +1995,12 @@ mod tests {
 
 Two details worth checking against the real API before you run anything: `std::net::TcpListener::bind` creates a close-on-exec socket, so `make_inheritable` *clears* a flag that is set rather than setting one that is not; and `Child::new` takes the wait closure **only** — the terminal record is not a slot the caller fills but the relay thread's return value, which `Child::with_relay` joins inside `Child::wait`. That is why `confine` moves its `std::process::Child` into the closure and attaches the handle the spawn returned (`Child::new(move || Ok(child.wait()?)).with_relay(relay)`), and why P0's constructor has no second parameter for a slot: the shared-slot design was removed before this plan was written.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-macos && cargo clippy -p tinio-sandbox-macos --all-targets -- -D warnings`
-Expected: PASS everywhere, including on the authoring host (every argv test here is pure — each one exercises the `command_args` builder; `confine` itself is called only by the stub-arm test on non-macOS targets). The tracing test runs on both: on macOS through the core's `step`, which this file calls rather than defines, and elsewhere through the stub arm's own refusal, and both require the event's `step` field to equal the error's. Confirm the lint stayed scoped to the one site the design enumerates: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-macos/src` prints exactly one line, the attribute on `listener`, and `rg -c 'unsafe \{' crates/tinio-sandbox-macos/src/launch.rs` reports exactly one, in that same function; `rg -n 'unsafe' crates/tinio-sandbox-macos/src/relay.rs crates/tinio-sandbox-macos/src/profile.rs` prints nothing. A **second** attribute or block is what this check is for — not a missing one — and `cargo clippy` is green either way, because `deny` is what makes the single allowance expressible at all.
+Expected: PASS everywhere, including on the authoring host (every argv test here is pure — each one exercises the `command_args` builder; `confine` itself is called only by the stub-arm test on non-macOS targets). The tracing test runs on both: on macOS through the core's `step`, which this file calls rather than defines, and elsewhere through the stub arm's own refusal, and both require the event's `step` field to equal the error's. Confirm the lint stayed scoped to the one site the design enumerates: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-macos/src` prints exactly one line, the attribute on `inherited_fd`, and `rg -c 'unsafe \{' crates/tinio-sandbox-macos/src/launch.rs` reports exactly one, in that same function; `rg -n 'unsafe' crates/tinio-sandbox-macos/src/relay.rs crates/tinio-sandbox-macos/src/profile.rs` prints nothing. A **second** attribute or block is what this check is for — not a missing one — and `cargo clippy` is green either way, because `deny` is what makes the single allowance expressible at all.
 
-- [ ] **Step 6: Verify against a real `sandbox-exec` on a Mac**
+- [x] **Step 6: Verify against a real `sandbox-exec` on a Mac**
 
 On the Mac, run:
 
@@ -2030,7 +2037,7 @@ It is built anyway, for two reasons that are the design's own. The failure is **
 
 **Vocabulary, because three different things in this phase are called a relay.** The *event relay* (Task 2, `Observer`) moves the child's **bytes** out, child → parent, on stdout. The *signal relay* (this task) moves a **termination signal** in, parent → child. *Exit-status forwarding* (Task 9) carries the child's **exit code** back to the caller after the child has exited. They are independent: a launcher with no signal relay still passes every exit-status assertion in this plan, and one with no event relay still passes every signal assertion — which is exactly why each has its own test rather than an extra assertion in another task's.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-macos/src/relay.rs`, at the bottom:
 
@@ -2074,12 +2081,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tinio-sandbox-macos relay::`
 Expected: FAIL — `cannot find function 'relay_decision'`. These three run on any host, which is deliberate: the relay's *policy* is testable everywhere, and only its mechanism needs a Mac.
 
-- [ ] **Step 3: Write `relay.rs`**
+- [x] **Step 3: Write `relay.rs`**
 
 ```rust
 //! Relaying termination signals to the confined child while the launcher waits.
@@ -2365,7 +2372,7 @@ fn start_relaying() -> std::io::Result<()> {
 }
 ```
 
-- [ ] **Step 4: Wire it into the manifest, `lib.rs` and `launch.rs`**
+- [x] **Step 4: Wire it into the manifest, `lib.rs` and `launch.rs`**
 
 `crates/tinio-sandbox-macos/Cargo.toml` — one dependency beside `rustix`, in the same target group:
 
@@ -2456,12 +2463,12 @@ pub use tinio_sandbox_macos::launch::listener as adopted_listener;
 
 That split is deliberate: a name the call site uses on every platform gets a neutral wrapper, a name it uses only inside an already-branched arm gets a gated re-export. Either way `serve` names the facade and never a platform crate, which is what keeps the dependency graph acyclic (decision 3).
 
-- [ ] **Step 5: Run the pure tests**
+- [x] **Step 5: Run the pure tests**
 
 Run: `cargo test -p tinio-sandbox-macos relay:: && cargo clippy -p tinio-sandbox-macos --all-targets -- -D warnings`
 Expected: PASS on the authoring host — three tests, no warnings. Confirm this module added no `unsafe`: `rg -n 'unsafe' crates/tinio-sandbox-macos/src/relay.rs` must print nothing — the crate's single `#[allow(unsafe_code)]` site is the listener rebuild in `launch.rs` (Task 2), and a hit here would be a second site that design decision 14 does not enumerate.
 
-- [ ] **Step 6: Write the macOS integration test**
+- [x] **Step 6: Write the macOS integration test**
 
 `crates/tinio-sandbox-macos/tests/relay.rs`:
 
@@ -2546,7 +2553,7 @@ fn a_disarmed_relay_leaves_the_child_alone() {
 
 Both tests leave `SIGTERM` handled in the test binary for the rest of its run, which is `disarm`'s documented residue rather than an accident — the handler stays installed because this crate registers through `signal-hook`'s iterator API, which keeps its registration ids to itself. The second test depends on it: a restored default disposition would kill the process that sends itself the signal. What it means for the binary as a whole is worth knowing before a later test sends itself one: it will be swallowed, not fatal, and a test that wants to die has to use a signal outside `RELAYED_SIGNALS`.
 
-- [ ] **Step 7: Run the integration test to verify it fails, then passes**
+- [x] **Step 7: Run the integration test to verify it fails, then passes**
 
 Run: `cargo test -p tinio-sandbox-macos --test relay -- --nocapture`
 Expected: FAIL before Step 3 — the test process dies on the signal it sends itself, and the harness reports a killed test binary rather than an assertion failure. Then, with the implementation in place, PASS both tests: the first asserts the child died of `SIGTERM` while the test process lived, the second asserts a disarmed relay forwards nothing.
@@ -2566,7 +2573,7 @@ Expected: FAIL before Step 3 — the test process dies on the signal it sends it
 
 This is the phase's first real question: **does a `(deny default)` profile leave enough for a Rust process to start?** Design §5 says the exact set is empirical and the Risks table says "the first task of P3 is to make a confined server start and serve one request, not to refine the profile". A first run that fails is the expected outcome, not a mistake.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-macos/tests/startup.rs`:
 
@@ -2668,7 +2675,7 @@ fn a_confined_process_starts() {
 }
 ```
 
-- [ ] **Step 2: Write the harness**
+- [x] **Step 2: Write the harness**
 
 `crates/tinio-sandbox-macos/tests/harness/mod.rs`:
 
@@ -3142,7 +3149,7 @@ Three things about this module are worth stating outright, because each of them 
 - **`run_confined` launches a launcher copy, and the probe's non-child arm calls [`launch`] — the two halves of one design.** The copy is what puts a filter the child can match into the child's argv (the module docs state why `confine`'s own re-invocation cannot supply one), and `launch()` is where the copy stops being a test runner and becomes the launcher: it is the one line each probe in Tasks 4, 6 and 7 carries in its `None` arm. Without the pair, the child's argv would carry the descriptor element as its only filter, libtest would run nothing (`running 0 tests … 3 filtered out`, exit 0), leaving the parent to report a missing report file.
 - **`remove_rule` returns an `Option`, and the pruner reports "not present".** The `DEVICE_RULES` ids are in the source whether or not the sandbox asked for the device files, so an id can legitimately have no rule in the rendered text; the pruning script greps for the harness's `prune: rule-not-present id=…` line rather than mis-reading the failure as "required".
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run (on the Mac): `cargo test -p tinio-sandbox-macos --test startup -- --nocapture`
 Expected: FAIL. Three failure modes arrive looking different, and telling them apart is most of this step's work:
@@ -3153,7 +3160,7 @@ Expected: FAIL. Three failure modes arrive looking different, and telling them a
 
 **This failure is the deliverable of the step**: it is the empirical set's first iteration. Paste the full failure output into the task's notes.
 
-- [ ] **Step 4: Extend the candidate set until the process starts**
+- [x] **Step 4: Extend the candidate set until the process starts**
 
 Work only through `RUNTIME_BASELINE` in `crates/tinio-sandbox-macos/src/profile.rs`. Each iteration: add one candidate rule, rerun, and record in the task notes which failure it removed. The refusals themselves come from one command, in a second terminal while the probe runs:
 
@@ -3170,7 +3177,7 @@ Two rules of engagement while doing this:
 - **Never** add `(allow default)`, and never add `network-outbound`. A profile that starts by allowing everything proves nothing and cannot be pruned back honestly.
 - Add the *narrowest* form that works: a named `global-name`, a `subpath` of the directory that was actually refused. Task 5 deletes whatever the pruning run says is unnecessary; adding a broad rule now and pruning it later is acceptable, adding `(allow default)` is not.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tinio-sandbox-macos --test startup -- --nocapture`
 Expected: PASS — `payload=ok`, `threads=4`, `read_marker=confined`, and a non-zero `available_parallelism`. The `payload=ok` assertion is what proves the payload-on-stdin handover of design §3 step 7 and the listener descriptor in argv both worked, so a pass here is the phase's first real progress.
@@ -3178,6 +3185,8 @@ Expected: PASS — `payload=ok`, `threads=4`, `read_marker=confined`, and a non-
 ---
 
 ### Task 5: Settle the baseline, and record why each rule survives
+
+**Result, 2026-09-25: recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile"), in its audit, `sysctl` and `home` paragraphs.** This plan does not backfill the run's findings; the section named above is the record.
 
 **Files:**
 - Create: `crates/tinio-sandbox-macos/scripts/prune-profile.sh`
@@ -3189,7 +3198,7 @@ Expected: PASS — `payload=ok`, `threads=4`, `read_marker=confined`, and a non-
 
 Task 4 found *a* working set. This task turns it into a *minimal, recorded* set, and **it is a required step rather than a follow-up**: design §5 calls the set empirical, and this is what makes "empirical" mean "measured" rather than "whatever worked the first time". Two things are settled before it starts and neither is re-opened here — the system read set is the narrowed one Task 1 ships (no `/private` blanket, no `/dev` blanket, no dead `/etc` rule, and `process-fork`/`signal (target self)` carried only until this run decides them), and every entry that is not one of the four `required` ones is subject to removal. A rule that survives without an observation saying what broke without it is deleted, not documented.
 
-- [ ] **Step 1: Write the pruning script**
+- [x] **Step 1: Write the pruning script**
 
 `crates/tinio-sandbox-macos/scripts/prune-profile.sh`:
 
@@ -3240,19 +3249,19 @@ echo "surviving entry's `evidence` field with what the run showed."
 
 Make it executable: `chmod +x crates/tinio-sandbox-macos/scripts/prune-profile.sh`.
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `bash crates/tinio-sandbox-macos/scripts/prune-profile.sh`
 Expected: a table, one line per rule id. Every `NOT NEEDED` line is a rule to delete; every `required` line is a rule to keep and to justify; a `NOT PRESENT` line is a rule the probe's own sandbox does not ask for — fix the probe (`device_files()`) rather than treating it as a verdict. Save the table verbatim in the task notes — it is the phase's evidence.
 
-- [ ] **Step 3: Delete what is not needed**
+- [x] **Step 3: Delete what is not needed**
 
 For each rule the run marked `NOT NEEDED`, delete its `Allowance` from `RUNTIME_BASELINE` (or `DEVICE_RULES`), then rerun the whole suite to confirm nothing depended on it for a different reason:
 
 Run: `cargo test -p tinio-sandbox-macos && bash crates/tinio-sandbox-macos/scripts/prune-profile.sh`
 Expected: the suite passes and the deleted ids no longer appear in the table. If deleting a rule makes the pruning table unstable (a different rule now reports `NOT NEEDED`), the two rules overlap — keep the narrower one and say so in `evidence`.
 
-- [ ] **Step 4: Rewrite every surviving `evidence` field**
+- [x] **Step 4: Rewrite every surviving `evidence` field**
 
 Each surviving entry's `evidence` names the observation, in the shape:
 
@@ -3266,11 +3275,11 @@ Each surviving entry's `evidence` names the observation, in the shape:
 
 Write the machine, the macOS version and the symptom. `"candidate"` may not survive this task, and neither may a restatement of what the rule obviously does — the field exists to say *what broke without it*. **Two shapes need a sentence more than the others**: an entry whose removal changed nothing is *deleted*, not excused; and an entry whose evidence still reads "carried by design §5's measured text" (`process-fork` and `signal-self` arrive that way) has to have been decided by this run — kept with the failure its removal produced, or deleted.
 
-- [ ] **Step 5: Record the network question's state**
+- [x] **Step 5: Record the network question's state**
 
 There is no network rule to leave alone and none to prune: the `accept` question was settled on macOS 15.8 before this plan was revised (design §5), and Task 7 asserts the empty network surface rather than discovering it. Add nothing network-side here; a rule added on a hunch would later read as a measurement.
 
-- [ ] **Step 6: Run the full crate test suite**
+- [x] **Step 6: Run the full crate test suite**
 
 Run: `cargo test -p tinio-sandbox-macos`
 Expected: PASS — `startup` green with the reduced baseline, and every pure test from Tasks 1 and 2 still green.
@@ -3286,7 +3295,7 @@ Expected: PASS — `startup` green with the reduced baseline, and every pure tes
 - Consumes: the harness, `AccessMode`, `Sandbox`.
 - Produces: nothing the library uses; this is the proof that `expose(path, access)` means what design §2's table says on this platform.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-macos/tests/exposures.rs`:
 
@@ -3491,12 +3500,12 @@ fn a_read_only_exposure_refuses_writes_and_still_reads() {
 
 The single `child_exposures` probe serves both parents by reading its paths from the parameters, so the read-only run swaps `root_write` for a denial without a second probe, and the symlinked-root fixtures appear in both — the read-only run canonicalises its own root, which on macOS is a second spelling for the same reason.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-sandbox-macos --test exposures -- --nocapture`
 Expected: FAIL. Likely first failures, in order: `canonical_read` refused (canonicalisation missing or wrong — the profile then spells only the path the operator wrote, and Seatbelt matches the resolved one), `deep_read` refused for the same reason when the root's own prefix is a symlink, or `state_write` denied when the state directory sits outside the served root and was not exposed.
 
-- [ ] **Step 3: Make it pass**
+- [x] **Step 3: Make it pass**
 
 Fix in this order, then rerun after each fix:
 
@@ -3504,12 +3513,12 @@ Fix in this order, then rerun after each fix:
 2. If reads under an exposure are denied but the exposure itself resolves, the ancestor traversal is being checked after all: add `(allow file-read-metadata)` (or the narrowest form that works) to `RUNTIME_BASELINE` with its observation, and rerun Task 5's pruning script so it is pruned like everything else.
 3. If a write into a read-only exposure *succeeds*, the rule is wrong, not the test: `AccessMode::ReadOnly` must emit no `file-write*` for that path. Fix `profile` before touching anything else.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p tinio-sandbox-macos --test exposures -- --nocapture`
 Expected: PASS — both tests, `payload=ok`, every `ok:` assertion exact, the read-only `root_write` reporting `permission denied`, and the refusals reporting an error of either kind (the test's pair of accepted strings is deliberate and Step 1 explains why). If `escape_read` reads successfully, the confinement is wider than the exposure set says and that is a stop-and-investigate, not a test to relax.
 
-- [ ] **Step 5: Rerun the pruning script**
+- [x] **Step 5: Rerun the pruning script**
 
 Run: `bash crates/tinio-sandbox-macos/scripts/prune-profile.sh`
 Expected: the same table as Task 5, modulo any rule added in Step 3. A rule whose necessity changes here was only ever needed by a path this test exercises; update its `evidence`.
@@ -3517,6 +3526,8 @@ Expected: the same table as Task 5, modulo any rule added in Step 3. A rule whos
 ---
 
 ### Task 7: The network rules — the `accept` question, already answered
+
+**Result, 2026-09-25: recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile"), in its network paragraph.**
 
 **Files:**
 - Create: `crates/tinio-sandbox-macos/tests/network.rs`
@@ -3527,7 +3538,7 @@ Expected: the same table as Task 5, modulo any rule added in Step 3. A rule whos
 
 Design §5 used to leave one question to a real Mac: "whether `accept` on an already-bound inherited socket still needs `network-inbound`". It was settled on macOS 15.8 on 2026-09-19, and the answer is **no** — `accept` on an inherited listener is not gated by the sandbox at all. Only `bind()` and `listen()` are, and the parent performs both before the child exists. So the profile's entire network surface is **empty**, there is no inbound rule to add, and this task is an assertion rather than an experiment. (Measured alongside it, and not needed here because nothing inside the profile binds: `bind()` is satisfied by *either* `network-bind` *or* `network-inbound`.)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-sandbox-macos/tests/network.rs`:
 
@@ -3643,12 +3654,13 @@ fn the_profile_grants_no_network_operation_at_all() {
 }
 ```
 
-- [ ] **Step 2: Run the test**
+- [x] **Step 2: Run the test**
 
 Run: `cargo test -p tinio-sandbox-macos --test network -- --nocapture`
 Expected: PASS on all three tests. `accept=ok:ping` proves both that the descriptor handover of design §3 step 7 reached the child and that the sandbox does not gate `accept`; `outbound=refused(permission denied)` proves the outbound refusal; the profile assertion proves the row is empty.
 
 - [ ] **Step 3: If `accept` is refused, stop and re-measure rather than adding a rule**
+  *(Not ticked: conditional and never triggered — Step 2's run is green, so the premise it guards did not occur; the three network tests pass in the tree, and design §5's network paragraph records the control-socket handoff they rest on.)*
 
 A denial here contradicts a measurement taken on macOS 15.8, and none of the three things it can mean is "add `network-inbound`": the listener is not actually being inherited (check the payload's fd number against design §3 step 7), the descriptor lost its listening state between parent and child, or this macOS version gates `accept` where 15.8 did not. The third is a real possibility — the tool that separates them is `log stream --predicate 'sender == "Sandbox"'`, which names the refused operation as it happens and is how every macOS row of design §5 was established (`log show` reports nothing for refusals on 15.8, even with `--info --debug`). Record what it says; do not add a rule to turn a red test green.
 
@@ -3656,9 +3668,11 @@ A denial here contradicts a measurement taken on macOS 15.8, and none of the thr
 
 ### Task 8: `serve` on macOS — the launcher path
 
+**Result, 2026-09-25: recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile"), in its `state` paragraph.** This plan does not restate the run's findings.
+
 **Files:**
 - Verify, do not edit: `crates/tinio-config/src/schema/server.rs` — P2 Task 11 Step 1 writes `probe_read_only` there (shared §4)
-- Modify: `crates/tinio-server/examples/serve.rs`
+- Modify: `crates/tinio-cli/src/commands/start/serve.rs` — the serving entry point; the launcher's own half is `crates/tinio-cli/src/sandbox/macos.rs` and `crates/tinio-cli/src/commands/start/run.rs` (the `crates/tinio-server/examples/serve.rs` this plan was written against is retired and gone)
 
 **Interfaces:**
 - Consumes: `tinio_sandbox::{adopt, is_listener_fd_arg, on_stop, platform, supervise, AccessMode, Backend as _, Confinement, Event, LaunchPlan, Sandbox}` (the facade re-exports core and the selected platform crate) plus the file's existing `FsStorage`/`FsOptions`, `state`, `sources` and `watch` imports, which the child's storage construction and stop channel use unchanged.
@@ -3666,7 +3680,7 @@ A denial here contradicts a measurement taken on macOS 15.8, and none of the thr
 
 This is design §10's sequence for a child-launching platform: steps 1 (discriminator), 2 (targeted read-only lookup), 3 (bytes only), 5 (sources exist), 6 (bind, expose, launch), 7 (print, supervise, forward), 8 (runtime).
 
-- [ ] **Step 1: Verify the read-only probe is present, and do not write it again**
+- [x] **Step 1: Verify the read-only probe is present, and do not write it again**
 
 `tinio_config::server::probe_read_only` is **P2's edit and not this plan's**: P2 Task 11 Step 1 writes the function and its test into `crates/tinio-config/src/schema/server.rs`, because P2 is the earlier of the two phases that need it (`2026-09-18-sandbox-shared.md` §4). This plan used to write both as well, which made one file the subject of two tasks' edits — the defect that section exists to remove.
 
@@ -3679,9 +3693,9 @@ cargo test -p tinio-config probe_reads_only
 
 Expected: both names are found in that file, and the test passes. If the function is **not** there, P2 has not landed — stop and say so rather than writing it here. The one thing this step checks beyond its presence is the shape Step 2's call depends on: it takes the configuration bytes as `&[u8]` and returns a `Result` that `?` can carry into `main`, and it reads nothing but `[server] read_only` (design decision 18).
 
-- [ ] **Step 2: Wire `serve`**
+- [x] **Step 2: Wire `serve`**
 
-In `crates/tinio-server/examples/serve.rs`:
+In `crates/tinio-cli/src/commands/start/serve.rs` (the launcher's own half is `crates/tinio-cli/src/sandbox/macos.rs` and `crates/tinio-cli/src/commands/start/run.rs`):
 
 (a) imports, beside the existing ones:
 
@@ -4117,7 +4131,7 @@ Two signature changes make the above work, and **which plan holds the pen is dec
 
 Delete the `#[tokio::main]` attribute (the Linux plan already replaced it with a plain `fn main`), delete the old `println!("listening on …")`, and make sure nothing else in the file reads `Config` before step 7 above. Every remaining `println!` and `eprintln!` in this file is a bug: stdout is the protocol channel and the logs belong on stderr.
 
-- [ ] **Step 3: Run the tests and the example**
+- [x] **Step 3: Run the tests and the example**
 
 Run:
 
@@ -4129,7 +4143,7 @@ cargo check -p tinio-server --no-default-features
 
 Expected: the example's unit tests pass, clippy is clean, and the feature-off build still compiles (the example is skipped by `required-features`).
 
-- [ ] **Step 4: Run it by hand on a Mac**
+- [x] **Step 4: Run it by hand on a Mac**
 
 Run:
 
@@ -4150,6 +4164,8 @@ Expected: the child runs under `sandbox-exec`, and the state directory contains 
 
 ### Task 9: The confined server, end to end, on the CI macOS leg
 
+**Result, 2026-09-25: the arm this leg owes is recorded in `docs/tests.md`'s CLI section and `.github/workflows/ci.yml`'s cucumber comment; the profile and launch measurements behind it are in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile").**
+
 **Files:**
 - Create: `crates/tinio-server/tests/sandbox_macos_e2e.rs`
 - Modify: `crates/tinio-server/Cargo.toml` (the `[[test]]` target)
@@ -4159,7 +4175,7 @@ Expected: the child runs under `sandbox-exec`, and the state directory contains 
 - Consumes: the built `tinio` binary, located by `crates/tinio-server/tests/common/mod.rs`'s `tinio_bin` (the retired example's `serve_bin` under its current name — the helper is `common::tinio_bin` today), which this tree's spawning targets share (this file among them, since the spawn/readiness hoist); `crates/tinio-e2e`'s harness resolves the same binary its own way, `cargo_bin("tinio")`, because a different crate's test tree cannot import this one's support.
 - Produces: the macOS leg's acceptance — "a confined server serves a request" (design §12), and the exit-status forwarding of design §3 step 8.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-server/tests/sandbox_macos_e2e.rs`:
 
@@ -4381,12 +4397,12 @@ fn timeout() -> u64 {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tinio-server --test sandbox_macos_e2e -- --nocapture`
 Expected: FAIL before Step 3 with "no test target named `sandbox_macos_e2e`"; after Step 3, the first real failures are the interesting ones — no `Listening` frame (the launcher failed, or the event relay is not running), a refused connection (the child never reached `accept`), or a missing access log (the write grant is wrong).
 
-- [ ] **Step 3: Wire the test target**
+- [x] **Step 3: Wire the test target**
 
 `crates/tinio-server/Cargo.toml`:
 
@@ -4396,7 +4412,7 @@ name = "sandbox_macos_e2e"
 required-features = ["sandbox"]
 ```
 
-- [ ] **Step 4: Make it pass**
+- [x] **Step 4: Make it pass**
 
 The three likely causes, in order:
 
@@ -4404,21 +4420,28 @@ The three likely causes, in order:
 2. `connection refused`: the child is running but never accepts. Check Task 7's `accept=` result — this is the same question, now on the inherited descriptor through `tokio::net::TcpListener::from_std`.
 3. `no access log`: the state directory is not inside a writable exposure. Check the exposure set actually passed (Task 8's `sandbox_exposures`) and whether `with_canonical_paths` produced the rule the kernel matches.
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p tinio-server --test sandbox_macos_e2e -- --nocapture`
 Expected: PASS. Confirm the leg's claims in the output: an HTTP response, an access log on disk, the launcher's own `info!` events on stderr (`profile`, `preflight`, `spawn`, `exit`), a forwarded exit status of `Some(0)` — the child's own graceful stop, carried back by the launcher — and frames and nothing else on stdout.
 
-- [ ] **Step 6: Confirm the CI leg picks it up**
+- [x] **Step 6: Confirm the CI leg picks it up**
+  *(Ticked on a **measured** selection run, 2026-09-26: `cargo-nextest 0.9.146` — the version `.config/nextest.toml:25` says its filter was verified against — on the macOS guest, where `cargo nextest list --cargo-profile ci --profile ci --workspace --exclude tinio-e2e` reported **1719 tests across 36 binaries**. `tinio-server::sandbox_macos_e2e` is present with its **3** tests and the six `tinio-sandbox-macos` suite binaries with **13** (`exposures` 3, `handover` 1, `injection` 2, `network` 3, `relay` 2, `startup` 2) beside that crate's 26 lib tests. That command is `action.yml:62`'s verbatim, with no `-E`.)*
 
-Run: `cargo nextest run --cargo-profile ci --profile ci --workspace --exclude tinio-e2e -E 'test(sandbox)'`
-Expected: the macOS sandbox tests are selected, plus the Linux ones (which skip by `cfg`). The CI macOS leg (`test-port`, `macos-latest`, `default` mode) runs exactly this command set through `./.github/actions/run-test-leg`; Step 7 adds the linting that leg needs on top; the `no-default` leg skips `sandbox_macos_e2e` through `required-features`, and `tinio-sandbox-macos`'s own tests run in both.
+**This step's original command was wrong, and the run showed it rather than the docs arguing it.** `-E 'test(sandbox)'` selects **21 tests across 4 binaries** — 12 `tinio-cli sandbox::tests::*`, one `tinio-config sources::tests::sandbox_flag_parses_strictly`, 5 `tinio-sandbox-core sandbox::tests::*`, 3 `tinio-server::serve_sandbox_channels *` — and **not one** from `tinio-sandbox-macos` or `sandbox_macos_e2e`. `test()` matches the **test name**, not the binary id, and no test name in either target contains `sandbox`; only module paths and an unrelated binary name do. The predicate for a target is `binary_id`, and it needs the **qualified** form: `-E 'binary_id(sandbox_macos_e2e)'` fails to parse (`operator didn't match any binary IDs`, exit 94) while `-E 'binary_id(tinio-server::sandbox_macos_e2e)'` yields the 3 and `-E 'binary_id(/^tinio-sandbox-macos::./)'` the 13.
+
+**One correction to this step's own mechanism claim.** `jail` and `signals` are absent from the macOS leg **not** because `profile.ci.default-filter` removed them: `--ignore-default-filter` returned a byte-identical 1719/36 and nextest printed no "skipped via profile.ci.default-filter" note. Both binaries *are* built for the leg and each answers `--list` with **0 tests**, because `crates/tinio-sandbox-linux/tests/jail.rs` and `crates/tinio-sandbox-windows/tests/signals.rs` are `#![cfg(target_os = …)]`-emptied on macOS. That filter is inert on this leg and bites on the linux/windows ones.
+
+**Listing is not a hermetic dry run.** `cargo nextest list` executed `#[test]` bodies during discovery — macOS kernel `Sandbox` entries appeared while listing — so a list run is evidence about *selection* and nothing about pass/fail; Step 5 owns that.
+
+Run: `cargo nextest list --cargo-profile ci --profile ci --workspace --exclude tinio-e2e` (no `-E`; add `--ignore-default-filter` to see that the floor does not move on this leg)
+Expected: **1719 tests across 36 binaries**; `tinio-server::sandbox_macos_e2e` with its three tests, the six `tinio-sandbox-macos` suite binaries with thirteen, plus the Linux confinement tests (which skip by `cfg`). The CI macOS leg (`test-port`, `macos-latest`, `default` mode) runs that `-E`-free command set through `./.github/actions/run-test-leg`; Step 7 adds the linting that leg needs on top; the `no-default` leg skips `sandbox_macos_e2e` through `required-features`, and `tinio-sandbox-macos`'s own tests run in both.
 
 The macOS leg must prove, and this task makes it prove: a confined process starts and reads its data; the exposure rules bite (a refused read and a refused write, either of the two errors a refusal can wear); outbound is refused after a proven baseline; the profile grants no `network-outbound`; a signal to the launcher reaches the confined child (Task 3's signal relay, re-asserted here against the real `sandbox-exec` process tree); the confined server emits a `Listening` event that the launcher relays, and nothing but frames reaches the consumer; the launcher's `info!` events are on stderr; and the confined *server* serves a request and has its exit status forwarded. A profile that merely fails to crash the process passes none of them.
 
 **The leg records refusals; it does not assert on them, and the asymmetry with Task 10 is deliberate.** On a shared runner the `Sandbox` log is every process on the machine and the leg runs concurrently with the rest of the matrix, so a denial line there is evidence to read rather than a gate — and attributing one at all needs the process name in the record, which is the trap Task 10's script comments describe. The exact-zero assertion lives in that script (Task 10), where the machine is quiet and the profile under test is the only thing running.
 
-- [ ] **Step 7: Make the macOS leg lint the workspace, and correct the lint job's comment**
+- [x] **Step 7: Make the macOS leg lint the workspace, and correct the lint job's comment**
 
 `.github/workflows/ci.yml`. The `lint` job lints only on ubuntu, and macOS-only code is invisible to it — the comment in that job claims the opposite and is already false (the workspace already carries macOS-conditional code: `#[cfg(all(unix, not(target_os = "macos")))]` in `crates/tinio-fs/src/fsutil.rs` and `crates/tinio-fs/src/backend/tests.rs`, whose macOS side ubuntu never compiles, and this phase adds a whole backend of it), so it is corrected here rather than left to mislead the next reader. Add the step below to the `test-port` job, after `*sccache` and before `run-test-leg`, so the leg's lint is its gate and its failure is reported before the leg spends its test time:
 
@@ -4463,7 +4486,7 @@ And replace the `lint` job's matrix comment (its first three lines are the ones 
 - Consumes: nothing.
 - Produces: the one command that reproduces the phase's macOS acceptance, and its record in the documentation the workspace treats as the source of truth for test runs.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 `crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh`:
 
@@ -4553,12 +4576,12 @@ echo "no unexpected refusal for the server's own process"
 
 Make it executable: `chmod +x crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh`.
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `bash crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh`
 Expected: the three sections pass, the necessity table prints, and the refusal check reports no unexpected refusal for the server's own process — the three expected operations are named in the script and anything else is a failure. This is the P3 acceptance run (design §13's "the operator verifies on their own machine").
 
-- [ ] **Step 3: Record the commands in `docs/tests.md`**
+- [x] **Step 3: Record the commands in `docs/tests.md`**
 
 Add a section after `## Platform-gated verification (WSL2)`, in the file's existing compressed style:
 
@@ -4570,7 +4593,7 @@ Add a section after `## Platform-gated verification (WSL2)`, in the file's exist
 - The confined server's endpoint is an `Event` frame — `event: listening`, then `data: {"addr":"127.0.0.1:<port>"}`, then a blank line (the name travels in the SSE field and the payload carries only what the name does not say) — and not a line to scrape. Parsing lives with the consumer; the harness's `wait_for_ready` change is the Linux plan's (it emits the first events), not this phase's. The launcher's own record is on stderr: shared §7's `info!` half, at `Verbosity::Info`, without an environment filter.
 ```
 
-- [ ] **Step 4: Run the documentation gate**
+- [x] **Step 4: Run the documentation gate**
 
 Run:
 
@@ -4585,6 +4608,8 @@ Expected: both clean. The macOS-only items' doctests are compiled only on macOS,
 
 ### Task 11: Check the macOS evidence rows against the run, and run the whole gate
 
+**Result, 2026-09-25: the profile's measurements are recorded in `docs/superpowers/specs/2026-09-18-sandbox-design.md` §5 ("The macOS SBPL profile").** Read that section, not this task's checklist, for what each rule's failure mode is.
+
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-18-sandbox-design.md` (§5's profile block and the paragraphs around it, §12's CI bullet, and the Risks row only if the run contradicts it)
 
@@ -4594,7 +4619,7 @@ Expected: both clean. The macOS-only items' doctests are compiled only on macOS,
 
 **There is nothing left to flip, and that is what this task records.** The design was written while macOS was unmeasured, and P3 originally carried two steps that replaced its `(unverified)` rows with results. The VM run of 2026-09-19 was folded into the design first, so the macOS rows are measured, §5 is measured text, and the only `(unverified)` rows remaining are Windows's. What this task does is the opposite of a flip: it reads the document against the run and corrects only what the run contradicts.
 
-- [ ] **Step 1: Read the design's macOS rows against your run, and do not re-derive them**
+- [x] **Step 1: Read the design's macOS rows against your run, and do not re-derive them**
 
 The doc was updated when the VM run was folded in, so §5 already holds the measured profile, the four load-bearing allowances with the failure mode of each, and the symlink/`file-read-metadata` rule; §7's macOS row already reads "no network capability of any kind"; decisions 16 and 24 already cite the `accept` and `-D` results; and the evidence table already lists every macOS row with its observation. Check each against your own run and correct only what your run contradicts. Those paragraphs were written from a probe on macOS 15.8 with a listener handover, which is exactly what Task 7 exercises — so a disagreement means something in the crate, not in the doc, and it is worth stopping over.
 
@@ -4602,7 +4627,7 @@ That the only `(unverified)` rows left are Windows's is itself worth checking ra
 
 **One claim is known to be wrong before you start, and this is where it gets corrected.** The evidence table's row about the server running under §5's profile says the log returns **zero** violations for the server's own process. That is a rendering of a measurement taken with `log show`, which on 15.8 reports no refusals at all — and every confined process in fact carries the noise floor Task 4 and Task 10 name (its own executable's `file-read-data`, `file-write-data /dev/dtracehelper`, `network-outbound /private/var/run/syslog`). The row is corrected here to say what was observed: no refusal *outside that floor*, read with `log stream`.
 
-- [ ] **Step 2: Correct §5's profile text where this phase's run contradicts it — which it does**
+- [x] **Step 2: Correct §5's profile text where this phase's run contradicts it — which it does**
 
 Design §5 holds the measured profile, and **this phase's Task 1 already ships a *narrower* one**, deliberately: `/private` is split into `/private/etc` and `/private/var/folders`, the `(subpath "/etc")` rule is deleted (a symlink into `/private`, matching nothing), the `(subpath "/dev")` blanket is replaced by the device literals, `(allow process-exec)` becomes `(allow process-exec (literal (param "P")))` — the one exec the launch performs, rather than whatever the child can read — and `(allow process-fork)`/`(allow signal (target self))` are carried until Task 5's run decides them. So the correction here is not conditional on Task 5 finding something: the two texts disagree, and the run is what justifies the narrower one. Update §5's profile block and the paragraphs around it from the necessity table:
 
@@ -4613,7 +4638,7 @@ Design §5 holds the measured profile, and **this phase's Task 1 already ships a
 
 The Risks row is the other thing to touch, and only if the run contradicts it: it says the remaining macOS work is a smoke test rather than a research question, and if Task 5 pruned an allowance §5 still lists, or if Task 4 needed one the doc never mentions, both are wrong and get corrected with the observation that justifies it. An edit for its own sake is how a measured statement turns back into a guess — but this phase's narrowing is not an edit for its own sake, it is the operator's decision and Task 5's table is its evidence.
 
-- [ ] **Step 3: Record that the macOS leg lints the workspace, not only tests it**
+- [x] **Step 3: Record that the macOS leg lints the workspace, not only tests it**
 
 §12's **CI** bullet describes which leg does what, and P3 changed one of those facts: the `macos-latest` leg of `test-port` now runs `cargo clippy --profile ci --workspace --all-targets -- -D warnings` as well as the test suite (Task 9 Step 7), because macOS-only code never compiles in the ubuntu clippy job. Add that to the existing bullet — it is one sentence, and it goes inside the bullet, not beside it:
 
@@ -4623,7 +4648,7 @@ The `macos-latest` leg lints the workspace as well as testing it, since macOS-on
 
 Do not add a second bullet: §12's CI bullet is the one that already says which leg does what, and a new bullet would be a second place to keep in step.
 
-- [ ] **Step 4: Run the standard acceptance gate**
+- [x] **Step 4: Run the standard acceptance gate**
 
 Run:
 
@@ -4640,7 +4665,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 Expected: all clean. On the authoring host the macOS tests compile to empty binaries and the Linux ones are unaffected; on the Mac, `bash crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh` must be green in the same session.
 
-- [ ] **Step 5: Confirm the crate's lint boundary stayed where the design put it**
+- [x] **Step 5: Confirm the crate's lint boundary stayed where the design put it**
 
 Run: `rg -n 'allow\(unsafe_code\)' crates/tinio-sandbox-macos/src crates/tinio-sandbox-linux/src crates/tinio-sandbox-windows/src crates/tinio-sandbox-core/src crates/tinio/src`
 Expected: **one** line from `tinio-sandbox-macos` — the attribute on `launch::listener`, the child's rebuild from the inherited descriptor, whose `# Safety` section states the invariant (the descriptor is the launcher's, held open for the child's whole lifetime and never closed) — and no second one, which is the boundary this step enforces: the crate is `deny` with that site alone, because `BorrowedFd::borrow_raw` and `OwnedFd::from_raw_fd` are both `unsafe fn` and no safe route to the rebuild exists. Then three from `tinio-sandbox-linux` (`kernel_fork` in the user-namespace probe, the `unshare` call, and the seccomp `prctl`), **nothing** from `tinio-sandbox-core` and the facade (both stay `forbid`), and whatever `tinio-sandbox-windows` establishes if P2 has landed — one module per Win32 capability, its count taken from its implementation. Every one of them is listed in design decision 14 and its Bookkeeping; a hit outside that list is the failure this step is looking for, and a macOS hit count other than one is the same failure.
@@ -4691,7 +4716,7 @@ EOF
 | decision 2 `Confinement`, no `#[cfg]` at the call site | 8 (one `#[cfg]` for who binds, which decision 16 makes platform-dependent; the confinement *shape* stays cfg-free) |
 | decision 6 macOS launches a child | 2, 8 |
 | decision 8 read-only is the absence of a write permission | 1, 6 |
-| decision 14 `deny` plus one enumerated `#[allow(unsafe_code)]` site per backend | 1 (the manifest's `unsafe_code = "deny"`), 2 (`listener`: the rebuild from the inherited descriptor, the attribute, and the `# Safety` invariant — the crate's only site) |
+| decision 14 `deny` plus enumerated `#[allow(unsafe_code)]` sites per backend | 1 (the manifest's `unsafe_code = "deny"`), 2 (`listener`: the rebuild from the inherited descriptor, the attribute, and the `# Safety` invariant — the crate's first site; it had exactly one when this plan was written and has three since 2026-09-26, when the in-process mechanism added `apply::libsystem` and `apply::validator`'s `fork`) |
 | decision 16 the parent binds the port; no `network-bind`; `accept` ungated on the inherited listener | 7, 8 |
 | decision 17 the payload is the only discriminator, and it travels on stdin | 2 (write and close), 4 (`payload=ok` in the harness), 8 (`adopt`) |
 | decision 18 no retained parse in the parent; one targeted lookup | 8 (`probe_read_only`, verified not written) |
@@ -4705,23 +4730,24 @@ EOF
 
 **Placeholder scan.** No `TBD`, no "add error handling", no "similar to Task N". Two places carry an explicit *procedure* instead of a value, because the value cannot be known before a Mac runs it — and both say so in the step: the baseline allowance set (Tasks 4 and 5, which measure and then require the pruning run) and the `accept` rule (Task 7, whose outcome is already measured and whose step says what to do if the machine disagrees). Task 11 forbids writing an evidence row without a pasted measurement rather than templating one.
 
-**Type consistency.** Every core item is called exactly as P0 Task 2 fixes it — that surface, and the ownership of it, is `2026-09-18-sandbox-shared.md` §3's and is not repeated here. There is no `nonce()`, no `MAGIC` and no `with_nonce` on it: the payload is one JSON object. **The crate's public surface, and nothing else**: `Backend` and `backend()` at the root (the type the facade's `platform()` selects — Task 1), `confine`, `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` and `SANDBOX_EXEC` (Task 2), `launch::listener` and `launch::PREFLIGHT_MARKER`, `profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)> }, with_canonical_paths, Allowance, RUNTIME_BASELINE, DEVICE_RULES}` (Task 1), and `relay::{on_stop, on_forwarded_stop, disarm, relay_decision, RELAYED_SIGNALS}` (Task 3) — the launcher's half and the child's half of the relay, in that order, with the facade presenting the child's as `on_stop` (Task 3 Step 4) so both launcher platforms call one name. **Everything else in those modules is private and stays private** — `validate_path`, `refuse` and `push` in `profile.rs`; `hand_over`, `make_inheritable`, `preflight`, `spawn_error` and `PREFLIGHT_TIMEOUT` in `launch.rs` — and the Self-Review says so rather than listing them as surface, because none of them is called from outside the crate. **`serve`'s signature is P1's, `2026-09-18-sandbox-shared.md` §4 owns it, and P3 changes none of it**: `confined` passes the storage it built, its listener and its stop receiver; the plain serving path passes its own storage and no platform values at all; and the launcher passes none of them because it never reaches `serve` — the placement of the two storage constructions (Step 2(e)) is what keeps the launcher from building one. `harness::{Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule, CHILD_ENV, PARAMS_ENV, LAUNCH_ENV}` is created in Task 4 and used by Tasks 5, 6 and 7. No name is introduced twice with different meanings; the test harness's `Child` is its own type and is always written `harness::Child`. **The four failure builders are the core's and this crate defines none of them** — `refused`, `step` and `launch` are imported by `launch.rs` and `refused` is what `spawn_error`'s `NotFound` arm refuses with (P0 Task 1 landed them; the phase-basis correction is where this crate stopped defining its own `step`). The crate's lint is `unsafe_code = "deny"` with exactly one `#[allow(unsafe_code)]` site — `launch::listener`, whose `# Safety` section carries the invariant that the descriptor is the launcher's, held open for the child's whole lifetime and never closed, **and that `from_raw_fd` is called at most once per descriptor number** — and `make_inheritable` is deliberately written to need none: it clears `FD_CLOEXEC` through the socket's own `AsFd` rather than through a descriptor reconstructed from an integer, which is what keeps the crate's site count at one (decision 14, its Scope and the Bookkeeping bullet).
+**Type consistency.** Every core item is called exactly as P0 Task 2 fixes it — that surface, and the ownership of it, is `2026-09-18-sandbox-shared.md` §3's and is not repeated here. There is no `nonce()`, no `MAGIC` and no `with_nonce` on it: the payload is one JSON object. **The crate's public surface, and nothing else**: `Backend` and `backend()` at the root (the type the facade's `platform()` selects — Task 1), `confine`, `command_args(&Path, &[OsString], &Profile, Option<i64>) -> Vec<OsString>` and `SANDBOX_EXEC` (Task 2), `launch::listener` and `launch::PREFLIGHT_MARKER`, `profile::{profile(&Sandbox) -> Result<Profile>, Profile { text: String, params: Vec<(String, OsString)>, rules: usize }, rule_count, with_canonical_paths, Allowance, RUNTIME_BASELINE, DEVICE_RULES}` (Task 1), and `relay::{on_stop, on_forwarded_stop, disarm, relay_decision, RELAYED_SIGNALS}` (Task 3) — the launcher's half and the child's half of the relay, in that order, with the facade presenting the child's as `on_stop` (Task 3 Step 4) so both launcher platforms call one name. **Everything else in those modules is private and stays private** — `validate_path`, `refuse` and `push` in `profile.rs`; `hand_over`, `make_inheritable`, `preflight`, `spawn_error` and `PREFLIGHT_TIMEOUT` in `launch.rs` — and the Self-Review says so rather than listing them as surface, because none of them is called from outside the crate. **`serve`'s signature is P1's, `2026-09-18-sandbox-shared.md` §4 owns it, and P3 changes none of it**: `confined` passes the storage it built, its listener and its stop receiver; the plain serving path passes its own storage and no platform values at all; and the launcher passes none of them because it never reaches `serve` — the placement of the two storage constructions (Step 2(e)) is what keeps the launcher from building one. `harness::{Report, Child, child, is_child_process, launch, line, finish, run_confined, run_pruned, remove_rule, CHILD_ENV, PARAMS_ENV, LAUNCH_ENV}` is created in Task 4 and used by Tasks 5, 6 and 7. No name is introduced twice with different meanings; the test harness's `Child` is its own type and is always written `harness::Child`. **The four failure builders are the core's and this crate defines none of them** — `refused`, `step` and `launch` are imported by `launch.rs` and `refused` is what `spawn_error`'s `NotFound` arm refuses with (P0 Task 1 landed them; the phase-basis correction is where this crate stopped defining its own `step`). The crate's lint is `unsafe_code = "deny"` with its sites enumerated by decision 14 — the inherited-descriptor rebuild in `launch::inherited_fd` (the helper both safe rebuilds, `launch::listener` and `launch::control`, call), the libSystem FFI in `apply`, and `apply`'s validator `fork` — and `inherited_fd`'s `# Safety` section carries the invariant that the descriptor is the launcher's, held open for the child's whole lifetime and never closed, **and that `from_raw_fd` is called at most once per descriptor number**. `make_inheritable` is deliberately written to need none: it clears `FD_CLOEXEC` through the socket's own `AsFd` rather than through a descriptor reconstructed from an integer.
 
 **Deliberately out of P3's scope.**
 
 - The CLI flag, the `[server] sandbox` key and `TINIO_SANDBOX` (design Non-goals: they land with T066/T067). P3 reaches operators through `serve` only, exactly as P1 does on Linux (where the phase is Linux-only by construction now).
-- `TINIO_SANDBOX_MODEL` and the model selection of decision 7: Linux only. macOS has one mechanism and no fallback ladder.
+- `TINIO_SANDBOX_MODEL` and the model selection of decision 7: Linux only. macOS had one mechanism and no fallback ladder when this plan was written; **2026-09-26 added the second** (`TINIO_SANDBOX_MACOS_MECHANISM`, `sandbox-exec` default and `sandbox-init` the alternative, no ladder between them — an unknown value is a usage error), which is decision 6's and not a P3 task.
 - Windows (P2) and the other-unix `chroot` fallback (P4).
 - Read-only *mode* (FR-023) as a feature: it has **landed**. `serve` resolves the mode from `[server] read_only`, the `TINIO_READ_ONLY` overlay and the `--read-only` flag, and relocates the state directory to `TINIO_STATE_DIR` or `<home>/.tinio/roots/<hash>/` (`crates/tinio-config/src/state.rs`). What is P3's is the *confinement* of it — rendering `AccessMode::ReadOnly` on the served root and exposing the relocated state directory writable — which is why Task 8's `main` takes the state directory from the storage instead of hand-building `<root>/.tinio`.
 - The `otel`/`--sandbox` startup conflict (decision 25): `serve` never passes an endpoint.
 - **Tying the confined child's *lifetime* to the launcher's.** Decision 20's first obligation is a Windows Job object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) and has no macOS analogue: a launcher killed with `SIGKILL` leaves a confined server running. Its *second* obligation — relaying termination signals — is in scope and is Task 3. The distinction matters at test time: Task 9 signals the child directly rather than killing the launcher, so the test does not leak a confined server into the CI leg.
-- **A guard on `argv` length**, and the earlier draft of this bullet counted the wrong quantity. The argv carries two things that grow with the exposure set: the profile **text**, which is one argv element and is not small — every rule is written with a `; tinio:<id> — <evidence>` provenance comment and the baseline's entries carry sentences — and the `-D NAME=VALUE` elements, one pair per exposure, whose value is the operator's path. Decision 24's "argv is bounded by `ARG_MAX`, an order of magnitude larger than the compiled cap" compares the text against the *compiled* object's ~6 bytes per operation, and those are not the two things to compare: the text is kilobytes before a single exposure is added and can approach `ARG_MAX` at the 4096 exposures Task 1's count guard allows. No guard is written here, deliberately and for the reason that guard's own doc comment gives — the exposure set is a handful of paths in practice, and at a size where the text did not fit, the pre-flight would refuse it as a compile failure rather than silently truncating. A byte budget for the rendered text (comments included) is a follow-up measurement, not a guess to write in now.
-- The fallback to `sandbox_init` FFI if Apple removes `sandbox-exec`. The design authorizes it as a later fallback and P3's failure mode is "fail closed", so nothing here depends on it.
+  - **Correction, 2026-09-26: the gap is a hard-killed launcher, and only that.** The bullet above still holds for the launcher that never runs again — no mechanism here can end a child after its supervisor is gone — but it is **not** a statement that the launcher cannot end the child it started. The `state` publish failure that Task 8's launcher hits after the child reports `listening` used to return through `?` and leave a Seatbelt-confined server serving with no `state` file to find it; `tinio-sandbox-core`'s `Child` now carries an optional platform killer (`with_kill`/`kill`, `crates/tinio-sandbox-core/src/launcher/supervise.rs`), Task 2's `confine` supplies a `SIGKILL` to the pid it spawned, and `crates/tinio-cli/src/sandbox/macos.rs`'s `retract` kills and reaps the child before returning the publish error. That narrows one path — a startup failure leaves no serving process — and creates no lifetime tie: a launcher killed outright still leaves the child, which is what Task 9's signalling decision and this bullet's accepted gap continue to describe.
+- **A guard on `argv` length**, and the earlier draft of this bullet counted the wrong quantity. The argv carries two things that grow with the exposure set: the profile **text**, which is one argv element and is not small — every rule is written with a `; tinio:<id> — <evidence>` provenance comment and the baseline's entries carry sentences — and the `-D NAME=VALUE` elements, one pair per exposure, whose value is the operator's path. Decision 24's "argv is bounded by `ARG_MAX`, an order of magnitude larger than the compiled cap" compares the text against the *compiled* object's ~6 bytes per operation, and those are not the two things to compare: the text is kilobytes before a single exposure is added and can approach `ARG_MAX` at the 4096 exposures Task 1's count guard allows. No guard is written here, deliberately and for the reason that guard's own doc comment gives — the exposure set is a handful of paths in practice, and at a size where the text did not fit, the failure is the platform's own — `Command::spawn` answers `ArgumentListTooLong`, and the pre-flight, when it runs, refuses it as a compile failure first — rather than anything silently truncating. A byte budget for the rendered text (comments included) is a follow-up measurement, not a guess to write in now.
+- The fallback to `sandbox_init` FFI if Apple removes `sandbox-exec`. The design authorized it as a later fallback and P3's failure mode is "fail closed". **It landed as a selectable mechanism on 2026-09-26** (`TINIO_SANDBOX_MACOS_MECHANISM=sandbox-init`, decision 6 and the Bookkeeping ledger): nothing in P3 depends on it, and this bullet stays as the record of what the phase deliberately left to a later change.
 
 **Decisions taken here that the design leaves open.** These are the places where the plan had to choose:
 
 1. **One `#[cfg(target_os = "macos")]` helper in `serve`** (Task 8), for *who binds the listener*. Decision 16 makes that platform-dependent; decision 2's `Confinement` keeps the confinement *shape* out of the call site, which it still does.
-2. **The listener descriptor travels as an argv element spelled `tinio-sandbox-fd=<n>`** (the core's `listener_fd_arg`), and the payload does not: it goes on stdin (decision 17). Both `serve` and the test harness filter it out of their own arguments through the core's `is_listener_fd_arg` (Tasks 2, 4, 8). **The element has no leading dashes, and that is a hazard rather than a convenience**: libtest reads a positional argument as a test filter, so `sandbox-exec`'s child — which is the same test binary — would have this element as its filter. If it were the only one, the child would select no test at all, run nothing, exit 0 and write no report. `run_confined` therefore launches a **launcher copy** of the test binary with the probe's own name as its filter (Task 4), so the child inherits a filter that matches and this element is a second, harmless one. The earlier version of this decision called it "a harmless extra filter" without arranging that; the reproduction is in Task 4's harness docs (`running 0 tests … 3 filtered out`, exit 0).
+2. **The listener descriptor travels as an argv element spelled `tinio-sandbox-fd=<n>`** (the core's `listener_fd_arg`), and the payload does not: it goes on stdin (decision 17). Both `serve` and the test harness filter it out of their own arguments through the core's `is_launcher_fd_arg` (Tasks 2, 4, 8). **The element has no leading dashes, and that is a hazard rather than a convenience**: libtest reads a positional argument as a test filter, so `sandbox-exec`'s child — which is the same test binary — would have this element as its filter. If it were the only one, the child would select no test at all, run nothing, exit 0 and write no report. `run_confined` therefore launches a **launcher copy** of the test binary with the probe's own name as its filter (Task 4), so the child inherits a filter that matches and this element is a second, harmless one. The earlier version of this decision called it "a harmless extra filter" without arranging that; the reproduction is in Task 4's harness docs (`running 0 tests … 3 filtered out`, exit 0).
 3. **Canonical paths are emitted alongside the caller's paths, and a link out of the tree is not followed** (Task 1): macOS resolves `/tmp` to `/private/tmp` and `$TMPDIR` under `/private/var/folders`, and Seatbelt matches what the kernel knows — so the exposed path's own resolved spelling is added, because a rule on the given spelling alone matches nothing. What is *not* added is anything for a link that lives inside the exposed tree: such a link resolves at read time to a path no rule names, and the read is refused. Task 6 measures both halves — a root exposed through a symlink reads through either spelling, and `escape` does not read — and the exposure rules themselves are not separately prunable (they share one id), which is why the measurement is the test rather than a pruning run.
 4. **Non-UTF-8 and control-character paths are refused**, not escaped or lossily converted (Task 1): a lossy conversion would name a different path than the operator exposed.
 5. **The executable's directory is deliberately *not* exposed on macOS** (Task 2, Task 8). An earlier draft of this plan had the backend add it, by reading decision 22 as "launcher platforms"; the design now scopes that grant to Windows, where a confined child genuinely cannot load without an ACE on the binary's directory. On macOS the measurement is the opposite: `process-exec` is the only gate, `file-read-data` on the child's own image and on its directory is refused and logged, and the program runs regardless — true of an 81 MB Rust server binary as much as of a small C tool. §5's profile never carried the grant, so nothing is spent and nothing is lost, and `launch.rs` carries the note where the helper used to be so a future reader does not re-add it. (The launcher re-invokes itself, so the program path is the running process's own; nothing in `LaunchPlan` has to carry it.)

@@ -4,6 +4,12 @@ How the documents under `specs/`, `plans/` and `reviews/` relate to each other, 
 
 A feature large enough to need a design document usually needs more than one plan, because a plan covers one subsystem and produces working software on its own. That shape — **one spec, several plans** — has a recurring failure mode, and it is not disagreement. It is **agreement in more than one place**: two documents stating the same fact, drifting apart the moment one of them is edited.
 
+## Plan progress
+
+- Task done + review pass → tick that task's `- [ ]` boxes.
+- Skip deliberately → leave unticked + one-line why.
+- Ticked = step happened.
+
 ## One definer per fact
 
 Every fact that more than one document could state has exactly one owner. Every other document **refers to** it — by section, by decision number, by path — and never restates it.
@@ -37,4 +43,4 @@ The tell is a question shaped "where should X go?" asked after searching one pla
 
 The mitigations that came out of that pass are worth copying: a shared addition is named once and pointed at from everywhere else; a platform-specific need that shared code must call is a facade name with a `#[cfg]`-selected body, never a module re-export; and a plan that no longer owns an edit says so and tells the reader to verify instead.
 
-**A second pass over the same set found the same defect one level up, and gave it a fifth document.** The four plans each carried their own copy of the conventions they run under, of the crate topology, and of the list of what a launcher platform owns — the last of them carried twice, by P2's own note, "in the same words" — and `probe_read_only` was assigned to whichever launcher plan landed first, so one file was the subject of two tasks' edits. `plans/2026-09-18-sandbox-shared.md` now owns those facts and the four plans refer to it by section. Its §1 is nothing but pointers: each convention names the document that already owns it (`CLAUDE.md`, the constitution, `docs/cargo.md`, `docs/style.md`, `docs/tests.md`), because a consolidated copy inside the plan set would have been a fifth copy rather than one fewer. Its §2–§6 are stated once because no phase owns them — the two crate shapes, the launcher-platform list, the names two documents must spell alike, the three relays, and the two verification conventions. Five documents for one feature, then, and the fifth exists because the alternative was four copies of a fact with no phase to belong to.
+**A second pass over the same set found the same defect one level up, and gave it a fifth document.** The four plans each carried their own copy of the conventions they run under, of the crate topology, and of the list of what a launcher platform owns — the last of them carried twice, by P2's own note, "in the same words" — and `probe_read_only` was assigned to whichever launcher plan landed first, so one file was the subject of two tasks' edits. `plans/2026-09-18-sandbox-shared.md` now owns those facts and the four plans refer to it by section. Its §1 is nothing but pointers: each convention names the document that already owns it (`docs/compress.md`, `docs/git.md`, the constitution, `docs/cargo.md`, `docs/style.md`, `docs/tests.md`; `CLAUDE.md` is the always-loaded pointer into those), because a consolidated copy inside the plan set would have been a fifth copy rather than one fewer. Its §2–§6 are stated once because no phase owns them — the two crate shapes, the launcher-platform list, the names two documents must spell alike, the three relays, and the two verification conventions. Five documents for one feature, then, and the fifth exists because the alternative was four copies of a fact with no phase to belong to.

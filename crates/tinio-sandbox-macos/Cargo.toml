@@ -2,14 +2,32 @@
 name = "tinio-sandbox-macos"
 version.workspace = true
 edition.workspace = true
-description = "Seatbelt-backed confinement for tinio"
+description = "macOS confinement for tinio: a Seatbelt (SBPL) profile applied by sandbox-exec or in-process"
 publish = false
 
 [dependencies]
+handlebars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+
 tinio-sandbox-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+# The bounded-exit poll the suites wait with, shared with the other platform's tests and the
+# server's legs — the rule lives in `tinio-util::testing`, not per suite.
+tinio-util = { workspace = true, features = ["testing"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+rustix = { workspace = true, features = ["fs", "pipe", "process"] }
+signal-hook = { workspace = true, features = ["iterator"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "rt"] }
 
 [lints.clippy]
 absolute_paths = "warn"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

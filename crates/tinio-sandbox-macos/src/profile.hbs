@@ -1,0 +1,5 @@
+(version 1)
+(deny default)
+{{#each exposures}}{{#if this.writable}}(allow file-read* file-write* (subpath (param "E{{@index}}"))){{else}}(allow file-read* (subpath (param "E{{@index}}"))){{/if}} ; tinio:exposure — the operator's exposure set (design §2)
+{{/each}}{{#each baseline}}{{this.rule}} ; tinio:{{this.id}} — {{this.evidence}}
+{{/each}}

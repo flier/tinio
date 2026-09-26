@@ -11,10 +11,10 @@
 //! undefined steps into a failure; the external client tags
 //! (`@interop`/`@boto3`/`@mc`) drop out unless `TINIO_E2E_EXTERNAL=1` — the
 //! same "opt-in" semantics the old `#[ignore]` integration tests had; and the
-//! host-bound confinement scenarios (`@confinement`) run on macOS, where the
-//! stub backend owes one deterministic refusal, and drop out elsewhere unless
-//! `TINIO_E2E_CONFINEMENT=1` — a target whose backend confines pays the
-//! launcher's ACL grant, and no budget here covers what `docs/tests.md`'s
+//! host-bound confinement scenarios (`@confinement`) run on macOS, whose
+//! launcher binds and spawns the confined child rather than paying a grant, and
+//! drop out elsewhere unless `TINIO_E2E_CONFINEMENT=1` — a Windows target pays
+//! the launcher's ACL grant, and no budget here covers what `docs/tests.md`'s
 //! "Grant cost" measures (see that section's owner rule; the platform
 //! scripts are the real gate).
 //!
@@ -55,10 +55,11 @@ fn main() {
     // reader compiled in, those scenarios can only 501), the target platform
     // decides `@unix`/`@windows` (each platform-bound scenario's steps exist
     // only where it can run — the systemd notify socket is a unix datagram)
-    // and `@confinement` (macOS's stub owes a refusal; a launcher target owes
-    // an ACE grant whose measured cost tens of seconds of variance), and the
-    // env opt-ins decide the external-client tags (they need third-party
-    // binaries) and the confinement scenarios off macOS.
+    // and `@confinement` (macOS runs the confinement: its launcher binds and
+    // spawns, with no grant to budget; a Windows target owes an ACE grant whose
+    // measured cost tens of seconds of variance), and the env opt-ins decide
+    // the external-client tags (they need third-party binaries) and the
+    // confinement scenarios off macOS.
     if !env::args().any(|a| a == "--tags") {
         let mut excluded = Vec::new();
         if !cfg!(feature = "parquet") {
@@ -68,10 +69,11 @@ fn main() {
         if env::var_os("TINIO_E2E_EXTERNAL").is_none() {
             excluded.extend(["@interop", "@boto3", "@mc"]);
         }
-        // `@confinement` is host-bound: macOS answers with the stub's refusal,
-        // while Linux/Windows run the confinement and pay the launcher's ACL
-        // grant — measured here at 4.6 s one run and past 120 s the next, so a
-        // leg cannot budget it and the capable host opts in.
+        // `@confinement` is host-bound, and macOS is the one arm a leg gets:
+        // its launcher binds and spawns the confined child, with no grant to
+        // budget. A Windows target pays the launcher's ACL grant — measured
+        // here at 4.6 s one run and past 120 s the next — so no leg can budget
+        // it and the capable host opts in.
         if !cfg!(target_os = "macos") && env::var_os("TINIO_E2E_CONFINEMENT").is_none() {
             excluded.push("@confinement");
         }

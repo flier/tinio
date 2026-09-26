@@ -28,6 +28,10 @@ windows-sys = { workspace = true, features = [
 ] }
 
 tinio-sandbox-core.workspace = true
+# The `testing` module re-exports `wait_for_exit` from `tinio-util::testing`, so
+# this is a real dependency and not a dev one: the module is unconditional (see
+# its doc for why a gated one cannot serve this crate's own `tests/`).
+tinio-util = { workspace = true, features = ["testing"] }
 
 [dev-dependencies]
 tempfile.workspace = true

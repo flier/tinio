@@ -17,7 +17,10 @@ use std::{
 
 #[cfg(windows)]
 use crate::_winsec::{create_restricted, restrict_to_current_user as restrict_file};
-use crate::{Config, Error, credentials, error, state::BASE_DIR_NAME};
+use crate::{
+    _util::path::contains_under_any_spelling, Config, Error, credentials, error,
+    state::BASE_DIR_NAME,
+};
 
 /// The primary file's name inside a state directory.
 ///
@@ -106,6 +109,10 @@ pub fn resolve_path(
 /// Auto-create is discovery's, and its one reachable input is `<state_dir>.tinio.toml`: an
 /// operator-named path never arrives absent, and read-only mode refuses a path under `root`
 /// outright, because FR-023's contract is that nothing under the served root is ever written.
+/// **The refusal is `contains_under_any_spelling`'s, and it compares both spellings** — the literal pair and
+/// the canonicalized one — because a state directory spelled through a symlinked component is
+/// the same directory as a canonical root's, and a literal comparison would let the write it
+/// exists to refuse through.
 ///
 /// # Examples
 ///
@@ -128,7 +135,7 @@ pub fn load_or_create(
     if path.is_file() {
         return Ok((Config::load(path)?, Outcome::Loaded));
     }
-    if read_only && path.starts_with(root) {
+    if read_only && contains_under_any_spelling(path, root) {
         return Err(Error::InvalidValue {
             key: "server.read_only".into(),
             reason: format!(
@@ -218,11 +225,18 @@ fn restrict_or_remove(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::fs::canonicalize;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     use secrecy::ExposeSecret;
     use tempfile::TempDir;
 
     use super::*;
+
+    #[cfg(unix)]
+    use crate::_util::path::path_contains;
     #[cfg(windows)]
     use crate::_winsec::acl_is_current_user_only;
 
@@ -402,11 +416,173 @@ mod tests {
         assert!(format!("{err}").contains("read-only"), "{err}");
     }
 
+    /// **The same refusal, reached through the other spelling of one directory — the hole a
+    /// literal comparison leaves open.** `root` is canonical by the time a run reaches here
+    /// (`resolve_root`), while the config path is built from `TINIO_STATE_DIR` as the operator
+    /// typed it, so on macOS `/tmp` (a symlink to `/private/tmp`) the pair is
+    /// `/tmp/<x>/.tinio/.tinio.toml` against `/private/tmp/<x>`: a comparison of the two literal
+    /// spellings answers `false`, the guard passes, and read-only mode writes a config — and the
+    /// whole state tree beside it — into the served root it promises to leave alone. The explicit
+    /// symlink is what makes the leg deterministic on every host rather than only where `/tmp`
+    /// happens to be one.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_run_refuses_the_same_root_spelled_through_a_symlink() {
+        // The tempdir is held: dropping it would take the real tree with it.
+        let dir = TempDir::new().expect("dir");
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).expect("real");
+        let canonical_root = canonicalize(&real).expect("canonicalize the root");
+        let linked = dir.path().join("link");
+        symlink(&real, &linked).expect("symlink");
+
+        // The exploit's pair, with the root's own spelling in place of macOS's `/tmp`: two
+        // spellings of this one directory, no literal relationship. **The state directory
+        // exists**, which is the exploit's own shape — `resolve` creates it at step h, before
+        // `plan` and `confine` — and it is also what makes the resolution reachable at all: what
+        // exists here is the leaf's *address*, and the leaf itself is the config this guard is
+        // about to refuse to write.
+        let state_dir = linked.join(BASE_DIR_NAME);
+        fs::create_dir_all(&state_dir).expect("the state directory");
+        let path = state_dir.join(CONFIG_FILE);
+        assert!(!path.exists(), "the config itself is the absent half");
+        assert!(
+            !path_contains(&path, &canonical_root),
+            "the leg is vacuous unless the literal comparison answers `false`: {path:?} vs \
+             {canonical_root:?}"
+        );
+        let err = load_or_create(&canonical_root, &path, true)
+            .expect_err("read-only must refuse the symlinked spelling too");
+        assert!(
+            format!("{err}").contains("read-only"),
+            "the refusal is the read-only one rather than an incidental one: {err}"
+        );
+
+        // **The leg above is not allowed to depend on the leaf existing, and this is the half that
+        // says so.** Nothing is created at `path` in this test — the state directory is the half
+        // that exists — so the pair under test is a symlinked state directory whose own leaf is
+        // absent, which is exactly the shape this guard is reached with and the one a
+        // `canonicalize` on the leaf answers `ENOENT` for. It **is** refused, and the assertion
+        // below is what fails if the resolution ever goes back to the leaf: the literal comparison
+        // is already asserted `false` a few lines up, so a `false` from the guard here can only
+        // come from the resolution's ancestor walk.
+        assert!(
+            contains_under_any_spelling(&path, &canonical_root),
+            "the resolution must reach the symlinked state directory through its existing \
+             ancestor: {path:?} vs {canonical_root:?}"
+        );
+
+        // **A sibling is not the exploit**, so the resolution is not answering `true` for
+        // everything: the same shape, one directory over from the root the guard was handed.
+        let beside = dir
+            .path()
+            .join("beside")
+            .join(BASE_DIR_NAME)
+            .join(CONFIG_FILE);
+        assert!(
+            !contains_under_any_spelling(&beside, &canonical_root),
+            "a state directory beside the root is outside it: {beside:?} vs {canonical_root:?}"
+        );
+
+        // **Only the state directory's spelling is compared, and the root's is deliberately
+        // not.** The product canonicalises the root before any guard sees it
+        // (`resolve_root`), so a root spelled through a link is a state this layer cannot be
+        // reached in — it would take a caller that canonicalised the state directory but not
+        // the root, which no arm does. Stating it here is what keeps a reader from reading the
+        // missing direction as an oversight: the `tinio-cli` guard's unit leg
+        // (`sandbox::tests::a_read_only_root_refuses_its_state_directory_under_either_spelling`)
+        // is where the root's spelling is exercised, because that guard takes both paths as
+        // written.
+        assert!(
+            !path_contains(
+                &canonical_root.join(BASE_DIR_NAME).join(CONFIG_FILE),
+                &linked
+            ),
+            "the root's spelling has no literal relationship to the state directory's"
+        );
+    }
+
+    /// **The comparison the guard makes is the shared owner's, and the cases the old
+    /// `Path::starts_with` got wrong are the ones pinned here.** A guard that answers the
+    /// read-only question differently from the launcher's guard answers it for the same pair is
+    /// the disagreement one of the two leaves open, so this copy carries the owner's semantics
+    /// rather than a literal reading of the two strings.
+    #[test]
+    fn the_config_guard_compares_components_rather_than_text() {
+        let root = Path::new("/srv/data");
+        assert!(
+            !contains_under_any_spelling(Path::new("/srv/data2/.tinio/config.toml"), root),
+            "a sibling whose name merely starts with the root's is not inside it"
+        );
+        assert!(
+            contains_under_any_spelling(root, root),
+            "the root is its own in-root case, which is the refusal the caller needs"
+        );
+        assert!(
+            contains_under_any_spelling(Path::new("/srv/data/./x/../.tinio/config.toml"), root),
+            "an operator's lexical spelling of an in-root directory is in-root"
+        );
+        assert!(
+            !contains_under_any_spelling(Path::new("/srv/state/config.toml"), root),
+            "a state directory beside the root is outside it"
+        );
+        assert!(
+            !contains_under_any_spelling(Path::new("/srv"), root),
+            "and containment is one-way: the root's parent is not inside the root"
+        );
+    }
+
+    /// **The rejoin's order is load-bearing under the component comparison this guard now
+    /// makes, and this is the leg that says so.** The root is canonical, the state directory is
+    /// spelled through a link, and the suffix below the link holds two absent names and the `..`s
+    /// that climb back over them: the written order resolves the config path onto
+    /// `<canonical root>/.tinio.toml`, while the reversed order this copy used to carry climbs
+    /// past the canonical ancestor and answers *outside* — a read-only run writing the config, and
+    /// the state tree beside it, inside the served root.
+    ///
+    /// **The order decided nothing before the comparison changed, and the measurement is kept
+    /// here rather than dropped**: under `Path::starts_with` — a literal component-prefix test
+    /// that reads no `..` — every permutation of the suffix stayed literally prefixed by the
+    /// canonical ancestor, so a search over 14,760 spellings found 0 divergences in the
+    /// fail-open direction and 580 in the over-refusal direction (2026-09-26), and the three
+    /// hostile runs were all refused. What makes the reversal wrong here is what makes it wrong
+    /// everywhere: it permutes a suffix whose order the lexical resolution reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_rejoin_in_the_written_order_keeps_an_in_root_config_path() {
+        let dir = TempDir::new().expect("dir");
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).expect("the served root");
+        let canonical_root = canonicalize(&real).expect("canonicalize the served root");
+        let linked = dir.path().join("link");
+        symlink(&real, &linked).expect("symlink");
+
+        // The guard's own shape: a leaf the run has not created, under two absent names, reached
+        // through the link.
+        let path = linked
+            .join("x")
+            .join("y")
+            .join("..")
+            .join("..")
+            .join(CONFIG_FILE);
+        assert!(
+            canonicalize(&path).is_err(),
+            "the leaf is the absent half, so the ancestor walk is what resolves it: {path:?}"
+        );
+        assert!(
+            !path_contains(&path, &canonical_root),
+            "the leg is vacuous unless the literal comparison answers `false`: {path:?} vs \
+             {canonical_root:?}"
+        );
+        assert!(
+            contains_under_any_spelling(&path, &canonical_root),
+            "the written order rejoins onto the canonical root: {path:?} vs {canonical_root:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_created_config_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = TempDir::new().expect("root");
         let state = TempDir::new().expect("state");
         let path = resolve_path(root.path(), state.path(), None).expect("resolve");

@@ -48,7 +48,7 @@ use crate::{
         to_nanos,
     },
     _store::{bucket, decode_acl_wire, decode_owner_wire, meta, object_part, upload},
-    _util::{lockmap, path::path_contains},
+    _util::{lockmap, path::contains_under_any_spelling},
     bucket::Store as BucketStore,
     database::{self, Handle, compact_if_needed},
     etag, fsutil,
@@ -446,23 +446,23 @@ impl FsStorage {
         // Read-only mode also refuses an explicit state dir inside the
         // storage root: such a caller silently writes the very tree the
         // mode promises to leave alone, and a writable root would never
-        // complain. Lexical (the design's residual): the state dir need
-        // not exist yet, so it cannot be canonicalized here.
+        // complain.
         //
-        // The rule itself is `tinio-util`'s [`path_contains`] — the one
-        // definer, shared with the server launcher's exposure set (design
-        // §9/§10), which asks the same question about the same two paths
-        // one process earlier. It is deliberately not spelled here: this
-        // guard carried its own copy once, and a second copy of a
-        // case-folding rule is how the other owner ends up comparing
-        // components literally — an in-root state dir in another case
-        // reading as outside (FR-023, decision 17a).
+        // The rule itself is `tinio-util`'s `contains_under_any_spelling` —
+        // the one definer, shared with the server launcher's exposure set
+        // (design §9/§10), which asks the same question about the same two
+        // paths one process earlier — and it compares both spellings of
+        // either side. It is deliberately not spelled here: this guard
+        // carried its own copy once, and a second copy of a case-folding
+        // rule is how the other owner ends up comparing components
+        // literally — an in-root state dir in another case reading as
+        // outside (FR-023, decision 17a).
         if options.access.is_read_only()
             && let Some(dir) = options.state_dir.as_deref()
         {
             let absolute = absolute(dir)
                 .map_err(|_| invalid_state_dir("could not be resolved in read-only mode"))?;
-            if path_contains(&absolute, &canonical) {
+            if contains_under_any_spelling(&absolute, &canonical) {
                 return Err(invalid_state_dir(
                     "must be outside the storage root in read-only mode",
                 ));

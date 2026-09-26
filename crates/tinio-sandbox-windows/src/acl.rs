@@ -9,7 +9,7 @@
 //!
 //! **The read half is the Win32 API because the tool's *text* cannot answer the
 //! question the read exists for.** The read decides whether the write may be
-//! skipped ([`already_granted`]), and `icacls` renders a well-known SID by
+//! skipped (`already_granted`), and `icacls` renders a well-known SID by
 //! **name**: an ACE written for [`ALL_APPLICATION_PACKAGES`] comes back as
 //! `APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)`, so a check for
 //! the literal `S-1-15-2-1` never saw the ACE it had just written and the skip
@@ -262,8 +262,8 @@ pub fn icacls_binary() -> PathBuf {
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] naming the path and carrying `icacls`'s own diagnostic when
-/// it exits non-zero.
+/// [`Error::Launch`](crate::_core::Error::Launch) naming the path and carrying
+/// `icacls`'s own diagnostic when it exits non-zero.
 ///
 /// # Examples
 ///
@@ -356,10 +356,10 @@ fn sid_spellings(sid: &str) -> Vec<&str> {
 }
 
 /// Whether `text` — an `icacls` listing — carries an entry for `sid`, in any
-/// spelling [`sid_spellings`] allows.
+/// spelling `sid_spellings` allows.
 ///
 /// **It is a test oracle now and no longer the production read.** [`has_ace`] and
-/// [`already_granted`] ask the kernel's DACL with [`EqualSid`], so nothing this
+/// `already_granted` ask the kernel's DACL with [`EqualSid`], so nothing this
 /// crate *decides* rides on how a SID is rendered; what still does is every suite
 /// that asserts against the tool's own output — `tests/acl.rs` pins
 /// [`ALL_APPLICATION_PACKAGES`] on the sibling batch through it, and
@@ -738,7 +738,7 @@ impl Drop for OwnedSid {
 ///
 /// # Errors
 ///
-/// [`Error::Launch`], as [`grant`].
+/// [`Error::Launch`](crate::_core::Error::Launch), as [`grant`].
 ///
 /// # Examples
 ///
@@ -785,12 +785,12 @@ pub fn revoke(path: &Path, sid: &PackageSid) -> Result<()> {
 /// answers `ERROR_FILE_NOT_FOUND` (measured 2026-09-25) rather than the tool's
 /// exit 2. Answering "no entry for this SID" for a path that could not be read
 /// would make every assertion that a revoked directory carries no ACE pass for
-/// the wrong reason, and would skip a needed grant in [`already_granted`].
+/// the wrong reason, and would skip a needed grant in `already_granted`.
 ///
 /// # Errors
 ///
-/// [`Error::Launch`] naming `path` when the DACL cannot be read at all, with the
-/// Win32 error as its source.
+/// [`Error::Launch`](crate::_core::Error::Launch) naming `path` when the DACL
+/// cannot be read at all, with the Win32 error as its source.
 ///
 /// # Examples
 ///
@@ -882,13 +882,13 @@ impl Grants {
 
     /// Authorize `path` for **this root's** package SID, in `target`'s shape.
     ///
-    /// Idempotent, and free once satisfied: [`grant_to`] reads the DACL first and
+    /// Idempotent, and free once satisfied: `grant_to` reads the DACL first and
     /// writes only what is missing, so the second run on the same root costs a
     /// read instead of a descriptor write.
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`] from [`grant_to`].
+    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
     ///
     /// # Examples
     ///
@@ -930,7 +930,7 @@ impl Grants {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`] from [`grant_to`].
+    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
     pub fn apply_standing(
         &mut self,
         path: &Path,
@@ -971,7 +971,7 @@ impl Grants {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`] from [`grant_to`].
+    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
     ///
     /// # Examples
     ///

@@ -19,7 +19,7 @@ use std::fs;
 #[cfg(any(windows, feature = "tls"))]
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::{fs::MetadataExt, net::UnixListener};
 #[cfg(windows)]
 use std::os::windows::io::{OwnedHandle, RawHandle};
 // `tls` bounds the handshake; `windows` bounds the pipe drain ([`DRAIN_LIMIT`]). One import for
@@ -35,6 +35,7 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 use std::{
+    mem,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process,
@@ -52,10 +53,18 @@ use hyper_util::{
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
 #[cfg(unix)]
-use tokio::net::UnixListener;
+use tokio::net::UnixListener as TokioUnixListener;
 #[cfg(feature = "tls")]
 use tokio::time::sleep;
-#[cfg(windows)]
+// **Two `#[cfg]`s need this name, and the `any` is load-bearing.** The Windows arm uses it in
+// `wait_for_peer_close`, and the TLS arm uses it for the handshake bound — and the TLS arm is
+// `#[cfg(feature = "tls")]` with **no** platform condition, so on macOS and Linux this import
+// must be here for the TLS build. Gated on `windows` alone it is absent exactly where the
+// handshake's `timeout` is compiled, which is a hard `E0425` for every non-Windows TLS build
+// (measured on macOS 15.8, 2026-09-25: `cargo build -p tinio` fails in this file at line 1051).
+// `tls` is a default feature of this crate, so that was every default build on those targets; it
+// stayed invisible because the Windows and macOS legs each satisfied one half of the old gate.
+#[cfg(any(windows, feature = "tls"))]
 use tokio::time::timeout;
 #[cfg(windows)]
 use tokio::{
@@ -152,7 +161,7 @@ pub async fn serve_local(
         // so there is no variant to match on and no unreachable arm to write.
         let Channel { listener, .. } = channel;
         // The one conversion: `std` (bound before the runtime) to tokio (served inside it).
-        let listener = UnixListener::from_std(listener).map_err(Error::Io)?;
+        let listener = TokioUnixListener::from_std(listener).map_err(Error::Io)?;
         axum::serve(listener, router(shared))
             .with_graceful_shutdown(until_stopped(stop))
             .await
@@ -1425,8 +1434,7 @@ impl Plane {
     pub fn adopt(options: Options, raws: &[RawHandle]) -> Result<Self, Error> {
         // The local form, resolved for its **name** alone — the handles are the objects, and
         // this name is what the state file records. Same rule, same definer as the bind's.
-        let selection = options.selection;
-        let Some(LocalForm::Pipe(name)) = selection.local.as_ref() else {
+        let Some(LocalForm::Pipe(name)) = options.selection.local.as_ref() else {
             return Err(Error::Transport(
                 "a confined child must be handed a named-pipe control channel: this selection \
                  names none, so there is nothing to adopt"
@@ -1461,25 +1469,117 @@ impl Plane {
         let transport = Transport::Local {
             channel: Channel { name, handles },
         };
-        let state = state_for(options.token.clone(), transport.identity(), &options.root)?;
-        // No socket file to record, and the `match` is `bind`'s rather than a second rule:
-        // `Channel::socket_path` is `None` on this platform by construction.
-        let socket = match &transport {
-            Transport::Local { channel } => {
-                channel.socket_path().map(SocketFile::at).transpose()?
-            }
-            _ => None,
+        Self::assemble(options, transport)
+    }
+
+    /// [`Plane::bind`]'s mirror for a process a launcher **confined**: the local control channel
+    /// is already bound, and this process serves on the socket it inherited.
+    ///
+    /// **Why adoption rather than a second bind.** The macOS profile grants the confined child no
+    /// `network-bind` at all, so a child that called [`crate::bind::bind_unix`] would die with
+    /// `could not bind … Operation not permitted` — and a rule that permitted the bind would be a
+    /// grant on every socket rather than a filter on the one the child wants. The launcher is
+    /// unconfined, so *it* binds the channel, and the child serves on the descriptor it inherits;
+    /// the profile therefore carries no network rule, exactly as it carries none for the data
+    /// plane, whose listener travels the same way (sandbox design decision 16, extended to the
+    /// control channel).
+    ///
+    /// **The single-instance claim is the launcher's, and it is neither weakened nor duplicated.**
+    /// The launcher's [`crate::bind::bind_unix`] is the bind that reclaimed a stale path and
+    /// claimed the socket file, so a second server on the same root is refused there — before any
+    /// child exists. This function binds nothing: it records the channel it was handed.
+    ///
+    /// **The identity is resolved here through the one definer, and not re-derived from the
+    /// descriptor.** `options.selection` is the same `Selection` the launcher bound — both
+    /// processes resolve it through the CLI's one `api_options` rule against the same root — and
+    /// [`resolve_socket_path`] turns its `[api.unix] path` into the absolute path
+    /// [`Plane::bind`] would have bound, so `state.control_name` records the path the launcher's
+    /// [`crate::bind::Channel::identity`] reported and the child actually serves on. The local
+    /// form must be a [`LocalForm::Unix`]: this platform's channel is a socket file, and a
+    /// selection that names none is the launcher's own contradiction rather than a run this
+    /// process may serve.
+    ///
+    /// The rest is [`Plane::bind`]'s, deliberately in the same order: the identity is recorded
+    /// from the channel, the `state` file is built around it, and the router is built with the
+    /// token rule for the local channel. The socket file is recorded too — the launcher created
+    /// it, and the child is the process that serves on it and so the one that removes it on the
+    /// way out, under the same identity check [`Plane::bind`]'s deletion uses.
+    ///
+    /// **The listener arrives as an object and not as an integer.** Turning an inherited
+    /// descriptor number back into a socket is `unsafe`, and this crate carries no site for it;
+    /// the platform crate that rebuilds it (the macOS backend's
+    /// `tinio_sandbox_macos::launch::control`, one of that crate's **three** enumerated
+    /// `#[allow(unsafe_code)]` sites — the `inherited_fd` rebuild, the libSystem FFI module the
+    /// in-process mechanism applies through, and that mechanism's validator's `fork`) is what
+    /// hands the object over.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Transport`] for a selection with no unix channel in it, and
+    /// [`crate::Error::State`] for an unreadable served root — the bind's own failures, minus
+    /// everything about binding.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(unix)]
+    /// # {
+    /// use std::{os::unix::net::UnixListener, path::PathBuf};
+    ///
+    /// use tinio_api::{
+    ///     Options, Plane,
+    ///     transport::{LocalForm, Selection},
+    /// };
+    /// use tokio::sync::watch;
+    ///
+    /// # fn main() -> Result<(), tinio_api::Error> {
+    /// let (stop, _rx) = watch::channel(false);
+    /// // The launcher's half: it bound the socket and cleared `FD_CLOEXEC` on it. What this
+    /// // process holds is the descriptor that crossed the exec, rebuilt into a listener by the
+    /// // platform crate.
+    /// let listener = UnixListener::bind("/tmp/tinio-0123456789abcdef.sock")?;
+    /// let plane = Plane::adopt(
+    ///     Options {
+    ///         selection: Selection {
+    ///             local: Some(LocalForm::Unix(PathBuf::from(
+    ///                 "/tmp/tinio-0123456789abcdef.sock",
+    ///             ))),
+    ///             ..Selection::default()
+    ///         },
+    ///         state_dir: PathBuf::from("/tmp"),
+    ///         root: PathBuf::from("/srv/data"),
+    ///         host: "127.0.0.1".to_string(),
+    ///         stop,
+    ///         gauges: None,
+    ///         // The launcher's token, when this plane is the child it confined.
+    ///         token: None,
+    ///     },
+    ///     listener,
+    /// )?;
+    /// // **No `publish` here, and that is the ruling rather than an omission**: this plane's
+    /// // `state` file is the launcher's — it wrote it, with the token above — so the plane
+    /// // serves, and the launcher publishes.
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(unix)]
+    pub fn adopt(options: Options, listener: UnixListener) -> Result<Self, Error> {
+        // The local form, resolved for its **path** alone — the socket is the object, and this
+        // path is what the state file records. Same rule, same definer as the bind's.
+        let Some(LocalForm::Unix(path)) = options.selection.local.as_ref() else {
+            return Err(Error::Transport(
+                "a confined child must be handed a unix control channel: this selection names \
+                 none, so there is nothing to adopt"
+                    .to_string(),
+            ));
         };
-        let shared = Arc::new(
-            Context::new(state, options.host, transport.auth(), options.stop)
-                .with_gauges(options.gauges),
-        );
-        Ok(Self {
-            transport: Mutex::new(Some(transport)),
-            shared,
-            state_dir: options.state_dir,
-            socket,
-        })
+        let channel = Channel {
+            listener,
+            path: resolve_socket_path(path, &options.state_dir),
+        };
+        let transport = Transport::Local { channel };
+        Self::assemble(options, transport)
     }
 
     /// Applies the three-choose-one rule and binds the winner — which **is** the
@@ -1519,24 +1619,55 @@ impl Plane {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn bind(options: Options) -> Result<Self, Error> {
-        let mut selection = options.selection;
+    pub fn bind(mut options: Options) -> Result<Self, Error> {
+        // **The selection leaves `options` rather than being cloned out of it.** `select` consumes
+        // the selection while [`Plane::assemble`] takes the whole `Options`, and the two needs used
+        // to be met with a clone — of three `Option`s, which is why it was affordable, and of
+        // nothing the assemble reads, which is why the take is the same shape with no copy. What
+        // stays behind is `Selection::default()`, and nothing downstream looks at it: the assemble
+        // reads the token, the root, the host, the stop channel, the gauges and the state dir, and
+        // the transport `select` just built is its answer to the selection.
+        let mut selection = mem::take(&mut options.selection);
         if let Some(LocalForm::Unix(path)) = &mut selection.local {
             *path = resolve_socket_path(path, &options.state_dir);
         }
         let transport = select(selection)?;
+        Self::assemble(options, transport)
+    }
+
+    /// The tail [`Plane::bind`] and both [`Plane::adopt`]s share: the `state` file built from the
+    /// transport's identity, the socket file that identity records when the transport has a path,
+    /// and the router around both.
+    ///
+    /// **One rule, three constructions**, and the order is the bind's: the identity is recorded as
+    /// the socket file is built because that is the only moment it is certainly this plane's file
+    /// (`Plane::remove_owned` compares against it later), and the `state` file is built around
+    /// the identity before the router exists. Both adopts hand over a channel the **launcher**
+    /// created, so what they record is the launcher's file as it stands when they read it; that is
+    /// the same rule, not a second one.
+    ///
+    /// **The `_ => None` arm is reachable, and [`Plane::bind`] is what reaches it.** [`select`]
+    /// answers [`Transport::Tcp`] (and `Https`, under `tls`) for an http/https selection, and
+    /// neither carries a socket path; only [`Transport::Local`] has one to record. Both adopts
+    /// construct `Local` and so never arrive there — but the arm is the bind's, not theirs, so it
+    /// stays in the one shape all three go through rather than being narrowed to the adopts.
+    ///
+    /// **What is recorded is not checked against `options.selection`.** The adopts trust the
+    /// object they were handed to be the channel at the path that selection names — meeting by
+    /// construction, which is the launcher's and the platform crate's to guarantee, as
+    /// [`Plane::adopt`] states; nothing here re-derives or compares the two.
+    ///
+    /// The caller's source travels in with the context and nowhere else, so the route's default
+    /// state stays `None` (`Context::new`): a plane built without one has no `/metrics`, and the
+    /// API tests can assert both halves of that.
+    fn assemble(options: Options, transport: Transport) -> Result<Self, Error> {
         let state = state_for(options.token.clone(), transport.identity(), &options.root)?;
-        // The identity is recorded here, at the bind, because that is the only moment it is
-        // certainly this plane's file: `remove_owned` compares against it later.
         let socket = match &transport {
             Transport::Local { channel } => {
                 channel.socket_path().map(SocketFile::at).transpose()?
             }
             _ => None,
         };
-        // The caller's source travels in with the context and nowhere else, so the route's
-        // default state stays `None` (`Context::new`): a plane built without one has no
-        // `/metrics`, and the API tests can assert both halves of that.
         let shared = Arc::new(
             Context::new(state, options.host, transport.auth(), options.stop)
                 .with_gauges(options.gauges),

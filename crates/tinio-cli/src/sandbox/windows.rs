@@ -23,37 +23,17 @@
 //! in the launch payload, which is private launcher→child data on stdin rather than an argv
 //! element or an environment variable any other process can read.
 
-#[cfg(feature = "api")]
-use std::time::Duration;
-use std::{env, fs, net::TcpListener as StdTcpListener};
+use std::env;
 
-use super::{refuse_in_root_state_dir, sandbox_request};
+use super::launch::Handoff;
 #[cfg(feature = "api")]
-use crate::_api::{
-    bind::{Channel, bind_pipe},
-    state::{self as api_state, State},
-    transport::LocalForm,
-};
+use crate::_api::{bind::bind_pipe, state as api_state, transport::LocalForm};
 use crate::{
-    _core::mode::AccessMode,
-    _sandbox::{Backend, Child, Confinement, LaunchPlan, Terminal, windows},
+    _sandbox::{Backend, Child, ControlHandle, windows},
     Error,
     commands::start::{Args, api_options},
     resolve::Resolution,
 };
-
-/// How long the launcher waits for the child's readiness frame before it gives up on publishing
-/// `state` and lets the supervision report what happened.
-///
-/// **A bound, not a promise about the child**: the child's own startup may take as long as it
-/// takes, and a child that never reports has either failed (its `Error` frame — or its exit
-/// status — is what the launcher reports) or is stuck. What the bound stops is a *stuck* child
-/// holding the launcher in a wait with nothing at the end of it: past it, the launcher does not
-/// publish and goes on to supervise, which is where the child's fate is decided anyway. The
-/// number is the sandbox design's readiness budget (§6, 30 s), which a confined launch has to
-/// fit inside and which the harnesses that wait on a launch time out against.
-#[cfg(feature = "api")]
-const PUBLISH_BOUND: Duration = Duration::from_secs(30);
 
 /// Design §10 step 6: the exposure set, the payload, the bound listener, the bound control
 /// channel and the launch.
@@ -92,28 +72,14 @@ const PUBLISH_BOUND: Duration = Duration::from_secs(30);
 ///
 /// # Errors
 ///
-/// The read of the configuration the payload carries, the bind, the capability list's own
-/// refusal, the token generation, the `state` publish, and every failure the backend reports —
-/// each fatal, because a confinement that cannot be applied must not leave the process running
-/// unconfined (design §11). A publish that fails after the child is running returns before the
-/// child is handed over, and the `Child` dropped on that path closes the job that owns it —
+/// The bind, the capability list's own refusal, the token generation, the publish's half-connected
+/// pair, the `state` publish, and every failure the backend reports — each fatal, because a
+/// confinement that cannot be applied must not leave the process running unconfined (design §11).
+/// A publish that fails after the child is running returns before the child is handed over, and the
+/// `Child` dropped on that path closes the job that owns it —
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — so a refused startup leaves no confined server behind.
 pub(super) fn confine_or_launch(resolution: &Resolution, args: &Args) -> Result<Child, Error> {
-    let access = AccessMode::from(resolution.read_only);
-    // Refused **before** the exposure set is built: the entry it would add is the hole the
-    // guard exists to close.
-    refuse_in_root_state_dir(
-        access.is_read_only(),
-        &resolution.root,
-        &resolution.state_dir,
-    )
-    .map_err(|err| Error::Operational(err.to_string()))?;
-    let sandbox = sandbox_request(&resolution.root, &resolution.state_dir, access);
-    // The launcher's resolution ran the serving chain, which created a missing file before
-    // this line, so the text is the same document the child would have read.
-    let config = fs::read_to_string(&resolution.config_path)?;
-    let listener = StdTcpListener::bind(resolution.address()?)?;
-    let plan = LaunchPlan::for_launch(config).with_listener(listener);
+    let (sandbox, plan) = super::launch::prepare(resolution)?;
     // **The control channel, when this run has a local one.** Held to the end of this
     // function and no further: the child inherits a *duplicate* of the handle, which is what
     // keeps the pipe alive once this one is dropped — the launcher never serves on it, and a
@@ -133,11 +99,16 @@ pub(super) fn confine_or_launch(resolution: &Resolution, args: &Args) -> Result<
                 // pipe at all (its identity is the package SID), so the handles it is handed are
                 // the whole of what it can ever serve on: one handle means the name answers once
                 // and then goes deaf, which is the defect the pool exists to close. The values
-                // travel as the raw handles the child's `Plane::adopt` converts back.
+                // travel as the raw handles the child's `Plane::adopt` converts back, and on this
+                // platform the plan holds them as values rather than owning them — `ControlHandle`
+                // carries the reason (`tinio-sandbox-core`'s `launcher::ControlHandle`: the
+                // launcher's `Channel` is the owner, and `OwnedHandle` has no safe constructor
+                // from a raw handle).
                 let handles = channel
                     .raw_handles()
                     .into_iter()
-                    .map(|raw| raw as usize as i64);
+                    .map(|raw| ControlHandle::inherited(raw as usize as i64))
+                    .collect::<Vec<_>>();
                 let plan = plan.with_controls(handles).with_token(token);
                 (plan, Some(channel))
             }
@@ -150,6 +121,12 @@ pub(super) fn confine_or_launch(resolution: &Resolution, args: &Args) -> Result<
     #[cfg(not(feature = "api"))]
     let control = (plan, None);
     let (plan, _channel) = control;
+    // **The publish's one value, built here and once** — `Handoff`'s own doc owns why the two halves
+    // are one fact and what it refuses. It is built **before the launch** so a half-connected pair
+    // is a startup refusal rather than a serving child whose `state` file was never written, and it
+    // borrows the token off the plan rather than holding a second copy of it.
+    #[cfg(feature = "api")]
+    let handoff = Handoff::of(&plan, _channel.as_ref())?;
     let options = windows::Options {
         capabilities: windows::Capability::parse_list(
             env::var("TINIO_SANDBOX_CAPABILITIES").ok().as_deref(),
@@ -157,71 +134,20 @@ pub(super) fn confine_or_launch(resolution: &Resolution, args: &Args) -> Result<
         ..Default::default()
     };
     let mut backend = windows::Backend::with_options(options);
-    let child = match backend.confine(&sandbox, &plan)? {
-        Confinement::Supervise(child) => child,
-        Confinement::InPlace => {
-            return Err(Error::Operational(
-                "the Windows backend must supervise its child rather than confine in place: \
-                 nothing was confined, so the run is refused"
-                    .into(),
-            ));
-        }
-    };
+    let child = super::launch::supervised("Windows", backend.confine(&sandbox, &plan)?)?;
     // **The publish, once the child says it is listening** — the readiness point, moved from the
-    // child's `serve` to the process that can write the file. The token comes back off the plan
-    // rather than out of a second copy, so the value in the payload the child adopted and the
-    // value in the file are one value by construction.
+    // child's `serve` to the process that can write the file. The token comes back off the plan and
+    // the name off the channel rather than out of second copies, so the value in the payload the
+    // child adopted and the value in the file are one value by construction. A run that bound no
+    // local channel has no handoff and owns no file: that is a state of the launch rather than a
+    // half of the pair, and the failure path needs nothing extra here — the `Child` dropped on it
+    // closes the job that owns the process (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
     #[cfg(feature = "api")]
-    if let (Some(channel), Some(token)) = (&_channel, plan.token()) {
-        publish_state(&child, channel, token, resolution)?;
+    if let Some(handoff) = &handoff {
+        super::launch::publish_state(&child, handoff, resolution)?;
     }
     Ok(child)
 }
 
-/// Write the `state` file for the child this launcher confined, with the port the child reported.
-///
-/// **Nothing is published unless the child reported `Listening`.** `None` from
-/// [`Child::wait_for_ready`] means no terminal event arrived inside [`PUBLISH_BOUND`] — a child
-/// that failed, or one that is stuck — and `Terminal::Error` means it reported its own failure.
-/// Neither is a server: `state` means "a server claims this root", and publishing it for a child
-/// that is not serving would send `tinio status` and `tinio stop` after a channel nothing
-/// answers. The launcher's report of what happened is the supervision's, which
-/// [`crate::commands::start::run`] reaches either way.
-///
-/// **The three facts are the child's and the file is the launcher's.** The port is the address
-/// the child relayed in its readiness frame (`Listening { addr }` — the socket this process
-/// bound and handed over); the control name is the launcher's own channel's identity, which is
-/// the name the child records too (`Plane::adopt` normalises the same selection through the same
-/// `bind::pipe_name`); and the root is the resolved one, canonical, exactly as the child's
-/// `ApiOptions` carries it.
-///
-/// **The pid is the launcher's** (`State::new`'s own `process::id()`), and that choice is
-/// deliberate rather than incidental. It is the process the operator owns: it outlives the
-/// child's whole serving life, killing it takes the child with it through the job object, and
-/// the `--daemon` parent's own readiness check compares the pid in this file against the pid it
-/// spawned — which *is* this launcher, so a file naming the confined grandchild would make the
-/// daemon time out on a run that started perfectly. It is also what makes `Plane::shutdown`'s
-/// removal guard hold in the child (`state.pid == process::id()` is false there), so the child
-/// never even attempts the deletion its confinement would refuse.
-#[cfg(feature = "api")]
-fn publish_state(
-    child: &Child,
-    channel: &Channel,
-    token: &str,
-    resolution: &Resolution,
-) -> Result<(), Error> {
-    let Some(terminal) = child.wait_for_ready(PUBLISH_BOUND) else {
-        return Ok(());
-    };
-    let Terminal::Listening(addr) = terminal else {
-        return Ok(());
-    };
-    let state = State::with_token(
-        channel.identity(),
-        Some(addr.port()),
-        &resolution.root,
-        token.to_owned(),
-    )?;
-    state.write(&resolution.state_dir)?;
-    Ok(())
-}
+// The `state` publish — its readiness gate, the bound it waits on and the pid/name choice —
+// is `super::launch`'s, shared with the macOS arm rather than spelled here.

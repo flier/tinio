@@ -83,6 +83,7 @@ sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
+tinio-api.workspace = true
 tinio-fs.workspace = true
 tinio-mem.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
@@ -93,6 +94,10 @@ required-features = ["sandbox"]
 
 [[test]]
 name = "sandbox_e2e_windows"
+required-features = ["sandbox"]
+
+[[test]]
+name = "sandbox_macos_e2e"
 required-features = ["sandbox"]
 
 [[bench]]

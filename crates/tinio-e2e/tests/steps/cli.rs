@@ -39,6 +39,8 @@ use tinio_sandbox::Event;
 use tokio::time::sleep;
 
 use super::World;
+#[cfg(target_os = "macos")]
+use super::common::sweep_confined_grandchild;
 
 /// How long a run may go without exiting and without reporting readiness before the harness
 /// calls it hung.
@@ -59,6 +61,19 @@ const CONFINED_RUN_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long the teardown's own client waits for the daemon it is ending — it exists to end a
 /// process, not to assert on it, so it is bounded rather than polled forever.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a **serving** run's `state` file is given to appear after its readiness frame.
+///
+/// **The two artifacts are written by different processes on macOS, and the frame can win the
+/// race.** The confined child emits `listening`, the launcher relays that frame to this harness's
+/// stdout and only then writes `state` (`crates/tinio-cli/src/sandbox/launch.rs`'s `publish_state`
+/// waits for the child's own terminal event), so a reading taken the instant the frame arrives can
+/// find the file not yet there — measured on macOS 15.8, 2026-09-25, once in two runs, while the
+/// second run showed the file already present. The window is the launcher's few syscalls, so the
+/// bound is far above it and still fails fast rather than hiding a run that never publishes;
+/// `crates/tinio-server/tests/sandbox_macos_e2e.rs` polls for the same artifact for the same
+/// reason. The refusal half needs no allowance at all: a run that refused has already exited.
+const PUBLISH_SETTLE: Duration = Duration::from_secs(2);
 
 /// One poll's wait: a run's exit and its readiness event are both watched by polling, and no
 /// scenario asserts on the poll's own cadence.
@@ -105,6 +120,11 @@ pub struct Cli {
     /// Whether this binary's parser knows `--sandbox` — the probe the sandbox scenario's
     /// discrimination rests on ([`Cli::knows_flag`]).
     sandbox_flag: Option<bool>,
+    /// Whether a run in this scenario actually asked for a confinement — the one state the macOS
+    /// sweep in [`Cli::kill_servers`] is gated on, because only such a run can leave the
+    /// grandchild that sweep exists to reach. Every other scenario would pay two process-table
+    /// scans for a process it never started.
+    confined_spawned: bool,
     /// The endpoint the last readiness event reported, kept across runs so a later `status` run
     /// can be held to the address the server actually bound.
     endpoint: Option<String>,
@@ -139,7 +159,7 @@ struct Run {
 impl Cli {
     /// Claims a scratch directory and makes the root the scenario serves under it.
     fn new() -> Self {
-        let dir = TempDir::new().expect("a scratch directory");
+        let dir = scratch_dir();
         let root = dir.path().join("root");
         fs::create_dir_all(&root).expect("the served root");
         let entries = fs::read_dir(&root).expect("read the root").count();
@@ -152,6 +172,7 @@ impl Cli {
             children: Vec::new(),
             daemon: None,
             sandbox_flag: None,
+            confined_spawned: false,
             endpoint: None,
             last: None,
             runs: 0,
@@ -261,6 +282,8 @@ impl Cli {
     async fn run(&mut self, command: &str) {
         let argv = self.argv(command);
         let detached = argv.iter().any(|arg| arg == "--daemon");
+        let confined = self.confined(&argv);
+        self.confined_spawned |= confined;
         let (out_path, err_path) = self.run_paths();
         let mut cmd = self.command();
         cmd.args(&argv[1..])
@@ -357,10 +380,25 @@ impl Cli {
     ///
     /// A killed server leaves its `state` file behind — no drain, no removal — which is exactly
     /// what the stale-state scenario needs.
+    ///
+    /// **On macOS the kill reaches the launcher and not the server, so the child is reaped by
+    /// name.** Seatbelt has no job object — a `SIGKILL`ed launcher leaves its confined child
+    /// running, an accepted gap the launcher's own module records
+    /// (`crates/tinio-cli/src/sandbox/macos.rs`) — and this harness holds no handle to that
+    /// grandchild. The sweep is [`sweep_confined_grandchild`]'s, which owns the pattern (the
+    /// scenario's own root, unique to it) and the precondition below; every other platform needs
+    /// no such step, because the process this kill ends *is* the server.
     fn kill_servers(&mut self) {
         for mut child in self.children.drain(..) {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        // **The gate is the precondition the sweep's doc states**: only a run that asked for a
+        // confinement can have left the grandchild, and the sweep is a `pkill -f` over the whole
+        // process table.
+        #[cfg(target_os = "macos")]
+        if self.confined_spawned {
+            sweep_confined_grandchild(&self.root);
         }
     }
 
@@ -437,6 +475,28 @@ impl Drop for Cli {
         // The backstop behind `teardown`; a daemon is deliberately not in a `Drop`'s reach (no
         // handle from here would touch it), which is why `teardown` asks it to stop instead.
         self.kill_servers();
+    }
+}
+
+/// The scenario's scratch directory: `$TMPDIR` everywhere except macOS, where it is `/tmp`.
+///
+/// **macOS is short for `sun_path`'s sake, not for tidiness** (`docs/tests.md`,
+/// "Platform-gated verification (macOS)"). A read-write run's control socket is
+/// `<root>/.tinio/tinio-<16 hex>.sock`, `sun_path` is **104 bytes**, and `$TMPDIR` there is
+/// `/private/var/folders/<2 chars>/<30 chars>/T/` — 57 bytes before `tempfile`'s own ten, so the
+/// socket name pushes past the limit and the server refuses to start. `/tmp` is the platform's
+/// short scratch area (canonical `/private/tmp`, 12 bytes), and the root under it measures ~62
+/// bytes for the same socket. `TINIO_STATE_DIR` is not the remedy: a read-write run's state
+/// directory is `<root>/.tinio` whatever that variable says (`resolve::resolve_state_dir`), and
+/// these scenarios serve read-write.
+fn scratch_dir() -> TempDir {
+    #[cfg(target_os = "macos")]
+    {
+        TempDir::new_in("/tmp").expect("a scratch directory")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        TempDir::new().expect("a scratch directory")
     }
 }
 
@@ -878,66 +938,37 @@ impl SandboxChannel {
     }
 }
 
-/// Which arm a requested confinement must take on this host — **predicted from the two facts a
-/// scenario cannot change**, so a run that took another one is a failure rather than an accepted
-/// alternative.
-#[derive(Clone, Copy, Debug)]
-enum Arm {
-    /// No `sandbox` feature in that binary, so nothing could be confined: clap's usage error for
-    /// the flag (not in that parser at all) and this crate's for the variable, naming the build.
-    BuildRefused,
-    /// Feature in, and this target's backend is still the stub (macOS): refused, naming the
-    /// platform.
-    PlatformRefused,
-    /// Feature in and this target's backend confines (Linux, Windows): honoured, the run serves.
-    Applied,
-}
-
-/// The arm owed here. [`Cli::sandbox_flag`] is the probe step's answer, which is the feature's
-/// own presence in the parsed binary; every scenario that runs the assertion probes first, and
-/// that is what makes the arm a prediction rather than whichever one happened.
-fn owed_arm(cli: &Cli) -> Arm {
-    if !cli
-        .sandbox_flag
-        .expect("the scenario probes `--sandbox` before it asserts the arm")
-    {
-        Arm::BuildRefused
-    } else if cfg!(target_os = "macos") {
-        // The one stub (`tinio_cli::sandbox::BACKEND_IS_STUB`: Linux P1 and Windows P2 are
-        // wired), and the spawned binary is built for this test binary's own target.
-        Arm::PlatformRefused
-    } else {
-        Arm::Applied
-    }
-}
-
 /// **The invariant every sandbox channel is held to, on every build: a requested confinement is
 /// never silently ignored.**
 ///
 /// Where nothing can honour the channel the run refuses, names the channel that asked for it, and
-/// — because the two refusals are a matched pair, written to be told apart — names the *build*
-/// where `--sandbox` is not in this parser and the *platform* whose backend cannot honour it, and
-/// never the other one. Where this target's backend is wired the request is honoured instead, and
-/// the assertion is the readiness event **plus the absence of every refusal's words**: "confined"
-/// is the platform legs' subject (`sandbox_e2e*`), not something a reader of stdout can certify.
+/// names the *build* whose parser has no `--sandbox` — never the platform, because every target
+/// this workspace builds has a backend that would honour one. Where this target's backend is
+/// wired the request is honoured instead, and the assertion is the readiness event **plus the
+/// absence of every refusal's words**: "confined" is the platform legs' subject (`sandbox_e2e*`),
+/// not something a reader of stdout can certify.
 ///
-/// **The arm is dispatched, not accepted either way.** [`owed_arm`] says which one this host owes
-/// and the run is held to that arm's own words, so the spelling this replaces — "either refused
-/// with the channel named or applied" — can no longer pass on a run that failed for some other
-/// reason and merely mentioned `sandbox`, nor on an honour arm that never reached readiness.
+/// **The arm is dispatched, not accepted either way.** The probe says which one this host owes —
+/// the feature is in that parser or it is not — and the run is held to that arm's own words, so
+/// the spelling this replaces — "either refused with the channel named or applied" — can no
+/// longer pass on a run that failed for some other reason and merely mentioned `sandbox`, nor on
+/// an honour arm that never reached readiness.
 #[then(expr = "the {string} request is answered, never ignored")]
 async fn request_answered(world: &mut World, channel: String) {
     let channel = SandboxChannel::parse(&channel);
     let cli = cli(world);
     let run = cli.last();
-    match owed_arm(cli) {
-        Arm::BuildRefused => refused_by_build(run, channel),
-        Arm::PlatformRefused => refused_by_platform(run, channel),
-        Arm::Applied => applied(run),
+    if cli
+        .sandbox_flag
+        .expect("the scenario probes `--sandbox` before it asserts the arm")
+    {
+        applied(run);
+    } else {
+        refused_by_build(run, channel);
     }
 }
 
-/// Every refusal, whichever arm raised it: the channel's own spelling, and no service.
+/// Every refusal: the channel's own spelling, and no service.
 fn refused(run: &Run, channel: SandboxChannel) {
     let status = run
         .status
@@ -964,8 +995,8 @@ fn refused(run: &Run, channel: SandboxChannel) {
 /// The build's refusal: the feature is not in that binary, so the run cannot confine and says so
 /// rather than serving unconfined. The flag is not in that parser at all — clap answers it, in
 /// clap's words — while the variable, which cannot be compiled away, is refused by the crate
-/// itself: a usage error (2) naming the **build**, never the platform, which is the other arm's
-/// half of the pair.
+/// itself: a usage error (2) naming the **build**, and never the platform, because no target this
+/// suite runs on owes that refusal any more.
 fn refused_by_build(run: &Run, channel: SandboxChannel) {
     refused(run, channel);
     assert_eq!(
@@ -994,29 +1025,6 @@ fn refused_by_build(run: &Run, channel: SandboxChannel) {
             );
         }
     }
-}
-
-/// The platform's refusal: the feature is in and this target's backend is the stub. A startup
-/// error (1) naming `std::env::consts::OS`, and never the build — telling the two apart is what
-/// the pair exists for.
-fn refused_by_platform(run: &Run, channel: SandboxChannel) {
-    refused(run, channel);
-    assert_eq!(
-        run.status.and_then(|status| status.code()),
-        Some(1),
-        "a stub backend is a startup error:\n{}",
-        run.stderr
-    );
-    assert!(
-        run.stderr.contains("platform"),
-        "the refusal names the platform whose backend cannot honour it:\n{}",
-        run.stderr
-    );
-    assert!(
-        !run.stderr.contains("build"),
-        "and not the build — the feature is compiled in:\n{}",
-        run.stderr
-    );
 }
 
 /// The honour arm: the request reached a run that serves, and **no refusal's words are anywhere
@@ -1048,12 +1056,31 @@ fn applied(run: &Run) {
 /// The publication half, per shape: a refusal leaves no `state` file, and a run that serves has
 /// one — so the file tracks *serving* rather than the channel, and a refusal stays
 /// distinguishable from a run.
+///
+/// **A serving run is given [`PUBLISH_SETTLE`] to produce the file and a refused one is given
+/// nothing**, which is the whole of the allowance: the readiness frame and the file are written
+/// by two processes on macOS (see that constant), while a refused run has exited and its absence
+/// is final.
 #[then("the root publishes a state file only when the run is serving")]
 async fn state_file_tracks_serving(world: &mut World) {
     let cli = cli(world);
     let file = state_file(cli.root());
-    let published = file.exists();
     let serving = cli.last().readiness.is_some();
+    let settle = if serving {
+        PUBLISH_SETTLE
+    } else {
+        Duration::ZERO
+    };
+    let deadline = Instant::now() + settle;
+    let published = loop {
+        if file.is_file() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        sleep(POLL).await;
+    };
     assert_eq!(
         published,
         serving,

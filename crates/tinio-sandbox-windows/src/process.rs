@@ -356,11 +356,11 @@ impl Drop for LaunchedProcess {
 /// before the child's parser ever sees it, so the argv the child reads is not the
 /// argv the operator passed — this launcher's own arguments filtered, with
 /// `tinio-sandbox-fd=<n>` among them. The NUL is appended here rather than by
-/// [`crate::wide`], because what this returns is units and not text.
+/// `crate::wide`, because what this returns is units and not text.
 ///
 /// The program path is the same rule through a second route, and it is not the
 /// program's argv element that decides it: [`launch`] hands the path to
-/// `CreateProcessW` as `lpApplicationName` through [`crate::wide_os`], so the image
+/// `CreateProcessW` as `lpApplicationName` through `crate::wide_os`, so the image
 /// the kernel opens is the one the caller named whatever this line says.
 ///
 /// # Examples

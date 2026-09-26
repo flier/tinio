@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use std::fs::create_dir_all;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::{
     fs::{read_dir, write},
@@ -189,6 +191,87 @@ fn read_only_refuses_an_in_root_state_dir() {
         },
     )
     .unwrap();
+
+    // **A state directory that does not exist yet is judged as the one that
+    // does**, and here that judgement is the accepted one: the resolution lands
+    // beside the root rather than inside it, so non-existence decides nothing on
+    // its own. This is read-only mode's ordinary input — the directory is the
+    // constructor's to create — and the leg below is the refusal it must not
+    // lose by making existence a condition.
+    let home = tempfile::tempdir().unwrap();
+    let absent = home.path().join("state");
+    assert!(!absent.exists());
+    FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            state_dir: Some(absent),
+            ..fs_options()
+        },
+    )
+    .unwrap();
+}
+
+/// **The same refusal reached through the other spelling of one directory** — the
+/// hole a literal comparison leaves open, and the shape macOS hands the guard for
+/// free: `tempfile` answers `$TMPDIR` as `/var/folders/…` while construction
+/// canonicalizes the root to `/private/var/folders/…`, so the two agree on no
+/// prefix at all, the guard passes, and read-only mode writes its whole state tree
+/// inside the tree it promises to leave alone. The explicit symlink is what makes
+/// the pair deterministic on every unix host rather than only where the temp
+/// directory happens to sit behind a link, and the `path_contains` assertion below
+/// is what keeps the leg from passing vacuously: the literal comparison really does
+/// answer `false` for this pair.
+///
+/// **Both halves of the state directory's existence are refused**, because the
+/// guard runs before read-only mode creates anything and the refusal cannot be a
+/// question about a directory that is not there yet. The resolution walks to the
+/// nearest existing ancestor — the link, which is the one component that does exist
+/// — and rejoins what is below it, so the absent leaf and the present one are the
+/// same directory to this guard. (Measured on macOS 15.8, 2026-09-25: a first
+/// version of that walk canonicalized the leaf itself, answered `ENOENT`, and let
+/// the exploit through — the launcher's copy of this rule carries the same
+/// measurement.)
+#[cfg(unix)]
+#[test]
+fn read_only_refuses_an_in_root_state_dir_spelled_through_a_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    create_dir_all(&real).unwrap();
+    let canonical_root = canonicalize(&real).unwrap();
+    let link = dir.path().join("link");
+    symlink(&real, &link).unwrap();
+    let spelled = link.join("state");
+    let absolute = absolute(&spelled).unwrap();
+    assert!(
+        !path_contains(&absolute, &canonical_root),
+        "the leg is vacuous unless the literal comparison answers `false`: \
+         {absolute:?} vs {canonical_root:?}"
+    );
+
+    for exists in [false, true] {
+        if exists {
+            create_dir_all(&spelled).unwrap();
+        }
+        assert_eq!(spelled.exists(), exists);
+        let err = FsStorage::new(
+            &canonical_root,
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                state_dir: Some(spelled.clone()),
+                ..fs_options()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidValue(_)),
+            "exists: {exists}: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("outside the storage root"),
+            "{err}"
+        );
+    }
 }
 
 /// The verbatim leg of the containment rule at the shapes the read-only

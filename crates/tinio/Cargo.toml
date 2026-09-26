@@ -34,6 +34,9 @@ default = [
     "copy",
     "list-v1",
     "list-v2",
+    "cors",
+    "select",
+    "acl",
     "openapi",
     "tls",
     "sandbox",
@@ -47,6 +50,14 @@ multipart = ["tinio-server/multipart"]
 copy = ["tinio-server/copy"]
 list-v1 = ["tinio-server/list-v1"]
 list-v2 = ["tinio-server/list-v2"]
+# The three the workspace's `tinio-server` pin compiles out unless they are named here: the root
+# manifest sets `default-features = false` on that dependency, so the facade's own list is what
+# decides whether the shipped binary carries them — and the `@boto3`/`@external` scenarios drive
+# the shipped binary, not the in-process server the e2e links (`crates/tinio-e2e` depends on
+# `tinio-server` by path with its defaults on).
+cors = ["tinio-server/cors"]
+select = ["tinio-server/select"]
+acl = ["tinio-server/acl"]
 otel = ["tinio-server/otel"]
 
 [lints.clippy]

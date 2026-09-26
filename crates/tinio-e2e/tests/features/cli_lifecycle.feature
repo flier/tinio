@@ -5,9 +5,10 @@
 # honour them, honoured where the target's backend is wired. Which of the two a scenario owes is
 # dispatched, never accepted either way (`steps/cli.rs`, `owed_arm`).
 #
-# `@confinement` is the host gate on those two: they need a target that can build the confinement
-# (or, macOS, owes the refusal), which no leg can assume, so the runner runs them on macOS and
-# takes them only on `TINIO_E2E_CONFINEMENT=1` elsewhere (`tests/cucumber.rs`).
+# `@confinement` is the host gate on those two: they run a confinement, which no leg may assume —
+# a Windows launcher pays an ACL grant worth tens of seconds of variance, so the runner runs them
+# on macOS (where the launcher only binds and spawns) and takes them elsewhere only on
+# `TINIO_E2E_CONFINEMENT=1` (`tests/cucumber.rs`).
 #
 # These are the legs `crates/tinio/tests/lifecycle.rs` used to hold. That file
 # keeps only the console-handler leg, which no scenario can express: it needs

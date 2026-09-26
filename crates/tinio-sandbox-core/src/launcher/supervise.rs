@@ -1,6 +1,6 @@
 //! Waiting for a confined child and undoing what its launch set up.
 
-use std::{process::ExitStatus, sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
+use std::{io, process::ExitStatus, sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
 
 use tracing::debug;
 
@@ -35,19 +35,32 @@ use crate::{error::Result, launcher::Terminal};
 /// before the relay thread starts, there is no lock to poison, no value to clone
 /// on every read, and no ordering rule for a launcher to remember.
 ///
+/// **A launch can also fail after the child exists, and the child has to be
+/// ended rather than dropped.** The macOS launcher publishes the child's `state`
+/// the moment the child reports it is listening, and that publish is the one
+/// fallible step left on the launch path: it writes into the state directory,
+/// which can refuse between the launcher's pre-flight probe and the write. The
+/// launcher's own `?` there would return the error and drop the [`Self`] — and
+/// on a platform with no job object a dropped child is not an ended one, because
+/// the handle the platform keeps is behind the wait closure, so the confined
+/// server keeps listening with no `state` file for `tinio status`/`stop` to find
+/// it. [`Self::with_kill`] is that path's half: the platform supplies the one
+/// call that ends the process it started.
+///
 /// **`Child` is not `Send`, and that is a property rather than an oversight.**
-/// The wait closure is a bare `Box<dyn FnMut() -> Result<ExitStatus>>`, and the
-/// Windows launcher's closure carries a raw process handle besides; nothing here
-/// crosses a thread boundary, because every call site confines *before* the
-/// runtime exists (design §10) on the thread that already owns the child. A
-/// future caller that needs to move one would add `+ Send` to that closure —
-/// and the Windows crate would then have to decide what to do about its handle,
-/// which is a decision worth making when something needs it rather than now.
+/// The wait closure is a bare `Box<dyn FnMut() -> Result<ExitStatus>>`, the kill
+/// closure beside it has the same shape, and the Windows launcher's wait closure
+/// carries a raw process handle besides; nothing here crosses a thread boundary,
+/// because every call site confines *before* the runtime exists (design §10) on
+/// the thread that already owns the child. A future caller that needs to move
+/// one would add `+ Send` to both closures — and the Windows crate would then
+/// have to decide what to do about its handle, which is a decision worth making
+/// when something needs it rather than now.
 ///
 /// # Examples
 ///
 /// ```
-/// use std::{process::Command, thread};
+/// use std::{cell::RefCell, process::Command, thread};
 ///
 /// use tinio_sandbox_core::Child;
 ///
@@ -59,6 +72,19 @@ use crate::{error::Result, launcher::Terminal};
 /// assert!(child.terminal().is_none(), "nothing has relayed yet");
 /// let _ = child.wait();
 /// # }
+///
+/// // The failure path's two halves: a killer that ends the process, and the wait
+/// // that still reaps it — which is why the same process sits in a `RefCell`
+/// // rather than moving into the killer.
+/// # #[cfg(unix)] {
+/// let process = RefCell::new(Command::new("sleep").arg("60").spawn().unwrap());
+/// let killer = RefCell::clone(&process);
+/// let mut child = Child::new(move || Ok(process.borrow_mut().wait()?))
+///     .with_kill(move || killer.borrow_mut().kill());
+/// child.kill().expect("the killer ends the child");
+/// let status = child.wait().expect("the wait still reaps it");
+/// assert!(!status.success(), "the child was killed, not exited");
+/// # }
 /// ```
 #[derive(derive_more::Debug)]
 pub struct Child {
@@ -69,6 +95,11 @@ pub struct Child {
     /// to exist: every `unwrap_err()` in the platform plans depends on it.
     #[debug(skip)]
     wait: Box<dyn FnMut() -> Result<ExitStatus>>,
+    /// The platform's way to end the child it started, when it has one (see
+    /// [`Self::with_kill`]). `#[debug(skip)]` for the reason the wait closure
+    /// above carries it.
+    #[debug(skip)]
+    kill: Option<Box<dyn FnMut() -> io::Result<()>>>,
     /// The launcher's relay thread — **and the channel its answer travels back
     /// through**: the thread returns what it recorded, and [`Self::wait`] takes
     /// that out of the join. `std::thread` rather than a runtime handle because
@@ -89,10 +120,14 @@ impl Child {
     ///
     /// The relay goes in separately, with [`Self::with_relay`], because the two
     /// are not always both there: the core's own tests run a child with no relay
-    /// at all, and a launcher never has one without a child.
+    /// at all, and a launcher never has one without a child. The same holds for
+    /// the killer: [`Self::with_kill`] is a second, optional collaborator rather
+    /// than part of this constructor, so a platform that has none — and every
+    /// test that spawns a process it means to wait for — is unchanged.
     pub fn new(wait: impl FnMut() -> Result<ExitStatus> + 'static) -> Self {
         Self {
             wait: Box::new(wait),
+            kill: None,
             relay: None,
             terminal: None,
             ready: None,
@@ -131,6 +166,120 @@ impl Child {
     pub fn with_ready(mut self, ready: Receiver<Terminal>) -> Self {
         self.ready = Some(ready);
         self
+    }
+
+    /// Give the child a way to be **ended** — the platform's one call that
+    /// terminates the process this value waits for, for the launch that fails
+    /// after the child exists (see [`Self::kill`]).
+    ///
+    /// **The child is not `kill`ed by dropping it, and that is why this is a
+    /// platform-supplied closure rather than something the core can do itself.**
+    /// On Windows a dropped [`Self`] closes the job object that owns the child
+    /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, decision 20) and the process goes
+    /// with it; on macOS there is no such object, and the only handle to the
+    /// process is behind the wait closure — the core cannot reach through an
+    /// opaque `FnMut`, and it may not call `kill(2)` itself: this crate is
+    /// `unsafe_code = "forbid"` and the process is not the core's to know. So the
+    /// platform that started it hands over the call, exactly as it hands over the
+    /// wait and the relay.
+    ///
+    /// **This is a builder rather than part of [`Self::new`] because a killer may
+    /// genuinely be absent, and `Option` says so in the type.** Windows leaves it
+    /// unset deliberately: its `Child` already ends the child by dropping the job,
+    /// so a killer there would duplicate a mechanism the platform has, and the
+    /// `None` is a decision the platform states rather than an omission. A
+    /// platform that launches no child at all never reaches either half.
+    ///
+    /// **The killer must not reap, and that is the one rule this closure has.**
+    /// [`Self::kill`] carries the whole contract: it ends the process and stops
+    /// there, [`Self::wait`] is still the caller's next call, and the wait is what
+    /// reaps. A killer whose platform handle would also reap — a
+    /// `std::process::Child::wait` written into this closure by mistake — reports
+    /// the refusal it gets on the second wait rather than pretending it ended
+    /// something.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// use tinio_sandbox_core::Child;
+    ///
+    /// let mut process = Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+    ///     .args(["/c", "exit 0"])
+    ///     .spawn()
+    ///     .unwrap();
+    /// // The platform's own kill, whatever it is: `SIGKILL` to the pid, a
+    /// // `TerminateProcess` on the handle.
+    /// let mut child = Child::new(move || Ok(process.wait()?))
+    ///     .with_kill(|| Err(std::io::Error::other("this platform has no killer")));
+    /// assert!(child.kill().is_err(), "the closure's own answer comes back");
+    /// let _ = child.wait();
+    /// ```
+    pub fn with_kill(mut self, kill: impl FnMut() -> io::Result<()> + 'static) -> Self {
+        self.kill = Some(Box::new(kill));
+        self
+    }
+
+    /// **End the child** — the launch-failure path, for a platform whose dropped
+    /// [`Self`] would otherwise leave the confined process running.
+    ///
+    /// **This does not end the child's lifecycle; [`Self::wait`] does, and the
+    /// caller calls it next.** The split is deliberate: the killer does the one
+    /// thing a platform can express without owning the wait (a `SIGKILL` to a pid,
+    /// a `TerminateProcess` on a handle), the wait is what **reaps** the process so
+    /// no zombie is left and what joins the relay. So the sequence a caller on the
+    /// failure path runs is `kill()` then `wait()` — the kill is what makes that
+    /// wait return instead of blocking, and the wait is what makes it a reap
+    /// rather than a leak.
+    ///
+    /// **After a kill, [`Self::wait`] reports the killed status and
+    /// [`Self::terminal`] stays what it already was.** A child killed before it
+    /// reported readiness has an empty relay, so the terminal record is `None`
+    /// **for the rest of this value's life** — a null byte for its own byte, not
+    /// the `None` that means "the relay has not been joined yet". A caller that
+    /// reads the record to decide what the child said learns nothing new from
+    /// this call, which is correct: a child ended by its launcher never reported.
+    ///
+    /// **A failure here must not mask the error the caller is already carrying**,
+    /// and that is the caller's rule rather than this method's: the reason this
+    /// exists is that a publish or a launch step failed after the child started,
+    /// and *that* failure is what the operator has to see. The answered
+    /// [`io::Error`] is the platform's own — the process already gone, a target
+    /// that did not fit — and the caller reports it beside the original error
+    /// rather than in place of it.
+    ///
+    /// **A child with no killer refuses rather than pretending.** [`Self::with_kill`]
+    /// carries why a platform may leave it unset; what such a platform must *not*
+    /// do is answer `Ok(())` to a caller that then believes a process it cannot
+    /// reach has been ended. Reaching [`Self::kill`] on a child that never had a
+    /// killer is a contract error in our own code, so it is reported as an
+    /// [`io::Error`] — not [`Error::Wait`](crate::Error::Wait), which is the wait's own failure — and
+    /// an operator reading it beside the original error can see that the child was
+    /// left to the platform's own mechanism or to nothing.
+    ///
+    /// # Errors
+    ///
+    /// The killer's own failure, or the refusal of a child that never had one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Child;
+    ///
+    /// // A child with no platform killer says so instead of silently succeeding.
+    /// let mut child = Child::new(|| unreachable!("this child is never waited for"));
+    /// let err = child.kill().expect_err("no killer was installed");
+    /// assert!(err.to_string().contains("no killer"), "{err}");
+    /// ```
+    pub fn kill(&mut self) -> io::Result<()> {
+        match self.kill.as_mut() {
+            Some(kill) => kill(),
+            None => Err(io::Error::other(
+                "the platform installed no killer on this child: nothing was ended, and the \
+                 process is whichever lifetime the platform ties it to",
+            )),
+        }
     }
 
     /// The first terminal event the child reported, **while it is still running** —
@@ -268,8 +417,9 @@ impl Child {
 /// **Teardown cannot report a failure, and that is deliberate rather than a
 /// gap.** A rollback that can fail belongs in the platform's wait closure, which
 /// owns the platform's error type and can name the directory it could not fix
-/// (design §11's Windows row); a `Drop` guard covers the `Child` that is never
-/// waited on at all. What is left for this callback is the work that cannot fail
+/// (design §11's Windows row); a `Child` that is never waited on at all is the
+/// caller's to end, through [`Child::kill`] on the path that failed after the
+/// child existed. What is left for this callback is the work that cannot fail
 /// — disarming a signal handler, removing a path the launcher created — which is
 /// what both launcher platforms pass it.
 ///
@@ -310,9 +460,11 @@ pub fn supervise(child: &mut Child, teardown: impl FnOnce()) -> Result<ExitStatu
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         io,
         net::SocketAddr,
         process::{Child as ProcessChild, ChildStdout, Command, ExitStatus, Stdio},
+        rc::Rc,
         sync::mpsc,
         thread,
         time::Duration,
@@ -352,6 +504,80 @@ mod tests {
     fn child_for(script: &str) -> Child {
         let mut process = exiting(script).spawn().expect("spawn");
         Child::new(move || Ok(process.wait()?))
+    }
+
+    /// Start a process that is still there a minute from now, and return it with
+    /// the platform call that ends it.
+    ///
+    /// **The process is portable and the killer is not, which is the whole point
+    /// of the split**: the child is `std::process`'s on both hosts — `sleep 60`, or
+    /// `ping` against the loopback address for a minute, neither of which reads
+    /// stdin — while the kill below is the platform's own.
+    ///
+    /// **The spawn takes a pipe rather than inheriting this process's stdin**, and
+    /// on Windows that is not cosmetic: a child handed an inherited console handle
+    /// can stall on it before its own work starts, which would make the kill below
+    /// a race against a program that never ran. Both production launchers pipe
+    /// their child's streams for their own reasons, so the piped shape is also the
+    /// one a real `Child` has.
+    fn lingering() -> Child {
+        #[cfg(windows)]
+        let script = "ping -n 60 127.0.0.1 > NUL";
+        #[cfg(not(windows))]
+        let script = "sleep 60";
+        let process = exiting(script)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        // **The pinned process is shared because the kill and the wait are both
+        // its callers and neither owns it.** `ProcessChild` owns the process, so a
+        // killer that took it would leave the wait below with nothing to reap —
+        // which is the `Clone`-free sharing `Rc` is for, and the same shape the
+        // production launchers get from an `i32`.
+        let process = Rc::new(RefCell::new(process));
+        let waited = Rc::clone(&process);
+        let killed = Rc::clone(&process);
+        Child::new(move || Ok(waited.borrow_mut().wait()?))
+            .with_kill(move || killed.borrow_mut().kill())
+    }
+
+    #[test]
+    fn a_killed_child_is_reaped_and_reports_what_it_was() {
+        // The launch-failure path, in the two calls the caller runs: `kill` ends a
+        // child that is still serving, and the `wait` after it is what keeps that
+        // from being a zombie — which is why the killer is forbidden to reap.
+        let mut child = lingering();
+
+        child.kill().expect("the platform's killer ends the child");
+        let status = child.wait().expect("the wait still reaps the killed child");
+
+        assert!(!status.success(), "a killed child did not exit cleanly");
+        assert_eq!(
+            child.terminal(),
+            None,
+            "the child was killed before it reported, so the relay recorded nothing"
+        );
+    }
+
+    #[test]
+    fn a_child_with_no_killer_refuses_rather_than_pretending() {
+        // The `None` arm of `with_kill`, which a platform with its own lifetime tie
+        // takes deliberately: the call must say that nothing was ended rather than
+        // answer `Ok(())` to a caller that would then believe a process it cannot
+        // reach was gone. The wait closure is never run, so this needs no process.
+        let mut child = Child::new(|| unreachable!("this child is never waited for"));
+        let err = child.kill().expect_err("no killer was installed");
+
+        assert!(
+            err.to_string().contains("no killer"),
+            "the refusal says which half is missing: {err}"
+        );
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "a real killer's `NotFound` means the child had already gone, and a platform that \
+             installed none must not answer as though one had: {err}"
+        );
     }
 
     /// The terminal event a relayed child would have reported.

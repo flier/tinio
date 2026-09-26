@@ -56,6 +56,37 @@ fn try_run() -> Result<ExitCode, Error> {
     let (argv, adopted) = sandbox::filter_argv(env::args_os().skip(1).collect())?;
     let argv: Vec<OsString> = iter::once(OsString::from("tinio")).chain(argv).collect();
 
+    // **The child's own confinement, applied before anything else happens** (design
+    // §10 step 1, decision 26). A launcher that resolved an in-process mechanism
+    // hands the profile over on the payload, and this is the process that can apply
+    // it — the apply is one-shot and irreversible, so the launcher's own process is
+    // exactly the one that *cannot*. Nothing has run here yet: no `.env`, no
+    // configuration file, no storage. **And it fails closed**: a child that cannot
+    // apply the confinement its launcher reported is a refusal, never a server.
+    //
+    // **The call sits ahead of the dispatch because the mechanism is not the
+    // command's**: it confines whatever this process was launched to do, and it acts
+    // only on what `filter_argv`'s decode already carried. `adopted` is `None` for
+    // every ordinary run, so those runs pay one `is_some` check and nothing else.
+    //
+    // **A free function rather than a method on `Adopted`**, which is the core's: the
+    // apply is the platform's (`tinio_sandbox::macos::apply` through the facade's
+    // platform-neutral name), and the core is `forbid` for `unsafe` and knows no
+    // mechanism.
+    //
+    // **The refusal is framed on stdout beside the `tinio: …` line stderr carries**,
+    // for the reason every other pre-dispatch refusal is (decision 19's "a startup
+    // failure is an event rather than an absence"): what fails here is a confined
+    // child, which is a process a launcher is waiting on a frame from. A bare return
+    // would leave that launcher decoding a child that exited without saying why.
+    #[cfg(all(feature = "sandbox", target_os = "macos"))]
+    if let Some(adopted) = adopted.as_ref()
+        && let Err(err) = sandbox::apply_self_confinement(adopted)
+    {
+        events::emit_error(&err.to_string());
+        return Err(err);
+    }
+
     // Steps a–e of §1, shared with the SCM's entry point: the discovery parse, `.env`, and the
     // authoritative parse — see [`command_line`] for the order and for what each pass answers.
     // The two arms are the two answers it can give, and the dispatch below runs on the

@@ -181,9 +181,11 @@ mod tests {
         Resolution {
             root: PathBuf::from(root),
             config: Config::default(),
+            config_text: String::new(),
             config_path: PathBuf::from(root).join(".tinio/.tinio.toml"),
             read_only: false,
             state_dir: PathBuf::from(root).join(".tinio"),
+            state_dir_override: None,
             config_error: None,
         }
     }

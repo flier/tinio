@@ -23,6 +23,7 @@ thiserror.workspace = true
 toml.workspace = true
 
 tinio-core.workspace = true
+tinio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

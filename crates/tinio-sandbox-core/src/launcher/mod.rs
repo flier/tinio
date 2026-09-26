@@ -4,6 +4,16 @@ pub mod payload;
 pub mod relay;
 pub mod supervise;
 
+// The descriptor fixture the Unix plan leg opens: `cfg(unix)` because only the Unix
+// `ControlHandle` is built from a real descriptor — Windows' is copied from a value the launcher's
+// channel owns, so that leg spells a number instead — and `cfg(test)` because nothing else here
+// reads a file.
+#[cfg(all(test, unix))]
+use std::fs;
+#[cfg(any(unix, test))]
+use std::io;
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::{ffi::OsString, io::Read, net::TcpListener};
 
 use tracing::debug;
@@ -14,13 +24,178 @@ use tracing::debug;
 // that does not exist.
 pub use self::{
     payload::{
-        CONTROL_FD_PREFIX, LISTENER_FD_PREFIX, LaunchPayload, control_fd_arg, control_fd_from_arg,
-        is_control_fd_arg, is_listener_fd_arg, listener_fd_arg, listener_fd_from_arg,
+        CONTROL_FD_PREFIX, LISTENER_FD_PREFIX, LaunchPayload, SandboxSpec, control_fd_arg,
+        control_fd_from_arg, is_control_fd_arg, is_launcher_fd_arg, is_listener_fd_arg,
+        listener_fd_arg, listener_fd_from_arg,
     },
     relay::{Observer, Terminal},
     supervise::{Child, supervise},
 };
 use crate::error::Result;
+
+/// One inherited control-channel handle the launcher holds for the child it is about to spawn.
+///
+/// **Owned, on the platform whose descriptor needs a flag cleared in the launcher's process.**
+/// A descriptor only survives the `execve` between the launcher and its child when its
+/// close-on-exec flag is clear, and the platform crate is the only layer that knows *when* to
+/// clear it: after the profile pre-flight and before the real spawn, so the throwaway probe
+/// inherits the listener and nothing else. Reaching the descriptor at that moment is what needs
+/// an object rather than a number — `rustix::io::fcntl_setfd` takes an `AsFd`, and nothing may
+/// rebuild one from an integer (decision 14: that rebuild is the platform crate's single
+/// enumerated `unsafe` site, in the child).
+///
+/// **The launcher's own copy is left alone.** The handle is a *duplicate*
+/// ([`BorrowedFd::try_clone_to_owned`], which is `F_DUPFD_CLOEXEC`), so the socket the launcher
+/// bound keeps every flag it had and the descriptor here is the handoff's alone. It closes when
+/// the plan is dropped — after the child was spawned and holds its own copy.
+///
+/// **A descriptor is only reachable as a duplicate, and that is why [`Self::duplicate`] is the
+/// only constructor.** `std` gives `OwnedFd` no safe route from a raw number: there is no
+/// `From<i32>` and no `TryFrom<RawFd>`, and `OwnedFd::from_raw_fd` is an `unsafe fn` this crate
+/// may not call (`unsafe_code = "forbid"`). Taking the *borrowed* descriptor and duplicating it
+/// is the safe route, and it is also the truthful one for this handoff.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::os::{fd::AsRawFd as _, unix::net::UnixListener};
+///
+/// use tinio_sandbox_core::ControlHandle;
+///
+/// let socket = UnixListener::bind("/run/tinio/control.sock")?;
+/// // The duplicate the launcher hands the plan, and the number its argv element will spell.
+/// let handle = ControlHandle::duplicate(&socket)?;
+/// assert_ne!(
+///     handle.value(),
+///     i64::from(socket.as_raw_fd()),
+///     "the plan owns a duplicate, not the launcher's own descriptor"
+/// );
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ControlHandle(OwnedFd);
+
+/// One inherited control-channel handle the launcher holds for the child it is about to spawn.
+///
+/// **The Windows form of the type above, and it holds a value rather than owning one.** Nothing
+/// on this platform needs the clear that motivates the Unix form: `SetHandleInformation(handle,
+/// HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)` is the platform's own step, taken immediately
+/// before `CreateProcessW`, so no caller has to reach an object between a pre-flight and a spawn.
+/// And it could not own one here anyway — `OwnedHandle` has no safe constructor from a raw
+/// handle (every `From` impl there takes an already-owned object), while the launcher holds
+/// handle *values* borrowed from the `Channel` that owns them. Owning would force `unsafe` into
+/// this crate, which is `forbid` throughout, so the value is carried as the number it is and the
+/// owner stays the launcher's channel.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+///
+/// use tinio_sandbox_core::ControlHandle;
+///
+/// // A handle value the launcher's channel owns, copied for the plan — never a new owner.
+/// let handle = ControlHandle::inherited(7);
+/// assert_eq!(handle.value(), 7);
+/// # let _ = File::open("Cargo.toml")?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlHandle(i64);
+
+/// The one constructor both launchers build a plan through.
+///
+/// **Unix: the descriptor is duplicated, so ownership is real and the plan closes it.** The
+/// duplicate is close-on-exec (`F_DUPFD_CLOEXEC`) and only the platform crate clears that, which
+/// is the whole reason this type exists. The conversion is written in terms of the borrowed
+/// descriptor rather than a number, and that is what keeps it safe: `try_clone_to_owned` needs a
+/// `BorrowedFd`, so a caller cannot hand it an integer it made up.
+///
+/// **Windows: the value is copied, because the channel is the owner.** The handle is marked
+/// inheritable just before `CreateProcessW` and nothing reopens it, so a duplicate would be a
+/// second owner of a pipe the channel already owns — a handle closed twice, or closed while the
+/// child still serves on it. **The two forms differ in signature because they differ in what they
+/// do**: Unix's `duplicate` is fallible (a descriptor table that is full, or a closed socket) and
+/// Windows' `inherited` cannot fail, so each is written for its own half rather than bent into one
+/// shape — the callers are `#[cfg]`-selected platform code either way.
+///
+/// # Errors
+///
+/// The duplicate's failure on Unix — a descriptor table that is full, or a closed socket.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::os::unix::net::UnixListener;
+///
+/// use tinio_sandbox_core::ControlHandle;
+///
+/// let socket = UnixListener::bind("/run/tinio/control.sock")?;
+/// let handle = ControlHandle::duplicate(&socket)?;
+/// assert!(handle.value() >= 0);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(unix)]
+impl ControlHandle {
+    /// Duplicate `socket`, whose duplicate this value owns until the plan is dropped.
+    ///
+    /// # Errors
+    ///
+    /// The duplicate's failure.
+    pub fn duplicate(socket: impl AsFd) -> io::Result<Self> {
+        socket.as_fd().try_clone_to_owned().map(Self)
+    }
+
+    /// The descriptor the child's argv will name, as the core spells inherited descriptors.
+    pub fn value(&self) -> i64 {
+        i64::from(self.0.as_raw_fd())
+    }
+}
+
+/// The object the clear is performed on — the whole reason the Unix form is owned.
+///
+/// `rustix::io::fcntl_setfd` takes the `AsFd` below, so the platform crate clears `FD_CLOEXEC`
+/// on a real descriptor object and never reconstructs one from the integer that crossed argv.
+#[cfg(unix)]
+impl AsFd for ControlHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+/// The Windows half of the one constructor — the handle **value** the launcher's channel owns.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::ControlHandle;
+///
+/// // The value a launcher's `Channel::raw_handles` answered, copied for the plan.
+/// let handle = ControlHandle::inherited(7);
+/// assert_eq!(handle.value(), 7);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(windows)]
+impl ControlHandle {
+    /// The handle `value` the launcher's channel keeps owning, named for the child's argv.
+    ///
+    /// The value is one the launcher already holds, so nothing here can fail and the signature
+    /// says so — the Unix form's `Result` is its own duplicate's, not a shape this one bends to.
+    /// **Nothing is
+    /// duplicated**, because this platform's handoff is a copied handle value: marking it
+    /// inheritable is the whole step, and a duplicate would be a second owner of a pipe the
+    /// child still serves on.
+    pub fn inherited(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// The handle value the platform marks inheritable and names in the child's argv.
+    pub fn value(&self) -> i64 {
+        self.0
+    }
+}
 
 /// Everything a launcher needs that is not an exposed path.
 ///
@@ -43,7 +218,7 @@ pub struct LaunchPlan {
     /// rather than one value because the channel is a **pool**: one instance answers a client and
     /// then stops listening, so the child needs every instance the launcher created (see
     /// [`Self::with_controls`]).
-    controls: Vec<i64>,
+    controls: Vec<ControlHandle>,
     /// The management plane's token, when the launcher generated one (see
     /// [`Self::with_token`]).
     ///
@@ -130,56 +305,95 @@ impl LaunchPlan {
     /// Carry the inherited **control channel's** handles (design decision 16, extended to
     /// the control plane).
     ///
-    /// The handles travel as the raw values the platform turns back into pipes, exactly
-    /// as [`Adopted::controls`] spells them, and for the listener's reason in reverse:
-    /// the socket is *owned* here because the parent must keep it alive, while the
-    /// control pipes are owned by the parent only long enough to create them — the child
-    /// serves on the handles it inherited, so nothing in this plan may own a second
-    /// `OwnedHandle` to the same object.
+    /// Each handle is a [`ControlHandle`] rather than a bare number, and that type's own doc
+    /// carries why: the platform crate has to reach the descriptor **after** the profile
+    /// pre-flight and clear its close-on-exec flag there, so that the throwaway probe inherits
+    /// **neither** descriptor — the clear is what comes *after* the probe, and one performed
+    /// before it would hand the probe the launcher's listening sockets. The listener takes the
+    /// same treatment from the other side: it is owned by the plan as a socket, and its clear
+    /// happens at the same moment.
     ///
-    /// **A set and not one handle.** The channel is a pool of instances, and a client only ever
-    /// reaches one that is *listening*: the launcher creates them all (only it can — the DACL is
-    /// current-user-only and the child's identity is the package SID), and the child serves on all
-    /// of them so that one instance serving a request does not leave the name deaf. Handing over
-    /// fewer than the launcher bound is a channel that answers once and then stops.
+    /// The handles travel as the raw values the platform turns back into the channel's objects,
+    /// exactly as [`Adopted::controls`] spells them, and for the listener's reason in reverse:
+    /// the listener socket is *owned* here because the parent must keep it alive, while the
+    /// control channel is owned by the parent only long enough to hand it over — the child serves
+    /// on the objects it inherited.
     ///
-    /// **Windows-only in practice.** The unix control channel is a socket file the
-    /// confined process binds itself (its jail exposes the state dir read-write), so the
-    /// unix launcher arms answer nothing and the child's `Plane::bind` is unchanged there.
+    /// **A set, because one platform's channel is a pool and the other's is not.** On Windows the
+    /// channel is a pool of pipe instances, and a client only ever reaches one that is
+    /// *listening*: the launcher creates them all (only it can — the DACL is current-user-only and
+    /// the child's identity is the package SID), and the child serves on all of them so that one
+    /// instance serving a request does not leave the name deaf — handing over fewer than the
+    /// launcher bound is a channel that answers once and then stops. On macOS the channel is a
+    /// single unix socket, and the reason it travels at all is the profile rather than an
+    /// identity: the confined child's `bind()` is a network operation that profile grants nothing
+    /// for, so the launcher binds the socket outside the sandbox and the child adopts the
+    /// descriptor. One entry there, and the platform refuses any other count.
     ///
     /// # Examples
     ///
-    /// ```
-    /// use tinio_sandbox_core::LaunchPlan;
+    /// ```no_run
+    /// # #[cfg(unix)]
+    /// # fn main() -> std::io::Result<()> {
+    /// use std::os::unix::net::UnixListener;
     ///
-    /// let plan = LaunchPlan::default().with_controls([1040, 1044]);
-    /// assert_eq!(plan.controls(), [1040, 1044]);
+    /// use tinio_sandbox_core::{ControlHandle, LaunchPlan};
+    ///
+    /// // Two bound sockets to hand over — the fixture, not the subject: what this leg asserts is
+    /// // the plan's own ordering and count, and each value is whatever the platform's duplicate
+    /// // answered.
+    /// let left = ControlHandle::duplicate(UnixListener::bind("/run/tinio/left.sock")?)?;
+    /// let right = ControlHandle::duplicate(UnixListener::bind("/run/tinio/right.sock")?)?;
+    /// let plan = LaunchPlan::default().with_controls([left, right]);
+    /// assert_eq!(plan.controls().len(), 2);
     ///
     /// // The single-handle spelling is the same fact: a plan that carries one instance.
-    /// assert_eq!(LaunchPlan::default().with_control(1040).controls(), [1040]);
+    /// assert_eq!(
+    ///     LaunchPlan::default()
+    ///         .with_control(ControlHandle::duplicate(UnixListener::bind(
+    ///             "/run/tinio/one.sock"
+    ///         )?)?)
+    ///         .controls()
+    ///         .len(),
+    ///     1
+    /// );
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(unix))]
+    /// # fn main() {}
     /// ```
-    pub fn with_controls(mut self, handles: impl IntoIterator<Item = i64>) -> Self {
+    pub fn with_controls(mut self, handles: impl IntoIterator<Item = ControlHandle>) -> Self {
         self.controls = handles.into_iter().collect();
         self
     }
 
     /// Carry **one** inherited control-channel handle — [`Self::with_controls`] with a single
-    /// element, for the callers whose channel is one instance.
+    /// element, for the callers whose channel is one instance: macOS's unix socket, and a
+    /// one-instance pipe.
     ///
     /// # Examples
     ///
-    /// ```
-    /// use tinio_sandbox_core::LaunchPlan;
+    /// ```no_run
+    /// # #[cfg(unix)]
+    /// # fn main() -> std::io::Result<()> {
+    /// use std::os::unix::net::UnixListener;
     ///
-    /// let plan = LaunchPlan::default().with_control(1040);
-    /// assert_eq!(plan.controls(), [1040]);
+    /// use tinio_sandbox_core::{ControlHandle, LaunchPlan};
+    ///
+    /// let handle = ControlHandle::duplicate(UnixListener::bind("/run/tinio/control.sock")?)?;
+    /// let plan = LaunchPlan::default().with_control(handle);
+    /// assert_eq!(plan.controls().len(), 1);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(unix))]
+    /// # fn main() {}
     /// ```
-    pub fn with_control(self, handle: i64) -> Self {
+    pub fn with_control(self, handle: ControlHandle) -> Self {
         self.with_controls([handle])
     }
 
     /// The inherited control channel's handles, in the order the launcher bound them.
-    pub fn controls(&self) -> &[i64] {
+    pub fn controls(&self) -> &[ControlHandle] {
         &self.controls
     }
 
@@ -203,6 +417,7 @@ impl LaunchPlan {
         Self::default().with_payload(LaunchPayload {
             config,
             token: None,
+            confinement: None,
         })
     }
 }
@@ -220,10 +435,11 @@ impl LaunchPlan {
 /// ```
 /// use tinio_sandbox_core::Adopted;
 ///
-/// let adopted = Adopted::new("port = 9000", Some(7), vec![9], None);
+/// let adopted = Adopted::new("port = 9000", Some(7), vec![9], None, None);
 /// assert_eq!(adopted.listener_fd, Some(7));
 /// assert_eq!(adopted.controls(), [9]);
 /// assert_eq!(adopted.token(), None);
+/// assert!(adopted.confinement().is_none());
 /// ```
 #[derive(Clone, PartialEq, Eq, derive_more::Debug)]
 pub struct Adopted {
@@ -239,9 +455,10 @@ pub struct Adopted {
     /// The inherited listener's descriptor, which only the platform can turn
     /// back into a socket.
     pub listener_fd: Option<i64>,
-    /// The inherited control channel's handles, when the parent created the channel — the
-    /// Windows launcher, because a container's process cannot create the pipes its
-    /// current-user-only DACL needs.
+    /// The inherited control channel's handles, when the parent created the channel — a
+    /// launcher platform, either because a container's process cannot create the pipes its
+    /// current-user-only DACL needs (Windows) or because the confinement's profile grants no
+    /// `bind()` for a socket (macOS).
     ///
     /// Spelled exactly like [`Adopted::listener_fd`], and for the same reason: only
     /// the platform can turn the values back into the objects they name, so the core
@@ -268,6 +485,20 @@ pub struct Adopted {
     /// as the configuration text above.
     #[debug(skip)]
     pub(crate) token: Option<String>,
+    /// What this process must do to confine **itself**, when its launcher's
+    /// mechanism hands it that job rather than wrapping its `exec`.
+    ///
+    /// **The child never reads the mechanism's environment variable.** The
+    /// launcher resolves the mechanism, renders the profile and states both here,
+    /// so the confinement a child applies is the one its launcher chose even if
+    /// the environment changed in between — and `None`, the ordinary case, is
+    /// every launch whose confinement was already applied to it (`sandbox-exec`
+    /// and Windows) or that was never confined at all.
+    ///
+    /// **Printed by `Debug`**, unlike the two fields above: the profile names no
+    /// path and holds no secret — the same bytes `sandbox-exec` carries in its
+    /// own process list — and a refusal here is diagnosed from exactly this text.
+    pub(crate) confinement: Option<SandboxSpec>,
 }
 
 /// Recover a launch, or decide this process is the launcher.
@@ -342,6 +573,7 @@ pub fn adopt(
                 Some(listener_fd),
                 control_fds,
                 payload.token,
+                payload.confinement,
             )))
         }
         Err(_) => {
@@ -367,7 +599,7 @@ impl Adopted {
     /// ```
     /// use tinio_sandbox_core::Adopted;
     ///
-    /// let adopted = Adopted::new("port = 9000", Some(7), Vec::new(), None);
+    /// let adopted = Adopted::new("port = 9000", Some(7), Vec::new(), None, None);
     /// assert_eq!(adopted.config(), "port = 9000");
     /// assert_eq!(adopted.listener(), Some(7));
     /// assert!(adopted.controls().is_empty());
@@ -377,12 +609,14 @@ impl Adopted {
         listener_fd: Option<i64>,
         control_fds: Vec<i64>,
         token: Option<String>,
+        confinement: Option<SandboxSpec>,
     ) -> Self {
         Self {
             config: config.into(),
             listener_fd,
             control_fds,
             token,
+            confinement,
         }
     }
 
@@ -397,7 +631,7 @@ impl Adopted {
     /// ```
     /// use tinio_sandbox_core::Adopted;
     ///
-    /// let adopted = Adopted::new("port = 9000", None, Vec::new(), None);
+    /// let adopted = Adopted::new("port = 9000", None, Vec::new(), None, None);
     /// assert_eq!(adopted.config(), "port = 9000");
     /// ```
     pub fn config(&self) -> &str {
@@ -415,7 +649,7 @@ impl Adopted {
     /// ```
     /// use tinio_sandbox_core::Adopted;
     ///
-    /// let adopted = Adopted::new(String::new(), Some(7), Vec::new(), None);
+    /// let adopted = Adopted::new(String::new(), Some(7), Vec::new(), None, None);
     /// assert_eq!(adopted.listener(), Some(7));
     /// ```
     pub fn listener(&self) -> Option<i64> {
@@ -425,14 +659,15 @@ impl Adopted {
     /// The inherited control channel's handles, when the parent created the channel.
     ///
     /// **What the child does with them is the whole point**: a non-empty answer means the
-    /// launcher already owns the control channel — its pipes exist, with the DACL only
-    /// the unrestricted launcher could attach — so the child adopts those objects rather
-    /// than creating a second one. Empty is every other shape of launch: the unix
-    /// launcher arms, an `api`-less build, and a run whose selection carries no local
-    /// channel at all.
+    /// launcher already created the control channel — its pipes exist with a DACL only the
+    /// unrestricted launcher could attach, or its socket is bound where only the unconfined
+    /// process may bind one — so the child adopts those objects rather than creating a second
+    /// one. Empty is every other shape of launch: an in-place platform, an `api`-less build, and
+    /// a run whose selection carries no local channel at all.
     ///
-    /// One entry per instance, and the child serves on all of them: a channel needs more than one
-    /// so that a client can reach a listening instance while another serves. The single-handle
+    /// One entry per instance, and the child serves on all of them: a Windows channel needs more
+    /// than one so that a client can reach a listening instance while another serves, while a
+    /// macOS channel is one socket and the platform refuses any other count. The single-handle
     /// spelling this replaced answered `Option<i64>`, which is the shape a pool cannot use.
     ///
     /// # Examples
@@ -440,7 +675,7 @@ impl Adopted {
     /// ```
     /// use tinio_sandbox_core::Adopted;
     ///
-    /// let adopted = Adopted::new(String::new(), Some(7), vec![9, 13], None);
+    /// let adopted = Adopted::new(String::new(), Some(7), vec![9, 13], None, None);
     /// assert_eq!(adopted.controls(), [9, 13]);
     /// ```
     pub fn controls(&self) -> &[i64] {
@@ -460,17 +695,43 @@ impl Adopted {
     /// ```
     /// use tinio_sandbox_core::Adopted;
     ///
-    /// let adopted = Adopted::new(String::new(), Some(7), vec![9], Some("00".repeat(32)));
+    /// let adopted = Adopted::new(String::new(), Some(7), vec![9], Some("00".repeat(32)), None);
     /// assert_eq!(adopted.token().map(str::len), Some(64));
     /// ```
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
+
+    /// What this process must do to confine **itself**, when its launcher's
+    /// mechanism handed it that job.
+    ///
+    /// **`Some` is a command, not a hint**: the child is the only process that can
+    /// apply a profile to itself, and the process that applied it is one-shot and
+    /// irreversible, so a child that met one of these and served anyway would be
+    /// serving unconfined under a launcher that reported a confinement. `None` is
+    /// every launch whose confinement was already applied — `sandbox-exec`
+    /// wrapping the `exec`, or Windows' container at process creation — and every
+    /// unconfined run.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Adopted;
+    ///
+    /// let adopted = Adopted::new(String::new(), Some(7), Vec::new(), None, None);
+    /// assert!(adopted.confinement().is_none());
+    /// ```
+    pub fn confinement(&self) -> Option<&SandboxSpec> {
+        self.confinement.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, ffi::OsString, fmt::Debug, io, mem, sync::Once};
+    // `io` and `fs` are not imported here: the module above does — `io` for the constructor's
+    // return type, `fs` for the descriptor fixture below — and `use super::*` brings both bindings
+    // in, so a second import of either is a duplicate.
+    use std::{cell::RefCell, ffi::OsString, fmt::Debug, mem, sync::Once};
 
     use tracing::{
         Event, Subscriber,
@@ -634,6 +895,36 @@ mod tests {
     }
 
     #[test]
+    fn adopt_hands_back_the_confinement_the_frame_carried() {
+        // The fourth thing a payload can carry, and the one a child acts on rather than reads:
+        // a mechanism that confines the child in-process puts the render and its values here,
+        // and an `adopt` that dropped them would leave that child serving **unconfined** under a
+        // launcher that reported a confinement — the failure decision 5's fail-closed rule is
+        // about. The absent direction is the other half: every launch whose confinement was
+        // already applied carries none, and `None` is what keeps `sandbox-exec`'s child and
+        // Windows' reading the frame they were written against.
+        let frame = r#"{"config":"port = 9000","confinement":{"mechanism":"sandbox-init","profile":"(deny default)","params":[["E0","/srv/data"]]}}"#;
+        let adopted = adopt([listener_fd_arg(7)], io::Cursor::new(frame))
+            .unwrap()
+            .expect("an element and a decodable payload");
+        let confinement = adopted.confinement().expect("the frame carried one");
+        assert_eq!(confinement.mechanism, "sandbox-init");
+        assert_eq!(confinement.profile, "(deny default)");
+        assert_eq!(confinement.param("E0"), Some("/srv/data"));
+
+        assert!(
+            adopt(
+                [listener_fd_arg(7)],
+                io::Cursor::new(br#"{"config":"port = 9000"}"#)
+            )
+            .unwrap()
+            .expect("the same frame without the field")
+            .confinement()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn adopt_reads_both_inherited_descriptors_out_of_one_argv() {
         // The two elements are read in the same pass, and neither stands in for the
         // other: a child of the Windows launcher inherits a listener and a control
@@ -681,31 +972,70 @@ mod tests {
         );
     }
 
+    /// Handles for the plan legs below, in the shape each platform's `ControlHandle` takes.
+    ///
+    /// **A real descriptor on Unix and a bare value on Windows**, which is the same difference the
+    /// type itself carries: Unix's constructor duplicates a descriptor (so the test opens one) and
+    /// Windows' copies the handle the launcher's channel owns (so the test spells one). The
+    /// ordering assertion below needs two distinct values, and each platform's constructor is what
+    /// makes them distinct.
+    fn control_handles() -> (ControlHandle, ControlHandle) {
+        #[cfg(unix)]
+        {
+            let duplicate = || {
+                let source = fs::File::open("/dev/null").expect("a descriptor to duplicate");
+                ControlHandle::duplicate(&source).expect("duplicate a descriptor")
+            };
+            (duplicate(), duplicate())
+        }
+        #[cfg(windows)]
+        {
+            let copy = |value| ControlHandle::inherited(value);
+            (copy(1040), copy(1044))
+        }
+    }
+
     #[test]
     fn the_plan_carries_the_inherited_control_handles() {
         // The accessor pair, and the `Default` both `bind`ers rely on: a plan that
-        // never named a control handle answers empty, which is the unix and `api`-less
-        // shape of every launch.
-        assert_eq!(LaunchPlan::default().controls(), [] as [i64; 0]);
+        // never named a control handle answers empty, which is the shape of every
+        // `api`-less launch and of a launcher run whose selection names no local
+        // channel. It is not the *unix* shape: macOS is a unix launcher platform and
+        // carries one when it has a local channel.
+        let (first, second) = control_handles();
+        assert_ne!(
+            first.value(),
+            second.value(),
+            "each duplicate is its own descriptor, so the plan's ordering is readable"
+        );
+        assert!(LaunchPlan::default().controls().is_empty());
         assert_eq!(
-            LaunchPlan::new().with_control(1040).controls(),
-            [1040],
+            LaunchPlan::new().with_control(first).controls().len(),
+            1,
             "the single-handle spelling is a one-instance channel"
         );
-        assert_eq!(
-            LaunchPlan::new().with_controls([1040, 1044]).controls(),
-            [1040, 1044],
-            "a pool is every instance the launcher bound, in its order"
+        let (third, fourth) = control_handles();
+        let plan = LaunchPlan::new()
+            .with_controls([third, fourth])
+            .controls()
+            .iter()
+            .map(ControlHandle::value)
+            .collect::<Vec<_>>();
+        assert_eq!(plan.len(), 2, "a pool is every instance the launcher bound");
+        assert_ne!(
+            plan[0], plan[1],
+            "the pool is a set of handles, in its order: {plan:?}"
         );
         // And it rides beside the other two facts rather than replacing one: the
         // listener and the control handles are separate handoffs.
         let plan = LaunchPlan::for_launch("port = 9000".into())
-            .with_controls([1040, 1044])
+            .with_controls([second])
             .with_payload(LaunchPayload {
                 config: "port = 9001".into(),
                 token: None,
+                confinement: None,
             });
-        assert_eq!(plan.controls(), [1040, 1044]);
+        assert_eq!(plan.controls().len(), 1);
         assert_eq!(plan.config(), "port = 9001");
     }
 

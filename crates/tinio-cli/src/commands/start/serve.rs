@@ -109,9 +109,19 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     let mut stop = handles.shutdown.clone();
     // **A confined child arms the forwarded-stop relay** (design §3 step 9, decision 20): its
     // launcher forwards a stop rather than killing it, and without this hook the stop would meet
-    // the default disposition and end the process where it stands instead of draining. Only a
-    // launched child has a launcher to forward one, which is why the arm is the payload's.
-    #[cfg(target_os = "windows")]
+    // the default disposition and end the process where it stands instead of draining — the child
+    // dies by signal, `status.code()` is `None`, and the launcher's exit-status forwarding
+    // (design §3 step 8) turns a graceful stop into an operational failure. Only a launched child
+    // has a launcher to forward one, which is why the arm is the payload's.
+    //
+    // **Both launcher platforms, and the gate says so rather than listing Windows alone.** The
+    // two differ in how the stop reaches them — a Windows container signals only its main process,
+    // so the relay is required there, while macOS's `launchd` signals the whole job and the relay
+    // is defensive (design decision 20's grade table) — but a child of either launcher is a
+    // process whose supervisor forwards the stop, so both need somewhere for it to land. An
+    // in-place platform never reaches this: Linux confines *this* process, so the supervisor
+    // signals the server itself and there is nothing to forward.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if adopted.is_some() {
         let stopper = handles.stopper.clone();
         sandbox::on_stop(move || {
@@ -164,13 +174,19 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     let background = tokio::spawn(scanner_and_sweeper(storage.clone(), stop.clone(), access));
 
     #[cfg(feature = "api")]
-    // **A launched child never writes `state`.** Its launcher does: the file's DACL is
-    // current-user-only and protected, so this process — inside the container, with the package
-    // SID as its identity — is refused every path-based access to it, and the launcher publishes
-    // the file once *this* process reports it is listening. The skip is not a degradation: the
-    // file exists by the time any client can act on the readiness event this line is part of.
-    // `adopted.is_none()` is every process that owns its own `state`, which is every unconfined
-    // run and every in-place platform.
+    // **A launched child never writes `state`.** Its launcher does, and the two launcher
+    // platforms reach that answer by different routes. On Windows the cause is the file's
+    // DACL: current-user-only and protected, so this process — inside the container, with the
+    // package SID as its identity — is refused every path-based access to it. On macOS nothing
+    // refuses the write, and the cause is ownership instead: `state` must name the launcher,
+    // whose `--daemon` readiness check compares the file's pid against the pid it spawned and
+    // whose `Plane::shutdown` removal guard expects itself, and the launch token is minted by
+    // the publisher — the macOS arm's own module doc is that reason's home
+    // (`crate::sandbox::macos`). Either way the launcher publishes the file once *this* process
+    // reports it is listening. The skip is not a degradation: the file exists by the time any
+    // client can act on the readiness event this line is part of. `adopted.is_none()` is every
+    // process that owns its own `state`, which is every unconfined run and every in-place
+    // platform.
     if adopted.is_none() {
         plane.publish(address.port())?; // `state` is written here
     }

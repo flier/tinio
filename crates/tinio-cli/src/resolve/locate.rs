@@ -96,6 +96,36 @@ pub fn resolve_root(explicit: Option<&Path>, from: &Path) -> Result<PathBuf, Err
     })
 }
 
+/// [`resolve_root`] with its walk-up starting point read **only when there is a walk-up**.
+///
+/// [`resolve_root`]'s `from` is consulted in one branch and one only — the explicit `DIR` answer
+/// returns `candidate.canonicalize()` without ever looking at it — so computing `current_dir()`
+/// eagerly at the call site paid for a lookup most runs never use. **On macOS that lookup is a
+/// grant rather than a microsecond**, which is what makes this a correctness fix and not a tidy-up:
+/// `env::current_dir()` is `getcwd()`, `getcwd()` there is `fcntl(F_GETPATH)`, and Seatbelt refuses
+/// it for a working directory under a directory the profile does not grant — so a confined child
+/// **died** with `tinio: I/O error: Operation not permitted (os error 1)` at this call, before it
+/// emitted an event, whenever the launcher's working directory sat inside the operator's home
+/// (measured on macOS 15.8, 2026-09-25, with `tinio server /tmp/<root> --port 0 --sandbox` run from
+/// `~/…` and no home rule in the profile). The launcher platforms' profile has to name every path
+/// its confined child touches, and a directory the child never reads should not be one of them.
+///
+/// The walk-up shape keeps the lookup, and it does not need a grant of its own: when no `DIR` was
+/// given, the root the walk finds is an ancestor of the working directory, so the directory is
+/// inside the served root's own exposure.
+///
+/// # Errors
+///
+/// Whatever [`resolve_root`] refuses, plus the working directory's own I/O error.
+fn rooted(explicit: Option<&Path>) -> Result<PathBuf, Error> {
+    match explicit {
+        // `from` is deliberately the same path: `resolve_root` never reads it on this branch, and
+        // passing the working directory here would be the lookup this function exists to avoid.
+        Some(dir) => resolve_root(Some(dir), dir),
+        None => resolve_root(None, &current_dir()?),
+    }
+}
+
 /// The mode (decision 4): `--read-only` and `TINIO_READ_ONLY` — the flag's two channels, which
 /// clap resolves as one answer — then the config file's `[server] read_only`.
 ///
@@ -346,7 +376,7 @@ fn locate_with(
     provenance: &Provenance,
     adopted: Option<&str>,
 ) -> Result<Located, Error> {
-    let root = resolve_root(discovery.dir.as_deref(), &current_dir()?)?;
+    let root = rooted(discovery.dir.as_deref())?;
     // The config the **mode** is read from, before the state dir is known: `<root>/.tinio`'s own
     // pair, which is readable whatever the mode turns out to be (the root-side file is the one
     // FR-023 keeps readable in read-only mode too). A confined child holding the payload's text
@@ -393,7 +423,11 @@ pub struct Located {
     /// `TINIO_STATE_DIR` as the discovery parse read it, kept for the **candidate pair** a client
     /// probes: it replaces the home-derived candidate in either mode
     /// ([`state_dir_candidates`]), and that answer must be the same one `.env`'s own location
-    /// was resolved from — read once, before the load, or the two could disagree.
+    /// was resolved from — read once, before the load, or the two could disagree. **It is copied
+    /// onto the [`super::Resolution`] this value is consumed by**, which is where the two readers
+    /// that would otherwise have to take it off `Located` *before* the move find it:
+    /// [`super::Resolution::state_dir_source`] (the confinement's read-only macOS rule) and
+    /// [`super::state_dir_candidates`]'s caller.
     pub state_dir_override: Option<PathBuf>,
 }
 

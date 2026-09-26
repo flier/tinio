@@ -4,7 +4,7 @@
 
 **Goal:** Build the part of `--sandbox` that every platform shares — the `Backend` contract, its vocabulary, the launcher machinery both child-launching platforms use, the facade, and the three platform crates as compiling stubs.
 
-**Architecture:** Five crates. `tinio-sandbox-core` owns the trait, the shared vocabulary and the launcher machinery. `tinio-sandbox-linux`, `-macos` and `-windows` implement the trait for their platform; macOS and Windows are `Unsupported` stubs here, present so the trait's shape is exercised from both an in-process backend and a launcher backend rather than guessed from one. `tinio-sandbox` is a thin facade that re-exports the core and, behind `[target.'cfg(…)'​.dependencies]`, the one platform implementation that applies. **This plan builds all five crates and fills none of the platform bodies.**
+**Architecture:** Five crates. `tinio-sandbox-core` owns the trait, the shared vocabulary and the launcher machinery. `tinio-sandbox-linux`, `-macos` and `-windows` implement the trait for their platform; macOS and Windows are `Unsupported` stubs here, present so the trait's shape is exercised from both an in-process backend and a launcher backend rather than guessed from one. `tinio-sandbox` is a thin facade that re-exports the core and, behind `[target.'cfg(…)'.dependencies]`, the one platform implementation that applies. **This plan builds all five crates and fills none of the platform bodies.**
 
 **Tech Stack:** Rust 2024, `thiserror` for error types, `derive_more` for `Display`, `serde` + `serde_json` for the event and payload wire types, `sse-core` for SSE framing, and `rustix` (in the platform crates the stubs declare but do not yet use).
 

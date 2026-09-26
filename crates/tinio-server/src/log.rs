@@ -9,6 +9,7 @@
 //! `otel` feature adds an OTLP export layer (T053).
 
 use std::{
+    env,
     error::Error,
     fmt::Debug,
     fs::File,
@@ -304,8 +305,27 @@ pub fn build_subscriber(
         Verbosity::Debug => Level::DEBUG,
     };
     let stderr = BoxMakeWriter::new(io::stderr).with_max_level(level);
+    // **ANSI follows `NO_COLOR`, and the variable is the *only* thing consulted.**
+    // `tracing-subscriber` turns ANSI on whenever its `ansi` feature is compiled in — it never asks
+    // `isatty` — so a run whose stderr is a pipe, a journal or a CI step still gets escapes around
+    // every field *name*: `step` arrives as `\x1b[3mstep\x1b[0m\x1b[2m=\x1b[0m"profile"`, and no
+    // consumer can find `step="profile"`. Honouring `NO_COLOR` is the standard remedy and the one
+    // an operator already has: `NO_COLOR=1 tinio server …` gives plain text, and a terminal that
+    // wants colour keeps it. The workspace's other subscribers set `with_ansi(false)` outright
+    // because they exist only inside tests; this one is the product's, so the choice belongs to
+    // whoever is reading the log.
+    //
+    // Measured on macOS 15.8 (2026-09-25): the sandbox phase's end-to-end leg failed its
+    // `step="profile"` assertion against this subscriber's output for exactly this reason, while
+    // the confined server itself was serving requests — so that leg now exports `NO_COLOR`. The
+    // JSON layer needs no counterpart: its field names are quoted keys, never styled.
+    let ansi = env::var_os("NO_COLOR").is_none();
     let op_layer = match format {
-        Format::Text => fmt::layer().with_writer(stderr).with_target(false).boxed(),
+        Format::Text => fmt::layer()
+            .with_writer(stderr)
+            .with_target(false)
+            .with_ansi(ansi)
+            .boxed(),
         Format::Json => fmt::layer()
             .json()
             .with_writer(stderr)
@@ -333,8 +353,6 @@ pub fn otel_layer<S>(
 where
     S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
 {
-    use std::env;
-
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
     use opentelemetry_sdk::trace::SdkTracerProvider;

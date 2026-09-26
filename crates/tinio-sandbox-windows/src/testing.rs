@@ -28,17 +28,19 @@
 //! precondition may be turned into a skip, so a leg cannot opt itself out of an
 //! assertion in a second spelling of [`ALLOW_SKIP`].
 //!
+//! **[`wait_for_exit`] is defined in [`tinio_util::testing`] and re-exported
+//! here.** This module used to hold it, and this crate's root is
+//! `#![cfg(target_os = "windows")]` — so the macOS legs that need the same rule
+//! could not import it at all. The definer moved to the crate both platforms
+//! build; the re-export is what keeps every caller of this path (this crate's own
+//! suites, `tinio-server/tests/support/windows_e2e_harness.rs`'s wrapper) working
+//! unchanged.
+//!
 //! Behind the crate's own `#![cfg(target_os = "windows")]` for the crate root's
 //! reason: `crates/*` has no per-target member form, so this compiles on hosts
 //! it does not serve.
 
-use std::{
-    env, fs,
-    path::Path,
-    process::{Child, Command, ExitStatus},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{env, fs, path::Path, process::Command};
 
 use crate::acl;
 
@@ -94,35 +96,17 @@ pub fn host_cannot(what: &str, reason: &str, remedy: &str) -> bool {
 /// Wait for `child` to exit, or kill it and fail the test rather than block on
 /// it.
 ///
-/// **Every spawned process is waited for or killed on every path, red ones
-/// included**, and this is the one function that rule is spelled in — which is
-/// why it is here rather than in each suite. The failing path kills before it
-/// panics: a child left running keeps `target\debug\deps\<suite>-<hash>.exe`
-/// open for the rest of the run, which breaks a later build with `LNK1104`, and
-/// it keeps writing its own libtest output into the parent's.
-///
-/// `try_wait` polls rather than `wait_with_output` waiting, which is the price
-/// of the bound: nothing here needs the child's captured output, since a child
-/// that inherits this process's streams has already written it where the reader
-/// of a red log will see it. `what` names the process whose exit is being waited
-/// for, because a suite has more than one.
-pub fn wait_for_exit(child: &mut Child, within: Duration, what: &str) -> ExitStatus {
-    let deadline = Instant::now() + within;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll the child") {
-            return status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "{what} did not exit within {within:?} — whatever it did is in the output above; \
-                 it has been killed"
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
+/// **The definition is [`tinio_util::testing::wait_for_exit`]'s, re-exported
+/// rather than written again**: this crate's root is
+/// `#![cfg(target_os = "windows")]`, so the rule's other callers — the server's
+/// macOS e2e leg and the macOS crate's own suites — cannot reach a definer that
+/// lives here, and each re-spelled the deadline/poll/kill rule for itself. The
+/// name stays on this path because that is what this crate's own suites
+/// (`tests/common/mod.rs`) and the server harness's wrapper
+/// (`tinio-server/tests/support/windows_e2e_harness.rs`) already import; the
+/// rule, its bounds and the kill-before-panic are documented there.
+#[doc(inline)]
+pub use tinio_util::testing::wait_for_exit;
 
 /// `icacls` on `path`, with `args` appended, and its exit status checked.
 ///

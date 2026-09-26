@@ -16,7 +16,16 @@ mod spawn;
 use std::time::{Duration, Instant};
 
 use common::wait_timeout;
-use spawn::{Scratch, Serve, state_var};
+#[cfg(all(windows, feature = "sandbox"))]
+use spawn::state_var;
+// The state-directory override is the environment channel only one test can reach, and that test is
+// `cfg(all(windows, feature = "sandbox"))` — the in-root state directory is refused by the shared
+// containment rule before any server starts, and Windows is the platform where one directory has
+// two spellings (the case rule the test is about). It is imported under that same gate rather than
+// in the list above, because the macOS and Linux legs of this suite never call it and the
+// workspace's `-D warnings` gate turns the unused name into a failure — which the macOS clippy step
+// added for the sandbox phase is what caught.
+use spawn::{Scratch, Serve};
 use tinio_config::sources::SANDBOX_VAR;
 use tinio_sandbox::Event;
 use tokio::time::sleep;
@@ -224,17 +233,30 @@ async fn a_sandbox_channel_switched_off_is_not_a_refusal() {
     server.stop();
 }
 
-/// Case 11: the state-directory guard is case-folded, because on the volume it
-/// runs on the two spellings are one directory.
+/// Case 11: the in-root state directory is refused whatever its case, because on
+/// the volume it runs on the two spellings are one directory.
 ///
 /// Design §9 refuses a read-only root that holds the state directory, because
 /// the launcher would have to grant that directory a **read-write** entry
 /// inside a root the operator asked to expose read-only. On NTFS
 /// `<scratch>\root` and `<scratch>\ROOT` resolve to the same directory while a
 /// literal component comparison calls them unrelated — so the state directory
-/// spelled in the other case slipped past the guard and got exactly that entry.
-/// `tinio_util::path::path_contains` is the shared rule both call sites now
-/// use; this leg is what fails while they do not.
+/// spelled in the other case slipped past both guards and got exactly that entry.
+/// `tinio_util::path::contains_under_any_spelling` is the shared rule every call
+/// site now uses — the config layer's guard and the launcher's among them; this
+/// leg is what fails while they do not.
+///
+/// **Two layers refuse this pair and the config layer answers first, which is why
+/// the sentence pinned below is its own.** `discover::load_or_create` asks
+/// `contains_under_any_spelling` before it auto-creates the config, and this leg's first start
+/// has no config yet, so the refusal that lands is `server.read_only`'s
+/// (`read-only mode never writes under the served root`); the launcher's
+/// `refuse_in_root_state_dir` — whose sentence names the state directory it would
+/// have granted read-write — is the second of the two and is never reached. The
+/// earlier refusal is the right outcome rather than an accident: the pair is
+/// unservable for the reason both layers state, and the case fold that makes
+/// `ROOT` and `root` one directory is what puts the pair in front of the earlier
+/// one at all.
 ///
 /// **The two paths really are one directory**: the root exists as `<scratch>\
 /// root`, `TINIO_STATE_DIR` names `<scratch>\ROOT\state`, and the volume
@@ -243,8 +265,10 @@ async fn a_sandbox_channel_switched_off_is_not_a_refusal() {
 /// to build the exposure set with a read-write entry inside the read-only root
 /// (which case 11's unit-test twin in the example pins directly).
 ///
-/// Windows-only because the fold is, and feature-gated because the refusal is
-/// the launcher's — on a build without `sandbox` the flag is refused before it.
+/// Windows-only because the fold is, and feature-gated because a build without
+/// `sandbox` refuses `--sandbox` at the flag, before any configuration is read —
+/// so the state-directory refusal is unreachable there and this leg would fail
+/// for the wrong reason.
 #[cfg(all(windows, feature = "sandbox"))]
 #[tokio::test]
 async fn an_in_root_state_dir_is_refused_whatever_its_case() {
@@ -269,13 +293,14 @@ async fn an_in_root_state_dir_is_refused_whatever_its_case() {
          spelling does not make it servable ({status}); stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("holds the state directory"),
-        "the refusal must be the in-root state directory guard rather than anything else it could \
-         have failed on; stderr:\n{stderr}"
+        stderr.contains("read-only mode never writes under the served root"),
+        "the refusal must be the config layer's in-root refusal rather than anything else it could \
+         have failed on (the launcher's guard is the second layer and this run never reaches it); \
+         stderr:\n{stderr}"
     );
-    // **And it is a frame, not only a stderr line.** This guard refuses inside the
-    // launcher's arm, whose result is `main`'s return value — so the frame comes from
-    // the boundary rather than from the guard: `run`'s serving arm sends every refusal
+    // **And it is a frame, not only a stderr line.** The config layer runs inside
+    // `start::run`, whose result is `main`'s return value — so the frame comes from the
+    // boundary rather than from the refusal: `run`'s serving arm sends every refusal
     // that `start::run` returns through `events::emit_error` before the `Err` travels
     // on, which is decision 19's "a startup failure is an event rather than an absence"
     // applied to the sequence as a whole. The lines are pinned rather than the event
@@ -284,7 +309,7 @@ async fn an_in_root_state_dir_is_refused_whatever_its_case() {
         .stdout_event()
         .expect("the refusal frame, since the process exited");
     assert!(
-        matches!(&event, Event::Error { message } if message.contains("holds the state directory")),
+        matches!(&event, Event::Error { message } if message.contains("read-only mode never writes under the served root")),
         "the in-root refusal must send an `error` frame, not {event:?}"
     );
     assert_eq!(

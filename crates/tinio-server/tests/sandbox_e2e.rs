@@ -16,13 +16,12 @@ mod common;
 
 use std::{
     env, fs,
-    io::{self, Read, Write},
-    net::TcpStream,
+    io::{self, Read as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
 
-use common::{tinio_bin, wait_for_listening};
+use common::{answer, tinio_bin, wait_for_listening};
 use tinio_sandbox::linux::Mechanism;
 
 /// The one way past a missing precondition, and it is a deliberate opt-in.
@@ -198,12 +197,13 @@ fn a_confined_server_serves() {
     // `SocketAddr`, `SocketAddr` implements `ToSocketAddrs`, and that is the
     // point of the field being typed — there is no text in between that could
     // disagree with what was bound. (There is no `SocketAddr::as_str`.)
-    let mut stream = TcpStream::connect(addr).expect("connect to the confined server");
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .expect("write");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
+    // The probe itself is `common::answer`'s — the request bytes, the read and
+    // the bound in one place — and its refusal goes through `fail`, which kills
+    // the child before it reports, the rule the handshake above already follows.
+    let response = match answer(addr) {
+        Ok(response) => response,
+        Err(message) => fail(&mut child, &message),
+    };
     assert!(response.starts_with("HTTP/1.1 "), "{response}");
 
     child.kill().expect("kill");
@@ -271,12 +271,10 @@ fn a_confined_read_only_server_refuses_writes_through_the_served_root() {
         Ok(addr) => addr,
         Err(message) => fail(&mut child, &message),
     };
-    let mut stream = TcpStream::connect(addr).expect("connect to the confined server");
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .expect("write");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
+    let response = match answer(addr) {
+        Ok(response) => response,
+        Err(message) => fail(&mut child, &message),
+    };
     assert!(response.starts_with("HTTP/1.1 "), "{response}");
 
     // The read first, through the confined process's own root: the planted

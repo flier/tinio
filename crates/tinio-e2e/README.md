@@ -54,7 +54,7 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
 | `@cli` | scenario | The CLI scenarios (`cli_lifecycle.feature`): they spawn the real `tinio` binary and observe it from outside, so the `#[before]` hook spawns nothing for them — no in-process server, no wire client. The binary must be built first (`cargo build -p tinio`); `{root}`/`{state}` in a step's command line expand to the scenario's scratch root and relocated state dir. |
 | `@unix` `@windows` | scenario | Platform-bound: the step definitions exist only on that platform, so the default filter excludes the other platform's tag (an undefined step is a failure under `fail_on_skipped()`). Today only the notify scenario carries one (`@unix`). |
-| `@confinement` | scenario | Host-bound: the two sandbox scenarios of `cli_lifecycle.feature` need a target that can build the confinement, which no CI leg assumes. The default filter runs them on macOS (whose backend is the stub, so the leg is one deterministic refusal) and takes them elsewhere only with `TINIO_E2E_CONFINEMENT=1`; their real gate is the platform script on a host that owes the precondition (`docs/tests.md`, "Platform-gated verification"). |
+| `@confinement` | scenario | Host-bound: the two sandbox scenarios of `cli_lifecycle.feature` run a real confinement, and the runner's default filter is what selects them (`tests/cucumber.rs` — on macOS by default, elsewhere only with `TINIO_E2E_CONFINEMENT=1`). Their real gate is the platform script on a host that owes the precondition (`docs/tests.md`, "Platform-gated verification"). |
 
 The **`@external` umbrella** is `@interop` ∪ `@boto3` ∪ `@mc`.
 
@@ -81,13 +81,14 @@ cargo test -p tinio-e2e --test traceability      # spec↔tag cross-check
   @parquet and not @interop and not @boto3 and not @mc and not @confinement'` with
   `TINIO_E2E_BACKEND=mem`.
 - **The `@confinement` pair is opt-in off macOS, and serial when it runs.** Opt in only on a host
-  that can actually build the confinement (WSL2 with an unprivileged userns, or a Windows host
-  with a console and a writable volume) — CI never opts in: ubuntu's AppArmor default refuses the
+  that can actually confine (WSL2 with an unprivileged userns, or a Windows host with a console
+  and a writable volume) — CI never sets the variable: ubuntu's AppArmor default refuses the
   userns, a hosted Windows runner owes no ACE-grant budget, and either would make the leg
-  permanently red, which certifies nothing. `--concurrency 1` is the spelling to use: the pair
-  timed out twice at the default concurrency while the harness still had its 30 s bound, and one
-  launcher run's grant alone is tens of seconds (the six timings, and what they do not prove, are
-  in `docs/tests.md`, "Platform-gated verification (Windows)").
+  permanently red, which certifies nothing. macOS needs no opt-in: the runner's default filter
+  selects the pair there, where the launcher only binds and spawns. `--concurrency 1` is the
+  spelling to use: the pair timed out twice at the default concurrency while the harness still had
+  its 30 s bound, and one launcher run's grant alone is tens of seconds (the six timings, and what
+  they do not prove, are in `docs/tests.md`, "Platform-gated verification (Windows)").
   `TINIO_E2E_CONFINEMENT=1 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036' --concurrency 1`
 - **The `@cli` scenarios spawn the real binary**, so it has to be built before the run
   (`cargo build -p tinio`) — `assert_cmd::cargo::cargo_bin` resolves `<profile>/tinio` beside the
