@@ -234,7 +234,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
     #[cfg(unix)]
     use crate::_util::path::path_contains;
     #[cfg(windows)]

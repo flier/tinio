@@ -6,7 +6,7 @@
 //! socket the element names, and the launcher side is the only place that can
 //! see what the child made of it.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 mod common;
 
@@ -49,10 +49,7 @@ fn child_role() {
     assert_eq!(adopted.config(), "version = 1\n");
     // The element named the listener's handle and `adopt` handed back the
     // descriptor; rebuilding the socket is this crate's half.
-    assert!(
-        adopted.listener_fd.is_some(),
-        "the element named a listener"
-    );
+    assert!(adopted.listener().is_some(), "the element named a listener");
     let listener = launch::listener(&adopted).expect("rebuild the listener");
     assert!(listener.local_addr().expect("a bound socket").port() > 0);
     let report = env::var(REPORT).expect("report path");

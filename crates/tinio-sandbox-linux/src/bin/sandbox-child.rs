@@ -36,6 +36,27 @@ fn main() {
     use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, Sandbox};
     use tinio_sandbox_linux::{Backend, Options};
 
+    // **The second mode of this probe, and it exists so a prober installs the
+    // crate's own program rather than a copy of the policy.** `filter_program`
+    // is pure and the filter is irreversible, so a test cannot install it and a
+    // prober that spelled the instruction list a second time could drift from
+    // the one the kernel actually gets. This mode prints the compiled program —
+    // one `struct sock_filter` per line, `code jt jf k` — and returns before
+    // anything is unshared, mapped or mounted; the WSL2 script's harness is what
+    // reads it (`scripts/wsl-chroot.sh`'s seccomp leg).
+    if env::var_os("TINIO_SANDBOX_TEST_DUMP_FILTER").is_some() {
+        use tinio_sandbox_linux::seccomp::{Arch, filter_program};
+
+        let arch = Arch::current().expect("this target has a syscall table");
+        for instruction in filter_program(arch) {
+            println!(
+                "{:04x} {:02x} {:02x} {:08x}",
+                instruction.code, instruction.jt, instruction.jf, instruction.k
+            );
+        }
+        return;
+    }
+
     let root = env::var("TINIO_SANDBOX_TEST_ROOT").expect("child needs a root");
     // **The address the parent is listening on, not one on the network.** It is
     // named by the parent because only the parent can hold the listener that

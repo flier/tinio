@@ -1,7 +1,7 @@
 //! The Job object, tested against an unconfined child: the primitive is
 //! independent of the AppContainer, and a failure here is then unambiguous.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 use std::{
     os::windows::io::AsRawHandle,

@@ -16,7 +16,7 @@
 //! there, and that is the contract". What the guard still owns is the profile's
 //! lifetime.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 // `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
 // is deliberately neither `Send` nor `Sync`, which is what clippy's
 // `arc_with_non_send_sync` is about; this one is shared ownership inside one test

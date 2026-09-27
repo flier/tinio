@@ -66,10 +66,10 @@ pub const EXIT_TIMEOUT_VAR: &str = "TINIO_LAUNCHER_EXIT_TIMEOUT_SECS";
 /// concurrent writers or the launcher's ACE count: the residual package ACEs were
 /// removed (Access 68 → 11) and the latency stayed at 19–30 s per call.
 /// `docs/tests.md`'s Windows section carries the whole experiment and the
-/// controls that exclude the rest. **The launcher's grant and its rollback are
-/// each one such write** (`icacls` on the program directory), so on that host a
-/// 15 s bound is below the cost of a single call and the leg fails on the clock
-/// instead of on its subject.
+/// controls that exclude the rest. **The launcher's grant is one such write**
+/// (`icacls` on the program directory — its DACL *reads* are API calls, its
+/// writes are the tool's), so on that host a 15 s bound is below the cost of a
+/// single `icacls` call and the leg fails on the clock instead of on its subject.
 ///
 /// **On such a host**: set [`EXIT_TIMEOUT_VAR`] to a larger number of seconds and
 /// run the suite with `--test-threads=1`, so two launchers do not write the same
@@ -94,6 +94,43 @@ pub fn exit_timeout() -> Duration {
         },
         Err(_) => DEFAULT_EXIT_TIMEOUT,
     }
+}
+
+/// `tinio server <root> --port <port> --sandbox`, as both of this file's run
+/// shapes start it: **the argv, the environment and the creation flags are one
+/// body**, so what distinguishes a run is which of them the leg keeps, never how
+/// the launcher is invoked.
+///
+/// **The CLI serves an existing `DIR` or refuses it** ("pass an existing DIR"),
+/// where the retired example created the root it was handed: the harness makes
+/// it, and the legs that are about a *missing* root make their own absence.
+///
+/// **The credential pair is injected here rather than left to the operator's
+/// environment.** Every request these legs make is signed by `common::signed`
+/// with `DEFAULT_ROOT_ACCESS_KEY` and [`SECRET_KEY`], while the CLI reads
+/// `[auth]` — and a first start *generates* a random pair into the config it
+/// creates, so a leg that did not pin the pair would be answered
+/// `AccessDenied`/`SignatureDoesNotMatch` for a request the harness itself
+/// signed. Both names are the same two constants the signing side uses (not a
+/// third copy of their values), the child inherits the launcher's environment,
+/// and `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are the chain
+/// `crates/tinio-server/tests/serve_read_only.rs`'s `Serve::spawn` uses for the
+/// same reason.
+fn launcher_command(root: &Path, port: u16) -> Command {
+    fs::create_dir_all(root).expect("the served root");
+    let mut command = Command::new(tinio_bin());
+    command
+        .args([
+            "server",
+            root.to_str().expect("a UTF-8 root"),
+            "--port",
+            &port.to_string(),
+            "--sandbox",
+        ])
+        .env("TINIO_ACCESS_KEY", DEFAULT_ROOT_ACCESS_KEY)
+        .env("TINIO_SECRET_KEY", SECRET_KEY)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP);
+    command
 }
 
 /// One `tinio server <root> --sandbox` run, from the test's side.
@@ -126,9 +163,23 @@ pub struct Run {
 /// the ANSI SGR sequences `tracing`'s text formatter writes separate a field's name
 /// from its `=`, so [`without_ansi`] runs first.
 pub fn grant_event(text: &str) -> Option<String> {
+    step_event(text, "grant the ACLs")
+}
+
+/// The one line of `text` that carries the `step="<step>"` event named by `step`,
+/// or `None` when the process reported no such event.
+///
+/// **The caller's step name is the contract, and the line is not** — [`grant_event`]
+/// states the rule, and this is the one body it and the legs' other step reads share:
+/// the launcher platforms write `step="child exit"` with the code the child left
+/// (`tinio-sandbox-windows`'s `process.rs`, the other end of its `CreateProcessW`
+/// event) exactly as they write `step="grant the ACLs"`, so both are read the same
+/// way rather than by a prefix test each leg spells for itself.
+pub fn step_event(text: &str, step: &str) -> Option<String> {
+    let needle = format!(r#"step="{step}""#);
     without_ansi(text)
         .lines()
-        .find(|line| line.contains(r#"step="grant the ACLs""#))
+        .find(|line| line.contains(&needle))
         .map(str::to_owned)
 }
 
@@ -186,37 +237,16 @@ impl Run {
     /// reaches the file, because its stderr is an inherited handle: the access
     /// decision was made at the open, and no path is involved afterwards.
     ///
-    /// **The credential pair is injected here rather than left to the operator's
-    /// environment.** Every request these legs make is signed by `common::signed`
-    /// with `DEFAULT_ROOT_ACCESS_KEY` and [`SECRET_KEY`], while the CLI reads
-    /// `[auth]` — and a first start *generates* a random pair into the config it
-    /// creates, so a leg that did not pin the pair would be answered
-    /// `AccessDenied`/`SignatureDoesNotMatch` for a request the harness itself
-    /// signed. Both names are the same two constants the signing side uses (not a
-    /// third copy of their values), the child inherits the launcher's environment,
-    /// and `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are the chain
-    /// `crates/tinio-server/tests/serve_read_only.rs`'s `Serve::spawn` uses for the
-    /// same reason.
+    /// What this shape adds to [`launcher_command`] is what it *waits for*: the
+    /// endpoint the confined child reports, read off the stdout this run keeps
+    /// piped. A leg whose subject is a launch that never reports wants [`Exit`]
+    /// instead, which waits for nothing and keeps both streams as files.
     pub(super) fn spawn(root: &Path, port: u16) -> Self {
-        // **The CLI serves an existing `DIR` or refuses it** ("pass an existing DIR"), where the
-        // retired example created the root it was handed: the harness makes it, and the legs
-        // that are about a *missing* root make their own absence.
-        fs::create_dir_all(root).expect("the served root");
         let log = root.with_file_name("launcher.log");
         let stderr = fs::File::create(&log).expect("create the launcher's log");
-        let mut launcher = Command::new(tinio_bin())
-            .args([
-                "server",
-                root.to_str().expect("a UTF-8 root"),
-                "--port",
-                &port.to_string(),
-                "--sandbox",
-            ])
-            .env("TINIO_ACCESS_KEY", DEFAULT_ROOT_ACCESS_KEY)
-            .env("TINIO_SECRET_KEY", SECRET_KEY)
+        let mut launcher = launcher_command(root, port)
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .expect("spawn tinio server");
         // The handshake is the harness's; the failure is this leg's, because a
@@ -260,9 +290,9 @@ impl Run {
     /// decision 21's second artifact, read the way an operator reads it.
     ///
     /// **This is the only half of decision 21 an ACE count cannot see.** The
-    /// profile and the ACEs are two artifacts a clean run takes back, and a
-    /// launcher that rolled the ACEs up and left the profile behind passes
-    /// every assertion on the DACL: that is exactly the state this phase's own
+    /// profile is the artifact a clean run takes back — the ACEs are standing and
+    /// stay — so a launcher that left the profile behind passes every assertion
+    /// on the DACL: that is exactly the state this phase's own
     /// diagnosis found (eight leaked profiles from runs that exited cleanly,
     /// because a `process::exit` had landed above the `Drop` that deletes
     /// them), and the fix for it is the kind a later `process::exit` can
@@ -318,6 +348,166 @@ impl Run {
     }
 }
 
+/// One `tinio server <root> --sandbox` run **whose subject is how it ends**.
+///
+/// **What [`Run`] cannot serve, and why this is not a second spelling of it.**
+/// `Run::spawn` blocks until the confined server reports an endpoint, which is the
+/// wrong shape for a leg whose subject *is* a launch that never reports: that
+/// handshake would spend the failure on its own "no `listening` event" message, and
+/// the frame the launcher writes on its way out — the thing such a leg is here to
+/// read — would be quoted from inside a helper's panic instead of asserted. Here
+/// nothing is waited for: **both streams are files beside the root**, stdout
+/// included, because the assertion reads the frames written there and a pipe nobody
+/// drains is a blocked writer rather than a missing event — and the leg waits for
+/// the exit itself ([`wait_for_exit`], which is also what kills a launcher that
+/// never ends).
+///
+/// The argv, the environment and the creation flags are [`launcher_command`]'s, so
+/// the two shapes differ in nothing but what they wait for.
+pub struct Exit {
+    pub(super) launcher: Child,
+    /// The launcher's **stdout**: the event stream, and the frames a leg asserts on.
+    pub(super) stdout: PathBuf,
+    /// The launcher's stderr, which the confined child inherits: the log, and the
+    /// child's own `tinio: …` refusal among it.
+    pub(super) log: PathBuf,
+}
+
+/// The rule [`Run`]'s `Drop` states, for the same reason and with the same
+/// consequence: a leg that panics between the spawn and its own wait would otherwise
+/// leave the launcher *and* the confined child alive for the rest of the run,
+/// holding the job, the ACEs and the image the next build of the binary needs.
+impl Drop for Exit {
+    fn drop(&mut self) {
+        let _ = self.launcher.kill();
+        let _ = self.launcher.wait();
+    }
+}
+
+impl Exit {
+    /// Spawn `tinio server <root> --sandbox` on `root` and return at once.
+    pub(super) fn spawn(root: &Path, port: u16) -> Self {
+        let stdout = root.with_file_name("launcher.stdout");
+        let log = root.with_file_name("launcher.log");
+        let launcher = launcher_command(root, port)
+            .stdout(Stdio::from(
+                fs::File::create(&stdout).expect("create the launcher's stdout file"),
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(&log).expect("create the launcher's log"),
+            ))
+            .spawn()
+            .expect("spawn tinio server");
+        Self {
+            launcher,
+            stdout,
+            log,
+        }
+    }
+
+    /// The launcher's stdout as it stands — for a launch that never reported, the
+    /// `error` frame the parent wrote on its own behalf and nothing else.
+    pub(super) fn stdout_text(&self) -> String {
+        fs::read_to_string(&self.stdout).expect("the launcher's stdout")
+    }
+
+    pub(super) fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).expect("the launcher's log")
+    }
+}
+
+/// `icacls <path> <args…>`, **checked**: a refusal here is the fixture's failure and
+/// not the product's, so it fails the leg with the tool's own text rather than
+/// leaving an assertion to discover the missing ACE.
+pub fn icacls_with(path: &Path, args: &[&str]) {
+    let output = Command::new(acl::icacls_binary())
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("run icacls on {}: {err}", path.display()));
+    assert!(
+        output.status.success(),
+        "icacls {} {args:?}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The SID of the account this process runs as — `whoami`'s own answer, in the
+/// `S-1-5-…` form [`acl::grant_spec`] takes.
+///
+/// **A SID and not a name, because a name is resolved.** `icacls` takes a
+/// `*`-prefixed SID literally and resolves every other spelling against the local
+/// (or domain) account database, so a name another principal happens to share would
+/// grant the wrong account — the rule [`acl::grant_spec`]'s own doc states from the
+/// crate's side, which is why this leg's fixture asks for a SID.
+///
+/// `/fo csv /nh` is `whoami`'s machine-parsable form: one record, no header, every
+/// field quoted and `,`-separated, the SID last. A refusal is the fixture's, so it
+/// fails with the tool's text.
+pub fn current_user_sid() -> String {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("run whoami");
+    assert!(
+        output.status.success(),
+        "whoami: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .trim()
+        .rsplit("\",\"")
+        .next()
+        .map(|field| field.trim_matches('"').to_string())
+        .unwrap_or_default();
+    assert!(
+        sid.starts_with("S-1-5-"),
+        "whoami answered no SID this leg can grant: {text:?}"
+    );
+    sid
+}
+
+/// **`dir` and everything under it grant this process's own user alone** — the
+/// fixture a leg needs when the subject is a path a *confined child* cannot reach.
+///
+/// **The seal is the whole point, and it is a removal rather than a denial.** A
+/// confined child's access check is a restricted-token one: an object it opens must
+/// carry an ACE for a SID of its own (the package SID `S-1-15-2-…` or `ALL
+/// APPLICATION PACKAGES`, which is what the launcher's grants name) — and a *deny*
+/// ACE for such a SID does not refuse it, because deny ACEs are evaluated against a
+/// token's normal groups while the restriction is a second, allow-only pass. So an
+/// object is hidden from the child by **carrying no container ACE at all**, which is
+/// what `/inheritance:r` plus one ACE for the calling user leaves.
+///
+/// **The inherited ACEs have to go, and that is what makes this deterministic.** A
+/// served tree under a scratch directory that grants `ALL APPLICATION PACKAGES` —
+/// which some hosts' scratch trees do — would be reachable from inside the container
+/// whatever this leg did to one directory of its own; removing the inheritance is
+/// what turns "this host's tree happens not to grant it" into a property of the
+/// fixture. Every ACE this leaves is the calling user's, which the launcher (the same
+/// account, unconfined) and this process both keep.
+pub fn seal_to_current_user(dir: &Path) {
+    let spec = acl::grant_spec(
+        &current_user_sid(),
+        Target::Directory,
+        AccessMode::ReadWrite,
+    );
+    icacls_with(dir, &["/inheritance:r"]);
+    icacls_with(dir, &["/grant:r", &spec, "/q"]);
+    // The precondition itself, read back: a seal that did not take would let the
+    // confined child through and turn the leg's subject into its fixture's accident.
+    let listing = icacls(dir);
+    assert!(
+        !listing.contains("ALL APPLICATION PACKAGES")
+            && !listing.contains("S-1-15-2-")
+            && !listing.contains("S-1-15-3-"),
+        "the seal did not take: an ACE a confined child can satisfy is still on {}:\n{listing}",
+        dir.display()
+    );
+}
+
 /// **The host's preconditions, probed before anything is spawned — and the only
 /// place this suite's opt-outs are decided.** Returns `false` when this machine
 /// cannot do something a leg needs *and* the operator has deliberately said so;
@@ -327,11 +517,14 @@ impl Run {
 /// spawn, and the reason names whichever answered no:
 ///
 /// - **can it confine at all** — [`host_can_confine`] performs the launcher's own
-///   setup acts against a throwaway directory and rolls them back;
+///   setup acts against a throwaway directory and leaves them standing with it
+///   (every grant this crate makes is standing, design decision 15 — the scratch
+///   directory's own removal is what takes its ACE away);
 /// - **can it deliver a console control event** — [`console_device`] opens
 ///   `CONOUT$`, which is the console a `GenerateConsoleCtrlEvent` needs to have
-///   anywhere to go. The rollback half of the second leg depends on that event,
-///   and a host without a console cannot exercise that half at all.
+///   anywhere to go. The clean-exit half of the second leg depends on that event
+///   (the launcher, still alive, deletes the profile it created), and a host
+///   without a console cannot exercise that half at all.
 ///
 /// That is the precondition Ruling 28 makes an opt-out, and the shape is P1's
 /// suite's: fail by default, name what is missing *and the remedy*, and let
@@ -377,7 +570,7 @@ pub fn host_missing() -> Option<String> {
 /// caller's console — `control::send_stop`'s own `# Errors` names "there is no
 /// console to deliver on" as one of its two causes — and opening the console
 /// device fails exactly when there is none. A CI runner that spawns this suite
-/// without a console cannot exercise the rollback half of the second leg, which
+/// without a console cannot exercise the clean-exit half of the second leg, which
 /// is why that is a precondition here rather than a failure there.
 ///
 /// It is deliberately **not** a probe of the launcher's group: whether a

@@ -16,8 +16,7 @@ tinio-sandbox-core.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
-# The bounded-exit poll the suites wait with, shared with the other platform's tests and the
-# server's legs — the rule lives in `tinio-util::testing`, not per suite.
+
 tinio-util = { workspace = true, features = ["testing"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

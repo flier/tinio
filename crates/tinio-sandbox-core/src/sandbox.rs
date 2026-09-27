@@ -49,6 +49,16 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// An empty request: nothing exposed, no device files.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Sandbox;
+    ///
+    /// let sandbox = Sandbox::new();
+    /// assert!(sandbox.exposures().is_empty());
+    /// assert!(!sandbox.device_files_enabled());
+    /// ```
     pub fn new() -> Self {
         Self::default()
     }
@@ -57,6 +67,22 @@ impl Sandbox {
     ///
     /// Exposing the same path twice keeps the **most permissive** access: a
     /// narrower entry can never silently downgrade a wider one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{AccessMode, Sandbox};
+    ///
+    /// let sandbox = Sandbox::new()
+    ///     .expose("/srv/data", AccessMode::ReadWrite)
+    ///     .expose("/srv/data", AccessMode::ReadOnly);
+    /// assert_eq!(sandbox.exposures().len(), 1, "one entry per path");
+    /// assert_eq!(
+    ///     sandbox.exposures()[0].access,
+    ///     AccessMode::ReadWrite,
+    ///     "the narrower entry did not downgrade the wider one"
+    /// );
+    /// ```
     pub fn expose(mut self, host: impl Into<PathBuf>, access: AccessMode) -> Self {
         merge_exposure(&mut self.exposures, host.into(), access);
         self
@@ -66,17 +92,56 @@ impl Sandbox {
     /// concept. Linux binds `/dev/{null,zero,random,urandom}`; they are
     /// defensive rather than load-bearing, because Rust's `getrandom` is a
     /// syscall and needs no `/dev` (design decision 12).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Sandbox;
+    ///
+    /// // Opt-in: a request that never asked for them carries no device files.
+    /// assert!(!Sandbox::new().device_files_enabled());
+    /// assert!(Sandbox::new().device_files().device_files_enabled());
+    /// ```
     pub fn device_files(mut self) -> Self {
         self.device_files = true;
         self
     }
 
     /// The exposures, in the order they were added.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use tinio_sandbox_core::{AccessMode, Sandbox};
+    ///
+    /// let sandbox = Sandbox::new()
+    ///     .expose("/srv/a", AccessMode::ReadOnly)
+    ///     .expose("/srv/b", AccessMode::ReadWrite);
+    /// let hosts: Vec<&Path> = sandbox
+    ///     .exposures()
+    ///     .iter()
+    ///     .map(|exposure| exposure.host.as_path())
+    ///     .collect();
+    /// assert_eq!(hosts, [Path::new("/srv/a"), Path::new("/srv/b")]);
+    /// ```
     pub fn exposures(&self) -> &[Exposure] {
         &self.exposures
     }
 
     /// Whether [`Self::device_files`] was called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Sandbox;
+    ///
+    /// // The flag is an argument `from_exposures` takes rather than one it remembers, and
+    /// // this is the read a caller transforming an existing set passes back in.
+    /// let taken = Sandbox::from_exposures(Vec::new(), true);
+    /// assert!(taken.device_files_enabled());
+    /// ```
     pub fn device_files_enabled(&self) -> bool {
         self.device_files
     }

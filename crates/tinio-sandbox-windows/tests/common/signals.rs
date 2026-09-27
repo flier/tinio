@@ -70,8 +70,9 @@ pub fn beat(report: &Path) -> ! {
 ///
 /// **The hook writes [`STOPPED`] and then ends the process with
 /// [`STOPPED_EXIT`].** The file is the evidence; the exit is what unwinds the
-/// tree — the launcher's wait returns, its ACL rollback runs and it forwards the
-/// status — so a test that reached its hook also leaves no process behind.
+/// tree — the launcher's wait returns and it forwards the status — so a
+/// test that reached its hook also leaves no process behind. The grants the run
+/// wrote are standing, so the launcher's exit takes nothing back.
 fn stop_hook(report: &Path) {
     let stopped = report.join(STOPPED);
     launch::on_stop(move || {

@@ -12,7 +12,7 @@
 //! deserializer be the validator.
 //!
 //! `config` is a `String`, not bytes: `Config::load` reads the file with
-//! `read_to_string` and `toml::from_str` takes a `&str` (`crates/tinio-config/src/schema/config.rs:129`),
+//! `read_to_string` and `toml::from_str` takes a `&str` (`crates/tinio-config/src/schema/config.rs:131`),
 //! so a configuration that is not valid UTF-8 already fails to load long before
 //! a launch happens. Carrying bytes here would mean a base64 adapter hand-written
 //! for an input the rest of the program cannot produce.
@@ -289,6 +289,26 @@ impl<'a> Wire<'a> {
 /// whole reason it is on the frame: the child never reads the mechanism's
 /// environment variable, so a variable that changed between the two processes
 /// cannot make a child apply a confinement its launcher did not choose.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::SandboxSpec;
+///
+/// // The render and the values its `(param "…")` references resolve to, exactly as the
+/// // other mechanism spells them on `sandbox-exec`'s argv.
+/// let confinement = SandboxSpec {
+///     mechanism: "sandbox-init".into(),
+///     profile: "(version 1)\n(deny default)\n(allow file-read* (subpath (param \"E0\")))\n"
+///         .into(),
+///     params: vec![(String::from("E0"), String::from("/srv/data"))],
+/// };
+/// assert_eq!(confinement.param("E0"), Some("/srv/data"));
+/// assert!(
+///     !confinement.profile.contains("/srv/data"),
+///     "the text names no path: the value travels in `params`"
+/// );
+/// ```
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::Debug)]
 pub struct SandboxSpec {
     /// The mechanism's name, in the spelling its environment variable takes.
@@ -448,6 +468,20 @@ pub fn is_control_fd_arg(arg: &OsStr) -> bool {
 /// every call site; a third element kind would have to be added to each of those spellings, and
 /// one that missed it makes clap refuse a confined start with a usage error — the failure the
 /// filters exist to prevent.
+///
+/// # Examples
+///
+/// ```
+/// use std::ffi::OsStr;
+///
+/// use tinio_sandbox_core::{control_fd_arg, is_launcher_fd_arg, listener_fd_arg};
+///
+/// // Both handoffs, and nothing an operator would type: this is the predicate a caller
+/// // filters argv by before the parser sees it.
+/// assert!(is_launcher_fd_arg(&listener_fd_arg(7)));
+/// assert!(is_launcher_fd_arg(&control_fd_arg(9)));
+/// assert!(!is_launcher_fd_arg(OsStr::new("--port")));
+/// ```
 pub fn is_launcher_fd_arg(arg: &OsStr) -> bool {
     is_listener_fd_arg(arg) || is_control_fd_arg(arg)
 }

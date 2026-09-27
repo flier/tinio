@@ -84,9 +84,21 @@ pub fn adopted_control(adopted: &Adopted) -> Result<UnixListener> {
 /// child path drives.
 ///
 /// **The macOS half of the pair above, and the same name for the same reason**:
-/// the CLI's serving path gates its child arm by `feature = "sandbox"` alone, so
-/// it names this one name on every platform and the facade selects the
-/// implementation (design decision 2, §10). What differs is where the socket
+/// each launcher platform publishes this one name, so the child path writes it
+/// once and the implementation is selected by the build rather than by a branch
+/// at the call site (design decision 2, §10). **The selection is a `#[cfg]` and
+/// the call site that absorbs it is the CLI's**, so this name is *not* reachable
+/// from a feature-only gate: it does not exist on Linux, where the confinement is
+/// in place and no launcher hands a listener over. The name the child path
+/// actually writes is `crates/tinio-cli/src/sandbox/mod.rs`'s own
+/// `adopted_listener`, which exists on **every** target and in every build — that
+/// module is compiled everywhere, because a capability that does not exist cannot
+/// refuse — delegates here on a launcher platform, and refuses on a target whose
+/// confinement never hands one over. Which of the two a given process is comes
+/// from its own shape rather than from a feature: the CLI asks whether it was
+/// launched at all (`adopted.is_some()`), and a child of one of these two
+/// platforms is the only process for which that answer is yes.
+/// What differs between the two launcher arms is where the socket
 /// comes from. The macOS launcher binds with `std`, clears the descriptor's
 /// close-on-exec flag so it survives `execve`, and this rebuild is what turns the
 /// inherited descriptor back into a `TcpListener`; **on unix a `std` socket is
@@ -127,12 +139,15 @@ pub fn adopted_listener(adopted: &Adopted) -> Result<TcpListener> {
 /// decision 20's second half).
 ///
 /// **The macOS half of the pair above, and the same name for the same reason**:
-/// the CLI's confined child is gated by the feature alone and can name no platform
-/// crate, so the facade is where each call that path makes gets one
-/// `#[cfg]`-selected spelling. What travels behind it differs — the macOS relay
-/// delivers a real signal into the confined child, so the child needs its own
-/// registration for the forwarded stop to land anywhere — and what the child sees
-/// does not: a closure that runs on a thread of its own and starts the shutdown.
+/// the child path names one name and the build selects the implementation, which
+/// is why this block is `#[cfg]`-selected for the platform that has a launcher
+/// ([`adopted_listener`] states the rule; the CLI's own wrapper is the call site,
+/// and it carries the same two-platform `#[cfg]`, because a target that confines
+/// in place has no launcher to forward a stop). What travels behind it differs — the macOS
+/// relay delivers a real signal into the confined child, so the child needs its
+/// own registration for the forwarded stop to land anywhere — and what the child
+/// sees does not: a closure that runs on a thread of its own and starts the
+/// shutdown.
 ///
 /// **One return type with the other two, mapped here rather than in the platform
 /// crate** ([`adopted_listener`] states the rule): macOS's `io::Result` is what
@@ -161,27 +176,22 @@ pub fn adopted_listener(adopted: &Adopted) -> Result<TcpListener> {
 pub fn on_stop(hook: impl Fn() + Send + 'static) -> Result<()> {
     macos_on_stop(hook).map_err(step("install stop-signal handling"))
 }
-// **Exactly the core's public surface, name for name, and that equality is the
-// rule rather than an accident.** The consumers are `crates/tinio-cli` (the
-// serving process, which reaches this crate through the `sandbox` feature its
-// manifest declares) and `crates/tinio-server`; neither implements `Backend` or
-// constructs a platform's `Options`, so "what the consumer needs" and "what the
-// core publishes" are the same set. Anything narrower would have to be
-// re-derived every time a consumer appears, and would drift silently until a
-// platform crate failed to build.
-//
-// The list is kept in the core's grouping (vocabulary, then launcher) so the two
-// can be compared by eye, and Task 3's `the_launcher_surface_is_re_exported`
-// binds every name it lists — so a name that stops resolving, or that changes
-// shape, is a compile error in that test rather than a discovery three phases
-// later. A name *added* to the core is still this list's to gain by hand: see
-// the comment on that test.
 /// The child-side listener rebuild, under the platform-neutral name the shared
 /// child path drives.
 ///
-/// **The name is what the `#[cfg]` is for**: the CLI's serving path gates its
-/// child arm by `feature = "sandbox"` alone, so it names this one name on every
-/// platform and the facade selects the implementation (design decision 2, §10). Nothing else
+/// **The name is what the `#[cfg]` is for, and the gate it answers sits one layer
+/// up** (design decision 2, §10): the re-export exists where a launcher does, so a
+/// call site that names it is `#[cfg]`-selected for those platforms already — which
+/// is exactly what the CLI's own wrapper is,
+/// `crates/tinio-cli/src/sandbox/mod.rs`'s `adopted_listener`. **That wrapper is
+/// not gated by the feature**: `sandbox/mod.rs` is compiled into every build
+/// (its own module doc says why — a capability that does not exist cannot refuse),
+/// and its platform arm is `#[cfg(any(target_os = "macos", target_os = "windows"))]`
+/// with a refusal in the other direction, while the shape that decides whether a
+/// wrapper is called at all is the call site's `adopted.is_some()`
+/// (`commands/start/serve.rs`'s listener arm, the other caller). What it does is
+/// delegate here on a launcher platform and refuse on a target whose confinement
+/// never hands one over. Nothing else
 /// from this platform's `launch` module rides along — the launcher's own argv
 /// construction and `disarm` have no shared call site — and the core's names,
 /// `adopt` among them, are already re-exported above rather than here.
@@ -216,9 +226,12 @@ pub use tinio_sandbox_windows::launch::listener as adopted_listener;
 /// the whole of it.** `adopted_listener` above reconstructs the socket the
 /// launcher bound; this is what the child arms so that a forwarded stop gives it
 /// somewhere to drain from rather than the default disposition, which is to die
-/// where it stands. Both are named by the CLI's confined child, which is gated by the
-/// feature alone and can name no platform crate — so the facade is where each
-/// call that path makes gets one `#[cfg]`-selected spelling.
+/// where it stands. Both are reached by the CLI's confined child through **its own**
+/// wrappers rather than through these re-exports directly:
+/// `crates/tinio-cli/src/sandbox/mod.rs` carries an `on_stop` beside its
+/// `adopted_listener`, `#[cfg]`-selected for the two platforms that forward a stop,
+/// and the call site asks the process's own shape first — `adopted.is_some()`, the
+/// same question that decides whether this child was launched at all.
 ///
 /// **One return type with the other two, and here it is the platform's already**
 /// ([`adopted_listener`] states the rule): the Windows hook answers the core's
@@ -296,10 +309,25 @@ pub fn disarm_signal_relay() {
     let _ = windows_relay_disarm();
 }
 
+// **Exactly the core's public surface, name for name, and that equality is the
+// rule rather than an accident.** The consumers are `crates/tinio-cli` (the
+// serving process, which reaches this crate through the `sandbox` feature its
+// manifest declares) and `crates/tinio-server`; neither implements `Backend` or
+// constructs a platform's `Options`, so "what the consumer needs" and "what the
+// core publishes" are the same set. Anything narrower would have to be
+// re-derived every time a consumer appears, and would drift silently until a
+// platform crate failed to build.
+//
+// The list is kept in the core's grouping (vocabulary, then launcher) so the two
+// can be compared by eye, and Task 3's `the_launcher_surface_is_re_exported`
+// binds every name it lists — so a name that stops resolving, or that changes
+// shape, is a compile error in that test rather than a discovery three phases
+// later. A name *added* to the core is still this list's to gain by hand: see
+// the comment on that test.
 pub use crate::_core::{
     AccessMode, Adopted, Backend, CONTROL_FD_PREFIX, Child, Confinement, ControlHandle, Error,
     Event, Exposure, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer, Result, Sandbox,
-    Terminal, adopt, control_fd_arg, control_fd_from_arg, fail, is_control_fd_arg,
+    SandboxSpec, Terminal, adopt, control_fd_arg, control_fd_from_arg, fail, is_control_fd_arg,
     is_launcher_fd_arg, is_listener_fd_arg, launch, listener_fd_arg, listener_fd_from_arg, refused,
     step, supervise,
 };
@@ -324,16 +352,25 @@ pub use crate::_core::{
 /// ```
 #[cfg(target_os = "linux")]
 pub use crate::_linux as linux;
-/// The backend for the platform this build targets, and the constructor for it.
+/// The backend for the platform this build targets, as a **value**.
+///
+/// **The trait has one public name here, and it is [`Backend`]** — the core's, re-exported
+/// with the rest of that surface rather than republished under a name of this arm's own.
+/// The alias this arm used to add (`Platform`) was one fact with two public spellings,
+/// which is the rule the list above is written under: a consumer that wants the trait
+/// names `tinio_sandbox::Backend` on every target, and the only thing a target has to
+/// answer for itself is *which type* implements it.
 ///
 /// # Examples
 ///
 /// ```
-/// let backend: tinio_sandbox::Platform = tinio_sandbox::platform();
-/// let _ = backend;
+/// let mut backend = tinio_sandbox::platform();
+/// // The constructor's answer is this build's backend, reached through the one name the
+/// // facade publishes for the trait.
+/// let _: &mut dyn tinio_sandbox::Backend = &mut backend;
 /// ```
 #[cfg(target_os = "linux")]
-pub use crate::_linux::{Backend as Platform, backend as platform};
+pub use crate::_linux::backend as platform;
 /// The macOS backend's own crate, for the settings the shared surface does not
 /// carry — its `Options`, which holds the mechanism (`Mechanism`), and the
 /// `apply` module the confined child reaches its own confinement through.
@@ -359,16 +396,19 @@ pub use crate::_linux::{Backend as Platform, backend as platform};
 /// ```
 #[cfg(target_os = "macos")]
 pub use crate::_macos as macos;
-/// The backend for the platform this build targets, and the constructor for it.
+/// The backend for the platform this build targets, as a **value**.
+///
+/// [`Backend`] is the one public name for the trait (the Linux arm above carries the
+/// rule); this is the constructor, and it differs per target only in the type it answers.
 ///
 /// # Examples
 ///
 /// ```
-/// let backend: tinio_sandbox::Platform = tinio_sandbox::platform();
-/// let _ = backend;
+/// let mut backend = tinio_sandbox::platform();
+/// let _: &mut dyn tinio_sandbox::Backend = &mut backend;
 /// ```
 #[cfg(target_os = "macos")]
-pub use crate::_macos::{Backend as Platform, backend as platform};
+pub use crate::_macos::backend as platform;
 /// The Windows backend's own crate, for the settings the shared surface does not
 /// carry — its `Options`, and the capabilities that value holds — which a
 /// consumer writes inside the `#[cfg(target_os = "windows")]` block it would have
@@ -387,13 +427,16 @@ pub use crate::_macos::{Backend as Platform, backend as platform};
 /// ```
 #[cfg(target_os = "windows")]
 pub use crate::_windows as windows;
-/// The backend for the platform this build targets, and the constructor for it.
+/// The backend for the platform this build targets, as a **value**.
+///
+/// [`Backend`] is the one public name for the trait (the Linux arm above carries the
+/// rule); this is the constructor, and it differs per target only in the type it answers.
 ///
 /// # Examples
 ///
 /// ```
-/// let backend: tinio_sandbox::Platform = tinio_sandbox::platform();
-/// let _ = backend;
+/// let mut backend = tinio_sandbox::platform();
+/// let _: &mut dyn tinio_sandbox::Backend = &mut backend;
 /// ```
 #[cfg(target_os = "windows")]
-pub use crate::_windows::{Backend as Platform, backend as platform};
+pub use crate::_windows::backend as platform;

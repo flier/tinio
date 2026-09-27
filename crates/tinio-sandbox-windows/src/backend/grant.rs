@@ -83,9 +83,10 @@ pub(crate) const GRANT_PHASE_WARN_AFTER: Duration = Duration::from_secs(15);
 /// the run fit the budget and is written not to read as though it could: the
 /// pass is the filesystem's own inheritance over every object under every
 /// exposed directory (the `acl` module's doc carries the measurement — 200,200
-/// objects, 32–38 s of granting and 27–47 s of rollback on NTFS against
-/// 8.6–8.8 s each way on ReFS), so what shortens it is the operator's choice of
-/// what to expose. The message therefore points at the design's own remedy — expose the
+/// objects, 32–38 s of granting on NTFS against 8.6–8.8 s on ReFS, with the
+/// second pass of the same shape measured at 27–47 s before the grants became
+/// standing), so what shortens it is the operator's choice of what to expose.
+/// The message therefore points at the design's own remedy — expose the
 /// narrowest directory that serves the corpus, or accept the cost — and says in
 /// as many words that this line reports the pass rather than shortening it.
 ///
@@ -143,6 +144,6 @@ pub(crate) fn report_grant_phase(elapsed: Duration, exposures: usize) {
         elapsed_ms,
         exposures,
         threshold_ms,
-        "the ACL grant phase took {elapsed:?}, half or more of the {READINESS_BUDGET:?} readiness budget a confined launch has to fit inside; the grant and its rollback each touch every object under an exposed directory (the filesystem's inheritance, not a walk this launcher makes), so expose the narrowest directory that serves the corpus or accept the cost — this line reports the pass, it does not shorten it (design §6)"
+        "the ACL grant phase took {elapsed:?}, half or more of the {READINESS_BUDGET:?} readiness budget a confined launch has to fit inside; the grant touches every object under an exposed directory (the filesystem's inheritance, not a walk this launcher makes), so expose the narrowest directory that serves the corpus or accept the cost — this line reports the pass, it does not shorten it (design §6)"
     );
 }

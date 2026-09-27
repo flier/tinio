@@ -15,7 +15,7 @@ use std::{
     io::{self, Write},
     mem,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     thread::{self, ThreadId},
     time::Duration,
 };
@@ -168,6 +168,23 @@ impl Drop for Recording {
     }
 }
 
+/// **One recording at a time across this binary's tests.**
+///
+/// The capture is process-wide and holds one buffer, so two tests that assert on
+/// it must not overlap: `Capture::record`'s "one recording at a time" is an
+/// *assertion*, and an assertion is the wrong shape for a rule two tests have to
+/// keep — the loser fails for the other test's timing rather than for its own
+/// subject, and the second recording clears the first's buffer with its own
+/// events. This is the same device `tests/profile.rs` uses for the same reason.
+/// It is taken once per test rather than once per `recorded` call, so a nested
+/// `recorded` inside one test is still what the assertion catches.
+fn recorder() -> MutexGuard<'static, ()> {
+    static RECORDER: Mutex<()> = Mutex::new(());
+    RECORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Run `body` with the capture recording this thread's events.
 fn recorded<T>(body: impl FnOnce() -> T) -> (T, String) {
     let capture = capture();
@@ -210,6 +227,7 @@ fn recorded<T>(body: impl FnOnce() -> T) -> (T, String) {
 /// [`Error::Launch`]: crate::_core::Error::Launch
 #[test]
 fn the_failures_this_module_builds_are_logged_where_they_are_built() {
+    let _recorder = recorder();
     let dir = tempdir().expect("temp dir");
     let real = dir.path().join("real");
     fs::create_dir_all(&real).expect("create the target");
@@ -284,6 +302,7 @@ fn the_failures_this_module_builds_are_logged_where_they_are_built() {
 /// cannot promise).
 #[test]
 fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
+    let _recorder = recorder();
     let just_under = GRANT_PHASE_WARN_AFTER - Duration::from_millis(1);
     let ((), quiet) = recorded(|| report_grant_phase(just_under, 3));
     assert!(
@@ -310,6 +329,36 @@ fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
     );
     assert!(loud.contains("narrowest directory"), "{loud}");
     assert!(loud.contains("does not shorten it"), "{loud}");
+}
+
+/// **A standing grant is `debug!`, and the phase's own event is the `info!`.**
+///
+/// P2's logging split puts each ACE grant at `debug!` and the phase at `info!`,
+/// and this is the half an operator's log level decides: `serve`'s subscriber
+/// prints at `INFO`, so a per-ACE line would put one entry in the log for every
+/// standing grant on every launch — the program directory and then the `*.dll`
+/// batch beside it — where what an operator reads is the phase's one line.
+#[test]
+// `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
+// is deliberately neither `Send` nor `Sync` — the same allow, for the same
+// reason, as `tests/acl.rs`'s: this is shared ownership inside one thread, which
+// is what the code under test is given.
+#[allow(clippy::arc_with_non_send_sync)]
+fn a_standing_grant_is_not_an_info_event() {
+    let _recorder = recorder();
+    let dir = tempdir().expect("temp dir");
+    let sid = Arc::new(PackageSid::derive(&package_name(dir.path())).expect("the profile"));
+    let mut grants = Grants::new(sid);
+    let ((), logged) = recorded(|| {
+        grants
+            .apply_standing(dir.path(), Target::ProgramDirectory, AccessMode::ReadOnly)
+            .expect("grant the standing SID");
+    });
+    assert!(
+        logged.is_empty(),
+        "a per-ACE grant belongs at the level a log shows the phase at, not \
+         above it: {logged}"
+    );
 }
 
 #[test]
@@ -693,8 +742,9 @@ fn a_path_spelled_through_a_junction_is_refused_rather_than_followed() {
 fn two_spellings_of_one_directory_collapse_to_one_exposure() {
     // The merge *after* the resolution is the one that matters: two spellings
     // that survive the first merge as two entries are one directory once they
-    // are resolved, and two ACEs on one directory is what rollback would have
-    // to remove twice.
+    // are resolved, and an unresolved pair would write two ACEs for one SID on
+    // one directory — the second of which the grant-only read then reports
+    // as already granted.
     let dir = tempdir().expect("temp dir");
     let real = dir.path().join("data");
     fs::create_dir_all(&real).expect("create the directory");

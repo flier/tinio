@@ -18,7 +18,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
-    Foundation::LocalFree,
+    Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0},
     Security::{
         Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW},
         FreeSid,
@@ -28,7 +28,10 @@ use windows_sys::Win32::{
         },
         PSID, SID_AND_ATTRIBUTES,
     },
-    System::SystemServices::SE_GROUP_ENABLED,
+    System::{
+        SystemServices::SE_GROUP_ENABLED,
+        Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
+    },
 };
 
 use crate::{
@@ -212,15 +215,179 @@ fn plain_root(root: &Path) -> Cow<'_, Path> {
     Cow::Owned(PathBuf::from(OsString::from_wide(&stripped)))
 }
 
+/// The lock one root's launch window and one root's profile deletion exclude each
+/// other through — **one kernel object per served root, held across processes**.
+///
+/// **Why a profile needs one.** One root is one `package_name` is one SID is one
+/// profile: a second launcher's `CreateAppContainerProfile` answers
+/// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` with a null SID out-parameter and
+/// takes the first launcher's profile over, and `PackageSid`'s `Drop` deletes it
+/// when that value goes, because nothing distinguishes "I created it" from "I
+/// took it over" (measured on this host, 2026-09-26). The damage that costs is
+/// exactly one interleaving — a `CreateProcessW` that lands between another
+/// process's delete and its own completion fails `err=2
+/// ERROR_FILE_NOT_FOUND` for a program that exists, three ways measured — so the
+/// window a launch needs is `[derive the profile … CreateProcessW]`, and both
+/// ends of it are taken through this lock: the launcher holds it for the whole
+/// window, and [`PackageSid`]'s `Drop` holds it around the delete.
+///
+/// **Held, not owned for the child's life.** The lock is released at
+/// `CreateProcessW`, so two runs on one root still run at once — a running
+/// confined child is unharmed by a peer's delete (measured: same token, same
+/// package SID, still writes through its ACE), which is why nothing here tries
+/// to keep the profile alive for the child. The only case it serialises is a peer
+/// whose launch overlaps the same root's window, and its bound is that window:
+/// the ACL phase, seconds on a large tree.
+///
+/// **The name is the package name, so the object is per root and machine-wide**:
+/// `Global\tinio.profile.<package_name>`. `Global\` rather than `Local\` because
+/// two launchers on one root need not share a session — a service serving a root
+/// and an operator's shell on it are one root — and measured on this host
+/// 2026-09-27: a non-elevated process creates the object, a peer process opens it
+/// by name, and a peer's wait blocks while it is held.
+///
+/// **Acquisition never fails a launch, and the abandonment rule is why it can
+/// be waited on without a bound.** A holder killed inside its window leaves the
+/// kernel to release the object, and the waiter's `WaitForSingleObject` answers
+/// `WAIT_ABANDONED` rather than hanging or failing: the lock is the waiter's, the
+/// invariant it protects holds vacuously (the holder is gone, so no
+/// `CreateProcessW` is in flight), and the event says so — a crash is worth an
+/// operator's eye, not a refusal. A host that refuses the object outright
+/// (`CreateMutexW` failing, which is the machine-wide namespace's one real
+/// exposure) degrades to the pre-lock behaviour — warned, not silent — rather
+/// than refusing to confine the server at all.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox_windows::sid::{ProfileLock, package_name};
+///
+/// let name = package_name(std::path::Path::new(r"E:\srv\tinio"));
+/// // `None` when the kernel refuses the object: a launch continues without the
+/// // exclusion rather than failing, which the warning beside it records.
+/// let window = ProfileLock::acquire(&name);
+/// drop(window);
+/// ```
+pub struct ProfileLock {
+    handle: HANDLE,
+}
+
+impl ProfileLock {
+    /// Take this root's lock, waiting until the peer that holds it is done.
+    ///
+    /// `None` when no lock could be created, which the crate treats as "no
+    /// exclusion" rather than as a failure: what is being serialised is a
+    /// handover between two launchers, and a launcher that refused to start over
+    /// it would trade a rare misdiagnosis for a total failure. Both reasons are
+    /// logged, because a guarantee that is not in force has to be visible.
+    #[must_use]
+    pub fn acquire(package: &str) -> Option<Self> {
+        // **`Global\` and no fallback to the session namespace.** Measured on
+        // this host 2026-09-27: a non-elevated process creates and shares it. A
+        // host that refuses it is a host where the exclusion is absent, which is
+        // the behaviour every launcher had before this lock existed — stated in
+        // a warning rather than papered over with a second scope that would
+        // exclude only part of the window's peers.
+        let wide = crate::wide(&format!(r"Global\tinio.profile.{package}"));
+        // SAFETY: `wide` is NUL-terminated and alive for the call, a null
+        // security descriptor gives the object this process's default DACL, and
+        // `binitialowner = 0` leaves the ownership to the wait below — so the
+        // create itself never owns the mutex and never needs a release of its
+        // own. The handle is closed by `Drop` on every path below.
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
+        if handle.is_null() {
+            let error = last_error();
+            tracing::warn!(
+                step = "CreateMutexW",
+                package = package,
+                error = %error,
+                "no per-root launch lock, so a peer's exit may delete this \
+                 root's profile while a launch is in flight"
+            );
+            return None;
+        }
+        // SAFETY: `handle` is the mutex the call above returned and is live for
+        // the call; the wait is INFINITE and not alertable, so it returns only
+        // when the mutex is this thread's — or when the kernel releases an
+        // abandoned one, which is the case below.
+        let waited = unsafe { WaitForSingleObject(handle, INFINITE) };
+        match waited {
+            WAIT_OBJECT_0 => Some(Self { handle }),
+            // **The abandonment rule**: the holder died without releasing
+            // (it was killed inside its window), so the kernel hands the mutex
+            // over rather than gating on a process that no longer exists. The
+            // lock is this thread's, the window it would have been protecting is
+            // gone with the holder, and the warning is what makes a crashed
+            // launcher visible in a log.
+            WAIT_ABANDONED => {
+                tracing::warn!(
+                    step = "WaitForSingleObject",
+                    package = package,
+                    "the per-root launch lock was abandoned by a launcher that \
+                     died holding it; taken over"
+                );
+                Some(Self { handle })
+            }
+            other => {
+                let error =
+                    io::Error::other(format!("WaitForSingleObject: WAIT_EVENT 0x{other:08X}"));
+                // SAFETY: `handle` is this call's own allocation and nothing has
+                // taken it.
+                unsafe { CloseHandle(handle) };
+                tracing::warn!(
+                    step = "WaitForSingleObject",
+                    package = package,
+                    error = %error,
+                    "no per-root launch lock, so a peer's exit may delete this \
+                     root's profile while a launch is in flight"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        // SAFETY: `handle` is this value's own mutex, taken by the wait in
+        // `acquire` on this thread, so the release is this thread's to make —
+        // and the handle is closed exactly once, here.
+        if unsafe { ReleaseMutex(self.handle) } == 0 {
+            // Only reachable if the guard were dropped on another thread than
+            // the one that took it, which the type's own `!Send` shape (a raw
+            // `HANDLE`) makes a compile error rather than a state to handle.
+            tracing::warn!(
+                step = "ReleaseMutex",
+                error = %last_error(),
+                "the per-root launch lock was not released by its owner"
+            );
+        }
+        // SAFETY: the same handle, closed once, as the mutex is no longer this
+        // thread's.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
 /// A created package SID **and the profile behind it**, alive for as long as
 /// anything needs them.
 ///
 /// The two are one value deliberately. A SID whose profile does not exist cannot
-/// launch, so there is no state in which this crate holds one without the other;
-/// the raw SID is freed with `FreeSid` when this value drops, the string form
-/// with `LocalFree`, and the profile with `DeleteAppContainerProfile` — so the
-/// profile's lifetime is the value's, which is the launcher's, which is the
-/// child's.
+/// launch, so a value that carried one without the other would be a value the
+/// launcher could not use; the raw SID is freed with `FreeSid` when this value
+/// drops, the string form with `LocalFree`, and the profile with
+/// `DeleteAppContainerProfile` — so the profile's lifetime is the value's, which
+/// is the launcher's, which is the child's.
+///
+/// **One profile has several such values, in several processes**, because the
+/// profile's name is derived from the served root and nothing else: a second
+/// launcher on a root *takes the first's profile over* rather than creating a
+/// second one, and the first launcher's `Drop` then deletes it. That is the state
+/// this doc used to deny ("there is no state in which this crate holds one
+/// without the other"): the takeover's value holds a SID whose profile its peer
+/// has removed, and it cannot launch until something creates the profile again
+/// (measured 2026-09-26). The damage that costs is one launch in flight, which is
+/// why the delete and the launcher's window are both taken under
+/// [`ProfileLock`].
 ///
 /// # Examples
 ///
@@ -401,22 +568,57 @@ impl Drop for PackageSid {
         // SAFETY: `raw` is this value's own allocation, produced by the profile
         // creation and freed exactly once here.
         unsafe { FreeSid(self.raw) };
+        // **The delete is taken under this root's lock, against every launch on
+        // it.** A peer holding the lock is between its derive and its
+        // `CreateProcessW`, and that is the one interval where this delete
+        // damages anything: the peer's own launch then fails `err=2
+        // ERROR_FILE_NOT_FOUND` for a program that exists (measured 2026-09-26).
+        // A running child is unharmed either way, which is why the lock is taken
+        // around the delete rather than held for the child's life.
+        let _lock = ProfileLock::acquire(&self.name);
         let wide = crate::wide(&self.name);
         // SAFETY: `wide` is NUL-terminated and alive for the call, and the name
         // is the one this value created the profile under.
         let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
         if hr != 0 {
-            // A residue rather than a failure, and `Drop` has no caller to report
-            // one to: the next run derives the same name and takes this profile
-            // over (decision 21). Warned, because shared §7's "a documented
-            // degradation is logged" is what makes an undeleted profile visible
-            // in a log rather than inferable from a package listing.
-            tracing::warn!(step = "DeleteAppContainerProfile", name = %self.name, hr = hr);
+            // **The delete failed, and that is all this branch means.** It is
+            // *not* "someone else deleted it": the API does not report that as a
+            // failure at all — it answers `S_OK` for a name that is not there
+            // (measured 2026-09-26) — so a non-zero `hr` is this call being
+            // refused, and what is left behind is a profile this run could not
+            // take back. A residue rather than a failure, and `Drop` has no
+            // caller to report one to: the next run derives the same name and
+            // takes this profile over (decision 21). Warned, because shared §7's
+            // "a documented degradation is logged" is what makes an undeleted
+            // profile visible in a log rather than inferable from a package
+            // listing.
+            tracing::warn!(
+                step = "DeleteAppContainerProfile",
+                name = %self.name,
+                hr = hr,
+                absent = false,
+                "the profile could not be deleted and may still be on this \
+                 machine; the next run on this root takes it over (decision 21)"
+            );
         } else {
             // The other half of the pair the creation emits, so a log answers
             // "was this process confined, and to what" from both ends of the
             // profile's life (shared §7).
-            tracing::info!(step = "DeleteAppContainerProfile", name = %self.name, sid = %self.text);
+            //
+            // **`hr == 0` is "no profile with this name is left", which is not
+            // the same statement as "this call deleted one"**, and the field
+            // says the first because that is what the call knows: measured on
+            // this host 2026-09-26, `DeleteAppContainerProfile` answers `S_OK`
+            // for a name that was never created just as it does for one it
+            // removed, so an event that claimed the removal would be reporting
+            // an action this value cannot observe — and a run whose profile a
+            // peer had already taken is exactly that case.
+            tracing::info!(
+                step = "DeleteAppContainerProfile",
+                name = %self.name,
+                sid = %self.text,
+                absent = true
+            );
         }
     }
 }

@@ -5,7 +5,21 @@ use std::path::{Component, Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::_core::{Error, Result};
+use crate::_core::{Error, Result, refused};
+
+/// The `step` every refusal about an exposed path carries, wherever it is
+/// built.
+///
+/// **One string for four refusal reasons across two modules**, which is why it
+/// is a constant rather than a literal at each site: the four `Error::BadPath`s
+/// below and `enter`'s "does not exist" refusal are the same operator-facing
+/// operation — *this path cannot be used as an exposure* — and shared §7's rule
+/// is that the event and the `Error` it is emitted beside name the same
+/// operation, so that a log line and a returned failure cannot be read as two
+/// different things. Two modules spelling `"expose"` separately are two places
+/// to change the day one of them is renamed, which is the drift that rule
+/// exists to prevent.
+pub(crate) const EXPOSE_STEP: &str = "expose";
 
 /// The directory the tmpfs jail is mounted on.
 ///
@@ -70,6 +84,14 @@ pub fn jail_root(tmpdir: &Path, served_root: &Path) -> PathBuf {
 /// which only a host of `/` produces, and which would make the first entry of
 /// the mount plan a self-bind of the jail tmpfs.
 ///
+/// **Each refusal is logged where it is built, with [`EXPOSE_STEP`] as its
+/// `step`** (shared §7). This is a public function, so the caller may be
+/// outside the crate — and until 2026-09-26 the only event a refused exposure
+/// produced was emitted by `enter`, which a direct caller never runs: the
+/// failure came back with no record of it anywhere. Folding the event into the
+/// construction site is what makes the log and the `Error` the same fact for
+/// every caller rather than for this crate's own.
+///
 /// # Examples
 ///
 /// ```
@@ -82,10 +104,13 @@ pub fn jail_root(tmpdir: &Path, served_root: &Path) -> PathBuf {
 /// ```
 pub fn mirror_under(jail: &Path, host: &Path) -> Result<PathBuf> {
     if !host.is_absolute() {
-        return Err(Error::BadPath {
-            path: host.to_path_buf(),
-            reason: "not absolute",
-        });
+        return Err(refused(
+            EXPOSE_STEP,
+            Error::BadPath {
+                path: host.to_path_buf(),
+                reason: "not absolute",
+            },
+        ));
     }
     // `RootDir` is the leading `/` the jail already supplies and `CurDir` is a
     // no-op, so both are skipped and `/srv/./data` and `/srv/data` land
@@ -99,10 +124,13 @@ pub fn mirror_under(jail: &Path, host: &Path) -> Result<PathBuf> {
         match component {
             Component::RootDir | Component::CurDir => {}
             Component::ParentDir => {
-                return Err(Error::BadPath {
-                    path: host.to_path_buf(),
-                    reason: "contains `..`",
-                });
+                return Err(refused(
+                    EXPOSE_STEP,
+                    Error::BadPath {
+                        path: host.to_path_buf(),
+                        reason: "contains `..`",
+                    },
+                ));
             }
             // `Normal` on every platform this crate builds for; `Prefix` is
             // Windows-only and cannot appear in a Linux path.
@@ -120,10 +148,13 @@ pub fn mirror_under(jail: &Path, host: &Path) -> Result<PathBuf> {
     // later target would land on the host's own `/`, and `apply_mount` would
     // create those directories on the host before any confinement exists.
     if out == jail {
-        return Err(Error::BadPath {
-            path: host.to_path_buf(),
-            reason: "jail root",
-        });
+        return Err(refused(
+            EXPOSE_STEP,
+            Error::BadPath {
+                path: host.to_path_buf(),
+                reason: "jail root",
+            },
+        ));
     }
     // Unreachable while `..` is refused and every pushed component is a
     // `Normal` one — kept because "the mirror is strictly below the jail root"
@@ -131,26 +162,23 @@ pub fn mirror_under(jail: &Path, host: &Path) -> Result<PathBuf> {
     // and one comparison is a cheap way to keep it true if the loop above ever
     // grows a case.
     if !out.starts_with(jail) {
-        return Err(Error::BadPath {
-            path: host.to_path_buf(),
-            reason: "escapes the jail",
-        });
+        return Err(refused(
+            EXPOSE_STEP,
+            Error::BadPath {
+                path: host.to_path_buf(),
+                reason: "escapes the jail",
+            },
+        ));
     }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io,
-        path::{Path, PathBuf},
-        sync::{Arc, Mutex},
-    };
-
-    use tracing::{Level, subscriber::with_default};
-    use tracing_subscriber::fmt;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::testing::{assert_step, record_events};
 
     #[test]
     fn jail_root_name_is_stable_and_root_derived() {
@@ -296,55 +324,43 @@ mod tests {
 
     #[test]
     fn the_jail_root_derivation_is_traced_with_its_step() {
-        // `tracing` emits nothing until a subscriber exists, so "this operation
-        // is traced" is only assertable against a sink (shared §7) — and the
-        // `step` field is the assertion because it is the string a failure
-        // event and an `Error::Step` have to share.
-        let (jail, log) = traced(|| jail_root(Path::new("/tmp"), Path::new("/srv/data")));
-        assert!(log.contains(r#"step="jail_root""#), "{log}");
+        // **The `debug!` half of shared §7, and the event an operator reaches
+        // for when a mount does not land**: the jail's own path is not in the
+        // mount plan's `info!` set, so this is where it is recorded. The
+        // recorder is `crate::testing`'s — one for the whole crate, because the
+        // `step` field is the assertion in every module that makes it and the
+        // helper's doc carries the reason it is a global capture rather than a
+        // thread-scoped one.
+        let (jail, log) = record_events(|| jail_root(Path::new("/tmp"), Path::new("/srv/data")));
+        assert_step(&log, "jail_root");
         assert!(log.contains(&jail.display().to_string()), "{log}");
     }
 
-    /// Run `f` under a subscriber that writes into a buffer, and hand back what
-    /// `f` returned together with the log it produced.
-    ///
-    /// A thread-local default rather than a global one, so it cannot leak into
-    /// the tests libtest runs beside this one.
-    fn traced<T>(f: impl FnOnce() -> T) -> (T, String) {
-        let sink = Sink::default();
-        let subscriber = fmt()
-            .with_writer({
-                let sink = sink.clone();
-                move || sink.clone()
-            })
-            .with_max_level(Level::DEBUG)
-            // ANSI is on whenever the `ansi` feature is enabled and `NO_COLOR`
-            // is unset, and the escapes land *inside* `step="jail_root"` — the
-            // assertion below would then turn on the operator's environment
-            // rather than on the event.
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .finish();
-        let value = with_default(subscriber, f);
-        let log = String::from_utf8(sink.0.lock().unwrap().clone()).expect("utf-8 log");
-        (value, log)
-    }
-
-    /// The `io::Write` half of `traced`; `MakeWriter` is implemented for a
-    /// closure returning one of these, which is the shortest way to read a
-    /// subscriber's output back out of a test.
-    #[derive(Clone, Default)]
-    struct Sink(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+    #[test]
+    fn a_refused_exposure_is_logged_where_it_is_refused() {
+        // **A public function's failure needs its own event, and this is the
+        // caller that never had one** (shared §7: the event belongs where the
+        // returned `Error` is built): `mirror_under` is reachable from outside
+        // the crate, and the only event a refused exposure used to produce came
+        // from `enter`, which such a caller never runs. The four reasons share
+        // one `step` — the operation, not the reason — and the reason is a field
+        // of the `Error`, which is what this asserts beside the step.
+        for (host, reason) in [
+            ("relative/path", "not absolute"),
+            ("/srv/../etc", "contains `..`"),
+            ("/", "jail root"),
+        ] {
+            let (error, logged) =
+                record_events(|| mirror_under(Path::new("/tmp/j"), Path::new(host)));
+            let Error::BadPath {
+                reason: refused, ..
+            } = error.expect_err("refused")
+            else {
+                panic!("{host} must be refused as a bad path");
+            };
+            assert_eq!(refused, reason, "{host}");
+            assert_step(&logged, EXPOSE_STEP);
+            assert!(logged.contains(host), "{logged}");
         }
     }
 }

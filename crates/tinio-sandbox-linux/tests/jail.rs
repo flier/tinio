@@ -235,6 +235,19 @@ fn a_read_only_jail_keeps_the_served_root_unwritable() {
     // this proves is that the child reached a read-only mechanism and said
     // which; which one it is on this host is what the phase's own script reads
     // out of the line.
+    //
+    // **Neither leg reaches the `EPERM` branch on this kernel, and this is the
+    // place the follow-ups plan asked for that to be written down** (§7: "the
+    // arm stays; the gap is documented where the test asserts 'one of the
+    // two'"): design §4 records that the remount now re-asserts the source
+    // mount's own locked flags, so the request is accepted where the partial one
+    // was refused, and both legs of this run report `read-only-arm: remount`
+    // (measured, `TINIO_SANDBOX_MODEL=userns` and `=root`). The `overlay`
+    // alternative in the assertion above is therefore a mechanism this run does
+    // not exercise end to end; reaching the `EPERM` branch needs a locked
+    // per-mount flag the request does not name, which is §7's own remaining
+    // work, and this test keeps accepting the arm so that it stays covered when
+    // that work lands rather than being deleted as dead.
     assert!(
         log.contains("read-only-arm: remount") || log.contains("read-only-arm: overlay"),
         "{log}"

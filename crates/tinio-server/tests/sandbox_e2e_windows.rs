@@ -5,8 +5,10 @@
 //!
 //! Preconditions this host cannot meet fail unless `TINIO_SANDBOX_ALLOW_SKIP`
 //! is set, and that decision happens before the first spawn. A request that
-//! is not answered, an ACE that is not rolled back, or a profile that is not
-//! removed fails regardless.
+//! is not answered, a profile that is not removed when the launcher exits
+//! cleanly, or an ACE that is silently taken back fails regardless — every
+//! grant this crate makes is standing (design decision 15), so a residue is
+//! the expected state and its absence is the surprise.
 
 #![cfg(all(windows, feature = "sandbox"))]
 
@@ -18,18 +20,19 @@ mod harness;
 use std::{
     fs,
     net::TcpStream,
-    process::Command,
+    os::windows::process::ExitStatusExt as _,
+    process::{Command, ExitStatus},
     thread,
     time::{Duration, Instant},
 };
 
 use common::signed;
 use harness::{
-    Run, ace_count, answer, exit_timeout, grant_event, host_ready, icacls, junction, wait_for_exit,
-    without_ansi,
+    Exit, Run, ace_count, answer, exit_timeout, grant_event, host_ready, icacls, junction,
+    seal_to_current_user, step_event, wait_for_exit, without_ansi,
 };
 use tinio_sandbox::{
-    AccessMode,
+    AccessMode, Event,
     windows::acl::{self, Target},
 };
 
@@ -97,11 +100,13 @@ fn a_confined_server_serves_and_the_launchers_death_takes_it_with_the_ace_left_b
     wait_for_exit(&mut run.launcher, &run.log, "the killed launcher");
 
     // **The residue is asserted as a residue, not as an absence.** `kill` is
-    // `TerminateProcess`, so the launcher's rollback never ran and the ACE is
-    // still on the root — which is what the design's risk table says happens, and
-    // a test claiming otherwise would be asserting something the mechanism cannot
-    // deliver. What decision 21 promises is that the residue is *identifiable and
-    // reusable*, and that is the next test's subject.
+    // `TerminateProcess`, so the launcher's teardown never ran and the ACE is
+    // still on the root — and it would be there had the teardown run, because
+    // every grant this crate makes is standing (design decision 15), which is what
+    // the design's risk table says happens and a test claiming otherwise would be
+    // asserting something the mechanism cannot deliver. What decision 21 promises
+    // is that the residue is *identifiable and reusable*, and that is the next
+    // test's subject.
     //
     // **The SID compared is the one the launcher reported, never the `S-1-15-2-`
     // prefix**: `S-1-15-2-1` is ALL APPLICATION PACKAGES, which every directory an
@@ -354,12 +359,168 @@ async fn a_confined_server_refuses_an_escaping_bucket_junction_as_nonexistent() 
         answer.text()
     );
 
-    // **Ended with a stop rather than a kill**, so the launcher rolls back what
-    // it granted — the executable's directory among the exposures, and the
-    // served root. A hard kill would leave both as this suite's residue on every
-    // run of this leg.
+    // **Ended with a stop rather than a kill**, so the launcher's teardown runs
+    // and its AppContainer profile is deleted (decision 21) — but nothing is
+    // rolled back: every grant this crate makes is standing (design decision 15),
+    // so the executable's directory among the exposures and the served root both
+    // keep this run's package-SID ACE. The root's and the escaping bucket's
+    // targets go with this leg's temporary directory; the executable's
+    // directory's is this suite's residue on every run of this leg, exactly as
+    // the test above asserts a residue rather than an absence. A hard kill would
+    // leave the profile behind as well, for the next run on the same root to take
+    // over.
     // This leg's subject is the answer above; the wait is asserted because a
     // launcher that outlives its stop is a relay failure [`Run::stop`] reports.
     // Its status is the child's and is not read here.
     let _ = run.stop("the stopped launcher");
+}
+
+/// **A confined child that dies on the way up becomes the parent's own `error`
+/// frame, and the status that parent answers with is the child's.**
+///
+/// This is design §3 step 8 and the one assertion §12 asks of the launcher
+/// platforms beyond the relay
+/// (`docs/superpowers/specs/2026-09-18-sandbox-design.md:552`): a child "which
+/// exits without ever reporting becomes the parent's own `Event::Error`, read
+/// from the terminal record **after** the wait rather than before it". The site
+/// is `crates/tinio-cli/src/commands/start/run.rs`'s `launcher_exit` — the
+/// sentence and the code that arm answers with — and this is the leg that reads
+/// them off the process rather than off a library call: the unit legs beside
+/// that function pin the *decision*, and only a spawned binary shows the write
+/// and the exit status.
+///
+/// **The induction is a served root that is a directory junction, and the two
+/// processes meet different trees.** The launcher resolves the operator's path
+/// as the unconfined user: it canonicalises the junction to the directory it
+/// names, builds the exposure set from **that** path (the `resolve an exposed
+/// path` events carry it, and the junction's own spelling appears nowhere in the
+/// grant), writes the package SID's ACE there, and launches. The child is
+/// re-invoked with the launcher's own argv, so *its* first act is to
+/// canonicalise the **junction**, whose entry lives outside every exposure: the
+/// tree this fixture seals grants the calling user alone, a confined child's
+/// access check needs an ACE for a SID of its own, and `resolve_root` therefore
+/// answers the CLI's usage error (`exit 2`) — **before the dispatch**, which is
+/// why nothing reaches stdout from the child at all.
+///
+/// **What each half of the fixture is load-bearing for.** The junction is what
+/// puts the child's path outside the exposure set, where a plain directory would
+/// have been granted; the seal is what makes the refusal a property of this leg
+/// rather than of the host's scratch tree (`harness::seal_to_current_user`
+/// carries the measurement and the reason). Neither is decoration: a fixture
+/// whose link did not take fails in `junction`'s own self-assertion, and a seal
+/// that did not take fails its read-back — not this leg's assertions.
+///
+/// **The frame is the parent's, and there is exactly one of them.** The parent
+/// and the child never both frame one failure, and this is the half where the
+/// child sent nothing: the assertion is therefore the stream's **bytes** against
+/// the crate's own encoder — one `error` frame, carrying the parent's sentence —
+/// rather than "an error appeared somewhere", and a `listening` frame (the child
+/// having reported after all) fails it rather than being ignored by it.
+///
+/// **The status in that sentence is the child's own.** `exit 2` is the CLI's
+/// usage refusal, where the launcher's answer for a child that left no status at
+/// all is `1` — `launcher_exit`'s documented fallback for a child killed by a
+/// signal — so the number cannot be a non-zero the parent invented for the
+/// occasion.
+///
+/// **Three reads say a child really ran**, each of them a different process's
+/// record: the launcher logged `CreateProcessW` (it got past the resolution and
+/// the grants), the child's own `tinio: …` refusal names the junction path on
+/// the stderr it inherited, and the launcher logged the child's exit with the
+/// code the frame renders. A launch that failed before spawning fails this leg
+/// instead of passing it: the parent's own refusals carry a different sentence
+/// (`run`'s serving arm frames the `Err` that `start::run` returns) and its
+/// pre-dispatch ones carry no frame at all.
+///
+/// **Not covered here, and it is stated rather than implied.** The macOS arm of
+/// the same assertion — this leg is the Windows one, and the host that would run
+/// the other is not this one — and the *ordering* the design sentence names
+/// ("after the wait rather than before it"), which is a property of `supervise`'s
+/// borrowed child and `Child::wait`'s join rather than of anything observable on
+/// this side of the pipe: a parent that read the record early would compile, run,
+/// and usually answer with the same frame.
+#[test]
+fn a_child_that_never_reports_is_the_parents_own_error_frame() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tree = dir.path().join("tree");
+    let real = tree.join("real");
+    let root = tree.join("root");
+    if !host_ready() {
+        return;
+    }
+    // The tree, then the link, then the seal: the standing entries are written
+    // over what is already inside the tree, so the junction ends up carrying the
+    // calling user's ACE alone — which is the state the child is refused in.
+    fs::create_dir_all(&real).expect("the directory the junction names");
+    fs::write(real.join("hello.txt"), b"hello").expect("seed an object");
+    junction(&root, &real);
+    seal_to_current_user(&tree);
+
+    let mut run = Exit::spawn(&root, 0);
+    let status = wait_for_exit(&mut run.launcher, &run.log, "the launcher");
+
+    // The parent's own answer is the child's status, and the log is quoted with
+    // the failure because the launcher's log is what an operator reads after it.
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "the launcher forwards the child's status: a confined child that cannot resolve the root \
+         it was launched with leaves the CLI's usage refusal (2), where a child that left no \
+         status at all would have had the launcher answering 1. The launcher's log:\n{}",
+        run.log_text()
+    );
+
+    // **One frame, and it is the parent's sentence.** Comparing the whole stream
+    // against the encoder's own bytes is what makes the two halves of the design's
+    // sentence checkable at once: the frame is an `error`, and it is the *parent's*
+    // — a relayed frame from the child would be a different `message` here, and a
+    // second frame would be extra bytes.
+    let stdout = run.stdout_text();
+    let sentence = format!(
+        "the confined child exited ({}) without reporting readiness",
+        ExitStatus::from_raw(2)
+    );
+    assert_eq!(
+        stdout,
+        Event::Error { message: sentence }.encode(),
+        "stdout must carry the parent's own `error` frame and nothing else — no `listening` frame, \
+         since the child never reported, and no second frame for one failure. Got:\nstdout:\n\
+         {stdout}\nThe launcher's log:\n{}",
+        run.log_text()
+    );
+
+    // **A child ran**, and each half of the evidence is another process's record:
+    // the launcher reached the launch, the launcher saw the child leave with the
+    // code the frame renders, and the child's own refusal — in the child's own
+    // words, on the stderr it inherited — names the path its argv carried.
+    let log = without_ansi(&run.log_text());
+    assert!(
+        log.contains("CreateProcessW"),
+        "the launcher never reached the launch, so this leg would be asserting on a parent that \
+         never had a child:\n{log}"
+    );
+    let exited = step_event(&log, "child exit").unwrap_or_else(|| {
+        panic!(
+            "the launcher logged no `step=\"child exit\"` event, so the child this leg is about \
+             cannot be told from one that never existed:\n{log}"
+        )
+    });
+    assert!(
+        exited.contains("code=2"),
+        "the child left the status the frame renders, and the launcher's own record of the wait \
+         says so: {exited}\n{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "tinio: the storage root `{}` is not usable: ",
+            root.display()
+        )),
+        "the child's own refusal is on the stderr it inherits, and it names the operator's \
+         spelling — the junction the launcher resolved on its own side:\n{log}"
+    );
+    assert!(
+        log.contains("— pass an existing DIR"),
+        "the child's refusal is `resolve_root`'s, whose remedy is the half an operator acts \
+         on:\n{log}"
+    );
 }

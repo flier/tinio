@@ -569,7 +569,7 @@ Expected: clean.
 
 **Interfaces:**
 - Consumes: `Error`, `Result`, `Sandbox`.
-- Produces: `Event` (`Listening`, `Error`) with `encode` / `decode` (its two-field decoder is `pub(crate)`); `Observer` with `Terminal { Listening, Error }`, `record` (pure) and `observe` (async) — **the relay's public half, because it is the one that answers "did the child become ready?"**; `Confinement { InPlace, Supervise(Child) }`; `Child` (`new`, `with_relay`, `wait`, `terminal`); `supervise(&mut Child, teardown) -> Result<ExitStatus>` — **by reference, because the caller reads `Child::terminal` after it returns**; `LaunchPlan` (`new`, `with_payload`, `payload`, `with_listener`, `listener`, `config`, `for_launch`) — **the listener's one home, and it owns it**, because the parent must keep the socket alive for the child's whole lifetime and a bare descriptor could outlive the thing it names; `LaunchPayload { config }` — one JSON object carrying the configuration text, serde on both sides and no wrapper methods; `Adopted` (`config`, `listener`) and `adopt(args, stdin)`; and the argv-element contract `LISTENER_FD_PREFIX` / `listener_fd_arg` / `is_listener_fd_arg` / `listener_fd_from_arg`.
+- Produces: `Event` (`Listening`, `Error`) with `encode` / `decode` (its two-field decoder is `pub(crate)`); `Observer` with `Terminal { Listening, Error }`, `record` (pure) and `observe` (async) — **the relay's public half, because it is the one that answers "did the child become ready?"**; `Confinement { InPlace, Supervise(Child) }`; `Child` (`new`, `with_relay`, `wait`, `terminal`); `supervise(&mut Child, teardown) -> Result<ExitStatus>` — **by reference, because the caller reads `Child::terminal` after it returns**; `LaunchPlan` (`new`, `with_payload`, `payload`, `with_listener`, `listener`, `config`, `for_launch`) — **the listener's one home, and it owns it**, because the parent must keep the socket alive for the child's whole lifetime and a bare descriptor could outlive the thing it names; `LaunchPayload { config }` — one JSON object carrying the configuration text, serde on both sides and no wrapper methods **as P0 landed** (the landed shape is `LaunchPayload { config: String, token: Option<String>, confinement: Option<SandboxSpec> }` in `crates/tinio-sandbox-core/src/launcher/payload.rs`, and the owned `encode` and the borrowed `encode_frame` arrived with the launchers — shared §3 owns both the shape and the encoding); `Adopted` (`config`, `listener`) and `adopt(args, stdin)`; and the argv-element contract `LISTENER_FD_PREFIX` / `listener_fd_arg` / `is_listener_fd_arg` / `listener_fd_from_arg`.
 
 **There is no stderr relay here, and that is a deliberate absence rather than an omission.** Both launcher platforms leave the child's stderr **inherited** (`Stdio::inherit()` / `h_std_error` set to the launcher's own), so there is no pipe to fill and no writer to block — the deadlock a pump would exist to prevent cannot arise. An earlier draft of this task carried a `relay_stderr` for that reason; it was removed once the platform plans were read closely enough to see that neither of them pipes stderr. A function with no caller is a promise the crate does not keep.
 
@@ -656,6 +656,8 @@ mod tests {
 ```
 
 `crates/tinio-sandbox-core/src/launcher/supervise.rs`:
+
+**One comment in the block below is the pre-standing record, and it stays as written (a phase's record, `docs/superpowers/README.md`'s record rule): "A failed child is exactly when the ACLs, the profile and the jail directory most need undoing" predates the standing ruling — what a failed child ends is the child, the profile and the job, and no ACE is reverted on any path (design decision 15: every grant stands and nothing removes it); the jail directory is still the platform's own to remove, which is the half of the sentence that survives and is why the teardown runs on every path.**
 
 ```rust
 #[cfg(test)]
@@ -759,6 +761,8 @@ Run: `cargo test -p tinio-sandbox-core launcher::`
 Expected: FAIL — `cannot find struct 'LaunchPayload'`.
 
 - [x] **Step 3: Write `launcher/payload.rs`**
+
+**One correction to the block below, which stays as written (a phase's record): the one in-tree pointer in its module doc has drifted since the phase — `Config::load` is `crates/tinio-config/src/schema/config.rs:131` today, not the `:129` the copy names, and `crates/tinio-sandbox-core/src/launcher/payload.rs` (the landed module, whose descriptor sentence also names `CONTROL_FD_PREFIX` beside the listener's) is where the corrected line lives.**
 
 ```rust
 //! The launch payload: how a confined child learns it is the child.
@@ -917,6 +921,8 @@ Add to Step 1's test module, so the contract is pinned rather than merely implem
 with `use std::ffi::{OsStr, OsString};` added to the test module's imports.
 
 - [x] **Step 4: Write `launcher/supervise.rs`**
+
+**One correction to the block below, which stays as written (a phase's record): its `supervise` doc calls a failed launch the moment "an ACL grant or a temporary directory most needs reverting" and cites decision 15 for it — decision 15 has since been amended to standing grants, so the landed contract is that no ACE is reverted on any path; the platform's teardown still runs on every path and still undoes what that platform set up (the AppContainer profile, the Job), which is where the sentence's live half is. The temporary-directory half is unaffected.**
 
 ```rust
 //! Waiting for a confined child and undoing what its launch set up.
@@ -2054,7 +2060,7 @@ impl Adopted {
 }
 ```
 
-**What stays in the platform crates, and why.** The listener rebuild (`Adopted::listener_fd` → a `std::net::TcpListener`) is `from_raw_socket` on Windows and an `OwnedFd` conversion on macOS — platform syscalls, and the reason this split is where it is. So are the pipes, the handle plumbing, the `CreateProcess`/`sandbox-exec` call, and the signal relay. The **signal relay is deliberately not a core trait**: Windows drives it from a console-control event and macOS from `signal-hook`, they share no code, and the only thing that must agree is the name — each crate exports `on_stop` and `disarm`, and the facade re-exports the selected one.
+**What stays in the platform crates, and why.** The listener rebuild (`Adopted::listener()` → a `std::net::TcpListener`, the descriptor number behind it being crate-private for the reason `Adopted`'s own doc gives) is `from_raw_socket` on Windows and an `OwnedFd` conversion on macOS — platform syscalls, and the reason this split is where it is. So are the pipes, the handle plumbing, the `CreateProcess`/`sandbox-exec` call, and the signal relay. The **signal relay is deliberately not a core trait**: Windows drives it from a console-control event and macOS from `signal-hook`, they share no code, and the only thing that must agree is the name — each crate exports `on_stop` and `disarm`, and the facade re-exports the selected one.
 
 **`adopt`'s tests, and the one the earlier draft was missing.** The rule "reads `stdin` only when `args` carries the listener element" is the task's only fail-safe against a launcher blocking forever on a real terminal, and **a reader that returns EOF cannot test it**: `io::empty()` and a `Cursor` over an empty buffer behave identically whether or not they are read. The test therefore needs a reader that is *hostile to being read at all*:
 
@@ -2331,7 +2337,7 @@ Expected: no hits. The core is `forbid` and stays that way.
 
 **Interfaces:**
 - Consumes: `Backend`, `Confinement`, `LaunchPlan`, `Sandbox`, `Error` from the core.
-- Produces: `tinio_sandbox::{AccessMode, Sandbox, Backend, Confinement, LaunchPlan, platform, Platform}` — the facade's surface, which every consumer names and nothing else does.
+- Produces: `tinio_sandbox::{AccessMode, Sandbox, Backend, Confinement, LaunchPlan, platform}` — the facade's surface, which every consumer names and nothing else does. One trait, one public name: the list carried a `Platform` alias too (a republishing of `Backend`, which the list above already re-exports on every target), and it is gone — one fact with two public spellings is the rule the list is written under, and `platform()` is the constructor's one name.
 
 The macOS and Windows bodies are `Unsupported` stubs. They exist now because the trait's shape must be exercised from both shapes — an in-process backend and a launcher backend — before either platform phase is written against it; a trait with one implementor is a guess (design decision 3, §3).
 
@@ -2602,7 +2608,7 @@ pub use crate::_macos::{Backend as Platform, backend as platform};
 pub use crate::_windows::{Backend as Platform, backend as platform};
 ```
 
-**Each platform arm is one re-export of two names, and the doc comment is repeated per arm rather than written once.** The alias *is* the selection: a name the consumer uses must resolve on the target that selects it, and a doc comment only survives the build it is compiled in — so a comment on the Linux arm alone would leave `Platform` undocumented on the other two. `Backend as Platform` and `backend as platform` are the names the consumers already use, so there is no second name for either fact: an earlier shape re-exported `Backend as PlatformBackend` and `backend` and then re-bound them with `pub type Platform = PlatformBackend;` and `pub fn platform() -> Platform { backend() }`, which gave one item four names and a wrapper whose only job was to rename.
+**Each platform arm is one re-export, and the doc comment is repeated per arm rather than written once.** The re-export *is* the selection: a name the consumer uses must resolve on the target that selects it, and a doc comment only survives the build it is compiled in — so a comment on the Linux arm alone would leave `platform` undocumented on the other two. The landed arms re-export `backend` as `platform` and add no alias for the trait: its one public name is the core's `Backend`, which the list above re-exports on every target (`Backend as Platform`, which the arms used to publish beside it, was that one fact under a second public name, and it is gone). An earlier shape re-exported `Backend as PlatformBackend` and `backend` and then re-bound them with `pub type Platform = PlatformBackend;` and `pub fn platform() -> Platform { backend() }`, which gave one item four names and a wrapper whose only job was to rename.
 
 **Every `#[cfg]` above is written twice for one reason, and both copies are load-bearing.** The alias declarations put the dependencies behind `docs/style.md`'s rule (`crate::_core::{…}`, `crate::_linux::{…}` rather than each crate's own name), and a platform alias carries the *same* gate as the re-export it feeds, because the `extern crate` it declares names a crate that exists only on that target: an ungated `pub extern crate tinio_sandbox_linux as _linux;` is `E0463: can't find crate` on the other two hosts, from the declaration rather than from a use.
 
@@ -2877,7 +2883,7 @@ EOF
 - **`Error::BadPayload`.** It existed to report a payload that failed its nonce check. With the nonce gone and the payload parsed by `serde_json`, nothing constructs it: `adopt` treats an undecodable payload as "this is the launcher" — `Ok(None)` — which is the documented behaviour and needs no error value. An enum variant no code path builds is a promise the type does not keep.
 - **`MAGIC` and `NONCE_LEN`.** They belonged to the hand-rolled binary frame. `serde_json` rejects foreign text at the first byte and has no length field to validate.
 - **`nonce()` and `LaunchPlan::with_nonce`.** The nonce they served could not discriminate anything the payload's shape did not (design decision 17, amended), and its removal is what let `for_launch` become infallible.
-- **`LaunchPayload::encode` / `decode`.** Two wrappers whose whole body would be one `serde_json` call. The call sites use `serde_json` directly, which also keeps the "the whole stream is the payload" rule visible where it is enforced.
+- **`LaunchPayload::encode` / `decode`.** Two wrappers whose whole body would be one `serde_json` call. The call sites use `serde_json` directly, which also keeps the "the whole stream is the payload" rule visible where it is enforced. **One half of this was later reversed, and this bullet is the record of the state it was written in**: `LaunchPayload::encode` and the borrowed `encode_frame` landed with the launcher platforms, which need the borrowed write rather than a `serde_json` call of their own, and `shared §3` is where the three names and their reason now live. `decode` stayed off the surface — `adopt` still calls `serde_json::from_str::<LaunchPayload>` itself.
 
 **What the grilling of 2026-09-19 changed, and why each item was a defect rather than a preference.**
 

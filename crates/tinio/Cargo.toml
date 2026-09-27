@@ -6,7 +6,12 @@ description = "Tinio: an S3-compatible local storage server (facade crate with t
 
 [dependencies]
 tinio-api = { workspace = true, optional = true }
-tinio-cli = { workspace = true, default-features = false, features = ["sandbox"] }
+# No features here: this crate's own list below is what names them, exactly as it
+# names the server's. A pin that turned `sandbox` on unconditionally would make
+# `--no-default-features` ship a confined binary anyway, and the feature-off legs
+# (`crates/tinio/tests/doctor.rs`, `crates/tinio-server/tests/serve_sandbox_channels.rs`)
+# key off the package's feature rather than this dependency's.
+tinio-cli = { workspace = true, default-features = false }
 tinio-config.workspace = true
 tinio-core.workspace = true
 tinio-server.workspace = true

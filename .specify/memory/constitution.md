@@ -1,6 +1,6 @@
 <!-- Sync Impact Report
-  Version change: 1.0.1 -> 1.0.2
-  Modified principles: none (wording-only amendment)
+  Version change: 1.0.2 -> 2.0.0
+  Modified principles: III (redefinition: the MUST for rustdoc examples now binds fewer items — still every public item, but four classes are exempt, as a closed list)
   Added sections: none
   Removed sections: none
   Follow-up TODOs: none
@@ -24,7 +24,14 @@ Library code MUST NOT panic on any input; all fallible operations MUST return `R
 
 ### III. Idiomatic Rust APIs
 
-Public APIs MUST follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/): consistent naming, `From`/`TryFrom` conversions, `AsRef`/`Borrow` where appropriate, and ownership/borrowing patterns natural to callers. Every public item MUST have doc comments including at least one runnable `rustdoc` example. Features MUST be `no_std`-compatible where they do not inherently require allocation or std I/O.
+Public APIs MUST follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/): consistent naming, `From`/`TryFrom` conversions, `AsRef`/`Borrow` where appropriate, and ownership/borrowing patterns natural to callers. Every public item MUST have doc comments including at least one runnable `rustdoc` example, **except the four classes below and no others** — the list is closed, and a further class is added here rather than assumed at the call site:
+
+- **Compile-time constants** (and const-like items such as `static`s), where the example could only restate the value.
+- **Trivial accessors** — a getter, or a `From`/`Deref` that forwards one field — where an example and the signature would say the same thing.
+- **Test-support modules and their items**, which exist for other crates' tests rather than for callers.
+- **Pure FFI wrappers** whose only honest example would be a `no_run` spawn of the process or call the binding exists to make.
+
+An exempt item MUST still carry a doc comment; the exemption covers the example alone. Features MUST be `no_std`-compatible where they do not inherently require allocation or std I/O.
 
 **Rationale**: Idiomatic Rust APIs are discoverable and composable; doc examples double as compile-time tests of the public contract.
 
@@ -85,4 +92,4 @@ Versioning policy (for this constitution):
 
 Compliance review: every PR and release review MUST verify compliance with this constitution; non-compliant changes are rejected even if tests pass. Runtime development guidance lives in `CLAUDE.md` and may change freely, but MUST NOT contradict this constitution.
 
-**Version**: 1.0.2 | **Ratified**: 2026-08-21 | **Last Amended**: 2026-08-21
+**Version**: 2.0.0 | **Ratified**: 2026-08-21 | **Last Amended**: 2026-09-27

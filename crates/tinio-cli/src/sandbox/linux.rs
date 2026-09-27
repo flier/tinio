@@ -111,14 +111,21 @@ pub(super) fn confine_in_place(resolution: &Resolution, access: AccessMode) -> R
         }
         Confinement::Supervise(child) => {
             // Unreachable on Linux by construction, kept so the call site is platform-neutral;
-            // the launcher plans own its real behaviour. The shape is theirs too: `supervise`
-            // borrows the child, and the terminal read that follows is what tells a child which
-            // never reported from one that is merely quiet (decision 19).
+            // the launcher plans own its real behaviour.
+            //
+            // **The terminal read that used to sit here is gone, and it is the shared path's
+            // rather than this arm's.** It answered "did the child ever report readiness?" by
+            // writing a sentence to **stderr** — a stream no consumer of a launcher parses —
+            // while decision 19's rule is an `Event::Error` frame on **stdout**. The frame now
+            // exists, and it lives where both launcher platforms reach it:
+            // `commands::start::run`'s supervision arm reads the same record after the same wait
+            // and emits it through `crate::events`. Folding the read there rather than keeping a
+            // second, weaker spelling here is what `docs/superpowers/README.md`'s one-definer
+            // rule asks for, and on this platform the arm is unreachable anyway — `enter` answers
+            // [`Confinement::InPlace`](crate::_sandbox::Confinement::InPlace) on every path, so
+            // this branch exists for the match's exhaustiveness and not for a run.
             let mut child = child;
             let status = supervise(&mut child, || ())?;
-            if child.terminal().is_none() {
-                eprintln!("sandbox: the confined child exited without reporting readiness");
-            }
             process::exit(status.code().unwrap_or(1));
         }
     }

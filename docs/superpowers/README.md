@@ -23,6 +23,14 @@ The facts that have bitten are always in one of these families:
 - **Type names that cross a document boundary.** Two plans naming the same type differently is how a third name gets invented.
 - **crate names that appear in example code.** An example that compiles on every platform is the strictest consumer of the public surface, so what it may name is a contract.
 
+## The record rule
+
+A plan states what a phase intended and did, and its **records** — fenced code and test snippets, drafted commit messages, quoted logs, measurement tables — belong to that phase rather than to the tree. When the landed code or a later ruling supersedes a record, the record **stays exactly as written** and the correction lives in **live prose beside it**, naming the landed contract and the decision that owns it. Editing a record to match the tree would rewrite history and destroy the diff a reader uses to see what changed; leaving it uncorrected would let a superseded contract read as current.
+
+Where the correction goes depends on what the record is. For a fence, it goes **immediately before** it, so a reader meets the correction first; where a task's own prose above the fence already states the landed contract, that prose is the correction and a second one beside the fence would be a second statement of one fact.
+
+Live prose is not a record. Headings, task bodies, checklists, `Expected:` lines and interface lists are claims about today and are corrected in place; the record rule protects the record, not the plan's account of the tree.
+
 ## The check, before a phase closes
 
 Run it per phase, not per task. For each family above, name the single owner, then search the **other** documents for a second statement of the same fact.

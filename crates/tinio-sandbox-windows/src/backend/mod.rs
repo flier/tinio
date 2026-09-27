@@ -58,7 +58,7 @@ use crate::{
     job::Job,
     launch::command_args,
     process::{self, Container, LaunchSpec, LaunchedProcess},
-    sid::{CapabilitySids, PackageSid, package_name},
+    sid::{CapabilitySids, PackageSid, ProfileLock, package_name},
     socket,
 };
 
@@ -89,8 +89,11 @@ pub struct Options {
     /// Override the program the launcher re-invokes. `None` means this process's
     /// own executable, which is what production uses (design §10 step 6).
     ///
-    /// A test seam with one job: a launch that fails *after* the ACLs are on is
-    /// the only way to exercise design §11's failed-launch rollback.
+    /// A test seam with one job: a launch that fails *after* the ACLs are on,
+    /// which is the only way to exercise the failure path design §11 describes
+    /// — every grant written before it left standing, and the profile taken
+    /// back with the value that held it (`tests/confine.rs`'s failed-launch
+    /// test).
     pub program: Option<PathBuf>,
     /// Override the child's arguments. `None` means the launcher's own, minus
     /// `argv[0]`, with the payload element appended (design §3 step 1).
@@ -218,6 +221,11 @@ struct PreparedLaunch<'a> {
     all: Vec<Exposure>,
     caller: CallerSet,
     listener: &'a TcpListener,
+    /// **The launch window's lock, taken before the profile is derived and
+    /// released once `CreateProcessW` has returned** — see [`sid::ProfileLock`]
+    /// for what it excludes a peer's delete from, and
+    /// [`spawn_supervised_child`] for where it is released.
+    window: Option<ProfileLock>,
     sid: Arc<PackageSid>,
     capabilities: CapabilitySids,
 }
@@ -260,6 +268,15 @@ fn prepare_launch<'a>(
         )
     })?;
     let package = package_name(&served);
+    // **The window opens here, before the profile is derived**, and closes once
+    // the child exists ([`spawn_supervised_child`]): a peer's `Drop` deletes the
+    // profile this root shares, and a delete that lands between this derive and
+    // `CreateProcessW` is the one interleaving that damages anything — this
+    // launch then fails `err=2 ERROR_FILE_NOT_FOUND` for a program that exists
+    // (measured 2026-09-26). `None` means the kernel refused the lock, which the
+    // acquisition warned about and which is the behaviour of a launcher that had
+    // no lock at all.
+    let window = ProfileLock::acquire(&package);
     #[allow(clippy::arc_with_non_send_sync)]
     let sid = Arc::new(PackageSid::derive(&package)?);
     let capabilities = CapabilitySids::resolve(
@@ -275,17 +292,20 @@ fn prepare_launch<'a>(
         all,
         caller,
         listener,
+        window,
         sid,
         capabilities,
     })
 }
 
-/// Grant the whitelist and return the guard that rolls it back.
+/// Grant the whitelist and return the guard that keeps the profile alive.
 ///
 /// Caller directories keep the inherited ACE. The program directory does not,
 /// and sibling DLLs are one `*.dll` pattern. A caller's file never reaches the
 /// loop: [`canonical_caller`] refused it. Failure returns before the phase
-/// report; [`crate::acl::Grants`]'s `Drop` rolls back what was already applied.
+/// report, and **nothing is taken back**: the grants are standing, so what a
+/// partial pass leaves behind is exactly what a complete one does
+/// ([`crate::acl::Grants`]'s doc states the contract and its measurement).
 ///
 /// **It announces the pass once, as an `info!` event whose fields are the package
 /// SID and the exposure set**, which is what an operator reads to see what the run
@@ -322,15 +342,26 @@ fn grant_whitelist(inputs: &PreparedLaunch<'_>) -> Result<Grants> {
         // `Target::ProgramDirectory` and `Target::File`, so a shape that
         // disagreed with its path would be an `icacls` that exits 0 and writes
         // nothing — a confined child that cannot read a file its loader needs.
-        // The loop above is also what keeps this from firing in a debug build:
-        // every host reached here was resolved by `canonical_exposures`, so it
-        // exists, and the file-shaped entries — the ones for which a directory
-        // assertion would be wrong — were filtered out before it.
-        debug_assert!(
-            target != Target::ProgramDirectory || exposure.host.is_dir(),
-            "Target::ProgramDirectory is for a directory, and {} is not one",
-            exposure.host.display()
-        );
+        //
+        // **A returned failure and not a `debug_assert!`**, which is what stood
+        // here: a panic is what this crate's rules forbid in library code
+        // (constitution II, and `control.rs` states the same rule for its own
+        // discarded result), and an assertion that unwinds in a debug build and
+        // disappears in a release one is the worst half of both. The check
+        // cannot fire as the code stands — every host reached here was resolved
+        // by `canonical_exposures`, so it exists, and the file-shaped entries,
+        // for which a directory check would be wrong, were filtered out above —
+        // which is why it is a guard on the way to the grant rather than a
+        // condition anything is expected to meet.
+        if target == Target::ProgramDirectory && !exposure.host.is_dir() {
+            return Err(launch(
+                "shape an ACL grant",
+                &exposure.host,
+                io::Error::other(
+                    "Target::ProgramDirectory is for a directory, and this exposed path is not one",
+                ),
+            ));
+        }
         // **The program directory is the one entry that does not depend on the
         // root, so it is a standing grant for `ALL APPLICATION PACKAGES` rather
         // than for this run's package SID.** Every other entry belongs to one
@@ -394,6 +425,7 @@ fn spawn_supervised_child(
     let PreparedLaunch {
         program,
         listener,
+        window,
         sid,
         capabilities,
         ..
@@ -419,8 +451,17 @@ fn spawn_supervised_child(
         handles::mark_inheritable(*control)
             .map_err(|source| launch("mark the control channel inheritable", "control", source))?;
     }
-    let payload_pipe = handles::pipe().map_err(|source| launch("CreatePipe", "stdin", source))?;
-    let event_pipe = handles::pipe().map_err(|source| launch("CreatePipe", "stdout", source))?;
+    // **Both pipes own their ends from here on**, so every failure between this
+    // line and the closes below — the second `pipe()`, `inherited_stderr()`,
+    // the job, the launch, the payload write, the relay's arming — returns with
+    // nothing leaked, and the event pipe's write end in particular cannot
+    // survive into a relay that would then never see end-of-stream
+    // (`handles::Pipe`'s doc, and `handles::parent_end` for why that one hangs
+    // rather than leaks).
+    let mut payload_pipe =
+        handles::pipe().map_err(|source| launch("CreatePipe", "stdin", source))?;
+    let mut event_pipe =
+        handles::pipe().map_err(|source| launch("CreatePipe", "stdout", source))?;
     // **Serialized from borrows** (`LaunchPayload::encode_frame`): the configuration text and the
     // plan's token go straight into the frame, where an owned `LaunchPayload` would have copied
     // both first — and this is the path that blocks until the child drains its stdin.
@@ -462,22 +503,44 @@ fn spawn_supervised_child(
         &LaunchSpec {
             program: &program,
             args: &args,
-            stdin: payload_pipe.read,
-            stdout: event_pipe.write,
+            // Borrowed, not handed over: `CreateProcessW` duplicates the child's
+            // copy of each, so the pipes keep owning these until the closes
+            // below. The `ok_or_else` cannot fire — nothing gives an end up
+            // before this line — and it is the call-site bug's error shape
+            // rather than a panic (`handles::end_gone`).
+            stdin: payload_pipe
+                .read()
+                .ok_or_else(|| handles::end_gone("stdin"))?,
+            stdout: event_pipe
+                .write()
+                .ok_or_else(|| handles::end_gone("stdout"))?,
             stderr,
             inherited: &inherited,
         },
         &container,
     )?;
+    // **The window closes here, and this is the only place it is given up on the
+    // success path.** The child exists from `CreateProcessW`'s return, so the
+    // profile is no longer something this launch needs kept — and a peer's
+    // delete, which was the whole reason the lock was held, can no longer turn
+    // this launch into `err=2 ERROR_FILE_NOT_FOUND` for a program that exists.
+    // Every failure above returns through `?`, which drops the guard with the
+    // rest of the launch's locals.
+    drop(window);
     if let Err(err) = job.assign(launched.handle()) {
         let _ = launched.terminate(1);
         return Err(err);
     }
-    handles::close(payload_pipe.read);
-    handles::close(event_pipe.write);
-    handles::write_payload(payload_pipe.write, &payload)?;
+    // The child's own ends are `CreateProcessW`'s copies now, so this process's
+    // are closed — and the event pipe's write end in particular has to be, or
+    // the relay's read never sees end-of-stream (`handles::parent_end`). Both
+    // closes go through the pipes, which is what keeps a later failure from
+    // closing them a second time.
+    payload_pipe.close_read();
+    event_pipe.close_write();
+    handles::write_payload(&mut payload_pipe, &payload)?;
     control::arm(launched.pid())?;
-    let events = tokio_fs::File::from_std(handles::parent_end(event_pipe.read));
+    let events = tokio_fs::File::from_std(event_pipe.take_read_file()?);
     // The readiness announcement's two halves: the relay sends the first terminal event on the
     // sender as it records it, and the receiver rides the supervision back to the launcher. The
     // sender dies with the `Observer` when the stream ends, which is what turns a child that

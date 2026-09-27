@@ -3,7 +3,7 @@
 //! plumbing on its own so a failure is unambiguous; the confined variant is in
 //! `tests/confine.rs`.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 mod common;
 

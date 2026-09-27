@@ -41,8 +41,8 @@ use crate::error::Result;
 /// clear it: after the profile pre-flight and before the real spawn, so the throwaway probe
 /// inherits the listener and nothing else. Reaching the descriptor at that moment is what needs
 /// an object rather than a number — `rustix::io::fcntl_setfd` takes an `AsFd`, and nothing may
-/// rebuild one from an integer (decision 14: that rebuild is the platform crate's single
-/// enumerated `unsafe` site, in the child).
+/// rebuild one from an integer (decision 14: that rebuild is one of the platform crate's three
+/// enumerated `unsafe` sites, in the child).
 ///
 /// **The launcher's own copy is left alone.** The handle is a *duplicate*
 /// ([`BorrowedFd::try_clone_to_owned`], which is `F_DUPFD_CLOEXEC`), so the socket the launcher
@@ -144,11 +144,45 @@ impl ControlHandle {
     /// # Errors
     ///
     /// The duplicate's failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::os::unix::net::UnixListener;
+    ///
+    /// use tinio_sandbox_core::ControlHandle;
+    ///
+    /// // The launcher has bound the channel; the plan takes a *duplicate*, so the socket it
+    /// // bound keeps every flag it had.
+    /// let socket = UnixListener::bind("/run/tinio/control.sock")?;
+    /// let handle = ControlHandle::duplicate(&socket)?;
+    /// assert!(handle.value() >= 0);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn duplicate(socket: impl AsFd) -> io::Result<Self> {
         socket.as_fd().try_clone_to_owned().map(Self)
     }
 
     /// The descriptor the child's argv will name, as the core spells inherited descriptors.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::os::unix::net::UnixListener;
+    ///
+    /// use tinio_sandbox_core::{ControlHandle, control_fd_arg};
+    ///
+    /// let socket = UnixListener::bind("/run/tinio/control.sock")?;
+    /// let handle = ControlHandle::duplicate(&socket)?;
+    /// // The number the child's argv carries, spelled by the one function that spells it.
+    /// let element = control_fd_arg(handle.value());
+    /// assert!(
+    ///     element
+    ///         .to_string_lossy()
+    ///         .starts_with("tinio-sandbox-control-fd=")
+    /// );
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn value(&self) -> i64 {
         i64::from(self.0.as_raw_fd())
     }
@@ -187,11 +221,31 @@ impl ControlHandle {
     /// duplicated**, because this platform's handoff is a copied handle value: marking it
     /// inheritable is the whole step, and a duplicate would be a second owner of a pipe the
     /// child still serves on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::ControlHandle;
+    ///
+    /// // The value a launcher's channel answered, copied for the plan — never a new owner.
+    /// let handle = ControlHandle::inherited(1040);
+    /// assert_eq!(handle.value(), 1040);
+    /// ```
     pub fn inherited(value: i64) -> Self {
         Self(value)
     }
 
     /// The handle value the platform marks inheritable and names in the child's argv.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{ControlHandle, control_fd_arg};
+    ///
+    /// // The number the child's argv carries, spelled by the one function that spells it.
+    /// let element = control_fd_arg(ControlHandle::inherited(1040).value());
+    /// assert_eq!(element, "tinio-sandbox-control-fd=1040");
+    /// ```
     pub fn value(&self) -> i64 {
         self.0
     }
@@ -231,17 +285,57 @@ pub struct LaunchPlan {
 
 impl LaunchPlan {
     /// An empty plan.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// // Every fact a plan can carry is absent, which is the shape of the in-place platforms'
+    /// // call: they confine this process and hand no child anything.
+    /// let plan = LaunchPlan::new();
+    /// assert!(plan.payload().is_none());
+    /// assert!(plan.listener().is_none());
+    /// assert!(plan.controls().is_empty());
+    /// assert!(plan.token().is_none());
+    /// ```
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Carry a payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{LaunchPayload, LaunchPlan};
+    ///
+    /// let plan = LaunchPlan::new().with_payload(LaunchPayload {
+    ///     config: "port = 9000".into(),
+    ///     token: None,
+    ///     confinement: None,
+    /// });
+    /// assert_eq!(plan.config(), "port = 9000");
+    /// ```
     pub fn with_payload(mut self, payload: LaunchPayload) -> Self {
         self.payload = Some(payload);
         self
     }
 
     /// The payload, when one was set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// let plan = LaunchPlan::for_launch("port = 9000".into());
+    /// assert_eq!(
+    ///     plan.payload().map(|payload| payload.config.as_str()),
+    ///     Some("port = 9000")
+    /// );
+    /// assert!(LaunchPlan::new().payload().is_none());
+    /// ```
     pub fn payload(&self) -> Option<&LaunchPayload> {
         self.payload.as_ref()
     }
@@ -277,6 +371,19 @@ impl LaunchPlan {
     }
 
     /// The token, when the launcher set one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// let token = "00".repeat(32);
+    /// let plan = LaunchPlan::for_launch("port = 9000".into()).with_token(token.clone());
+    /// // The value the child verifies `/status` and `/stop` against, and the one the launcher
+    /// // publishes in `state`: one value, read off the plan rather than carried twice.
+    /// assert_eq!(plan.token(), Some(token.as_str()));
+    /// assert_eq!(LaunchPlan::new().token(), None);
+    /// ```
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
@@ -292,12 +399,42 @@ impl LaunchPlan {
     /// The listener lives **here and not in the payload** (design §1: the plan
     /// holds what the launcher needs that is not a path) — carrying it in both
     /// would be two sources of truth for one fact.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    ///
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// // The launcher binds before any runtime exists, and the child inherits the socket
+    /// // rather than the right to bind one (design decision 16).
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let plan = LaunchPlan::new().with_listener(listener);
+    /// assert!(plan.listener().is_some());
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn with_listener(mut self, listener: TcpListener) -> Self {
         self.listener = Some(listener);
         self
     }
 
     /// The owned listener, when the parent bound one.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    ///
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// let plan = LaunchPlan::new().with_listener(TcpListener::bind("127.0.0.1:0")?);
+    /// // The parent keeps the socket alive for the child's whole lifetime, so the plan owns
+    /// // it rather than naming the descriptor it derived.
+    /// assert!(plan.listener().is_some());
+    /// assert!(LaunchPlan::new().listener().is_none());
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn listener(&self) -> Option<&TcpListener> {
         self.listener.as_ref()
     }
@@ -393,12 +530,62 @@ impl LaunchPlan {
     }
 
     /// The inherited control channel's handles, in the order the launcher bound them.
+    ///
+    /// # Examples
+    ///
+    /// **Every arm is spelled out, because neither `ControlHandle` constructor exists on both
+    /// platforms** — `duplicate` is `#[cfg(unix)]`, `inherited` is `#[cfg(windows)]`, and the
+    /// type itself is neither on a third target. An example that named one of them here was a
+    /// doctest this file could not compile on the other launcher platform, which is invisible to
+    /// a `#[cfg]`-aware check but not to `cargo test --doc` on that target.
+    ///
+    /// ```no_run
+    /// # #[cfg(unix)]
+    /// # fn main() -> std::io::Result<()> {
+    /// use std::os::unix::net::UnixListener;
+    ///
+    /// use tinio_sandbox_core::{ControlHandle, LaunchPlan};
+    ///
+    /// let handle = ControlHandle::duplicate(UnixListener::bind("/run/tinio/control.sock")?)?;
+    /// let plan = LaunchPlan::new().with_control(handle);
+    /// // A set rather than one value, because the channel is a pool: the child serves on
+    /// // every instance the launcher bound.
+    /// assert_eq!(plan.controls().len(), 1);
+    /// assert!(LaunchPlan::new().controls().is_empty());
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(windows)]
+    /// # fn main() {
+    /// use tinio_sandbox_core::{ControlHandle, LaunchPlan};
+    ///
+    /// // The Windows form copies the handle value the launcher's channel owns.
+    /// let plan = LaunchPlan::new().with_control(ControlHandle::inherited(1040));
+    /// assert_eq!(plan.controls().len(), 1);
+    /// assert!(LaunchPlan::new().controls().is_empty());
+    /// # }
+    /// # #[cfg(not(any(unix, windows)))]
+    /// # fn main() {}
+    /// ```
     pub fn controls(&self) -> &[ControlHandle] {
         &self.controls
     }
 
     /// The configuration text the launcher forwards **unparsed** (design
     /// decision 18). Empty when no payload was set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// let plan = LaunchPlan::for_launch("port = 9000".into());
+    /// assert_eq!(plan.config(), "port = 9000");
+    /// assert_eq!(
+    ///     LaunchPlan::new().config(),
+    ///     "",
+    ///     "a plan that carries no payload forwards no configuration"
+    /// );
+    /// ```
     pub fn config(&self) -> &str {
         self.payload
             .as_ref()
@@ -413,6 +600,17 @@ impl LaunchPlan {
     /// Infallible because the payload it builds is one string. The earlier shape
     /// had to generate a nonce here and was `Result` for it; with the nonce gone
     /// (design decision 17) there is nothing left to fail.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::LaunchPlan;
+    ///
+    /// // The launcher's own constructor: the configuration's text, and nothing else yet.
+    /// let plan = LaunchPlan::for_launch("port = 9000".into());
+    /// assert_eq!(plan.config(), "port = 9000");
+    /// assert_eq!(plan.token(), None);
+    /// ```
     pub fn for_launch(config: String) -> Self {
         Self::default().with_payload(LaunchPayload {
             config,
@@ -425,10 +623,12 @@ impl LaunchPlan {
 /// What a confined child recovers from its own launch (design decision 17).
 ///
 /// **Construction goes through [`Adopted::new`] or [`adopt`], and reads go through the
-/// accessors.** `config`, `control_fds` and `token` are crate-private on purpose: a `pub` field
-/// beside an accessor that returns the same value is one fact with two public spellings, and the
-/// pair drifts the moment either grows a rule of its own. `listener_fd` is the exception and stays
-/// public, because the Windows platform's `launch::listener` reads the field directly.
+/// accessors.** Every field is crate-private: a `pub` field beside an accessor that returns the
+/// same value is one fact with two public spellings, and the pair drifts the moment either grows
+/// a rule of its own. `listener_fd` used to be the exception — a comment here argued that the
+/// Windows platform's `launch::listener` read the field directly — and it was not one: that
+/// reader and macOS's both call [`Self::listener`] now, and the CLI always did, so no caller
+/// needed a spelling the accessor could not serve.
 ///
 /// # Examples
 ///
@@ -436,7 +636,7 @@ impl LaunchPlan {
 /// use tinio_sandbox_core::Adopted;
 ///
 /// let adopted = Adopted::new("port = 9000", Some(7), vec![9], None, None);
-/// assert_eq!(adopted.listener_fd, Some(7));
+/// assert_eq!(adopted.listener(), Some(7));
 /// assert_eq!(adopted.controls(), [9]);
 /// assert_eq!(adopted.token(), None);
 /// assert!(adopted.confinement().is_none());
@@ -453,8 +653,9 @@ pub struct Adopted {
     #[debug(skip)]
     pub(crate) config: String,
     /// The inherited listener's descriptor, which only the platform can turn
-    /// back into a socket.
-    pub listener_fd: Option<i64>,
+    /// back into a socket. Read through [`Adopted::listener`] — the field is
+    /// crate-private for the reason the struct's own doc gives.
+    pub(crate) listener_fd: Option<i64>,
     /// The inherited control channel's handles, when the parent created the channel — a
     /// launcher platform, either because a container's process cannot create the pipes its
     /// current-user-only DACL needs (Windows) or because the confinement's profile grants no
@@ -591,8 +792,9 @@ impl Adopted {
     /// child uses, decoding its launch payload — and it builds through this function, so a caller
     /// assembling the shape by hand (a test driving a role) produces exactly what the wire
     /// produces rather than a second spelling of it. Reads go through [`Self::config`],
-    /// [`Self::listener`], [`Self::controls`] and [`Self::token`]: the fields are private on
-    /// purpose (the struct's own doc says why), `listener_fd` excepted.
+    /// [`Self::listener`], [`Self::controls`], [`Self::token`] and [`Self::confinement`]: every
+    /// field is private on purpose (the struct's own doc says why), with no exception left to
+    /// name.
     ///
     /// # Examples
     ///

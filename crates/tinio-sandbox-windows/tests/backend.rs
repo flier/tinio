@@ -104,13 +104,23 @@ fn the_program_directory_and_the_sibling_dlls_are_exposed_read_only() {
 /// product's own `target/debug/examples` is 539 files and 0 DLLs — and a program
 /// whose directory does not exist is not a failure of the exposure set: the
 /// directory entry is still produced and the resolution that follows reports the
-/// missing path, which is what `confine`'s failed-launch rollback test relies on
+/// missing path, which is what `confine`'s failed-launch test relies on
 /// (a directory that did not exist would fail before a single ACE was granted, and
 /// that test needs the ACLs on).
 #[test]
 fn a_program_directory_with_no_dll_adds_no_file_entry() {
-    let sandbox = Sandbox::new().expose("E:/srv/tinio", AccessMode::ReadOnly);
-    let all = backend::exposures(&sandbox, Path::new("E:/build/serve.exe"));
+    // **A tree this test owns, so the count below is a fact about the fixture
+    // rather than about `E:\build`.** The count is the assertion here ("the
+    // served root and the program's directory, and no DLL entry"), and the only
+    // way it can be one is for the program's directory to be one this test
+    // filled — a fixed path would make the test depend on what happens to be
+    // beside `E:\build\serve.exe` on the host running it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let program_dir = dir.path().join("build");
+    fs::create_dir_all(&program_dir).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    let sandbox = Sandbox::new().expose(dir.path().join("srv"), AccessMode::ReadOnly);
+    let all = backend::exposures(&sandbox, &program_dir.join("serve.exe"));
     assert_eq!(
         all.len(),
         2,
@@ -257,8 +267,8 @@ fn the_executables_own_file_entries_are_granted_rather_than_refused() {
 }
 
 /// A program directory with no DLL is one entry and no pattern, and a directory
-/// with one is a pattern the tool matches against that directory — the shape the
-/// grant and its rollback both go through.
+/// with one is a pattern the tool matches against that directory — the shape
+/// the grant goes through.
 ///
 /// The negative half is the assertion that matters: an unmatched pattern is an
 /// `icacls` error rather than a no-op (measured 2026-09-21), so answering `None`

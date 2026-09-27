@@ -57,7 +57,7 @@ use crate::{
 /// does not exist. That is the difference between this function and a filesystem
 /// walk with a failure mode of its own — its one caller needs a program directory
 /// that does not exist to reach the *grant*, which is what `tests/confine.rs`'s
-/// failed-launch rollback test relies on.
+/// failed-launch test relies on.
 ///
 /// # Examples
 ///
@@ -68,9 +68,18 @@ use crate::{
 /// use tinio_sandbox_windows::backend::exposures;
 ///
 /// let sandbox = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
-/// // A program directory that does not exist contributes no DLL entry.
 /// let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
-/// assert_eq!(all.len(), 2);
+/// // The caller's root and the program's own directory, whatever that directory
+/// // holds: the `*.dll` files beside the program are entries of their own, so how
+/// // many there are is the filesystem's answer rather than this call's.
+/// assert!(
+///     all.iter()
+///         .any(|exposure| exposure.host == Path::new(r"E:\srv\tinio"))
+/// );
+/// assert!(
+///     all.iter()
+///         .any(|exposure| exposure.host == Path::new(r"E:\build"))
+/// );
 /// ```
 pub fn exposures(sandbox: &Sandbox, program: &Path) -> Vec<Exposure> {
     // A bare file name has no directory of its own to expose; the resolution that
@@ -90,6 +99,25 @@ pub fn exposures(sandbox: &Sandbox, program: &Path) -> Vec<Exposure> {
 /// directory that a build may be changing under them.
 ///
 /// [`confine`]: crate::_core::Backend::confine
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
+/// use tinio_sandbox_windows::backend::{SiblingScan, with_siblings};
+///
+/// let sandbox = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
+/// // One scan, handed to both readers: the exposure set and the grant's `*.dll`
+/// // pattern are then about one directory listing.
+/// let siblings = SiblingScan::scan(Path::new(r"E:\build"));
+/// let all = with_siblings(&sandbox, &siblings);
+/// assert!(
+///     all.iter()
+///         .any(|exposure| exposure.host == Path::new(r"E:\build"))
+/// );
+/// ```
 pub fn with_siblings(sandbox: &Sandbox, siblings: &SiblingScan) -> Vec<Exposure> {
     build_exposures(sandbox, Some(siblings))
 }
@@ -278,8 +306,9 @@ fn sibling_exposures(scan: &SiblingScan) -> Vec<Exposure> {
 /// Collapse duplicate hosts, keeping the widest access.
 ///
 /// A path may be exposed twice — the caller's list, the state directory, the
-/// executable's directory — and granting the same SID twice on the same
-/// directory would leave an entry rollback has to remove twice.
+/// executable's directory — and two entries for one path would be two ACEs
+/// for the same SID on one directory, one of which the grant-only read would
+/// report as already granted for ever after.
 ///
 /// **The rule is the core's, and this calls into it rather than restating it.**
 /// [`Sandbox::from_exposures`] applies `Sandbox::expose`'s most-permissive rule
@@ -456,9 +485,9 @@ pub fn canonical_exposures(exposures: Vec<Exposure>) -> Result<Vec<Exposure>> {
         .collect::<Result<Vec<_>>>()?;
     // Merged again, and this is the merge that matters: two spellings of one
     // directory are two entries until they are resolved, and one directory with
-    // two ACEs is a rollback that has to remove the same grant twice. The core's
-    // rule, with no device files behind it — what this function is handed is a
-    // resolved exposure set and nothing else.
+    // two ACEs for one SID is one grant the read reports as already there for
+    // ever after. The core's rule, with no device files behind it — what this
+    // function is handed is a resolved exposure set and nothing else.
     Ok(merge(canonical))
 }
 
@@ -664,11 +693,12 @@ pub fn served_root(sandbox: &Sandbox) -> Result<PathBuf> {
 ///
 /// use tinio_sandbox_windows::backend::SiblingScan;
 ///
-/// // A directory that does not exist holds no sibling, so there is no pattern —
-/// // and the grant knows to write nothing rather than invoke the tool.
+/// // Lexical, and one enumeration for both readers: the scan answers about the
+/// // path it was given whether or not that directory is there, and a directory
+/// // holding no DLL has no `*.dll` pattern to grant.
 /// let scan = SiblingScan::scan(Path::new(r"E:\build"));
-/// assert!(scan.is_empty());
-/// assert!(scan.pattern().is_none());
+/// assert_eq!(scan.dir(), Path::new(r"E:\build"));
+/// assert_eq!(scan.pattern().is_none(), scan.is_empty());
 /// ```
 pub struct SiblingScan {
     dir: PathBuf,
@@ -677,6 +707,21 @@ pub struct SiblingScan {
 
 impl SiblingScan {
     /// Enumerate `dir` once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use tinio_sandbox_windows::backend::SiblingScan;
+    ///
+    /// // Lexical: the scan answers about the path it was given whether or not
+    /// // that directory is there, and one holding no DLL has no `*.dll` pattern
+    /// // to grant — the pair the grant itself reads.
+    /// let scan = SiblingScan::scan(Path::new(r"E:\build"));
+    /// assert_eq!(scan.dir(), Path::new(r"E:\build"));
+    /// assert_eq!(scan.pattern().is_none(), scan.is_empty());
+    /// ```
     pub fn scan(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
@@ -685,6 +730,17 @@ impl SiblingScan {
     }
 
     /// Whether the directory holds no sibling at all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use tinio_sandbox_windows::backend::SiblingScan;
+    ///
+    /// let scan = SiblingScan::scan(Path::new(r"E:\build"));
+    /// assert_eq!(scan.is_empty(), scan.files().is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
@@ -698,15 +754,15 @@ impl SiblingScan {
     /// parameter` naming the second path and writes nothing, a comma-joined pair
     /// exits `123`, and the flags-first order is refused outright. The pattern is
     /// matched by the *tool* against the directory, so one invocation still
-    /// covers every DLL directly inside it, and it is also what makes the
-    /// rollback one invocation rather than a list.
+    /// covers every DLL directly inside it, and it is also what makes the grant
+    /// one invocation rather than a list.
     ///
     /// **An unmatched pattern is an error and not a no-op** (measured the same
     /// day: `icacls <dir>\*.dllx /grant:r …` exits `2` `The system cannot find
     /// the file specified.`), which is why this answers `None` for a directory
-    /// with no sibling rather than handing the caller a pattern that grants
-    /// nothing: [`crate::acl::Grants`] would then record a grant that never landed, and its
-    /// rollback would report a failure for a path it never wrote.
+    /// with no sibling rather than handing the caller a pattern the tool would
+    /// refuse: that failure would arrive as an `Error` about a grant nobody
+    /// needed, where a directory holding no DLL is not a failure of anything.
     pub fn pattern(&self) -> Option<PathBuf> {
         if self.is_empty() {
             return None;
@@ -722,11 +778,35 @@ impl SiblingScan {
     }
 
     /// The files this scan found, in the order every caller sees them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use tinio_sandbox_windows::backend::SiblingScan;
+    ///
+    /// let scan = SiblingScan::scan(Path::new(r"E:\build"));
+    /// // Sorted, and the same set the `*.dll` pattern matches — which is what
+    /// // makes one enumeration the answer for both readers.
+    /// assert_eq!(scan.files().is_empty(), scan.pattern().is_none());
+    /// ```
     pub fn files(&self) -> &[PathBuf] {
         &self.files
     }
 
     /// The directory the scan is of, for the callers that name it in a log line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use tinio_sandbox_windows::backend::SiblingScan;
+    ///
+    /// let scan = SiblingScan::scan(Path::new(r"E:\build"));
+    /// assert_eq!(scan.dir(), Path::new(r"E:\build"));
+    /// ```
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -761,9 +841,15 @@ impl SiblingScan {
 /// ```
 /// use std::path::Path;
 ///
-/// use tinio_sandbox_windows::backend::sibling_dlls;
+/// use tinio_sandbox_windows::backend::{SiblingScan, sibling_dlls};
 ///
-/// assert!(sibling_dlls(Path::new(r"E:\build")).is_empty());
+/// // The same set [`SiblingScan`] reports, which is what makes the two one
+/// // enumeration rather than two readings of a directory.
+/// let scan = SiblingScan::scan(Path::new(r"E:\build"));
+/// assert_eq!(
+///     sibling_dlls(Path::new(r"E:\build")).len(),
+///     scan.files().len()
+/// );
 /// ```
 pub fn sibling_dlls(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {

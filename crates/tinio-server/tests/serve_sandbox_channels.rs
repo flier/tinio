@@ -33,21 +33,23 @@ use tokio::time::sleep;
 /// Case 7: a build **without** the `sandbox` feature refuses `--sandbox`
 /// rather than ignoring the flag.
 ///
-/// **This arm is reachable as of the final review pass, and that is the whole
-/// reason this leg exists.** The example used to be declared
-/// `required-features = ["sandbox"]`, so no build could produce a `serve`
-/// binary without the feature — which left the refusal in the example's `main`
-/// (`#[cfg(not(feature = "sandbox"))]`) unreachable in every configuration that
-/// could be built, and untested. The attribute is gone because a
-/// `--no-default-features` build must still be able to serve the harness, and
-/// what the feature gates is the `--sandbox` arm's body rather than the
-/// program's existence (design decisions 4 and 19) — so a build without it is
-/// a build that can receive the request this test makes.
+/// **The binary under test is the facade's `tinio`**, which the CI
+/// `no-default` leg builds with `--no-default-features` as a prerequisite of
+/// this suite (`run-test-leg`'s own step — the artifact under test must be the
+/// one the leg's feature set produces), and in that build **the flag is not in
+/// the parser at all**: its declaration is the feature's (decision 10,
+/// `Args`'s `sandbox` field), so clap answers it in clap's own words with the
+/// usage status rather than the crate refusing a request a parser accepted.
+/// `TINIO_SANDBOX` cannot be compiled away, so it keeps a hidden argument and
+/// the crate refuses it itself — [`refused_or_honoured`] is where that
+/// refusal's shape is pinned.
 ///
-/// It runs only where the feature is off, which is CI's `no-default` leg: that
-/// leg builds the example with `--no-default-features` and then runs this
-/// suite, so the binary under test is the one the assertion is about. A
-/// default-features run compiles this out, because there the flag is honoured.
+/// **The refusal is a frame on stdout in neither build, and the order is the
+/// reason**: a parse error is answered before any command is dispatched, and
+/// the serving path is the only writer of a frame (decision 19). What this
+/// channel owes is the usage status and a run that never served, and both are
+/// what the leg asserts. A default-features run compiles the leg out, because
+/// there the flag is in the parser and honoured.
 #[cfg(not(feature = "sandbox"))]
 #[tokio::test]
 async fn a_build_without_the_sandbox_feature_refuses_the_flag() {
@@ -63,27 +65,24 @@ async fn a_build_without_the_sandbox_feature_refuses_the_flag() {
         "a build without the feature must refuse `--sandbox` with the usage status rather than \
          run unconfined; stderr:\n{stderr}"
     );
+    // The flag was received and answered — clap's refusal names the argument it
+    // was given, which is what keeps this leg's exit status a refusal of *this*
+    // request rather than of anything else on the command line.
     assert!(
-        stderr.contains("without the `sandbox` feature"),
-        "stderr must name the feature the build is missing; got:\n{stderr}"
+        stderr.contains("unexpected argument") && stderr.contains("--sandbox"),
+        "the flag is not in that parser, so clap is what refuses it — in clap's words, naming \
+         the argument; got:\n{stderr}"
     );
-    // And the same refusal is an event on stdout: a consumer that waits for a
-    // frame reads the cause where an empty stream is the timeout it reports
-    // (design decision 19) — the property that keeps a refusal legible without
-    // the operator having to know which build they were handed.
-    let event = server
-        .stdout_event()
-        .expect("the refusal frame, since the process exited");
     assert!(
-        matches!(&event, Event::Error { message } if message.contains("`sandbox` feature")),
-        "the refusal must send an `error` frame naming the feature, not {event:?}"
+        server.stdout_lines().is_empty(),
+        "stdout is the serving path's protocol and no command has been dispatched, so a refusal \
+         answered by the parser writes no frame; got {:?}",
+        server.stdout_lines()
     );
-    let lines = server.stdout_lines();
-    assert_eq!(
-        lines.len(),
-        3,
-        "stdout must carry the refusal frame and nothing else — an `event:` line, a `data:` \
-         line and the blank line that closes it; got {lines:?}"
+    assert!(
+        !root.join(".tinio").exists(),
+        "a refusal lands before the run creates anything it serves: {} exists",
+        root.join(".tinio").display()
     );
 }
 
@@ -127,9 +126,15 @@ async fn refused_or_honoured(server: &mut Serve, channel: &str) -> Answer {
                         stderr.contains(channel),
                         "the refusal must name the channel that was set (`{channel}`); stderr:\n{stderr}"
                     );
+                    // The pair's own rule (`refuse_unhonourable`'s doc): the build's message
+                    // names the build and never the platform, the platform's names the platform
+                    // and never the build. `--sandbox` is not asserted as "the channel that
+                    // works" in either of them: a build whose feature is off has no such flag in
+                    // its parser at all (Case 7), so no refusal this crate writes can name it.
                     assert!(
-                        stderr.contains("--sandbox"),
-                        "the refusal must name the channel that works (`--sandbox`); stderr:\n{stderr}"
+                        stderr.contains("this build") != stderr.contains("this platform"),
+                        "the refusal names exactly one cause — the build's missing feature or the \
+                         platform's stub backend, never both; stderr:\n{stderr}"
                     );
                     let lines = server.stdout_lines();
                     assert_eq!(
@@ -174,11 +179,17 @@ async fn the_sandbox_env_var_is_refused_or_honoured() {
 
     let mut server = Serve::spawn(&root, &["--port", "0"], &[(SANDBOX_VAR, "1")]);
     if refused_or_honoured(&mut server, SANDBOX_VAR).await == Answer::Refused {
+        // **The store, not the directory it sits in.** `resolve::server` runs before the sandbox
+        // plan and mints `<root>/.tinio/.tinio.toml` on its way to the resolution — the document
+        // every first run creates, refused or not — which is the one creation `start::run`'s own
+        // note measures a refusal as unable to precede. What a refusal does precede is the
+        // serving path, and the store is its first write under the root; so the absence asserted
+        // here is the one that says "nothing was served".
         assert!(
-            !root.join(".tinio").exists(),
-            "a refusal lands before the run serves, and this one creates the state it serves: \
+            !root.join(".tinio/meta.redb").exists(),
+            "a refusal lands before the run serves, and the store is what a serving run opens: \
              {} exists",
-            root.join(".tinio").display()
+            root.join(".tinio/meta.redb").display()
         );
     }
 }

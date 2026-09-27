@@ -74,7 +74,7 @@ use tokio::{
     io::{BufReader, stdout as tokio_stdout},
     runtime::Builder as RuntimeBuilder,
 };
-use tracing::{debug, error, info};
+use tracing::{Level, debug, enabled, error, info};
 
 // The tests' own copy of the predicate: the launch itself asks the pair's question through
 // `is_launcher_fd_arg`, so this one is only reached from `mod tests` below.
@@ -126,15 +126,21 @@ fn program_reference() -> String {
 /// operator should not have to learn two numbers for it.
 pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The `step` every pre-flight failure names — **one spelling, because the log's
+/// The `step` every pre-flight record names — **one spelling, because the log's
 /// field and the error's field are the same sentence** (shared §7).
 ///
-/// It is a `const` rather than five hand-written literals for the reason the
-/// shared builder exists at all: this function used to spell `"sandbox-exec -p"`
-/// at every map, event and `Error::Step` it built, so a rename of one of them
-/// would have been a log line that no longer matched the error beside it — and
-/// nothing would have failed. The five sites now read this name.
-const PREFLIGHT_STEP: &str = "sandbox-exec -p";
+/// It is a `const` rather than hand-written literals for the reason the shared
+/// builder exists at all: the pre-flight's events, its maps and its `Error::Step`
+/// used to spell this name by hand, so a rename of one of them would have been a log
+/// line that no longer matched the error beside it — and nothing would have failed.
+///
+/// **The step's name rather than the command's, and the operator's grep is why**
+/// (ruling, 2026-09-26). The name used to be `"sandbox-exec -p"` — the invocation,
+/// not the step — while the acceptance below logged `"preflight"`, so one step had
+/// two spellings in the event stream and the refusal an operator greps for was filed
+/// under the one that names a command that may not even have run (the skip logs this
+/// step too, and under it nothing is executed at all).
+const PREFLIGHT_STEP: &str = "preflight";
 
 // Note on the imports that are *absent*: this module names no `tokio::io` trait,
 // and that is deliberate rather than an omission. `Observer::new` and `observe`
@@ -261,8 +267,14 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
     //    exec and the loader have already happened by the time the child applies
     //    the text, so both would be dead.
     let profile = profile(&with_canonical_paths(sandbox), mechanism)?;
+    // **The launch's own step, so the two records of one render can be told apart**
+    // (shared §7's one-event-per-operation rule, and the operator's grep). The render
+    // above logged the same counts under `step = "profile"` — `profile()` is where
+    // the text is rendered, and it owns that name — while this event is the launch's:
+    // what `confine` resolved to hand the child. Two emitters, two steps; one
+    // derivation of the numbers (`Profile::rules`), read by both.
     info!(
-        step = "profile",
+        step = "confine",
         mechanism = %mechanism,
         rules = profile.rules,
         params = profile.params.len(),
@@ -427,6 +439,10 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
 /// argv, the program to execute and the confinement; what happens to the child
 /// either of them produces is the same answer.
 ///
+/// **A failure here ends the child this call spawned** ([`Spawned`]): the steps
+/// between the spawn and the returned [`Child`] are all fallible, and none of them
+/// leaves a confined server behind for the launcher to report an error about.
+///
 /// `command` is the **process this one executes** — Apple's helper under
 /// `sandbox-exec`, this binary under `sandbox-init` — and it is deliberately not
 /// the same value as the program element `confine` writes into a helper's argv:
@@ -459,6 +475,15 @@ fn spawn(
         "the confined child is spawned"
     );
 
+    // **Everything between the spawn and the supervisor runs under this guard**, and
+    // that is the whole of its contract (SPEC-P3-01): the steps below are fallible,
+    // and before it existed their `?` dropped the `std::process::Child` where it
+    // stood — a confined server that kept the listener and had no `state` file to be
+    // found by, which [`Spawned`]'s own doc states in full. Nothing is guarded
+    // before this line, because nothing has been started yet, and the guard is
+    // released at the `Child` below, after which the waiting closure owns the child.
+    let spawned = Spawned::new(&mut child);
+
     // The signal relay (design §3 step 9, decision 20) — a different relay from
     // the event one below: that one moves the child's *bytes* out, this one moves
     // the launcher's *signals* in. **Armed after the spawn**, and it has to be:
@@ -472,7 +497,7 @@ fn spawn(
     // `i32`, so the conversion is checked rather than `as`-cast: a pid that does
     // not fit is a kernel this launcher cannot relay for, and a refusal at startup
     // beats a wrap that would signal an unrelated process later.
-    let pid = i32::try_from(child.id()).map_err(|_| Error::Unsupported {
+    let pid = i32::try_from(spawned.child.id()).map_err(|_| Error::Unsupported {
         detail: "the child's process id does not fit in an i32",
     })?;
     on_stop(pid).map_err(step("install stop-signal handling"))?;
@@ -485,12 +510,12 @@ fn spawn(
     //    relay thread below is not running yet: while this blocks, the child's
     //    stdout is unattended too. `hand_over`'s doc carries the whole statement.
     hand_over(
-        &mut child,
+        spawned.child,
         plan.config(),
         plan.token(),
         confinement.as_ref(),
     )?;
-    drop(child.stdin.take());
+    drop(spawned.child.stdin.take());
 
     // 7. The event relay, on a thread of its own. The parent waits for the child
     //    on the main thread, so draining its stdout has to happen here: one thread
@@ -523,7 +548,7 @@ fn spawn(
     //    this mirrors.
     let (ready_tx, ready_rx) = mpsc::channel();
     let mut relay = None;
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = spawned.child.stdout.take() {
         let handle = threads::Builder::new()
             .name("tinio-sandbox-events".into())
             .spawn(move || {
@@ -583,8 +608,10 @@ fn spawn(
     // branch below) drops the sender with it, so that caller gets `None` rather
     // than a wait it cannot end.
     //
-    // **The killer goes in beside them, because from here on a failure can leave a
-    // serving process behind.** The caller's next fallible step is the `state`
+    // **The killer goes in beside them, because a failure of the caller's can leave
+    // a serving process behind** — the guard above ends what a failure *inside* this
+    // launch leaves running, and this is what ends what a failure *after* it returns
+    // does. The caller's next fallible step is the `state`
     // publish, and it happens *after* the child reported it is listening; with no
     // job object on this platform, returning an error and dropping the `Child`
     // would end nothing — the confined server would keep the port and have no
@@ -614,6 +641,13 @@ fn spawn(
         // the `io::Result` the core's killer takes is that conversion's result.
         kill_process(pid, signal).map_err(|err: Errno| err.into())
     };
+    // **The handoff, and the last thing this launch can say before it**: the guard is
+    // released, which is the only way out of it that does not end the child, and the
+    // borrow ends with it — so the closure below can take the child by value, and no
+    // fallible step stands between this line and the supervisor the builders return.
+    // A launch that fails above this line has had its child ended by [`Spawned`]; one
+    // that fails below it is the core's to end, through the killer beside it.
+    spawned.release();
     let supervised = Child::new(move || Ok(child.wait()?)).with_kill(killer);
     Ok(Confinement::Supervise(match relay {
         Some(relay) => supervised.with_relay(relay).with_ready(ready_rx),
@@ -623,6 +657,90 @@ fn spawn(
         // relay is still a child to wait for.
         None => supervised,
     }))
+}
+
+/// The child a launch has spawned, **until the supervisor owns it** — the guard
+/// that makes a failed launch end what it started (SPEC-P3-01).
+///
+/// **Every step between the spawn and the supervisor is fallible, and a `?` at any
+/// of them used to leak a running confined server.** The child's pid has to fit the
+/// relay's `i32`, the signal relay has to install, the payload frame has to reach the
+/// child's stdin, and the event relay's thread has to start — and each of those `?`s
+/// dropped the `std::process::Child` where it stood. No job object on this platform
+/// ends a child with its parent, so what was dropped was a process that kept the
+/// listener and had no `state` file: the launcher reported a startup error naming
+/// nothing about it, and the orphan failed `adopt` on the child side and could
+/// re-enter the launcher path. **The guarantee is by construction rather than by four
+/// hand-written kills**: every one of those steps runs while this value is alive, so a
+/// step added later is covered without anyone having to remember to.
+///
+/// **The handoff is [`Self::release`], and the borrow is what enforces both halves.**
+/// The guard borrows the child, so the closure that waits for it cannot take
+/// ownership while the guard is alive: the success path *must* release, and any
+/// failure in between — including one added later — unwinds through this type's
+/// `Drop` and ends the child. What a drop cannot do is report, which is the right
+/// shape here: the caller is already returning the failure that got here, and the
+/// ending is this launch's last act rather than a second answer.
+struct Spawned<'a> {
+    /// The child this launch started, borrowed for as long as its ending is ours.
+    child: &'a mut ProcessChild,
+    /// Whether a drop still ends the child — cleared by [`Self::release`], which is
+    /// the only way to a supervisor.
+    ours: bool,
+}
+
+impl<'a> Spawned<'a> {
+    /// Take the ending of a freshly spawned child.
+    fn new(child: &'a mut ProcessChild) -> Self {
+        Self { child, ours: true }
+    }
+
+    /// Hand the child to its supervisor, and stop guarding it.
+    ///
+    /// **Consuming rather than a flag a caller could forget to set**, because the two
+    /// things this call does are one: it clears the drop's ending and it ends the
+    /// borrow, which is what lets the waiting closure take the child by value. A
+    /// launch that reached its supervisor therefore cannot have killed its child —
+    /// the only other way out of the guard is the drop that ends it.
+    fn release(mut self) {
+        self.ours = false;
+    }
+}
+
+impl Drop for Spawned<'_> {
+    /// End the child a failure left behind: `SIGKILL`, then reap.
+    ///
+    /// **`std`'s own `kill` rather than the killer's `rustix` call**, because this
+    /// runs on the path where the pid's conversion may be exactly what failed: the
+    /// `ProcessChild` is the handle, and it needs no number. `SIGKILL` for the reason
+    /// the killer uses it — a launch that failed must not wait on a process that may
+    /// never read its payload — and the reap follows so what is ended is not left as a
+    /// zombie for the rest of this process's life.
+    ///
+    /// **Both outcomes are a `debug!` and neither is returned**, which is the shape a
+    /// `Drop` has: the caller is unwinding a failure it already has, the child's own
+    /// exit is what a failed kill means, and what is left to say is only whether the
+    /// ending happened.
+    fn drop(&mut self) {
+        if !self.ours {
+            return;
+        }
+        if let Err(err) = self.child.kill() {
+            debug!(
+                step = "spawn",
+                error = %err,
+                "the failed launch's child had already exited"
+            );
+        }
+        match self.child.wait() {
+            Ok(_) => debug!(step = "spawn", "the failed launch's child was ended"),
+            Err(err) => debug!(
+                step = "spawn",
+                error = %err,
+                "the failed launch's child was not reaped"
+            ),
+        }
+    }
 }
 
 /// The argv `sandbox-init` spawns the child with: **the launcher's own argv, and
@@ -872,7 +990,7 @@ pub fn listener(adopted: &Adopted) -> io::Result<TcpListener> {
     // *public* surface, so it cannot see a `use` this module holds, while this
     // body cannot spell a path the lint refuses.
     let raw = adopted
-        .listener_fd
+        .listener()
         .ok_or_else(|| io::Error::other("no listener descriptor was handed over"))?;
     let owned = inherited_fd(raw)?;
     debug!(
@@ -1094,13 +1212,23 @@ fn preflight(profile: &Profile) -> Result<()> {
     // error the launch carries either way. So it runs in a debug build or under a `debug` log
     // level, and the event still reports which of the two happened — the confined leg asserts the
     // step is present, and a silent skip would make that assertion lie by omission.
-    if !(cfg!(debug_assertions) || tracing::enabled!(tracing::Level::DEBUG)) {
-        // The step's own name, not the command's: the acceptance below logs `step = "preflight"`,
-        // and a skip that logged `sandbox-exec -p` would leave the event stream with two names for
-        // one step — and would make the confined leg's `step="preflight"` assertion pass only in a
-        // debug build. `verdict` is what tells the two records apart.
+    //
+    // **The skip is by design and not a degradation, which is why it is an `info!`.**
+    // That is the operator's ruling (2026-09-26) and it is the distinction shared §7
+    // turns on: `warn!` is for *a documented degradation stated where it is decided* —
+    // a run that lost a guarantee it was promised — and this is a choice of how deep
+    // the startup check goes, with the confinement itself identical either way and the
+    // real spawn still failing closed on a profile `sandbox-exec` refuses. The event
+    // states the skip in the operator's own words (`verdict = "skipped"`) rather than
+    // leaving the absence of the acceptance line to be noticed, so nothing is
+    // unrecorded; what is *not* claimed is that a check ran when none did.
+    if !(cfg!(debug_assertions) || enabled!(Level::DEBUG)) {
+        // The step, not the command: [`PREFLIGHT_STEP`] is the one name all three
+        // records of this step carry — the skip, the acceptance below and every
+        // refusal — so an operator greps one string and `verdict` is what tells the
+        // records apart.
         info!(
-            step = "preflight",
+            step = PREFLIGHT_STEP,
             verdict = "skipped",
             "the pre-flight runs only in a debug build or under a debug log level"
         );
@@ -1181,7 +1309,7 @@ fn preflight(profile: &Profile) -> Result<()> {
         ))));
     }
     info!(
-        step = "preflight",
+        step = PREFLIGHT_STEP,
         rules = profile.rules,
         "sandbox-exec accepted the profile"
     );
@@ -1302,7 +1430,10 @@ mod tests {
     use std::{
         ffi::{OsStr, OsString},
         io,
-        os::{fd::AsFd, unix::net::UnixListener},
+        os::{
+            fd::AsFd,
+            unix::{net::UnixListener, process::ExitStatusExt},
+        },
         path::Path,
         slice,
         sync::{Arc, Mutex},
@@ -1696,6 +1827,65 @@ mod tests {
         assert!(is_listener_fd_arg(
             args.last().expect("the descriptor element")
         ));
+    }
+
+    /// A failed launch ends the child it started — **SPEC-P3-01's guarantee, on a
+    /// real process**.
+    ///
+    /// **A `sleep` rather than a mock, because what has to be observed is a fact
+    /// about the kernel**: that nothing is left running. `/bin/sleep 300` cannot exit
+    /// inside this test's window, so a `SIGKILL` in its exit status is the guard's own
+    /// doing rather than the child's — and it pins the signal too, which a bare
+    /// `!status.success()` would not.
+    ///
+    /// **The order is the failing `?`'s**: the guard is built around a child the test
+    /// just spawned and dropped without [`Spawned::release`], which is exactly what an
+    /// early return from `spawn` does. What it does not reach — the four fallible
+    /// steps themselves, which no test can force — is not asserted here; this leg is
+    /// the guard's contract, and the steps are what run under it.
+    #[test]
+    fn a_failed_launch_ends_the_child_it_spawned() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a process that outlives the guard");
+        {
+            let spawned = Spawned::new(&mut child);
+            // Dropped, not released: the failure path.
+            drop(spawned);
+        }
+        let status = child.wait().expect("the guard reaps what it kills");
+        assert_eq!(
+            status.signal(),
+            Some(SIGKILL),
+            "the guard's ending is a SIGKILL, not the child's own exit: {status:?}"
+        );
+    }
+
+    /// The other half of the same contract: **a child the supervisor takes is left
+    /// running.**
+    ///
+    /// **The pair is the property**, and either leg alone would pass for the wrong
+    /// reason: a guard that killed on every path passes the leg above and would kill
+    /// every launch, and one that never killed passes this leg and leaks. So this one
+    /// asserts what [`Spawned::release`] means — the child is alive once the guard is
+    /// gone, and only the test's own cleanup ends it.
+    #[test]
+    fn a_released_child_is_left_running() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a process the guard will release");
+        {
+            let spawned = Spawned::new(&mut child);
+            spawned.release();
+        }
+        assert!(
+            child.try_wait().expect("poll the child").is_none(),
+            "a released child is not the guard's to end"
+        );
+        child.kill().expect("end the child this test started");
+        child.wait().expect("reap the child this test started");
     }
 
     /// Everything the closure logged, as the subscriber rendered it.

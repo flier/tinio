@@ -6,6 +6,18 @@ use tracing::error;
 
 /// A confinement failure. Every variant is fatal to startup: design §11
 /// requires the process to refuse to run rather than continue unconfined.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::{Error, fail};
+///
+/// // What a syscall site builds: the operation's own name, and the platform's error as the
+/// // source a caller can still reach.
+/// let err = fail("mount", std::io::Error::from_raw_os_error(1));
+/// assert!(matches!(err, Error::Step { step: "mount", .. }), "{err}");
+/// assert!(std::error::Error::source(&err).is_some(), "{err}");
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A syscall or platform call refused. `step` names the operation, never
@@ -75,6 +87,26 @@ pub enum Error {
 }
 
 /// Convenience alias.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::{Error, Result, fail};
+///
+/// // Every backend's fallible step is written against this alias, so a `?` in a platform
+/// // crate names no type the core does not publish.
+/// fn enter() -> Result<()> {
+///     Err(fail("unshare", std::io::Error::from_raw_os_error(1)))
+/// }
+///
+/// assert!(matches!(
+///     enter(),
+///     Err(Error::Step {
+///         step: "unshare",
+///         ..
+///     })
+/// ));
+/// ```
 pub type Result<T> = result::Result<T, Error>;
 
 /// Log a failure and hand it back, so a refusing `return` in any backend is one

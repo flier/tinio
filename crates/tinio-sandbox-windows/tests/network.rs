@@ -58,7 +58,7 @@
 //! shape, and it is deliberate: the whole point of this suite is that a green run
 //! means the measurement was taken.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 mod common;
 
@@ -450,8 +450,10 @@ fn the_lan_answer_is_recorded() {
         // in `accept` for a caller that is never coming, and dropping the
         // supervision is what ends it — the `Child`'s closure drops with it,
         // closing the job handle and taking the child with it (decision 20), and
-        // the `Grants` guard rolls the ACEs back on the same path (Task 9's
-        // `a_dropped_supervision_also_rolls_back`).
+        // the `Grants` guard leaves the ACE standing on the same path (design
+        // decision 15 — the landed test is `confine.rs`'s
+        // `a_dropped_supervision_leaves_the_grant_standing_and_takes_the_child`,
+        // which asserts the grant still stands).
         if reached == Some(true) {
             let mut child = child;
             supervise(&mut child, || ()).expect("supervise the confined child");

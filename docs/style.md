@@ -34,6 +34,10 @@
 
 - `Single([u8; 16])`/`Composed([u8; 16], u32)`; parse `ETag::new`; emit `Display`; `from_content`/`composed_from_parts`.
 
+## Doc examples
+
+- Public item: doc comment + runnable rustdoc example; exempt classes are a closed list — owner constitution III (`.specify/memory/constitution.md`).
+
 ## Docs & scripts
 
 - English bullets. Scripts → `/tmp`.

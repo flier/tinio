@@ -55,6 +55,13 @@ unsafe extern "C" {
 /// the call (the array borrows them and the callee reads them only then), and the
 /// error string is copied before it is freed.
 ///
+/// **No example, by design, and the amended doc-example rule is why**: this is a pure
+/// FFI wrapper, and the only honest example would be one that must not run — it
+/// applies a profile to the process it is called in, one-shot and irreversibly, so a
+/// doctest that executed it would confine the doctest process for good and one that
+/// did not would demonstrate nothing. [`crate::apply::apply`] is the safe call a
+/// caller writes, and it is the one that carries the example.
+///
 /// # Errors
 ///
 /// The kernel's own message when the profile is refused, and a fixed sentence when

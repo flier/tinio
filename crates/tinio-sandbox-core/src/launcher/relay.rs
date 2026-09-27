@@ -80,6 +80,21 @@ pub(crate) async fn reemit(
 /// notice which. Deciding what to *do* about a missing one is the caller's
 /// (design decision 19: the parent owns the "printed exactly once"
 /// guarantee).
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::Terminal;
+///
+/// // The two terminal events a confined child can send, and nothing else: which one arrived —
+/// // or that neither did — is the whole of what a launcher's readiness rule reads.
+/// let reported = Terminal::Listening("127.0.0.1:9000".parse().expect("addr"));
+/// assert!(matches!(reported, Terminal::Listening(_)));
+/// assert!(matches!(
+///     Terminal::Error("no profile".into()),
+///     Terminal::Error(_)
+/// ));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminal {
     /// The child reached its listener.
@@ -139,6 +154,16 @@ pub struct Observer<W> {
 
 impl<W> Observer<W> {
     /// Wrap the writer the relayed frames go to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Observer;
+    ///
+    /// // A writer, and nothing else yet: no record, no announcement, no runtime.
+    /// let observer = Observer::new(Vec::<u8>::new());
+    /// assert!(observer.terminal().is_none(), "nothing has been recorded");
+    /// ```
     pub fn new(inner: W) -> Self {
         Self {
             terminal: None,
@@ -166,6 +191,24 @@ impl<W> Observer<W> {
     /// launcher that no announcement is coming: a child that exits without ever
     /// reporting readiness disconnects the channel rather than leaving the wait to
     /// run out its bound.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpsc;
+    ///
+    /// use tinio_sandbox_core::{Observer, Terminal};
+    ///
+    /// let (tx, rx) = mpsc::channel();
+    /// let mut observer = Observer::new(Vec::<u8>::new()).with_notify(tx);
+    /// observer.record("listening", "{\"addr\":\"127.0.0.1:9000\"}");
+    /// // The mid-stream half, sent as the frame is *seen* rather than when the stream ends:
+    /// // this is what a launcher that has to act while the child still serves reads.
+    /// assert_eq!(
+    ///     rx.recv().expect("the one announcement"),
+    ///     Terminal::Listening("127.0.0.1:9000".parse().expect("addr"))
+    /// );
+    /// ```
     pub fn with_notify(mut self, notify: Sender<Terminal>) -> Self {
         self.notify = Some(notify);
         self
@@ -192,6 +235,23 @@ impl<W> Observer<W> {
     /// relayed and not re-logged. It is also announced on the channel
     /// [`Self::with_notify`] installed, when one was — the launcher that has to act
     /// *now* rather than at end-of-stream reads that half.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{Event, Observer, Terminal};
+    ///
+    /// let mut observer = Observer::new(Vec::<u8>::new());
+    /// // A name this protocol does not define is dropped rather than failing.
+    /// assert_eq!(observer.record("unknown", "{}"), None);
+    ///
+    /// let addr = "127.0.0.1:9000".parse().expect("addr");
+    /// let event = observer.record("listening", "{\"addr\":\"127.0.0.1:9000\"}");
+    /// assert_eq!(event, Some(Event::Listening { addr }));
+    /// // The first terminal event is the one that sticks: the question is "did it ever become
+    /// // ready?", and a later `Error` reaching the consumer does not un-answer it.
+    /// assert_eq!(observer.terminal(), Some(&Terminal::Listening(addr)));
+    /// ```
     pub fn record(&mut self, name: &str, data: &str) -> Option<Event> {
         let event = Event::decode_fields(name, data)?;
         if self.terminal.is_none() {
@@ -212,11 +272,38 @@ impl<W> Observer<W> {
     ///
     /// `None` means neither `Listening` nor `Error` arrived — the case a
     /// launcher turns into its own `Event::Error` once the child has exited.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{Observer, Terminal};
+    ///
+    /// let mut observer = Observer::new(Vec::<u8>::new());
+    /// assert!(observer.terminal().is_none(), "nothing has been recorded");
+    /// observer.record("listening", "{\"addr\":\"127.0.0.1:9000\"}");
+    /// assert_eq!(
+    ///     observer.terminal(),
+    ///     Some(&Terminal::Listening(
+    ///         "127.0.0.1:9000".parse().expect("addr")
+    ///     ))
+    /// );
+    /// ```
     pub fn terminal(&self) -> Option<&Terminal> {
         self.terminal.as_ref()
     }
 
     /// Give the wrapped writer back.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Observer;
+    ///
+    /// // The relay forwarded the frames into the writer it was handed, and this is how its
+    /// // caller gets it back — the record is the `Observer`'s, the bytes are the writer's.
+    /// let observer = Observer::new(Vec::<u8>::new());
+    /// assert!(observer.into_inner().is_empty());
+    /// ```
     pub fn into_inner(self) -> W {
         self.inner
     }
@@ -250,6 +337,27 @@ impl<W: AsyncWrite + Unpin> Observer<W> {
     /// crate's only `From<io::Error>` is `Error::Wait`, whose message claims the
     /// confinement could not wait for the child — the wrong diagnosis for a
     /// parent whose stdout has closed, and one a bare `?` would have produced.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Observer;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// // A whole stream, read to its end: the two field lines and the blank line that
+    /// // dispatches the frame.
+    /// let input = "event: listening\ndata: {\"addr\":\"127.0.0.1:9000\"}\n\n";
+    /// let observer = Observer::new(Vec::new())
+    ///     .observe(input.as_bytes())
+    ///     .await
+    ///     .expect("the stream is I/O this reader can finish");
+    /// assert!(
+    ///     observer.terminal().is_some(),
+    ///     "the frame carried the one event"
+    /// );
+    /// # }
+    /// ```
     pub async fn observe(mut self, mut reader: impl AsyncBufRead + Unpin) -> Result<Self> {
         // **One decoder for the whole stream, and it must not be hoisted into
         // `decode`.** The decoder holds the field values of the event it has

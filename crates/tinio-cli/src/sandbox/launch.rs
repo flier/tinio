@@ -7,7 +7,6 @@
 //! by omission: the macOS arm ends a child whose publish failed, and the Windows arm did not.
 
 use std::net::TcpListener as StdTcpListener;
-
 #[cfg(feature = "api")]
 use std::time::Duration;
 

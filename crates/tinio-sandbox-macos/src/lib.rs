@@ -33,10 +33,8 @@
 //! accepted knowingly: on Linux and Windows the crate now compiles to an
 //! **empty library**, so this crate's unit tests and doctests do not run on a
 //! non-Mac host and every verification of it moves to a Mac — the same shape
-//! `tinio-sandbox-linux` already has in the other direction (`members =
-//! ["crates/*"]` is a flat glob with no per-target form, which is why the gate
-//! can only be per crate). `bash
-//! crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh` is the run.
+//! `tinio-sandbox-linux` already has in the other direction (`members = ["crates/*"]` is a flat
+//! glob with no per-target form, which is why the gate can only be per crate). `bash crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh` is the run.
 //!
 //! **A doctest written in this crate's *module* docs is not gated with the items
 //! beside it**, and that is the one sharp edge the ruling leaves: the gate removes

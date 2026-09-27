@@ -104,7 +104,7 @@ pub fn adopt(
 /// # Ok::<(), tinio_sandbox_core::Error>(())
 /// ```
 pub fn listener(adopted: &Adopted) -> Result<TcpListener> {
-    let fd = adopted.listener_fd.ok_or_else(|| {
+    let fd = adopted.listener().ok_or_else(|| {
         launch(
             "rebuild the listener",
             "argv",

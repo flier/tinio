@@ -16,8 +16,8 @@
 //! decision 16).
 //!
 //! Three consequences are stated rather than hidden: the launcher writes ACEs
-//! onto the operator's directories and a hard kill between grant and rollback
-//! leaves them (design §6); the program's own directory is exposed read-only,
+//! onto the operator's directories, they are standing, and a hard kill leaves
+//! them where they are (design §6); the program's own directory is exposed read-only,
 //! **without inheritance, together with the `*.dll` files directly beside the
 //! program** — the child's own loader reads what it imports under its own token,
 //! the image itself is opened with the launcher's, and what is *not* reached is a
@@ -134,12 +134,14 @@ pub(crate) fn wide_os(path: &OsStr) -> Vec<u16> {
 
 /// Read a NUL-terminated UTF-16 string into a `String`.
 ///
-/// **The crate root's one unsafe site**, and the reason the exception sits on
-/// this function rather than on the file: the manifest denies `unsafe_code`, a
-/// crate-level allow would lift that for every line of this module — including
-/// the modules it declares and every item added later — and the constitution
-/// asks for the smallest scope in which the exception is expressible (design
-/// decision 14).
+/// **One of the crate root's two unsafe sites, and the reason each exception
+/// sits on its own function rather than on the file**: the manifest denies
+/// `unsafe_code`, a crate-level allow would lift that for every line of this
+/// module — including the modules it declares and every item added later — and
+/// the constitution asks for the smallest scope in which the exception is
+/// expressible (design decision 14). **Two, and a reader counting them should
+/// count both**, because that is what the lint sees: this function and
+/// [`from_wide`] below, each with its own `allow`.
 ///
 /// # Safety
 ///

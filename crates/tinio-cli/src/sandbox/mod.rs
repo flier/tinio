@@ -1272,6 +1272,12 @@ mod tests {
     /// [`requested`] with **no** `TINIO_STATE_DIR` at all: the resolution derived the directory
     /// from the home — *underived* is the guard's own word for it — which is the case macOS has no
     /// grant for and the one [`refuse_underived_state_dir`] refuses on a read-only run.
+    ///
+    /// Gated with its only caller below, which is `sandbox`'s: a feature-off build never reaches
+    /// `plan` with a request to refuse (decision 5 refuses them all with the build named), so the
+    /// helper would be dead code in exactly the graph that has no use for it — which is what
+    /// `cargo test --workspace --no-default-features` reports.
+    #[cfg(feature = "sandbox")]
     fn underived(root: &Path, state_dir: &Path) -> Resolution {
         Resolution {
             state_dir_override: None,

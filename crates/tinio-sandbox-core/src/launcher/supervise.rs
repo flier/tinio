@@ -30,10 +30,29 @@ use crate::{error::Result, launcher::Terminal};
 /// rather than one because they answer at different times: "is it up?" versus "did
 /// it ever come up?".
 ///
-/// There is no slot to create first, and that is the simplification the join
-/// bought: with the answer travelling through `JoinHandle`, nothing has to exist
-/// before the relay thread starts, there is no lock to poison, no value to clone
-/// on every read, and no ordering rule for a launcher to remember.
+/// **The final half needs no slot to exist first, and that is the simplification
+/// the join bought**: with the answer travelling through `JoinHandle`, nothing has
+/// to exist before the relay thread starts for "did it ever come up?" — there is no
+/// lock to poison, no value to clone on every read, and no ordering rule for a
+/// launcher to remember.
+///
+/// **The mid-stream half is the exception, and it is exactly one thing: the
+/// channel, which has to exist before the thread does.**
+/// [`Self::with_ready`] takes the receiving end of an `mpsc` pair; the launcher
+/// creates that pair **before it spawns the relay thread**, and the sender moves
+/// into the thread with the child's stdout, where the closure builds the
+/// [`Observer`] and hands the sender to it ([`Observer::with_notify`]). So the
+/// installation is *inside* the thread and the pair is outside it — what the
+/// ordering the join removed does not cover is one channel created early, not one
+/// call written early. Both launcher platforms build the `Observer` that way.
+///
+/// That is the whole of it: a launcher that never wants the announcement creates
+/// nothing, and one that does creates a channel. The record itself is unchanged
+/// either way, which is what keeps the two channels two answers rather than two
+/// copies.
+///
+/// [`Observer`]: crate::launcher::Observer
+/// [`Observer::with_notify`]: crate::launcher::Observer::with_notify
 ///
 /// **A launch can also fail after the child exists, and the child has to be
 /// ended rather than dropped.** The macOS launcher publishes the child's `state`
@@ -59,8 +78,12 @@ use crate::{error::Result, launcher::Terminal};
 ///
 /// # Examples
 ///
-/// ```
-/// use std::{cell::RefCell, process::Command, thread};
+/// **`no_run` because it spawns processes** (constitution III): the example is compiled
+/// but not executed, so `cargo test --doc` neither starts a `true`, a `sleep 60` nor a
+/// `sh` on a host whose purpose here is to check that the API is callable as written.
+///
+/// ```no_run
+/// use std::{cell::RefCell, process::Command, rc::Rc, thread};
 ///
 /// use tinio_sandbox_core::Child;
 ///
@@ -74,11 +97,16 @@ use crate::{error::Result, launcher::Terminal};
 /// # }
 ///
 /// // The failure path's two halves: a killer that ends the process, and the wait
-/// // that still reaps it — which is why the same process sits in a `RefCell`
-/// // rather than moving into the killer.
+/// // that still reaps it — which is why the same process is shared through an
+/// // `Rc<RefCell<_>>` instead of moving into the killer. A bare `RefCell` cannot
+/// // be held by two closures, and a `std::process::Child` is not `Clone`: this
+/// // example claimed `RefCell::clone` and therefore compiled on no unix host at
+/// // all, which `#[cfg(unix)]` hid from every check that ran on Windows.
 /// # #[cfg(unix)] {
-/// let process = RefCell::new(Command::new("sleep").arg("60").spawn().unwrap());
-/// let killer = RefCell::clone(&process);
+/// let process = Rc::new(RefCell::new(
+///     Command::new("sleep").arg("60").spawn().unwrap(),
+/// ));
+/// let killer = Rc::clone(&process);
 /// let mut child = Child::new(move || Ok(process.borrow_mut().wait()?))
 ///     .with_kill(move || killer.borrow_mut().kill());
 /// child.kill().expect("the killer ends the child");
@@ -124,6 +152,22 @@ impl Child {
     /// the killer: [`Self::with_kill`] is a second, optional collaborator rather
     /// than part of this constructor, so a platform that has none — and every
     /// test that spawns a process it means to wait for — is unchanged.
+    ///
+    /// # Examples
+    ///
+    /// **`no_run` because it spawns a process** (constitution III):
+    ///
+    /// ```no_run
+    /// use std::process::Command;
+    ///
+    /// use tinio_sandbox_core::Child;
+    ///
+    /// // The platform's own wait, wrapped: the closure owns whatever handle the platform
+    /// // keeps, which is why nothing here names a `std::process::Child`.
+    /// let mut process = Command::new("true").spawn().unwrap();
+    /// let mut child = Child::new(move || Ok(process.wait()?));
+    /// assert!(child.wait().expect("the child is reaped").success());
+    /// ```
     pub fn new(wait: impl FnMut() -> Result<ExitStatus> + 'static) -> Self {
         Self {
             wait: Box::new(wait),
@@ -136,6 +180,20 @@ impl Child {
 
     /// Hand over the relay thread, so [`Self::wait`] can join it — and keep the
     /// terminal event it returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::thread;
+    ///
+    /// use tinio_sandbox_core::{Child, Terminal};
+    ///
+    /// // A thread that already knows the answer stands in for the relay: what `wait` joins is
+    /// // the handle, and what it keeps is the thread's own return value.
+    /// let relay = thread::spawn(|| Some(Terminal::Listening("127.0.0.1:9000".parse().unwrap())));
+    /// let child = Child::new(|| unreachable!("this child is never waited for")).with_relay(relay);
+    /// assert!(child.terminal().is_none(), "the join has not happened yet");
+    /// ```
     pub fn with_relay(mut self, relay: JoinHandle<Option<Terminal>>) -> Self {
         self.relay = Some(relay);
         self
@@ -200,7 +258,10 @@ impl Child {
     ///
     /// # Examples
     ///
-    /// ```
+    /// **`no_run` because it spawns a process** (constitution III): the example is compiled
+    /// but not executed.
+    ///
+    /// ```no_run
     /// use std::process::Command;
     ///
     /// use tinio_sandbox_core::Child;
@@ -355,6 +416,22 @@ impl Child {
     /// them: the panic is in this crate's own code, and [`Self::terminal`]
     /// reports a dead relay as "nothing was recorded", which is the same answer
     /// a caller gets for a child that never reported.
+    ///
+    /// # Examples
+    ///
+    /// **`no_run` because it spawns a process** (constitution III):
+    ///
+    /// ```no_run
+    /// use std::process::Command;
+    ///
+    /// use tinio_sandbox_core::Child;
+    ///
+    /// let mut process = Command::new("true").spawn().unwrap();
+    /// let mut child = Child::new(move || Ok(process.wait()?));
+    /// // The child's own answer, which is what a launcher forwards as its own (design §3
+    /// // step 8).
+    /// assert_eq!(child.wait().expect("reaped").code(), Some(0));
+    /// ```
     pub fn wait(&mut self) -> Result<ExitStatus> {
         let status = (self.wait)();
         // The child's own answer, which is what a stuck launcher needs to see:
@@ -394,6 +471,25 @@ impl Child {
     /// clock**: that one answers while the child is still running, for a caller
     /// that must act on readiness rather than only report on it afterwards. This
     /// one is the final word, and the only one that can say "it never reported".
+    ///
+    /// # Examples
+    ///
+    /// **`no_run` because it spawns a process** (constitution III):
+    ///
+    /// ```no_run
+    /// use std::{process::Command, thread};
+    ///
+    /// use tinio_sandbox_core::{Child, Terminal};
+    ///
+    /// let mut process = Command::new("true").spawn().unwrap();
+    /// let addr = "127.0.0.1:9000".parse().expect("addr");
+    /// let relay = thread::spawn(move || Some(Terminal::Listening(addr)));
+    /// let mut child = Child::new(move || Ok(process.wait()?)).with_relay(relay);
+    /// child.wait().expect("the child is reaped");
+    /// // The read is worth something only after the wait: by then the relay has been joined,
+    /// // so this is the final answer a launcher frames a `None` on rather than a snapshot.
+    /// assert!(child.terminal().is_some());
+    /// ```
     pub fn terminal(&self) -> Option<&Terminal> {
         self.terminal.as_ref()
     }
@@ -402,9 +498,13 @@ impl Child {
 /// Wait for the confined child, then undo the launch.
 ///
 /// Teardown runs on every path — a clean exit, a failed child and a failed
-/// wait alike — because a failed launch is exactly when an ACL grant or a
-/// temporary directory most needs reverting (design decision 15). The status
-/// returned is always the **child's**; teardown cannot mask it.
+/// wait alike — because a failed launch is exactly when the platform's own
+/// teardown most needs to run: what a launcher set up before the child existed
+/// is what has to come back down. **No ACE is reverted on any path**: every
+/// grant the Windows launcher makes is standing (design decision 15), so a
+/// failed launch leaves the ACEs it had already written for the next run on
+/// that root to find rather than handing it a clean tree. The status returned
+/// is always the **child's**; teardown cannot mask it.
 ///
 /// **It borrows the child rather than consuming it, and that is the whole reason
 /// the signature is `&mut Child`.** The caller's next move is to ask
@@ -415,7 +515,7 @@ impl Child {
 /// time this returns the answer is final.
 ///
 /// **Teardown cannot report a failure, and that is deliberate rather than a
-/// gap.** A rollback that can fail belongs in the platform's wait closure, which
+/// gap.** A teardown that can fail belongs in the platform's wait closure, which
 /// owns the platform's error type and can name the directory it could not fix
 /// (design §11's Windows row); a `Child` that is never waited on at all is the
 /// caller's to end, through [`Child::kill`] on the path that failed after the
@@ -423,7 +523,7 @@ impl Child {
 /// — disarming a signal handler, removing a path the launcher created — which is
 /// what both launcher platforms pass it.
 ///
-/// That the teardown ran is traced (`step = "teardown"`), because a rollback
+/// That the teardown ran is traced (`step = "teardown"`), because a teardown
 /// that silently did not happen is indistinguishable from one that did.
 ///
 /// # Errors
@@ -433,7 +533,10 @@ impl Child {
 ///
 /// # Examples
 ///
-/// ```
+/// **`no_run` because it spawns a process** (constitution III): the example is compiled
+/// but not executed.
+///
+/// ```no_run
 /// use std::process::Command;
 ///
 /// use tinio_sandbox_core::{Child, supervise};
@@ -670,8 +773,9 @@ mod tests {
 
     #[test]
     fn teardown_runs_even_when_the_child_fails() {
-        // A failed child is exactly when the ACLs, the profile and the jail
-        // directory most need undoing.
+        // A failed child is exactly when the teardown most needs to run: what it
+        // undoes is what the launcher set up — the profile and the job — and no
+        // ACE is reverted on any path (every grant is standing, design decision 15).
         let mut runs = 0;
         let _ = supervise(&mut child_for("exit 1"), || runs += 1);
         assert_eq!(runs, 1);

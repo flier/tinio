@@ -18,6 +18,7 @@
 
 use std::{
     ffi::{OsStr, OsString, c_void},
+    io,
     mem::size_of,
     os::windows::{ffi::OsStrExt, process::ExitStatusExt},
     path::Path,
@@ -30,7 +31,7 @@ use std::{
 // below is `E0255` — one name cannot bind two functions — and `launch` is what
 // both the core's builder and this module's `CreateProcessW` entry are called.
 // `launch_error` says which one it is: the builder, at every call site here.
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::{
     Security::{PSID, SECURITY_CAPABILITIES},
     System::Threading::{
@@ -44,7 +45,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    _core::{Result, launch as launch_error},
+    _core::{Error, Result, launch as launch_error},
     handles::{self, last_error},
     sid::CapabilitySids,
 };
@@ -235,8 +236,7 @@ impl LaunchedProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when the wait or the
-    /// exit-code query fails.
+    /// [`Error::Launch`] when the wait or the exit-code query fails.
     ///
     /// # Examples
     ///
@@ -296,8 +296,7 @@ impl LaunchedProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when the call is
-    /// refused. The caller returns the failure that *led* here rather than this
+    /// [`Error::Launch`] when the call is refused. The caller returns the failure that *led* here rather than this
     /// one — a launch that stopped must report why — and this error is not lost
     /// with it: [`launch_error`](tinio_sandbox_core::launch) logged it where it
     /// was built, which is the rule shared §7 states for every failure in this
@@ -444,14 +443,74 @@ fn append_arg(line: &mut Vec<u16>, arg: &OsStr) {
     line.push(QUOTE);
 }
 
+/// What `CreateProcessW` refused, **with the one Win32 code that has two causes
+/// here resolved rather than repeated**.
+///
+/// `ERROR_FILE_NOT_FOUND` is what the call answers for a program that is not
+/// there *and* for a program that is, when the AppContainer profile behind the
+/// launch's package SID is gone — measured on this host 2026-09-21 (a merely
+/// derived SID fails exactly this way for this crate's own binary and for
+/// `cmd.exe` alike, with or without the ACEs granted) and reproduced 2026-09-26,
+/// while a live `PackageSid`'s profile was deleted by its peer. Handed on as it
+/// arrives, the code reads as "the system cannot find the file specified" and
+/// sends an operator after a binary that was never missing, which is the
+/// misdiagnosis the launcher's per-root window exists to prevent between two
+/// launchers ([`crate::sid::ProfileLock`]) and this check exists to name when it
+/// comes from anywhere else — an older binary, an operator's cleanup, a caller
+/// that derived a SID without creating the profile.
+///
+/// Every other code is passed through untouched: this is the crate's one
+/// measured ambiguity, and the file's existence is what separates the two
+/// readings.
+///
+/// **There is no retry here, and its absence is a decision rather than an
+/// omission.** Re-creating the profile on this error and launching again is the
+/// cheap fix the same measurement supports, and it is deliberately not kept:
+/// with the launcher's window closing the peer-deletion cause between launchers
+/// ([`crate::sid::ProfileLock`]), a retry would answer a cause that no longer
+/// arises between them, and it could not be covered by a test that goes through
+/// `Backend::confine` — that path derives its own profile, so it never meets the
+/// state a retry exists for. Machinery no test can reach is what this crate
+/// refuses to carry, and what an operator gets instead is the diagnosis below: a
+/// deleter this crate cannot see (an operator's cleanup, an older binary) is
+/// named as the cause rather than repaired.
+fn create_process_error(program: &Path, code: io::Error) -> Error {
+    if code.raw_os_error() != Some(ERROR_FILE_NOT_FOUND as i32) {
+        return launch_error("CreateProcessW", program, code);
+    }
+    let diagnosis = if program.exists() {
+        // The program is there, so the file is not what the kernel could not
+        // find — and the crate knows what else it needs: the container's
+        // profile, which `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` names by
+        // SID and which `CreateAppContainerProfile` is what puts behind that
+        // SID.
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the program file is there, so the file is not what was not found: \
+             CreateProcessW answered ERROR_FILE_NOT_FOUND (2), which is what it \
+             answers for a package SID with no AppContainer profile behind it \
+             (measured on this host 2026-09-21 and 2026-09-26) — the profile \
+             behind this launch's package SID is gone",
+        )
+    } else {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the program file was not found: CreateProcessW answered \
+             ERROR_FILE_NOT_FOUND (2) and no file exists at that path",
+        )
+    };
+    launch_error("CreateProcessW", program, diagnosis)
+}
+
 /// Launch `program` inside `container`.
 ///
 /// # Errors
 ///
-/// [`Error::Launch`](tinio_sandbox_core::Error::Launch) naming the program and
-/// carrying the Win32 error, for a refused attribute list, attribute, or
-/// `CreateProcessW`. The caller must roll the ACLs back on every one of them
-/// (design §11).
+/// [`Error::Launch`] naming the program and carrying the Win32 error, for a
+/// refused attribute list, attribute, or
+/// `CreateProcessW`. **Nothing is taken back on any of them**: the grants are
+/// standing, so the caller leaves whatever was already written in place
+/// (design decision 15 as amended; [`crate::acl::Grants`]'s doc states it).
 ///
 /// # Examples
 ///
@@ -660,7 +719,7 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
             )
         };
         if created == 0 {
-            return Err(launch_error("CreateProcessW", spec.program, last_error()));
+            return Err(create_process_error(spec.program, last_error()));
         }
         // `info!`, and the single most useful line in the file: the program and
         // the pid, which is also the child's process-group id (it is created with

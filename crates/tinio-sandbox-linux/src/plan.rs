@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    _core::{AccessMode, Error, Result, Sandbox},
+    _core::{AccessMode, Error, Result, Sandbox, refused},
     Mechanism,
     jail::mirror_under,
 };
@@ -177,12 +177,21 @@ pub fn plan(sandbox: &Sandbox, jail: &Path, model: Mechanism) -> Result<Vec<Moun
             .count()
             > 1
     {
-        return Err(Error::Unsupported {
-            detail: "the user-namespace model supports at most one read-only exposure: the \
-                     fallback overlay is created once, and every read-only mount a refused \
-                     remount falls back to would share its upper directory, which an overlay \
-                     binds to a single lower",
-        });
+        // **Logged where the `Error` is built** (shared §7). `plan` is public,
+        // so a direct caller is a caller this refusal never happened for until
+        // 2026-09-26 — the event came from `enter`, which wraps the call — and
+        // the `step` is the operation this function performs rather than the
+        // caller's name for it, so one failure is one event with one step
+        // whichever side of the crate boundary it was reached from.
+        return Err(refused(
+            "plan",
+            Error::Unsupported {
+                detail: "the user-namespace model supports at most one read-only exposure: the \
+                         fallback overlay is created once, and every read-only mount a refused \
+                         remount falls back to would share its upper directory, which an overlay \
+                         binds to a single lower",
+            },
+        ));
     }
 
     for exposure in sandbox.exposures() {

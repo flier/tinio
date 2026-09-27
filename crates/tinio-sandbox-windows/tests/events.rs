@@ -5,7 +5,7 @@
 //! what lands on *its* stdout — a relay running inside the test process would
 //! write into libtest's own capture, where nothing can be read back.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 mod common;
 

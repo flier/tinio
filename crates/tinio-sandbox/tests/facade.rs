@@ -15,6 +15,15 @@ use std::{
     thread::JoinHandle,
 };
 
+// The core crate, under the facade's own alias for it: this is the path the **type
+// half** of every binding in `the_launcher_surface_is_re_exported` names, so a name the
+// core stops publishing fails there rather than only on the facade's side.
+use tinio_sandbox::_core as core;
+// The mechanism's own vocabulary, at the file top rather than inside the test that drives
+// it: `docs/style.md` says "Top `use`; never inline", and a macOS-only import belongs under
+// the same `#[cfg]` the test carries rather than in its body.
+#[cfg(target_os = "macos")]
+use tinio_sandbox::macos::{Mechanism, Options};
 use tinio_sandbox::{AccessMode, Backend, LaunchPlan, Sandbox, platform};
 
 #[test]
@@ -39,25 +48,46 @@ fn the_vocabulary_is_re_exported() {
 
 /// Every item the facade publishes, named through `tinio_sandbox::`.
 ///
-/// **This test enforces one direction, and the direction it cannot enforce is
-/// worth naming rather than implying.** Every binding below names a
-/// `tinio_sandbox::` item together with the shape the core gives it, so the
-/// facade has to supply that name with that shape: a name the facade claims
-/// while the core does not publish it — or publishes with a different
-/// signature, which the `fn`-pointer bindings catch — fails to compile here,
-/// and so does a facade that stops re-exporting one of the names listed.
-/// An earlier draft was wrong in both of those ways at once: it named `Error`,
-/// `Result`, `Exposure` and `Sandbox` that the core did not export, while
-/// `Event`, `adopt` and `Adopted` were missing from it. **`reemit` is not one of
-/// these either way**: it is `pub(crate)` and `#[cfg(test)]`, so it is a name
-/// neither list has ever had to carry.
+/// **Each binding names both crates, and that is what makes this list the core's
+/// list rather than a second hand-copy of it.** The *type* half of every binding
+/// is the core's path (`tinio_sandbox::_core::…`, the facade's own alias for the
+/// core crate) and the *value* half is the facade's, so one line fails for either
+/// of the two ways the surface can drift: a name the core stops publishing (or
+/// publishes with another shape, which the `fn`-pointer half catches) fails the
+/// type, and a name the core publishes but the facade does not re-export fails
+/// the value. An earlier draft enforced only the facade's side, which let a core
+/// item — `SandboxSpec` was the live one — be omitted from the facade with this
+/// test still green; an earlier draft before that was wrong in both directions at
+/// once, naming `Error`, `Result`, `Exposure` and `Sandbox` that the core did not
+/// export while `Event`, `adopt` and `Adopted` were missing from the facade.
 ///
-/// **What it cannot see is a name that is not in this list.** A core item added
-/// later and never re-exported leaves the facade — and this test — compiling,
-/// so "the two lists are equal" is the rule those additions are made under
-/// rather than a property this test proves. The paths are not mirrored either:
-/// the facade publishes names flat, so `tinio_sandbox::launcher::Observer` does
-/// not exist even though `tinio_sandbox_core::launcher::Observer` does.
+/// **One direction still cannot be seen, and it is inherent rather than an
+/// omission.** A core item added to `tinio_sandbox_core`'s root and never
+/// re-exported leaves the facade compiling, and this test cannot name a name it
+/// does not list — Rust has no way to enumerate another crate's surface at
+/// compile time. So "the two lists are equal" remains the rule those additions
+/// are made under, and the core's root list (`crates/tinio-sandbox-core/src/lib.rs`,
+/// whose comment states that rule) is where the owner of the list lives. What this
+/// test guarantees is the other half: **every name this list carries is bound in
+/// both crates**, so no name *on* the list can disappear from either side
+/// unnoticed, and the drift is a missing line in one file rather than a silently
+/// narrower facade.
+///
+/// **"Every name it carries" is a property to re-check when a name is added, not
+/// a claim to take on trust** — the failure it guards against is silent by
+/// construction, and it has already happened once: `Exposure`, `Terminal`,
+/// `LaunchPayload`, `Confinement` and `is_launcher_fd_arg` were all on the list
+/// and none was bound through the facade, so five deletions would have left this
+/// test green. Types that appear only in type positions need a **value** binding
+/// of their own (a literal, or a variant); functions and constants are bound by a
+/// path in the value position. The check is mechanical:
+/// `rg -o 'tinio_sandbox::([A-Za-z_]+)' crates/tinio-sandbox/tests/facade.rs` minus
+/// the names the file's own `use` line brings in must cover the list in
+/// `crates/tinio-sandbox/src/lib.rs`.
+///
+/// The paths are not mirrored either: the facade publishes names flat, so
+/// `tinio_sandbox::launcher::Observer` does not exist even though
+/// `tinio_sandbox_core::launcher::Observer` does.
 ///
 /// Written as a binding per item rather than a `use` list so the failure names
 /// the missing symbol.
@@ -82,45 +112,69 @@ fn the_launcher_surface_is_re_exported() {
     };
 
     // The vocabulary — Task 1's half of the surface.
-    let _: fn() -> tinio_sandbox::Sandbox = tinio_sandbox::Sandbox::new;
-    let _: fn(&tinio_sandbox::Sandbox) -> &[tinio_sandbox::Exposure] =
-        tinio_sandbox::Sandbox::exposures;
-    let _: fn(Vec<tinio_sandbox::Exposure>, bool) -> tinio_sandbox::Sandbox =
-        tinio_sandbox::Sandbox::from_exposures;
-    let _: fn(tinio_sandbox::AccessMode) -> bool = tinio_sandbox::AccessMode::is_read_only;
-    let _: fn(&tinio_sandbox::Error) -> String = |err| err.to_string();
-    let _: tinio_sandbox::Result<()> = Ok(());
+    let _: fn() -> core::Sandbox = tinio_sandbox::Sandbox::new;
+    let _: fn(&core::Sandbox) -> &[core::Exposure] = tinio_sandbox::Sandbox::exposures;
+    let _: fn(Vec<core::Exposure>, bool) -> core::Sandbox = tinio_sandbox::Sandbox::from_exposures;
+    let _: fn(core::AccessMode) -> bool = tinio_sandbox::AccessMode::is_read_only;
+    let _: fn(&core::Error) -> String = |err| err.to_string();
+    let _: core::Result<()> = Ok(());
+    // **A type that is only ever a *type* needs a value binding to be bound at all**, and
+    // these three are the names that slipped through for exactly that reason: each appeared
+    // beneath the core's path and never the facade's, so deleting it from the facade left this
+    // test green. A literal answers both halves at once — the declared type is the core's
+    // spelling and the expression is the facade's, which pins them as one type and pins the
+    // public shape a consumer writes.
+    let _: core::Exposure = tinio_sandbox::Exposure {
+        host: PathBuf::from("/srv/data"),
+        access: AccessMode::ReadOnly,
+    };
+    let _: core::Terminal =
+        tinio_sandbox::Terminal::Listening("127.0.0.1:9000".parse().expect("addr"));
+    let _: core::Confinement = tinio_sandbox::Confinement::InPlace;
     // The four shapes a backend builds a failure through — `refused` is the
     // primitive, `fail` and `step` build `Error::Step`, `launch` builds
     // `Error::Launch`. The two `impl Into<…>` parameters are fixed by the
     // binding's own type, and `step` is called rather than bound: it returns an
     // opaque `impl Fn`, which no `fn`-pointer binding can name.
-    let _: fn(&'static str, tinio_sandbox::Error) -> tinio_sandbox::Error = tinio_sandbox::refused;
-    let _: fn(&'static str, io::Error) -> tinio_sandbox::Error = tinio_sandbox::fail;
-    let _: fn(&'static str, PathBuf, io::Error) -> tinio_sandbox::Error = tinio_sandbox::launch;
-    let _: tinio_sandbox::Error =
-        tinio_sandbox::step::<io::Error>("mount")(io::Error::other("boom"));
+    let _: fn(&'static str, core::Error) -> core::Error = tinio_sandbox::refused;
+    let _: fn(&'static str, io::Error) -> core::Error = tinio_sandbox::fail;
+    let _: fn(&'static str, PathBuf, io::Error) -> core::Error = tinio_sandbox::launch;
+    let _: core::Error = tinio_sandbox::step::<io::Error>("mount")(io::Error::other("boom"));
 
     // The launcher machinery — Task 2's.
+    //
+    // **`platform()`'s answer is one more `Backend`, and this is the only name for that
+    // trait.** The arm used to republish the core's `Backend` as `Platform`, which is one
+    // fact with two public spellings — the rule the module doc above states; the constructor
+    // stays because which type answers the trait is the platform's own and a consumer cannot
+    // name one type for three targets.
+    let mut platform = tinio_sandbox::platform();
+    let _: &mut dyn Backend = &mut platform;
+    // The object lifetime is spelled rather than left to the default: `&mut dyn Backend` in
+    // this position means `&'a mut (dyn Backend + 'a)`, which is a *more* general pointer
+    // than the method's `for<'a> fn(&'a mut (dyn Backend + 'static), …)`.
     let _: fn(
-        &mut tinio_sandbox::Platform,
-        &tinio_sandbox::Sandbox,
-        &tinio_sandbox::LaunchPlan,
-    ) -> tinio_sandbox::Result<tinio_sandbox::Confinement> =
-        <tinio_sandbox::Platform as tinio_sandbox::Backend>::confine;
-    let _: fn(String) -> tinio_sandbox::LaunchPlan = tinio_sandbox::LaunchPlan::for_launch;
-    let _: fn(&tinio_sandbox::LaunchPlan) -> &str = tinio_sandbox::LaunchPlan::config;
-    let _: fn(&str) -> Option<tinio_sandbox::Event> = tinio_sandbox::Event::decode;
-    let _: fn(&mut tinio_sandbox::Observer<Vec<u8>>, &str, &str) -> Option<tinio_sandbox::Event> =
+        &mut (dyn Backend + 'static),
+        &core::Sandbox,
+        &core::LaunchPlan,
+    ) -> core::Result<core::Confinement> = <dyn Backend as Backend>::confine;
+    let _: fn(String) -> core::LaunchPlan = tinio_sandbox::LaunchPlan::for_launch;
+    let _: fn(&core::LaunchPlan) -> &str = tinio_sandbox::LaunchPlan::config;
+    let _: fn(&str) -> Option<core::Event> = tinio_sandbox::Event::decode;
+    let _: fn(&mut core::Observer<Vec<u8>>, &str, &str) -> Option<core::Event> =
         tinio_sandbox::Observer::record;
-    let _: fn(&tinio_sandbox::Observer<Vec<u8>>) -> Option<&tinio_sandbox::Terminal> =
+    let _: fn(&core::Observer<Vec<u8>>) -> Option<&core::Terminal> =
         tinio_sandbox::Observer::terminal;
-    let _: fn(Vec<OsString>, io::Empty) -> tinio_sandbox::Result<Option<tinio_sandbox::Adopted>> =
+    let _: fn(Vec<OsString>, io::Empty) -> core::Result<Option<core::Adopted>> =
         tinio_sandbox::adopt;
     let _: fn(i64) -> OsString = tinio_sandbox::listener_fd_arg;
     let _: fn(&OsStr) -> bool = tinio_sandbox::is_listener_fd_arg;
     let _: fn(&OsStr) -> Option<i64> = tinio_sandbox::listener_fd_from_arg;
     let _: &str = tinio_sandbox::LISTENER_FD_PREFIX;
+    // The predicate over **both** elements, which had no binding at all: it answers the
+    // question every argv filter asks, so a facade that stopped publishing it would take out
+    // the one call that keeps a descriptor element out of clap's parser.
+    let _: fn(&OsStr) -> bool = tinio_sandbox::is_launcher_fd_arg;
     // The control channel's quartet, beside the listener's: the second inherited
     // descriptor a launcher hands over, spelled by the same four shapes — the Windows
     // launcher's pipe pool and the macOS launcher's single unix socket, both of which
@@ -129,24 +183,42 @@ fn the_launcher_surface_is_re_exported() {
     let _: fn(&OsStr) -> bool = tinio_sandbox::is_control_fd_arg;
     let _: fn(&OsStr) -> Option<i64> = tinio_sandbox::control_fd_from_arg;
     let _: &str = tinio_sandbox::CONTROL_FD_PREFIX;
+    // **The confinement a launcher hands a child that confines itself**, and the reason
+    // this guard had to be widened: it is the public field type of
+    // `LaunchPayload::confinement` and the answer `Adopted::confinement` gives, so a
+    // facade consumer naming either must be able to name this type — and the facade
+    // omitted it while this test stayed green, because the list simply did not contain it.
+    let _: core::SandboxSpec = tinio_sandbox::SandboxSpec {
+        mechanism: String::new(),
+        profile: String::new(),
+        params: Vec::new(),
+    };
+    let _: fn(&core::Adopted) -> Option<&core::SandboxSpec> = tinio_sandbox::Adopted::confinement;
+    let _: fn(&mut core::LaunchPayload) -> &mut Option<core::SandboxSpec> =
+        |payload| &mut payload.confinement;
     // The owned handle a plan carries and the platform clears the flag on: the value the
     // child's element is spelled from, on the platform where the clear has to happen after
     // the profile pre-flight. `with_control` is a builder rather than a `fn`-pointer shape,
     // so it is called with the plan it consumes.
     let planned = tinio_sandbox::LaunchPlan::default().with_control(control());
     let _: i64 = planned.controls()[0].value();
-    let _: tinio_sandbox::Child = tinio_sandbox::Child::new(|| unreachable!("not waited"));
-    let _: fn(
-        tinio_sandbox::Child,
-        JoinHandle<Option<tinio_sandbox::Terminal>>,
-    ) -> tinio_sandbox::Child = tinio_sandbox::Child::with_relay;
-    let _: fn(&tinio_sandbox::Child) -> Option<&tinio_sandbox::Terminal> =
-        tinio_sandbox::Child::terminal;
+    let _: core::Child = tinio_sandbox::Child::new(|| unreachable!("not waited"));
+    let _: fn(core::Child, JoinHandle<Option<core::Terminal>>) -> core::Child =
+        tinio_sandbox::Child::with_relay;
+    let _: fn(&core::Child) -> Option<&core::Terminal> = tinio_sandbox::Child::terminal;
     // `&mut Child` rather than `Child`: the caller reads the terminal after this
     // returns, and a by-value signature would take the child away (decision 19).
-    let _: fn(&mut tinio_sandbox::Child, fn()) -> tinio_sandbox::Result<ExitStatus> =
-        tinio_sandbox::supervise;
-    let _: fn(&mut tinio_sandbox::LaunchPayload) -> &mut String = |payload| &mut payload.config;
+    let _: fn(&mut core::Child, fn()) -> core::Result<ExitStatus> = tinio_sandbox::supervise;
+    let _: fn(&mut core::LaunchPayload) -> &mut String = |payload| &mut payload.config;
+    // **The payload itself, from both sides**, and not only through the two field projections
+    // above: those named it beneath the core's path alone, so the facade's own spelling was
+    // never exercised. The literal is the facade's name over the core's declared type, so the
+    // two are pinned as one type and the three public fields are pinned with them.
+    let _: core::LaunchPayload = tinio_sandbox::LaunchPayload {
+        config: String::new(),
+        token: None,
+        confinement: None,
+    };
 }
 
 /// The **launch-failure pair** — the killer a launcher may hand over, and the call that runs it —
@@ -250,8 +322,6 @@ fn macos_selects_a_launcher_backend_rather_than_the_stub() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_publishes_the_mechanism_and_defaults_to_the_helper() {
-    use tinio_sandbox::macos::{Mechanism, Options};
-
     assert_eq!(Options::default().mechanism(), Mechanism::SandboxExec);
     assert_eq!(
         Mechanism::from_env(None).expect("absent means the default"),

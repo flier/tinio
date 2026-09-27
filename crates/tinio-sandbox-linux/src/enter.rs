@@ -20,13 +20,13 @@ use rustix::{
         set_capabilities, set_no_new_privs,
     },
 };
-use tracing::{Span, debug, field, instrument};
+use tracing::{Span, debug, field, info, instrument};
 
 use crate::{
-    _core::{Confinement, Error, Result, Sandbox},
+    _core::{Confinement, Error, Exposure, Result, Sandbox},
     Mechanism,
     caps::{self, Cap},
-    jail::{jail_root, mirror_under},
+    jail::{EXPOSE_STEP, jail_root, mirror_under},
     mechanism::{Resolved, fail, refused, step, unshare, userns_available},
     options::Options,
     plan::{Mount, MountKind, OverlayDirs, plan},
@@ -151,7 +151,15 @@ fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
         upper: jail.join(".overlay/upper"),
         work: jail.join(".overlay/work"),
     };
-    let mounts = plan(sandbox, &jail, resolved).map_err(|error| refused("plan", error))?;
+    // **No `refused("plan", …)` wrapper here, and dropping it is the other half
+    // of the construction-site rule** (shared §7: the event belongs where the
+    // returned `Error` is built). Both refusals `plan` can return are logged at
+    // their own sites now — its `Error::Unsupported`, and the `Error::BadPath`
+    // `mirror_under` builds — so a wrapper on this line would log one failure
+    // twice for this caller, while the caller the rule is actually about (one
+    // outside the crate, which never reaches this line) was the one with no
+    // record of it at all.
+    let mounts = plan(sandbox, &jail, resolved)?;
 
     Ok(Prepared {
         resolved,
@@ -180,7 +188,7 @@ fn resolve_model(opts: &Options) -> Result<Mechanism> {
         },
     );
 
-    match resolved {
+    let resolved = match resolved {
         // **The refusal *is* the mapping, and the shape this function used to
         // have is why.** It returned a [`Resolved`] and a second step mapped
         // that to a mechanism, where `Resolved::Unavailable` — the one value
@@ -191,7 +199,9 @@ fn resolve_model(opts: &Options) -> Result<Mechanism> {
         // model-shaped answer waiting for the first reader who reordered the
         // two. `Error::Unsupported` is what the platform really cannot do, and
         // the one thing P0's `Error` reserves that variant for.
-        Resolved::Unavailable(detail) => Err(refused("model", Error::Unsupported { detail })),
+        Resolved::Unavailable(detail) => {
+            return Err(refused("model", Error::Unsupported { detail }));
+        }
 
         // **The other half of the `local_uid` rule, and the half the request
         // cannot answer.** `Auto` resolves *into* the user namespace whenever
@@ -202,12 +212,27 @@ fn resolve_model(opts: &Options) -> Result<Mechanism> {
         // design §8 and §11 both call a startup configuration error. The
         // resolved model is the only thing that knows.
         Resolved::UserNamespace if opts.local_uid_configured() => {
-            Err(refused("local_uid", local_uid_conflicts_with_userns()))
+            return Err(refused("local_uid", local_uid_conflicts_with_userns()));
         }
 
-        Resolved::UserNamespace => Ok(Mechanism::UserNamespace),
-        Resolved::Root => Ok(Mechanism::Root),
-    }
+        Resolved::UserNamespace => Mechanism::UserNamespace,
+        Resolved::Root => Mechanism::Root,
+    };
+    // **The first of the three events shared §7 makes this crate's
+    // must-survive set**, and the one the design's own wording names first
+    // ("the resolved model"): the *resolved* model rather than the request,
+    // because `Auto` is a request that becomes one of the two, and an operator
+    // asking "was this process confined, and how" is asking about the one that
+    // ran. `Debug`-level detail belongs to the spans this function keeps; this
+    // is the event that has to survive `serve`'s fixed `Verbosity::Info`.
+    info!(
+        step = "model",
+        model = ?resolved,
+        requested = ?opts.model(),
+        euid = opts.euid(),
+        "the model this process confines itself with"
+    );
+    Ok(resolved)
 }
 
 /// Refuse a missing or un-mirrorable exposure before a directory is created.
@@ -224,14 +249,18 @@ fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
     for exposure in sandbox.exposures() {
         if !exposure.host.exists() {
             return Err(refused(
-                "expose",
+                EXPOSE_STEP,
                 Error::BadPath {
                     path: exposure.host.clone(),
                     reason: "does not exist",
                 },
             ));
         }
-        mirror_under(Path::new("/"), &exposure.host).map_err(|error| refused("expose", error))?;
+        // **No `refused` wrapper**: `mirror_under` logs its own refusal where it
+        // builds the `Error`, with the same `step` this loop's "does not exist"
+        // refusal uses, so an exposure that cannot be mirrored is one event
+        // whichever of the two reasons it was refused for.
+        mirror_under(Path::new("/"), &exposure.host)?;
     }
     Ok(())
 }
@@ -325,8 +354,8 @@ fn enter_mount_namespace() -> Result<()> {
     Ok(())
 }
 
-/// The mounts, in plan order. `ret` is the Info event for the exposure set
-/// that landed (shared §7).
+/// The mounts, in plan order. The Info event for the exposure set that landed is
+/// [`announce_exposures`]'s (shared §7).
 #[instrument(
     skip_all,
     ret,
@@ -337,7 +366,61 @@ fn apply_planned_mounts(sandbox: &Sandbox, mounts: &[Mount], overlay: &OverlayDi
     for entry in mounts {
         apply_mount(entry, overlay)?;
     }
+    announce_exposures(sandbox.exposures(), mounts.len());
     Ok(())
+}
+
+/// The Info event for the exposure set the jail applied — the second of the
+/// three events shared §7 requires of this crate, and the "to what" half of its
+/// question.
+///
+/// **Emitted after the loop rather than before it**, because what it states is
+/// what *landed*: a mount that failed takes the process with it (design §11's
+/// fail-closed) and its own failure event is what the operator reads, so an
+/// announcement ahead of the loop would be a set that a failed run never
+/// applied. The per-mount half is `trace_mount`'s `debug!`, one per entry with
+/// the target and the kind, which is why this one carries the set as a whole.
+///
+/// **A function rather than an inline `info!`, for the reason every `announce_*`
+/// here is one: the site is unreachable from a test.** The mounts are real
+/// syscalls in a namespace a test process cannot enter, so §7's "asserts the
+/// event's `step` field" could not be a property this crate can lose. It takes
+/// the two facts the site has.
+fn announce_exposures(exposures: &[Exposure], mounts: usize) {
+    info!(
+        step = "exposures",
+        count = exposures.len(),
+        mounts,
+        exposures = %describe_exposures(exposures),
+        "the exposure set the jail applied"
+    );
+}
+
+/// The exposure set as one field value: `path (access)` per entry, comma
+/// separated.
+///
+/// **A rendered list is a field value and not a sentence**, which is the shape
+/// §7's "fields, not sentences" asks for: `step`, `path` and `access` stay field
+/// names, and what a *set* needs is one field whose value is the set — the same
+/// shape `tinio-sandbox-windows`' grant phase announces its own with. The access
+/// is spelled rather than debug-printed because this line is read by an operator
+/// asking what the jail let through.
+fn describe_exposures(exposures: &[Exposure]) -> String {
+    exposures
+        .iter()
+        .map(|exposure| {
+            format!(
+                "{} ({})",
+                exposure.host.display(),
+                if exposure.access.is_read_only() {
+                    "read-only"
+                } else {
+                    "read-write"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Pivot into the jail and detach the old root.
@@ -717,7 +800,18 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     // check canonicalises its target below: mountinfo reports *resolved*
     // paths, so an unresolved source under a symlinked ancestor would match a
     // shallower mount point and re-assert less than the bind inherited.
-    let source = fs::canonicalize(&entry.source).unwrap_or_else(|_| entry.source.clone());
+    //
+    // **And a failure is fatal rather than falling back to the unresolved
+    // string, which is what this line used to do** (follow-ups §6; design §11's
+    // "never continues unconfined" read as an invariant rather than as an
+    // aspiration). The fallback was a fail-open with no legitimate caller: the
+    // bind of this very source has just succeeded, so the path exists, and the
+    // only thing the fallback could do is make `source_mount_flags_in` match a
+    // shallower mount and re-assert *less* than the bind inherited — a read-only
+    // exposure that silently keeps a locked flag's protection off. A source that
+    // cannot be resolved is a mount the confinement did not establish, and the
+    // process exits before it serves anything.
+    let source = fs::canonicalize(&entry.source).map_err(step("canonicalize mount source"))?;
     let inherited = source_mount_flags_in(&read_mountinfo()?, &source);
     match mount_remount(
         &entry.target,
@@ -769,10 +863,20 @@ fn refuse_writable_nested_mounts(entry: &Mount) -> Result<()> {
     // through the symlink `/tmp/x/link/j` is listed as
     // `/tmp/x/real/j` — so a `$TMPDIR` under a symlinked
     // ancestor would make an unresolved target miss its own
-    // submounts. Canonicalised when the call answers, and the
-    // target as it stands when it does not, which can cost a
-    // missed refusal but cannot invent one.
-    let target = fs::canonicalize(&entry.target).unwrap_or_else(|_| entry.target.clone());
+    // submounts.
+    //
+    // **The failure is propagated, and the fallback it replaces
+    // was a fail-open with no legitimate caller.** The target
+    // is a directory this run created inside the jail and
+    // mounted on a few instructions ago, so a canonicalisation
+    // that fails means the mount this check is about did not
+    // land — and answering that with the unresolved string
+    // makes `writable_nested_mounts_in` match nothing, which
+    // reports the exposure as read-only while a writable
+    // submount stays reachable. That is the one outcome this
+    // function exists to prevent, and a missing canonical name
+    // is not a reason to skip the search for it.
+    let target = fs::canonicalize(&entry.target).map_err(step("canonicalize mount target"))?;
     let nested = writable_nested_mounts_in(&read_mountinfo()?, &target);
     if let Some(mount) = nested.first() {
         // **The nested mount is named by its *host* path**,
@@ -840,9 +944,15 @@ fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
 
 #[instrument(level = "debug", skip_all, ret, fields(retained = ?keep, effective = field::Empty))]
 fn drop_capabilities(keep: &[Cap]) -> Result<()> {
+    // **The retained set is announced before anything is given up**, so a run
+    // that dies part-way through the sweep still says which policy it was
+    // enforcing.
+    announce_retained(keep);
+
     // No new privileges first: it is what lets the seccomp filter install
     // without CAP_SYS_ADMIN.
     set_no_new_privs(true).map_err(step("no_new_privs"))?;
+    announce_no_new_privs();
 
     // **The bounding set goes first, and that order is load-bearing.**
     // `PR_CAPBSET_DROP` requires `CAP_SETPCAP` in the *effective* set at the
@@ -906,11 +1016,56 @@ fn drop_capabilities(keep: &[Cap]) -> Result<()> {
     sets.inheritable = CapabilitySet::empty();
     set_capabilities(None, sets).map_err(step("capset"))?;
     Span::current().record("effective", wanted.bits());
+    announce_capset(wanted);
 
     // The bounding set is what makes the drop stick across `execve`: with euid 0
     // the kernel recomputes the permitted set as full on exec, and only the
     // bounding set bounds it. Every capability not kept has left it by now.
     Ok(())
+}
+
+// **The three events below are functions rather than inline `info!`s, and the
+// reason is the same for each: the operations they describe cannot be undone.**
+// `drop_capabilities` sets `no_new_privs` — a process-wide switch with no
+// unset — removes bits from the bounding set and narrows the process's own sets,
+// so a test that reached any of them would leave the test binary unable to
+// confine anything, the tests beside it included. Shared §7 wants each event's
+// `step` field to be a property a test can *lose*, so the events are reachable
+// where the sites are not: each takes exactly the values the site hands the
+// kernel, and a recording of one is the line the run writes.
+//
+// **The per-drop events stay `debug!`, and that is §7's own split rather than an
+// omission** — "each bounding-set drop" is named there as the per-item detail
+// behind these, and the `info!` half is the policy (the retained set), the
+// switch (`no_new_privs`) and the outcome (`capset`).
+
+/// The capability policy this run enforces, announced before anything is given
+/// up (shared §7).
+fn announce_retained(keep: &[Cap]) {
+    info!(
+        step = "retained capabilities",
+        count = keep.len(),
+        retained = %keep.iter().map(|cap| cap.name()).collect::<Vec<_>>().join(", "),
+        "the capabilities this process keeps"
+    );
+}
+
+/// The part of the drop that makes the rest stick across `execve` (shared §7).
+fn announce_no_new_privs() {
+    info!(
+        step = "no_new_privs",
+        "privilege gain across execve is off for this process"
+    );
+}
+
+/// The `capset` that narrows the process's own sets, with the mask the kernel
+/// was handed (shared §7).
+fn announce_capset(retained: CapabilitySet) {
+    info!(
+        step = "capset",
+        retained = retained.bits(),
+        "the process's own capability sets were narrowed"
+    );
 }
 
 /// Every capability `CAP_CHOWN` (0) through `CAP_CHECKPOINT_RESTORE` (40), in
@@ -970,16 +1125,92 @@ const ALL_CAPABILITIES: [CapabilitySet; 41] = [
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use rustix::{io::Errno, mount::MountFlags};
+    use rustix::{io::Errno, mount::MountFlags, thread::CapabilitySet};
 
     use super::{
-        refused_remount_needs_the_overlay, source_mount_flags_in, writable_nested_mounts_in,
+        announce_capset, announce_exposures, announce_no_new_privs, announce_retained,
+        refused_remount_needs_the_overlay, resolve_model, source_mount_flags_in,
+        writable_nested_mounts_in,
     };
     use crate::{
-        _core::{AccessMode, Backend as BackendTrait, Error, LaunchPlan, Sandbox},
+        _core::{AccessMode, Backend as BackendTrait, Error, Exposure, LaunchPlan, Sandbox},
         Backend, Mechanism,
+        caps::Cap,
         options::Options,
+        testing::{assert_step, record_events},
     };
+
+    #[test]
+    fn the_exposure_set_is_traced_with_its_step() {
+        // **The second of the three events, and the "to what" half of shared
+        // §7's question.** The set is rendered as one field value — the per-mount
+        // `debug!`s are the item detail and are invisible under `serve`'s
+        // subscriber — so this asserts both halves of what an operator reads:
+        // the counts and the set itself, in the access spelling the run used.
+        let exposures = [
+            Exposure {
+                host: PathBuf::from("/srv/data"),
+                access: AccessMode::ReadOnly,
+            },
+            Exposure {
+                host: PathBuf::from("/srv/state"),
+                access: AccessMode::ReadWrite,
+            },
+        ];
+        let (_, logged) = record_events(|| announce_exposures(&exposures, 3));
+        assert_step(&logged, "exposures");
+        assert!(logged.contains("count=2"), "{logged}");
+        assert!(logged.contains("mounts=3"), "{logged}");
+        assert!(
+            logged.contains("exposures=/srv/data (read-only), /srv/state (read-write)"),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn the_capability_policy_is_traced_with_its_steps() {
+        // **§7's "the retained capability set and each drop; `capset`", of which
+        // only the drops had an event before this** — and the drops' own stays
+        // `debug!`, because §7 names it as the per-item detail while these three
+        // are the policy, the switch and the outcome. The per-drop path cannot be
+        // driven from a test at all (removing a bit from the bounding set is
+        // one-way), so its `debug!` is asserted nowhere and says so at its site.
+        let (_, logged) = record_events(|| announce_retained(&[Cap::Chown]));
+        assert_step(&logged, "retained capabilities");
+        assert!(logged.contains("count=1"), "{logged}");
+        assert!(logged.contains("retained=CAP_CHOWN"), "{logged}");
+
+        let (_, logged) = record_events(announce_no_new_privs);
+        assert_step(&logged, "no_new_privs");
+
+        let (_, logged) = record_events(|| announce_capset(CapabilitySet::CHOWN));
+        assert_step(&logged, "capset");
+        assert!(
+            logged.contains(&format!("retained={}", CapabilitySet::CHOWN.bits())),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn the_resolved_model_is_traced_with_its_step() {
+        // **Shared §7's check on the event the plan names first**: the resolved
+        // model is what answers "was this process confined, and to how", and a
+        // `debug!`-only record of it is invisible under `serve`'s subscriber,
+        // which is built at a fixed `Verbosity::Info` with no environment
+        // filter. The refusal tests reach this function too, which is why the
+        // recorder is a global one (`crate::testing` states the mechanism).
+        //
+        // The options are injected and the model is *forced*, so no probe forks:
+        // what this asserts is the event, not the host's answer.
+        let opts = Options::default().with_model(Mechanism::Root).with_euid(0);
+        let (resolved, logged) = record_events(|| resolve_model(&opts));
+        assert_eq!(
+            resolved.expect("root with euid 0 needs no probe"),
+            Mechanism::Root
+        );
+        assert_step(&logged, "model");
+        assert!(logged.contains("model=Root"), "{logged}");
+    }
 
     #[test]
     fn an_empty_sandbox_is_refused() {

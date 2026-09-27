@@ -1,5 +1,6 @@
-//! ACL whitelist: grant the package SID an access mode on each exposed path,
-//! and take those grants back on the way out (decisions 15, 21, §6).
+//! ACL whitelist: grant the package SID an access mode on each exposed path, and
+//! leave those grants standing — the launcher takes nothing back on the way out
+//! (decisions 15, 21, §6).
 //!
 //! **Writes go through `icacls.exe` resolved from the system directory, not
 //! `PATH` and not `SetNamedSecurityInfo`; reads go through
@@ -49,12 +50,12 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     process::{Command, Output},
-    ptr::{from_mut, null_mut},
+    ptr::{addr_of, from_mut, null_mut},
     sync::Arc,
 };
 
 use windows_sys::Win32::{
-    Foundation::{GENERIC_ALL, LocalFree},
+    Foundation::LocalFree,
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         Authorization::{ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
@@ -93,8 +94,9 @@ use crate::{
 /// no-op** — `icacls` exits 0 and writes nothing — while the file shape sent to a
 /// directory leaves every descendant ungranted. *Whether it propagates* is a policy:
 /// a caller's exposed directory must reach the descendants it already holds (design
-/// §6's whitelist, one ACE per exposed path instead of a `/t` walk and a per-file
-/// rollback), and decision 22's program-directory entry deliberately does not.
+/// §6's whitelist, one ACE per exposed path instead of a `/t` walk over
+/// every file in the tree), and decision 22's program-directory entry deliberately
+/// does not.
 ///
 /// # Examples
 ///
@@ -141,7 +143,7 @@ pub enum Target {
 /// DELETE` (`0x001301BF`) and `RX` is the read and execute halves
 /// (`0x001200A9`). `(OI)(CI)` means object-and-container inherit, **is meaningful
 /// on a directory only**, and is what carries an exposed directory's ACE to the
-/// descendants that were already there — and what makes the grant and its rollback
+/// descendants that were already there — and what makes a grant on a directory
 /// cost a pass over the whole tree (design §6 and its Risks row).
 ///
 /// [`Target::Directory`] is therefore the only variant that carries the flags: a
@@ -158,8 +160,9 @@ pub enum Target {
 /// intent or the other way round, and `(OI)(CI)` is the single token in this table
 /// that distinguishes a shape at all — it is what separates [`Target::Directory`]
 /// from both of the others. Which variant a call site holds is checked where it is
-/// chosen: `backend::grant_whitelist` asserts that the program directory it shapes
-/// is a directory.
+/// chosen: `backend::grant_whitelist` refuses a program-directory shape whose path
+/// is not a directory, rather than handing `icacls` a grant it would report as
+/// successful and write nothing for.
 ///
 /// # Examples
 ///
@@ -369,6 +372,20 @@ fn sid_spellings(sid: &str) -> Vec<&str> {
 /// the predicate exists: `S-1-15-2-1` is printed as `ALL APPLICATION PACKAGES`.
 ///
 /// Public because those suites ask it and the text they hold is the tool's.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_windows::acl::mentions_sid;
+///
+/// // The literal spelling, which is what a package SID comes back as.
+/// let listing = r"D:\srv\tinio:\S-1-15-2-1:(OI)(CI)(RX)";
+/// assert!(mentions_sid(listing, "S-1-15-2-1"));
+/// // And the name `icacls` renders a well-known SID under, which is the reason
+/// // this predicate exists at all.
+/// let named = r"D:\srv APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)";
+/// assert!(mentions_sid(named, "S-1-15-2-1"));
+/// ```
 #[must_use]
 pub fn mentions_sid(text: &str, sid: &str) -> bool {
     text.lines().any(|line| {
@@ -392,7 +409,7 @@ fn ace_sid(ace: *mut c_void) -> PSID {
     // `ACCESS_ALLOWED_ACE` inside a descriptor that is alive for the call, so
     // reading its `SidStart` field is in bounds and aligned, and the field is
     // the first byte of that ACE's SID.
-    unsafe { std::ptr::addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) as PSID }
+    unsafe { addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) as PSID }
 }
 
 /// Whether `ace` — an access-allowed entry — carries `mask` or more, in the
@@ -413,10 +430,13 @@ fn ace_sid(ace: *mut c_void) -> PSID {
 /// more than enough as unsatisfied and rewrite its descriptor, which is the cost
 /// this read exists to avoid.
 ///
-/// **`F` needs no branch of its own**: `GENERIC_ALL` carries every bit the other
-/// two masks have, so the same containment test answers it. **An `INHERIT_ONLY`
-/// ACE fails every target**: such an entry reaches nothing on this object, so it
-/// is not the grant a caller asked for however wide its mask.
+/// **`F` needs no branch of its own**: what `icacls` stores for `(F)` is
+/// `FILE_ALL_ACCESS` (`0x001F_01FF`), which carries every bit the other two masks
+/// have, so the same containment test answers it — and the generic bit is not a
+/// shortcut to that: an ACE whose mask is `GENERIC_ALL` and nothing else grants
+/// no specific right at all, which is the false skip this test used to take.
+/// **An `INHERIT_ONLY` ACE fails every target**: such an entry reaches nothing on
+/// this object, so it is not the grant a caller asked for however wide its mask.
 fn access_matches(ace: &ACCESS_ALLOWED_ACE, access: AccessMode, target: Target) -> bool {
     /// `DELETE` (`0x0001_0000`), which `icacls` folds into `(M)` and not into
     /// `(RX)`; `windows-sys` exports it as a generic-mapping bit only.
@@ -432,13 +452,19 @@ fn access_matches(ace: &ACCESS_ALLOWED_ACE, access: AccessMode, target: Target) 
     if flags & INHERIT_ONLY_ACE != 0 {
         return false;
     }
-    let target_ok = match access {
+    // **`F` is not a branch of its own, and the branch that stood here was
+    // wrong.** `icacls`'s `(F)` stores `FILE_ALL_ACCESS` (`0x001F_01FF`), which
+    // contains every bit both masks above are built from, so this containment
+    // test answers it; the `GENERIC_ALL` disjunct that used to sit beside it
+    // fired only for a mask literally carrying bit 28 — which an access check
+    // expands into *no specific right at all* — and a skip that fired there left
+    // a confined child without the access it was launched for (`(F)`'s own
+    // measurement, and the false skip it pins, are in `a_mask_carrying_only_the_
+    // generic_bit_does_not_satisfy_a_grant`).
+    let mask_ok = match access {
         AccessMode::ReadWrite => ace.Mask & MODIFY == MODIFY,
         AccessMode::ReadOnly => ace.Mask & READ_AND_EXECUTE == READ_AND_EXECUTE,
     };
-    // `F` is not a branch of its own: `GENERIC_ALL` contains every bit the two
-    // masks above are built from, so the same containment test answers it.
-    let mask_ok = target_ok || ace.Mask & GENERIC_ALL == GENERIC_ALL;
     let flags_ok = target != Target::Directory
         || (flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
             == OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE);
@@ -733,8 +759,10 @@ impl Drop for OwnedSid {
 /// Idempotent, and measured rather than assumed: `icacls <dir> /remove:g
 /// "*<sid>" /q` for a SID with **no entry anywhere under the path** exits `0`
 /// with `Successfully processed 1 files; Failed processing 0 files` (2026-09-21,
-/// this host). That is what lets the rollback run over paths whose grant never
-/// landed, and over a crashed run's residue that was already taken back.
+/// this host). That is what lets a `revoke` run over a path whose grant never
+/// landed, and over a crash's residue that was already taken back — and it is
+/// the operator's primitive rather than the launcher's: nothing on the exit path
+/// calls it (`Grants`'s doc states the standing contract).
 ///
 /// # Errors
 ///
@@ -830,8 +858,20 @@ pub fn has_ace(path: &Path, sid: &PackageSid) -> Result<bool> {
 /// is also the ACE the next run on the same root reuses — the SID is root-derived
 /// and deterministic — and a crashed run's residue was already the designed
 /// takeover case, so taking it back bought nothing and cost seconds per launch.
-/// What it gives up is stated in `docs/superpowers/specs/2026-09-18-sandbox-design.md`:
-/// once a root has been served, its package SID keeps the access it was granted.
+///
+/// **Measured on this host 2026-09-25, reproduced on three binary revisions:
+/// readiness on a root that has already been served falls from 11 287.9 ms to
+/// 65.2 ms (about 170x)** once the skip finds the standing ACE, where the first
+/// run on that root pays one descriptor write over 82 184 objects at 0.136 ms
+/// per object.
+///
+/// **What that gives up is stated rather than implied: a served root keeps its
+/// package SID's ACE until an operator takes it back**, with `icacls <dir>
+/// /remove:g "*<sid>"`. The launcher removes nothing on the way out — not on the
+/// clean path and not on the failure path — and what it leaves is the ACE the
+/// next run on that root reuses. **This crate's design says exactly that**; the
+/// sentence that used to stand here cited the design for the opposite contract,
+/// and the citation was false rather than stale.
 ///
 /// # Examples
 ///
@@ -921,7 +961,9 @@ impl Grants {
     /// which is the per-launch cost this exists to remove. The event says whether
     /// this run wrote it or found it there (`written`), so the standing fact — and
     /// a directory that already carried it for another reason — is observable
-    /// rather than inferred.
+    /// rather than inferred. **It is `debug!`, one event per ACE**: the launch's
+    /// `info!` is [`grant_whitelist`](mod@crate::backend)'s phase line, and the level
+    /// split is what keeps a per-entry event out of an operator's log.
     ///
     /// **It is for the read-only program directory and its sibling DLLs and for
     /// nothing else.** [`ALL_APPLICATION_PACKAGES`] carries the price; a served
@@ -931,6 +973,27 @@ impl Grants {
     /// # Errors
     ///
     /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::{path::Path, sync::Arc};
+    ///
+    /// use tinio_sandbox_core::AccessMode;
+    /// use tinio_sandbox_windows::{
+    ///     acl::{self, Target},
+    ///     sid::{PackageSid, package_name},
+    /// };
+    ///
+    /// let dir = Path::new(r"E:\build");
+    /// let sid = PackageSid::derive(&package_name(dir)).unwrap();
+    /// let mut grants = acl::Grants::new(Arc::new(sid));
+    /// // One ACE for `ALL APPLICATION PACKAGES`, which every container already
+    /// // holds, so a new root never rewrites this directory.
+    /// grants
+    ///     .apply_standing(dir, Target::ProgramDirectory, AccessMode::ReadOnly)
+    ///     .unwrap();
+    /// ```
     pub fn apply_standing(
         &mut self,
         path: &Path,
@@ -938,7 +1001,13 @@ impl Grants {
         access: AccessMode,
     ) -> Result<()> {
         let written = grant_to(path, target, access, ALL_APPLICATION_PACKAGES)?;
-        tracing::info!(
+        // **`debug!`, because a grant is a per-ACE event and the phase is the
+        // `info!`** (P2's logging split): the phase's own line is
+        // `grant_whitelist`'s, once per launch, and this one would otherwise
+        // print the program directory and then every `*.dll` batch into the
+        // operator's log on every start. `written` still travels with it, so a
+        // reader at `debug` sees the skip as plainly as the write.
+        tracing::debug!(
             step = "grant the ACLs",
             path = %path.display(),
             sid = ALL_APPLICATION_PACKAGES,
@@ -1038,6 +1107,14 @@ fn invoke(path: &Path, flags: &[&OsStr]) -> Result<Output> {
 mod tests {
     use std::{fs, path::Path, process::Command};
 
+    // The three names only a measurement needs: `(F)`'s stored mask, the bit
+    // that marks an inherited entry, and the generic bit the read must *not*
+    // treat as one (they are imported here rather than above because the
+    // production read never names them).
+    use windows_sys::Win32::{
+        Foundation::GENERIC_ALL, Security::INHERITED_ACE, Storage::FileSystem::FILE_ALL_ACCESS,
+    };
+
     use super::*;
     use crate::_core::AccessMode;
 
@@ -1107,17 +1184,110 @@ mod tests {
         );
     }
 
+    /// **`GENERIC_ALL` on its own is not the container**, and the disjunct that
+    /// treated it as one was a false skip: bit 28 is a *request* bit that an
+    /// access check expands into nothing, so an ACE whose mask carries only it
+    /// grants no specific right to anyone. Every ACE `icacls` writes carries the
+    /// specific bits as well — `(M)` is `0x0013_01BF` and `(RX)` is `0x0012_00A9`
+    /// — which is why the disjunct was redundant where it was not wrong, and why
+    /// removing it costs the skip nothing.
+    #[test]
+    fn a_mask_carrying_only_the_generic_bit_does_not_satisfy_a_grant() {
+        // The shape `any_ace_in` reads an ACE as: a header, a mask, the SID.
+        let aced = |flags: u8, mask: u32| ACCESS_ALLOWED_ACE {
+            Header: ACE_HEADER {
+                AceType: ACCESS_ALLOWED_ACE_TYPE,
+                AceFlags: flags,
+                AceSize: 0,
+            },
+            Mask: mask,
+            SidStart: 0,
+        };
+        let both = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        for access in [AccessMode::ReadOnly, AccessMode::ReadWrite] {
+            assert!(
+                !access_matches(&aced(both, GENERIC_ALL), access, Target::Directory),
+                "`GENERIC_ALL` alone carries no specific right, so it satisfies \
+                 no grant however it is asked ({access:?})"
+            );
+        }
+        // The control: the mask the generic bit *expands to* is the container,
+        // and containment answers it for both accesses.
+        assert!(access_matches(
+            &aced(both, FILE_ALL_ACCESS),
+            AccessMode::ReadOnly,
+            Target::Directory
+        ));
+        assert!(access_matches(
+            &aced(both, FILE_ALL_ACCESS),
+            AccessMode::ReadWrite,
+            Target::Directory
+        ));
+    }
+
+    /// The masks of a path's access-allowed ACEs, in the DACL's own order.
+    ///
+    /// **`explicit` decides whether the entries the tool did not write are
+    /// counted, and the mask measurement below needs "no".** A `%TEMP%`
+    /// directory inherits `(OI)(CI)(RX)` for `BUILTIN\Users` from the volume's
+    /// own DACL — the same SID those grants name — so a reading of every entry
+    /// answers "RX is there" for a directory where nothing was granted at all:
+    /// the false pass this parameter removes. `INHERITED_ACE` is the flag such
+    /// an entry carries and the one the tool's own entry does not.
+    ///
+    /// A test read and not the production one: `acl_grants` asks the kernel the
+    /// same question through `any_ace_in`, and this exists so a measurement of
+    /// what `icacls` *stored* can be asserted without a second `PackageSid`.
+    fn masks(path: &Path, explicit: bool) -> Vec<u32> {
+        let mut found = Vec::new();
+        let (dacl, descriptor) = read_dacl(path).expect("read").expect("a DACL");
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` is the ACL `read_dacl` returned and is alive until the
+        // free below; `info` is its out-parameter.
+        let counted = unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        assert_ne!(counted, 0);
+        for index in 0..info.AceCount {
+            let mut ace: *mut c_void = null_mut();
+            // SAFETY: `dacl` is alive and `index` is below its own count.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                continue;
+            }
+            // SAFETY: `GetAce` returned this ACE inside the live ACL, and its
+            // type is tested before the mask is read off it.
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                && !(explicit && u32::from(header.AceFlags) & INHERITED_ACE != 0)
+            {
+                // SAFETY: the type above is this structure's.
+                found.push(unsafe { (&*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask });
+            }
+        }
+        // SAFETY: the descriptor is this test's own read, freed once here; the
+        // ACL inside it is not freed on its own.
+        unsafe { LocalFree(descriptor) };
+        found
+    }
+
     /// The access bits `icacls`'s aliases *stored*, read back out of a DACL the
-    /// tool wrote — and the two constants below are the same numbers derived from
-    /// the generic rights.
+    /// tool wrote — and the constants below are the same numbers derived from the
+    /// generic rights.
     ///
     /// **This is the whole "API predicate agrees with the tool" argument, and it
-    /// is a measurement rather than a transcription.** `icacls` accepts `(M)` and
-    /// `(RX)` as aliases and stores the mask behind the alias, so the read has to
-    /// compare those bits: measured on this host 2026-09-25, `:(OI)(CI)RX` stored
-    /// `0x0012_00A9` and `:(OI)(CI)M` stored `0x0013_01BF`. If a future tool or
-    /// filesystem stores something else, this test fails before the skip can
-    /// start rewriting descriptors it did not need to.
+    /// is a measurement rather than a transcription.** `icacls` accepts `(M)`,
+    /// `(RX)` and `(F)` as aliases and stores the mask behind the alias, so the
+    /// read has to compare those bits: measured on this host 2026-09-25,
+    /// `:(OI)(CI)RX` stored `0x0012_00A9` and `:(OI)(CI)M` stored `0x0013_01BF`,
+    /// and `:(OI)(CI)F` — the third iteration, added with the mask the `F` alias
+    /// stores — is what makes the containment test's `F` claim a measurement. If
+    /// a future tool or filesystem stores something else, this test fails before
+    /// the skip can start rewriting descriptors it did not need to.
     #[test]
     fn the_aliases_icacls_writes_are_the_masks_this_read_compares() {
         const RX: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
@@ -1126,43 +1296,39 @@ mod tests {
         assert_eq!(modify, 0x0013_01BF);
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let only = |path: &Path| {
-            let mut found = Vec::new();
-            let (dacl, descriptor) = read_dacl(path).expect("read").expect("a DACL");
-            let mut info = ACL_SIZE_INFORMATION::default();
-            // SAFETY: `dacl` is the ACL `read_dacl` returned and is alive until
-            // the free below; `info` is its out-parameter.
-            let counted = unsafe {
-                GetAclInformation(
-                    dacl,
-                    (&raw mut info).cast(),
-                    size_of::<ACL_SIZE_INFORMATION>() as u32,
-                    AclSizeInformation,
-                )
-            };
-            assert_ne!(counted, 0);
-            for index in 0..info.AceCount {
-                let mut ace: *mut c_void = null_mut();
-                // SAFETY: `dacl` is alive and `index` is below its own count.
-                if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-                    continue;
-                }
-                // SAFETY: `GetAce` returned this ACE inside the live ACL, and its
-                // type is tested before the mask is read off it.
-                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-                if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
-                    // SAFETY: the type above is this structure's.
-                    found.push(unsafe { (&*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask });
-                }
-            }
-            // SAFETY: the descriptor is this test's own read, freed once here;
-            // the ACL inside it is not freed on its own.
-            unsafe { LocalFree(descriptor) };
-            found
-        };
+        // **The oracle's control, and the false pass it removes.** Nothing has
+        // been granted to this directory, yet a reading that counts every
+        // access-allowed entry answers "RX is there": the entry is the
+        // *inherited* `(OI)(CI)(RX)` ACE the temp volume puts on every directory
+        // it creates, and it names `BUILTIN\Users`, the very SID the grants below
+        // name. An oracle over every entry therefore passed for a tool that wrote
+        // nothing (SPEC-P2-03), and what the assertions from here on read is the
+        // explicit set — the entries without `INHERITED_ACE`, which is what
+        // "`icacls` stored this" means.
+        //
+        // The two assertions are one demonstration: the inherited entry is
+        // there, and it is not what the oracle counts.
+        let untouched = dir.path().join("untouched");
+        fs::create_dir_all(&untouched).expect("create");
+        assert!(
+            masks(&untouched, false).contains(&RX),
+            "this host's temp volume puts no inherited (RX) entry on a new \
+directory, so the false pass this control is about is not exercised here: {:08X?}",
+            masks(&untouched, false)
+        );
+        assert!(
+            !masks(&untouched, true).contains(&RX),
+            "nothing has been granted here, so an oracle that answered RX from \
+an inherited entry is answering for the wrong reason: {:08X?}",
+            masks(&untouched, true)
+        );
 
         let users = "S-1-5-32-545";
-        for (spec, wanted) in [("(OI)(CI)RX", RX), ("(OI)(CI)M", modify)] {
+        for (spec, wanted) in [
+            ("(OI)(CI)RX", RX),
+            ("(OI)(CI)M", modify),
+            ("(OI)(CI)F", FILE_ALL_ACCESS),
+        ] {
             let path = dir.path().join(spec.replace(['(', ')'], ""));
             fs::create_dir_all(&path).expect("create");
             let granted = Command::new(icacls_binary())
@@ -1176,9 +1342,9 @@ mod tests {
                 String::from_utf8_lossy(&granted.stderr)
             );
             assert!(
-                only(&path).contains(&wanted),
+                masks(&path, true).contains(&wanted),
                 "icacls stored something other than 0x{wanted:08X} for {spec}: {:08X?}",
-                only(&path)
+                masks(&path, true)
             );
         }
     }

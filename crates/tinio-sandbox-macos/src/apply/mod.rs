@@ -101,6 +101,19 @@ const VALIDATOR_TIMEOUT: Duration = PREFLIGHT_TIMEOUT;
 /// field and the error's field are the same sentence (shared §7).
 const VALIDATOR_STEP: &str = "sandbox-init validator";
 
+/// The `step` every apply record names — one spelling, because the log's field and
+/// the error's field are the same sentence (shared §7).
+///
+/// **The mechanism's name rather than a phrase about the operation**, and the
+/// operator's grep is why — the same ruling that made `launch::PREFLIGHT_STEP` a
+/// step's name rather than the command's. This moment has a second record on the other
+/// side of the seam: the CLI reports the apply under `step = "sandbox-init"`
+/// (`tinio-cli`'s `apply_self_confinement`), so one string covers the refusal and the
+/// run it refused. The site used to log that name while building its `Error` under
+/// `"apply the SBPL profile"` — one failure, two events, two names, and the second one
+/// spelled at exactly one site in the crate, which is the drift §7 forbids.
+const APPLY_STEP: &str = "sandbox-init";
+
 /// The byte a child writes to answer "the kernel accepted the profile".
 const ACCEPTED: u8 = 1;
 
@@ -119,6 +132,22 @@ const ACCEPTED: u8 = 1;
 ///
 /// [`Error::Unsupported`] for a value that is not UTF-8, which the profile
 /// generator refuses long before a launch.
+///
+/// # Examples
+///
+/// ```
+/// use std::ffi::OsString;
+///
+/// use tinio_sandbox_macos::apply::pairs;
+///
+/// // One exposure's pair, in the shape the render declares it: the name the text
+/// // references, and the path it resolves to.
+/// let params = vec![(String::from("E0"), OsString::from("/srv/data"))];
+/// assert_eq!(
+///     pairs(&params).unwrap(),
+///     vec![(String::from("E0"), String::from("/srv/data"))]
+/// );
+/// ```
 pub fn pairs(params: &[(String, OsString)]) -> Result<Vec<(String, String)>> {
     params
         .iter()
@@ -170,22 +199,32 @@ pub fn apply(profile: &str, params: &[(String, String)]) -> Result<()> {
     // function carries no allow: what is left here is the mapping from the
     // kernel's answer to this crate's error, and a profile whose refusal must be
     // diagnosed from the kernel's own words.
-    libsystem::init(profile, params).map_err(|diagnostic| {
-        error!(
-            step = "sandbox-init",
-            diagnostic = %diagnostic,
-            "the kernel refused the profile"
-        );
-        step("apply the SBPL profile")(io::Error::other(format!(
-            "sandbox_init_with_parameters refused: {diagnostic}"
-        )))
-    })?;
+    libsystem::init(profile, params).map_err(refused_by_the_kernel)?;
     debug!(
-        step = "sandbox-init",
+        step = APPLY_STEP,
         params = params.len(),
         "the profile was applied to this process"
     );
     Ok(())
+}
+
+/// The refusal `libsystem`'s diagnostic becomes: **logged where the [`Error`] is
+/// built, under the one step this site names** ([`APPLY_STEP`], shared §7).
+///
+/// A function rather than the closure this used to be written as, for the reason the
+/// const exists at all: the event and the error are one sentence about one failure,
+/// and a body that builds both is what makes that a property rather than a habit —
+/// the leg below reads the event and the returned error and fails if either stops
+/// naming [`APPLY_STEP`].
+fn refused_by_the_kernel(diagnostic: String) -> Error {
+    error!(
+        step = APPLY_STEP,
+        diagnostic = %diagnostic,
+        "the kernel refused the profile"
+    );
+    step(APPLY_STEP)(io::Error::other(format!(
+        "sandbox_init_with_parameters refused: {diagnostic}"
+    )))
 }
 
 /// The confinement a child applied to itself, as its launcher's frame asked for it.
@@ -195,6 +234,22 @@ pub fn apply(profile: &str, params: &[(String, String)]) -> Result<()> {
 /// parameters it referenced. The counts are this crate's rather than a caller's because the render
 /// is — [`rule_count`](crate::profile::rule_count) reads the SBPL text's own spelling, and a caller
 /// counting for itself would be a second reader of one profile.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_macos::{Mechanism, apply::Applied};
+///
+/// // What a child confined by the in-process mechanism reports to its launcher's
+/// // event: which mechanism the frame named, and the shape of the text it applied.
+/// let applied = Applied {
+///     mechanism: Mechanism::SandboxInit,
+///     rules: 4,
+///     params: 1,
+/// };
+/// assert_eq!(applied.mechanism.as_str(), "sandbox-init");
+/// assert_eq!(applied.rules, 4);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
     /// The mechanism the frame named, resolved and applied by [`self_confinement`].
@@ -214,6 +269,19 @@ pub struct Applied {
 /// (`tinio-cli`'s `self_confinement_refused` says so from its side). The classes are variants
 /// rather than one rendered string so that a caller can answer each in its own words without
 /// parsing this type's.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_macos::apply::Refused;
+///
+/// // The sentence a frame naming the exec-wrapping mechanism gets: this process
+/// // cannot apply a confinement the launcher's helper already applied.
+/// let refused = Refused::WrapsTheExec {
+///     mechanism: String::from("sandbox-exec"),
+/// };
+/// assert!(refused.to_string().contains("confines the exec"));
+/// ```
 #[derive(Debug)]
 pub enum Refused {
     /// The frame names a mechanism this build does not know.
@@ -391,6 +459,18 @@ pub fn self_confinement(adopted: &Adopted) -> result::Result<Option<Applied>, Re
 /// [`Error::Step`] when the pipe, the fork or the reap fails, when the child
 /// outlives [`VALIDATOR_TIMEOUT`], and when the child reports that the kernel
 /// refused the profile.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tinio_sandbox_macos::apply::validator;
+///
+/// // A profile the kernel compiles: `Ok(())`, and this process is left unconfined —
+/// // the apply happened in the forked child. `no_run` because this forks a process,
+/// // which is the whole of what it does.
+/// validator("(version 1)\n(deny default)\n", &[])?;
+/// # Ok::<(), tinio_sandbox_core::Error>(())
+/// ```
 #[allow(unsafe_code)]
 pub fn validator(profile: &str, params: &[(String, String)]) -> Result<()> {
     // A child that applies the profile and a parent that never does: the answer
@@ -573,7 +653,55 @@ fn end(child: Pid, happy: bool) -> Result<()> {
 mod tests {
     use std::{env, ffi::OsStr, os::unix::ffi::OsStrExt as _};
 
+    use tinio_util::testing::SharedBuf;
+    use tracing::subscriber::with_default;
+
     use super::*;
+
+    /// A refused apply logs the `step` it returns — shared §7's checking rule at the
+    /// one site that had two names for it.
+    ///
+    /// **The refusal path without the refusal**: [`apply`] confines the process that
+    /// calls it, one-shot and irreversibly, so a test may not call it — but the
+    /// sentence a refusal becomes is a function of the kernel's own diagnostic, and
+    /// calling that function under a recording subscriber is what holds the event's
+    /// `step` and the error's to one string. A rename at either site fails here rather
+    /// than in a log nobody reads.
+    ///
+    /// **`with_ansi(false)` is load-bearing for a field assertion** (measured in the
+    /// core's recorder test): without it the subscriber interleaves escapes into the
+    /// field *syntax*, so `step="…"` never appears as such. The level is the one
+    /// `serve`'s subscriber enables rather than `TRACE`, so a failure moved to
+    /// `debug!` would stop being recorded and this leg would lose the property instead
+    /// of keeping it.
+    #[test]
+    fn the_apply_refusal_logs_the_step_it_returns() {
+        let capture = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        let error = with_default(subscriber, || {
+            refused_by_the_kernel(String::from("syntax error: expecting ')'"))
+        });
+
+        let Error::Step { step, .. } = &error else {
+            panic!("the apply's refusal is the core's `step`: {error:?}");
+        };
+        assert_eq!(*step, APPLY_STEP);
+        let logged = String::from_utf8(capture.0.lock().expect("the capture mutex").clone())
+            .expect("the capture is UTF-8");
+        assert!(
+            logged.contains(&format!("step=\"{APPLY_STEP}\"")),
+            "{logged}"
+        );
+        assert!(logged.contains("diagnostic=syntax error"), "{logged}");
+    }
 
     #[test]
     fn the_validator_accepts_a_profile_the_kernel_compiles() {

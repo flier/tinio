@@ -4,7 +4,7 @@
 //! helpers. The allows cover that split: a name another binary calls is not
 //! dead, and the re-exports stay so call sites keep `common::`.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 #[allow(dead_code)]
 mod launch;

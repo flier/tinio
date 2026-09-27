@@ -57,5 +57,29 @@ pub trait Backend {
     ///
     /// Any failure is fatal: the caller must exit rather than continue
     /// unconfined (design §11).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{Backend, Confinement, LaunchPlan, Result, Sandbox};
+    ///
+    /// // The trait's own example is the shape an implementation takes; this is the call site
+    /// // that shape exists for, where the answer — and not a `#[cfg]` — decides what the
+    /// // process does next.
+    /// struct Noop;
+    ///
+    /// impl Backend for Noop {
+    ///     fn confine(&mut self, _sandbox: &Sandbox, _plan: &LaunchPlan) -> Result<Confinement> {
+    ///         Ok(Confinement::InPlace)
+    ///     }
+    /// }
+    ///
+    /// let mut backend = Noop;
+    /// match backend.confine(&Sandbox::new(), &LaunchPlan::new())? {
+    ///     Confinement::InPlace => {}
+    ///     Confinement::Supervise(_child) => {}
+    /// }
+    /// # Ok::<(), tinio_sandbox_core::Error>(())
+    /// ```
     fn confine(&mut self, sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement>;
 }

@@ -23,6 +23,16 @@ const EVENT: &str = "event: ";
 /// place to change it: `Event::decode` used to build the dependency's default
 /// while the relay pinned 64 KiB — the same crate, two limits, and the one this
 /// comment argues against at the site a consumer reaches.
+///
+/// **The `unwrap()` is deliberate, and no form exists that avoids it.** Constitution
+/// II forbids one in library code, and the alternatives are all worse here:
+/// `NonZeroUsize::new_unchecked` is an `unsafe fn` this crate may not call
+/// (`unsafe_code = "forbid"`), and a fallible spelling would have to answer
+/// *something* for the zero that cannot occur — a second limit, silently
+/// different from this one. What the `unwrap()` costs is bounded by where it
+/// runs: the expression is a constant, so the panic it could in principle raise
+/// is a **compile error** rather than a runtime one, and the line cannot be
+/// reached by any input.
 pub(crate) const MAX_FIELD: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
 
 /// The event name that means "the listener is bound".
@@ -104,6 +114,29 @@ struct Error<'a> {
 
 impl Event {
     /// The event name this frame carries in its `event:` line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Event;
+    ///
+    /// // The name is what a consumer dispatches on, and the payload never repeats it: the two
+    /// // spellings of one fact would have no tie-breaker if they disagreed.
+    /// assert_eq!(
+    ///     Event::Listening {
+    ///         addr: "127.0.0.1:9000".parse().unwrap()
+    ///     }
+    ///     .name(),
+    ///     "listening"
+    /// );
+    /// assert_eq!(
+    ///     Event::Error {
+    ///         message: "boom".into()
+    ///     }
+    ///     .name(),
+    ///     "error"
+    /// );
+    /// ```
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Listening { .. } => LISTENING,
@@ -127,6 +160,27 @@ impl Event {
     ///
     /// Not reachable: the two payloads are a `SocketAddr` and a `String`, and
     /// neither can fail to serialize.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Event;
+    ///
+    /// // A message with a newline in it stays **one** frame: the newline is an escape inside
+    /// // the `data:` value rather than a line break, which is the whole reason the framing is
+    /// // SSE and not bare JSONL.
+    /// let frame = Event::Error {
+    ///     message: "line one\nline two".into(),
+    /// }
+    /// .encode();
+    /// assert_eq!(frame.matches("\n\n").count(), 1, "{frame:?}");
+    /// assert_eq!(
+    ///     Event::decode(&frame),
+    ///     Some(Event::Error {
+    ///         message: "line one\nline two".into()
+    ///     })
+    /// );
+    /// ```
     pub fn encode(&self) -> String {
         let payload = match self {
             Self::Listening { addr } => serde_json::to_string(&Listening { addr: *addr }),

@@ -93,6 +93,18 @@ const TEMPLATE: &str = include_str!("profile.hbs");
 /// deliberately no separate view type — a wrapper holding the same fields would be
 /// this struct spelled twice, and the one it would drift from is the table the
 /// pruning run parses.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_macos::profile::{Allowance, RUNTIME_BASELINE};
+///
+/// // One row of the table the render is a filter over: the rule, its stable id and
+/// // the observation that keeps it here.
+/// let entry: &Allowance = &RUNTIME_BASELINE[0];
+/// assert_eq!(entry.id, "process-exec");
+/// assert!(entry.rule.starts_with("(allow process-exec"));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Allowance {
     /// Stable identifier, unique across the profile.
@@ -257,7 +269,7 @@ pub const RUNTIME_BASELINE: &[Allowance] = &[
     Allowance {
         id: "root-traversal",
         rule: "(allow file-read* (literal \"/\"))",
-        evidence: "required: without it the process dies of SIGABRT and the only violation logged is `file-read-data /`. Grants on prefixes under the root do not substitute — the refused read is of the root directory itself. **Measured on macOS 15.8, 2026-09-19: with the rule removed the process exits rc=134 with `Sandbox: deny(1) file-read-data /` on `log stream`** — the same abort the design records, now with the exact log line to search for. **Re-measured on the real product path, 2026-09-25, and what died was the pre-flight's own `/bin/echo`, not `sandbox-exec`**: with the rule removed the launcher never reaches the real child at all — it reports `sandbox-exec refused the profile step=\"sandbox-exec -p\" exit=None diagnostic=` and exits 1 — while `log stream --predicate 'sender == \"Sandbox\"'` carries `Sandbox: echo(<pid>) deny(1) file-read-data /` beside the sysctl names the probe also hits. The entry's earlier framing (\"`sandbox-exec` died with no diagnostic\") is the same event described wrongly: the abort is diagnostic-free on the process side, and the kernel line is the diagnostic, which is why it is quoted here rather than the absence. The mechanism is dyld: **`ktrace` shows it resolving its shared cache through relative paths** (`../../System/Volumes/Preboot/Cryptexes/OS/…`), which walks to `/`, and the kernel refuses the read of the root directory itself — measured with the `metadata` confound removed, which is why `(allow file-read-metadata)` in this same table does not cover it. **The rule also grants enumerating `/`, which this entry never stated**: measured on macOS 15.8, 2026-09-25 under the real baseline, a confined `/bin/ls /` lists **16 entries**; with this rule removed it dies `rc=134` and lists **0**; with `(allow file-read-metadata)` removed instead and this rule kept it still lists **16** — so listing the root is this rule's own capability, carried by `file-read*` on the directory, not by the metadata rule",
+        evidence: "required: without it the process dies of SIGABRT and the only violation logged is `file-read-data /`. Grants on prefixes under the root do not substitute — the refused read is of the root directory itself. **Measured on macOS 15.8, 2026-09-19: with the rule removed the process exits rc=134 with `Sandbox: deny(1) file-read-data /` on `log stream`** — the same abort the design records, now with the exact log line to search for. **Re-measured on the real product path, 2026-09-25, and what died was the pre-flight's own `/bin/echo`, not `sandbox-exec`**: with the rule removed the launcher never reaches the real child at all — it reports `sandbox-exec refused the profile step=\"sandbox-exec -p\" exit=None diagnostic=` and exits 1 — `sandbox-exec -p` was the pre-flight step's spelling at that revision, and `preflight` is its name today, so the same refusal greps under that — while `log stream --predicate 'sender == \"Sandbox\"'` carries `Sandbox: echo(<pid>) deny(1) file-read-data /` beside the sysctl names the probe also hits. The entry's earlier framing (\"`sandbox-exec` died with no diagnostic\") is the same event described wrongly: the abort is diagnostic-free on the process side, and the kernel line is the diagnostic, which is why it is quoted here rather than the absence. The mechanism is dyld: **`ktrace` shows it resolving its shared cache through relative paths** (`../../System/Volumes/Preboot/Cryptexes/OS/…`), which walks to `/`, and the kernel refuses the read of the root directory itself — measured with the `metadata` confound removed, which is why `(allow file-read-metadata)` in this same table does not cover it. **The rule also grants enumerating `/`, which this entry never stated**: measured on macOS 15.8, 2026-09-25 under the real baseline, a confined `/bin/ls /` lists **16 entries**; with this rule removed it dies `rc=134` and lists **0**; with `(allow file-read-metadata)` removed instead and this rule kept it still lists **16** — so listing the root is this rule's own capability, carried by `file-read*` on the directory, not by the metadata rule",
         for_every_mechanism: true,
     },
 ];
@@ -308,6 +320,30 @@ pub const RUNTIME_BASELINE: &[Allowance] = &[
 /// compile error (`sandbox-exec` reports `invalid data type of path filter;
 /// expected pattern, got boolean`, exit 65) and an **empty** value is one too
 /// (`empty subpath pattern`, exit 65).
+///
+/// # Examples
+///
+/// ```
+/// use std::ffi::OsString;
+///
+/// use tinio_sandbox_core::{AccessMode, Sandbox};
+/// use tinio_sandbox_macos::{
+///     Mechanism,
+///     profile::{Profile, profile, rule_count},
+/// };
+///
+/// let rendered: Profile = profile(
+///     &Sandbox::new().expose("/srv/data", AccessMode::ReadOnly),
+///     Mechanism::SandboxExec,
+/// )
+/// .unwrap();
+/// // The path is a `-D` value and never text: the rule refers to it by name.
+/// assert!(rendered.text.contains("(subpath (param \"E0\"))"));
+/// assert_eq!(rendered.params[0].1, OsString::from("/srv/data"));
+/// // `rules` is `rule_count`'s answer carried here, so the field and the text
+/// // cannot disagree.
+/// assert_eq!(rendered.rules, rule_count(&rendered.text));
+/// ```
 #[derive(Debug)]
 pub struct Profile {
     /// The profile text.
@@ -402,6 +438,18 @@ fn render(view: &ProfileView<'_>) -> Result<String> {
 /// number an operator compares across two runs means one thing: what the profile
 /// grants. It filters the rendered text rather than adding the two collections up,
 /// because the text is what the operator and `sandbox-exec` both read.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_macos::profile::rule_count;
+///
+/// // The `(version 1)`/`(deny default)` header is not a rule.
+/// assert_eq!(
+///     rule_count("(version 1)\n(deny default)\n(allow file-read*)\n"),
+///     1
+/// );
+/// ```
 pub fn rule_count(text: &str) -> usize {
     text.lines()
         .filter(|line| line.starts_with("(allow "))
@@ -414,16 +462,41 @@ pub fn rule_count(text: &str) -> usize {
 ///
 /// Two legs assert it: this module's `the_profile_grants_no_network_operation_at_all`
 /// and `tests/network.rs`'s `the_profile_grants_no_network_operation`. Their bodies
-/// were byte-identical — the same four spellings and the same whole-word check over
-/// the same render — so a keyword added to one left the other green, which is the
-/// drift this function removes: both legs read this table, and the table is the
-/// whole surface.
+/// were byte-identical — the same four spellings and the same check over the same
+/// render — so a keyword added to one left the other green, which is the drift this
+/// function removes: both legs read this table, and the table is the whole surface.
 ///
-/// **The list is the operations SBPL can grant on the network plus the wildcard,
-/// and the word check is what closes it**: a rule this profile grows later has to
-/// name one of the five or mention `network` at all, which is why the answer is the
-/// keyword rather than a `bool` — a failing leg prints the operation that reached
-/// the text.
+/// **What is checked is each line's rule and not its provenance comment**, which is
+/// the half of this promise the first version did not keep. A rendered line is
+/// `<rule> ; tinio:<id> — <evidence>`, so a search over the whole text can be answered
+/// by an `evidence` string: a rule added later whose evidence merely says "network"
+/// reddened both legs with a message about a rule that mentions no such thing, and a
+/// check that fails for prose is not the check its own doc claims. The split is on
+/// this crate's own `; tinio:` marker rather than on any `;`, so a name or a value
+/// that carries a semicolon is not mistaken for the start of a comment.
+///
+/// **The list is the operations SBPL can grant on the network plus the wildcard, and
+/// the word check over the same rule text is what closes it**: a rule this profile
+/// grows later has to name one of the five or mention `network` at all, which is why
+/// the answer is the keyword rather than a `bool` — a failing leg prints the operation
+/// that reached the text.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_macos::profile::network_operation;
+///
+/// // Nothing granted on the network, and an evidence string that says the word
+/// // does not change that: the answer is about the rules.
+/// assert_eq!(
+///     network_operation("(deny default)\n; tinio:example — needs no network rule\n"),
+///     None
+/// );
+/// assert_eq!(
+///     network_operation("(allow network-outbound)\n"),
+///     Some("network-outbound")
+/// );
+/// ```
 ///
 /// # Measured, macOS 15.8
 ///
@@ -444,11 +517,20 @@ pub fn network_operation(text: &str) -> Option<&'static str> {
         "network-inbound",
         "network*",
     ];
-    OPERATIONS
-        .iter()
-        .copied()
-        .find(|operation| text.contains(operation))
-        .or_else(|| text.contains("network").then_some("network"))
+    // **Per line, and only up to the provenance marker** (see the doc above): the
+    // comment tail is an `evidence` string, and one that happens to say "network"
+    // must not answer a question about what the profile grants.
+    text.lines().find_map(|line| {
+        let rule = match line.split_once("; tinio:") {
+            Some((rule, _)) => rule,
+            None => line,
+        };
+        OPERATIONS
+            .iter()
+            .copied()
+            .find(|operation| rule.contains(operation))
+            .or_else(|| rule.contains("network").then_some("network"))
+    })
 }
 
 /// Render the profile for `sandbox`, for the mechanism that will apply it.
@@ -1035,6 +1117,36 @@ mod tests {
         // The parameters are separate argv data and are never parsed as rules, so no exposure —
         // however its path is spelled — can widen this surface; `the_profile_text_carries_no_path`
         // is the measurement of that.
+    }
+
+    #[test]
+    fn the_network_check_reads_the_rules_and_not_the_provenance_comments() {
+        // **The positive control the property above needs** (SPEC-P3-08), and the reason the
+        // check is written per line: a rendered line is `<rule> ; tinio:<id> — <evidence>`, so a
+        // search over the whole text can be answered by an `evidence` string — a rule added
+        // later whose evidence merely says "network" reddened both network legs with a message
+        // about a rule that grants nothing. Three answers are pinned here: prose is not a rule,
+        // a rule's own spelling still is one, and the keyword fallback still closes the list.
+        assert_eq!(
+            network_operation("(deny default)\n; tinio:example — needs no network rule\n"),
+            None,
+            "an evidence string is not a rule"
+        );
+        assert_eq!(
+            network_operation("(allow file-read*)\n; tinio:example — no network here\n"),
+            None,
+            "a rule that grants nothing, under a comment that names an operation"
+        );
+        assert_eq!(
+            network_operation("(allow network-bind) ; tinio:example — binds\n"),
+            Some("network-bind"),
+            "the same shape with the operation in the rule is answered"
+        );
+        assert_eq!(
+            network_operation("(allow network-something-else) ; tinio:example — tail\n"),
+            Some("network"),
+            "a spelling outside the table is still closed by the word check"
+        );
     }
 
     #[test]

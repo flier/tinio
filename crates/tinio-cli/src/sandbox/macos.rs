@@ -184,8 +184,8 @@ pub(super) fn confine_or_launch(resolution: &Resolution, args: &Args) -> Result<
                 // listening socket they had no business holding — measured on macOS 15.8,
                 // 2026-09-25, the pre-flight's process held `fd 3`, this socket. The child still
                 // receives the descriptor its argv element names — the launcher's half is the
-                // duplicate, and the integer→descriptor rebuild is the platform crate's single
-                // enumerated `unsafe` site, the child's half.
+                // duplicate, and the integer→descriptor rebuild is one of the platform crate's
+                // three enumerated `unsafe` sites, the child's half.
                 let plan = plan
                     .with_control(ControlHandle::duplicate(channel.socket())?)
                     .with_token(token);

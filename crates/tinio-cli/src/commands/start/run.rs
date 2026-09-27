@@ -10,7 +10,7 @@ use std::os::windows::io::RawHandle;
 #[cfg(all(feature = "api", any(target_os = "macos", target_os = "windows")))]
 use std::process;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::process::ExitCode;
+use std::process::{ExitCode, ExitStatus};
 #[cfg(feature = "api")]
 use std::sync::Arc;
 
@@ -28,12 +28,17 @@ use crate::_api::{
     Options as ApiOptions, Plane,
     metrics::{DEFAULT_TTL, Gauges, MetricsSource},
 };
+// `Terminal` is the record `launcher_exit` reads; the other two are the arm's own calls.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::_sandbox::{disarm_signal_relay, supervise};
+use crate::_sandbox::{Terminal, disarm_signal_relay, supervise};
 #[cfg(unix)]
 use crate::_server::identity;
 #[cfg(feature = "api")]
 use crate::daemon;
+// The frame writer the launcher arm's own refusal goes through, and the launcher arm's own
+// gate: the in-place platforms never reach `launcher_exit`, so they compile neither name.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::events;
 use crate::{
     _config::{
         Config,
@@ -293,11 +298,29 @@ pub fn run(
             status = %status,
             "the confined child exited; its status is forwarded"
         );
-        // A child killed by a signal has no exit code; 1 is the operational failure that is.
-        let code = status.code().unwrap_or(1);
-        return Ok(Server::Launched(ExitCode::from(
-            u8::try_from(code).unwrap_or(1),
-        )));
+        // **§3 step 8's other half, and the one frame this process emits on its own behalf.**
+        // The parent never emits `Listening` — that event means the data plane is serving, only
+        // the child knows that, and a parent printing the endpoint it had bound would announce a
+        // server that may never accept. What it does emit is its own `Event::Error` when the
+        // child exited **without ever having reported**, and the answer to that question is the
+        // terminal record read **after** the wait: `supervise` borrows the child and `wait` joins
+        // the relay, so the record is final rather than a snapshot — reading it before the wait
+        // would report a healthy child as never having started.
+        //
+        // Both launcher plans carried this as ticked work and the tree kept only the `info!`
+        // beside it, which left a child that died on the way up reaching its caller as an
+        // **absence** — exactly what decision 19's "a startup failure is an event rather than an
+        // absence" exists to prevent, and what a harness waiting for a frame reads as a timeout
+        // instead of a cause.
+        //
+        // **This is not a second frame for one failure.** The arm below returns
+        // `Ok(Server::Launched(…))`, so `run`'s serving arm never sees an `Err` for this path and
+        // never frames one: the sentence travels on stdout once, from here.
+        let (refusal, code) = launcher_exit(status, child.terminal());
+        if let Some(message) = refusal {
+            events::emit_error(&message);
+        }
+        return Ok(Server::Launched(ExitCode::from(code)));
     }
     // The in-place shape: the call happens for its own side effect, and its `None` is the answer
     // this process acts on by continuing to the runtime that serves.
@@ -433,6 +456,49 @@ pub fn run(
     // k is `run::on_runtime`'s: no runtime is created anywhere in this module.
 }
 
+/// What this launcher owes once the child it supervised is gone: the frame stdout gets, and the
+/// exit code this process answers with.
+///
+/// **§3 step 8's other half, stated as the decision rather than as the write.** The parent never
+/// emits `Listening` — that event means the data plane is serving, only the child knows that, and
+/// a parent that printed the endpoint it had bound would be announcing a server that may never
+/// accept. What it does emit is its own `Event::Error` when the child exited **without ever
+/// having reported**, which is [`Child::terminal`]'s answer *after* the wait: the wait joins the
+/// relay, so the record is final rather than a snapshot, and a child that never became ready is
+/// that `None` rather than a guess.
+///
+/// **The status is forwarded either way, and the frame does not rewrite it.** §3 step 8 makes the
+/// launcher's own answer the child's status, which is what a `--daemon` parent's readiness probe
+/// and every harness reading this process's exit code are given; the frame is added information
+/// about a startup the parent watched fail, not a replacement for what the child said. `1` stands
+/// in only where there is no code to forward at all — a child killed by a signal.
+///
+/// **It answers rather than emits because the emission is the caller's**: `crate::events` owns
+/// stdout on this path (decision 19's "stdout carries event frames and nothing else"), so a
+/// function that both decided the sentence and wrote it would put the one writer in two places —
+/// and could not be driven by a test at all.
+///
+/// [`Child::terminal`]: crate::_sandbox::Child::terminal
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn launcher_exit(status: ExitStatus, reported: Option<&Terminal>) -> (Option<String>, u8) {
+    // A child killed by a signal has no exit code; 1 is the operational failure that is. A code
+    // outside `u8` is not this process's to invent either, and answers the same way — the shape
+    // the exit-code mapping had before the decision moved here.
+    let code = match status.code() {
+        Some(code) => u8::try_from(code).unwrap_or(1),
+        None => 1,
+    };
+    match reported {
+        Some(_) => (None, code),
+        None => (
+            Some(format!(
+                "the confined child exited ({status}) without reporting readiness"
+            )),
+            code,
+        ),
+    }
+}
+
 /// The `state` file **this launcher** published for the child it just supervised, removed
 /// best-effort on the way out.
 ///
@@ -511,6 +577,10 @@ fn otlp_endpoint(config: &Config) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    // The launcher arm's own names, under the launcher arm's own gate: a host whose platform
+    // confines in place drives neither test below, so it compiles neither the import.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    use std::process::Command;
     use std::{
         fs::{OpenOptions, create_dir_all, read_dir, read_to_string},
         io::Write as _,
@@ -520,6 +590,80 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    use crate::_sandbox::{Child, Terminal};
+
+    /// A confined child that exits with `code` and relays nothing.
+    ///
+    /// **A real process on both hosts, and no mock anywhere in these legs.** The decision under
+    /// test reads the `ExitStatus` and the terminal record, and this produces both the way the
+    /// launcher produces them: `supervise` over a `Child` whose wait closure reaps a real child
+    /// that carries no relay. That is also exactly the shape of a child which died before its
+    /// first frame — nothing recorded a terminal event, so `terminal` answers `None` once the
+    /// wait has returned rather than because the test said so.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn dying(code: u8) -> Child {
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(windows)]
+        command.args(["/c", &format!("exit {code}")]);
+        #[cfg(not(windows))]
+        let mut command = Command::new("sh");
+        #[cfg(not(windows))]
+        command.args(["-c", &format!("exit {code}")]);
+        let mut process = command.spawn().expect("spawn the child stand-in");
+        Child::new(move || Ok(process.wait()?))
+    }
+
+    /// **A child that never reported readiness is the parent's own refusal** (design §3 step 8,
+    /// decision 19), and this is the leg that fails without it: before the frame existed the run
+    /// reached its caller as an absence, with nothing on stdout to say a confined server had
+    /// died on the way up.
+    ///
+    /// **What this leg does not cover is the call site's two effects** — the `events::emit_error`
+    /// write and the `Server::Launched` it returns — because both need the spawned binary rather
+    /// than a library call. `crates/tinio-e2e`'s `@confinement` legs own that half (they spawn
+    /// `tinio` and read its streams); this one pins the decision those effects are made on.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn a_child_that_never_reported_is_the_parents_own_refusal() {
+        let mut child = dying(3);
+        let status = supervise(&mut child, || ()).expect("the child is reaped");
+        assert!(
+            child.terminal().is_none(),
+            "nothing relayed, so the record is the 'never reported' answer"
+        );
+
+        let (refusal, code) = launcher_exit(status, child.terminal());
+
+        let expected = format!("the confined child exited ({status}) without reporting readiness");
+        assert_eq!(
+            refusal.as_deref(),
+            Some(expected.as_str()),
+            "the parent's own sentence, and the only frame it emits on its own behalf"
+        );
+        assert_eq!(
+            code, 3,
+            "the status is forwarded rather than rewritten: the frame is added information, and \
+             the answer a `--daemon` parent or a harness reads stays the child's"
+        );
+    }
+
+    /// **The other direction, and the one a launcher that framed unconditionally would break**: a
+    /// child that did report is a server that started, so a perfectly good run must carry no
+    /// `error` frame for its consumer to misread.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn a_child_that_reported_is_never_framed() {
+        let mut child = dying(0);
+        let status = supervise(&mut child, || ()).expect("the child is reaped");
+        let reported = Terminal::Listening("127.0.0.1:9000".parse().expect("addr"));
+
+        let (refusal, code) = launcher_exit(status, Some(&reported));
+
+        assert_eq!(refusal, None, "a child that reported owes stdout nothing");
+        assert_eq!(code, 0, "and its status is still the launcher's answer");
+    }
 
     /// A resolution of the shape a read-only run resolves to: the served root and a state
     /// directory **beside** it, which is where read-only mode puts state and the only shape the

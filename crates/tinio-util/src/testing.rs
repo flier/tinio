@@ -34,8 +34,9 @@
 //! owner filter (filter-then-paginate) (spec 2026-09-05);
 //! rename_object; and the completed-object part listing with its
 //! OBJECT_PARTS lifecycle (spec 2026-08-31).
-//! [`tinio_mem::MemoryStorage`] — the in-memory reference backend —
-//! backs conformance tests in the `tinio-mem` crate.
+//! `tinio_mem::MemoryStorage` — the in-memory reference backend, named rather
+//! than linked because `tinio-util` does not depend on `tinio-mem` — backs
+//! conformance tests in the `tinio-mem` crate.
 //!
 //! This module is a deliberately panicking test harness (assert-style);
 //! unwraps here are assertion plumbing, not library error handling.

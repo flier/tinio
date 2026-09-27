@@ -6,7 +6,7 @@
 //! same role from their own binaries, and this file is the one that drives the
 //! launch machinery by hand rather than through [`Backend::confine`].
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 mod common;
 
@@ -74,8 +74,8 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("the listener's address");
     socket::mark_inheritable(&listener).expect("mark the listener inheritable");
-    let payload_pipe = handles::pipe().expect("the child's stdin");
-    let event_pipe = handles::pipe().expect("the event pipe");
+    let mut payload_pipe = handles::pipe().expect("the child's stdin");
+    let mut event_pipe = handles::pipe().expect("the event pipe");
     // `command_args` puts the listener element first and the launcher's own
     // arguments after it (Task 7 fixes the rule, and Task 9's `confine` states
     // the same one from the launcher's end), so the child's argv is `<program>
@@ -95,7 +95,7 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
         confinement: None,
     })
     .expect("the payload serializes");
-    handles::write_payload(payload_pipe.write, &frame)
+    handles::write_payload(&mut payload_pipe, &frame)
         .expect("write the frame into the child's stdin");
     let stderr = handles::inherited_stderr().expect("the launcher's stderr");
 
@@ -103,8 +103,8 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
         &LaunchSpec {
             program: &program,
             args: &args,
-            stdin: payload_pipe.read,
-            stdout: event_pipe.write,
+            stdin: payload_pipe.read().expect("the payload pipe's read end"),
+            stdout: event_pipe.write().expect("the event pipe's write end"),
             stderr,
             inherited: &[socket::handle(&listener)],
         },
@@ -119,8 +119,8 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     // the event pipe's write end still open here, the child's stdout never
     // reaches end-of-stream (`handles::parent_end`'s rule, and what the launch
     // site of Task 9 does at this same point).
-    handles::close(payload_pipe.read);
-    handles::close(event_pipe.write);
+    payload_pipe.close_read();
+    event_pipe.close_write();
     // **The child's last act is the `accept()` on the listener it inherited, so
     // answering it is what lets this test wait for the child at all**: a test
     // that only waited would be waiting for a process that is waiting for the
@@ -131,9 +131,9 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     let status = launched.wait().expect("wait");
 
     let report = tree.report_text();
-    acl::revoke(&tree.root, &sid).expect("roll back");
-    acl::revoke(&launcher_dir, &sid).expect("roll back");
-    acl::revoke(&tree.report, &sid).expect("roll back");
+    acl::revoke(&tree.root, &sid).expect("take the grant back");
+    acl::revoke(&launcher_dir, &sid).expect("take the grant back");
+    acl::revoke(&tree.report, &sid).expect("take the grant back");
 
     assert_eq!(
         status.code(),
@@ -147,6 +147,80 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
     assert!(
         report.contains("denied-read: refused (permission denied)"),
         "{report}"
+    );
+}
+
+/// **The misdiagnosis the measured window produced, as an assertion on the
+/// error**: `ERROR_FILE_NOT_FOUND` has two causes here, and the raw code cannot
+/// tell an operator which one they have.
+///
+/// `CreateProcessW` answers it for a program that is *there* when the
+/// AppContainer profile behind the launch's package SID is gone — measured on
+/// this host 2026-09-21 for this crate's own binary and for `cmd.exe` alike, and
+/// reproduced 2026-09-26 while a peer launcher's exit deleted a live
+/// `PackageSid`'s profile — so an error that only repeated the code sent the
+/// operator after a binary that was never missing. The two states are built here
+/// the way the measurements built them: one value creates the profile, a second
+/// takes it over, and the creator's exit deletes it, leaving the survivor holding
+/// a SID whose profile is gone (the container half); and a path under a directory
+/// that exists whose file does not (the file half).
+#[test]
+fn the_file_not_found_code_says_which_of_its_two_causes_it_had() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tree = common::Tree::at(dir.path());
+    let creator = common::sid_for(&tree);
+    let survivor = common::sid_for(&tree);
+    drop(creator);
+
+    let program = env::current_exe().expect("current exe");
+    assert!(
+        program.is_file(),
+        "this test's whole point is a program that is there: {}",
+        program.display()
+    );
+    let container = Container {
+        package_sid: survivor.raw(),
+        capabilities: CapabilitySids::resolve(&[]).expect("no capabilities"),
+    };
+    let launch = |program: &Path| {
+        process::launch(
+            &LaunchSpec {
+                program,
+                args: &[],
+                stdin: ptr::null_mut(),
+                stdout: ptr::null_mut(),
+                stderr: ptr::null_mut(),
+                inherited: &[],
+            },
+            &container,
+        )
+        .expect_err("a SID whose profile is gone cannot launch")
+    };
+
+    // The container half: the file is there, the profile is not.
+    let rendered = launch(&program).to_string();
+    assert!(rendered.contains("CreateProcessW"), "{rendered}");
+    assert!(
+        rendered.contains("the program file is there"),
+        "the error must say the file was not what was missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("profile"),
+        "the error must name the container rather than leave the operator \
+         chasing a program that exists: {rendered}"
+    );
+
+    // The file half: the same code, a program that really is not there.
+    let missing = dir.path().join("no-such-program.exe");
+    assert!(!missing.exists(), "{}", missing.display());
+    let rendered = launch(&missing).to_string();
+    assert!(
+        rendered.contains("the program file was not found"),
+        "the error must say the file was what was not found: {rendered}"
+    );
+    assert!(
+        !rendered.contains("profile"),
+        "the file is missing, so nothing here is about the container: {rendered}"
     );
 }
 
@@ -178,6 +252,15 @@ fn a_bad_program_path_is_an_error_naming_the_path() {
     let rendered = err.to_string();
     assert!(rendered.contains("CreateProcessW"), "{rendered}");
     assert!(rendered.contains("does-not-exist"), "{rendered}");
+    // **This path fails with `ERROR_PATH_NOT_FOUND` (3), not
+    // `ERROR_FILE_NOT_FOUND` (2)** — the *directory* is what is missing, and the
+    // kernel says so — so the crate passes the code through as it arrives and
+    // nothing here is about the container (`the_file_not_found_code_says_which_
+    // of_its_two_causes_it_had` is the test that pins the ambiguous code).
+    assert!(
+        !rendered.contains("profile"),
+        "the path is missing, so nothing here is about the container: {rendered}"
+    );
 }
 
 /// The default capability set — none at all — gets a test of its own, because it
@@ -205,8 +288,8 @@ fn the_empty_capability_set_launches() {
         .to_path_buf();
     acl::grant(&launcher_dir, Target::Directory, AccessMode::ReadOnly, &sid)
         .expect("grant the launcher's directory");
-    let stdin = handles::pipe().expect("the child's stdin");
-    let stdout = handles::pipe().expect("the child's stdout");
+    let mut stdin = handles::pipe().expect("the child's stdin");
+    let mut stdout = handles::pipe().expect("the child's stdout");
     let stderr = handles::inherited_stderr().expect("the launcher's stderr");
 
     let mut launched = process::launch(
@@ -218,8 +301,8 @@ fn the_empty_capability_set_launches() {
                 OsString::from("--exact"),
                 OsString::from("no_such_test_runs_here"),
             ],
-            stdin: stdin.read,
-            stdout: stdout.write,
+            stdin: stdin.read().expect("the payload pipe's read end"),
+            stdout: stdout.write().expect("the event pipe's write end"),
             stderr,
             inherited: &[],
         },
@@ -229,10 +312,10 @@ fn the_empty_capability_set_launches() {
         },
     )
     .expect("the default capability set launches");
-    handles::close(stdin.read);
-    handles::close(stdout.write);
+    stdin.close_read();
+    stdout.close_write();
     let status = launched.wait().expect("wait");
-    acl::revoke(&launcher_dir, &sid).expect("roll back");
+    acl::revoke(&launcher_dir, &sid).expect("take the grant back");
 
     assert_eq!(
         status.code(),

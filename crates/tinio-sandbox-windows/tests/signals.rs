@@ -21,7 +21,7 @@
 //! in groups of their own, so a stop can be addressed at one of them and the
 //! other watched for a delivery it must not receive.
 
-#![cfg(windows)]
+#![cfg(target_os = "windows")]
 
 mod common;
 
@@ -202,8 +202,9 @@ fn a_stop_addressed_at_the_launcher_reaches_the_confined_child() {
         "the confined child's stop hook never fired within {WINDOW:?}: the launcher did not forward \
          the stop to the child's process group (design §3 step 9)"
     );
-    // The hook ends the child, so the launcher's wait returns, its ACL rollback
-    // runs and it exits with the status it was handed (design §3 step 8).
+    // The hook ends the child, so the launcher's wait returns and it exits with
+    // the status it was handed (design §3 step 8). The grants it wrote are
+    // standing, so nothing happens on the way out but the exit.
     let status = common::wait_for_exit(launcher.child_mut(), common::TIMEOUT, "the launcher");
     assert_eq!(
         status.code(),

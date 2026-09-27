@@ -84,7 +84,13 @@ pub const CHILD_ENV: &str = "TINIO_SANDBOX_MACOS_CHILD";
 /// otherwise changes nothing. It travels through the environment rather than
 /// through the parameter text because it is the *launcher's* choice — the child
 /// learns it from the launch payload, exactly as the product's child does.
-pub const MECHANISM_ENV: &str = "TINIO_SANDBOX_MACOS_MECHANISM";
+///
+/// **The name is [`Mechanism::ENV`]'s and not a second spelling of it**: the
+/// variable is the platform's (`tinio-sandbox-macos`'s `mechanism` module owns it,
+/// and the CLI reads the same one), so the harness aliases the owner's constant
+/// rather than repeating the string — a rename that reached only one of the two
+/// would leave this suite driving a variable nothing reads.
+pub const MECHANISM_ENV: &str = Mechanism::ENV;
 
 /// The mechanism the launcher copy resolves, from [`MECHANISM_ENV`].
 ///
@@ -751,6 +757,11 @@ fn child_argv(test_name: &str) -> Vec<OsString> {
     ]
 }
 
+/// The address every harness launch asks the server to bind — the kernel picks the port and the
+/// child reports what it got. A constant rather than a parsed argument, because it is one value at
+/// every call site.
+const LISTEN_ADDR: &str = "127.0.0.1:0";
+
 /// The `key=value` text the child reads its parameters from — **every line
 /// terminated, including the last**.
 ///
@@ -762,11 +773,11 @@ fn child_argv(test_name: &str) -> Vec<OsString> {
 /// a confined process with a `(deny default)` profile granting nothing: the
 /// report write was refused and the whole probe failed for a reason that looked
 /// like the profile generator's. Measured on macOS 15.8, 2026-09-25.
-/// The address every harness launch asks the server to bind — the kernel picks the port and the
-/// child reports what it got. A constant rather than a parsed argument, because it is one value at
-/// every call site.
-const LISTEN_ADDR: &str = "127.0.0.1:0";
-
+///
+/// **It sat above [`LISTEN_ADDR`] until this was moved**, so both paragraphs were
+/// that constant's doc and this function had none — the mistake the paragraph above
+/// describes from its other side, and the reason the two are now on the items they
+/// name.
 fn parameters(extra: &[(&str, String)], report: &Path) -> String {
     let mut all: Vec<(String, String)> = extra
         .iter()

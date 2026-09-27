@@ -30,6 +30,11 @@ pub mod options;
 pub mod plan;
 pub mod seccomp;
 
+/// The recorder the crate's own unit tests read their events through. Test-only,
+/// so it is not part of the surface a caller sees.
+#[cfg(test)]
+mod testing;
+
 pub use self::{
     caps::{Cap, retained},
     jail::{jail_root, mirror_under},

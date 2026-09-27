@@ -16,6 +16,8 @@
 
 use std::{env, fmt};
 
+use tracing::error;
+
 use crate::_core::{Error, Result};
 
 /// Which mechanism confines a macOS child (design decision 6).
@@ -133,7 +135,7 @@ impl Mechanism {
                 // the Linux model's refusal is: the caller's `?` only prints it
                 // on the way out, and the value that was wrong is the whole
                 // diagnosis.
-                tracing::error!(
+                error!(
                     step = Self::ENV,
                     value = wrong,
                     "unsupported confinement mechanism"
@@ -334,10 +336,9 @@ mod tests {
         // honest.** `sandbox-exec` cannot exec its target without the rule (exit
         // `71`, measured on the real product path), so the helper needs it and
         // the in-process route — whose exec and loader have already run — must
-        // not keep it.
+        // not keep it. One assertion per mechanism: the pair is the property, and
+        // a second copy of either half asserted nothing the first did not.
         assert!(Mechanism::SandboxExec.wraps_the_exec());
-        assert!(Mechanism::SandboxExec.wraps_the_exec());
-        assert!(!Mechanism::SandboxInit.wraps_the_exec());
         assert!(!Mechanism::SandboxInit.wraps_the_exec());
     }
 }
