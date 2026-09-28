@@ -24,18 +24,33 @@
 //! would already be treating the *unavailable* case as fatal on the kernels
 //! that have no `io_uring` at all.
 //!
-//! **The ptrace family is denied beside the network paths, and it is a second
-//! guarantee rather than a second spelling of the first** (follow-ups §6(a)).
-//! `ptrace`, `process_vm_readv` and `process_vm_writev` have nothing to do with
-//! outbound traffic: they are what a confined same-uid process uses to reach a
-//! process *outside* the jail — which the user namespace does not confine — and
-//! to follow `/proc/<pid>/root` across the mount view this program's own
-//! confinement just established. The cost is real and tooling-visible (`gdb`,
-//! `perf` and `strace` all attach, so none of them works inside the jail) and it
-//! is recorded at [`Syscall::Ptrace`]. **It does not replace the
-//! address-family note below and is not a network guarantee**: `connect` is
-//! denied whatever family it names, and this addition denies three more
-//! syscalls, not a capability.
+//! **The cross-process family is denied beside the network paths, and it is a
+//! second guarantee rather than a second spelling of the first** (follow-ups
+//! §6(a)). `ptrace`, `process_vm_readv`, `process_vm_writev` and `pidfd_getfd`
+//! have nothing to do with outbound traffic: they are what a confined same-uid
+//! process uses to reach a process *outside* the jail — which the user namespace
+//! does not confine — and to follow `/proc/<pid>/root` across the mount view
+//! this program's own confinement just established.
+//!
+//! **The fourth member was missing while the first three were in the list, and
+//! what it reached was a descriptor rather than a memory range.** `pidfd_open`
+//! names any same-uid peer, and `pidfd_getfd` copies one of that peer's
+//! descriptors out — a host directory fd, say, which `openat` then walks out of
+//! the mount view — under the same `PTRACE_MODE_ATTACH_REALCREDS` permission
+//! `ptrace` itself wants. **That permission is a check inside the kernel, not a
+//! call to the `ptrace` syscall**, so denying `ptrace` closed nothing here: the
+//! two are separate syscall paths into one check, which is why each had to be
+//! named. Measured on the acceptance kernel with the ten-entry list's program
+//! installed, from a process the filter had already confined:
+//! `pidfd_getfd(pidfd_open(peer), dirfd)` returned a descriptor and `openat`
+//! read the host's `/etc/hostname` through it, where the current list answers
+//! `EPERM` (see [`Syscall::PidfdGetFd`] for the numbers).
+//!
+//! The cost of the whole family is real and tooling-visible (`gdb`, `perf` and
+//! `strace` all attach, so none of them works inside the jail) and it is
+//! recorded at [`Syscall::Ptrace`]. **It does not replace the address-family
+//! note below and is not a network guarantee**: `connect` is denied whatever
+//! family it names, and this family denies four syscalls, not a capability.
 //!
 //! **The x32 ABI used to be a third boundary this program could not see, and it
 //! is closed by one mask.** On `x86_64` an x32 process reports the same
@@ -43,7 +58,7 @@
 //! distinguish it; the ABI lives in the syscall number, and
 //! [`filter_program`] now refuses any number with `__X32_SYSCALL_BIT` set
 //! before the equality tests run. **The mask denies every x32 syscall, not only
-//! the ten the list names**, and that is the shape the follow-ups plan ratified:
+//! the eleven the list names**, and that is the shape the follow-ups plan ratified:
 //! the program compares `seccomp_data.nr` once and has no second comparison to
 //! key on both the ABI bit and a number, while nothing in this workspace builds
 //! or runs an x32 binary — so refusing the whole ABI costs nothing anything here
@@ -59,7 +74,7 @@ use std::{io, mem::offset_of, ptr};
 /// use tinio_sandbox_linux::seccomp::{Arch, SockFilter, filter_program};
 ///
 /// let program: Vec<SockFilter> = filter_program(Arch::X86_64);
-/// assert_eq!(program.len(), 27, "one struct per instruction");
+/// assert_eq!(program.len(), 29, "one struct per instruction");
 /// assert_eq!(program[0].jt, 0, "a load jumps nowhere");
 /// ```
 pub use linux_raw_sys::ptrace::sock_filter as SockFilter;
@@ -107,11 +122,11 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 ///
 /// **One array rather than a hand-written pair of instructions per syscall**, so
 /// that a variant added to [`Syscall`] cannot be left out of the program it
-/// exists for: `the_program_covers_every_denied_syscall` derives the length it
-/// expects from this constant, and `Syscall`'s own `match` in
+/// exists for: `the_program_length_is_fixed_per_architecture` derives the length
+/// it expects from this constant, and `Syscall`'s own `match` in
 /// [`Arch::syscall_nr`] is exhaustive, so the two together are a compile error
 /// plus a failing test rather than a silently unfinished filter.
-const DENIED: [Syscall; 10] = [
+const DENIED: [Syscall; 11] = [
     Syscall::Connect,
     Syscall::SendTo,
     Syscall::SendMsg,
@@ -122,6 +137,7 @@ const DENIED: [Syscall; 10] = [
     Syscall::Ptrace,
     Syscall::ProcessVmReadv,
     Syscall::ProcessVmWritev,
+    Syscall::PidfdGetFd,
 ];
 
 /// The architecture the filter is compiled for.
@@ -223,6 +239,37 @@ pub enum Syscall {
     /// into one is what turns a bug inside the jail into code running outside
     /// it, and neither needs the peer's cooperation.
     ProcessVmWritev,
+    /// `pidfd_getfd` — the family's descriptor half, and the one the `ptrace`
+    /// denial does not cover.
+    ///
+    /// **It is denied beside the two `process_vm_*` calls because it reaches the
+    /// same peers by a different door**: `pidfd_open(peer)` names any same-uid
+    /// process, and `pidfd_getfd` duplicates one of that process's descriptors
+    /// into this one. The permission is the kernel's
+    /// `PTRACE_MODE_ATTACH_REALCREDS` check — the same one `ptrace` wants, and
+    /// satisfied by being the same uid with a dumpable peer — which is a check
+    /// *inside* `pidfd_getfd`, not a call to the `ptrace` syscall, so the
+    /// [`Syscall::Ptrace`] entry closes nothing here. What the copy is for is
+    /// the mount view: a descriptor to a directory on the host can be walked
+    /// with `openat`, and the path it names is the peer's rather than the jail's
+    /// — `/proc/<pid>/root` by another route, from a process whose own
+    /// confinement just removed every path out.
+    ///
+    /// **`pidfd_open` itself stays allowed**, and that is not an oversight: it
+    /// returns a handle for waiting on a process and copies nothing, while
+    /// `waitid(P_PIDFD)` is how a supervisor waits on a child — refusing the
+    /// open would take that away for no closure. The list denies the call that
+    /// moves a descriptor, which is the one with the reach.
+    ///
+    /// Measured on the acceptance kernel (`6.18.33.2-microsoft-standard-WSL2`)
+    /// with the ten-entry list's program installed — the bytes below minus this
+    /// entry's pair, so the old policy exactly: `pidfd_getfd(pidfd_open(peer),
+    /// <the peer's directory fd>)` returned `6` where the filter had been
+    /// installed, and the `openat` through that copy read the host's
+    /// `/etc/hostname` (`FLIER-WIN11`), from a process whose own confinement had
+    /// just removed every path out. With this entry in the list the same call
+    /// answers `EPERM`, and `pidfd_open` beside it still returns.
+    PidfdGetFd,
 }
 
 impl Arch {
@@ -306,6 +353,7 @@ impl Arch {
             (Self::X86_64, Syscall::Ptrace) => 101,
             (Self::X86_64, Syscall::ProcessVmReadv) => 310,
             (Self::X86_64, Syscall::ProcessVmWritev) => 311,
+            (Self::X86_64, Syscall::PidfdGetFd) => 438,
             (Self::Aarch64, Syscall::Connect) => 203,
             (Self::Aarch64, Syscall::SendTo) => 206,
             (Self::Aarch64, Syscall::SendMsg) => 211,
@@ -313,6 +361,11 @@ impl Arch {
             (Self::Aarch64, Syscall::Ptrace) => 117,
             (Self::Aarch64, Syscall::ProcessVmReadv) => 270,
             (Self::Aarch64, Syscall::ProcessVmWritev) => 271,
+            // **Generic-table numbers, so the same on both tables**: 438 was
+            // assigned after `arm64` moved to the generic table, exactly like
+            // 425-427 below — and unlike the ptrace family above it, whose
+            // numbers the two architectures had already chosen for themselves.
+            (Self::Aarch64, Syscall::PidfdGetFd) => 438,
             // **The same three numbers on both tables, and not by coincidence**:
             // 425-427 were assigned from the generic syscall table, which
             // `arm64` uses for every post-4.0 addition — unlike `connect` and
@@ -327,7 +380,7 @@ impl Arch {
 /// Build the filter program. Pure — the whole denial policy is testable
 /// without installing anything.
 ///
-/// **Twenty-seven instructions on `x86_64` and twenty-five on `aarch64`**, and
+/// **Twenty-nine instructions on `x86_64` and twenty-seven on `aarch64`**, and
 /// the difference is the x32 mask: it is `x86_64`'s alone, because that ABI is
 /// the only one with a second syscall table reachable from a 64-bit process
 /// (see the module doc).
@@ -337,8 +390,8 @@ impl Arch {
 /// ```
 /// use tinio_sandbox_linux::seccomp::{Arch, filter_program};
 ///
-/// assert_eq!(filter_program(Arch::X86_64).len(), 27);
-/// assert_eq!(filter_program(Arch::Aarch64).len(), 25);
+/// assert_eq!(filter_program(Arch::X86_64).len(), 29);
+/// assert_eq!(filter_program(Arch::Aarch64).len(), 27);
 /// ```
 pub fn filter_program(arch: Arch) -> Vec<SockFilter> {
     let load = |offset: u32| SockFilter {
@@ -452,9 +505,14 @@ pub enum Seccomp {
 
 /// Install the filter on the calling thread.
 ///
-/// Must run before any thread exists: a seccomp filter applies per-thread
-/// unless `SECCOMP_FILTER_FLAG_TSYNC` is used, and there is nothing to
-/// synchronise while the process is single-threaded (design §8).
+/// **Must run before any thread exists, and the caller checks that rather than
+/// assuming it**: a filter applies per-thread unless
+/// `SECCOMP_FILTER_FLAG_TSYNC` is passed, and TSYNC is deliberately not passed —
+/// it synchronises the *filter* alone, while the mount namespace, the user
+/// namespace, `no_new_privs` and the credentials stay the calling task's, so it
+/// would shrink the hole rather than close it (design §8). `enter` refuses a
+/// process with more than one task before it reaches this call, and its check is
+/// where that argument is written out in full.
 ///
 /// `ret` is the Info event for the install (shared §7), emitted by
 /// [`announce_installed`]; the skip is still a `warn!`.
@@ -470,8 +528,8 @@ pub enum Seccomp {
 ///
 /// [`Error::Unsupported`] when the program does not fit the `u16` length the
 /// kernel's `struct sock_fprog` carries — **unreachable by construction**,
-/// because [`filter_program`] returns a fixed twenty-seven instructions on
-/// `x86_64` and twenty-five on `aarch64`; it is listed so the conversion's
+/// because [`filter_program`] returns a fixed twenty-nine instructions on
+/// `x86_64` and twenty-seven on `aarch64`; it is listed so the conversion's
 /// failure mode is named rather than left to be discovered at the
 /// `u16::try_from`.
 ///
@@ -480,8 +538,11 @@ pub enum Seccomp {
 /// This is one of the crate's three authorised `unsafe` sites (design decision
 /// 14). Its invariants: `program` outlives the call — `fprog` borrows it and
 /// nothing stores either — `fprog` is `linux_raw_sys::ptrace::sock_fprog`, the
-/// kernel's own layout, and the process is single-threaded so no task can
-/// observe a half-installed filter.
+/// kernel's own layout, and the process is single-threaded, so no task can
+/// observe a half-installed filter. **The last one is checked by the caller
+/// rather than assumed**: the invariant is about this thread group and not
+/// about this function, so `enter` refuses a process with more than one task
+/// before it gets here.
 ///
 /// # Examples
 ///
@@ -582,8 +643,8 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     use linux_raw_sys::general::{
         __NR_connect, __NR_io_uring_enter, __NR_io_uring_register, __NR_io_uring_setup,
-        __NR_process_vm_readv, __NR_process_vm_writev, __NR_ptrace, __NR_sendmmsg, __NR_sendmsg,
-        __NR_sendto,
+        __NR_pidfd_getfd, __NR_process_vm_readv, __NR_process_vm_writev, __NR_ptrace,
+        __NR_sendmmsg, __NR_sendmsg, __NR_sendto,
     };
 
     use super::*;
@@ -653,7 +714,9 @@ mod tests {
         // same process held: `x32 connect: ALLOWED (result=0) ->
         // ('127.0.0.1', 35596)`.
         let program = filter_program(Arch::X86_64);
-        for nr in [42, 44, 46, 307, 425, 426, 427, 0, 1, 101, 310, 311] {
+        for nr in [
+            42, 44, 46, 307, 425, 426, 427, 0, 1, 101, 310, 311, 438, 434,
+        ] {
             let x32 = X32_SYSCALL_BIT | nr;
             assert_eq!(
                 verdict(&program, AUDIT_ARCH_X86_64, x32),
@@ -693,19 +756,30 @@ mod tests {
     }
 
     #[test]
-    fn the_ptrace_family_is_denied() {
+    fn the_cross_process_family_is_denied() {
         // **The escape the user namespace does not cover** (follow-ups §6(a)): a
         // confined same-uid process can still attach to a process outside the
         // jail, read or write its memory, or follow `/proc/<pid>/root` across
         // the mount view. Measured live before these rules landed, with this
         // program installed by `prctl`: `ptrace TRACEME: ALLOWED (result=0)`,
         // `process_vm_readv (self): ALLOWED (result=5)`.
+        //
+        // **The fourth entry is the descriptor half, and it was the one the
+        // other three could not cover**: `pidfd_getfd` asks the kernel for the
+        // same `PTRACE_MODE_ATTACH_REALCREDS` permission `ptrace` does, but it
+        // asks through a different syscall, so a program that denies `ptrace`
+        // and not this one leaves the peer's descriptors reachable. Measured
+        // live with the ten-entry list's program installed: `pidfd_getfd(pidfd
+        // _open(peer), dirfd)` returned `6`, the `openat` through that copy read
+        // the host's `/etc/hostname`, and the `pidfd_open` beside it returned —
+        // which is why `pidfd_open` is deliberately still in the tail.
         for arch in [Arch::X86_64, Arch::Aarch64] {
             let program = filter_program(arch);
             for syscall in [
                 Syscall::Ptrace,
                 Syscall::ProcessVmReadv,
                 Syscall::ProcessVmWritev,
+                Syscall::PidfdGetFd,
             ] {
                 let nr = arch.syscall_nr(syscall);
                 assert_eq!(
@@ -715,12 +789,26 @@ mod tests {
                 );
             }
         }
-        // The family's numbers are per-architecture, so the two tables disagree
-        // about them — which is the half of this rule a single-architecture
-        // assertion would miss.
+        // The ptrace family's numbers are per-architecture, so the two tables
+        // disagree about them — which is the half of this rule a
+        // single-architecture assertion would miss.
         assert_ne!(
             Arch::X86_64.syscall_nr(Syscall::Ptrace),
             Arch::Aarch64.syscall_nr(Syscall::Ptrace)
+        );
+        // **`pidfd_getfd` is the other shape**: 438 was assigned from the
+        // generic table, so it is the same number on both — and `pidfd_open`,
+        // which stays allowed, is its neighbour there. Asserting the pair pins
+        // both halves: the open is not in the list and the copy is.
+        assert_eq!(Arch::X86_64.syscall_nr(Syscall::PidfdGetFd), 438);
+        assert_eq!(
+            Arch::Aarch64.syscall_nr(Syscall::PidfdGetFd),
+            Arch::X86_64.syscall_nr(Syscall::PidfdGetFd)
+        );
+        assert_eq!(
+            verdict(&filter_program(Arch::X86_64), AUDIT_ARCH_X86_64, 434),
+            SECCOMP_RET_ALLOW,
+            "`pidfd_open` copies nothing and a supervisor waits on it"
         );
     }
 
@@ -732,17 +820,17 @@ mod tests {
         // contributes a compare and a denial; the x32 mask is one more pair on
         // the architecture that has the ABI; and the tail allows. A variant added
         // to `Syscall` and forgotten in `DENIED` is a failing length here rather
-        // than a filter that denies nine of ten paths.
+        // than a filter that denies ten of eleven paths.
         assert_eq!(
             filter_program(Arch::X86_64).len(),
             4 + 2 * DENIED.len() + 2 + 1
         );
-        assert_eq!(filter_program(Arch::X86_64).len(), 27);
+        assert_eq!(filter_program(Arch::X86_64).len(), 29);
         assert_eq!(
             filter_program(Arch::Aarch64).len(),
             4 + 2 * DENIED.len() + 1
         );
-        assert_eq!(filter_program(Arch::Aarch64).len(), 25);
+        assert_eq!(filter_program(Arch::Aarch64).len(), 27);
     }
 
     #[test]
@@ -762,7 +850,7 @@ mod tests {
             .collect();
         assert_eq!(
             denials,
-            vec![5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25],
+            vec![5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27],
             "one per `DENIED` entry, plus the x32 mask"
         );
     }
@@ -849,7 +937,7 @@ mod tests {
     #[test]
     fn jump_offsets_land_on_each_denial_or_skip_it() {
         let program = filter_program(Arch::X86_64);
-        for index in [6, 8, 10, 12, 14, 16, 18, 20, 22, 24] {
+        for index in [6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26] {
             assert_eq!(program[index].code, bpf_code(BPF_JMP | BPF_JEQ | BPF_K));
             assert_eq!(program[index].jt, 0, "equal falls through to the denial");
             assert_eq!(program[index].jf, 1, "unequal skips it");
@@ -926,6 +1014,11 @@ mod tests {
             arch.syscall_nr(Syscall::ProcessVmWritev),
             __NR_process_vm_writev
         );
+        // The descriptor half of the same family, and the leg that says 438 is
+        // the kernel's number on both tables rather than this file's: `arm64`
+        // takes its own legacy numbers for the old calls above and the generic
+        // table's for everything assigned after it switched.
+        assert_eq!(arch.syscall_nr(Syscall::PidfdGetFd), __NR_pidfd_getfd);
         // **The x32 mask's literal is checkable on exactly one target.** The UAPI
         // publishes `__X32_SYSCALL_BIT` in its `x86_64`, `x86` and `x32` modules
         // and in no `aarch64` one, so this line is what keeps the constant in
@@ -942,9 +1035,9 @@ mod tests {
         // event is asserted through the function `install` calls with the values
         // the kernel is handed. The `warn!` on the skip is not assertable at all
         // and `announce_installed`'s doc says why.
-        let (_, logged) = record_events(|| announce_installed(Arch::X86_64, 27));
+        let (_, logged) = record_events(|| announce_installed(Arch::X86_64, 29));
         assert_step(&logged, "seccomp");
         assert!(logged.contains("arch=X86_64"), "{logged}");
-        assert!(logged.contains("instructions=27"), "{logged}");
+        assert!(logged.contains("instructions=29"), "{logged}");
     }
 }

@@ -1,136 +1,111 @@
-//! Test-only helpers, kept because two test modules need the same one.
+//! Test-only helpers, shared by this crate's own unit tests, the jail suite and
+//! `tinio-server`'s Linux e2e legs.
+//!
+//! **Three of them are this platform's own and live here rather than in
+//! `tinio-util::testing`**: [`requested_model`] and [`host_can_confine`] speak
+//! this crate's [`Mechanism`], and [`unshare_probe`] runs util-linux's
+//! `unshare(1)` against this platform's `/proc` — none of the three can cross to
+//! a shared crate without taking this crate's vocabulary and this platform's
+//! tooling with it. They are here because `tests/jail.rs` and
+//! `tinio-server/tests/sandbox_e2e.rs` must agree on them word for word and had
+//! a copy each; `docs/tests.md` names the convention — shared test support lives
+//! on the crate that owns the subject.
+//!
+//! **The other two are `tinio_util::testing`'s, re-exported here** for the reason
+//! that module states: `record_events`, the `assert_step` read off it and the
+//! `with_ansi(false)` that assertion rests on are spelled once there, because a
+//! crate whose root is `#![cfg(target_os = "…")]` cannot take them from another
+//! such crate. This crate's unit-test modules name them through `crate::testing`.
+//!
+//! **The module is compiled for this crate's unit tests and behind the
+//! non-default `testing` feature**, which is what its self dev-dependency and
+//! `tinio-server`'s turn on: a `#[cfg(test)]` module is invisible to `tests/`, so
+//! the harness has to be lib code to cross that boundary at all.
 
-use std::{cell::RefCell, io, sync::OnceLock};
+use std::{
+    env,
+    process::{Command, Stdio},
+};
 
-use tracing::{Level, callsite::rebuild_interest_cache};
-use tracing_subscriber::fmt::MakeWriter;
+// The two shared devices, under the names this crate's unit tests already
+// import — the `cfg(test)` is the only build they are needed in, and it is the
+// one build that has `tinio-util` on the lib's own edge list.
+#[cfg(test)]
+pub(crate) use tinio_util::testing::{assert_step, record_events};
 
-thread_local! {
-    /// What this thread is recording, or `None` when it is not recording at all.
-    ///
-    /// **A thread-local rather than a shared buffer behind a lock, and the reason
-    /// is a fork.** `mechanism::userns_available`'s probe forks, and the child
-    /// inherits whatever subscriber the parent had: an event the child emits
-    /// through a *locked* buffer lands in a critical section a sibling thread may
-    /// have been holding when the fork happened, and the child then blocks until
-    /// the probe's five-second deadline — measured, on the first shape of this
-    /// helper, as `userns_available`'s own test failing in five seconds. A
-    /// thread-local takes no lock on the write path, and the common case is not
-    /// even reached: a forking test is not a recording one, so the child inherits
-    /// `None` and its event is dropped without allocating.
-    static BUFFER: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+use crate::Mechanism;
+
+/// The model the WSL2 script asked for, read the way the child reads it: the
+/// same variable through the same one reader.
+pub fn requested_model() -> Mechanism {
+    Mechanism::from_env(env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
+        .expect("TINIO_SANDBOX_MODEL must name a model")
 }
 
-/// Everything `body` logged, as the subscriber rendered it, beside what `body`
-/// returned.
+/// Whether this host can confine under `model` — asked **before** the child
+/// runs, and asked as a capability rather than as a substring of a failure.
 ///
-/// The crate installs no subscriber of its own (shared §7), so a test that wants
-/// to read this crate's events has to be the one that captures them.
-pub(crate) fn record_events<T>(body: impl FnOnce() -> T) -> (T, String) {
-    install();
-    // The buffer is emptied at both ends rather than dropped at the start: a
-    // panic in the body leaves it in place, and the next recording on this
-    // thread clears it, so a failed test cannot bleed into a later one.
-    BUFFER.with(|buffer| *buffer.borrow_mut() = Some(Vec::new()));
-    let value = body();
-    let logged = BUFFER.with(|buffer| {
-        let text = buffer.borrow_mut().take().unwrap_or_default();
-        String::from_utf8(text).expect("the capture is UTF-8")
-    });
-    (value, logged)
-}
-
-/// Shared §7's check, as one assertion: the event carries `step` as a rendered
-/// field.
+/// **This is the whole difference between a green suite and a quiet one.** The
+/// earlier shape skipped whenever the child's log contained `confine-failed:`,
+/// which made every confinement bug indistinguishable from a host that cannot
+/// confine: a mount table that never built, a device node created as a
+/// directory (Task 5's `apply_mount`) or a `prctl` that was refused all printed
+/// `skipping:` and exited 0. The question has a positive answer, it is
+/// answerable here, and asking it first is what lets the child's failure be a
+/// failure.
 ///
-/// **A rendered field and not a substring of the whole line**, which is the
-/// distinction the core's own recorder test states at length: the operation's
-/// name appears inside the message and inside any error the same call returns,
-/// so `contains("jail_root")` would pass for an event whose `step` field said
-/// something else. The log is in the failure message, because a recording that
-/// came out empty is the other half of what can go wrong here.
-pub(crate) fn assert_step(logged: &str, step: &str) {
-    assert!(
-        logged.contains(&format!("step=\"{step}\"")),
-        "no `step=\"{step}\"` in:\n{logged}"
-    );
-}
-
-/// Install the recording subscriber, once for the whole test binary.
+/// `Ok(())` when the kernel granted every namespace the model needs. `Err` with
+/// the `unshare(1)` invocations that answered no, spelled as an operator would
+/// retype them — carried out rather than logged, because the caller is where
+/// the answer decides between failing and skipping, and its message has to name
+/// the command it tried.
 ///
-/// **Global and installed once, rather than a thread-scoped `with_default`, and
-/// that is a measured correction rather than a preference.** `tracing` caches
-/// each callsite's `Interest` in a **process-global** cell, written both when a
-/// callsite is first hit and when a dispatch is created — and while exactly one
-/// dispatch is registered, which is the whole of a `with_default` recording,
-/// `tracing-core`'s `Rebuilder::JustOne` consults *the calling thread's* default
-/// rather than the registry. A thread-scoped subscriber is therefore invisible to
-/// every other thread, so a parallel test that happens to be the first to hit the
-/// same callsite writes `never` into the shared cell and the event this test
-/// exists to observe is dropped in silence. **This crate's test modules share
-/// callsites with a dozen other tests** (`resolve_model` is reached by the refusal
-/// tests, `jail_root` by every `jail.rs` test), so the shape that flaked in
-/// `tinio-sandbox-windows`'s capture is the shape this file would have had.
-///
-/// A global subscriber is visible from every thread, so the cell can only ever
-/// say "interested". Which thread's lines a recording reads is still decided per
-/// thread, by [`BUFFER`], so two tests can record at once.
-///
-/// **`try_init` and never `init`** (shared §7): a subscriber the caller already
-/// installed wins, and if one ever is, the capture stays empty and the assertions
-/// fail loudly rather than passing on a recording that never happened.
-///
-/// The level is `DEBUG` rather than §7's `Info`, because the per-item half is a
-/// core operation too: a capture at `Info` would leave every `debug!` site with
-/// no test that could fail if it were deleted.
-fn install() {
-    static INSTALLED: OnceLock<()> = OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_writer(Sink)
-            // **Load-bearing for a field assertion, and measured rather than
-            // assumed**: the default subscriber wraps each field *name* and the
-            // equals sign after it in ANSI escapes, so a captured line carries
-            // `step` only as coloured spans and never as `step="…"`.
-            .with_ansi(false)
-            .with_max_level(Level::DEBUG)
-            .try_init();
-        // **`set_global_default` stores the dispatch without re-evaluating the
-        // callsite cache** — only `Dispatch::new` does that, and it runs before
-        // the default is visible — so a callsite another test already hit stays
-        // cached `never`. Rebuilding here, with the global default in place, is
-        // what turns those cells back to "interested".
-        rebuild_interest_cache();
-    });
-}
-
-/// The subscriber's writer: it appends to the **calling thread's** buffer, or
-/// drops the event when that thread is not recording.
-///
-/// A zero-sized type with no state of its own, because the state is the
-/// thread-local: `MakeWriter`'s writer is created per event, and anything shared
-/// here would be a lock on the event path — see [`BUFFER`] for what that cost.
-struct Sink;
-
-impl io::Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        BUFFER.with(|buffer| {
-            if let Some(text) = buffer.borrow_mut().as_mut() {
-                text.extend_from_slice(buf);
-            }
-        });
-        Ok(buf.len())
+/// **`unshare(1)` rather than the backend's own `userns_available()`**: that
+/// probe forks, and its safety argument is that nothing else exists in the
+/// process yet (design §10) — a libtest worker thread is not that place. The
+/// command is the one the WSL2 script gates on, so the script and the test
+/// agree by construction rather than by review. It is also a *lower* bound on
+/// this binary's capability, and knowingly so: `mechanism.rs` tells operators to
+/// give the binary an AppArmor profile, which confines a profiled child where
+/// plain `unshare(1)` still fails — so a host can answer this probe with "no"
+/// and still confine the child. That is the residual fuzziness a skip has to be
+/// deliberate to cross, and it is why the opt-in exists.
+pub fn host_can_confine(model: Mechanism) -> Result<(), String> {
+    // Each variant is asked for the namespaces it actually needs: `--user
+    // --map-root-user` for the user-namespace model, and a bare `--mount` for
+    // the root model, whose single capability is `CAP_SYS_ADMIN`. Asking the
+    // kernel rather than reading `geteuid()` is the point — a container can run
+    // as uid 0 and still refuse a mount namespace, which is a host where this
+    // model would fail at the first mount rather than at the probe.
+    let user: &[&str] = &["--user", "--map-root-user"];
+    let mount: &[&str] = &["--mount"];
+    let probes: &[&[&str]] = match model {
+        Mechanism::UserNamespace => &[user],
+        Mechanism::Root => &[mount],
+        Mechanism::Auto => &[user, mount],
+    };
+    if probes.iter().any(|flags| unshare_probe(flags)) {
+        return Ok(());
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    Err(probes
+        .iter()
+        .map(|flags| format!("unshare {} true", flags.join(" ")))
+        .collect::<Vec<_>>()
+        .join(" and "))
 }
 
-impl<'a> MakeWriter<'a> for Sink {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        Sink
-    }
+/// `unshare(1)` with `flags`, as a process of its own.
+///
+/// A missing `unshare(1)` panics rather than skipping: the precondition is then
+/// unknowable, and a suite that cannot tell "this host cannot confine" from "I
+/// could not ask" is the shape this function exists to delete.
+pub fn unshare_probe(flags: &[&str]) -> bool {
+    Command::new("unshare")
+        .args(flags)
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or_else(|err| panic!("the precondition needs util-linux's `unshare(1)`: {err}"))
 }

@@ -1,46 +1,36 @@
 //! Generated credentials for a first start (`config.md:141`, FR-007).
 
-use std::fmt;
-
-use crate::Error;
+use crate::{
+    Error,
+    auth::{Secret, SecretKey},
+};
 
 /// The generated pair.
+///
+/// **The secret key is [`Secret`]** — redacted from `Debug` by construction (`SecretBox`),
+/// matching every other secret this crate hands to callers. An unredacted `String` would be
+/// one `tracing::debug!("{credentials:?}")` away from a secret in a log line.
 ///
 /// # Examples
 ///
 /// ```rust
+/// use secrecy::ExposeSecret;
 /// use tinio_config::credentials::{Credentials, generate};
 ///
 /// let pair: Credentials = generate()?;
 /// assert_eq!(pair.access_key.len(), 32); // 16 bytes, hex-encoded
-/// assert_eq!(pair.secret_key.len(), 64); // 32 bytes, hex-encoded
+/// assert_eq!(pair.secret_key.expose_secret().len(), 64); // 32 bytes, hex-encoded
 /// // The secret is redacted whenever the pair is formatted.
-/// assert!(!format!("{pair:?}").contains(&pair.secret_key));
+/// let secret = pair.secret_key.expose_secret();
+/// assert!(!format!("{pair:?}").contains(&**secret));
 /// # Ok::<(), tinio_config::Error>(())
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Credentials {
     /// At least 16 bytes of CSPRNG output, hex-encoded.
     pub access_key: String,
     /// At least 32 bytes, hex-encoded.
-    pub secret_key: String,
-}
-
-impl fmt::Debug for Credentials {
-    /// Prints the access key and a redacted secret key.
-    ///
-    /// Written by hand rather than derived: this is a public type in a public
-    /// module whose next consumer is the CLI, and a derived `Debug` prints the
-    /// secret key — one `tracing::debug!("{credentials:?}")` away from a secret
-    /// in a log line. The crate's other secret material is redacted by
-    /// construction (`auth::Secret` wraps a `SecretBox`), and a value the crate
-    /// hands to callers should not be the one that is not.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Credentials")
-            .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
-            .finish()
-    }
+    pub secret_key: Secret,
 }
 
 /// The contract's floors, in bytes before hex encoding.
@@ -52,16 +42,17 @@ const SECRET_BYTES: usize = 32;
 /// # Examples
 ///
 /// ```rust
+/// use secrecy::ExposeSecret;
 /// use tinio_config::credentials::generate;
 ///
 /// let pair = generate()?;
-/// assert_ne!(pair.access_key, pair.secret_key);
+/// assert_ne!(pair.access_key.as_str(), &**pair.secret_key.expose_secret());
 /// # Ok::<(), tinio_config::Error>(())
 /// ```
 pub fn generate() -> Result<Credentials, Error> {
     Ok(Credentials {
         access_key: hex(ACCESS_BYTES)?,
-        secret_key: hex(SECRET_BYTES)?,
+        secret_key: SecretKey::from(hex(SECRET_BYTES)?).into(),
     })
 }
 
@@ -81,6 +72,8 @@ fn hex(bytes: usize) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -89,22 +82,27 @@ mod tests {
         // credential is a string no parser has to escape.
         let pair = generate().unwrap();
         assert_eq!(pair.access_key.len(), ACCESS_BYTES * 2);
-        assert_eq!(pair.secret_key.len(), SECRET_BYTES * 2);
+        assert_eq!(pair.secret_key.expose_secret().len(), SECRET_BYTES * 2);
         assert!(pair.access_key.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(pair.secret_key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            pair.secret_key
+                .expose_secret()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 
     #[test]
     fn the_pair_redacts_its_secret_when_debugged() {
-        // The hand-written `Debug`: the access key identifies the pair, the
-        // secret key never reaches a log line, and neither `{:?}` nor the
-        // struct-literal `{:#?}` can undo that.
+        // `Secret` redacts by construction: the access key identifies the pair, the
+        // secret never reaches a log line, and neither `{:?}` nor `{:#?}` can undo that.
         let pair = generate().unwrap();
+        let secret = pair.secret_key.expose_secret().to_string();
         for printed in [format!("{pair:?}"), format!("{pair:#?}")] {
             assert!(printed.contains(&pair.access_key), "{printed}");
-            assert!(printed.contains("<redacted>"), "{printed}");
+            assert!(printed.contains("REDACTED"), "{printed}");
             assert!(
-                !printed.contains(&pair.secret_key),
+                !printed.contains(&secret),
                 "the secret key must not be printed: {printed}"
             );
         }

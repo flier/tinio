@@ -31,6 +31,14 @@ pub enum Confinement {
 
 /// A platform's confinement mechanism.
 ///
+/// **This trait answers "confine this", and never "is there a mechanism here".** A `Backend`
+/// value exists only where an implementation does, so a caller cannot ask a target that has
+/// none whether it has one — and the answer is needed *before* an arm chooses a backend, to
+/// refuse a request rather than reach an arm that cannot exist. The availability question is
+/// therefore published beside the platform selection, as `tinio_sandbox::backend_available`,
+/// and deliberately not as a method here: this trait stays the one call every mechanism
+/// answers, and a target with no implementation has nothing to answer it on.
+///
 /// **`confine` takes `&mut self`**, and the receiver is the honest one in both
 /// directions: on Linux the call changes the calling process irreversibly
 /// (design decision 26), while a launcher backend uses the receiver to record
@@ -82,4 +90,57 @@ pub trait Backend {
     /// # Ok::<(), tinio_sandbox_core::Error>(())
     /// ```
     fn confine(&mut self, sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement>;
+}
+
+/// What a target's confinement does, so a caller branches on the fact and not on the OS.
+///
+/// **Each backend publishes its own instance**, as the `FACTS` constant beside its [`Backend`]
+/// implementation: every field here is a statement about that backend's mechanism, so the crate
+/// that owns the mechanism is the crate that answers for it. A table of `cfg!(target_os = …)`
+/// assembled in a crate that owns none of them is a second home for the same fact — and the one
+/// that drifts when a mechanism changes.
+///
+/// **Ending the child of a launch that fails after it exists is not a field here.** Each launcher
+/// platform installs its own killer on the child it starts ([`Child::with_kill`]), so
+/// [`Child::abort`] ends the child on every launcher platform and the caller's call is
+/// unconditional — a field here could only restate the answer the platform already gave when it
+/// built the child.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::PlatformFacts;
+///
+/// // What a backend that confines in place answers: it launches nothing, so the three facts a
+/// // launch has are not its to state.
+/// let in_place = PlatformFacts {
+///     launches_child: false,
+///     refuses_derived_state_dir: false,
+///     probe_state_dir_writable: false,
+///     control_socket: false,
+/// };
+/// assert!(!in_place.launches_child);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformFacts {
+    /// The backend launches a supervised child. An in-place backend confines this process.
+    pub launches_child: bool,
+    /// The mechanism grants the state directory and not its parent.
+    pub refuses_derived_state_dir: bool,
+    /// The launcher proves the state directory can take a file before it launches.
+    pub probe_state_dir_writable: bool,
+    /// The launcher rebuilds the inherited control channel as a unix socket, rather than reading
+    /// handle values the child inherited.
+    pub control_socket: bool,
+}
+
+impl PlatformFacts {
+    /// No mechanism at all: what a target with no backend wired answers, and what an in-place
+    /// backend answers for the three facts a launch would own.
+    pub const NONE: Self = Self {
+        launches_child: false,
+        refuses_derived_state_dir: false,
+        probe_state_dir_writable: false,
+        control_socket: false,
+    };
 }

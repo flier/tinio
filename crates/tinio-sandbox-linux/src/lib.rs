@@ -4,6 +4,22 @@
 //! calling process, so there is no child, no payload and no exit-status
 //! forwarding (design decision 6).
 //!
+//! **The process must be single-threaded when it confines itself, and the
+//! backend refuses one that is not rather than assuming the entry point got the
+//! ordering right.** Every operation of the sequence — `unshare`,
+//! `no_new_privs`, the capability drop and the seccomp filter — applies to the
+//! calling task alone, so a second thread would keep the host mount namespace,
+//! the full credentials and an unfiltered network for the life of the process
+//! while the run reported itself confined (design §8, §10; the design's own
+//! §10 wiring is what used to carry this, and a subscriber built before
+//! `confine` is the shape that breaks it). [`Backend`]'s `confine` reads
+//! `/proc/self/task` and refuses with the count before the first irreversible
+//! step, and the refusal is fail-closed: a `/proc` that cannot be read refuses
+//! too. The remedy belongs to the entry point — build the subscriber and the
+//! runtime *after* the confinement — and not to
+//! `SECCOMP_FILTER_FLAG_TSYNC`, which would synchronise the filter while the
+//! namespaces and the credentials stayed per-thread.
+//!
 //! **The crate is behind `#![cfg(target_os = "linux")]`** so the workspace
 //! builds on every host. `rustix` itself compiles everywhere — it ships no
 //! crate-level gate and a Windows build simply links a different backend — but
@@ -20,7 +36,9 @@
 #[doc(hidden)]
 pub extern crate tinio_sandbox_core as _core;
 
-use crate::_core::{Backend as BackendTrait, Confinement, LaunchPlan, Result, Sandbox};
+use crate::_core::{
+    Backend as BackendTrait, Confinement, LaunchPlan, PlatformFacts, Result, Sandbox,
+};
 
 pub mod caps;
 pub mod enter;
@@ -30,10 +48,17 @@ pub mod options;
 pub mod plan;
 pub mod seccomp;
 
-/// The recorder the crate's own unit tests read their events through. Test-only,
-/// so it is not part of the surface a caller sees.
-#[cfg(test)]
-mod testing;
+/// The crate's test-side support, in one place: this platform's host
+/// precondition and the two shared recording devices.
+///
+/// **Behind the non-default `testing` feature** (`docs/tests.md`'s rule for a
+/// crate's own harness module, and the shape `tinio-sandbox-windows` takes): the
+/// module has to be lib code to cross the `tests/` boundary at all, and the
+/// feature is what keeps it out of a build that is not a test build. The crate's
+/// own test targets turn it on through the self dev-dependency in `Cargo.toml`,
+/// and `tinio-server`'s Linux e2e target asks for it from its own edge.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use self::{
     caps::{Cap, retained},
@@ -43,6 +68,12 @@ pub use self::{
     plan::{DEVICE_FILES, Mount, MountKind, OverlayDirs, plan},
     seccomp::Seccomp,
 };
+
+/// What this mechanism does, for a caller that branches on the fact rather than the OS.
+///
+/// **The in-place answer**: this backend confines the calling process (design decision 6), so it
+/// launches nothing and none of the three facts a *launch* owns are its to state.
+pub const FACTS: PlatformFacts = PlatformFacts::NONE;
 
 /// The Linux backend.
 ///
@@ -57,9 +88,9 @@ pub use self::{
 #[derive(Debug, Clone, Default)]
 pub struct Backend {
     options: Options,
-    /// What the last `confine` did about the network filter. Interior
-    /// mutability because `Backend::confine` takes `&self` (P0's trait) and the
-    /// value can only be known once the filter has been attempted.
+    /// What the last `confine` did about the network filter, written through the
+    /// trait's `&mut self` receiver once the filter has been attempted — the
+    /// value cannot be known before that.
     ///
     /// The alternative was to carry it in `Confinement`, which is P0's type and
     /// would then drag a Linux-only fact into both launcher platforms; or to

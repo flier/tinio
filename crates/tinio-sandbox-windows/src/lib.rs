@@ -31,15 +31,26 @@
 //! compiles — and lints — on targets it does not serve. **The modules of the
 //! Windows implementation land across this phase's tasks**, so the list below
 //! grows one name per task: a module joins it in the task that creates it.
+//!
+//! **The NUL-terminated UTF-16 rule is [`tinio_winsec::to_wide`]'s, not this
+//! crate's.** Every name this crate hands the kernel — `sid`'s profile names and
+//! capability strings, `process`'s image path, `acl`'s descriptor read — goes
+//! through that one function, which the workspace's other Windows crates share,
+//! so the encoding has one spelling here rather than one per module. What stays
+//! at this root is the inverse: `from_wide_units` and `from_wide` below, which
+//! are this crate's own FFI because no other crate reads a name back out of the
+//! kernel.
 
 #![cfg(target_os = "windows")]
 
 #[doc(hidden)]
 pub extern crate tinio_sandbox_core as _core;
 
-use std::{ffi::OsStr, iter::once, os::windows::ffi::OsStrExt, slice::from_raw_parts};
+use std::slice::from_raw_parts;
 
-use crate::_core::{Backend as BackendTrait, Confinement, LaunchPlan, Result, Sandbox};
+use crate::_core::{
+    Backend as BackendTrait, Confinement, LaunchPlan, PlatformFacts, Result, Sandbox,
+};
 
 pub mod acl;
 pub mod backend;
@@ -50,14 +61,22 @@ pub mod launch;
 pub mod process;
 pub mod sid;
 pub mod socket;
-// **Unconditional, and that is the whole point rather than an oversight.** A
-// `#[cfg(test)]` module is invisible to `tests/`, and the crate cannot enable a
-// feature of its own for them — a dev-dependency on itself is a cycle — so a
-// gated `testing` module would be reachable by `tinio-server`'s suites and not
-// by this crate's, which is the duplication the module exists to remove. What
-// it costs is one small module compiled into a library nothing outside the
-// workspace builds (`publish = false`), and what it buys is that the
-// "waited for or killed on every path" rule is spelled once for both callers.
+// **Behind this crate's `testing` feature, which no production build turns on.**
+// The module is the conformance device `tinio-server`'s Windows e2e suite and this
+// crate's own suites compose, and `docs/tests.md` puts conformance support in
+// `[dev-dependencies]` rather than in a library a consumer links — the feature is
+// what makes that true here, because the module has to be lib code to cross the
+// `tests/` boundary at all. What turns it on:
+//
+// - this crate's own suites, through the self dev-dependency in `Cargo.toml` (a
+//   `#[cfg(test)]` module is invisible to `tests/`, so a test-only module has to be
+//   a feature, and the feature has to be asked for on this crate's test builds);
+// - `tinio-server`'s Windows e2e targets, through their dev-dependency on this
+//   crate with `features = ["testing"]`.
+//
+// It pulls `tinio-util`'s `testing` feature with it, which is the other half of the
+// same rule: the shared device is not compiled into the launcher the CLI starts.
+#[cfg(feature = "testing")]
 pub mod testing;
 
 /// This crate's own names, reached from the crate root.
@@ -68,6 +87,22 @@ pub mod testing;
 /// `Options` and the `Capability` list those options carry — are at this root as
 /// well, so `tinio_sandbox_windows::Options` resolves without the module path.
 pub use self::backend::{Backend, Capability, Options};
+
+/// What this mechanism does, for a caller that branches on the fact rather than the OS.
+///
+/// **The launcher answer, minus the macOS facts**: this backend starts a supervised child, and
+/// the three facts a *launch* owns are Seatbelt's rather than its — it refuses no derived state
+/// directory, proves nothing writable before launching, and reads handle values rather than
+/// rebuilding a socket.
+///
+/// **Ending the child is not among these facts**, and this backend does end one: like every
+/// launcher platform it installs a killer (`TerminateJobObject` on the job it holds), so a launch
+/// that fails after `confine` returns ends its child through `Child::abort` rather than through a
+/// fact a call site would have to consult.
+pub const FACTS: PlatformFacts = PlatformFacts {
+    launches_child: true,
+    ..PlatformFacts::NONE
+};
 
 /// The backend for this platform, with its defaults.
 ///
@@ -102,37 +137,13 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement> {
     backend().confine(sandbox, plan)
 }
 
-/// A NUL-terminated UTF-16 copy of `text`.
+/// Read a NUL-terminated UTF-16 buffer as the units before its terminator.
 ///
-/// **The crate root owns the termination rule, and every wide string this crate
-/// builds goes through here or through `wide_os` below rather than spelling it
-/// itself**: `sid`'s profile names and capability strings take this one, and the
-/// system directory [`handles`](mod@handles) reads back from the kernel takes
-/// [`from_wide_units`].
-///
-/// **`process`'s command line is the one buffer that takes neither, and the reason
-/// is that it is not text**: every argument in it may be arbitrary UTF-16, so it is
-/// built and terminated as code units rather than as a string
-/// ([`process::command_line`]'s doc states it), while the program path — an
-/// `OsStr` and not a `str` — takes `wide_os`.
-pub(crate) fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(once(0)).collect()
-}
-
-/// A NUL-terminated UTF-16 copy of `path`, for the input that cannot go through
-/// `wide`'s `&str`.
-///
-/// A Windows path is arbitrary UTF-16 rather than UTF-8, so `to_string_lossy`
-/// is not a conversion this crate may make on one: it replaces a unit that is
-/// not valid UTF-8 with U+FFFD and the kernel then opens a different file from
-/// the one the caller named. `encode_wide` is the lossless copy — it is what
-/// `OsStr` is for on this platform — and the termination below is the same rule
-/// `wide` applies.
-pub(crate) fn wide_os(path: &OsStr) -> Vec<u16> {
-    path.encode_wide().chain(once(0)).collect()
-}
-
-/// Read a NUL-terminated UTF-16 string into a `String`.
+/// **The reader to `tinio_winsec::to_wide`'s writer, and the half of the rule
+/// that stays here**: the encoding is shared (the crate doc names the one
+/// function that applies it), while this direction is this crate's own FFI — the
+/// inverse of a rule is not something the writer's crate has to own, and
+/// `tinio-winsec` reads no name back out of the kernel.
 ///
 /// **One of the crate root's two unsafe sites, and the reason each exception
 /// sits on its own function rather than on the file**: the manifest denies
@@ -160,10 +171,11 @@ pub(crate) unsafe fn from_wide_units<'a>(text: *const u16) -> &'a [u16] {
 /// The same units as a `String`, **for the inputs that are text rather than
 /// paths**: a SID's rendered form and a command line's arguments.
 ///
-/// `from_utf16_lossy` is right for those and wrong for a path — [`wide_os`]'s
-/// doc states why a path may not take it, and [`system_directory`] is the one
-/// caller that has a path, so it goes through [`from_wide_units`] and
-/// `OsString::from_wide` instead.
+/// `from_utf16_lossy` is right for those and wrong for a path — a Windows path is
+/// arbitrary UTF-16, so the lossy read replaces any unit that is not valid UTF-8
+/// with U+FFFD and a caller then names a different file from the one it was given
+/// — and [`system_directory`] is the one caller that has a path, so it goes
+/// through [`from_wide_units`] and `OsString::from_wide` instead.
 ///
 /// [`system_directory`]: crate::handles::system_directory
 ///

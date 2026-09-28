@@ -1,8 +1,14 @@
 //! Waiting for a confined child and undoing what its launch set up.
 
-use std::{io, process::ExitStatus, sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
+use std::{
+    io,
+    process::ExitStatus,
+    sync::mpsc::{Receiver, RecvTimeoutError},
+    thread::JoinHandle,
+    time::Duration,
+};
 
-use tracing::debug;
+use tracing::{debug, error, info};
 
 use crate::{error::Result, launcher::Terminal};
 
@@ -55,16 +61,18 @@ use crate::{error::Result, launcher::Terminal};
 /// [`Observer::with_notify`]: crate::launcher::Observer::with_notify
 ///
 /// **A launch can also fail after the child exists, and the child has to be
-/// ended rather than dropped.** The macOS launcher publishes the child's `state`
-/// the moment the child reports it is listening, and that publish is the one
+/// ended rather than dropped.** The launcher publishes the child's `state` the
+/// moment the child reports it is listening, and that publish is the one
 /// fallible step left on the launch path: it writes into the state directory,
 /// which can refuse between the launcher's pre-flight probe and the write. The
-/// launcher's own `?` there would return the error and drop the [`Self`] — and
-/// on a platform with no job object a dropped child is not an ended one, because
-/// the handle the platform keeps is behind the wait closure, so the confined
-/// server keeps listening with no `state` file for `tinio status`/`stop` to find
-/// it. [`Self::with_kill`] is that path's half: the platform supplies the one
-/// call that ends the process it started.
+/// launcher's own `?` there would return the error and drop the [`Self`] — and a
+/// dropped child is not an ended one, because the handle the platform keeps is
+/// behind the wait closure, so the confined server keeps listening with no
+/// `state` file for `tinio status`/`stop` to find it. [`Self::with_kill`] is that
+/// path's half: the platform supplies the one call that ends the process it
+/// started, and [`Self::abort`] is the caller's — **one call, on every launcher
+/// platform**, which is what keeps the knowledge of *which* platform can end its
+/// own child out of the caller's hands.
 ///
 /// **`Child` is not `Send`, and that is a property rather than an oversight.**
 /// The wait closure is a bare `Box<dyn FnMut() -> Result<ExitStatus>>`, the kill
@@ -141,6 +149,38 @@ pub struct Child {
     /// [`Self::with_ready`]). `None` for a child nothing is waiting on — the core's
     /// own tests, and every platform that has no reason to act before the wait.
     ready: Option<Receiver<Terminal>>,
+}
+
+/// What waiting for a child's first frame ended on — **the three facts a single `Option` folds**,
+/// and the caller's next step differs by which one it is.
+///
+/// A caller that only wants "did it report?" still reads [`Child::terminal`] after the wait, which
+/// is final; this is for the caller that has to act *before* then, and whose action differs.
+///
+/// # Examples
+///
+/// ```
+/// use std::{sync::mpsc, time::Duration};
+///
+/// use tinio_sandbox_core::{Child, Readiness};
+///
+/// let (_tx, rx) = mpsc::channel();
+/// let child = Child::new(|| unreachable!("this child is never waited for")).with_ready(rx);
+/// assert_eq!(
+///     child.wait_for_ready(Duration::from_millis(1)),
+///     Readiness::Elapsed
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    /// The child reported a terminal fact, in its own words.
+    Reported(Terminal),
+    /// **The relay ended without one**: the child is gone before it reported, so whatever it
+    /// wrote and the exit status [`Child::wait`] reports are the run's report.
+    Gone,
+    /// **The bound elapsed with the child still there.** Nothing has been reported *yet*, and it
+    /// is the caller's deadline — not the child — that has run out.
+    Elapsed,
 }
 
 impl Child {
@@ -242,11 +282,16 @@ impl Child {
     /// wait and the relay.
     ///
     /// **This is a builder rather than part of [`Self::new`] because a killer may
-    /// genuinely be absent, and `Option` says so in the type.** Windows leaves it
-    /// unset deliberately: its `Child` already ends the child by dropping the job,
-    /// so a killer there would duplicate a mechanism the platform has, and the
-    /// `None` is a decision the platform states rather than an omission. A
-    /// platform that launches no child at all never reaches either half.
+    /// genuinely be absent, and `Option` says so in the type** — but **every platform that
+    /// launches a child installs one**, because [`Self::abort`] is what the launch-failure
+    /// path calls on all of them and an `abort` with nothing to end would be a claim the
+    /// platform cannot honour. Both launcher platforms therefore hand one over, and they
+    /// are the mechanism each already had: a `SIGKILL` to the pid on macOS, and
+    /// `TerminateJobObject` on the job the Windows launcher holds (the same object whose
+    /// kill-on-close ties the child's lifetime to the launcher's, used here to end the child
+    /// *now* rather than at the launcher's exit). What is left in the `None` arm is the
+    /// core's own tests, and any future platform whose child genuinely cannot outlive the
+    /// value — for which [`Self::abort`] states what it does instead.
     ///
     /// **The killer must not reap, and that is the one rule this closure has.**
     /// [`Self::kill`] carries the whole contract: it ends the process and stops
@@ -282,17 +327,16 @@ impl Child {
         self
     }
 
-    /// **End the child** — the launch-failure path, for a platform whose dropped
-    /// [`Self`] would otherwise leave the confined process running.
+    /// **End the child**, through the killer [`Self::with_kill`] installed.
     ///
-    /// **This does not end the child's lifecycle; [`Self::wait`] does, and the
-    /// caller calls it next.** The split is deliberate: the killer does the one
-    /// thing a platform can express without owning the wait (a `SIGKILL` to a pid,
-    /// a `TerminateProcess` on a handle), the wait is what **reaps** the process so
-    /// no zombie is left and what joins the relay. So the sequence a caller on the
-    /// failure path runs is `kill()` then `wait()` — the kill is what makes that
-    /// wait return instead of blocking, and the wait is what makes it a reap
-    /// rather than a leak.
+    /// **This is the platform's half and not the failure path's whole**:
+    /// [`Self::abort`] is the call a caller makes, and this is what it drives. The
+    /// split is deliberate: the killer does the one thing a platform can express
+    /// without owning the wait (a `SIGKILL` to a pid, a `TerminateJobObject` on the
+    /// job), the wait is what **reaps** the process so no zombie is left and what
+    /// joins the relay. So the sequence the failure path runs is `kill()` then
+    /// `wait()` — the kill is what makes that wait return instead of blocking, and
+    /// the wait is what makes it a reap rather than a leak.
     ///
     /// **After a kill, [`Self::wait`] reports the killed status and
     /// [`Self::terminal`] stays what it already was.** A child killed before it
@@ -343,6 +387,90 @@ impl Child {
         }
     }
 
+    /// **End the child and reap it — the launch-failure path in one call, on every
+    /// platform.**
+    ///
+    /// **The call site is one statement because the platform knowledge is not the caller's.** A
+    /// launch that fails after its child exists — the `state` publish a launcher performs the
+    /// moment the child reports it is listening, whose write can be refused between the
+    /// launcher's pre-flight probe and the file — must end a child that would otherwise keep
+    /// serving with nothing naming it. **How an ending is possible differs by platform, and that
+    /// difference used to be a table the caller consulted before deciding whether to call
+    /// [`Self::kill`] at all.** The table is gone: [`Self::with_kill`] is where each platform
+    /// answers, this is where the answer is used, and `child.abort()` means the same thing on
+    /// every launcher platform — a `SIGKILL` to the pid on macOS, `TerminateJobObject` on the job
+    /// the Windows launcher holds.
+    ///
+    /// **Both halves are needed and the order is the contract**: the killer ends a child that is
+    /// still serving, and the [`Self::wait`] after it is the reap — no zombie is left, the relay
+    /// is joined, and [`Self::terminal`] is as final here as it is after a successful launch.
+    ///
+    /// **A child with no killer is not ended here, and the wait is skipped with it.** A platform
+    /// that installs none is one whose child cannot outlive this value (see [`Self::with_kill`]),
+    /// so there is nothing to end — and waiting for a process nothing has ended would hang the
+    /// launcher instead of letting it report the failure it is carrying. That platform-shaped
+    /// branch lives **here, in the core**, rather than at a call site that could not know it.
+    ///
+    /// **The errors are logged and not returned.** The caller is already carrying the failure
+    /// that ended the launch, and that failure is what the operator has to see; a second error
+    /// answered here would be a second answer for the same run. The logging is what the caller
+    /// used to do around the pair.
+    ///
+    /// # Examples
+    ///
+    /// **`no_run` because it spawns a process** (constitution III):
+    ///
+    /// ```no_run
+    /// use std::{cell::RefCell, process::Command, rc::Rc};
+    ///
+    /// use tinio_sandbox_core::Child;
+    ///
+    /// # #[cfg(unix)] {
+    /// let process = Rc::new(RefCell::new(
+    ///     Command::new("sleep").arg("60").spawn().unwrap(),
+    /// ));
+    /// let waited = Rc::clone(&process);
+    /// let killed = Rc::clone(&process);
+    /// let mut child = Child::new(move || Ok(waited.borrow_mut().wait()?))
+    ///     .with_kill(move || killed.borrow_mut().kill());
+    /// // The launch failed after this child existed: one call ends it and reaps it.
+    /// child.abort();
+    /// # }
+    /// ```
+    pub fn abort(&mut self) {
+        // The platform's ending first, and the reap only when a killer was installed: a child
+        // whose platform ties its lifetime elsewhere is not this value's to wait for.
+        let ended = self.kill.as_mut().map(|kill| kill());
+        match &ended {
+            Some(Ok(())) => {}
+            Some(Err(error)) => error!(
+                step = "abort",
+                error = %error,
+                "the child of a failed launch could not be killed: it may still be serving, and \
+                 the failure that ended the launch is what the operator sees"
+            ),
+            None => error!(
+                step = "abort",
+                "the platform installed no killer on this child, so nothing was ended here: its \
+                 lifetime is tied to something this value does not own"
+            ),
+        }
+        if ended.is_none() {
+            return;
+        }
+        // The reap, whether or not the killer reported success: a killer that failed on the
+        // platforms that install one means the process is already gone (`ESRCH`, a job handle
+        // that no longer names it), and this wait is what reaps the status either way.
+        match self.wait() {
+            Ok(status) => info!(
+                step = "abort",
+                code = status.code(),
+                "the child of a failed launch was killed and reaped"
+            ),
+            Err(error) => error!(step = "abort", error = %error, "the reaping wait failed"),
+        }
+    }
+
     /// The first terminal event the child reported, **while it is still running** —
     /// `None` when it reported none, and `None` once `bound` elapses.
     ///
@@ -371,7 +499,7 @@ impl Child {
     /// ```
     /// use std::{sync::mpsc, time::Duration};
     ///
-    /// use tinio_sandbox_core::{Child, Terminal};
+    /// use tinio_sandbox_core::{Child, Readiness, Terminal};
     ///
     /// let (tx, rx) = mpsc::channel();
     /// let child = Child::new(|| unreachable!("this child is never waited for")).with_ready(rx);
@@ -379,14 +507,25 @@ impl Child {
     /// tx.send(Terminal::Listening(addr)).expect("send");
     /// assert_eq!(
     ///     child.wait_for_ready(Duration::from_secs(1)),
-    ///     Some(Terminal::Listening(addr))
+    ///     Readiness::Reported(Terminal::Listening(addr))
     /// );
     /// ```
-    pub fn wait_for_ready(&self, bound: Duration) -> Option<Terminal> {
-        // `ok()` folds the two failures into the one answer this API has: the bound elapsed, or
-        // the relay ended without announcing — both are "nothing reported", and the caller's next
-        // step is the same one either way.
-        self.ready.as_ref()?.recv_timeout(bound).ok()
+    pub fn wait_for_ready(&self, bound: Duration) -> Readiness {
+        // **The three answers are read off the channel, not off a clock.** `recv_timeout` tells
+        // the two failures apart itself — `Disconnected` is the relay ending, `Timeout` is the
+        // bound running out — so a caller never has to time the call to recover the distinction,
+        // which is what folding them into one `None` forced and what a `Disconnected` arriving
+        // after the deadline got wrong.
+        let Some(ready) = self.ready.as_ref() else {
+            // No channel was wired: nothing can ever be announced, so this is the relay-ended
+            // answer rather than a wait on something that will not come.
+            return Readiness::Gone;
+        };
+        match ready.recv_timeout(bound) {
+            Ok(terminal) => Readiness::Reported(terminal),
+            Err(RecvTimeoutError::Disconnected) => Readiness::Gone,
+            Err(RecvTimeoutError::Timeout) => Readiness::Elapsed,
+        }
     }
 
     /// Block until the child exits, then until its relay has finished.
@@ -518,7 +657,7 @@ impl Child {
 /// gap.** A teardown that can fail belongs in the platform's wait closure, which
 /// owns the platform's error type and can name the directory it could not fix
 /// (design §11's Windows row); a `Child` that is never waited on at all is the
-/// caller's to end, through [`Child::kill`] on the path that failed after the
+/// caller's to end, through [`Child::abort`] on the path that failed after the
 /// child existed. What is left for this callback is the work that cannot fail
 /// — disarming a signal handler, removing a path the launcher created — which is
 /// what both launcher platforms pass it.
@@ -642,6 +781,32 @@ mod tests {
         let killed = Rc::clone(&process);
         Child::new(move || Ok(waited.borrow_mut().wait()?))
             .with_kill(move || killed.borrow_mut().kill())
+    }
+
+    #[test]
+    fn abort_ends_the_child_and_reaps_it() {
+        // **The launch-failure path in the one call a caller makes**, and the same two effects
+        // `kill` and `wait` had when a call site spelled them for itself: the second wait below
+        // returns a killed status rather than one the `sleep 60` would have taken a minute to
+        // produce — which is the ending — and it returns at all, which is the reap.
+        let mut child = lingering();
+
+        child.abort();
+
+        let status = child.wait().expect("the reaped status is readable again");
+        assert!(!status.success(), "the child was killed, not exited");
+        assert_eq!(child.terminal(), None, "the killed child never reported");
+    }
+
+    #[test]
+    fn abort_without_a_killer_ends_nothing_and_does_not_wait() {
+        // **The one arm a platform with its own lifetime tie takes**, and the reason `abort`
+        // exists rather than the caller calling `kill` and `wait` itself: the wait closure is
+        // `unreachable!`, so this test hangs (and then panics) if `abort` waits for a child that
+        // nothing ended. The refusal is logged, which is all a caller already carrying the
+        // launch failure can do with it.
+        let mut child = Child::new(|| unreachable!("abort must not wait without a killer"));
+        child.abort();
     }
 
     #[test]
@@ -824,21 +989,20 @@ mod tests {
     #[test]
     fn wait_for_ready_answers_the_announcement_and_the_absent_cases() {
         // The three answers this API has, in one test because they are one decision: a child whose
-        // relay announced readiness, one nothing is waiting on, and one that announced nothing —
-        // the first is `Some`, the other two are `None` rather than a wait on something that will
-        // not come.
+        // relay announced, one nothing is waiting on, and one that announced nothing — the first
+        // is `Reported`, the second `Gone`, and only the last waits its bound out.
         let (tx, rx) = mpsc::channel();
         let announced = Child::new(|| unreachable!("never waited for")).with_ready(rx);
         tx.send(listening()).expect("announce");
         assert_eq!(
             announced.wait_for_ready(Duration::from_secs(1)),
-            Some(listening())
+            Readiness::Reported(listening())
         );
 
         let unwired = Child::new(|| unreachable!("never waited for"));
         assert_eq!(
             unwired.wait_for_ready(Duration::from_secs(1)),
-            None,
+            Readiness::Gone,
             "a platform that wired no channel answers at once"
         );
 
@@ -847,7 +1011,20 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Terminal>();
         drop(tx);
         let quiet = Child::new(|| unreachable!("never waited for")).with_ready(rx);
-        assert_eq!(quiet.wait_for_ready(Duration::from_secs(1)), None);
+        assert_eq!(
+            quiet.wait_for_ready(Duration::from_secs(1)),
+            Readiness::Gone
+        );
+
+        // **The bound itself — the arm a caller used to have to time the call to recover.** A
+        // channel that neither disconnects nor announces is the one case the clock was read for,
+        // and it is the channel's own `Timeout` rather than an `Instant` comparison.
+        let (_tx, rx) = mpsc::channel::<Terminal>();
+        let silent = Child::new(|| unreachable!("never waited for")).with_ready(rx);
+        assert_eq!(
+            silent.wait_for_ready(Duration::from_millis(1)),
+            Readiness::Elapsed
+        );
     }
 
     #[tokio::test]

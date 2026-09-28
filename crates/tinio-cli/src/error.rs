@@ -5,6 +5,8 @@
 
 use std::io;
 
+use handlebars::RenderError;
+
 #[cfg(feature = "api")]
 use crate::_api;
 use crate::{
@@ -55,6 +57,13 @@ pub enum Error {
     /// return), so it is carried as its message rather than wrapped.
     #[error("logging error: {0}")]
     Log(String),
+    /// A template failed to render — exit code 1. The handlebars error stays the
+    /// [`source`](std::error::Error::source), including its reason and location.
+    #[error("{context}: {source}")]
+    Render {
+        context: &'static str,
+        source: RenderError,
+    },
     /// A management-plane failure — exit code 1.
     #[cfg(feature = "api")]
     #[error("management error: {0}")]
@@ -73,6 +82,8 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
+
     use io::Error as IoError;
 
     use super::*;
@@ -111,5 +122,23 @@ mod tests {
     #[test]
     fn errors_are_send_sync_and_static() {
         assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn a_render_error_keeps_its_source() {
+        let missing = "work".to_string();
+        let source = handlebars::RenderError::strict_error(Some(&missing));
+        let err = Error::Render {
+            context: "the systemd unit could not be rendered",
+            source,
+        };
+        assert_eq!(err.exit_code(), 1);
+        let kept = StdError::source(&err)
+            .and_then(|err| err.downcast_ref::<handlebars::RenderError>())
+            .expect("the handlebars error");
+        assert_eq!(
+            kept.to_string(),
+            handlebars::RenderError::strict_error(Some(&missing)).to_string()
+        );
     }
 }

@@ -33,6 +33,7 @@ use std::{
 use assert_cmd::{Command as AssertCmd, cargo::cargo_bin};
 use cucumber::{given, then, when};
 use tinio_sandbox::Event;
+use tinio_util::testing::kill_and_reap;
 
 use super::{FsKind, World, common::deterministic_bytes, has_tag};
 use crate::_server::{
@@ -122,9 +123,12 @@ impl Drop for External {
 /// on the same root. One home for the teardown ordering rationale — the
 /// Drop impls of [`External`]/[`SpawnedServer`] and the not-ready panic
 /// path all call it.
+///
+/// The sequence itself is [`kill_and_reap`]'s, spelled once for the whole
+/// workspace: this name stays because the ordering rule above is this
+/// harness's and not the shared helper's.
 fn terminate(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(child);
 }
 
 /// A running serve subprocess on an ephemeral loopback port (killed on

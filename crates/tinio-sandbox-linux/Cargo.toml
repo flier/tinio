@@ -22,8 +22,24 @@ tracing.workspace = true
 tinio-sandbox-core.workspace = true
 
 [dev-dependencies]
+# The crate's own suites reach `tinio_sandbox_linux::testing` (`src/testing.rs`),
+# and that module is behind this crate's `testing` feature — hence the self
+# dev-dependency, which is what turns the feature on for a test build without
+# turning it on for anyone who merely depends on this crate. Cargo unifies the two
+# edges, so the lib under test and this edge are one build. The same shape
+# `tinio-sandbox-windows` takes for the same reason.
+tinio-sandbox-linux = { path = ".", features = ["testing"] }
 tempfile.workspace = true
-tracing-subscriber.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
+
+[features]
+# **Conformance support, and not part of a production build of this crate.** The
+# `testing` module — the host precondition `tests/jail.rs` and `tinio-server`'s
+# Linux e2e legs both ask, and the recording devices this crate's unit tests read
+# their events through — is compiled only when this feature is on, and `default`
+# is empty for the same reason. The module needs no dependency the crate does not
+# already have, so the feature turns nothing on but itself.
+testing = []
 
 [lints.clippy]
 absolute_paths = "warn"

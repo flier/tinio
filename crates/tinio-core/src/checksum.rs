@@ -341,6 +341,13 @@ mod tests {
         assert_eq!(Recorded::from_wire_opt(""), None);
         assert_eq!(Recorded::from_wire_opt("garbage"), None);
         assert_eq!(Recorded::from_wire_opt("CRC32:y/Q5Jg==:BOGUS"), None);
+        // Either half can be the invalid one: a known kind does not save
+        // a row whose algorithm name is unknown (a downgrade that landed
+        // a foreign algorithm must not resurrect the row).
+        assert_eq!(Recorded::from_wire_opt("BLAKE3:y/Q5Jg==:FULL_OBJECT"), None);
+        // The split is by halves, not by field count: an element holding
+        // one `:` has a value but no kind, and neither half is optional.
+        assert_eq!(Recorded::from_wire_opt("CRC32:y/Q5Jg=="), None);
     }
 
     #[test]
@@ -375,5 +382,112 @@ mod tests {
             stored_type("composite"),
             Err(storage::Error::InvalidChecksum(_))
         ));
+    }
+
+    #[test]
+    fn supports_is_the_algorithm_by_type_table() {
+        // The create and complete validations ask THIS table whether the
+        // client's algorithm may carry the derivation it asked for
+        // (spec 2026-08-31): COMPOSITE is every algorithm but CRC64NVME
+        // (whose digest is always the whole content), FULL_OBJECT is the
+        // CRC family — the digests that linearize from their parts.
+        for algo in Algorithm::ALL {
+            assert_eq!(
+                Type::Composite.supports(algo),
+                algo != Algorithm::Crc64Nvme,
+                "COMPOSITE with {algo}"
+            );
+            assert_eq!(
+                Type::FullObject.supports(algo),
+                matches!(
+                    algo,
+                    Algorithm::Crc32 | Algorithm::Crc32C | Algorithm::Crc64Nvme
+                ),
+                "FULL_OBJECT with {algo}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_raw_decodes_the_base64_wire_form() {
+        let digest = [0xab_u8; 16];
+        let value = Value(STANDARD.encode(digest));
+        assert_eq!(value.raw().as_deref(), Some(&digest[..]));
+        assert_eq!(value.md5_raw(), Some(digest));
+
+        // A value that is not base64, and one whose width is not an MD5,
+        // both answer `None` — the read paths serve the part without a
+        // checksum rather than failing, and the tee's MD5 slot doubles
+        // as a part ETag, so a short digest must never be mistaken for
+        // one (the `[u8; 16]` width IS the check).
+        assert_eq!(Value("not base64!".into()).raw(), None);
+        assert_eq!(Value("not base64!".into()).md5_raw(), None);
+        assert_eq!(Value(STANDARD.encode([0xab_u8; 15])).md5_raw(), None);
+    }
+
+    #[test]
+    fn part_checksum_etag_digest_follows_the_tee() {
+        // The tee promised no MD5: the backend hashes the part itself.
+        let none = PartChecksum::default();
+        assert_eq!(none.etag_digest(), None);
+
+        // The promise is known BEFORE the body streams (the fs writer
+        // picks its inline hasher from it) while the cell stays empty
+        // until the stream ends — a mid-stream read must answer `None`,
+        // not a zeroed digest.
+        let promised = PartChecksum {
+            etag: Some(OnceLock::new()),
+            ..PartChecksum::default()
+        };
+        assert_eq!(promised.etag_digest(), None);
+        promised
+            .etag
+            .as_ref()
+            .expect("promised above")
+            .set([7; 16])
+            .expect("unset until here");
+        assert_eq!(promised.etag_digest(), Some([7; 16]));
+    }
+
+    #[test]
+    fn upload_wire_round_trips() {
+        let fixed = Upload {
+            algorithm: Algorithm::Sha512,
+            r#type: Some(Type::Composite),
+        };
+        assert_eq!(
+            fixed.to_wire(),
+            (String::from("SHA512"), String::from("COMPOSITE"))
+        );
+        assert_eq!(Upload::from_wire("SHA512", "COMPOSITE").unwrap(), fixed);
+        assert_eq!(
+            Upload::from_wire_opt("SHA512", "COMPOSITE"),
+            Some(fixed.clone())
+        );
+
+        // The empty type element marks a create that fixed no derivation
+        // — it must survive `to_wire` → `from_wire` as `None`, or every
+        // read of such a row would invent a COMPOSITE.
+        let unfixed = Upload {
+            algorithm: Algorithm::Crc32C,
+            r#type: None,
+        };
+        assert_eq!(unfixed.to_wire(), (String::from("CRC32C"), String::new()));
+        assert_eq!(Upload::from_wire("CRC32C", "").unwrap(), unfixed);
+        assert_eq!(Upload::from_wire_opt("CRC32C", ""), Some(unfixed));
+
+        // Each half reports its own offending name (the row is quoted in
+        // the S3 error message).
+        assert_eq!(
+            Upload::from_wire("BLAKE3", "").unwrap_err().to_string(),
+            "invalid checksum: `BLAKE3`"
+        );
+        assert_eq!(
+            Upload::from_wire("CRC32C", "PRIMITIVE")
+                .unwrap_err()
+                .to_string(),
+            "invalid checksum: `PRIMITIVE`"
+        );
+        assert_eq!(Upload::from_wire_opt("BLAKE3", "FULL_OBJECT"), None);
     }
 }

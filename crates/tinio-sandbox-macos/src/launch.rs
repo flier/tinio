@@ -15,7 +15,7 @@
 //! **Both mechanisms share everything after the spawn** — the payload write, the
 //! event relay, the readiness channel and the killer — because a change to how a
 //! confined child is supervised must not be able to reach one of them and miss the
-//! other. What differs is the argv and the check: [`ChildArgv`].
+//! other. What differs is the argv and the check: `ChildArgv`.
 //!
 //! `sandbox-exec` is deprecated by Apple and still shipped. It is not a
 //! supported or versioned API, and nothing here treats it as one: when Apple
@@ -203,7 +203,7 @@ fn canonical_program() -> Result<PathBuf> {
 /// `sandbox-init` spawns the child directly, proves the profile with
 /// [`crate::apply::validator`] and carries the text on the launch payload for the
 /// child to apply to itself. Everything from the spawn on — the payload write, the
-/// relay, the readiness channel, the killer — is [`spawn`], shared, so the two
+/// relay, the readiness channel, the killer — is `spawn`, shared, so the two
 /// mechanisms cannot disagree about how a confined child is supervised.
 ///
 /// **The profile is rendered once per launch and by the resolved mechanism**, and
@@ -266,7 +266,7 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
     //    parameter is rendered at all** (`Mechanism::wraps_the_exec`): the
     //    exec and the loader have already happened by the time the child applies
     //    the text, so both would be dead.
-    let profile = profile(&with_canonical_paths(sandbox), mechanism)?;
+    let profile = profile(with_canonical_paths(sandbox).sandbox(), mechanism)?;
     // **The launch's own step, so the two records of one render can be told apart**
     // (shared §7's one-event-per-operation rule, and the operator's grep). The render
     // above logged the same counts under `step = "profile"` — `profile()` is where
@@ -291,18 +291,24 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
     //    costs no pipe and no descriptor.
     //
     //    **The token is the plan's, and pairing the two is this platform's job.**
-    //    `LaunchPlan::for_launch` builds its payload with `token: None` and
+    //    `LaunchPlan::for_launch` carries the text and no token of its own, and
     //    `with_token` sets the plan's — so the frame is built from the plan's two
-    //    halves rather than by serializing the carried payload as it stands, which
-    //    is what the Windows backend does too. Serializing the payload alone left
+    //    halves rather than by serializing something the plan holds as it stands,
+    //    which is what the Windows backend does too. Writing the text alone left
     //    the child with no token, so its plane minted one of its own while this
     //    launcher published the plan's in `state`: the file landed and named the
     //    right socket, and every client that read it was refused `401` — `tinio
     //    status` answered "it is stale" (measured on macOS 15.8, 2026-09-25).
-    if plan.payload().is_none() {
-        error!(step = "payload", "the launch plan carries no payload");
+    //
+    //    **The presence test is `has_config`, not `config().is_empty()`**: an empty
+    //    text is a legitimate configuration — the child parses it into every
+    //    default and serves — while a plan no constructor put a text on has
+    //    nothing to forward, and a frame written for it would hand the child an
+    //    empty document instead of a refusal.
+    if !plan.has_config() {
+        error!(step = "payload", "the launch plan carries no configuration");
         return Err(Error::Unsupported {
-            detail: "the launch plan carries no payload",
+            detail: "the launch plan carries no configuration",
         });
     }
 
@@ -366,9 +372,12 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
     //    the descriptors are derived from them here — argv is the single source of
     //    truth the child reads. Both halves go through the objects themselves:
     //    `as_raw_fd` for the number, and `make_inheritable` for the flag, which
-    //    takes them as `AsFd`. Nothing in this process reconstructs a descriptor
-    //    from an integer, so the crate's descriptor `unsafe` site stays in the
-    //    child (decision 14).
+    //    takes them as `AsFd`. Nothing in this step reconstructs a descriptor from
+    //    an integer, and neither does the launcher-side duplicate the facade makes
+    //    when it builds the plan — that is the core's safe
+    //    `ControlHandle::duplicate` over a borrowed descriptor — so the crate's one
+    //    descriptor `unsafe` site is elsewhere: the child's rebuild
+    //    (`inherited_fd`, decision 14).
     //
     //    **This step sits after the mechanism's check, and the placement is the
     //    handover's whole audience**: the clear is what makes a descriptor visible
@@ -573,10 +582,10 @@ fn spawn(
                 // `as_raw_fd` plus `mem::forget` would move ownership just as well,
                 // but it needs an `unsafe` block where this needs none — and this
                 // crate's enumerated `#[allow(unsafe_code)]` sites are the
-                // inherited-descriptor rebuild in `inherited_fd`, the libSystem FFI
-                // in `apply` and the validator's `fork` (decision 14), so an
-                // `unsafe` here would be one site more, with no invariant to
-                // justify it.
+                // inherited-descriptor rebuild in `inherited_fd` and the pair in
+                // `apply` (the libSystem FFI module and the validator's `fork`;
+                // decision 14), so an `unsafe` here would be one site more, with no
+                // invariant to justify it.
                 let file = File::from(OwnedFd::from(stdout));
                 let reader = BufReader::new(file);
                 let Ok(runtime) = RuntimeBuilder::new_current_thread().build() else {
@@ -616,9 +625,9 @@ fn spawn(
     // job object on this platform, returning an error and dropping the `Child`
     // would end nothing — the confined server would keep the port and have no
     // `state` file, so `tinio status` and `tinio stop` could not find it. The core
-    // owns that path's shape ([`Child::kill`], called before its `wait`), and this
-    // is the platform's one call it hands over: a `SIGKILL` to the pid derived
-    // above. **It takes the pid and not the process**, which is what keeps the wait
+    // owns that path's shape ([`Child::abort`], the kill and the reap in one
+    // call), and this is the platform's one call it hands over: a `SIGKILL` to
+    // the pid derived above. **It takes the pid and not the process**, which is what keeps the wait
     // closure — the owner of the `std::process::Child`, and so the only thing that
     // can reap — untouched beside it; a killer that reaped would leave the wait
     // with nothing to return.
@@ -718,9 +727,11 @@ impl Drop for Spawned<'_> {
     /// zombie for the rest of this process's life.
     ///
     /// **Both outcomes are a `debug!` and neither is returned**, which is the shape a
-    /// `Drop` has: the caller is unwinding a failure it already has, the child's own
-    /// exit is what a failed kill means, and what is left to say is only whether the
-    /// ending happened.
+    /// `Drop` has: the caller is unwinding a failure it already has, a failed kill means
+    /// the signal was not delivered — a child that had already exited is its commonest
+    /// cause and not its only one, which is why the message names the call and leaves the
+    /// reason to the error beside it — and what is left to say is only whether the ending
+    /// happened.
     fn drop(&mut self) {
         if !self.ours {
             return;
@@ -729,7 +740,7 @@ impl Drop for Spawned<'_> {
             debug!(
                 step = "spawn",
                 error = %err,
-                "the failed launch's child had already exited"
+                "the failed launch's child was not killed"
             );
         }
         match self.child.wait() {
@@ -966,8 +977,9 @@ fn inherited_fd(raw: i64) -> io::Result<OwnedFd> {
 /// defining crate. The rebuild is the platform's job — it is `fcntl`/`dup` on
 /// Unix and handle plumbing on Windows — so core stops at the descriptor and
 /// this crate does the rest. What is left here is the *shape*: the inherited
-/// number becomes an [`OwnedFd`] ([`inherited_fd`], the crate's descriptor
-/// `unsafe` site) and `std`'s own `From` impl turns that into the socket.
+/// number becomes an [`OwnedFd`] (`inherited_fd`, the crate's
+/// inherited-descriptor `unsafe` site) and `std`'s own `From` impl turns that
+/// into the socket.
 ///
 /// # Errors
 ///
@@ -997,7 +1009,12 @@ pub fn listener(adopted: &Adopted) -> io::Result<TcpListener> {
         step = "listener",
         raw, "the child rebuilt its listener from the inherited descriptor"
     );
-    Ok(TcpListener::from(owned))
+    let listener = TcpListener::from(owned);
+    // The descriptor crossed `execve` inside `sandbox-exec`. A unix `std` socket is created
+    // non-blocking, but tokio reads this one as blocking and panics in `from_std` unless the
+    // child's copy is set again (measured 2026-09-25).
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// Rebuild the **control channel's** socket from the descriptor `adopt` handed
@@ -1060,9 +1077,9 @@ pub fn control(adopted: &Adopted) -> io::Result<UnixListener> {
 /// **whole configuration text** (decision 17), forwarded unparsed, and `token` is
 /// the value this launcher minted and publishes in `state` — the credential the
 /// child's plane verifies `/status` and `/stop` against. `LaunchPayload` is the
-/// wire shape on both launcher platforms, and building it here rather than
-/// serializing the payload the plan carries is what puts the token on it at all:
-/// `for_launch` sets `token: None`, `with_token` sets the plan's, and only the
+/// wire shape on both launcher platforms, and building it here from the plan's
+/// two halves is what puts the token on it at all: `for_launch` sets no token,
+/// `with_token` sets the plan's, and only the
 /// platform pairs them (`crates/tinio-sandbox-windows/src/backend/mod.rs` is the
 /// other one). A frame without it is a child that mints its own token, which is
 /// the run measured on macOS 15.8, 2026-09-25: `state` named the right socket and
@@ -1346,8 +1363,9 @@ fn preflight(profile: &Profile) -> Result<()> {
 /// The wrapper is safe **because the objects themselves are the arguments**: `TcpListener` and
 /// `ControlHandle` implement `AsFd`, so `rustix::io::fcntl_setfd` is handed real borrowed
 /// descriptors and nothing here reconstructs one from an integer. That is why this function
-/// needs no `#[allow(unsafe_code)]`: the crate's enumerated sites are the child's descriptor
-/// rebuild ([`inherited_fd`]) and the FFI in [`crate::apply`] (decision 14).
+/// needs no `#[allow(unsafe_code)]`: the crate's enumerated sites are the child's
+/// descriptor rebuild (`inherited_fd`) and the pair in [`crate::apply`] — the
+/// libSystem FFI module and the validator's `fork` (decision 14).
 fn make_inheritable(listener: Option<&TcpListener>, controls: &[ControlHandle]) -> Result<()> {
     // `None` is legal: a caller that bound nothing is a caller whose child will
     // bind its own socket, and Linux has no listener to hand over at all.
@@ -1436,13 +1454,11 @@ mod tests {
         },
         path::Path,
         slice,
-        sync::{Arc, Mutex},
     };
 
     use rustix::io::fcntl_getfd;
     use tinio_sandbox_core::AccessMode;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::fmt::MakeWriter;
+    use tinio_util::testing::{assert_step, record_events};
 
     use super::*;
 
@@ -1888,53 +1904,6 @@ mod tests {
         child.wait().expect("reap the child this test started");
     }
 
-    /// Everything the closure logged, as the subscriber rendered it.
-    ///
-    /// **This installs a subscriber for the duration of one closure and no
-    /// longer**, which is the whole reason it is a test helper: the crate
-    /// installs none (shared §7), so a test that wants to read its own events
-    /// has to be the one to capture them. `with_default` is thread-scoped, so
-    /// the other tests in this binary are unaffected.
-    fn record_events(emit: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-
-        impl io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().expect("sink").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> MakeWriter<'a> for Sink {
-            type Writer = Sink;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let sink = Sink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            // **Load-bearing for a field assertion, and measured rather than
-            // assumed**: the default subscriber wraps each field *name* and the
-            // equals sign after it in ANSI escapes, so a captured line carries
-            // the field only as coloured spans and never as `step=<value>`. The Linux
-            // plan's own `traced` helper carries this same line for the same
-            // reason, and so does the core's recorder test.
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .without_time()
-            .finish();
-        with_default(subscriber, emit);
-        String::from_utf8_lossy(&sink.0.lock().expect("sink")).into_owned()
-    }
-
     /// A failure logs the `step` it returns, under a recording subscriber.
     ///
     /// Shared §7's checking rule, and the one assertion that makes "it logs" a
@@ -1951,10 +1920,19 @@ mod tests {
     /// name five call sites in one function used to spell by hand: the one
     /// [`PREFLIGHT_STEP`] binding is what the log's field and the error's field
     /// now share, and this leg fails if either stops reading it.
+    ///
+    /// **The recording is [`record_events`]'s, the one device this crate's legs share**, and this
+    /// test used to hold a private twin of it. The twin differed on one point only — it scoped its
+    /// subscriber to the calling thread (`with_default`) where the device installs a *process*
+    /// default and filters by thread in its sink — and that difference is the defect the device
+    /// exists to remove: a thread-scoped subscriber is invisible to `tracing`'s process-wide
+    /// callsite cache, so a parallel test that hits the same callsite first writes `never` into the
+    /// shared cell and this leg's event is dropped in silence. The device's doc carries the
+    /// mechanism.
     #[test]
     fn a_failure_logs_the_step_it_returns() {
         let mut named = None;
-        let recorded = record_events(|| {
+        let (_, recorded) = record_events(|| {
             let err = step("payload stdin")(io::Error::other("no piped stdin"));
             named = Some(match err {
                 Error::Step { step, .. } => step,
@@ -1967,10 +1945,11 @@ mod tests {
             assert_eq!(step, PREFLIGHT_STEP);
         });
         assert_eq!(named, Some("payload stdin"));
-        assert!(recorded.contains("step=\"payload stdin\""), "{recorded}");
-        assert!(
-            recorded.contains(&format!("step=\"{PREFLIGHT_STEP}\"")),
-            "{recorded}"
-        );
+        // **The field check is [`assert_step`]'s** (shared §7, and it owns the
+        // `with_ansi(false)` prerequisite the device carries); what this leg adds is
+        // the second name — the pre-flight's own step, whose rename is what the pair
+        // exists to catch.
+        assert_step(&recorded, "payload stdin");
+        assert_step(&recorded, PREFLIGHT_STEP);
     }
 }

@@ -4,14 +4,18 @@
 //! decision 14). The crate's other two are `launch::inherited_fd` — the inherited
 //! descriptor rebuild — and `apply::validator`'s `fork`, which is `unsafe` for a
 //! reason of its own (a child of a threaded process is not something a signature
-//! can promise) and is therefore counted separately.
+//! can promise) and is therefore counted separately. **The launcher-side duplicate of a
+//! control descriptor is no longer a site of its own**: the facade now makes it with the
+//! core's safe `ControlHandle::duplicate`, over a descriptor whose openness the type
+//! system carries, so the number-based duplicate that used to be counted here was deleted
+//! rather than moved (2026-09-27).
 //!
 //! **Neither `rustix` nor `libc` ships a binding for these symbols**, which is why
 //! the declarations are this crate's: `libc` 0.2.189's `apple` module carries no
 //! `sandbox_*` name at all (measured), and `rustix` has no `sandbox_init` wrapper.
 //! The declaration is Apple's ABI rather than a layout this crate reasons about.
 //!
-//! **Everything above this module is safe.** [`init`] is the only entry point, it
+//! **Everything above this module is safe.** [`init`](crate::apply::libsystem::init) is the only entry point, it
 //! takes Rust types, and it owns the two rules the raw call needs: the caller's
 //! strings outlive the call, and the error string the callee allocates is freed
 //! exactly once — by `sandbox_free_error`, the only deallocator libSystem

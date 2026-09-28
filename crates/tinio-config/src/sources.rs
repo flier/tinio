@@ -11,12 +11,13 @@
 //!   are one parser's answers and one precedence, expressed in one place rather than
 //!   re-implemented beside it. The parse is two-pass for exactly that reason — `.env` is
 //!   loaded between the passes, and the second one sees the file;
-//! - [`parse_read_only`] and [`parse_sandbox`] (both through `parse_switch`) are **pure syntax
-//!   helpers**: the tolerant `1`/`true`/`0`/`false` grammar, with [`READ_ONLY_VAR`] and
-//!   [`SANDBOX_VAR`] naming the variables they belong to. No code path here reads an
-//!   environment variable — the CLI's `--read-only`/`--sandbox` flags carry the same grammar in
-//!   their own `value_parser` (`crates/tinio-cli/src/commands/mod.rs`'s `parse_switch`) and the
-//!   variable names beside those flags, so nothing in this workspace calls the helpers;
+//! - [`parse_read_only`] and [`parse_sandbox`] are **pure syntax helpers**: they are
+//!   `tinio_util::switch::parse_switch` — the one definer of the tolerant `1`/`true`/`0`/`false`
+//!   grammar, shared with the CLI's `--read-only`/`--sandbox` flags and their `value_parser`
+//!   (`crates/tinio-cli/src/commands/mod.rs`) — each naming the variable whose refusal it wraps
+//!   ([`READ_ONLY_VAR`], [`SANDBOX_VAR`]). No code path here reads an environment variable, and
+//!   nothing in this workspace calls these two helpers: the variable names travel beside the
+//!   flags that do read them;
 //! - the config file is the lowest-precedence source: parsed by
 //!   [`crate::schema::Config::parse`] as the base, overlaid by the CLI's resolution
 //!   (`tinio-cli`'s `resolve` module).
@@ -26,7 +27,7 @@
 
 use std::path::Path;
 
-use crate::{Error, error};
+use crate::{_util::switch::parse_switch, Error, error};
 
 /// Load `<state-dir>/.env` if present (FR-016; loaded from the state dir).
 ///
@@ -66,7 +67,7 @@ pub const READ_ONLY_VAR: &str = "TINIO_READ_ONLY";
 /// handler (`tinio-fs`'s `scanner_enabled`) ignores an unrecognised value
 /// and falls back to the `[scanner]` section gate.
 pub fn parse_read_only(raw: &str) -> Result<bool, Error> {
-    parse_switch(READ_ONLY_VAR, raw)
+    parse_switch(raw).map_err(|refusal| Error::invalid_value(READ_ONLY_VAR, refusal))
 }
 
 /// The environment variable that selects sandbox mode — decision 1's third
@@ -80,27 +81,7 @@ pub const SANDBOX_VAR: &str = "TINIO_SANDBOX";
 /// who wrote `TINIO_SANDBOX=yes` serving unconfined with nothing logged
 /// (design decision 5, §11).
 pub fn parse_sandbox(raw: &str) -> Result<bool, Error> {
-    parse_switch(SANDBOX_VAR, raw)
-}
-
-/// The grammar [`parse_read_only`] and [`parse_sandbox`] share, with the refusal
-/// both owe: an unrecognised value is a startup error rather than a fallback,
-/// because a typo in either key decides whether the process protects its root or
-/// confines itself, and a silent default is the failure both designs exist to
-/// prevent.
-///
-/// One definer for the accepted spellings, because the next one added — or a
-/// change to the message — has to reach both keys at once; kept apart they are
-/// equal only while an author remembers they exist.
-fn parse_switch(var: &str, raw: &str) -> Result<bool, Error> {
-    match raw.trim() {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(Error::invalid_value(
-            var,
-            format!("expected 0/1/true/false, got `{other}`"),
-        )),
-    }
+    parse_switch(raw).map_err(|refusal| Error::invalid_value(SANDBOX_VAR, refusal))
 }
 
 #[cfg(test)]

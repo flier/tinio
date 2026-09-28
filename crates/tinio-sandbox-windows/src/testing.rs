@@ -9,14 +9,20 @@
 //! convention: shared test support lives on the crate that owns the subject
 //! rather than in a copy per suite.
 //!
-//! **Why it is a plain module and not a `testing` feature.** A feature is the
-//! usual spelling of that convention (`tinio-util`'s), and it is what this
-//! crate's own tests cannot use: `#[cfg(test)]` is invisible to `tests/`, and a
-//! crate cannot enable a feature of its own for them — a dev-dependency on
-//! itself is a cycle. A gated module would therefore be reachable by
-//! `tinio-server`'s suite and not by this crate's, and the copy would survive in
-//! exactly the file this module was extracted from. The cost is one small
-//! module in a library `publish = false` keeps inside this workspace.
+//! **It is a `testing` feature and not a plain module.** A feature is the usual
+//! spelling of that convention (`tinio-util`'s, and this crate's `testing` is
+//! non-default for the same reason), and it is what keeps the devices out of a
+//! build that is not a test build: the module compiles only when the feature is
+//! on, and no production edge turns it on. **A `#[cfg(test)]` module could not do
+//! this**, because `#[cfg(test)]` is invisible to `tests/` — the harness has to
+//! be lib code to cross that boundary at all. So the feature is asked for on this
+//! crate's own test builds by a dev-dependency on this crate itself
+//! (`tinio-sandbox-windows = { path = ".", features = ["testing"] }` in
+//! `Cargo.toml`, which is not the cycle it reads as: Cargo unifies that edge with
+//! the lib under test, so both are one build), and `tinio-server`'s Windows e2e
+//! targets ask for it the same way from their own dev-dependency. Either way the
+//! module is reachable from `tests/` without a per-suite copy. The cost is one
+//! small module in a library `publish = false` keeps inside this workspace.
 //!
 //! **Nothing here asserts anything about the confinement.** These are devices a
 //! test composes: what a test proves is still in the test. The two rules they do
@@ -28,70 +34,22 @@
 //! precondition may be turned into a skip, so a leg cannot opt itself out of an
 //! assertion in a second spelling of [`ALLOW_SKIP`].
 //!
-//! **[`wait_for_exit`] is defined in [`tinio_util::testing`] and re-exported
-//! here.** This module used to hold it, and this crate's root is
-//! `#![cfg(target_os = "windows")]` — so the macOS legs that need the same rule
-//! could not import it at all. The definer moved to the crate both platforms
-//! build; the re-export is what keeps every caller of this path (this crate's own
-//! suites, `tinio-server/tests/support/windows_e2e_harness.rs`'s wrapper) working
+//! **[`wait_for_exit`], [`host_cannot`], the [`ALLOW_SKIP`] pair, the [`capture`]
+//! device and the [`Capture`]/[`Recording`]/[`recorder`] names beside it are
+//! defined in [`tinio_util::testing`] and re-exported here.** This module used to
+//! hold them, and this crate's root is `#![cfg(target_os = "windows")]` — so the
+//! macOS and Linux legs that need the same rules, or record their own events,
+//! could not import them at all, and each spelled its own copy. The definers moved
+//! to the crate every platform builds; the re-exports are what keep every caller
+//! of this path (this crate's own suites,
+//! `tinio-server/tests/support/windows_e2e_harness.rs`'s wrapper) working
 //! unchanged.
 //!
 //! Behind the crate's own `#![cfg(target_os = "windows")]` for the crate root's
 //! reason: `crates/*` has no per-target member form, so this compiles on hosts
 //! it does not serve.
 
-use std::{env, fs, path::Path, process::Command};
-
-use crate::acl;
-
-/// The one way past a precondition this host cannot meet, and it is a deliberate
-/// opt-in: `TINIO_SANDBOX_ALLOW_SKIP`.
-///
-/// **A suite that certifies a confinement does not get to skip in silence.** The
-/// rule, the variable and its spelling are P1's and Task 11's
-/// (`crates/tinio-sandbox-linux/tests/jail.rs`,
-/// `crates/tinio-server/tests/sandbox_e2e_windows.rs`), kept identical so one habit
-/// covers all of them. It covers the *host's* preconditions alone and nothing the
-/// product does: a failure after the first spawn is a suite's subject, and no value
-/// of this variable makes it pass.
-pub const ALLOW_SKIP: &str = "TINIO_SANDBOX_ALLOW_SKIP";
-
-/// Whether the operator has deliberately opted out of a precondition this host
-/// cannot meet (see [`ALLOW_SKIP`]).
-pub fn skip_allowed() -> bool {
-    env::var(ALLOW_SKIP).is_ok_and(|value| !value.is_empty())
-}
-
-/// `what` cannot run on this host: **fail here, or let the operator opt out and let
-/// the caller return early**.
-///
-/// **This is the one arbitration of [`ALLOW_SKIP`] in this crate**, and the three
-/// details that make a skip honest are its shape rather than its callers':
-///
-/// - **The assertion is evaluated before the `eprintln!`.** A skip printed by
-///   libtest is swallowed without `--nocapture`, so a host that cannot run the leg
-///   and did not opt out has to read as a *failure* — otherwise the suite reports a
-///   green run that certified nothing, which is exactly the defect this rule exists
-///   for.
-/// - **The panic names the variable and the remedy.** `what` and `reason` are the
-///   caller's (which leg, which capability of the machine answered no), and the
-///   message always carries [`ALLOW_SKIP`]'s name plus whatever other way out the
-///   caller knows, `remedy`, appended verbatim.
-/// - **The skip branch prints and returns `false`**, so the caller's shape is
-///   `if !host_cannot(…) { return; }` or a direct `return`: the leg then asserts
-///   nothing about the product, which is what the operator asked for.
-///
-/// `false` is what every returning path carries — a host that cannot run a leg
-/// cannot run it — and the panic is the whole of the other path.
-pub fn host_cannot(what: &str, reason: &str, remedy: &str) -> bool {
-    assert!(
-        skip_allowed(),
-        "this host cannot run {what} ({reason}), so this leg would assert nothing. Set \
-         {ALLOW_SKIP}=1 to pass deliberately on a host that genuinely cannot{remedy}"
-    );
-    eprintln!("skipping: this host cannot run {what} ({reason}) and {ALLOW_SKIP} is set{remedy}");
-    false
-}
+use std::{fs, path::Path, process::Command};
 
 /// Wait for `child` to exit, or kill it and fail the test rather than block on
 /// it.
@@ -107,6 +65,23 @@ pub fn host_cannot(what: &str, reason: &str, remedy: &str) -> bool {
 /// rule, its bounds and the kill-before-panic are documented there.
 #[doc(inline)]
 pub use tinio_util::testing::wait_for_exit;
+/// The one way past a precondition this host cannot meet, the deliberate opt-in
+/// `TINIO_SANDBOX_ALLOW_SKIP`, and the arbitration a suite takes it through.
+///
+/// **Defined in [`tinio_util::testing`] and re-exported here**, for
+/// [`wait_for_exit`]'s reason: this crate's root is
+/// `#![cfg(target_os = "windows")]`, so the Linux jail suite and the server's
+/// Linux e2e legs — both of which skip under the same variable — could not import
+/// a definer that lives here and each spelled the rule again. The name stays on
+/// this path because that is what this crate's own suites
+/// (`tests/network.rs`, `src/backend/tests.rs`) and the server harness
+/// (`tinio-server/tests/support/windows_e2e_harness.rs`) already import; the
+/// rule, the assert-before-print order and the remedy's spelling are documented
+/// at the definer.
+#[doc(inline)]
+pub use tinio_util::testing::{ALLOW_SKIP, host_cannot, skip_allowed};
+
+use crate::acl;
 
 /// `icacls` on `path`, with `args` appended, and its exit status checked.
 ///
@@ -187,3 +162,12 @@ pub fn junction(link: &Path, target: &Path) {
         link.display()
     );
 }
+
+/// The capture a test binary records through — **defined in [`tinio_util::testing`] and re-exported
+/// here**, for [`wait_for_exit`]'s reason: this crate's root is `#![cfg(target_os = "windows")]`, so
+/// the macOS and Linux legs that record their own events could not take a definer that lives here,
+/// and each of them spelled its own copy of it. The device's doc carries the install, the level it
+/// records at, the second-global-installer hazard and which threads each entry point owns; the two
+/// callers of this path (`src/backend/tests.rs`, `tests/profile.rs`) are unchanged.
+#[doc(inline)]
+pub use tinio_util::testing::{Capture, Recording, capture, recorder};

@@ -31,7 +31,6 @@ mod fsutil;
 mod listing;
 pub mod meta;
 pub mod multipart;
-mod pacing;
 pub mod path;
 mod scanner;
 pub mod sweep;

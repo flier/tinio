@@ -1,5 +1,5 @@
 //! The SCM dispatcher. A process the Service Control Manager started is a service,
-//! not a command line; `try_run_as_service` answers before any parser sees argv.
+//! not a command line; [`try_run_as_service`] answers before any parser sees argv.
 
 use std::{
     ffi::OsString,
@@ -27,14 +27,10 @@ use crate::{
     run::{Resolved, command_line, on_runtime},
 };
 
-// ---------------------------------------------------------------------------------------
-// The SCM's half: the one place in this crate where a server is started by the operating
-// system rather than by a command line.
-// ---------------------------------------------------------------------------------------
-
 /// The SCM's own window for a pending start or stop before it assumes the service hung: the
 /// drain bound `contracts/cli.md` names for `POST /stop`, which is exactly what the stop
 /// control below has to finish inside.
+#[cfg(windows)]
 const PENDING_HINT: Duration = Duration::from_secs(10);
 
 /// The stop the SCM asks for, and the channel it has to reach (decision 12: one channel, and
@@ -51,10 +47,12 @@ const PENDING_HINT: Duration = Duration::from_secs(10);
 ///
 /// The sections it guards are a field write, a sender clone and a non-blocking `watch` send:
 /// the system thread that runs the handler is never parked behind anything slow.
+#[cfg(windows)]
 struct StopRequest(Mutex<StopState>);
 
 /// What [`StopRequest`] guards: the process's channel, once it exists, and whether a stop is
 /// waiting for it.
+#[cfg(windows)]
 #[derive(Default)]
 struct StopState {
     /// The one shutdown channel — the sender `Plane::bind` also hands to `POST /stop`.
@@ -63,6 +61,7 @@ struct StopState {
     requested: bool,
 }
 
+#[cfg(windows)]
 impl StopRequest {
     /// Nothing asked for yet, no channel yet.
     fn new() -> Self {
@@ -108,6 +107,7 @@ impl StopRequest {
 /// is what lets `run` put this before the CLI parse: an ordinary `tinio doctor` pays nothing
 /// for it. A `true` answer means the service has already run to completion, because
 /// `service_dispatcher::start` blocks until the SCM reports the service stopped.
+#[cfg(windows)]
 pub(crate) fn try_run_as_service() -> bool {
     service_dispatcher::start(SERVICE_NAME, ffi_service_main).is_ok()
 }
@@ -119,10 +119,12 @@ pub(crate) fn try_run_as_service() -> bool {
 // vector) stays in `windows-service` rather than becoming an `#[allow(unsafe_code)]` site of
 // ours — and the comment is not a doc comment because rustdoc generates no documentation for
 // a macro invocation, which is a `-D warnings` failure.
+#[cfg(windows)]
 windows_service::define_windows_service!(ffi_service_main, service_main);
 
 /// The service, on the thread the SCM creates for it: the control handler, the status
 /// reports, and then the server the service's registered `binPath` names.
+#[cfg(windows)]
 fn service_main(arguments: Vec<OsString>) {
     // The handler needs the status handle and the handle is what registering answers, so the
     // one is published to the other, on an `Arc` the `'static` closure can own, before any
@@ -159,6 +161,7 @@ fn service_main(arguments: Vec<OsString>) {
 }
 
 /// The SCM's controls, answered on a thread of its own.
+#[cfg(windows)]
 fn control_event(
     published: &OnceLock<ServiceStatusHandle>,
     request: &StopRequest,
@@ -191,6 +194,7 @@ fn control_event(
 
 /// The refusal an SCM start gets when its registered argv is not `tinio server <DIR>` — one
 /// author, for the two shapes that can arrive here (another command, or no command at all).
+#[cfg(windows)]
 fn not_a_server() -> Error {
     Error::Usage(format!(
         "`{SERVICE_NAME}` was started with an argument vector that is not a server command: the \
@@ -206,6 +210,7 @@ fn not_a_server() -> Error {
 /// and the only decision left to the SCM's path is who supplies the vector. `command_line`
 /// supplies the rest, `.env` included: a service-started server must resolve exactly as one
 /// started from a shell does.
+#[cfg(windows)]
 fn run_service(
     arguments: Vec<OsString>,
     handle: &ServiceStatusHandle,
@@ -257,8 +262,9 @@ fn run_service(
             // only where it cannot honour one, with the two refusals `contracts/cli.md`'s
             // `--sandbox` bullet specifies (a usage error naming the build when the `sandbox`
             // feature is off, a startup error naming the platform while the backend is a stub),
-            // and `sandbox::BACKEND_IS_STUB` is `false` on every target this workspace confines
-            // on — Linux, macOS and Windows — so here `confine` is reached and the arm is taken.
+            // and `tinio_sandbox::backend_available` answers `true` on every target this
+            // workspace confines on — Linux, macOS and Windows — so here `confine` is reached
+            // and the arm is taken.
             tracing::debug!("the confined child has already exited");
             Ok(())
         }
@@ -270,6 +276,7 @@ fn run_service(
 /// `SHUTDOWN` and `PRESHUTDOWN` are mutually exclusive (MSDN): a service that takes the
 /// machine's shutdown notification registers the former, and [`control_event`] answers the
 /// latter whether or not it is accepted.
+#[cfg(windows)]
 fn set_status(
     handle: &ServiceStatusHandle,
     state: ServiceState,
@@ -299,16 +306,18 @@ fn set_status(
 }
 
 /// A run that succeeded, named so the two reporting sites above read the same way.
+#[cfg(windows)]
 const NO_ERROR: ServiceExitCode = ServiceExitCode::NO_ERROR;
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, windows))]
+mod scm_tests {
     use super::*;
 
     // The Windows half's unit, and the only leg it has on this side: the SCM itself cannot be
     // driven from a test process (it is the OS that starts services, and only for services it
     // has registered), so what is asserted is the ordering the handshake turns on — a stop that
     // arrives before the process's channel exists, and one that arrives after it.
+    #[cfg(windows)]
     #[test]
     fn a_stop_is_never_lost_to_the_start_window() {
         use tokio::sync::watch;
@@ -323,6 +332,7 @@ mod tests {
         assert!(*shutdown.borrow_and_update(), "and it reached the channel");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_stop_after_the_channel_exists_is_sent_at_once() {
         use tokio::sync::watch;

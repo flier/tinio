@@ -581,21 +581,14 @@ async fn served_root_holds(world: &mut super::World, bucket: String, key: String
 /// **There is no non-macOS spelling, and that is why this is `cfg`'d rather than
 /// stubbed.** Every other platform needs no sweep at all, because the process a
 /// kill ends *is* the server; a no-op here would let a call site read as if it
-/// swept. The server crate's e2e module keeps its own copy of the three lines
-/// for the same reason this module exists at all: a `tests/` tree is not
-/// importable from another crate.
+/// swept.
+///
+/// **The rule is [`tinio_util::testing::sweep_confined_grandchild`]'s, re-exported
+/// rather than copied.** The server crate's e2e module needs the same sweep, and a
+/// `tests/` tree is not importable from another one — a crate both dev-depend on
+/// is, which is what removes the copy this module used to keep.
 #[cfg(target_os = "macos")]
-pub fn sweep_confined_grandchild(root: &Path) {
-    // A root that is not UTF-8 cannot be matched by a command line; the harness
-    // builds this one from a scratch directory it made itself, so the guard is
-    // a fact about the fixture rather than a silent skip.
-    let Some(root) = root.to_str() else {
-        return;
-    };
-    let _ = Command::new("pkill")
-        .args(["-f", &format!("tinio server {root}")])
-        .status();
-}
+pub use tinio_util::testing::sweep_confined_grandchild;
 
 /// The generic response assertions — one home, so a new feature does not
 /// have to hunt for them in a feature-specific step module (the wire-XML

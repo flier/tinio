@@ -47,15 +47,57 @@
 //! spelling of "every spawned process is waited for or killed on every path",
 //! which the two launcher platforms' legs need and only a crate both of them
 //! build can hold.
+//!
+//! Two more are the spawned-child half: [`kill_and_reap`] (re-exported from
+//! [`crate::process`], where it is defined outside this feature because a
+//! production caller needs it too) and [`PipedChild`], the child whose two pipes
+//! are drained into shared buffers for the legs that read them. `PipedChild` is
+//! deliberately **not** the whole spawn harness: the readiness event the server
+//! legs decode off its stdout is `tinio_sandbox::Event`'s, and a test device that
+//! would put the sandbox stack on every `testing` build stays in the test tree.
+//! What is here is the half that needs nothing but `std`.
+//!
+//! The recording half is **one device** and not a pair of helpers: [`capture`],
+//! the [`Capture`] it answers with, the [`Recording`] guard whose two entry
+//! points ([`Capture::record`] and [`Capture::record_every_thread`]) decide
+//! whether a recording owns the calling thread or every thread, and [`recorder`],
+//! the process-wide lock the every-thread callers take first. [`record_events`]
+//! is the thin wrapper over that device which a leg runs a body through, and
+//! [`ThreadLocalBuf`] is the sink a single-thread recording writes through. Each
+//! name carries one decision — which sink a process that forks can be recorded
+//! through, the `with_ansi(false)` that keeps a captured field greppable, the one
+//! level a recording runs at — and a crate behind a `#![cfg(target_os = "…")]`
+//! root cannot take any of them from another such crate, so it takes them from
+//! here instead of spelling a second copy of each.
+//!
+//! Four more are the rules a suite is least able to keep on its own, each
+//! spelled once per platform crate before it landed here: [`host_cannot`], with
+//! [`ALLOW_SKIP`] and [`skip_allowed`], the one arbitration of a host
+//! precondition that may be skipped under; [`assert_step`], shared §7's check in
+//! its rendered-field form; [`wait_for_path`], the bounded poll on a file another
+//! process produces, beside [`poll_exit`]; and [`Untouchable`], the reader that
+//! fails a test which reads it. None of them names a domain type or a platform,
+//! which is what lets them live in the shared module at all.
+//!
+//! Four fixtures are the same idea one step down: [`conform_owner`],
+//! [`conform_other_owner`], [`conform_group_read_grant`] and [`checksum_tee`]
+//! are the ACL and checksum-slot literals the conformance blocks build on, and
+//! the fs and mem suites hold the same four as `owner_id`, `other_owner_id`,
+//! `all_users_read_grant` and `checksum_tee` — thin delegations there, so a
+//! literal three suites agree on is written down once.
 
 use std::{
-    env, io,
-    process::{Child, ExitStatus, id},
+    cell::RefCell,
+    env,
+    io::{self, BufRead, BufReader, Read},
+    mem,
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio, id},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -65,6 +107,8 @@ use futures::{StreamExt, stream};
 // (`wait_for_exit`) beside the async one; tokio's timer-aware instant is named
 // for its crate so the two cannot be swapped by a `use` nobody looked at.
 use tokio::time::{Instant as TokioInstant, sleep};
+use tracing::{Level, callsite::rebuild_interest_cache};
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
@@ -121,21 +165,24 @@ pub fn etag(hex: &str) -> ETag {
 }
 
 /// The harness's fixed canonical owner id (64 lowercase hex) — the
-/// recorded owner element the ACL blocks write and assert.
-fn conform_owner() -> acl::OwnerId {
+/// recorded owner element the ACL blocks write and assert. The fs and mem
+/// suites delegate to it as their `owner_id`.
+pub fn conform_owner() -> acl::OwnerId {
     acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
         .expect("64 lowercase hex")
 }
 
-/// A second canonical owner id, distinct from [`conform_owner`].
-fn conform_other_owner() -> acl::OwnerId {
+/// A second canonical owner id, distinct from [`conform_owner`]. The fs and
+/// mem suites delegate to it as their `other_owner_id`.
+pub fn conform_other_owner() -> acl::OwnerId {
     acl::OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100")
         .expect("64 lowercase hex")
 }
 
 /// The standard group-read grant (AllUsers READ) — the ACL-block
-/// fixture grant both backends share.
-fn conform_group_read_grant() -> acl::Grant {
+/// fixture grant both backends share. The fs suite delegates to it as its
+/// `all_users_read_grant`.
+pub fn conform_group_read_grant() -> acl::Grant {
     acl::Grant {
         grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
         permission: acl::Permission::Read,
@@ -144,8 +191,9 @@ fn conform_group_read_grant() -> acl::Grant {
 
 /// The server's checksum tee slot with `algorithm`/`value` pre-loaded —
 /// the digest the write paths record atomically with the row (the
-/// harness sets the slot itself: the backends never hash).
-fn checksum_tee(algorithm: checksum::Algorithm, value: &str) -> Arc<checksum::PartChecksum> {
+/// harness sets the slot itself: the backends never hash). The fs and mem
+/// suites delegate to it as their own `checksum_tee`.
+pub fn checksum_tee(algorithm: checksum::Algorithm, value: &str) -> Arc<checksum::PartChecksum> {
     let slot = Arc::new(checksum::PartChecksum::default());
     let _ = slot.digest.set(checksum::Part {
         algorithm,
@@ -2617,6 +2665,53 @@ pub async fn wait_for(mut cond: impl FnMut() -> bool) {
     }
 }
 
+/// End the confined grandchild a `kill` leaves behind on macOS.
+///
+/// **A launcher leg's own cleanup, and macOS's alone.** The launcher is what a
+/// leg kills; the confined server is the launcher's *child*, and on macOS
+/// nothing forwards the launcher's death to it — no job object, as Windows has
+/// — so the server survives, keeps the served root open, and the next leg reads
+/// to EOF and hangs instead of reporting (measured on macOS 15.8, 2026-09-25).
+/// The pattern is the leg's own served root, which is unique to it and is named
+/// in both processes' argv.
+///
+/// **A caller must have confined something before it sweeps.** This is a
+/// `pkill -f` over the whole process table, so a leg that spawned no confined
+/// server would be matching a pattern it never created.
+///
+/// **The `cfg` is why the sweep is not a no-op elsewhere.** Every platform but
+/// macOS needs no sweep — the process a kill ends *is* the server — so on any
+/// other target this function does not exist and a call site cannot forget the
+/// gate.
+///
+/// **It lives here for [`wait_for_exit`]'s reason**: the rule was spelled once
+/// in `tinio-server`'s e2e module and once in the e2e crate's CLI harness, each
+/// documented as unavoidable because two `tests/` trees are not importable from
+/// each other. A crate both of them already dev-depend on is importable from
+/// both, so the two copies become one definer and two re-exports.
+#[cfg(target_os = "macos")]
+pub fn sweep_confined_grandchild(root: &Path) {
+    // A root that is not UTF-8 cannot be matched by a command line, and the legs
+    // that call this build theirs from a scratch directory of their own — so the
+    // guard is a fact about the fixture rather than a silent skip.
+    let Some(root) = root.to_str() else {
+        return;
+    };
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("tinio server {root}")])
+        .status();
+}
+
+/// Kill `child` and reap it, ignoring both answers — the silent sibling of [`wait_for_exit`], for
+/// every path that has already decided what to report.
+///
+/// **Re-exported rather than defined here**, because it needs nothing this feature provides: the
+/// definition is [`crate::process`]'s, beside nothing else, so a production caller (the daemon
+/// parent that kills a child it has just reported as unready) reaches it without turning `testing`
+/// — and `tinio-core` behind it — on. A test tree still spells it
+/// `tinio_util::testing::kill_and_reap`, which is where the rule's other readers live.
+pub use crate::process::kill_and_reap;
+
 /// Wait for `child` to exit, or kill it and fail the test rather than block on
 /// it.
 ///
@@ -2644,8 +2739,7 @@ pub async fn wait_for(mut cond: impl FnMut() -> bool) {
 /// for, because a suite has more than one.
 pub fn wait_for_exit(child: &mut Child, within: Duration, what: &str) -> ExitStatus {
     poll_exit(child, within).unwrap_or_else(|| {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_reap(child);
         panic!(
             "{what} did not exit within {within:?} — whatever it did is in the output above; \
              it has been killed"
@@ -2674,8 +2768,362 @@ pub fn poll_exit(child: &mut Child, within: Duration) -> Option<ExitStatus> {
     }
 }
 
+/// Whether `path` exists before `within` passes, polling every `poll` — the sync sibling of
+/// [`wait_for`] and one family with [`poll_exit`].
+///
+/// **It waits on an event another process produces** — a marker file a spawned child writes, the
+/// state file a launcher publishes — so the answer is a `bool` and the failure path stays with the
+/// caller. [`wait_for`] cannot serve those callers: its panic is all a suite gets back, and a leg
+/// whose child is still alive has to kill it before it fails (the rule [`wait_for_exit`] states),
+/// which is why the verdict is returned rather than asserted here.
+///
+/// **Three suites spelled this loop with an interval of their own** — `tinio-sandbox-macos`'s
+/// handover, `tinio-sandbox-windows`'s signals and `tinio-server`'s macOS e2e — so the interval is a
+/// parameter rather than a constant: it is the resolution of the window the caller writes down, and
+/// the three legitimately differ. The final `exists()` re-read after the loop is deliberate, so a
+/// path that appeared inside the last sleep is still answered for.
+pub fn wait_for_path(path: &Path, within: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(poll);
+    }
+    path.exists()
+}
+
+/// Shared §7's check, as one assertion: the event carries `step` as a rendered
+/// field.
+///
+/// **A rendered field and not a substring of the whole line**, which is the
+/// distinction the core's own recorder test states at length: the operation's
+/// name appears inside the message and inside any error the same call returns,
+/// so `contains("jail_root")` would pass for an event whose `step` field said
+/// something else. The log is in the failure message, because a recording that
+/// came out empty is the other half of what can go wrong here.
+///
+/// **`with_ansi(false)` on the recording subscriber is the prerequisite this
+/// assertion rests on**, and it is measured rather than assumed: the default
+/// subscriber interleaves escape sequences into the field *syntax* — `step=`
+/// arrives as `\x1b[3mstep\x1b[0m\x1b[2m=\x1b[0m` — so `step="…"` never appears
+/// as such without it. The value substrings an earlier generation of these tests
+/// checked survived that colouring; the field names do not.
+pub fn assert_step(logged: &str, step: &str) {
+    assert!(
+        logged.contains(&format!("step=\"{step}\"")),
+        "no `step=\"{step}\"` in:\n{logged}"
+    );
+}
+
+/// The recorded line carrying `needle` is logged at `level`: **the level check a recording can no
+/// longer make by filtering.**
+///
+/// **Why it is an assertion and not the recording's own filter.** The device records at `DEBUG` — one
+/// level for one device, because a sibling crate's leg asserts a `debug!` event — so a recording no
+/// longer *selects* the level `serve`'s subscriber enables, and a leg whose event was moved to
+/// `debug!` would still be recorded and still pass. This puts that property back and makes it
+/// stronger: the line's own level is read rather than inferred from what a filter let through, so a
+/// **downgrade** to `debug!` and a **promotion** away from the level `serve` enables both fail it,
+/// where the filter could only ever catch the downgrade.
+///
+/// **The level is read off the line the needle is on, never off the whole recording.** A recording
+/// holds every line its body emitted, so a text-wide search would answer a question about a different
+/// event than the caller asked. The rendered level is a bare token at the head of the line
+/// (`… ERROR <target>: <message>`, measured on `tracing-subscriber` 0.3.23 with `with_ansi(false)`),
+/// which is why this is a `contains` on that line and not a parse — and why `with_ansi(false)` is the
+/// prerequisite [`assert_step`] documents.
+pub fn assert_recorded_at(logged: &str, needle: &str, level: Level) {
+    let line = logged
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no recorded line carries {needle:?} in:\n{logged}"));
+    assert!(
+        line.contains(level.as_str()),
+        "the line carrying {needle:?} is not at {level}: {line}"
+    );
+}
+
+/// No recorded line is at `level` or a more severe one: **"a subscriber at this level prints
+/// nothing"**, the assertion a leg whose subject is a *silent* path needs, and [`assert_recorded_at`]'s
+/// inverse.
+///
+/// **Why it cannot be `logged.is_empty()`.** The device records at `DEBUG` (one level for one device),
+/// so a path an `INFO` subscriber prints nothing for still leaves its `debug!` lines in the buffer.
+/// What an operator sees is decided by the *level* of those lines rather than by their absence, so that
+/// is what is asserted — the same move [`assert_recorded_at`] makes, in the other direction: a `warn!`
+/// quietly demoted to `debug!` no longer empties the buffer, and this is what still fails for it. The
+/// doc there carries why the recording cannot make the check by filtering.
+///
+/// **The tokens are spelled out rather than derived from `Level`'s own ordering**, which is *inverted
+/// on purpose*: `tracing` orders levels by verbosity (`ERROR < WARN < INFO < DEBUG < TRACE`), so
+/// `rendered >= level` in Rust would mean "quieter than or equal to", the opposite of what a reader of
+/// this assertion takes it for.
+///
+/// The rendered level is a bare token at the head of each line (`… ERROR <target>: …`, measured), so a
+/// line whose message happens to spell a level name is answered for as if it were that level. Every
+/// caller so far asserts about a path whose message is the caller's own prose; a needle with a level
+/// name in it is what [`assert_recorded_at`] is for.
+pub fn assert_recorded_below(logged: &str, level: Level) {
+    const SEEN: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    let visible: &[&str] = match level {
+        Level::TRACE => &SEEN[..],
+        Level::DEBUG => &SEEN[1..],
+        Level::INFO => &SEEN[2..],
+        Level::WARN => &SEEN[3..],
+        Level::ERROR => &SEEN[4..],
+    };
+    for line in logged.lines() {
+        assert!(
+            !visible.iter().any(|token| line.contains(token)),
+            "a line is at {level} or above, which a subscriber at {level} prints: {line}\nin:\n{logged}"
+        );
+    }
+}
+
+/// A reader that fails the test if anything reads from it.
+///
+/// **An EOF-returning reader cannot express this rule**: `io::empty()` and a
+/// `Cursor` over an empty buffer behave identically whether or not they are read,
+/// so a test built on one passes for a rule that reads stdin and one that does
+/// not. This reader is hostile to being read at all, which is the property under
+/// test — `adopt` must not read a stdin nothing launched it with, because an
+/// operator's terminal blocks rather than answering.
+pub struct Untouchable;
+
+impl Read for Untouchable {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        panic!("`adopt` read stdin without a listener element in argv");
+    }
+}
+
+/// The one way past a precondition this host cannot meet, and it is a deliberate
+/// opt-in: `TINIO_SANDBOX_ALLOW_SKIP`.
+///
+/// **A suite that certifies a confinement does not get to skip in silence.** The
+/// rule, the variable and its spelling are P1's and Task 11's
+/// (`crates/tinio-sandbox-linux/tests/jail.rs`,
+/// `crates/tinio-server/tests/sandbox_e2e_windows.rs`), kept identical so one habit
+/// covers all of them. It covers the *host's* preconditions alone and nothing the
+/// product does: a failure after the first spawn is a suite's subject, and no value
+/// of this variable makes it pass.
+pub const ALLOW_SKIP: &str = "TINIO_SANDBOX_ALLOW_SKIP";
+
+/// Whether the operator has deliberately opted out of a precondition this host
+/// cannot meet (see [`ALLOW_SKIP`]).
+pub fn skip_allowed() -> bool {
+    env::var(ALLOW_SKIP).is_ok_and(|value| !value.is_empty())
+}
+
+/// `what` cannot run on this host: **fail here, or let the operator opt out and let
+/// the caller return early**.
+///
+/// **This is the one arbitration of [`ALLOW_SKIP`] every suite that skips shares**,
+/// and the three details that make a skip honest are its shape rather than its
+/// callers':
+///
+/// - **The assertion is evaluated before the `eprintln!`.** A skip printed by
+///   libtest is swallowed without `--nocapture`, so a host that cannot run the leg
+///   and did not opt out has to read as a *failure* — otherwise the suite reports a
+///   green run that certified nothing, which is exactly the defect this rule exists
+///   for.
+/// - **The panic names the variable and the remedy.** `what` and `reason` are the
+///   caller's (which leg, which capability of the machine answered no), and the
+///   message always carries [`ALLOW_SKIP`]'s name plus whatever other way out the
+///   caller knows, `remedy`, appended verbatim.
+/// - **The skip branch prints and returns**, so the caller's shape is
+///   `host_cannot(…); return;` — or `host_cannot(…); false` where the leg's own
+///   answer is the `bool`: the leg then asserts nothing about the product, which
+///   is what the operator asked for.
+///
+/// **It answers `()` rather than a `bool` that is `false` on every returning
+/// path.** The panic is the other path, so a returned value carries no
+/// information, and one that looked like an answer would invite a caller to
+/// write `if host_cannot(…) { … }` — the skip inverted, silently.
+pub fn host_cannot(what: &str, reason: &str, remedy: &str) {
+    assert!(
+        skip_allowed(),
+        "this host cannot run {what} ({reason}), so this leg would assert nothing. Set \
+         {ALLOW_SKIP}=1 to pass deliberately on a host that genuinely cannot{remedy}"
+    );
+    eprintln!("skipping: this host cannot run {what} ({reason}) and {ALLOW_SKIP} is set{remedy}");
+}
+
+/// The lines a child has written to one pipe so far, shared with that pipe's draining thread (the
+/// only writer).
+type Lines = Arc<Mutex<Vec<String>>>;
+
+/// Drain `pipe` line by line into `lines` until EOF (the child exits). A pipe nobody reads fills up
+/// and blocks the child, so both pipes are always drained, whether or not the leg looks at them.
+fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut raw = Vec::new();
+        while reader.read_until(b'\n', &mut raw).is_ok_and(|n| n > 0) {
+            // Lossy: a diagnostic that is not UTF-8 drops bytes from the record, never the rest of
+            // the pipe.
+            let line = String::from_utf8_lossy(&raw);
+            lines
+                .lock()
+                .expect("the pipe buffer")
+                .push(line.trim_end().to_string());
+            raw.clear();
+        }
+    })
+}
+
+/// A spawned child with both pipes drained into shared buffers, killed and reaped when it drops.
+///
+/// **Both pipes are drained whether or not the leg reads them**, and a thread each is why: a pipe
+/// nobody reads fills up and blocks the child, so a harness that wanted only stderr would hang the
+/// server it is observing once that server logged more than a pipe holds. The buffers are the two
+/// the leg reads through [`stdout_lines`](Self::stdout_lines), [`stderr_text`](Self::stderr_text)
+/// and [`stderr_containing`](Self::stderr_containing).
+///
+/// **Killed and reaped on every path out of the leg, the panic path included**, because `Drop`
+/// runs [`stop`](Self::stop) — an assertion failure must not leave a server holding its listener,
+/// its jail and the served root's state lock for the rest of the run. An explicit call is only
+/// about ordering: it gets the complete pipes (their write ends close at the child's death, so the
+/// drains finish) before the leg's final assertions.
+///
+/// **Why the std half is shared and the rest is not.** Two `tests/` trees cannot import from each
+/// other, and both spawn the real `tinio server` and read its pipes: the read-only suite
+/// (`tinio-server/tests/serve_read_only.rs`) and the sandbox-channel harness beside it
+/// (`tests/support/serve_spawn.rs`) held a byte-identical copy of this — the buffers, the drain,
+/// the exit wait and the kill — and the copies were equal only while an author remembered the
+/// other. What both of them add on top, and what stays in those trees, is the decoding of the
+/// readiness event, which is `tinio_sandbox::Event`'s: it would cost every `testing` build the
+/// whole sandbox stack to hold it here, for a type only those two binaries read.
+///
+/// The child inherits this process's environment; a harness that must remove or set a variable does
+/// it on the [`Command`] before [`spawn`](Self::spawn).
+pub struct PipedChild {
+    child: Child,
+    stdout: Lines,
+    stderr: Lines,
+    /// The draining threads, taken by `stop`.
+    drains: Vec<JoinHandle<()>>,
+}
+
+impl PipedChild {
+    /// Spawn `cmd` and start the two draining threads.
+    ///
+    /// **Both pipes are set here rather than by the caller**, because draining them is this type's
+    /// contract: a caller that forgot `Stdio::piped()` would get a child whose output nobody reads,
+    /// which is the hang the type exists to prevent. A spawn failure panics — every caller is a
+    /// test or a harness, and a binary that cannot be spawned is the leg's own precondition.
+    pub fn spawn(cmd: &mut Command) -> Self {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap_or_else(|e| {
+            panic!("cannot spawn {}: {e}", cmd.get_program().to_string_lossy())
+        });
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let drains = vec![
+            drain(
+                child.stdout.take().expect("stdout is piped"),
+                Arc::clone(&stdout),
+            ),
+            drain(
+                child.stderr.take().expect("stderr is piped"),
+                Arc::clone(&stderr),
+            ),
+        ];
+        Self {
+            child,
+            stdout,
+            stderr,
+            drains,
+        }
+    }
+
+    /// The child itself, for the polls a leg writes against its own readiness protocol
+    /// (`try_wait`, a signal, a pid).
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// Wait for the child to exit on its own — the legs that expect a failure, never a server —
+    /// and return its status.
+    ///
+    /// Bounded by [`wait_timeout_secs`], and the deadline kills before it panics: a child that
+    /// never exits is the failure mode every `PipedChild` caller has, and the stderr quoted beside
+    /// the message is the evidence it left.
+    pub async fn exited(&mut self) -> ExitStatus {
+        let timeout = wait_timeout_secs();
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("the child's status") {
+                // Complete the pipes before the caller reads them: the child is gone, so its ends
+                // are closed and the drains cannot block.
+                self.join_drains();
+                return status;
+            }
+            if Instant::now() >= deadline {
+                self.stop();
+                panic!(
+                    "the child did not exit within {timeout} s (this leg expects a failure); \
+                     stderr:\n{}",
+                    self.stderr_text()
+                );
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Kill and reap the child now, then join the draining threads (their pipes reach EOF at the
+    /// child's death). `Drop` runs the same path, so an assertion failure later still reaps — an
+    /// explicit call just gets the complete pipes before the leg's final assertions.
+    pub fn stop(&mut self) {
+        kill_and_reap(&mut self.child);
+        self.join_drains();
+    }
+
+    /// Join the draining threads, taking the handles so a second `stop` cannot join them twice.
+    pub fn join_drains(&mut self) {
+        for handle in self.drains.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
+    /// Everything the child has written to stdout so far.
+    pub fn stdout_lines(&self) -> Vec<String> {
+        self.stdout.lock().expect("the stdout buffer").clone()
+    }
+
+    /// Everything the child has written to stderr so far, line-joined.
+    pub fn stderr_text(&self) -> String {
+        self.stderr.lock().expect("the stderr buffer").join("\n")
+    }
+
+    /// The child's stderr once it carries `needle`, waiting (bounded) while it does not. A separate
+    /// thread drains the pipe, so a line the child wrote is not necessarily recorded the instant
+    /// this thread looks — a live child's stderr has no EOF to synchronize on.
+    pub async fn stderr_containing(&self, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(wait_timeout_secs());
+        loop {
+            let text = self.stderr_text();
+            if text.contains(needle) || Instant::now() >= deadline {
+                return text;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+}
+
+impl Drop for PipedChild {
+    fn drop(&mut self) {
+        // See [`PipedChild::stop`] and the type's doc.
+        self.stop();
+    }
+}
+
 /// An owned `Write` sink for the fmt layers under test (the log.rs and
 /// pipeline.rs test pattern — F32: one definition, three copies removed).
+///
+/// **Right where the test reaps every thread it starts**, which is the shape both of its callers
+/// have. A recording whose process **forks** underneath it cannot use one: take [`ThreadLocalBuf`],
+/// which carries the measurement and the lock-free alternative.
 #[derive(Clone, Default)]
 pub struct SharedBuf(pub Arc<Mutex<Vec<u8>>>);
 
@@ -2688,6 +3136,349 @@ impl io::Write for SharedBuf {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+thread_local! {
+    /// What this thread is recording, or `None` when it is not recording at all.
+    ///
+    /// **A thread-local rather than a shared buffer behind a lock, and the reason is a fork** — see
+    /// [`ThreadLocalBuf`] for what the fork does to the other shape and what this one gives up for it.
+    static THREAD_BUFFER: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// The sink a recording writes through when the process can **fork** underneath it: the lock-free twin
+/// of [`SharedBuf`].
+///
+/// **Thread-local rather than one buffer behind a `Mutex`, and the reason is a fork.** An event written
+/// through a `Mutex` takes a critical section a sibling thread may have held at the instant the fork
+/// happened, and the child inherits it locked with nobody left to unlock it: on Linux the in-place
+/// confinement forks inside its availability probe, and the first shape of that crate's recorder — the
+/// one this type replaces — put the forked child on that lock until the probe's five-second deadline,
+/// measured as the probe's own test failing in five seconds. A thread-local takes no lock at all on the
+/// write path, and the forking case does not even reach the buffer: a forking test is not a recording
+/// one, so the child inherits `None` and its event is dropped without allocating.
+///
+/// **What that gives up, against [`SharedBuf`]**: a recording reads the thread that made it and no
+/// other, so an event emitted on a worker thread is dropped rather than collected, where a shared
+/// buffer would have collected it. Choose by what the test does with threads — one that joins every
+/// thread it starts can share a buffer; one whose process forks underneath it cannot.
+///
+/// **The state is one `thread_local` for the module rather than a field**, so the sink is zero-sized and
+/// `MakeWriter`'s per-event writer costs nothing to create; anything shared here would be the lock this
+/// type exists to avoid.
+pub struct ThreadLocalBuf;
+
+impl ThreadLocalBuf {
+    /// Start recording on this thread, dropping whatever it held.
+    ///
+    /// **Emptied at the start of a recording and not only at the end**, because a body that panics never
+    /// reaches [`take`](Self::take): the buffer it filled stays where it is, and the next recording on
+    /// this thread is what clears it, so a failed test cannot bleed into a later one.
+    pub fn clear() {
+        THREAD_BUFFER.with(|buffer| *buffer.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording: what this thread logged since [`clear`](Self::clear), as the subscriber rendered
+    /// it.
+    ///
+    /// Empty rather than a panic when this thread recorded nothing (a nested recording takes the buffer
+    /// first), because "the capture came out empty" is a failure the caller's own assertion has to state.
+    pub fn take() -> String {
+        THREAD_BUFFER.with(|buffer| {
+            let text = buffer.borrow_mut().take().unwrap_or_default();
+            String::from_utf8(text).expect("the capture is UTF-8")
+        })
+    }
+
+    /// Whether this thread has a recording open — **the question [`Capture`]'s write path asks first**,
+    /// and it answers without taking any lock, which is what keeps a recording fork-safe.
+    pub fn is_recording() -> bool {
+        THREAD_BUFFER.with(|buffer| buffer.borrow().is_some())
+    }
+
+    /// What this thread has logged since [`clear`](Self::clear), without taking it: the non-taking twin
+    /// of [`take`](Self::take), for a caller that polls a recording still in progress.
+    pub fn peek() -> String {
+        THREAD_BUFFER.with(|buffer| {
+            String::from_utf8_lossy(buffer.borrow().as_deref().unwrap_or_default()).into_owned()
+        })
+    }
+}
+
+impl io::Write for ThreadLocalBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        THREAD_BUFFER.with(|buffer| {
+            if let Some(text) = buffer.borrow_mut().as_mut() {
+                text.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for ThreadLocalBuf {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ThreadLocalBuf
+    }
+}
+
+/// Everything `body` logged, as the subscriber rendered it, beside what `body` returned.
+///
+/// **A recording installs its own subscriber because the crate under test installs none** (shared §7):
+/// the process that owns the runtime decides where events go, so a test that wants to read its own
+/// crate's events has to be the one that captures them. What it installs is fixed rather than
+/// parameterised — ANSI off (load-bearing: the default subscriber wraps each field *name* and the equals
+/// sign after it in escapes, so no captured line would carry `step="…"`) and `DEBUG` (§7's `Info` would
+/// leave every `debug!` site with no test that could fail if it were deleted) — because a knob here is a
+/// way for two callers to disagree about what a captured line looks like.
+///
+/// **The buffer is emptied at both ends rather than dropped at the start**: a panic in the body leaves it
+/// in place, and the next recording on this thread clears it, so a failed test cannot bleed into a later
+/// one. The pair is the body's value and the text, in that order, so a caller that wants only the log
+/// writes `let (_, logged) = record_events(…)`.
+///
+/// **It is the device's single-thread entry point and nothing more** ([`capture`] carries the install
+/// and the level): a leg that has to order two threads' events, or to poll a recording while it is
+/// still open, takes the device and [`Capture::record_every_thread`] directly.
+pub fn record_events<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let capture = capture();
+    let _recording = capture.record();
+    let value = body();
+    (value, capture.text())
+}
+
+/// The recording device a test binary's legs share, installed once for the process.
+///
+/// **One subscriber for the whole process, as the global default, installed with `try_init` and never
+/// `init`** (shared §7), and that is a measured correction rather than a preference. `tracing` caches
+/// each callsite's `Interest` in a **process-global** cell, written both when a callsite is first hit
+/// and when any dispatch is created — and while exactly one dispatch is registered, which is the whole
+/// of a `with_default` recording, `tracing-core`'s `Rebuilder::JustOne` consults *the calling thread's*
+/// default rather than the registry. A thread-scoped subscriber is therefore invisible to every other
+/// thread, so a parallel test that happens to be the first to hit the same callsite writes `never` into
+/// the shared cell and the event the recording exists to observe is dropped in silence: one run in
+/// thirty, and only when the other thread wins that race. A **global** default is visible from every
+/// thread, so the cell can only ever say "interested". **A crate whose test modules share callsites with
+/// the tests around them is that shape**, and the sandbox crates are: `resolve_model` is reached by the
+/// refusal tests as well as by the recording one, and `jail_root` by every `jail.rs` test.
+///
+/// **A second global installer in the same test binary silently loses this device**, and it is the one
+/// failure its `try_init` cannot turn into a loud one: whoever installs a process default first wins, so
+/// a device installed after another one's subscriber stays empty and every assertion reading it fails
+/// for a recording that never happened. `tinio-sandbox-core` is the binary where that bites — its
+/// `launcher/adopt.rs` tests install a structured recorder of their own as the process default — so that
+/// crate's `error.rs` recorder test stays thread-scoped (`with_default`) instead of taking this device.
+/// **A crate whose test binary installs a default of its own cannot use this one.**
+///
+/// **The level is `DEBUG` rather than §7's `Info`**, because the per-item half is a core operation too:
+/// a capture at `Info` would leave every `debug!` site — Linux's `jail_root` is one, and its own test
+/// asserts it — with no test that could fail if it were deleted. What a recording gives up for that is
+/// the ability to *select* a level, so a leg that has to hold an event at the level `serve`'s subscriber
+/// enables asserts that level on the recorded line ([`assert_recorded_at`]) instead of relying on a
+/// filter to drop the event.
+///
+/// **Which threads a recording owns is its entry point's decision**, and it is the only point the two
+/// entry points differ on: [`Capture::record`] owns the calling thread alone, through
+/// [`ThreadLocalBuf`], and [`Capture::record_every_thread`] owns every thread, through the one shared
+/// buffer the [`Recording`] guard closes. A recording reads only what it owns, so another test's events
+/// never reach an assertion that did not ask for them.
+///
+/// **`try_init` and never `init`** (shared §7): a subscriber the caller already installed wins, and if
+/// one ever is, the capture stays empty and the assertions fail loudly rather than passing on a
+/// recording that never happened.
+pub fn capture() -> Capture {
+    static CAPTURE: OnceLock<Capture> = OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let capture = Capture::default();
+            let _ = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                // **Load-bearing for a field assertion, and measured rather than
+                // assumed**: the default subscriber wraps each field *name* and the
+                // equals sign after it in ANSI escapes, so a captured line carries
+                // `step` only as coloured spans and never as `step="…"`.
+                .with_ansi(false)
+                .with_max_level(Level::DEBUG)
+                .try_init();
+            // **`set_global_default` stores the dispatch without re-evaluating the
+            // callsite cache** — only `Dispatch::new` does that, and it runs before
+            // the default is visible — so a callsite another test already hit stays
+            // cached `never`. Rebuilding here, with the global default in place, is
+            // what turns those cells back to "interested".
+            rebuild_interest_cache();
+            capture
+        })
+        .clone()
+}
+
+/// The recorder: the buffer an every-thread recording writes into, and whether one is open.
+#[derive(Clone, Default)]
+pub struct Capture(Arc<Shared>);
+
+/// [`Capture`]'s shared half, which the capture's own lock protects where it needs protecting.
+#[derive(Default)]
+struct Shared {
+    /// The buffer an **every-thread** recording writes into. A single-thread recording never touches it:
+    /// its lines go to the calling thread's [`ThreadLocalBuf`].
+    text: Mutex<Vec<u8>>,
+    /// Whether an every-thread recording is open right now.
+    ///
+    /// An atomic rather than a flag beside the buffer's lock, because the write path asks this question
+    /// before it is willing to take that lock: a recording whose process forks underneath it must not
+    /// enter a critical section a sibling thread held at the instant of the fork ([`ThreadLocalBuf`]
+    /// carries that measurement).
+    every_thread: AtomicBool,
+}
+
+impl Capture {
+    /// Own this thread's events until the guard drops.
+    ///
+    /// **The exact filter is the thread's own buffer**, which is what keeps another test's event — the
+    /// subscriber is the process's — out of this recording, and what lets two tests record at once.
+    ///
+    /// **An every-thread recording must not be open when this one opens**: it claims *every* thread's
+    /// lines, so this recording would read an empty buffer while its own lines landed in the other one.
+    /// The assertion is what says so, and the pair of entry points is small enough for that to stay a
+    /// rule rather than a hope — the every-thread callers take [`recorder`] first as well.
+    pub fn record(&self) -> Recording {
+        assert!(
+            !self.0.every_thread.load(Ordering::Acquire),
+            "one recording at a time: an every-thread recording is open, so this thread's lines are \
+             not this recording's to read"
+        );
+        ThreadLocalBuf::clear();
+        Recording {
+            capture: self.clone(),
+            every_thread: false,
+        }
+    }
+
+    /// Own **every** thread's events until the guard drops.
+    ///
+    /// The mode an ordering assertion needs rather than a convenience: the two events it compares are
+    /// written by two threads, so a recording that owned one of them would have nothing to order.
+    ///
+    /// **Every other test's events land in the buffer too** while one of these is open — the lines a test
+    /// that is *not* recording has nowhere else to go, where a single-thread recording keeps its own
+    /// ([`Capture::record`]'s doc). That is why its callers take [`recorder`] first and name the package
+    /// or the step their assertion is about.
+    pub fn record_every_thread(&self) -> Recording {
+        assert!(
+            self.0
+                .every_thread
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "one recording at a time, and this capture already has an every-thread one"
+        );
+        self.0.text.lock().expect("the capture mutex").clear();
+        Recording {
+            capture: self.clone(),
+            every_thread: true,
+        }
+    }
+
+    /// What the recording has written so far, without taking it: the reader a caller polls with when the
+    /// event it waits for is the signal itself rather than one of the assertions (`tests/profile.rs`'s
+    /// `wait_for`).
+    pub fn peek(&self) -> String {
+        if ThreadLocalBuf::is_recording() {
+            ThreadLocalBuf::peek()
+        } else {
+            String::from_utf8_lossy(&self.0.text.lock().expect("the capture mutex")).into_owned()
+        }
+    }
+
+    /// What the recording wrote, as UTF-8 — and takes it, so the next recording starts from an empty
+    /// buffer.
+    pub fn text(&self) -> String {
+        if ThreadLocalBuf::is_recording() {
+            ThreadLocalBuf::take()
+        } else {
+            let text = mem::take(&mut *self.0.text.lock().expect("the capture mutex"));
+            String::from_utf8(text).expect("the capture is UTF-8")
+        }
+    }
+}
+
+impl io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // This thread's own recording first, and **without taking the shared lock**: a recording whose
+        // process forks underneath it must not enter a critical section the child inherits held (see
+        // [`ThreadLocalBuf`]). The shared buffer is reached only by threads that are not recording, and
+        // the callers that fork under a recording are not those.
+        if ThreadLocalBuf::is_recording() {
+            io::Write::write(&mut ThreadLocalBuf, buf)?;
+        } else if self.0.every_thread.load(Ordering::Acquire) {
+            self.0
+                .text
+                .lock()
+                .expect("the capture mutex")
+                .extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Capture {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// One recording's lifetime: the guard both of [`Capture`]'s recording entry points answer with.
+///
+/// A guard rather than a matching call at the end, so that a body which panics releases the capture
+/// instead of leaving the every-thread flag set — a later read would then answer from a buffer no
+/// recording owns, and a later write would land in it. **A single-thread recording needs no release**:
+/// its buffer is the thread's own, and the clear-at-the-start rule is what keeps a failed test from
+/// bleeding into the next one on that thread.
+pub struct Recording {
+    capture: Capture,
+    every_thread: bool,
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        if self.every_thread {
+            self.capture.0.every_thread.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// **One every-thread recording at a time across a test binary's tests.**
+///
+/// The shared buffer is process-wide and holds one recording, so two tests that assert on it must not
+/// overlap: [`Capture::record_every_thread`]'s "one at a time" is an *assertion*, and an assertion is
+/// the wrong shape for a rule two tests have to keep — the assert fires before the buffer is cleared, so
+/// an overlap makes the loser panic on the other test's timing without clearing the winner's events,
+/// where the failure this device prevents is one test answering from another's verdict. It is taken once
+/// per test rather than once per recording, so a nested recording inside one test is still what the
+/// assertion catches.
+///
+/// **What it cannot cover is the other tests' events**, which the lock has no hold on: a test that never
+/// records still emits, which is why an assertion names the package or the step it is about rather than
+/// counting on a buffer only its own test wrote (`tests/profile.rs`'s ordering test names the profile it
+/// reads the two deletes of).
+///
+/// Poisoning is not a second failure: the test that panicked while recording has already failed this
+/// binary, and the next reader takes the buffer rather than reporting a failure that hides the first.
+pub fn recorder() -> MutexGuard<'static, ()> {
+    static RECORDER: Mutex<()> = Mutex::new(());
+    RECORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Trusted-literal tag set (panics on invalid tags — tests and fixtures).

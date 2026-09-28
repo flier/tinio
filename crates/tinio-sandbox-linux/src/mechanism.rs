@@ -5,24 +5,16 @@
 //! The crate root re-exports the public names, so callers keep writing
 //! `tinio_sandbox_linux::Mechanism`.
 
-use std::{
-    fs::File,
-    io::{self, Read as _, Write as _},
-    os::fd::OwnedFd,
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::{os::fd::OwnedFd, time::Duration};
 
 use rustix::{
-    fs::{OFlags, fcntl_setfl},
     pipe::pipe,
-    process::{WaitOptions, waitpid},
     runtime::{Fork, exit_group, kernel_fork},
     thread::{UnshareFlags, unshare_unsafe},
 };
 use tracing::{debug, error};
 
-use crate::_core::{Error, Result};
+use crate::_core::{Error, ProbeSteps, Result, await_verdict, report_verdict};
 // **The failure builders are the core's, and they are re-exported here rather
 // than re-imported by each module.** This file defined all three until the
 // phase-basis correction moved them to `tinio-sandbox-core`, beside the other
@@ -170,13 +162,30 @@ impl Mechanism {
 }
 
 /// How long [`userns_available`] waits for its forked child, at each end of the
-/// handshake — the read and the reap share the one deadline.
+/// handshake — the read and the reap share the one deadline, which
+/// [`await_verdict`] applies to both.
 ///
 /// Generous on purpose rather than tight: the child's whole job is one syscall,
 /// one byte and an exit, so a healthy run answers in microseconds and anything
 /// this far out is a child that is gone or stuck rather than one that is slow.
 /// The value is a bound on a hang, not a performance budget.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The names this probe's own failures carry: the flag, the read and the reap,
+/// one step each.
+///
+/// **Three names rather than one, and that is the half of the handshake that
+/// stays this crate's** — [`ProbeSteps`] takes its words from the caller for
+/// exactly this reason, since what a failure is *called* belongs to the site that
+/// knows what was being probed. A probe that could not be made non-blocking, one
+/// whose child never answered, and one whose child could not be reaped are three
+/// different diagnoses, and `userns probe read` is the string an operator greps
+/// the log for when the model table was decided on a timeout.
+const PROBE_STEPS: ProbeSteps = ProbeSteps {
+    nonblocking: "userns probe nonblocking",
+    read: "userns probe read",
+    reap: "userns probe reap",
+};
 
 /// Whether this kernel grants an unprivileged `unshare(CLONE_NEWUSER)`.
 ///
@@ -189,12 +198,27 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// policy refuses the call, and the design's rule is that the syscall is the
 /// authority (design decision 7).
 ///
+/// **The parent's half of that handshake is `tinio_sandbox_core`'s now, and this
+/// probe gained the shared helper's semantics with it.** The pipe, the fork and
+/// the child's body stay here — the fork is this crate's `unsafe` site, and the
+/// child's `unshare`, its one byte and its `exit_group` are the half that knows
+/// what was being probed — while the non-blocking flag, the bounded read, the
+/// `SIGKILL` and the bounded reap are [`await_verdict`]'s. **Two things change
+/// with it, and both were this probe's own shape**: it used to leave its child
+/// unsignalled on *every* path — the deadline's included, so a probe that timed
+/// out left a child running — and it turned any `waitpid` error into the probe's
+/// refusal even when the byte it had already read was a sound verdict. The child
+/// is now ended on every path, an `ESRCH` from the kill is a `debug!` rather
+/// than a refusal, and a reap that fails while the read produced a verdict is
+/// tolerated: the verdict is what the model table is decided on, and the reap is
+/// cleanup.
+///
 /// # Preconditions
 ///
 /// **It forks, so no thread may exist yet** (design §10): the child is a copy of
 /// the calling thread, which is the thing `kernel_fork`'s signature cannot
-/// promise, and `serve` confines before it builds its runtime for exactly that
-/// reason. **This crate's own test does not meet the precondition** — libtest
+/// promise, and `serve` confines before it builds its runtime — and, on this
+/// platform, before it installs its subscriber — for exactly that reason. **This crate's own test does not meet the precondition** — libtest
 /// runs it on a worker thread with the others beside it, and one of those may be
 /// holding the tracing lock when the fork happens, leaving the child blocked if
 /// its one event reaches that lock. The failure is bounded and loud rather than
@@ -203,13 +227,27 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The test stays, because it is the only pin on the property the two-tier
 /// fallback rests on — the probe does not confine its caller.
 ///
+/// **The confinement's own thread check does not cover this call, and that is
+/// the half of the precondition worth stating plainly**: the probe runs
+/// inside `enter`'s validation, because the model table cannot be resolved
+/// without its answer, while the check that refuses a threaded process sits
+/// *after* validation, in front of the first irreversible step — so a process
+/// that arrived with a second thread reaches this fork and is refused a few
+/// instructions later. That ordering is deliberate (`validate_and_plan` is
+/// where an operator's own mistake is meant to be reported as itself), and it
+/// means a threaded process's probe is the one fork this crate still makes in a
+/// thread group it has not checked. It is bounded and loud for the reason the
+/// test's paragraph above gives: a child that deadlocks on a lock the fork
+/// copied expires as a [`Error::Step`] and the run refuses.
+///
 /// # Errors
 ///
 /// [`Error::Step`] when the fork or the pipe itself fails, **or when either end
 /// of the handshake runs past `PROBE_TIMEOUT`** — the private constant above,
 /// named rather than linked because a private item is not a link target —
 /// distinct from a probe that ran and answered "no", which is `Ok(false)` and
-/// an ordinary outcome.
+/// an ordinary outcome. The read and the reap raise that refusal through
+/// [`await_verdict`], which owns the bound.
 ///
 /// # Examples
 ///
@@ -231,21 +269,31 @@ pub fn userns_available() -> Result<bool> {
     // ship is `rustix::runtime::kernel_fork`, which is `unsafe fn` because a
     // fork in a multi-threaded process is not something a signature can promise.
     // The invariant it relies on is design §10's ordering rather than anything
-    // this call can check: the probe runs before any thread exists (decision 26),
-    // so the child is a copy of a single-threaded process and touches nothing but
-    // its own pipe end, the `unshare` wrapper's one event and `exit_group`.
-    // **That event does fire in production.** `serve` installs its subscriber
-    // before `confine` — deliberately, so the confinement's own events are not
-    // dropped — and the child inherits it, so a host that refuses the namespace
-    // gets an `error!` from the child's failed `unshare` for what the parent
-    // reports as an ordinary negative answer. The line is left standing rather
-    // than silenced: the unshare genuinely did fail, it costs one entry beside
-    // the `Error::Unsupported` the parent logs immediately afterwards, and
-    // silencing it would mean the child calling `unshare_unsafe` itself — a
-    // fourth `unsafe` site, which decision 14 forbids. It also needs rustix's
-    // `runtime` feature, on top of the `pipe` one `pipe()` above already uses —
-    // both are in the crate's manifest, and both are stated in this plan's tech
-    // stack.
+    // this call can check: every production caller confines from a `fn main`
+    // that has spawned nothing, so the child is a copy of a single-threaded
+    // process and touches nothing but its own pipe end (the one byte
+    // `report_verdict` writes through it), the `unshare` wrapper's one event and
+    // `exit_group`. **The order the check and this fork stand in is deliberate,
+    // and the `# Preconditions` section above states it in full**: `enter`
+    // refuses a threaded process *after* `validate_and_plan`, which is where
+    // this call sits, so a process that arrived with a second thread is forked
+    // from first and refused immediately afterwards.
+    // **On this platform's production path that event now has no subscriber,
+    // and the ordering that removed it is deliberate.** `serve` installs its
+    // subscriber *after* `confine` on the in-place arm — a subscriber built with
+    // an OTLP endpoint starts a thread, and a thread alive at the confinement
+    // stays outside it for the life of the process — so this child's `error!`,
+    // like the confinement's own events, is emitted where nothing is listening.
+    // **That is a diagnostic loss and not a silent one**: the parent reports the
+    // same fact as its own answer — `Ok(false)` and the fallback to root, or the
+    // `Resolved::Unavailable` this module's table answers with, which
+    // `enter`'s `resolve_model` turns into an `Error::Unsupported` — and a
+    // caller that installs a subscriber before confining still reads the line. The line is left standing rather than silenced: the unshare
+    // genuinely did fail, and silencing it would mean the child calling
+    // `unshare_unsafe` itself — a fourth `unsafe` site, which decision 14
+    // forbids. It also needs rustix's `runtime` feature, on top of the `pipe`
+    // one `pipe()` above already uses — both are in the crate's manifest, and
+    // both are stated in this plan's tech stack.
     let fork = unsafe { kernel_fork() }.map_err(step("userns probe fork"))?;
     match fork {
         Fork::Child(_) => {
@@ -255,95 +303,35 @@ pub fn userns_available() -> Result<bool> {
             // the easy half of it — `NEWUSER` alone, in a child that is about
             // to exit.
             let granted = unshare(UnshareFlags::NEWUSER, "userns probe").is_ok();
-            let mut writer = File::from(writer);
-            // A failed write means the parent is gone; exiting is the whole job.
-            let _ = writer.write_all(&[u8::from(granted)]);
+            // The one byte, through the core's writer, and then the exit. **The
+            // child never returns into its own Rust**: the helper says why that
+            // is the caller's to do rather than the helper's, and a failed write
+            // — a parent that is already gone — is not a reason to do anything
+            // else.
+            let _ = report_verdict(writer, granted);
             // **`exit_group`, because `rustix::process` has no `exit`**: the
             // exit syscall is `rustix::runtime::exit_group`, which terminates
             // the child's whole thread group — a distinction that costs nothing
-            // here, because the child has exactly one thread, and the same
-            // ordering argument (design §10) is what says so.
+            // here, because a fork child is a copy of the calling thread alone
+            // and so has exactly one, whatever the parent's count was.
             exit_group(0);
         }
         Fork::ParentOf(child) => {
             drop(writer);
-            // **Both halves of this handshake are bounded, and the reason is the
-            // design's own evidence table**: "An unbounded `waitpid` after a
-            // fallback `kill` is a harness hazard … A supervisor that reaps a
-            // child it may not be able to signal must bound that wait." The
-            // probe that row describes is bounded at both ends — an `alarm` in
-            // the child and a `NOHANG` loop in the parent — and this one can
-            // only have the second: `rustix` ships no `alarm` (nothing in it
-            // sets a timer), and a hand-rolled FFI declaration for one would be
-            // a fourth `unsafe` site, which this crate's ledger does not have.
-            // So the parent carries both, and the read end is made
-            // non-blocking — which is what lets the read share the reap's
-            // deadline instead of blocking past it.
-            let mut reader = File::from(reader);
-            fcntl_setfl(&reader, OFlags::NONBLOCK).map_err(step("userns probe nonblocking"))?;
-            let deadline = Instant::now() + PROBE_TIMEOUT;
-            let mut answer = [0u8; 1];
-            let available = loop {
-                match reader.read(&mut answer) {
-                    // EOF: the child died without answering. A failed probe,
-                    // not a "no" — `Ok(false)` is a child that ran and reported
-                    // a refusal, which is this probe's ordinary negative.
-                    Ok(0) => {
-                        return Err(fail(
-                            "userns probe read",
-                            io::Error::from(io::ErrorKind::UnexpectedEof),
-                        ));
-                    }
-                    Ok(_) => break answer[0] != 0,
-                    // `Interrupted` is retried for the same reason `read_exact`
-                    // used to retry it internally — a resting pipe is not a
-                    // reason to call a probe failed — and `WouldBlock` is what
-                    // the non-blocking end reports between the child's write and
-                    // the deadline.
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        // **Expiry is a refusal, never a false `Ok`.** A probe
-                        // that answered "unavailable" on a timeout would send
-                        // `Auto` to the root model on a host that never refused
-                        // anything — a silent downgrade produced by a hang
-                        // (design §11's fail-closed, applied to the question the
-                        // model table is built on).
-                        if Instant::now() >= deadline {
-                            return Err(fail(
-                                "userns probe read",
-                                io::Error::from(io::ErrorKind::TimedOut),
-                            ));
-                        }
-                        sleep(Duration::from_millis(1));
-                    }
-                    Err(source) => return Err(fail("userns probe read", source)),
-                }
-            };
-            // The reap, on the same deadline and refusing the same way. The
-            // child has written and exited before the read returned on every
-            // run that answers, so a `NOHANG` miss that persists to the
-            // deadline is a child that is gone or stuck rather than one that is
-            // slow. (`WaitOptions::NOHANG` is the kernel's `WNOHANG`; rustix
-            // spells the constant without the leading `W`.)
-            loop {
-                match waitpid(Some(child), WaitOptions::NOHANG) {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {
-                        sleep(Duration::from_millis(1));
-                    }
-                    Ok(None) => {
-                        return Err(fail(
-                            "userns probe reap",
-                            io::Error::from(io::ErrorKind::TimedOut),
-                        ));
-                    }
-                    Err(source) => return Err(fail("userns probe reap", source)),
-                }
-            }
+            // **The bound is the parent's at both ends, and the shared helper is
+            // where it lives now.** The design's own evidence row — "an
+            // unbounded `waitpid` after a fallback `kill` is a harness hazard …
+            // a supervisor that reaps a child it may not be able to signal must
+            // bound that wait" — describes a probe bounded at both ends by an
+            // `alarm` in the child and a `NOHANG` loop in the parent, and this
+            // one can only have the second: `rustix` ships no `alarm` (nothing
+            // in it sets a timer), and a hand-rolled FFI declaration for one
+            // would be a fourth `unsafe` site, which this crate's ledger does
+            // not have. So the deadline is the parent's — applied to the read
+            // through the non-blocking flag [`await_verdict`] sets and to the
+            // reap through its `NOHANG` loop — and the child is ended on every
+            // path, this one included.
+            let available = await_verdict(reader, child, PROBE_STEPS, PROBE_TIMEOUT)?;
             debug!(
                 step = "userns probe",
                 available, "unprivileged user namespace probed"
@@ -373,8 +361,15 @@ pub fn userns_available() -> Result<bool> {
 /// rustix marks `unshare_unsafe` unsafe because `CLONE_FILES` would break a
 /// multi-threaded process. This crate never passes it: the confinement calls
 /// this twice with `NEWUSER` and `NEWNS`, and the probe passes `NEWUSER` in a
-/// forked child that does nothing else and exits. The entry point guarantees no
-/// thread exists before either of them (design §10).
+/// forked child that does nothing else and exits.
+///
+/// **The confinement's half of "no thread exists" is now checked rather than
+/// promised**: `enter` refuses a process with more than one task before its
+/// first irreversible step, so neither of its two calls here can be made in a
+/// process the kernel would refuse `CLONE_NEWUSER` in (design §10). The probe's
+/// half is the precondition [`userns_available`] documents and does not
+/// enforce — it forks inside a libtest worker in this crate's own test — and
+/// that function's doc says so rather than restating it here.
 #[allow(unsafe_code)]
 pub(crate) fn unshare(flags: UnshareFlags, step_name: &'static str) -> Result<()> {
     // SAFETY: the flags are the caller's, and every caller in this crate passes

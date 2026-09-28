@@ -32,7 +32,12 @@ use std::{
 use common::{frame_line, stdout_lines, tinio_bin, wait_for_listening_in, wait_timeout};
 use tinio_api::state::State;
 use tinio_sandbox::Event;
-use tinio_util::testing::poll_exit;
+use tinio_util::testing::{kill_and_reap, poll_exit, wait_for_path};
+
+/// How often the leg looks for a file the product writes: the waits below are
+/// bounded by [`wait_timeout`], so the poll is their resolution and not a
+/// resource.
+const POLL: Duration = Duration::from_millis(50);
 
 #[test]
 fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
@@ -142,7 +147,11 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
     // the response the client read and the log line the child writes are two
     // events with no ordering between them.
     let access_log = root.join(".tinio/access.log");
-    if wait_for_path(&access_log).is_none() {
+    // **The wait is the shared device's; the `is_file` is this leg's own.** The
+    // device answers "it is there", and what this leg needs is that the child
+    // wrote a *file*: a directory at that path is not the write being waited for,
+    // and the failure below has to be the one that says so.
+    if !wait_for_path(&access_log, wait_timeout(), POLL) || !access_log.is_file() {
         fail(
             &mut child,
             logged,
@@ -170,7 +179,7 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
     // the `listening` frame, the HTTP response and the access log — which is why
     // this is a different leg rather than a stronger form of one of them.
     let state_file = root.join(".tinio/state");
-    if wait_for_path(&state_file).is_none() {
+    if !wait_for_path(&state_file, wait_timeout(), POLL) || !state_file.is_file() {
         fail(
             &mut child,
             logged,
@@ -502,18 +511,6 @@ fn control_socket(root: &Path) -> Result<PathBuf, String> {
     Ok(sockets.remove(0))
 }
 
-/// Whether `path` is a file within the suite's readiness budget.
-fn wait_for_path(path: &Path) -> Option<()> {
-    let deadline = Instant::now() + wait_timeout();
-    while Instant::now() < deadline {
-        if path.is_file() {
-            return Some(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    None
-}
-
 /// Best-effort removal of the leg's served root.
 ///
 /// The root is one this leg made under `/tmp` rather than a
@@ -556,8 +553,7 @@ fn fail(child: &mut Child, logged: thread::JoinHandle<String>, root: &Path, mess
     // The sweep is `common::sweep_confined_grandchild`'s: it owns the pattern and the reason both
     // processes have to go (the launcher, and the confined grandchild it cannot take with it).
     common::sweep_confined_grandchild(root);
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(child);
     cleanup(root);
     eprintln!("sandbox_macos_e2e: {message}");
     let log = logged.join().unwrap_or_default();
@@ -642,6 +638,15 @@ mod tests {
     /// `sandbox-exec -p '(version 1)(allow default)'`, and it is the one input the
     /// nested explanation exists for. Quoting it whole is what keeps this test
     /// measuring the product's rendering instead of a message this file invented.
+    ///
+    /// **A dated record, and left as pasted.** The `step` it names is
+    /// `sandbox-exec -p`, which is what the pre-flight logged on the day it was
+    /// captured; the step was renamed to `preflight` afterwards, and that is the
+    /// name the live product renders and the one this file asserts `step="preflight"`
+    /// for. Rewriting the text would stop it being the string the run produced,
+    /// which is the whole reason it is quoted here — and the explanation reads the
+    /// `sandbox_apply` line rather than the step name, so the record still exercises
+    /// exactly what [NESTED_REFUSAL] exists for.
     const NESTED: &str = "serve refused to start: sandbox error: sandbox step `sandbox-exec -p` \
         failed: exit Some(71): sandbox-exec: sandbox_apply: Operation not permitted";
 
@@ -681,6 +686,11 @@ mod tests {
     /// diagnostic cannot be the predicate — the second case below is that refusal
     /// with the sandbox-exec code and nothing else in common, and it is the one
     /// that would be misread as the environment's doing by a looser test.
+    ///
+    /// Both strings are in [NESTED]'s dated shape: the `step` they name is the
+    /// pre-flight's 2026-09-25 spelling, `sandbox-exec -p`, and not the live
+    /// `preflight` — which is why neither of them can be the nested one, the
+    /// predicate being the `sandbox_apply` line rather than the step name.
     #[test]
     fn a_refusal_that_is_not_the_nested_one_is_returned_untouched() {
         let profile_refused = "serve refused to start: sandbox error: sandbox step `sandbox-exec -p` \

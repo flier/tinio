@@ -16,7 +16,9 @@ use std::{
 use smart_default::SmartDefault;
 use tokio::{fs, sync::watch};
 
-use crate::{backend::FsStorage, error::Error, fsutil::entries_of, pacing, path::TMP_DIR_NAME};
+use crate::{
+    _util::pacing, backend::FsStorage, error::Error, fsutil::entries_of, path::TMP_DIR_NAME,
+};
 
 /// Sweep construction options (contracts/config.md `[s3]` TTLs).
 ///

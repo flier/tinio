@@ -2,7 +2,7 @@
 //!
 //! The second macOS mechanism (design decision 6): where `sandbox-exec` confines
 //! a process it `exec`s, this applies a Seatbelt profile to the process that asks
-//! for it. It carries **two** of the crate's three enumerated `unsafe` sites
+//! for it. It carries **two** of the crate's four enumerated `unsafe` sites
 //! (decision 14): the `libSystem` declarations ([`libsystem`]) and [`validator`]'s
 //! `fork`, which is `unsafe` for a reason of its own — a child of a threaded
 //! process is not something a signature can promise.
@@ -48,31 +48,21 @@
 //! **The fork is bounded at both ends and reports through a pipe rather than an
 //! exit status**, for the reason `tinio-sandbox-linux`'s user-namespace probe is:
 //! the child's whole job is one call, one byte and an exit, and a child that never
-//! answers must be a refusal rather than a launcher that waits forever.
+//! answers must be a refusal rather than a launcher that waits forever. **The
+//! parent's half of that handshake is not this file's** — the non-blocking read,
+//! the `SIGKILL` and the bounded reap are [`await_verdict`]'s, in
+//! `tinio-sandbox-core`, so one implementation of one protocol serves this probe
+//! and the Linux one. What stays here is what only this crate can own: the
+//! `unsafe` `fork`, the child's `libc::_exit`, and the step name every failure of
+//! the handshake carries ([`ProbeSteps::named`]).
 
-use std::{
-    error::Error as StdError,
-    ffi::OsString,
-    fmt,
-    fs::File,
-    io::{self, Read as _, Write as _},
-    os::fd::OwnedFd,
-    result,
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::{ffi::OsString, io, os::fd::OwnedFd, result, time::Duration};
 
-use rustix::{
-    fs::{OFlags, fcntl_setfl},
-    io::Errno,
-    pipe::pipe,
-    process::{Pid, Signal, WaitOptions, kill_process, waitpid},
-};
-use signal_hook::consts::signal::SIGKILL;
+use rustix::{pipe::pipe, process::Pid};
 use tracing::{debug, error, info};
 
 use crate::{
-    _core::{Adopted, Error, Result, fail, step},
+    _core::{Adopted, Error, ProbeSteps, Result, await_verdict, fail, report_verdict, step},
     launch::PREFLIGHT_TIMEOUT,
     mechanism::Mechanism,
     profile::rule_count,
@@ -99,6 +89,11 @@ const VALIDATOR_TIMEOUT: Duration = PREFLIGHT_TIMEOUT;
 
 /// The `step` every validator failure names — one spelling, because the log's
 /// field and the error's field are the same sentence (shared §7).
+///
+/// **One name for the whole handshake, handed to core as such**: the pipe, the
+/// fork and the parent's own refusal all answer to it, and so do the shared
+/// helper's three operations ([`ProbeSteps::named`]) — the non-blocking flag, the
+/// read and the reap.
 const VALIDATOR_STEP: &str = "sandbox-init validator";
 
 /// The `step` every apply record names — one spelling, because the log's field and
@@ -108,14 +103,13 @@ const VALIDATOR_STEP: &str = "sandbox-init validator";
 /// operator's grep is why — the same ruling that made `launch::PREFLIGHT_STEP` a
 /// step's name rather than the command's. This moment has a second record on the other
 /// side of the seam: the CLI reports the apply under `step = "sandbox-init"`
-/// (`tinio-cli`'s `apply_self_confinement`), so one string covers the refusal and the
+/// (`tinio-cli`'s `apply_self_confinement`, which reaches this function through the
+/// facade's platform-neutral name of the same shape —
+/// `tinio_sandbox::apply_self_confinement`), so one string covers the refusal and the
 /// run it refused. The site used to log that name while building its `Error` under
 /// `"apply the SBPL profile"` — one failure, two events, two names, and the second one
 /// spelled at exactly one site in the crate, which is the drift §7 forbids.
 const APPLY_STEP: &str = "sandbox-init";
-
-/// The byte a child writes to answer "the kernel accepted the profile".
-const ACCEPTED: u8 = 1;
 
 /// A parameter list, as the flat name/value pairs [`apply`] takes — the shape
 /// [`Profile::params`](crate::profile::Profile::params) holds, with each value as
@@ -232,7 +226,7 @@ fn refused_by_the_kernel(diagnostic: String) -> Error {
 /// **The three facts the caller's own event reports** (`tinio-cli`'s `step = "sandbox-init"` line):
 /// which mechanism the payload named, how many rules the text it applied grants and how many
 /// parameters it referenced. The counts are this crate's rather than a caller's because the render
-/// is — [`rule_count`](crate::profile::rule_count) reads the SBPL text's own spelling, and a caller
+/// is — [`rule_count`] reads the SBPL text's own spelling, and a caller
 /// counting for itself would be a second reader of one profile.
 ///
 /// # Examples
@@ -254,7 +248,7 @@ fn refused_by_the_kernel(diagnostic: String) -> Error {
 pub struct Applied {
     /// The mechanism the frame named, resolved and applied by [`self_confinement`].
     pub mechanism: Mechanism,
-    /// How many rules the applied text grants — [`rule_count`](crate::profile::rule_count)'s
+    /// How many rules the applied text grants — [`rule_count`]'s
     /// number.
     pub rules: usize,
     /// How many `(param "…")` values the profile referenced, which is the frame's own list length.
@@ -266,9 +260,13 @@ pub struct Applied {
 /// **The two payload refusals are one sentence, and this type is its first half**: what the frame
 /// asks for and why this process may not do it. What the caller does about it — a run refused
 /// rather than served, a probe that fails — is the caller's half, and the two meet at a colon
-/// (`tinio-cli`'s `self_confinement_refused` says so from its side). The classes are variants
+/// (`tinio-cli`'s `sandbox::apply_self_confinement` says so from its side). The classes are variants
 /// rather than one rendered string so that a caller can answer each in its own words without
 /// parsing this type's.
+///
+/// **`thiserror` renders the type**: one `#[error]` per variant, and the kernel's own refusal stays
+/// reachable from the variant that carries it as its `#[source]` rather than being re-rendered
+/// here.
 ///
 /// # Examples
 ///
@@ -282,7 +280,7 @@ pub struct Applied {
 /// };
 /// assert!(refused.to_string().contains("confines the exec"));
 /// ```
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Refused {
     /// The frame names a mechanism this build does not know.
     ///
@@ -290,6 +288,9 @@ pub enum Refused {
     /// [`Mechanism::from_env`] is a parser: the field is the launcher's word for what it resolved,
     /// and a value this build cannot read is a disagreement between the two processes rather than
     /// a mechanism to guess at.
+    #[error(
+        "the launch payload asks for confinement by `{mechanism}`, which this build does not know"
+    )]
     UnknownMechanism {
         /// The spelling the frame carried, which is the whole diagnosis.
         mechanism: String,
@@ -300,6 +301,10 @@ pub enum Refused {
     /// hands the profile to the helper instead — so this is a disagreement between the two
     /// processes rather than a confinement to apply, and applying it would confine a child whose
     /// `exec`-time profile is already in force.
+    #[error(
+        "the launch payload asks this process to apply `{mechanism}`, but that mechanism confines \
+         the exec rather than the child"
+    )]
     WrapsTheExec {
         /// The spelling the frame carried.
         mechanism: String,
@@ -308,38 +313,12 @@ pub enum Refused {
     ///
     /// Carries [`apply`]'s own [`Error`] — the value any caller of that function gets — so the
     /// diagnostic is libSystem's rather than a second sentence about it.
-    Apply(Error),
-}
-
-impl fmt::Display for Refused {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownMechanism { mechanism } => write!(
-                formatter,
-                "the launch payload asks for confinement by `{mechanism}`, which this build does \
-                 not know"
-            ),
-            Self::WrapsTheExec { mechanism } => write!(
-                formatter,
-                "the launch payload asks this process to apply `{mechanism}`, but that mechanism \
-                 confines the exec rather than the child"
-            ),
-            // The apply's `Error` is already the whole sentence — its `step` and the kernel's own
-            // words — so this arm adds nothing to it.
-            Self::Apply(error) => write!(formatter, "{error}"),
-        }
-    }
-}
-
-impl StdError for Refused {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            // The one variant with a cause of its own; the two payload refusals are their own
-            // whole diagnosis, which is what their `Display` renders.
-            Self::Apply(error) => Some(error),
-            Self::UnknownMechanism { .. } | Self::WrapsTheExec { .. } => None,
-        }
-    }
+    // The apply's `Error` is already the whole sentence — its `step` and the kernel's own words —
+    // so this renders it verbatim and adds nothing to it. `#[source]` is what keeps that diagnostic
+    // reachable from the refusal; the other two variants have no cause of their own to reach,
+    // because their sentence is their whole diagnosis.
+    #[error("{0}")]
+    Apply(#[source] Error),
 }
 
 /// Apply the confinement **the launch payload carries** to this process — the child side of the
@@ -349,7 +328,10 @@ impl StdError for Refused {
 /// `apply_self_confinement`) reports what it did as a tracing event and turns a refusal into its
 /// own `Error`; the harness's child (`tests/harness`) asserts. Both reach the rule through this
 /// function, so a mechanism added to [`Mechanism`], or a change to what
-/// [`Mechanism::wraps_the_exec`] answers, is one edit here rather than one per consumer.
+/// [`Mechanism::wraps_the_exec`] answers, is one edit here rather than one per consumer. The
+/// product's path is the facade's neutral name (`tinio_sandbox::apply_self_confinement`), because
+/// what a *platform that cannot apply a frame* does with one is the contract's rule and not this
+/// crate's — this function is the macOS arm of it.
 ///
 /// **`Ok(None)` is every process that is not the child of this mechanism**: a launcher, a `status`
 /// client, an unconfined run, and the child of the mechanism that confines by wrapping its `exec`,
@@ -457,7 +439,7 @@ pub fn self_confinement(adopted: &Adopted) -> result::Result<Option<Applied>, Re
 /// # Errors
 ///
 /// [`Error::Step`] when the pipe, the fork or the reap fails, when the child
-/// outlives [`VALIDATOR_TIMEOUT`], and when the child reports that the kernel
+/// outlives `VALIDATOR_TIMEOUT`, and when the child reports that the kernel
 /// refused the profile.
 ///
 /// # Examples
@@ -492,9 +474,8 @@ pub fn validator(profile: &str, params: &[(String, String)]) -> Result<()> {
         0 => {
             drop(reader);
             let accepted = apply(profile, params).is_ok();
-            let mut writer = File::from(writer);
             // A failed write means the parent is gone; exiting is the whole job.
-            if writer.write_all(&[u8::from(accepted)]).is_err() {
+            if report_verdict(writer, accepted).is_err() {
                 debug!(step = VALIDATOR_STEP, "the validator's parent is gone");
             }
             // **`libc::_exit` rather than `std::process::exit`**: a forked child
@@ -509,25 +490,26 @@ pub fn validator(profile: &str, params: &[(String, String)]) -> Result<()> {
         }
         child => {
             drop(writer);
-            // **The verdict is read first, and the ending is what comes after it,
-            // so a pid this crate cannot name is not a reason to leave a byte
-            // unread.** `Pid::from_raw` answers `None` for a value that is not a
-            // process, which a kernel that just forked cannot produce — and if it
-            // somehow did, the refusal that follows is the honest answer rather
-            // than a `Pid` this code invented.
-            let verdict = read_verdict(File::from(reader));
+            // **The pid is resolved before the handshake, because the handshake
+            // takes one.** `await_verdict` is handed the child's `Pid` rather
+            // than the raw `pid_t` deliberately — a `kill(0, …)` would signal this
+            // process's whole group — and `Pid::from_raw` answers `None` for a
+            // value that is not a process, which a kernel that just forked cannot
+            // produce. If it somehow did, this return drops `reader`: the child's
+            // one-byte write cannot land, gets `EPIPE`, and the child exits, which
+            // is the honest answer rather than a `Pid` this code invented.
             let Some(pid) = Pid::from_raw(child) else {
                 return Err(fail(
                     VALIDATOR_STEP,
                     io::Error::other("the forked child's pid is not a process id"),
                 ));
             };
-            // The child is ended and reaped before the verdict is reported, on
-            // every path: a validator whose child is left running, or left as a
-            // zombie, would outlive the check it was for — and the one path that
-            // needs the ending rather than the wait is the deadline's.
-            end(pid, verdict.is_ok())?;
-            let accepted = verdict?;
+            let accepted = await_verdict(
+                reader,
+                pid,
+                ProbeSteps::named(VALIDATOR_STEP),
+                VALIDATOR_TIMEOUT,
+            )?;
             if accepted {
                 info!(step = VALIDATOR_STEP, "the kernel accepted the profile");
                 return Ok(());
@@ -543,118 +525,11 @@ pub fn validator(profile: &str, params: &[(String, String)]) -> Result<()> {
     }
 }
 
-/// The child's one-byte answer, or a refusal when it does not arrive in time.
-///
-/// **A timeout is a refusal and never an acceptance.** A validator that read a
-/// hang as "the kernel was happy" would start a child whose profile was never
-/// proved — design §11's fail-closed, applied to the question this function asks.
-fn read_verdict(reader: File) -> Result<bool> {
-    // The read end is made non-blocking — `F_SETFL`/`O_NONBLOCK`, which is a
-    // different flag on a different `fcntl` command than the descriptor flags
-    // `launch::make_inheritable` clears — so the read can share the reap's
-    // deadline instead of blocking past it.
-    fcntl_setfl(&reader, OFlags::NONBLOCK).map_err(step(VALIDATOR_STEP))?;
-    let mut reader = reader;
-    let deadline = Instant::now() + VALIDATOR_TIMEOUT;
-    let mut answer = [0u8; 1];
-    loop {
-        match reader.read(&mut answer) {
-            // EOF: the child died without answering, which is a failed check
-            // rather than a "no" — `Ok(false)` is a child that ran and reported
-            // the kernel's refusal.
-            Ok(0) => {
-                return Err(fail(
-                    VALIDATOR_STEP,
-                    io::Error::from(io::ErrorKind::UnexpectedEof),
-                ));
-            }
-            Ok(_) => return Ok(answer[0] == ACCEPTED),
-            // `Interrupted` is retried because a resting pipe is not a reason to
-            // call the check failed, and `WouldBlock` is what the non-blocking end
-            // reports between the child's write and the deadline.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                // **Expiry is a refusal, never a false `Ok`**: a check that
-                // answered "accepted" on a timeout would launch a child against a
-                // profile nothing compiled.
-                if Instant::now() >= deadline {
-                    return Err(fail(
-                        VALIDATOR_STEP,
-                        io::Error::from(io::ErrorKind::TimedOut),
-                    ));
-                }
-                sleep(Duration::from_millis(1));
-            }
-            Err(source) => return Err(fail(VALIDATOR_STEP, source)),
-        }
-    }
-}
-
-/// End and reap the validator's child: a `SIGKILL` and a bounded `NOHANG` reap,
-/// whichever way the read ended.
-///
-/// **`SIGKILL` rather than the child's own exit**, because the path that needs
-/// this most is the deadline's: a child that has not written its byte inside
-/// [`VALIDATOR_TIMEOUT`] is one this process must not wait for, and the kill is
-/// what turns a wedged check into an ordinary failure. The reap is bounded for
-/// the same reason the read was — a process this one may not be able to signal
-/// (it is not this process's to signal once it is a zombie, and the kernel owns
-/// the timing) must not become an unbounded wait, which is the harness hazard the
-/// design's evidence table records.
-///
-/// `happy` is whether the verdict itself was sound; the reap's own failures are
-/// returned only when it was not, so a healthy check is not turned into a failure
-/// by a refused `kill` on a child that had already exited.
-fn end(child: Pid, happy: bool) -> Result<()> {
-    let deadline = Instant::now() + VALIDATOR_TIMEOUT;
-    // A child that has already exited is the ordinary case here, so the signal is
-    // attempted and its answer reported in the log rather than returned: `ESRCH`
-    // is "it is gone", which is what this call wants.
-    if let Some(signal) = Signal::from_named_raw(SIGKILL)
-        && let Err(errno) = kill_process(child, signal)
-    {
-        debug!(
-            step = VALIDATOR_STEP,
-            ?errno,
-            "the validator's child was already gone"
-        );
-    }
-    loop {
-        match waitpid(Some(child), WaitOptions::NOHANG) {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(1)),
-            Ok(None) => {
-                return Err(fail(
-                    VALIDATOR_STEP,
-                    io::Error::from(io::ErrorKind::TimedOut),
-                ));
-            }
-            // A signal that arrived while this process was in `waitpid` is not a
-            // failure of the reap; the poll is retried against the same deadline.
-            Err(Errno::INTR) => {}
-            // A child this process already reaped, or one it cannot wait for, is
-            // reported only when the verdict was unsound anyway: the caller's own
-            // refusal is the operator's diagnosis, and this is the second thing
-            // that went wrong.
-            Err(source) if happy => {
-                debug!(step = VALIDATOR_STEP, error = %source, "the validator's child was not reaped");
-                return Ok(());
-            }
-            Err(source) => return Err(fail(VALIDATOR_STEP, source)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{env, ffi::OsStr, os::unix::ffi::OsStrExt as _};
 
-    use tinio_util::testing::SharedBuf;
-    use tracing::subscriber::with_default;
+    use tinio_util::testing::{assert_recorded_at, assert_step, record_events};
 
     use super::*;
 
@@ -668,39 +543,27 @@ mod tests {
     /// `step` and the error's to one string. A rename at either site fails here rather
     /// than in a log nobody reads.
     ///
-    /// **`with_ansi(false)` is load-bearing for a field assertion** (measured in the
-    /// core's recorder test): without it the subscriber interleaves escapes into the
-    /// field *syntax*, so `step="…"` never appears as such. The level is the one
-    /// `serve`'s subscriber enables rather than `TRACE`, so a failure moved to
-    /// `debug!` would stop being recorded and this leg would lose the property instead
-    /// of keeping it.
+    /// **The field and level assertions below are [`assert_step`]'s and [`assert_recorded_at`]'s**
+    /// (shared §7): the first owns the `with_ansi(false)` prerequisite the recording device carries,
+    /// and the second is where the *level* is held now that one device records every level at
+    /// `DEBUG` — its doc carries why reading the level off the line is the stronger of the two
+    /// checks, and what the filter it replaced could not see.
     #[test]
     fn the_apply_refusal_logs_the_step_it_returns() {
-        let capture = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer({
-                let capture = capture.clone();
-                move || capture.clone()
-            })
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-
-        let error = with_default(subscriber, || {
-            refused_by_the_kernel(String::from("syntax error: expecting ')'"))
-        });
+        let (error, logged) =
+            record_events(|| refused_by_the_kernel(String::from("syntax error: expecting ')'")));
 
         let Error::Step { step, .. } = &error else {
             panic!("the apply's refusal is the core's `step`: {error:?}");
         };
         assert_eq!(*step, APPLY_STEP);
-        let logged = String::from_utf8(capture.0.lock().expect("the capture mutex").clone())
-            .expect("the capture is UTF-8");
-        assert!(
-            logged.contains(&format!("step=\"{APPLY_STEP}\"")),
-            "{logged}"
-        );
+        assert_step(&logged, APPLY_STEP);
         assert!(logged.contains("diagnostic=syntax error"), "{logged}");
+        assert_recorded_at(
+            &logged,
+            &format!("step=\"{APPLY_STEP}\""),
+            tracing::Level::ERROR,
+        );
     }
 
     #[test]

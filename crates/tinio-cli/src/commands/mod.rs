@@ -132,7 +132,15 @@ pub struct DirArgs {
     pub env: EnvArgs,
 }
 
-/// The boolean switches' parser: the tolerant `1`/`true`/`0`/`false` spelling.
+/// The boolean switches' parser: `tinio_util::switch::parse_switch`, the tolerant
+/// `1`/`true`/`0`/`false` spelling and **the one definer of it in this workspace**.
+///
+/// **Re-exported rather than re-spelled, because the flag and the variable are one decision on two
+/// channels.** `TINIO_READ_ONLY`/`TINIO_SANDBOX` are parsed from the environment by `tinio-config`
+/// (`sources.rs`), and the same two names reach the same flags through their `env` attributes
+/// here; while each side carried its own `match`, the four spellings and the refusal's wording were
+/// equal exactly as long as an author remembered the other copy existed, and the answer decides
+/// whether the process protects its root or confines itself.
 ///
 /// **This is what lets `--read-only` and `--sandbox` carry an `env` attribute at all.** clap's
 /// `SetTrue` action parses its values with `ValueParser::bool()`, whose only spellings are the
@@ -145,13 +153,7 @@ pub struct DirArgs {
 /// The strictness is deliberate and matches the contract: a typo must not silently switch a
 /// confinement off (nor serve a writable root), so anything but the four spellings is refused —
 /// an empty value included, which is never "unset" and never `false`.
-pub(crate) fn parse_switch(raw: &str) -> Result<bool, String> {
-    match raw.trim() {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(format!("expected 0/1/true/false, got `{other}`")),
-    }
-}
+pub(crate) use crate::_util::switch::parse_switch;
 
 /// The root, the mode and the ordered state-dir candidates a client command probes — resolved
 /// **once**, for `status`, `stop` and (through the same chain) plan C's `doctor`, and reached

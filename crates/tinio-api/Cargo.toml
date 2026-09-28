@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 axum.workspace = true
+derive_more = { workspace = true, features = ["debug"] }
 getrandom.workspace = true
 hex.workspace = true
 http.workspace = true
@@ -20,6 +21,7 @@ hyper-util = { workspace = true, features = [
 ] }
 prometheus.workspace = true
 rustls-pemfile = { workspace = true, optional = true }
+secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha1.workspace = true
@@ -31,6 +33,7 @@ tracing.workspace = true
 utoipa = { workspace = true, optional = true }
 
 tinio-core.workspace = true
+tinio-util.workspace = true
 
 [features]
 default = ["openapi", "tls"]

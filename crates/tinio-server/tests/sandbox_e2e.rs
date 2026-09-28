@@ -15,85 +15,20 @@
 mod common;
 
 use std::{
-    env, fs,
+    fs,
     io::{self, Read as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
 
 use common::{answer, tinio_bin, wait_for_listening};
-use tinio_sandbox::linux::Mechanism;
-
-/// The one way past a missing precondition, and it is a deliberate opt-in.
-///
-/// **A suite that certifies a confinement does not get to skip in silence**: a
-/// precondition that is absent fails the run by default, so a host that cannot
-/// confine can never report a pass for a server that was never jailed. An
-/// operator who knows this machine cannot confine sets this variable and means
-/// it. The rule and the variable are the jail test's (`tinio-sandbox-linux`'s
-/// `tests/jail.rs`), spelled the same way so one habit covers both.
-const ALLOW_SKIP: &str = "TINIO_SANDBOX_ALLOW_SKIP";
-
-/// The model the run asked for, read from the same variable `tinio server` reads,
-/// so the precondition below is asked about the leg that is actually running.
-fn requested_model() -> Mechanism {
-    Mechanism::from_env(env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
-        .expect("TINIO_SANDBOX_MODEL must name a model")
-}
-
-/// Whether this host can confine under `model` — the same precondition as the
-/// jail test's, and asked **before** the server is spawned.
-///
-/// The earlier shape of this test read the server's stderr *after* it failed to
-/// print an endpoint and skipped on a substring ("sandbox unsupported",
-/// "Operation not permitted"), which is a skip a broken confinement can
-/// produce as easily as an unprivileged host: anything that makes `tinio server`
-/// die early while mentioning permissions reports a green suite. The question has a
-/// positive answer, so it is asked first and the failure becomes a failure.
-///
-/// Each variant asks for the namespaces it needs — `--user --map-root-user` for
-/// the user-namespace model, a bare `--mount` for the root model, whose single
-/// capability is `CAP_SYS_ADMIN` — and `Auto` takes either. The two legs of the
-/// WSL2 script set `TINIO_SANDBOX_MODEL`, so `requested_model` is what the
-/// server will resolve, not a guess about it.
-///
-/// `Err` carries the `unshare(1)` invocations that answered no, spelled as an
-/// operator would retype them: the caller's message has to name the command it
-/// tried, which is the whole difference between a legible skip and a shrug.
-fn host_can_confine(model: Mechanism) -> Result<(), String> {
-    let user: &[&str] = &["--user", "--map-root-user"];
-    let mount: &[&str] = &["--mount"];
-    let probes: &[&[&str]] = match model {
-        Mechanism::UserNamespace => &[user],
-        Mechanism::Root => &[mount],
-        Mechanism::Auto => &[user, mount],
-    };
-    if probes.iter().any(|flags| unshare_probe(flags)) {
-        return Ok(());
-    }
-    Err(probes
-        .iter()
-        .map(|flags| format!("unshare {} true", flags.join(" ")))
-        .collect::<Vec<_>>()
-        .join(" and "))
-}
-
-/// `unshare(1)` with `flags`, as a process of its own — the program the WSL2
-/// script gates on, so the script and the test agree by construction.
-///
-/// A missing `unshare(1)` panics rather than skipping: the precondition is then
-/// unknowable, and a suite that cannot tell "this host cannot confine" from "I
-/// could not ask" is the shape this function exists to delete.
-fn unshare_probe(flags: &[&str]) -> bool {
-    Command::new("unshare")
-        .args(flags)
-        .arg("true")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or_else(|err| panic!("the precondition needs util-linux's `unshare(1)`: {err}"))
-}
+// **The precondition is `tinio-sandbox-linux`'s** — the same reader of
+// `TINIO_SANDBOX_MODEL` the confined child uses, and the same `unshare(1)` probes
+// the jail suite asks, so this leg and that suite cannot drift apart on what a
+// host must grant. What stays here is the part that is this file's own: which
+// failure each answer becomes.
+use tinio_sandbox::linux::testing::{host_can_confine, requested_model};
+use tinio_util::testing::{host_cannot, kill_and_reap};
 
 /// Kill and reap the child, then fail with `message` and the stderr it left.
 ///
@@ -103,8 +38,7 @@ fn unshare_probe(flags: &[&str]) -> bool {
 /// own. Reaping also ends the reader thread, whose pipe reaches EOF at the
 /// child's death, so the stderr read below cannot block.
 fn fail(child: &mut Child, message: &str) -> ! {
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(child);
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
@@ -114,31 +48,21 @@ fn fail(child: &mut Child, message: &str) -> ! {
 
 /// The precondition every leg of this file asks before it spawns anything:
 /// `false` when this host cannot confine under the model the run asked for and
-/// [`ALLOW_SKIP`] was set deliberately, which is the only case in which a leg
-/// returns unasserted.
+/// the operator opted out through [`host_cannot`]'s variable, which is the only
+/// case in which a leg returns unasserted.
 ///
-/// **A skip printed through `eprintln!` alone is a silent one**: libtest
-/// swallows it without `--nocapture`, so a host that cannot confine reported a
-/// green run that certified nothing. The opt-in is what makes the skip a
-/// statement an operator made rather than one the suite made for them.
-///
-/// One function rather than one copy per leg, because the skip rule is the
+/// **One function rather than one copy per leg**, because the skip rule is the
 /// thing a second leg is most likely to get subtly wrong — a leg that skipped
 /// without the opt-in would certify a server that was never jailed, which is
-/// exactly what design §12 refuses.
+/// exactly what design §12 refuses. The order of the assertion and the print,
+/// and the variable they name, are the shared device's.
 fn confinement_available() -> bool {
     let model = requested_model();
     if let Err(tried) = host_can_confine(model) {
-        assert!(
-            env::var(ALLOW_SKIP).is_ok_and(|value| !value.is_empty()),
-            "this host cannot confine under {model:?}: the precondition `{tried}` failed, so this \
-             run would certify a server that was never jailed. WSL2 is where both legs are \
-             verified (design §12). Set {ALLOW_SKIP}=1 to skip deliberately on a host that \
-             genuinely cannot confine."
-        );
-        eprintln!(
-            "skipping: this host cannot confine under {model:?} and {ALLOW_SKIP} is set (design \
-             §12)"
+        host_cannot(
+            &format!("a server confined under {model:?}"),
+            &format!("the precondition `{tried}` failed"),
+            ". WSL2 is where both legs are verified (design §12)",
         );
         return false;
     }

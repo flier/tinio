@@ -20,6 +20,7 @@ use tinio_sandbox::{
         control, sid, testing,
     },
 };
+use tinio_util::testing::kill_and_reap;
 
 use super::common::{SECRET_KEY, answer as probe, tinio_bin, wait_for_listening};
 
@@ -216,8 +217,7 @@ fn field(line: &str, name: &str) -> Option<String> {
 /// only thing that can (decision 20).
 impl Drop for Run {
     fn drop(&mut self) {
-        let _ = self.launcher.kill();
-        let _ = self.launcher.wait();
+        kill_and_reap(&mut self.launcher);
     }
 }
 
@@ -379,8 +379,7 @@ pub struct Exit {
 /// holding the job, the ACEs and the image the next build of the binary needs.
 impl Drop for Exit {
     fn drop(&mut self) {
-        let _ = self.launcher.kill();
-        let _ = self.launcher.wait();
+        kill_and_reap(&mut self.launcher);
     }
 }
 
@@ -414,23 +413,6 @@ impl Exit {
     pub(super) fn log_text(&self) -> String {
         fs::read_to_string(&self.log).expect("the launcher's log")
     }
-}
-
-/// `icacls <path> <args…>`, **checked**: a refusal here is the fixture's failure and
-/// not the product's, so it fails the leg with the tool's own text rather than
-/// leaving an assertion to discover the missing ACE.
-pub fn icacls_with(path: &Path, args: &[&str]) {
-    let output = Command::new(acl::icacls_binary())
-        .arg(path)
-        .args(args)
-        .output()
-        .unwrap_or_else(|err| panic!("run icacls on {}: {err}", path.display()));
-    assert!(
-        output.status.success(),
-        "icacls {} {args:?}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// The SID of the account this process runs as — `whoami`'s own answer, in the
@@ -494,8 +476,12 @@ pub fn seal_to_current_user(dir: &Path) {
         Target::Directory,
         AccessMode::ReadWrite,
     );
-    icacls_with(dir, &["/inheritance:r"]);
-    icacls_with(dir, &["/grant:r", &spec, "/q"]);
+    // Both calls go through the crate's own re-export (`testing::icacls`, the same
+    // function [`icacls`] delegates to), which is **checked**: a refusal here is the
+    // fixture's failure and not the product's, so the leg fails with the tool's own text
+    // rather than leaving an assertion to discover the missing ACE.
+    testing::icacls(dir, &["/inheritance:r"]);
+    testing::icacls(dir, &["/grant:r", &spec, "/q"]);
     // The precondition itself, read back: a seal that did not take would let the
     // confined child through and turn the leg's subject into its fixture's accident.
     let listing = icacls(dir);
@@ -553,7 +539,8 @@ pub fn host_ready() -> bool {
     let Some(reason) = host_missing() else {
         return true;
     };
-    testing::host_cannot("the confined server suite", &reason, " (design §12)")
+    testing::host_cannot("the confined server suite", &reason, " (design §12)");
+    false
 }
 
 /// Which host capability is missing, if either — the one reason [`host_ready`]
@@ -616,8 +603,7 @@ pub fn host_can_confine() -> Result<(), String> {
 /// listener, its job and its ACEs for the life of the test process, and the leg
 /// that failed is the one whose launcher is least likely to exit on its own.
 pub fn fail(launcher: &mut Child, log: &Path, message: &str) -> ! {
-    let _ = launcher.kill();
-    let _ = launcher.wait();
+    kill_and_reap(launcher);
     panic!(
         "{message}; the launcher's log:\n{}",
         fs::read_to_string(log).unwrap_or_default()

@@ -70,16 +70,22 @@ fn try_run() -> Result<ExitCode, Error> {
     // every ordinary run, so those runs pay one `is_some` check and nothing else.
     //
     // **A free function rather than a method on `Adopted`**, which is the core's: the
-    // apply is the platform's (`tinio_sandbox::macos::apply` through the facade's
-    // platform-neutral name), and the core is `forbid` for `unsafe` and knows no
-    // mechanism.
+    // rule is the contract's (`tinio_sandbox::apply_self_confinement`, which applies the
+    // platform's own answer where one exists), and the core is `forbid` for `unsafe` and
+    // knows no mechanism.
+    //
+    // **The call is on every target, and that is the rule rather than an omission.** Which
+    // platform can apply a frame's confinement is the facade's answer, not this file's: a
+    // process whose platform applies its confinement at creation or in place has no spec to
+    // apply and refuses one instead of serving without it, so a `#[cfg]` here would be a
+    // target where a forged frame serves unconfined. The frame's own presence is the
+    // discriminator, which is the same question `adopted.is_some()` asks above.
     //
     // **The refusal is framed on stdout beside the `tinio: …` line stderr carries**,
     // for the reason every other pre-dispatch refusal is (decision 19's "a startup
     // failure is an event rather than an absence"): what fails here is a confined
     // child, which is a process a launcher is waiting on a frame from. A bare return
     // would leave that launcher decoding a child that exited without saying why.
-    #[cfg(all(feature = "sandbox", target_os = "macos"))]
     if let Some(adopted) = adopted.as_ref()
         && let Err(err) = sandbox::apply_self_confinement(adopted)
     {

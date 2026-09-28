@@ -34,6 +34,7 @@ use std::{
 };
 
 use tinio_sandbox_windows::control;
+use tinio_util::testing::{kill_and_reap, wait_for_path};
 
 /// How often this suite looks at a file: the resolution of every window below.
 const POLL: Duration = Duration::from_millis(50);
@@ -120,8 +121,7 @@ impl Owned {
     /// Kill it and reap it.
     fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
         }
     }
 }
@@ -130,18 +130,6 @@ impl Drop for Owned {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Whether `path` appears within `within`, polling every [`POLL`].
-fn appears(path: &Path, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        thread::sleep(POLL);
-    }
-    path.exists()
 }
 
 /// Watch `stopped` for `within` while the child beats, failing the moment it
@@ -186,7 +174,7 @@ fn a_stop_addressed_at_the_launcher_reaches_the_confined_child() {
     // The child's hook is installed: from here a forwarded stop has somewhere to
     // land instead of taking the default disposition.
     assert!(
-        appears(&armed, common::TIMEOUT),
+        wait_for_path(&armed, common::TIMEOUT, POLL),
         "the confined child never armed its stop hook: nothing would have caught a forwarded stop, \
          and this run proves nothing about the relay"
     );
@@ -198,7 +186,7 @@ fn a_stop_addressed_at_the_launcher_reaches_the_confined_child() {
     // forward can have reached. `send_stop` returning `Ok` above says only that
     // the call was accepted.
     assert!(
-        appears(&stopped, WINDOW),
+        wait_for_path(&stopped, WINDOW, POLL),
         "the confined child's stop hook never fired within {WINDOW:?}: the launcher did not forward \
          the stop to the child's process group (design §3 step 9)"
     );
@@ -242,7 +230,7 @@ fn the_stop_reaches_the_group_it_addresses_and_reaches_no_other() {
         (&other_tree, "the other"),
     ] {
         assert!(
-            appears(&tree.report.join(common::ARMED), common::TIMEOUT),
+            wait_for_path(&tree.report.join(common::ARMED), common::TIMEOUT, POLL),
             "the {what} child never armed its stop hook"
         );
     }
@@ -250,7 +238,7 @@ fn the_stop_reaches_the_group_it_addresses_and_reaches_no_other() {
     control::send_stop(addressed.group()).expect("a console to deliver a stop on");
 
     assert!(
-        appears(&addressed_stopped, WINDOW),
+        wait_for_path(&addressed_stopped, WINDOW, POLL),
         "the hook of the process group the stop was addressed to never fired: the event did not \
          reach the group it named"
     );

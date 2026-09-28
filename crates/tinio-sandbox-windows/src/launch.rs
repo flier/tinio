@@ -111,7 +111,14 @@ pub fn listener(adopted: &Adopted) -> Result<TcpListener> {
             io::Error::other("the launch named no listener descriptor"),
         )
     })?;
-    socket::from_value(fd as u64)
+    let listener = socket::from_value(fd as u64)?;
+    // A `std` socket is created blocking on Windows. The mode is inherited by every accepted
+    // connection, and tokio cannot see it (`check_socket_for_blocking` is a no-op off unix), so
+    // hyper's next read blocks a worker inside `recv`. The child's copy is the one that serves.
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| launch("mark the listener nonblocking", "listener", source))?;
+    Ok(listener)
 }
 
 /// Run `handler` when this process is stopped: the child-side half of the signal

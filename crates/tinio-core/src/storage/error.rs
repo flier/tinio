@@ -364,4 +364,54 @@ mod tests {
             other => panic!("expected PartTooSmall, got {other:?}"),
         }
     }
+
+    #[test]
+    fn error_helpers_build_their_own_variant() {
+        // The constructors are the crate's one spelling per failure — the
+        // backends call these, never the variants — and the variant IS
+        // what the S3 layer maps to a status and an error code (404
+        // `NoSuchBucket` vs 409 `BucketAlreadyOwnedByYou` vs 416
+        // `InvalidRange`). A helper that built its neighbour's variant,
+        // or swapped a two-number payload, would answer the wrong code
+        // with every other test still green: each variant renders its
+        // own message, so the rendering pins both.
+        let bucket = bucket::name("data").unwrap();
+        let key = object::key("dir/file.txt").unwrap();
+
+        let cases = [
+            (no_such_bucket(&bucket), "no such bucket: `data`"),
+            (no_such_key(&key), "no such object: `dir/file.txt`"),
+            (
+                no_such_upload("abc-123"),
+                "no such multipart upload: `abc-123`",
+            ),
+            (already_exists(&bucket), "already exists: `data`"),
+            (not_empty(&bucket), "bucket is not empty: `data`"),
+            (invalid_part_number(0), "invalid part number: 0"),
+            (invalid_part(3), "invalid part: 3"),
+            (no_parts(), "no parts uploaded"),
+            (
+                too_many_uploads(4),
+                "too many in-progress multipart uploads (limit: 4)",
+            ),
+            (
+                entity_too_large(7, 6),
+                "entity too large: 7 bytes exceeds the 6-byte limit",
+            ),
+            (access_denied(&key), "access denied: `dir/file.txt`"),
+            (
+                io(IoError::from(ErrorKind::NotFound)),
+                "I/O error: entity not found",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+
+        let src = "x".parse::<u32>().unwrap_err();
+        assert_eq!(
+            invalid_part_key(src.clone()).to_string(),
+            format!("invalid part key: {src}")
+        );
+    }
 }

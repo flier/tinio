@@ -35,6 +35,12 @@
 //! site to stop composing its own, on 2026-09-26, when the `tinio-util` edge landed and its private
 //! copy went with it.
 
+#[cfg(windows)]
+use std::{
+    borrow::Cow,
+    ffi::OsString,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+};
 use std::{
     fs::canonicalize,
     path::{Component, Path, PathBuf},
@@ -73,7 +79,14 @@ use std::{
 /// shape: `std::fs::canonicalize` answers a verbatim path (`\\?\D:\data`,
 /// or `\\?\UNC\srv\share\data` for a UNC root) while
 /// `std::path::absolute` answers the plain form (`D:\data`,
-/// `\\srv\share\data`).
+/// `\\srv\share\data`). **The respelling is the Windows-only
+/// `plain_spelling` below, and it reads the UTF-16 units rather than
+/// `to_str`**, so a path whose bytes are not valid Unicode is respelled too
+/// — the pairing is for *either spelling of one path*, and a path that is
+/// not text has two spellings as much as any other. The `to_str` version
+/// this replaced answered "no plain form" for exactly such a path, which
+/// left its two spellings unpaired — the pairing below is where that showed
+/// up.
 ///
 /// **Respell both, and that is a correction rather than symmetry.** The
 /// rule first respelled only the root, on the argument that only the root
@@ -94,6 +107,23 @@ use std::{
 ///
 /// A path that starts with itself is contained (the comparison includes
 /// equality), so a state directory equal to the root is an in-root one.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_util::path::path_contains;
+///
+/// assert!(path_contains(Path::new("data/state"), Path::new("data")));
+/// assert!(
+///     path_contains(Path::new("data"), Path::new("data")),
+///     "a path starts with itself, so the root is its own in-root case"
+/// );
+/// // Component-wise, never a string prefix: `data2` merely starts with the root's
+/// // name, so it is a sibling rather than a child.
+/// assert!(!path_contains(Path::new("data2/state"), Path::new("data")));
+/// ```
 pub fn path_contains(candidate: &Path, root: &Path) -> bool {
     #[cfg(not(windows))]
     {
@@ -101,18 +131,34 @@ pub fn path_contains(candidate: &Path, root: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        // Bound rather than inlined: `plain` answers an owned path per side, and
-        // the comparison below borrows both.
-        let plain_candidate = plain(candidate);
-        let plain_root = plain(root);
-        let candidates = [Some(candidate), plain_candidate.as_deref()];
-        let roots = [Some(root), plain_root.as_deref()];
+        // Bound rather than inlined: each plain spelling is a borrow of its `Cow` (owned
+        // only for the paths the strip changed), and both pairing sets borrow them.
+        let candidate_plain = plain_spelling(candidate);
+        let root_plain = plain_spelling(root);
+        // A path with no verbatim prefix *is* its plain spelling, and the `Cow` hands that
+        // path back unchanged, so that side contributes one spelling rather than the same
+        // one twice. The `Option` this replaced deduplicated the same way, and answered
+        // "no plain spelling" for a path whose bytes are not valid Unicode as well — which
+        // is the pairing that was missing.
+        let candidates = [
+            Some(candidate),
+            (candidate_plain.as_ref() != candidate).then_some(candidate_plain.as_ref()),
+        ];
+        let roots = [
+            Some(root),
+            (root_plain.as_ref() != root).then_some(root_plain.as_ref()),
+        ];
+        // The root's components are folded once rather than per candidate: the pairings below
+        // cross two spellings of each side, so a root rebuilt inside the inner closure is the
+        // same list computed up to twice over.
+        let roots: Vec<_> = roots
+            .iter()
+            .flatten()
+            .map(|root| lower_components(root))
+            .collect();
         candidates.into_iter().flatten().any(|candidate| {
             let candidate = lower_components(candidate);
-            roots
-                .iter()
-                .flatten()
-                .any(|root| candidate.is_within(&lower_components(root)))
+            roots.iter().any(|root| candidate.is_within(root))
         })
     }
 }
@@ -225,36 +271,186 @@ fn resolved_path(path: &Path) -> Option<PathBuf> {
 /// the served writable subtree this rule exists to close. `None` from either resolution
 /// contributes nothing, so the literal answer stands and a path that does not exist cannot leak
 /// through a symlink either.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_util::path::contains_under_any_spelling;
+///
+/// // The literal pair, and an operator's own spelling of the same directory: both
+/// // name a state directory inside the root.
+/// assert!(contains_under_any_spelling(
+///     Path::new("data/state"),
+///     Path::new("data")
+/// ));
+/// assert!(contains_under_any_spelling(
+///     Path::new("./data/.tinio"),
+///     Path::new("data")
+/// ));
+/// // The widening is over spellings of one path, never over which paths are inside:
+/// // a sibling stays outside.
+/// assert!(!contains_under_any_spelling(
+///     Path::new("data2/state"),
+///     Path::new("data")
+/// ));
+/// ```
 pub fn contains_under_any_spelling(candidate: &Path, root: &Path) -> bool {
     // Bound rather than inlined: both resolved forms are owned, and every comparison below borrows
     // a side. `None` is "nothing along this path resolves" rather than "resolve it again" — a path
     // with no resolvable ancestor keeps the literal answer it already had.
     let resolved_candidate = resolved_path(candidate);
     let resolved_root = resolved_path(root);
-    // The canonical-root case first, because it is the common one and the two-pairing answer is
-    // the same answer: `None` means the root has no resolvable ancestor (so the last two pairings
+    contained(
+        candidate,
+        root,
+        resolved_candidate.as_deref(),
+        resolved_root.as_deref(),
+    )
+}
+
+/// **Both directions over one pair of resolutions** — the form for a caller that has to ask the
+/// question both ways about one pair of paths.
+///
+/// The containment question is symmetric in its arguments but the resolution is not: asking it
+/// through [`contains_under_any_spelling`] twice resolves each path twice, so a guard that
+/// refuses "either inside the other" pays four ancestor walks where two decide both directions.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_util::path::contains_under_any_spelling_either_way;
+///
+/// assert_eq!(
+///     contains_under_any_spelling_either_way(Path::new("data/state"), Path::new("data")),
+///     (true, false)
+/// );
+/// ```
+pub fn contains_under_any_spelling_either_way(a: &Path, b: &Path) -> (bool, bool) {
+    let resolved_a = resolved_path(a);
+    let resolved_b = resolved_path(b);
+    (
+        contained(a, b, resolved_a.as_deref(), resolved_b.as_deref()),
+        contained(b, a, resolved_b.as_deref(), resolved_a.as_deref()),
+    )
+}
+
+/// The pairings, over resolutions the caller already holds — the body both public forms share.
+fn contained(
+    candidate: &Path,
+    root: &Path,
+    resolved_candidate: Option<&Path>,
+    resolved_root: Option<&Path>,
+) -> bool {
+    // The two pairings that never involve the root's own resolution: the candidate as the caller
+    // spelled it, and the candidate resolved, each against the root the caller named.
+    let literal = path_contains(candidate, root)
+        || resolved_candidate.is_some_and(|candidate| path_contains(candidate, root));
+    // The canonical-root case, because it is the common one and `literal` is already the whole
+    // answer: `None` means the root has no resolvable ancestor (so the last two pairings
     // contribute nothing), and `Some(root)` means the resolution was the identity (so they repeat
-    // the first two). Either way the walks and comparisons below are skipped.
-    if resolved_root
-        .as_deref()
-        .is_none_or(|resolved| resolved == root)
-    {
-        return path_contains(candidate, root)
-            || resolved_candidate
-                .as_deref()
-                .is_some_and(|candidate| path_contains(candidate, root));
+    // `literal`). Either way the walks below are skipped.
+    if resolved_root.is_none_or(|resolved| resolved == root) {
+        return literal;
     }
-    path_contains(candidate, root)
+    literal
+        || resolved_root.is_some_and(|root| path_contains(candidate, root))
         || resolved_candidate
-            .as_deref()
-            .is_some_and(|candidate| path_contains(candidate, root))
-        || resolved_root
-            .as_deref()
-            .is_some_and(|root| path_contains(candidate, root))
-        || resolved_candidate
-            .as_deref()
-            .zip(resolved_root.as_deref())
+            .zip(resolved_root)
             .is_some_and(|(candidate, root)| path_contains(candidate, root))
+}
+
+/// The plain (non-verbatim) spelling of `path` — **the strip runs on the
+/// UTF-16 units, never on a `&str`.**
+///
+/// `\\?\E:\data` becomes `E:\data`, and `\\?\UNC\srv\share\data` becomes
+/// `\\srv\share\data`. The two spellings are one directory, and the
+/// producers of these paths disagree about which one names it:
+/// [`canonicalize`] answers the verbatim form while
+/// `std::path::absolute`, an operator writing `TINIO_STATE_DIR` by hand,
+/// and any log line or shell completion that hands a path back answer the
+/// plain one. A path with no verbatim prefix is borrowed back unchanged,
+/// which is the whole of the "already plain" case — [`Cow::Borrowed`] is
+/// the caller's own path rather than a copy of it.
+///
+/// **A failed [`Path::to_str`] is not a reason to skip the strip.** A
+/// Windows path is arbitrary UTF-16, so the path behind a verbatim prefix
+/// need not be text at all: `\\?\E:\data\<U+D800>` and `E:\data\<U+D800>`
+/// are one directory, and a strip that read only what `to_str` could read
+/// left them two spellings — one directory under two names. Both prefixes
+/// are ASCII, which is what makes a comparison on a unit stream meaningful
+/// in the first place.
+///
+/// **This is the rule's one home.** It was written twice — the strip here
+/// read `to_str` and answered "no plain form" for a path that is not text,
+/// so [`path_contains`] never paired the two spellings of such a path,
+/// while the Windows sandbox crate's private copy stripped them on the
+/// units — and the two policies disagreed exactly where it costs most,
+/// because the sandbox derives one root's AppContainer profile name from
+/// the answer: two names for one directory is two profiles (its decision
+/// 21). A rule with two implementations has two policies, which is why the
+/// copy lives here now.
+///
+/// # Examples
+///
+/// ```
+/// use std::{
+///     borrow::Cow,
+///     ffi::OsString,
+///     os::windows::ffi::OsStringExt,
+///     path::{Path, PathBuf},
+/// };
+///
+/// use tinio_util::path::plain_spelling;
+///
+/// assert_eq!(
+///     plain_spelling(Path::new(r"\\?\E:\data")).as_ref(),
+///     Path::new(r"E:\data"),
+/// );
+/// assert_eq!(
+///     plain_spelling(Path::new(r"\\?\UNC\srv\share\data")).as_ref(),
+///     Path::new(r"\\srv\share\data"),
+/// );
+/// // A path that is already plain comes back borrowed rather than copied.
+/// assert!(matches!(
+///     plain_spelling(Path::new(r"E:\data")),
+///     Cow::Borrowed(_)
+/// ));
+///
+/// // The units, and not `to_str`: this path is a directory like any other, and the
+/// // strip has to see it — one directory spelled two ways is two names for whoever
+/// // derives a name from it.
+/// let mut plain: Vec<u16> = r"E:\data\".encode_utf16().collect();
+/// plain.push(0xD800);
+/// let mut verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+/// verbatim.extend_from_slice(&plain);
+/// assert_eq!(
+///     plain_spelling(&PathBuf::from(OsString::from_wide(&verbatim))).as_ref(),
+///     Path::new(&OsString::from_wide(&plain)),
+/// );
+/// ```
+#[cfg(windows)]
+pub fn plain_spelling(path: &Path) -> Cow<'_, Path> {
+    // Both prefixes are ASCII, so comparing them as units says what comparing
+    // them as text would — and the units are all a path that is not text offers.
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let Some(rest) = units.strip_prefix(verbatim.as_slice()) else {
+        return Cow::Borrowed(path);
+    };
+    let unc: Vec<u16> = r"UNC\".encode_utf16().collect();
+    let stripped = match rest.strip_prefix(unc.as_slice()) {
+        Some(share) => {
+            let mut joined: Vec<u16> = r"\\".encode_utf16().collect();
+            joined.extend_from_slice(share);
+            joined
+        }
+        None => rest.to_vec(),
+    };
+    Cow::Owned(PathBuf::from(OsString::from_wide(&stripped)))
 }
 
 /// A path reduced to the names that decide containment, and whether it was
@@ -401,7 +597,12 @@ fn components(path: &Path) -> Reduced {
 ///
 /// A path whose bytes are not valid Unicode is folded lossily inside
 /// [`components`]; NTFS cannot express two such names as distinct either, so the
-/// approximation cannot hide a real in-root state dir.
+/// approximation cannot hide a real in-root state dir. **The loss is a merge
+/// rather than a skip, which is what makes it safe and what separates it from
+/// the strip beside it**: folding two such names onto one string can only answer
+/// "contained" for a path that is not, and that is the refusing direction, while
+/// [`plain_spelling`] may not skip a spelling at all — a skipped spelling is one
+/// directory under two names, which is the direction that grants.
 #[cfg(windows)]
 fn lower_components(path: &Path) -> Reduced {
     let reduced = components(path);
@@ -413,22 +614,6 @@ fn lower_components(path: &Path) -> Reduced {
             .map(|part| part.to_lowercase())
             .collect(),
     }
-}
-
-/// The plain (non-verbatim) form of a canonical root:
-/// `std::fs::canonicalize` answers a verbatim path (`\\?\C:\data`, or
-/// `\\?\UNC\srv\share\data` for a UNC root) while
-/// `std::path::absolute` answers the plain form (`C:\data`,
-/// `\\srv\share\data`). `None` when the path carries no verbatim prefix —
-/// including a path [`Path::to_str`] cannot read (an unpaired surrogate,
-/// say), which has no plain form to hand back rather than one made up.
-#[cfg(windows)]
-fn plain(root: &Path) -> Option<PathBuf> {
-    let text = root.to_str()?.strip_prefix(r"\\?\")?;
-    Some(match text.strip_prefix("UNC\\") {
-        Some(unc) => PathBuf::from(format!(r"\\{unc}")),
-        None => PathBuf::from(text),
-    })
 }
 
 #[cfg(test)]
@@ -835,6 +1020,91 @@ mod tests {
             Path::new(r"\\?\E:\data"),
             Path::new(r"E:\data\state")
         ));
+    }
+
+    /// The strip itself, on the two shapes `canonicalize` produces and on the
+    /// identity case: `\\?\D:\data` is `D:\data`, `\\?\UNC\srv\share\data` is
+    /// `\\srv\share\data`, and a path with no verbatim prefix is returned
+    /// **borrowed** rather than copied. `UNC\` is the share form only
+    /// immediately after the prefix — a directory *called* `UNC` under a
+    /// verbatim drive is a plain directory, not a share.
+    #[cfg(windows)]
+    #[test]
+    fn windows_strips_the_verbatim_prefix() {
+        assert_eq!(
+            plain_spelling(Path::new(r"\\?\D:\data")).as_ref(),
+            Path::new(r"D:\data")
+        );
+        assert_eq!(
+            plain_spelling(Path::new(r"\\?\UNC\srv\share\data")).as_ref(),
+            Path::new(r"\\srv\share\data")
+        );
+        assert_eq!(
+            plain_spelling(Path::new(r"\\?\D:\UNC\data")).as_ref(),
+            Path::new(r"D:\UNC\data")
+        );
+        for plain in [r"D:\data", r"\\srv\share\data", r"relative\data"] {
+            assert!(
+                matches!(plain_spelling(Path::new(plain)), Cow::Borrowed(_)),
+                "{plain} carries no verbatim prefix, so it is its own plain spelling"
+            );
+        }
+    }
+
+    /// **The pairing the `to_str` strip skipped, and the reason the strip reads
+    /// the units.** A Windows path is arbitrary UTF-16, so the root behind a
+    /// verbatim prefix need not be text: `\\?\D:\data\<U+D800>` and
+    /// `D:\data\<U+D800>` are one directory. The version this replaced answered
+    /// "no plain form" for such a path — its `to_str` failed — so the two
+    /// spellings were never paired and [`path_contains`] answered `false`, which
+    /// on the sandbox side is two names and so two profiles for one root (its
+    /// decision 21).
+    ///
+    /// The sibling beside it is asserted outside, so the leg is a comparison
+    /// rather than a blanket `true`, and both directions are probed because
+    /// *either* side of the comparison can arrive verbatim: the root from
+    /// `canonicalize`, the candidate from an operator who pasted one.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pairs_the_two_spellings_of_a_root_that_is_not_text() {
+        let mut units: Vec<u16> = r"D:\data\".encode_utf16().collect();
+        units.push(0xD800);
+        let plain = PathBuf::from(OsString::from_wide(&units));
+        let mut verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+        verbatim.extend_from_slice(&units);
+        let verbatim = PathBuf::from(OsString::from_wide(&verbatim));
+
+        assert!(
+            plain.to_str().is_none(),
+            "the leg is vacuous unless the path really is not text: {plain:?}"
+        );
+        assert_eq!(plain_spelling(&verbatim).as_ref(), plain.as_path());
+
+        // The plain spelling of the verbatim root is the root, and the other way
+        // round; the candidate is the verbatim spelling an operator can paste.
+        assert!(
+            path_contains(&plain, &verbatim),
+            "one directory's two spellings must compare as one: {plain:?} vs {verbatim:?}"
+        );
+        assert!(path_contains(&verbatim.join("state"), &plain));
+
+        // Still component-wise: a sibling past the drive is outside in either
+        // spelling of the root.
+        let mut sibling: Vec<u16> = r"D:\data2\".encode_utf16().collect();
+        sibling.push(0xD800);
+        let sibling = PathBuf::from(OsString::from_wide(&sibling));
+        assert!(!path_contains(&sibling, &verbatim));
+        assert!(!path_contains(&sibling, &plain));
+
+        // The UNC form, unit by unit: the other prefix the strip reads.
+        let mut units: Vec<u16> = r"\\?\UNC\srv\share\".encode_utf16().collect();
+        units.push(0xDC00);
+        let share = PathBuf::from(OsString::from_wide(&units));
+        let mut units: Vec<u16> = r"\\srv\share\".encode_utf16().collect();
+        units.push(0xDC00);
+        let plain_share = PathBuf::from(OsString::from_wide(&units));
+        assert_eq!(plain_spelling(&share).as_ref(), plain_share.as_path());
+        assert!(path_contains(&plain_share, &share));
     }
 
     /// A candidate whose bytes are not valid Unicode is folded lossily

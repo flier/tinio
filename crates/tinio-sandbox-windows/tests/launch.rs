@@ -89,12 +89,11 @@ fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
         &[],
         &[OsString::from("child_role"), OsString::from("--exact")],
     );
-    let frame = serde_json::to_vec(&LaunchPayload {
-        config: probe.to_string_lossy().into_owned(),
-        token: None,
-        confinement: None,
-    })
-    .expect("the payload serializes");
+    // The frame is the core's `encode_frame`'s — the payload derives no
+    // `Serialize` — and the configuration it carries is the probe file's path,
+    // which is what the child role reads back out of the payload.
+    let frame = LaunchPayload::encode_frame(&probe.to_string_lossy(), None, None)
+        .expect("the frame is one JSON object");
     handles::write_payload(&mut payload_pipe, &frame)
         .expect("write the frame into the child's stdin");
     let stderr = handles::inherited_stderr().expect("the launcher's stderr");

@@ -7,12 +7,10 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Read},
     net::SocketAddr,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -22,42 +20,34 @@ use tinio_config::{
     state::STATE_DIR_VAR,
 };
 use tinio_sandbox::Event;
+use tinio_util::testing::PipedChild;
 use tokio::time::sleep;
 
 use super::common::{frame_line, signed, tinio_bin, wait_timeout};
 
-/// The lines a child has written to one pipe so far, shared with that
-/// pipe's draining thread (the only writer).
-type Lines = Arc<Mutex<Vec<String>>>;
-
-/// Drain `pipe` line by line into `lines` until EOF (the child exits). A
-/// pipe nobody reads fills up and blocks the child, so both pipes are
-/// always drained, whether or not the leg looks at them.
-fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut raw = Vec::new();
-        while reader.read_until(b'\n', &mut raw).is_ok_and(|n| n > 0) {
-            // Lossy: a diagnostic that is not UTF-8 drops bytes from the
-            // record, never the rest of the pipe.
-            let line = String::from_utf8_lossy(&raw);
-            lines
-                .lock()
-                .expect("the pipe buffer")
-                .push(line.trim_end().to_string());
-            raw.clear();
-        }
-    })
-}
-
 /// A spawned `serve` child with both pipes drained. Killed and reaped when
 /// it drops (see the module doc for the ordering rationale).
-pub struct Serve {
-    child: Child,
-    stdout: Lines,
-    stderr: Lines,
-    /// The draining threads, taken by `stop`.
-    drains: Vec<JoinHandle<()>>,
+///
+/// **The child, its two buffers, their drains and the kill are [`PipedChild`]'s**, because the
+/// read-only suite beside this one holds the same harness and two `tests/` trees cannot import
+/// from each other — the shared device is where that copy went. What stays here is the part both
+/// of them add on top and neither shares: reading the **readiness event** off stdout, which is
+/// `tinio_sandbox::Event`'s type. Its methods arrive through `Deref`, so a leg still spells
+/// `server.stop()`, `server.exited()` and `server.stderr_text()`.
+pub struct Serve(PipedChild);
+
+impl Deref for Serve {
+    type Target = PipedChild;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Serve {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl Serve {
@@ -85,28 +75,7 @@ impl Serve {
         for (name, value) in env {
             cmd.env(name, value);
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("cannot spawn {}: {e}", bin.display()));
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let drains = vec![
-            drain(
-                child.stdout.take().expect("stdout is piped"),
-                Arc::clone(&stdout),
-            ),
-            drain(
-                child.stderr.take().expect("stderr is piped"),
-                Arc::clone(&stderr),
-            ),
-        ];
-        Self {
-            child,
-            stdout,
-            stderr,
-            drains,
-        }
+        Self(PipedChild::spawn(&mut cmd))
     }
 
     /// Wait for the `listening` event and return the address the child
@@ -136,7 +105,7 @@ impl Serve {
                     }
                 }
             }
-            if let Some(status) = self.child.try_wait().expect("the child's status") {
+            if let Some(status) = self.child_mut().try_wait().expect("the child's status") {
                 // Stop first: the message is only as good as the pipes it
                 // quotes, and a live child's are not at EOF yet.
                 self.stop();
@@ -162,88 +131,15 @@ impl Serve {
     /// [`frame_line`], which owns the framing rule: a frame is
     /// `Event::encode`'s two field lines closed by a blank line, so scanning
     /// line by line would hand `Event::decode` half a frame.
+    ///
+    /// **Read as a snapshot** ([`PipedChild::stdout_lines`]), so the buffer's lock is never held
+    /// across a caller's failure path: those call `stop`, and the drain it joins takes the same
+    /// lock.
     pub(super) fn stdout_event(&self) -> Option<Event> {
         let mut frame = String::new();
-        self.stdout
-            .lock()
-            .expect("the stdout buffer")
+        self.stdout_lines()
             .iter()
             .find_map(|line| frame_line(&mut frame, line))
-    }
-
-    /// Wait for the child to exit on its own — the legs that expect a
-    /// failure, never a server — and return its status. Bounded the same
-    /// way as [`Serve::ready`].
-    pub(super) async fn exited(&mut self) -> ExitStatus {
-        let timeout = wait_timeout();
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("the child's status") {
-                // Complete the pipes before the caller reads them: the child
-                // is gone, so its ends are closed and the drains cannot block.
-                self.join_drains();
-                return status;
-            }
-            if Instant::now() >= deadline {
-                self.stop();
-                panic!(
-                    "the server did not exit within {} s (this leg expects a failure); stderr:\n{}",
-                    timeout.as_secs(),
-                    self.stderr_text()
-                );
-            }
-            sleep(Duration::from_millis(2)).await;
-        }
-    }
-
-    /// Kill and reap the child now, then join the draining threads (their
-    /// pipes reach EOF at the child's death). `Drop` runs the same path, so
-    /// an assertion failure later still reaps — an explicit call just gets
-    /// the complete pipes before the leg's final assertions.
-    pub(super) fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.join_drains();
-    }
-
-    /// Join the draining threads, taking the handles so a second `stop`
-    /// cannot join them twice.
-    pub(super) fn join_drains(&mut self) {
-        for handle in self.drains.drain(..) {
-            let _ = handle.join();
-        }
-    }
-
-    /// Everything the child has written to stdout so far.
-    pub(super) fn stdout_lines(&self) -> Vec<String> {
-        self.stdout.lock().expect("the stdout buffer").clone()
-    }
-
-    /// Everything the child has written to stderr so far, line-joined.
-    pub(super) fn stderr_text(&self) -> String {
-        self.stderr.lock().expect("the stderr buffer").join("\n")
-    }
-
-    /// The child's stderr once it carries `needle`, waiting (bounded) while
-    /// it does not. A separate thread drains the pipe, so a line the child
-    /// wrote is not necessarily recorded the instant this thread looks — a
-    /// live child's stderr has no EOF to synchronize on.
-    pub(super) async fn stderr_containing(&self, needle: &str) -> String {
-        let deadline = Instant::now() + wait_timeout();
-        loop {
-            let text = self.stderr_text();
-            if text.contains(needle) || Instant::now() >= deadline {
-                return text;
-            }
-            sleep(Duration::from_millis(2)).await;
-        }
-    }
-}
-
-impl Drop for Serve {
-    fn drop(&mut self) {
-        // See [`Serve::stop`] and the module doc.
-        self.stop();
     }
 }
 

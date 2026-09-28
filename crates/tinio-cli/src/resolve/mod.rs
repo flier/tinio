@@ -44,7 +44,6 @@ use crate::{
     Error,
     cli::{self, Provenance},
     commands::{DirArgs, EnvArgs, start},
-    sandbox::StateDirSource,
 };
 
 mod locate;
@@ -99,12 +98,13 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 /// launcher asks for.
 ///
 /// **`state_dir_override` is the discovery parse's `TINIO_STATE_DIR`, carried rather than dropped**
-/// — the *path* it named, and therefore the source [`state_dir_source`](Self::state_dir_source)
-/// reads. Both live here for one reason: `Located` is consumed by the chain that builds this value,
-/// so a caller that wanted either had to take it off `Located` **before** the move, and two callers
-/// did exactly that with the same comment. A value a resolution answers is the resolution's to
-/// carry, and the guard that needs the source (macOS's read-only rule) reads it where it already
-/// is.
+/// — the *path* it named, which is also the whole of what a directory's *source* is (named by the
+/// operator, or derived by the resolution). It lives here for one reason: `Located` is consumed by
+/// the chain that builds this value, so a caller that wanted it had to take it off `Located`
+/// **before** the move, and two callers did exactly that with the same comment. A value a
+/// resolution answers is the resolution's to carry, and the one guard that needs the source
+/// (macOS's read-only rule, `crate::sandbox`) derives it from this field beside the resolution
+/// rather than the resolution carrying the same fact twice.
 ///
 /// # Examples
 ///
@@ -183,43 +183,6 @@ impl Resolution {
             &self.config.server.host,
             self.config.server.port,
         )
-    }
-
-    /// Where the state directory came from: named by the operator, or derived by the resolution.
-    ///
-    /// **A view of [`state_dir_override`](Self::state_dir_override) rather than a second field**,
-    /// so the two cannot answer differently: the whole of what [`StateDirSource`] says is whether
-    /// that value is there. The reader is [`crate::sandbox::plan`]'s read-only macOS refusal, which
-    /// takes it off the resolution instead of having it threaded through every caller.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use std::path::PathBuf;
-    ///
-    /// use tinio_cli::{resolve::Resolution, sandbox::StateDirSource};
-    /// use tinio_config::Config;
-    ///
-    /// let mut resolution = Resolution {
-    ///     root: PathBuf::from("/srv/data"),
-    ///     config: Config::default(),
-    ///     config_text: String::new(),
-    ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
-    ///     read_only: false,
-    ///     state_dir: PathBuf::from("/srv/data/.tinio"),
-    ///     state_dir_override: None,
-    ///     config_error: None,
-    /// };
-    /// assert!(resolution.state_dir_source().is_derived());
-    /// resolution.state_dir_override = Some(PathBuf::from("/srv/state"));
-    /// assert_eq!(resolution.state_dir_source(), StateDirSource::Named);
-    /// ```
-    pub fn state_dir_source(&self) -> StateDirSource {
-        if self.state_dir_override.is_some() {
-            StateDirSource::Named
-        } else {
-            StateDirSource::Derived
-        }
     }
 }
 
@@ -603,10 +566,17 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
         (Some(text), _) => (Config::parse(text), text.to_owned()),
         // The serving chain **creates** the file it did not find (`contracts/cli.md:45`: it is
         // generated "on first start"), and the text of a document that call created is the text
-        // that call wrote — `to_toml`'s own bytes, from the value it serialized them from.
+        // that call wrote — `to_toml`'s own bytes, from the value it serialized them from. The
+        // create hands those bytes back rather than this arm serializing the same `Config` again.
+        //
+        // **The loaded arm is reachable**: the guard above is this arm's own `is_file` test, and
+        // another process can create the file between it and the call.
         (None, Chain::Serving) if !path.is_file() => {
-            let (config, _) = discover::load_or_create(&root, &path, read_only)?;
-            let text = config.to_toml()?;
+            let (config, outcome) = discover::load_or_create(&root, &path, read_only)?;
+            let text = match outcome {
+                discover::Outcome::Created(text) => text,
+                discover::Outcome::Loaded => config.to_toml()?,
+            };
             (Ok(config), text)
         }
         // A **non-launching** command reads what is there and leaves the root exactly as it found

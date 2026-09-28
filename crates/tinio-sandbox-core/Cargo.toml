@@ -16,6 +16,17 @@ tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 
 tinio-core.workspace = true
+tinio-util.workspace = true
+
+# **Target-gated, and only for the fork-probe handshake** (`src/launcher/probe.rs`):
+# a probe's pipe, its pid and the `kill`/`waitpid` that end it exist only on the
+# platforms that fork, and the module is `cfg(unix)` for the same reason. The
+# three features are exactly the ones that handshake calls — `pipe` for the pipe
+# the caller creates, `process` for `Pid`, `Signal`, `kill_process` and
+# `waitpid`, `fs` for `fcntl_setfl` — and nothing here needs `runtime`, because
+# this crate neither forks nor exits.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "pipe", "process"] }
 
 [dev-dependencies]
 tinio-util = { workspace = true, features = ["testing"] }

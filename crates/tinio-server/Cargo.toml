@@ -57,7 +57,6 @@ tinio-api = { workspace = true, optional = true }
 tinio-auth = { workspace = true, optional = true }
 tinio-config.workspace = true
 tinio-core.workspace = true
-tinio-sandbox.workspace = true
 tinio-select = { workspace = true, optional = true }
 tinio-util.workspace = true
 
@@ -86,6 +85,30 @@ tokio = { workspace = true, features = ["full"] }
 tinio-api.workspace = true
 tinio-fs.workspace = true
 tinio-mem.workspace = true
+# The confinement stack **this package's tests** read and its library never names: the three
+# sandbox e2e targets, the Windows harness and the read-only suite spawn a confined server and
+# decode the events it reported through `tinio_sandbox::Event`, while nothing under `src/` says
+# `tinio_sandbox` at all. A dev-dependency is the honest edge for that — a normal one put the whole
+# sandbox stack on every dependent of this crate whether or not a test was being built, while the
+# `sandbox` feature's name promised a `--no-default-features` build the opposite.
+tinio-sandbox.workspace = true
+# **The Linux e2e leg's host precondition, and only its tests need it**: the model
+# reader and the `unshare(1)` probes `sandbox_e2e` asks before it spawns anything
+# are `tinio-sandbox-linux`'s `testing` module (the same rule the two lines beside
+# this one follow), so the edge that turns it on is a dev-dependency — and the
+# facade above re-exports the crate, which is how the leg spells it
+# (`tinio_sandbox::linux::testing`). Cargo unifies the two edges, so the facade's
+# Linux backend and this one are one build of that crate. On a host the crate is
+# not built for it is the empty library its root `#![cfg]` makes it, which is also
+# why the target's own `#![cfg(target_os = "linux")]` is not repeated here.
+tinio-sandbox-linux = { workspace = true, features = ["testing"] }
+# **The conformance device the Windows harness composes, and only its tests need
+# it**: `tinio-sandbox-windows`'s `testing` module is a feature of that crate (the
+# same rule this file's `tinio-util` line follows), so the edge that turns it on is
+# a dev-dependency — and the facade above re-exports the crate, which is how the
+# harness spells it (`tinio_sandbox::windows::testing`). Cargo unifies the two
+# edges, so the harness and this one are one build of that crate.
+tinio-sandbox-windows = { workspace = true, features = ["testing"] }
 tinio-util = { workspace = true, features = ["testing"] }
 
 [[test]]
@@ -114,6 +137,12 @@ harness = false
 
 [features]
 default = ["multipart", "copy", "list-v1", "list-v2", "cors", "select", "acl", "sandbox"]
+# The confinement e2e targets' own switch, and nothing else's: `sandbox_e2e`, `sandbox_e2e_windows`
+# and `sandbox_macos_e2e` carry `required-features = ["sandbox"]`, and the crate they read the
+# confined child's events with is the dev-dependency above. Kept in `default` so
+# `cargo test -p tinio-server` runs them, and kept as a feature rather than folded into the targets
+# so `--no-default-features` still compiles them out on the platforms whose confinement cannot run
+# there.
 sandbox = []
 multipart = []
 copy = []

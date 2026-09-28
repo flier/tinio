@@ -27,7 +27,7 @@ smart-default.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 struson.workspace = true
 thiserror.workspace = true
-time = { workspace = true, features = ["formatting"] }
+time = { workspace = true, features = ["formatting"], optional = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
@@ -43,7 +43,7 @@ required-features = ["parquet"]
 
 [features]
 default = []
-parquet = ["dep:parquet", "dep:arrow", "dep:bytes"]
+parquet = ["dep:parquet", "dep:arrow", "dep:bytes", "dep:time"]
 
 [lints.clippy]
 absolute_paths = "warn"

@@ -14,7 +14,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     net::TcpListener,
     process::{Command, Stdio},
 };
@@ -24,6 +24,11 @@ use tinio_sandbox_core::{
     listener_fd_from_arg,
 };
 use tinio_sandbox_windows::{launch, socket};
+// **The stdin stand-in is the shared one** (`tinio_util::testing`), which the core's own
+// leg for this rule takes too: what the two measure is the same "was stdin read at all",
+// and only a reader that fails on being read can tell that from a reader that returns
+// nothing.
+use tinio_util::testing::Untouchable;
 use windows_sys::Win32::Foundation::HANDLE;
 
 /// The marker that makes [`child_role`] inert in this binary's own test run.
@@ -75,12 +80,11 @@ fn a_child_reads_the_frame_the_parent_wrote() {
         .spawn()
         .expect("spawn the child");
 
-    let frame = serde_json::to_vec(&LaunchPayload {
-        config: "version = 1\n".into(),
-        token: None,
-        confinement: None,
-    })
-    .expect("the payload serializes");
+    // The frame comes from the core's one writer — the payload derives no
+    // `Serialize` — so this is the byte string a launch really writes, config
+    // text and all.
+    let frame = LaunchPayload::encode_frame("version = 1\n", None, None)
+        .expect("the frame is one JSON object");
     child
         .stdin
         .take()
@@ -157,7 +161,7 @@ fn the_control_elements_ride_beside_the_listener_element() {
     // its plan carries them: the listener element first (the child reads *it* to decide
     // this process is a child), one control element per instance next, then the launcher's
     // arguments untouched. All of them are the child's to consume, so all are filtered out
-    // here — what `sandbox::filter_argv` does for the real CLI.
+    // here — what `tinio_sandbox_core::filter_argv` does for the real child.
     let instances = [1044usize as HANDLE, 1048usize as HANDLE];
     let args = launch::command_args(
         1040usize as HANDLE,
@@ -193,19 +197,4 @@ fn a_launch_that_named_no_listener_is_an_error_not_a_socket() {
     let rendered = error.to_string();
     assert!(rendered.contains("rebuild the listener"), "{rendered}");
     assert!(rendered.contains("argv"), "{rendered}");
-}
-
-/// A reader that fails the test if anything reads from it.
-///
-/// **An EOF-returning reader cannot express this rule**: `io::empty()` and a
-/// `Cursor` over an empty buffer behave identically whether or not they are read,
-/// so a test built on one passes for a rule that reads stdin and one that does
-/// not. This reader is hostile to being read at all, which is the property under
-/// test — the same shape the core's own test for this rule uses.
-struct Untouchable;
-
-impl Read for Untouchable {
-    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-        panic!("`adopt` read stdin without a listener element in argv");
-    }
 }

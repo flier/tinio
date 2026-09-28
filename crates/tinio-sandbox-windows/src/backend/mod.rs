@@ -1,15 +1,16 @@
 //! Windows backend: whitelist, container, relay, and the supervision handed back.
 //!
-//! `Backend::confine` runs four stages: `prepare_launch`, `grant_whitelist`,
-//! `spawn_supervised_child`, and `supervise_child`. Capability names live
-//! in `capability.rs`; exposure policy in `exposures.rs`; the grant phase's
+//! `Backend::confine` runs three stages: `prepare_launch`, `grant_whitelist`,
+//! and `spawn_supervised_child`, whose `Spawned` it turns into the `Confinement`
+//! it hands back. Capability names live
+//! in `capability.rs`; exposure policy in `exposures`; the grant phase's
 //! budget and its report in `grant.rs`. Re-exports below keep the old
 //! `backend::` paths. Submodules are private.
 //!
-//! `canonical_caller`, `shape_for`, and `CallerSet` are `pub(super)` so `confine`
-//! and `backend::tests` can reach them. `CallerSet` is not `pub`: a raw spelling
-//! must not be usable as the resolved one. This module makes no Win32 call, so
-//! it is not an `unsafe` site (decision 14).
+//! `canonical_whitelist`, `shape_for`, and `Whitelist` are `pub(in crate::backend)` so
+//! `confine` and `backend::tests` can reach them. `CallerSet` is
+//! not `pub`: a raw spelling must not be usable as the resolved one. This module
+//! makes no Win32 call, so it is not an `unsafe` site (decision 14).
 
 mod capability;
 mod exposures;
@@ -20,9 +21,10 @@ mod tests;
 use std::{
     env,
     ffi::OsString,
-    fs, io,
+    io,
     net::TcpListener,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         mpsc::{self, Receiver},
@@ -34,7 +36,7 @@ use std::{
 use tokio::{fs as tokio_fs, io as tokio_io, runtime::Builder};
 use windows_sys::Win32::Foundation::HANDLE;
 
-use self::exposures::{CallerSet, canonical_caller, shape_for};
+use self::exposures::{Whitelist, canonical_whitelist, shape_for};
 // The stage this file orchestrates calls the report; the constants beside it are
 // `grant.rs`'s and are read where they are measured against — `grant.rs` itself
 // and `backend::tests`, which imports them from that module rather than through
@@ -50,8 +52,8 @@ pub use self::{
 };
 use crate::{
     _core::{
-        AccessMode, Backend as BackendTrait, Child, Confinement, Exposure, LaunchPayload,
-        LaunchPlan, Observer, Result, Sandbox, Terminal, launch,
+        AccessMode, Backend as BackendTrait, Child, Confinement, LaunchPayload, LaunchPlan,
+        Observer, Result, Sandbox, Terminal, launch,
     },
     acl::{Grants, Target},
     control, handles,
@@ -61,6 +63,17 @@ use crate::{
     sid::{CapabilitySids, PackageSid, ProfileLock, package_name},
     socket,
 };
+
+/// The exit code this launcher's own endings report — the launch that did not
+/// happen, or the one whose next step refused it.
+///
+/// **One code for the two, and it is not the child's answer**: a terminated child
+/// never had one to give, and both call sites are the launcher saying that
+/// something on its own side failed. The failed-assignment path
+/// ([`spawn_supervised_child`]) already ends its child with this code, and the
+/// killer the core's `Child::abort` drives is the same ending reached from the
+/// other side.
+const ABORT_CODE: u32 = 1;
 
 /// What the launcher needs beyond the [`Sandbox`] and the [`LaunchPlan`].
 ///
@@ -170,13 +183,17 @@ impl Backend {
 impl BackendTrait for Backend {
     /// Launch an AppContainer child and hand it back for supervision.
     ///
-    /// The stages are `prepare_launch`, `grant_whitelist`,
-    /// `spawn_supervised_child`, and `supervise_child`.
+    /// The stages are `prepare_launch`, `grant_whitelist`, and
+    /// `spawn_supervised_child`.
     /// [`crate::acl::Grants`] moves into the wait closure on success, and its job
     /// there is the profile's lifetime rather than any undo: **the ACLs are
     /// standing** ([`crate::acl::Grants`]'s doc states why and what that gives up),
     /// so every other path simply drops the guard, which deletes the profile with
     /// the last `Arc<PackageSid>` — a launch that failed has no user left for it.
+    /// The job the launch created moves into **both** closures: the wait holds it so
+    /// the child's lifetime is bounded by the launcher's (decision 20), and the
+    /// killer the core's `Child::abort` calls terminates it, which is how a launch
+    /// that failed *after* the child existed ends a server that is already serving.
     ///
     /// # Errors
     ///
@@ -209,8 +226,45 @@ impl BackendTrait for Backend {
     fn confine(&mut self, sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement> {
         let inputs = prepare_launch(&self.options, sandbox, plan)?;
         let grants = grant_whitelist(&inputs)?;
-        let launched = spawn_supervised_child(&self.options, plan, inputs);
-        supervise_child(launched, grants)
+        // **A failed spawn returns with the grants still held here**, which drops
+        // the last `Arc<PackageSid>` and deletes the profile with it — the launch
+        // failed, so the profile has no user. **Nothing is taken back**: every
+        // grant is standing ([`crate::acl::Grants`]), so the wait closure's only
+        // job is to keep the profile alive until the child has exited and to hold
+        // the job so the child's lifetime is bounded by it (decision 20) — and the
+        // job is the same value the killer below terminates through.
+        let Spawned {
+            mut launched,
+            job,
+            relay,
+            ready,
+        } = spawn_supervised_child(&self.options, plan, inputs)?;
+        // **The job is shared with the killer instead of living in the wait closure alone**,
+        // because the two are the same mechanism used from two sides: `TerminateJobObject` is
+        // what ends the child *now*, and holding the job for the child's whole lifetime is what
+        // ends it when the launcher does (decision 20). `Rc` rather than a move is what lets
+        // both closures name it; it needs no `RefCell` because `terminate` borrows the job and
+        // the two callers are strictly ordered (`Child::abort` ends the child, then waits).
+        let job = Rc::new(job);
+        let aborting = Rc::clone(&job);
+        // The two `let _` lines are what make the closure **capture** both guards
+        // rather than let them drop at the end of this call.
+        Ok(Confinement::Supervise(
+            Child::new(move || {
+                let status = launched.wait();
+                let _ = &grants;
+                let _ = &job;
+                status
+            })
+            // **The killer the core's failure path calls**, and the platform's own mechanism
+            // rather than a second one: terminating the job ends the child the launcher put in
+            // it, exactly as closing the job does when the launcher exits — the difference is
+            // when. Without it a launcher that refused the `state` publish would have to exit
+            // for the child to die, and the core would have no way to end it.
+            .with_kill(move || aborting.terminate(ABORT_CODE).map_err(io::Error::other))
+            .with_relay(relay)
+            .with_ready(ready),
+        ))
     }
 }
 
@@ -218,8 +272,7 @@ impl BackendTrait for Backend {
 struct PreparedLaunch<'a> {
     program: PathBuf,
     siblings: Option<SiblingScan>,
-    all: Vec<Exposure>,
-    caller: CallerSet,
+    whitelist: Whitelist,
     listener: &'a TcpListener,
     /// **The launch window's lock, taken before the profile is derived and
     /// released once `CreateProcessW` has returned** — see [`sid::ProfileLock`]
@@ -252,14 +305,16 @@ fn prepare_launch<'a>(
                 source,
             )
         })?);
-    // One enumeration: the exposure set, the banner and the `*.dll` grant all
-    // read this scan.
+    // One enumeration: the whitelist's DLL entries, the banner and the `*.dll`
+    // grant all read this scan.
     let siblings = program.parent().map(SiblingScan::scan);
-    let all = match &siblings {
-        Some(siblings) => canonical_exposures(with_siblings(sandbox, siblings))?,
-        None => canonical_exposures(exposures(sandbox, &program))?,
-    };
-    let caller = canonical_caller(sandbox)?;
+    // **One resolution of the caller's paths, and the program's directory on the
+    // same pass**: the two halves used to be resolved separately — the granted set
+    // through `canonical_exposures`, the caller's set through a second walk of the
+    // same paths — so every caller path was walked, canonicalised and logged
+    // twice, and a third `fs::canonicalize` of the program's directory followed in
+    // `grant_whitelist`.
+    let whitelist = canonical_whitelist(sandbox, siblings.as_ref())?;
     let listener = plan.listener().ok_or_else(|| {
         launch(
             "hand the listener over",
@@ -279,18 +334,15 @@ fn prepare_launch<'a>(
     let window = ProfileLock::acquire(&package);
     #[allow(clippy::arc_with_non_send_sync)]
     let sid = Arc::new(PackageSid::derive(&package)?);
-    let capabilities = CapabilitySids::resolve(
-        &options
-            .capabilities
-            .iter()
-            .map(|capability| capability.sid())
-            .collect::<Vec<_>>(),
-    )?;
+    // **The capability list is resolved straight from the options, which is the
+    // only shape it can take**: [`CapabilitySids::resolve`] is handed the closed
+    // enum, so nothing between an operator's `TINIO_SANDBOX_CAPABILITIES` and the
+    // container's token is text a caller could spell.
+    let capabilities = CapabilitySids::resolve(&options.capabilities)?;
     Ok(PreparedLaunch {
         program,
         siblings,
-        all,
-        caller,
+        whitelist,
         listener,
         window,
         sid,
@@ -301,75 +353,62 @@ fn prepare_launch<'a>(
 /// Grant the whitelist and return the guard that keeps the profile alive.
 ///
 /// Caller directories keep the inherited ACE. The program directory does not,
-/// and sibling DLLs are one `*.dll` pattern. A caller's file never reaches the
-/// loop: [`canonical_caller`] refused it. Failure returns before the phase
-/// report, and **nothing is taken back**: the grants are standing, so what a
-/// partial pass leaves behind is exactly what a complete one does
+/// and every sibling DLL is granted on its own handle. A caller's file never
+/// reaches the loop: [`canonical_whitelist`] refused it, and the loop walks that
+/// whitelist's resolved entries alone, so no entry here is a file. Failure returns
+/// before the phase report, and **nothing is taken back**: the grants are standing,
+/// so what a partial pass leaves behind is exactly what a complete one does
 /// ([`crate::acl::Grants`]'s doc states the contract and its measurement).
 ///
 /// **It announces the pass once, as an `info!` event whose fields are the package
 /// SID and the exposure set**, which is what an operator reads to see what the run
 /// was about to grant and which profile it was about to grant it to. The event is
-/// emitted *before* the first `icacls`, so a run that dies mid-phase still says what
+/// emitted *before* the first grant, so a run that dies mid-phase still says what
 /// it was doing, and it is one structured event rather than the two `eprintln!`s it
 /// replaced: a library that announced this with `eprintln!` could neither be tested
 /// nor silenced (the same rule `crates/tinio-sandbox-linux/src/seccomp.rs` states
 /// for its own line), and `[log] verbosity` is what decides whether it appears.
 fn grant_whitelist(inputs: &PreparedLaunch<'_>) -> Result<Grants> {
+    // **The banner lists every path the run is about, the sibling DLLs included,
+    // and its count is that list's length** — the meaning both had before the
+    // DLLs stopped being resolved, so an operator's `exposures=` does not silently
+    // change under them. The DLLs come from `SiblingScan` and carry no resolution:
+    // each is granted by handle, on the path the scan enumerated.
     tracing::info!(
         step = "grant the ACLs",
         sid = inputs.sid.as_str(),
-        exposures = inputs.all.len(),
-        granting = %describe(&inputs.all)
+        exposures = inputs.whitelist.listed_len(),
+        granting = %inputs.whitelist.describe()
     );
     let mut grants = Grants::new(Arc::clone(&inputs.sid));
     let granting = Instant::now();
     if let Some(siblings) = &inputs.siblings {
         grants.apply_siblings(siblings, AccessMode::ReadOnly)?;
     }
-    let program_dir = inputs
-        .siblings
-        .as_ref()
-        .and_then(|siblings| fs::canonicalize(siblings.dir()).ok());
-    for exposure in inputs
-        .all
-        .iter()
-        .filter(|exposure| !exposure.host.is_file())
-    {
-        let target = shape_for(&inputs.caller, exposure, program_dir.as_deref());
-        // **The type is the whole safety net here, so the one fact the choice
-        // rests on is checked**: `acl::ace_spec` produces the same `RX`/`M` for
-        // `Target::ProgramDirectory` and `Target::File`, so a shape that
-        // disagreed with its path would be an `icacls` that exits 0 and writes
-        // nothing — a confined child that cannot read a file its loader needs.
+    for exposure in inputs.whitelist.granted() {
+        let target = shape_for(
+            inputs.whitelist.caller(),
+            exposure,
+            inputs.whitelist.program_dir(),
+        );
+        // **The type is the whole safety net here, and the one fact the choice
+        // rests on is checked where it matters** — the `Target` and the object the
+        // grant opens have to agree, or the ACE reaches the wrong thing: an
+        // inheritance-flagged grant on a file is a silent no-op, and the plain
+        // file form on a directory leaves every descendant ungranted. The check is
+        // the grant's own (`acl::Object::verify`, on the opened handle), which is
+        // the only place the question can be asked without a race: a shape that
+        // disagreed with its path would still be checked there, against the object
+        // the write will reach, and refused rather than written.
         //
-        // **A returned failure and not a `debug_assert!`**, which is what stood
-        // here: a panic is what this crate's rules forbid in library code
-        // (constitution II, and `control.rs` states the same rule for its own
-        // discarded result), and an assertion that unwinds in a debug build and
-        // disappears in a release one is the worst half of both. The check
-        // cannot fire as the code stands — every host reached here was resolved
-        // by `canonical_exposures`, so it exists, and the file-shaped entries,
-        // for which a directory check would be wrong, were filtered out above —
-        // which is why it is a guard on the way to the grant rather than a
-        // condition anything is expected to meet.
-        if target == Target::ProgramDirectory && !exposure.host.is_dir() {
-            return Err(launch(
-                "shape an ACL grant",
-                &exposure.host,
-                io::Error::other(
-                    "Target::ProgramDirectory is for a directory, and this exposed path is not one",
-                ),
-            ));
-        }
         // **The program directory is the one entry that does not depend on the
         // root, so it is a standing grant for `ALL APPLICATION PACKAGES` rather
         // than for this run's package SID.** Every other entry belongs to one
         // served root, and a new root is a new SID — which is why authorizing the
         // program directory per root would rewrite its security descriptor on
-        // every launch and make `SetNamedSecurityInfoW` walk its whole subtree
-        // (10–20 s for this workspace's `target\debug`; `sid::ALL_APPLICATION_PACKAGES`
-        // carries the price and why the other entries must not take it).
+        // every launch and make the write walk its whole subtree (10–20 s for this
+        // workspace's `target\debug`; `sid::ALL_APPLICATION_PACKAGES` carries the
+        // price and why the other entries must not take it).
         match target {
             Target::ProgramDirectory => {
                 grants.apply_standing(&exposure.host, target, exposure.access)?
@@ -377,7 +416,7 @@ fn grant_whitelist(inputs: &PreparedLaunch<'_>) -> Result<Grants> {
             _ => grants.apply(&exposure.host, target, exposure.access)?,
         }
     }
-    report_grant_phase(granting.elapsed(), inputs.all.len());
+    report_grant_phase(granting.elapsed(), inputs.whitelist.listed_len());
     Ok(grants)
 }
 
@@ -566,33 +605,4 @@ fn spawn_supervised_child(
         relay,
         ready: ready_rx,
     })
-}
-
-/// Hand the launched child to its supervision, keeping the SID alive for it.
-///
-/// The success arm is the only one that moves `grants`. The error arm returns
-/// while still holding them, which drops the last `Arc<PackageSid>` and deletes
-/// the profile with it — the launch failed, so the profile has no user. **Nothing
-/// is taken back**: every grant is standing (`acl::Grants`), so the wait closure's
-/// only job here is to keep the profile alive until the child has exited and to
-/// hold the job so the child's lifetime is bounded by it (decision 20).
-fn supervise_child(launched: Result<Spawned>, grants: Grants) -> Result<Confinement> {
-    match launched {
-        Ok(Spawned {
-            mut launched,
-            job,
-            relay,
-            ready,
-        }) => Ok(Confinement::Supervise(
-            Child::new(move || {
-                let status = launched.wait();
-                let _ = &grants;
-                let _ = &job;
-                status
-            })
-            .with_relay(relay)
-            .with_ready(ready),
-        )),
-        Err(err) => Err(err),
-    }
 }

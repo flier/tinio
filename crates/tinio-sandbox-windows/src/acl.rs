@@ -2,80 +2,206 @@
 //! leave those grants standing — the launcher takes nothing back on the way out
 //! (decisions 15, 21, §6).
 //!
-//! **Writes go through `icacls.exe` resolved from the system directory, not
-//! `PATH` and not `SetNamedSecurityInfo`; reads go through
-//! `GetNamedSecurityInfoW`.** `/grant:r` replaces this SID's ACE only;
-//! `/remove:g *<sid>` removes it. [`Error::Launch`] carries the tool's status
-//! and text, and a failed read carries the Win32 code instead.
+//! **A grant is written on a handle this module opened itself, so the object the
+//! check approved is the object that is granted.** `icacls /grant:r` wrote until
+//! 2026-09-27, and the defect that ended it is the check-then-use between the
+//! whitelist's reparse refusal and the tool's own re-resolution of the name it was
+//! handed: a writer who replaced an exposed directory with a junction inside
+//! the grant window got the ACE written somewhere the check never saw. [`Object`]
+//! opens the spelled path with `FILE_FLAG_OPEN_REPARSE_POINT`, so the *object
+//! named* is opened rather than followed; the opened object is asked what it is (a
+//! reparse point is refused, and so is an object of the wrong kind), and both the
+//! DACL read that decides the skip and the `SetSecurityInfo` write that follows
+//! happen **on that handle**. The ACE is what the tool's alias produced, and that
+//! is measured rather than argued: `(OI)(CI)RX` on a directory is
+//! `0x0012_00A9` with object-and-container inherit, and the descriptor
+//! `SetEntriesInAclW` + `SetSecurityInfo` leaves is the one `icacls /grant:r`
+//! left — entry for entry, control word included (`0x8404`, auto-inherited and
+//! **not** protected), with the same propagation to a directory's pre-existing
+//! children, which is what `tests/acl.rs` asserts against the tool as an
+//! independent oracle. [`Error::Launch`] carries the API's own status for a write
+//! or an open that failed, and a failed read carries it too.
 //!
 //! **The read half is the Win32 API because the tool's *text* cannot answer the
 //! question the read exists for.** The read decides whether the write may be
-//! skipped (`already_granted`), and `icacls` renders a well-known SID by
-//! **name**: an ACE written for [`ALL_APPLICATION_PACKAGES`] comes back as
+//! skipped, and `icacls` renders a well-known SID by **name**: an ACE written for
+//! [`ALL_APPLICATION_PACKAGES`] comes back as
 //! `APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)`, so a check for
 //! the literal `S-1-15-2-1` never saw the ACE it had just written and the skip
 //! never fired — which is not a cosmetic failure, because the write it failed to
-//! skip is `SetNamedSecurityInfoW` propagating eagerly over the whole subtree
+//! skip rewrites the descriptor and propagates eagerly over the whole subtree
 //! (10–30 s for this workspace's `target\debug`; measured 2026-09-25). Two
-//! spellings patched that symptom; [`has_ace`] ends the class, because
-//! `EqualSid` compares the two SIDs as the kernel compares them and no rendering
-//! takes part. [`mentions_sid`] survives as the *test* oracle over the tool's own
-//! text, where a rendering is the thing being asserted rather than the thing
-//! being trusted.
+//! spellings patched that symptom; [`has_ace`] ends the class, because the
+//! entries are compared with `EqualSid` — as the kernel compares them, in the
+//! walk [`tinio_winsec`] owns — and no rendering takes part. [`mentions_sid`]
+//! survives as the *test* oracle over the tool's own text, where a rendering is
+//! the thing being asserted rather than the thing being trusted.
 //!
-//! The read is this module's one `unsafe` site, and it is narrower than the
-//! writes: a security descriptor and nothing else, released once with
-//! `LocalFree` (the ACL belongs to the descriptor and may **not** be freed on its
-//! own). Decision 14 enumerates the sites.
+//! **The skip is a read of the same handle the write would use**, not of the name
+//! again: a name-based read through a link answers about whatever the link
+//! resolves to, and a "already granted" it reported for another object would skip
+//! the grant the launch needs while the child reaches the link's target. The
+//! oracle is unchanged — the predicate `access_matches` and the SID comparison
+//! [`walk_dacl`] makes — only the object it is asked of.
 //!
-//! [`Target`] is the grant shape. `(OI)(CI)` on a file is a silent no-op
-//! (exit 0, nothing written). Caller directories stay inherited: one ACE
-//! reaches pre-existing descendants, with no `/t` and one `/remove:g`. The
-//! program directory does not inherit. Sibling DLLs are one `*.dll` pattern;
-//! a second path on that command line is refused. A caller's file never
-//! reaches a grant: `canonical_caller` refuses it. The filesystem propagates
-//! an inherited ACE, so the tool's "1 files" is not the cost; `backend` times
-//! the phase.
+//! The `unsafe` here is the DACL's own: the handle open, the descriptor read (by
+//! handle and by name), the merge and the descriptor's release. **The ACE walk is
+//! not here** — the ACL's own count, `GetAce`, the ACE-type test and `EqualSid`
+//! are [`tinio_winsec::walk_dacl`]'s, which is where this crate's reads and that
+//! crate's current-user verdict share one traversal; what this crate hands it is a
+//! predicate and the SID to compare against. Every allocation is `LocalFree`d
+//! once, by the function that made it; the ACL inside a descriptor belongs to the
+//! descriptor and may **not** be freed on its own. Decision 14 enumerates the
+//! sites.
+//!
+//! [`Target`] is the grant shape, and the shape is checked against the object the
+//! handle opened rather than trusted: an inheritance-flagged ACE on a **file** is
+//! a silent no-op when `icacls` writes it (measured: exit 0, nothing written) and
+//! an inheritable ACE that nothing inherits from when the API does, so a shape that
+//! disagrees with the path is refused instead of granted. Caller directories stay
+//! inherited: one ACE reaches pre-existing descendants, with no `/t` and one
+//! `/remove:g`. The program directory does not inherit. Sibling DLLs are granted
+//! **one file at a time, each opened by handle** — a `*.dll` wildcard names objects
+//! no handle can be opened on, and the pattern is what let a linked `x.dll` be
+//! granted through the link. A caller's file never reaches a grant:
+//! `canonical_whitelist` refuses it. The filesystem propagates an inherited ACE, so
+//! one descriptor write is a pass over the whole subtree; `backend` times the phase.
 //!
 //! [`Error::Launch`]: crate::_core::Error::Launch
 
 // The manifest denies `unsafe_code` and the exception sits on the module that
-// needs it, as decision 14 asks: the descriptor read is the only block below,
-// and a crate-level allow would lift the lint for every module instead.
+// needs it, as decision 14 asks: every Win32 call below is the DACL layer's own —
+// the descriptor read, the handle the grant acts on, the merge and the
+// descriptor's release — and a crate-level allow would lift the lint for every
+// module instead. **The ACE walk is not among the sites this permit covers any
+// more**: it is `tinio-winsec`'s [`walk_dacl`], whose own module carries that
+// crate's exemption and states its reason.
 #![allow(unsafe_code)]
 
 use std::{
-    ffi::{OsStr, c_void},
+    ffi::OsStr,
     io,
-    mem::size_of,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     process::{Command, Output},
-    ptr::{addr_of, from_mut, null_mut},
+    ptr::{from_mut, null, null_mut},
     sync::Arc,
 };
 
+use tinio_winsec::{Ace, to_wide, walk_dacl};
 use windows_sys::Win32::{
-    Foundation::LocalFree,
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
     Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        Authorization::{ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+        ACCESS_ALLOWED_ACE, ACL,
+        Authorization::{
+            ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo,
+            SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
+            TRUSTEE_IS_USER, TRUSTEE_W,
+        },
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, NO_INHERITANCE,
+        OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
     },
-    Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE},
+    Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
+        WRITE_DAC,
+    },
 };
-
-/// `ACCESS_ALLOWED_ACE_TYPE` — the `AceType` of the only ACE this module reads.
-/// `windows-sys` exports the structure and not the type code for it, so the one
-/// value is named here rather than the ACE being assumed to be one.
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
 use crate::{
-    _core::{AccessMode, Result, launch},
+    _core::{AccessMode, Error, Result, launch},
     backend::SiblingScan,
-    handles::system_directory,
+    handles::{self, system_directory},
     sid::{ALL_APPLICATION_PACKAGES, PackageSid},
 };
+
+/// `DELETE` (`0x0001_0000`), which `icacls` folds into `(M)` and not into `(RX)`;
+/// `windows-sys` exports it as a generic-mapping bit only.
+const DELETE: u32 = 0x0001_0000;
+
+/// `icacls`'s `(M)` — the alias [`ace_spec`] spells and the mask
+/// [`access_matches`] compares: `FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+/// FILE_GENERIC_EXECUTE | DELETE` (`0x0013_01BF`).
+const MODIFY: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+
+/// `icacls`'s `(RX)` — the alias [`ace_spec`] spells and the mask
+/// [`access_matches`] compares: the read and execute halves (`0x0012_00A9`).
+const READ_AND_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+
+/// **The sentence a reparse point is refused with, and the one place it is
+/// spelled.** Three sites meet one: the whitelist's `refuse_reparse_points` — a
+/// link anywhere in a *spelled* path, which is where the ACE would land on the
+/// link's target — its `refuse_a_reparse_sibling`, and [`Object::verify`], the
+/// handle check every grant now passes.
+///
+/// **What it states is what a grant does through a link, and that is not one
+/// thing — the wording says so because the measurement did** (this host,
+/// 2026-09-27): `icacls /grant:r` on a path with a junction **above** the last
+/// component resolves it and writes the ACE on the target, outside the exposed
+/// tree (`…\hop\tinio` wrote `…\real\tinio`'s descriptor, and the pre-existing
+/// file beneath it inherited the ACE); on a path whose **last** component is a
+/// junction the ACE lands on the link's own object rather than on the target; on a
+/// **file symlink** it lands on the target — the sibling-DLL escape the name-based
+/// enumeration closes. None of the three is the ACE the caller asked for, and two
+/// of them can be outside the exposure.
+pub(crate) const REPARSE_POINT: &str = "is a reparse point (a junction or a symlink), and a grant through it lands on the link's own object or on whatever it resolves to — never on the path the caller named, and not necessarily inside the exposed tree";
+
+/// **The refusal a grant's shape earns on an object of the wrong kind** — the
+/// opened handle's own answer, and the replacement for the one failure `icacls`
+/// reported as success: an inheritance-flagged ACE on a file is a silent no-op
+/// (design §6's evidence row), and a plain ACE aimed at a directory leaves every
+/// descendant ungranted, so a shape that disagrees with the object is refused
+/// rather than written.
+const NOT_THE_GRANTED_KIND: &str = "is not the kind of object this grant's shape addresses: an inherited (OI)(CI) grant and the program directory's plain grant need a directory, and a file grant needs one that is not a directory — on the wrong kind the ACE is a silent no-op when a tool writes it and reaches nothing when this crate does";
+
+/// The refusal a reparse point earns: **the event and the error, built in one
+/// place** because the sites that meet one are three — the whitelist's walk over
+/// a spelled path's components, its sibling check, and the grant's own handle
+/// check — and one operator rule should read one way.
+///
+/// **The step is the caller's**, because the sites fail at different stages of a
+/// launch while the *finding* is one: `step` names where in the launch the refusal
+/// happened, and [`REPARSE_POINT`] is what happened.
+///
+/// **Hand-written for the same reason the caller's-file refusal is**: the
+/// `Error::BadPath` below carries the path as its field, and `fail`/`refused`
+/// cannot emit that — the error has to exist before `refused` could be handed it,
+/// and `fail` would either drop the path or turn this into a `Launch`. The event
+/// carries the core's fields — `step`, `path`, `error` — and is a security
+/// decision, so an operator has to see it in the log rather than infer it from a
+/// startup failure (shared §7's rule).
+pub(crate) fn reparse_refusal(path: &Path, step: &'static str) -> Error {
+    let error = Error::BadPath {
+        path: path.to_path_buf(),
+        reason: REPARSE_POINT,
+    };
+    tracing::error!(
+        step,
+        path = %path.display(),
+        error = %error,
+        "sandbox step failed"
+    );
+    error
+}
+
+/// The refusal a shape that disagrees with the object earns, in
+/// [`reparse_refusal`]'s shape and for its reason: **an `Error::BadPath` with the
+/// path as its field**, emitted where it is built.
+fn kind_refusal(path: &Path) -> Error {
+    let error = Error::BadPath {
+        path: path.to_path_buf(),
+        reason: NOT_THE_GRANTED_KIND,
+    };
+    tracing::error!(
+        step = "verify the granted path",
+        path = %path.display(),
+        error = %error,
+        "sandbox step failed"
+    );
+    error
+}
 
 /// The shape a grant takes.
 ///
@@ -91,8 +217,9 @@ use crate::{
 /// **The two dimensions behind it are independent.** *What the path is* decides
 /// whether inheritance is meaningful at all: `(OI)(CI)` is meaningful on a
 /// directory only, so an inheritance-flagged grant on a **file** is a **silent
-/// no-op** — `icacls` exits 0 and writes nothing — while the file shape sent to a
-/// directory leaves every descendant ungranted. *Whether it propagates* is a policy:
+/// no-op** when `icacls` writes it (exit 0, nothing written) and an ACE nothing
+/// inherits from when the API does, while the file shape sent to a directory
+/// leaves every descendant ungranted. *Whether it propagates* is a policy:
 /// a caller's exposed directory must reach the descendants it already holds (design
 /// §6's whitelist, one ACE per exposed path instead of a `/t` walk over
 /// every file in the tree), and decision 22's program-directory entry deliberately
@@ -127,8 +254,7 @@ pub enum Target {
     /// because the flags are a no-op on one. This variant is passed by its two
     /// callers rather than read off the filesystem to pick it — `backend::confine`
     /// filters the file-shaped entries out before asking `shape_for`, and
-    /// [`Grants::apply_siblings`] passes the literal for the tool's `*.dll`
-    /// pattern.
+    /// [`Grants::apply_siblings`] passes the literal for each enumerated `*.dll`.
     File,
     /// **The program's own directory, and decision 22's exception**: a directory
     /// whose ACE deliberately stops at it, because what the confined child may
@@ -159,10 +285,13 @@ pub enum Target {
 /// the only thing that keeps a call site from handing a file the directory-shaped
 /// intent or the other way round, and `(OI)(CI)` is the single token in this table
 /// that distinguishes a shape at all — it is what separates [`Target::Directory`]
-/// from both of the others. Which variant a call site holds is checked where it is
-/// chosen: `backend::grant_whitelist` refuses a program-directory shape whose path
-/// is not a directory, rather than handing `icacls` a grant it would report as
-/// successful and write nothing for.
+/// from both of the others.
+///
+/// **The string and the numbers a grant is actually written with are one table
+/// read twice**: [`ace_bits`] is the mask and the inheritance flags
+/// `SetSecurityInfo` takes, this is the tool's spelling of the same pair, and
+/// `the_aliases_icacls_writes_are_the_masks_this_read_compares` pins the two
+/// against each other on a real DACL.
 ///
 /// # Examples
 ///
@@ -195,12 +324,47 @@ pub const fn ace_spec(target: Target, access: AccessMode) -> &'static str {
     }
 }
 
+/// The same table as [`ace_spec`], in the two numbers the write takes: **the
+/// access mask and the inheritance flags an `EXPLICIT_ACCESS_W` carries**, which
+/// is what `grfAccessPermissions` and `grfInheritance` are set from.
+///
+/// **The numbers are the aliases' own, not a second opinion about them**: `M` is
+/// `MODIFY` (`0x0013_01BF`) and `RX` is `READ_AND_EXECUTE` (`0x0012_00A9`), the
+/// two constants the read compares against, and the flags are
+/// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE` for the one shape that
+/// propagates — `NO_INHERITANCE` for the two that do not, which is why a file
+/// grant never carries `(OI)(CI)` even though passing it would compile.
+///
+/// **The pair is `const` and private, and the table is small on purpose**: it is
+/// the whole of what `SET_ACCESS` is told, and every other part of the ACE — the
+/// SID, the type, the order the entry lands in — is the kernel's
+/// (`SetEntriesInAclW` inserts a new allow ACE ahead of the existing allows, which
+/// is the order `icacls` produced and the reason its alias list reads the same).
+const fn ace_bits(target: Target, access: AccessMode) -> (u32, u32) {
+    let mask = match access {
+        AccessMode::ReadOnly => READ_AND_EXECUTE,
+        AccessMode::ReadWrite => MODIFY,
+    };
+    let inheritance = match target {
+        Target::Directory => OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        Target::ProgramDirectory | Target::File => NO_INHERITANCE,
+    };
+    (mask, inheritance)
+}
+
 /// The `*<sid>:<perm>` argument `icacls` is given for `target`.
 ///
 /// The leading `*` is what stops the tool resolving the string as an account
 /// name: an AppContainer package SID has no account behind it, and a name form
 /// would be looked up in the local accounts and fail — or, worse, be answered by
 /// an account that happens to carry the name.
+///
+/// **The launcher no longer hands this to the tool — the tool is what an
+/// operator, a fixture and [`revoke`] still use** — so what the function is for
+/// now is that one table describes both writers: [`ace_bits`] is what
+/// `SetSecurityInfo` is told and this is the same pair in the tool's own spelling,
+/// which is what `tests/acl.rs` and `tinio-server`'s Windows fixtures need to
+/// write an ACE the launcher's read will recognize.
 ///
 /// # Examples
 ///
@@ -227,11 +391,16 @@ pub fn grant_spec(sid: &str, target: Target, access: AccessMode) -> String {
 /// **Robustness rather than defence, and the distinction is deliberate**: an
 /// actor who can set this launcher's environment is a local actor, and local
 /// actors are outside this feature's threat model, so nothing here is a defence
-/// being claimed. What the rule buys is that the tool which edits the DACL is the
-/// operating system's own even when `%SystemRoot%` is unset, stale or wrong. The
-/// module's rule — the process that decides this run's DACLs is not selectable
+/// being claimed. What the rule buys is that the tool this crate shells out to is
+/// the operating system's own even when `%SystemRoot%` is unset, stale or wrong.
+/// The module's rule — the process that decides this run's DACLs is not selectable
 /// through the environment — is what this function makes true of the code rather
 /// than an intention stated beside it.
+///
+/// **The grant no longer goes through the tool** ([`Object`] writes on a handle);
+/// what still does is [`revoke`], the operator's own primitive, and every suite
+/// and fixture that uses the tool as an independent oracle — which is why this
+/// path is still the system directory's rather than `PATH`'s.
 ///
 /// # Examples
 ///
@@ -248,25 +417,32 @@ pub fn icacls_binary() -> PathBuf {
 /// Grant `access` to `sid` on `path` in `target`'s shape, replacing any entry this
 /// SID already has there and touching nothing else.
 ///
-/// **Grant-only, never revoke-then-grant** (design decision 15): `/grant:r`
-/// rewrites this one SID's entry, so a directory's other ACEs, its permission
-/// bits and its owner are left as they were found — a sandbox run cannot lock an
-/// operator out of their own data. It is also what makes decision 21's takeover
-/// work: an ACE a crashed run left behind is *replaced* rather than duplicated.
+/// **Grant-only, never revoke-then-grant** (design decision 15): the entry is
+/// merged with `SET_ACCESS`, which replaces this one SID's ACE, so a directory's
+/// other ACEs, its permission bits and its owner are left as they were found — a
+/// sandbox run cannot lock an operator out of their own data. It is also what makes
+/// decision 21's takeover work: an ACE a crashed run left behind is *replaced*
+/// rather than duplicated (measured 2026-09-27: a second write with a different
+/// mask **and** different inheritance flags leaves one entry for the SID, not two).
+///
+/// **The path is opened, not resolved**: see [`Object`] for the handle the read and
+/// the write share and for the two refusals — a reparse point, and an object whose
+/// kind disagrees with `target` — that `icacls` could not report (its
+/// inheritance-flagged grant on a file exits 0 and writes nothing).
 ///
 /// **`target` is the caller's, and it is the caller's for each of the two
 /// questions `Target` encodes** (its own doc): `backend::confine` asks
-/// `shape_for` for every entry whose host is not a file, while
-/// `Grants::apply_siblings` passes a literal `Target::File` because the
-/// wildcard it grants through names only `*.dll` matches — neither site probes the path to
-/// answer either question. A shape that disagrees with the path is a grant the
-/// tool reports as successful and does not write (the module doc states the
-/// measurement).
+/// `shape_for` for every entry, while `Grants::apply_siblings` passes a literal
+/// `Target::File` for each enumerated `*.dll` — neither site probes the path to
+/// answer either question, and a shape that disagrees with the object it reaches is
+/// refused rather than approximated.
 ///
 /// # Errors
 ///
-/// [`Error::Launch`](crate::_core::Error::Launch) naming the path and carrying
-/// `icacls`'s own diagnostic when it exits non-zero.
+/// [`Error::Launch`](crate::_core::Error::Launch) naming the path and carrying the
+/// Win32 status when the object cannot be opened or the descriptor cannot be
+/// written, and [`Error::BadPath`](crate::_core::Error::BadPath) for a path that is
+/// a reparse point or an object of the wrong kind.
 ///
 /// # Examples
 ///
@@ -285,54 +461,413 @@ pub fn icacls_binary() -> PathBuf {
 /// acl::grant(root, Target::Directory, AccessMode::ReadOnly, &sid).unwrap();
 /// ```
 pub fn grant(path: &Path, target: Target, access: AccessMode, sid: &PackageSid) -> Result<()> {
-    grant_to(path, target, access, sid.as_str()).map(drop)
+    grant_to(path, target, access, GrantSid::of(sid)).map(drop)
 }
 
-/// [`grant`] for a SID that is not a [`PackageSid`] — the standing
-/// [`ALL_APPLICATION_PACKAGES`] grant — and the shape every grant in this crate
-/// goes through.
+/// One SID as the two readings a grant needs: **the resolved value the kernel
+/// compares and writes, and the `S-1-15-2-…` text an operator's log shows.**
 ///
-/// **The write is skipped when the DACL already carries what it would write**,
-/// and that skip is what makes a standing grant free. `icacls /grant:r` rewrites
-/// the security descriptor even when the ACE it names is already there, and a
-/// descriptor write on a directory propagates eagerly over its whole subtree
-/// (`SetNamedSecurityInfoW`; measured ≈0.04 ms per object for this shape on ReFS,
-/// 10–20 s for this workspace's `target\debug`). So the steady state is a read:
-/// [`already_granted`] asks the kernel's DACL — `GetNamedSecurityInfoW` and
-/// `EqualSid` — and a satisfied path never reaches the tool's write at all. The
-/// `bool` says whether the descriptor was written, which is what
-/// [`Grants::apply_standing`] logs.
+/// **They travel as one value because they are two readings of one SID, and
+/// nothing may derive either from the other.** [`has_ace`]'s doc states the rule:
+/// a [`PackageSid`] already *is* the SID its profile was created under, so a
+/// `ConvertStringSidToSidW` on `as_str()` would resolve the same SID a second
+/// time — an allocation and a `LocalFree` per granted path, which is what made a
+/// launch with a dozen exposures do a dozen needless conversions. The text is no
+/// longer an argument to anything (`SetEntriesInAclW` takes the pointer), so what
+/// it is for is the per-path event: an operator greps the `S-1-15-2-…` their own
+/// root derives, not a pointer.
 ///
-/// **[`GrantOutcome::Unanswerable`] writes**, and that is the only one of the
-/// three answers that does not come from a DACL: a wildcard path (see
-/// [`already_granted`]) is one nothing can read, and a grant that is not written
-/// at all would leave a confined child without the loader's own DLLs.
-fn grant_to(path: &Path, target: Target, access: AccessMode, sid: &str) -> Result<bool> {
-    if already_granted(path, sid, target, access)? == GrantOutcome::AlreadyGranted {
-        // Shared §7's per-operation event, with `written = false` so a log shows
-        // the skip rather than a silent absence of the line above it.
+/// [`Self::of`] is the route for a SID this crate already owns; the standing
+/// [`ALL_APPLICATION_PACKAGES`] grant arrives as text and goes through
+/// [`OwnedSid::parse`] first, which is the one place a parse is still owed.
+#[derive(Clone, Copy)]
+struct GrantSid<'a> {
+    /// The resolved SID, as every Win32 call takes it.
+    raw: PSID,
+    /// The rendered form, for the event a run leaves behind.
+    text: &'a str,
+}
+
+impl<'a> GrantSid<'a> {
+    /// The pair for a SID that is already resolved.
+    fn of(sid: &'a PackageSid) -> Self {
+        Self {
+            raw: sid.raw(),
+            text: sid.as_str(),
+        }
+    }
+}
+
+/// **The object a grant acts on: the one the caller spelled, opened rather than
+/// followed, and asked what it is before anything is written to it.**
+///
+/// This type exists because a path is not an object. `icacls /grant:r` — and any
+/// name-based API, `SetNamedSecurityInfoW` included — resolves the name again when
+/// it writes, so between the whitelist's reparse refusal and the write a local
+/// writer who swapped an exposed directory for a junction redirected the ACE: the
+/// check approved one object and the write reached another, with no re-check
+/// between them — and the window is the whole grant phase, which
+/// `backend/grant.rs` measures against a 30 s readiness budget.
+/// `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` opens the *object the name
+/// denotes* — the link itself, if the last component is one — and every later call
+/// takes that handle, so the object verified is the object written: there is no
+/// second resolution to lose a race to.
+///
+/// **Each handle is opened for the access its half needs and no more**:
+/// [`Self::open`] takes `READ_CONTROL` alone, which is what `GetSecurityInfo`
+/// needs to answer the skip, and [`Self::open_for_write`] takes
+/// `READ_CONTROL | WRITE_DAC`, which is what `SetSecurityInfo` needs to replace
+/// the entry. That split is not tidiness: a grant whose ACE is already there — the
+/// steady state of a standing grant, and every launch after the first on a root —
+/// must not fail on a path this process may read but may not re-ACL, and a single
+/// `READ_CONTROL | WRITE_DAC` open would refuse it before the read could answer
+/// "nothing to do". The write pays the stronger access only when a descriptor
+/// write is actually due.
+///
+/// **`FILE_FLAG_BACKUP_SEMANTICS` is passed for every target, directory or file**,
+/// because the kind question has to be the *handle's*: Windows refuses any handle
+/// to a directory without that flag, so a file-shaped grant on a directory would
+/// fail the open with `ERROR_ACCESS_DENIED` and never reach [`Self::verify`] —
+/// leaving the one check this type exists for unreachable in exactly the direction
+/// `icacls` used to report as success. The flag is what a directory needs and costs
+/// a file nothing (measured on this host 2026-09-27: a plain file opens, reads and
+/// re-ACLs through it).
+///
+/// **Two refusals, and both are the handle's own answer.** The attributes come from
+/// `GetFileInformationByHandle`, which reports on the object behind the handle
+/// rather than on the name: `FILE_ATTRIBUTE_REPARSE_POINT` is a link (refused with
+/// [`REPARSE_POINT`]'s sentence, the same rule the whitelist applies to a spelled
+/// path) and `FILE_ATTRIBUTE_DIRECTORY` decides whether the object is the kind
+/// `target` addresses (refused with [`NOT_THE_GRANTED_KIND`]'s). Both are
+/// `Error::BadPath` — a path that cannot be expressed inside the confinement, which
+/// is what "this is not the object the grant was about" is.
+///
+/// The `unsafe` blocks are this module's: the open, the attribute read, the
+/// descriptor read, the merge and the write, each with its own safety argument, and
+/// the handle is closed exactly once by `Drop`.
+struct Object {
+    /// The spelling the caller gave, which every error and event names: the handle
+    /// has no path of its own to report, and a `\\?\`-prefixed canonical spelling
+    /// is not what an operator typed.
+    path: PathBuf,
+    /// The handle to the object itself, live until `Drop`.
+    handle: HANDLE,
+}
+
+impl Object {
+    /// Open the object `path` denotes **for the read that decides the skip**,
+    /// without following a final reparse point.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Launch`](crate::_core::Error::Launch) naming the path when
+    /// `CreateFileW` refuses — a path that does not exist, or an object this
+    /// process may not read.
+    fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, READ_CONTROL)
+    }
+
+    /// Open the same object again **for the write**, with `WRITE_DAC` beside the
+    /// read access the first open had.
+    ///
+    /// **It is a second open of the same *name*, not a second class of object**:
+    /// the flags are [`Self::open`]'s, so a link that appeared between the two
+    /// calls is not followed — and the caller verifies this handle too, which is
+    /// what makes the write act on an object that passed the same two refusals the
+    /// read did. A failure here is the grant's failure: nothing has been written
+    /// (the write is the first thing this handle is used for), and nothing is taken
+    /// back on the way out, because every grant this crate makes is standing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Launch`](crate::_core::Error::Launch) naming the path when
+    /// `CreateFileW` refuses — including a path this process may read but may not
+    /// re-ACL, which is exactly the case the two-open split exists to keep off the
+    /// skip's path.
+    fn open_for_write(path: &Path) -> Result<Self> {
+        Self::open_with(path, READ_CONTROL | WRITE_DAC)
+    }
+
+    /// One open, with the access the caller's half needs.
+    fn open_with(path: &Path, access: u32) -> Result<Self> {
+        #[cfg(test)]
+        opens::note(access);
+        let name = to_wide(path.as_os_str());
+        // SAFETY: `name` is NUL-terminated and alive for the call, the share mode
+        // and creation disposition are the constants above, no security attributes
+        // are passed (`null`, so the object's own descriptor is untouched by the
+        // open), no template file is named, and `access` is a file access mask the
+        // caller derived from the half it is opening for. A successful call returns
+        // a handle this value owns.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(launch("open the granted path", path, handles::last_error()));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            handle,
+        })
+    }
+
+    /// What the opened object is, against what the grant's shape addresses.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadPath`] with [`REPARSE_POINT`] for a link and with
+    /// [`NOT_THE_GRANTED_KIND`] for an object whose directory-ness is not the kind
+    /// `target` speaks about; [`Error::Launch`] when the attributes cannot be read.
+    fn verify(&self, target: Target) -> Result<()> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `self.handle` is a live handle this value owns, and `info` is a
+        // correctly sized, writable out-parameter that stays alive for the call.
+        let read = unsafe { GetFileInformationByHandle(self.handle, &raw mut info) };
+        if read == 0 {
+            return Err(launch(
+                "verify the granted path",
+                &self.path,
+                handles::last_error(),
+            ));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(reparse_refusal(&self.path, "verify the granted path"));
+        }
+        let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        if is_directory != (target != Target::File) {
+            return Err(kind_refusal(&self.path));
+        }
+        Ok(())
+    }
+
+    /// Whether this object's DACL already carries the grant [`Self::write`] would
+    /// write.
+    ///
+    /// **The same oracle the name-based read used, asked of the handle**: the walk
+    /// is [`walk_dacl`]'s, which compares each entry's SID with `EqualSid`, and the
+    /// predicate is [`access_matches`], which asks the entry about its mask and its
+    /// inheritance flags — so "already granted" means exactly "the write would
+    /// change nothing", which is what makes the skip sound. Asking it of the name
+    /// instead would answer about whatever the name resolves to *now*, which is the
+    /// object this handle is not.
+    fn granted(&self, sid: PSID, target: Target, access: AccessMode) -> Result<bool> {
+        let wanted = |ace: &ACCESS_ALLOWED_ACE| access_matches(ace, access, target);
+        let Some((dacl, descriptor)) = self.read_dacl()? else {
+            return Ok(false);
+        };
+        let held = carries(&self.path, dacl, sid, &wanted);
+        // The descriptor is this read's own allocation, released once here — after the
+        // walk that borrows the ACL inside it has returned, and on the failure path too.
+        free_descriptor(descriptor);
+        held
+    }
+
+    /// Write `sid`'s entry — `(mask, inheritance)` for the shape, in place of
+    /// whatever this SID carries now — into the object's DACL.
+    ///
+    /// **The read-merge-write shape is `icacls /grant:r`'s own**: the old DACL is
+    /// read off the handle, `SetEntriesInAclW` merges one `SET_ACCESS` entry into
+    /// it (leaving every other trustee's entries where they were), and the merged
+    /// ACL and nothing else goes back through `SetSecurityInfo` with
+    /// `DACL_SECURITY_INFORMATION` — which is what leaves the owner, the group, the
+    /// SACL and the control bits alone, and what lets the filesystem propagate an
+    /// inheritable ACE to a directory's pre-existing children exactly as it did
+    /// when the tool wrote the ACE.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Launch`](crate::_core::Error::Launch) naming the path, with the
+    /// Win32 status of whichever of the three calls refused. **The status is the
+    /// call's own return value and not `GetLastError`'s**: this family reports its
+    /// failure as a `WIN32_ERROR` and does not set the thread's last error, so
+    /// [`handles::last_error`] would answer with a stale code here.
+    fn write(&self, sid: PSID, target: Target, access: AccessMode) -> Result<()> {
+        let Some((old, descriptor)) = self.read_dacl()? else {
+            // A null DACL is every access to every trustee; there is no ACL to merge
+            // into, and `SetEntriesInAclW`'s `oldacl` argument may be null for
+            // exactly that case ("no existing ACL"), so the merge starts from empty.
+            return self.merge_and_set(sid, target, access, null());
+        };
+        let result = self.merge_and_set(sid, target, access, old);
+        // SAFETY: the descriptor is this call's own read, released once here; the
+        // ACL pointer borrowed from it is not freed separately.
+        unsafe { LocalFree(descriptor) };
+        result
+    }
+
+    /// `SetEntriesInAclW` + `SetSecurityInfo` over `old`, which is either the
+    /// object's own ACL or `null`.
+    fn merge_and_set(
+        &self,
+        sid: PSID,
+        target: Target,
+        access: AccessMode,
+        old: *const ACL,
+    ) -> Result<()> {
+        let (mask, inheritance) = ace_bits(target, access);
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            // `SET_ACCESS` is `/grant:r`: this SID's entry is replaced, every other
+            // trustee's is left alone. `GRANT_ACCESS` would merge the masks instead,
+            // which is the behaviour decision 15 deliberately does not want.
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: inheritance,
+            Trustee: TRUSTEE_W {
+                // A SID and not a name: an AppContainer package SID has no account
+                // behind it, and a name would be looked up — the same rule
+                // `grant_spec`'s `*` prefix enforces for the tool's argument. The
+                // pointer is borrowed for this call alone: `SetEntriesInAclW` copies
+                // the SID into the ACL it builds.
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                ptstrName: sid.cast::<u16>(),
+                // `pMultipleTrustee` and `MultipleTrusteeOperation`, both defaulted:
+                // no trustee chain.
+                ..Default::default()
+            },
+        };
+        let mut merged: *mut ACL = null_mut();
+        // SAFETY: `entry` is one initialized EXPLICIT_ACCESS_W alive for the call
+        // and its trustee points at the caller's own SID; `old` is either null or an
+        // ACL the caller holds (the descriptor it borrows stays alive until the
+        // caller's free); `merged` is a valid out-parameter. On success the new ACL
+        // is this call's allocation to free.
+        let code = unsafe { SetEntriesInAclW(1, &entry, old, &raw mut merged) };
+        if code != 0 {
+            return Err(launch(
+                "merge the ACL grant",
+                &self.path,
+                io::Error::from_raw_os_error(code as i32),
+            ));
+        }
+        // SAFETY: `self.handle` is live for this value's lifetime; the ACL passed is
+        // the one just built and stays alive until the free below; the owner, group
+        // and SACL arguments are null, which is "not asked for", so only the DACL of
+        // the object changes.
+        let code = unsafe {
+            SetSecurityInfo(
+                self.handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                merged,
+                null_mut(),
+            )
+        };
+        // SAFETY: `merged` is `SetEntriesInAclW`'s own allocation and this is its
+        // only free; nothing reads it afterwards.
+        unsafe { LocalFree(merged.cast()) };
+        if code != 0 {
+            return Err(launch(
+                "write the DACL",
+                &self.path,
+                io::Error::from_raw_os_error(code as i32),
+            ));
+        }
+        #[cfg(test)]
+        writes::note();
+        Ok(())
+    }
+
+    /// This object's DACL, with the descriptor that owns it — read off the handle.
+    ///
+    /// [`read_dacl`]'s handle-shaped twin, and the reason it exists rather than a
+    /// name form: a name can be re-resolved, a handle cannot.
+    fn read_dacl(&self) -> Result<Option<(*mut ACL, PSECURITY_DESCRIPTOR)>> {
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: `self.handle` is a live handle this value owns with `READ_CONTROL`
+        // on it, `dacl` and `descriptor` are valid out-parameters, and a null
+        // owner/group/SACL out-parameter is the documented "not asked for". The
+        // descriptor it returns is the one `LocalFree` releases, exactly once, in
+        // the caller.
+        let code = unsafe {
+            GetSecurityInfo(
+                self.handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &raw mut dacl,
+                null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if code != 0 {
+            return Err(launch(
+                "read the DACL",
+                &self.path,
+                io::Error::from_raw_os_error(code as i32),
+            ));
+        }
+        if dacl.is_null() {
+            // The descriptor came back without a DACL: nothing to walk, and its own
+            // allocation is still this function's to release.
+            free_descriptor(descriptor);
+            return Ok(None);
+        }
+        Ok(Some((dacl, descriptor)))
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
+        // SAFETY: the handle is this value's own — `open` is the only constructor
+        // and nothing else holds a copy — so it is closed exactly once, here.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+/// Grant `access` to `sid` on the object `path` denotes, in `target`'s shape.
+///
+/// **Open, verify, read, and — only when the read says the grant is due — open
+/// again for the write.** A satisfied path costs one `READ_CONTROL` open and one
+/// descriptor read and never asks for `WRITE_DAC`; a path whose ACE is missing or
+/// too narrow is opened a second time with the write access and written through
+/// that handle, after [`Object::verify`] has answered the same two refusals for it.
+/// The `bool` says whether the descriptor was written, which is what the per-path
+/// event and [`Grants::apply_standing`] report.
+///
+/// **The event is the phase's own step name**, because that is what this is: one
+/// ACE of the `grant the ACLs` phase, at `debug!` with `written` telling the skip
+/// from the write (shared §7's per-operation event).
+///
+/// **The SID arrives as a [`GrantSid`] and is never re-parsed from its text**: the
+/// read and the write both compare and store the value the caller already holds,
+/// and the derived text only ever reaches a log line.
+fn grant_to(path: &Path, target: Target, access: AccessMode, sid: GrantSid<'_>) -> Result<bool> {
+    let read = Object::open(path)?;
+    read.verify(target)?;
+    if read.granted(sid.raw, target, access)? {
         tracing::debug!(
-            step = "icacls /grant:r",
+            step = "grant the ACLs",
             path = %path.display(),
             access = ?access,
-            sid,
+            sid = sid.text,
             written = false
         );
         return Ok(false);
     }
-    let spec = grant_spec(sid, target, access);
-    run(
-        "icacls /grant:r",
-        path,
-        &[OsStr::new("/grant:r"), OsStr::new(&spec), OsStr::new("/q")],
-    )?;
-    // Shared §7's per-operation event, with the three fields that matter here:
-    // which path, which access, which SID.
+    // The read handle is given up before the second open, so at most one handle to
+    // this object is live at a time and the write never depends on the read's.
+    drop(read);
+    let object = Object::open_for_write(path)?;
+    object.verify(target)?;
+    object.write(sid.raw, target, access)?;
     tracing::debug!(
-        step = "icacls /grant:r",
+        step = "grant the ACLs",
         path = %path.display(),
         access = ?access,
-        sid,
+        sid = sid.text,
         written = true
     );
     Ok(true)
@@ -362,14 +897,15 @@ fn sid_spellings(sid: &str) -> Vec<&str> {
 /// spelling `sid_spellings` allows.
 ///
 /// **It is a test oracle now and no longer the production read.** [`has_ace`] and
-/// `already_granted` ask the kernel's DACL with [`EqualSid`], so nothing this
-/// crate *decides* rides on how a SID is rendered; what still does is every suite
-/// that asserts against the tool's own output — `tests/acl.rs` pins
-/// [`ALL_APPLICATION_PACKAGES`] on the sibling batch through it, and
-/// `tests/confine.rs` asks whether the program directory carries the standing SID
-/// at all. Keeping one implementation of that question is what stops the oracle
-/// and the tool from drifting apart, and the rendering it handles is the reason
-/// the predicate exists: `S-1-15-2-1` is printed as `ALL APPLICATION PACKAGES`.
+/// the skip ask the kernel's DACL through [`walk_dacl`], which compares trustees
+/// with `EqualSid`, so nothing this crate *decides* rides on how a SID is
+/// rendered; what still does is every suite that asserts against the tool's own
+/// output — `tests/acl.rs` pins [`ALL_APPLICATION_PACKAGES`] on the sibling batch
+/// through it, and `tests/confine.rs` asks whether the program directory carries
+/// the standing SID at all. Keeping one implementation of that question is what
+/// stops the oracle and the tool from drifting apart, and the rendering it handles
+/// is the reason the predicate exists: `S-1-15-2-1` is printed as
+/// `ALL APPLICATION PACKAGES`.
 ///
 /// Public because those suites ask it and the text they hold is the tool's.
 ///
@@ -395,115 +931,112 @@ pub fn mentions_sid(text: &str, sid: &str) -> bool {
     })
 }
 
-/// The SID an access-allowed ACE names.
+/// Whether `ace` — an access-allowed entry, as [`walk_dacl`] hands one over, so
+/// the type test that makes this structure its layout has already been made —
+/// carries what a grant for `target`/`access` would write.
 ///
-/// The ACE has already been established as an `ACCESS_ALLOWED_ACE` — the only
-/// `AceType` [`any_ace_in`] reads an ACE as — which is what makes the `SidStart`
-/// field meaningful rather than a guess at some other ACE's layout. It has a known
-/// offset by the structure's definition (a header, a mask and then the SID
-/// inline), so this borrows the SID inside the descriptor and copies nothing:
-/// `EqualSid` reads it for the length the SID's own header carries, inside the ACL
-/// the descriptor owns.
-fn ace_sid(ace: *mut c_void) -> PSID {
-    // SAFETY: the caller's contract (above) is that `ace` points at an
-    // `ACCESS_ALLOWED_ACE` inside a descriptor that is alive for the call, so
-    // reading its `SidStart` field is in bounds and aligned, and the field is
-    // the first byte of that ACE's SID.
-    unsafe { addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) as PSID }
-}
-
-/// Whether `ace` — an access-allowed entry — carries `mask` or more, in the
-/// flags `target` and `access` require.
+/// **It asks [`ace_bits`], the one table the write is made from**, which is what
+/// keeps the read and the write from disagreeing: the *rule* differs — the write
+/// sets exactly those bits, the read accepts any entry that **contains** them —
+/// and that difference is this function's, not a second copy of the numbers. A
+/// DACL may carry `R`, `F`, a wider mask or one written by another tool, and every
+/// one of those that includes the request satisfies it; an equality would report a
+/// path that already has more than enough as unsatisfied and rewrite its
+/// descriptor, which is the cost this read exists to avoid.
 ///
-/// **The masks are the API spelling of `icacls`'s own aliases, derived from the
-/// generic rights rather than transcribed**, and that is the whole alignment
-/// argument: the tool writes what its alias expands to, so comparing those bits
-/// byte for byte decides the read exactly as the tool's own rendering did — `M`
-/// is `FILE_GENERIC_READ | WRITE | EXECUTE | DELETE` and `RX` is the read and
-/// execute halves plus `SYNCHRONIZE`. `ACCESS_ALLOWED_ACE::Mask` is what
-/// `GetNamedSecurityInfoW` reports for an entry, the alias is not stored, and the
-/// tests below pin both numbers against `icacls`.
-///
-/// **Containment is the test, not equality.** A DACL may carry `R`, `F`, a wider
-/// mask or one written by another tool, and every one of those that *includes*
-/// the request satisfies it — an equality would report a path that already has
-/// more than enough as unsatisfied and rewrite its descriptor, which is the cost
-/// this read exists to avoid.
+/// **The masks' provenance is the table's** (`icacls`'s own aliases, derived from
+/// the generic rights rather than transcribed) and so is the flags': a
+/// `Target::Directory` entry must carry `(OI)(CI)`, because an inherited grant that
+/// lost its flags reaches no descendant and is not the grant the caller asked for,
+/// while the two non-propagating shapes ask for no flags at all — at least the
+/// requested flags, and therefore any flags when none are requested.
 ///
 /// **`F` needs no branch of its own**: what `icacls` stores for `(F)` is
-/// `FILE_ALL_ACCESS` (`0x001F_01FF`), which carries every bit the other two masks
-/// have, so the same containment test answers it — and the generic bit is not a
-/// shortcut to that: an ACE whose mask is `GENERIC_ALL` and nothing else grants
-/// no specific right at all, which is the false skip this test used to take.
+/// `FILE_ALL_ACCESS` (`0x001F_01FF`), which carries every bit both masks have, so
+/// the same containment test answers it — and the generic bit is not a shortcut to
+/// that: an ACE whose mask is `GENERIC_ALL` and nothing else grants no specific
+/// right at all, which is the false skip this test used to take.
 /// **An `INHERIT_ONLY` ACE fails every target**: such an entry reaches nothing on
 /// this object, so it is not the grant a caller asked for however wide its mask.
 fn access_matches(ace: &ACCESS_ALLOWED_ACE, access: AccessMode, target: Target) -> bool {
-    /// `DELETE` (`0x0001_0000`), which `icacls` folds into `(M)` and not into
-    /// `(RX)`; `windows-sys` exports it as a generic-mapping bit only.
-    const DELETE: u32 = 0x0001_0000;
-    /// `icacls`'s `(M)` — the alias [`ace_spec`] writes.
-    const MODIFY: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
-    /// `icacls`'s `(RX)` — the alias [`ace_spec`] writes.
-    const READ_AND_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-
     let flags = u32::from(ace.Header.AceFlags);
     // An inherit-only ACE is not effective on this object at all, so it cannot
-    // satisfy a grant whatever its mask says.
+    // satisfy a grant whatever its mask or flags say.
     if flags & INHERIT_ONLY_ACE != 0 {
         return false;
     }
     // **`F` is not a branch of its own, and the branch that stood here was
     // wrong.** `icacls`'s `(F)` stores `FILE_ALL_ACCESS` (`0x001F_01FF`), which
-    // contains every bit both masks above are built from, so this containment
-    // test answers it; the `GENERIC_ALL` disjunct that used to sit beside it
+    // contains every bit the table's masks are built from, so the containment
+    // below answers it; the `GENERIC_ALL` disjunct that used to sit beside it
     // fired only for a mask literally carrying bit 28 — which an access check
     // expands into *no specific right at all* — and a skip that fired there left
     // a confined child without the access it was launched for (`(F)`'s own
     // measurement, and the false skip it pins, are in `a_mask_carrying_only_the_
     // generic_bit_does_not_satisfy_a_grant`).
-    let mask_ok = match access {
-        AccessMode::ReadWrite => ace.Mask & MODIFY == MODIFY,
-        AccessMode::ReadOnly => ace.Mask & READ_AND_EXECUTE == READ_AND_EXECUTE,
-    };
-    let flags_ok = target != Target::Directory
-        || (flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
-            == OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE);
+    let (mask, wanted) = ace_bits(target, access);
+    let mask_ok = ace.Mask & mask == mask;
+    let flags_ok = wanted == NO_INHERITANCE || flags & wanted == wanted;
     mask_ok && flags_ok
 }
 
-/// Whether any entry in `path`'s DACL names `sid` with at least the access
-/// [`grant_to`] would write.
+/// Whether `dacl` — one live ACL, with the descriptor that owns it still in the
+/// caller's hands — holds an access-allowed entry for `sid` that `wanted` accepts.
 ///
-/// This is [`already_granted`] and [`has_ace`] behind one traversal, because they
-/// are one question asked twice: a SID in the DACL is a grant, and whether its
-/// mask is enough is what decides the skip.
-fn acl_grants(path: &Path, sid: PSID, target: Target, access: AccessMode) -> Result<bool> {
-    // `false` for a target that needs no flags (the `Target::File` and
-    // `Target::ProgramDirectory` shapes), where `icacls` too makes no such
-    // demand; `Target::Directory` is asked for `(OI)(CI)`.
-    let wanted = |ace: &ACCESS_ALLOWED_ACE| {
-        ace.Header.AceType == ACCESS_ALLOWED_ACE_TYPE && access_matches(ace, access, target)
-    };
-    any_ace_in(path, &wanted, sid)
+/// **This crate's one question about a DACL, and its two reads differ in nothing
+/// else**: [`Object::granted`] asks it of the handle the write would act on, and
+/// [`any_ace_in`] of a path the test oracle named. The walk itself is
+/// [`walk_dacl`]'s — [`tinio_winsec`] owns the ACE sequence, from the ACL's own
+/// count through the type test to the SID comparison, so this crate never asks the
+/// kernel for an ACE — and what the walk hands over is [`Ace`]'s three cases;
+/// **the verdict is here**: a `Named` entry that `wanted` accepts ends the walk,
+/// and every other entry is passed over rather than answered. A DACL may carry
+/// entries this crate never wrote — an inherited `(OI)(CI)(RX)` for
+/// `BUILTIN\Users`, a deny another tool set — and the question is whether *this*
+/// grant is already there, not whether the DACL is anything in particular.
+///
+/// The caller keeps the descriptor: it read the ACL through it and releases it by
+/// the route that produced it, so nothing here frees.
+///
+/// **A walk that fails is a failed launch and not a skip**: [`walk_dacl`]'s error
+/// travels out as this call's own, attributed to the step `"walk the DACL"`, so an
+/// entry nothing could read never becomes a satisfied grant and no descriptor is
+/// rewritten on the strength of one. That is `tinio_winsec`'s decision and its
+/// reason is written beside it there — including the note that no test covers the
+/// failing `GetAce`, because reaching it needs a DACL the security APIs cannot hand
+/// out.
+fn carries(
+    path: &Path,
+    dacl: *const ACL,
+    sid: PSID,
+    wanted: &dyn Fn(&ACCESS_ALLOWED_ACE) -> bool,
+) -> Result<bool> {
+    // SAFETY: `dacl` is the caller's own read — the ACL inside the descriptor its
+    // `GetSecurityInfo` or `GetNamedSecurityInfoW` returned, alive until the
+    // caller's `free_descriptor` — and `sid` is the caller's live SID (a
+    // `PackageSid`'s or an `OwnedSid`'s), both live for this call.
+    let verdict = unsafe {
+        walk_dacl(path, dacl, sid, &mut |ace| match ace {
+            Ace::Named(ace) if wanted(ace) => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        })
+    }
+    .map_err(|source| launch("walk the DACL", path, source))?;
+    Ok(verdict.is_break())
 }
 
 /// Whether `path`'s DACL carries an entry for `sid` whatever its mask.
 fn acl_names(path: &Path, sid: PSID) -> Result<bool> {
-    any_ace_in(
-        path,
-        &|ace: &ACCESS_ALLOWED_ACE| ace.Header.AceType == ACCESS_ALLOWED_ACE_TYPE,
-        sid,
-    )
+    any_ace_in(path, &|_| true, sid)
 }
 
 /// Run `wanted` over `path`'s access-allowed ACEs and answer whether any names
 /// `sid`.
 ///
-/// **The DACL is the boundary of the `unsafe`**: `descriptor` is one
-/// `LocalFree`-owned allocation, released once here, and the ACL pointer is a
-/// borrow *into* it and is **never** freed on its own. `AceCount` is what this
-/// asks; the SIDs are recognized by [`EqualSid`] rather than by any rendering of
-/// them.
+/// The path-shaped read, for [`has_ace`] — the test oracle that asks about a path
+/// rather than about an opened object. The grant's own read is
+/// [`Object::granted`]'s, which asks the same question of the same DACL through a
+/// handle the writer holds.
 fn any_ace_in(
     path: &Path,
     wanted: &dyn Fn(&ACCESS_ALLOWED_ACE) -> bool,
@@ -512,57 +1045,27 @@ fn any_ace_in(
     let Some((dacl, descriptor)) = read_dacl(path)? else {
         return Ok(false);
     };
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: `dacl` is the ACL the descriptor above owns and stays valid for
-    // this call; `info` is the out-parameter the class calls for.
-    let counted = unsafe {
-        GetAclInformation(
-            dacl,
-            (&raw mut info).cast(),
-            size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-    };
-    if counted == 0 {
-        // SAFETY: the descriptor is freed once, and this is the last use of the
-        // ACL: "a DACL whose size could not be read has no entries to report".
-        unsafe { LocalFree(descriptor) };
-        return Ok(false);
+    let held = carries(path, dacl, sid, wanted);
+    // The descriptor is this read's own allocation, released once here — after the
+    // walk that borrows the ACL inside it has returned, and on the failure path too.
+    free_descriptor(descriptor);
+    held
+}
+
+/// Release a security descriptor this module read — **the one place its
+/// allocation is given back**.
+///
+/// Every producer here (`GetNamedSecurityInfoW`, `GetSecurityInfo`) documents
+/// `LocalFree` as the release and hands back one allocation, and the ACL pointer it
+/// filled is a borrow *into* that allocation: freeing the ACL on its own is the
+/// documented mistake, which is why no caller does it.
+fn free_descriptor(descriptor: PSECURITY_DESCRIPTOR) {
+    if descriptor.is_null() {
+        return;
     }
-    let mut found = false;
-    for index in 0..info.AceCount {
-        let mut ace: *mut c_void = null_mut();
-        // SAFETY: `dacl` is alive and `index` is below the count just read;
-        // `ace` is a valid out-parameter.
-        let read = unsafe { GetAce(dacl, index, &mut ace) };
-        if read == 0 || ace.is_null() {
-            continue;
-        }
-        // SAFETY: `GetAce` just returned a pointer to this ACE, which the ACL
-        // owns, so its header is readable and the pointer is aligned.
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-        // The type test comes first, and the ACE is only ever read as an
-        // `ACCESS_ALLOWED_ACE` once it passed: the two structures share their
-        // first eight bytes (header and mask), and a predicate that read `SidStart`
-        // off an ACE of any other type would be reading a different layout.
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
-            continue;
-        }
-        // SAFETY: the type above is this structure's, and the pointer is the
-        // ACE `GetAce` handed back.
-        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-        // SAFETY: `ace_sid`'s contract — an access-allowed ACE in a live
-        // descriptor — is met by the two lines above, and `sid` is the caller's
-        // own initialized SID.
-        if wanted(allowed) && unsafe { EqualSid(ace_sid(ace), sid) } != 0 {
-            found = true;
-            break;
-        }
-    }
-    // SAFETY: the descriptor is released exactly once, here, and the ACL pointer
-    // borrowed from it is not freed separately.
+    // SAFETY: the descriptor is this module's own read, it is not kept, and
+    // nothing else refers to it — the callers hand it over exactly once.
     unsafe { LocalFree(descriptor) };
-    Ok(found)
 }
 
 /// `path`'s DACL, with the descriptor that owns it — or `None` when the kernel
@@ -574,7 +1077,7 @@ fn any_ace_in(
 /// "nothing granted" a listing of it would produce. A failure to *read* is an
 /// error and travels that way, exactly as it did through the tool.
 fn read_dacl(path: &Path) -> Result<Option<(*mut ACL, PSECURITY_DESCRIPTOR)>> {
-    let name = crate::wide_os(path.as_os_str());
+    let name = to_wide(path.as_os_str());
     let mut dacl: *mut ACL = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: `name` is NUL-terminated and alive for the call, `dacl` and
@@ -595,12 +1098,11 @@ fn read_dacl(path: &Path) -> Result<Option<(*mut ACL, PSECURITY_DESCRIPTOR)>> {
     };
     if code != 0 {
         return Err(launch(
-            // **The string names the tool the skip's history is written in, and
-            // the test suite asserts on it** (`tests/acl.rs`'s "a path `icacls`
-            // cannot read is an error"): a Win32 failure is reported through the
-            // same variant and the same step name as the tool's non-zero exit, so
-            // a caller sees one read failure rather than two shapes of one.
-            "icacls (read the DACL)",
+            // The step names the read, which is a `GetNamedSecurityInfoW` and no
+            // longer the tool: the same variant and the same step a failed handle
+            // read reports, so a caller sees one read failure rather than two
+            // shapes of one.
+            "read the DACL",
             path.to_path_buf(),
             io::Error::from_raw_os_error(code as i32),
         ));
@@ -608,101 +1110,10 @@ fn read_dacl(path: &Path) -> Result<Option<(*mut ACL, PSECURITY_DESCRIPTOR)>> {
     if dacl.is_null() {
         // The descriptor came back without a DACL: nothing to walk, and its own
         // allocation is still this function's to release.
-        if !descriptor.is_null() {
-            // SAFETY: the descriptor is this call's own allocation, it is not
-            // kept, and nothing else refers to it.
-            unsafe { LocalFree(descriptor) };
-        }
+        free_descriptor(descriptor);
         return Ok(None);
     }
     Ok(Some((dacl, descriptor)))
-}
-
-/// Whether `path`'s DACL already carries the grant [`grant_to`] would write.
-///
-/// The oracle is [`acl_grants`]'s — `GetNamedSecurityInfoW` and `EqualSid` — read
-/// for the **mask** rather than for the SID alone, because that is what decides
-/// whether the write is needed: an entry that already carries `M` satisfies a
-/// read-only request and `F` satisfies both, while an entry left by an earlier
-/// read-only grant does **not** satisfy a read-write one. A `Target::Directory`
-/// entry must still carry `(OI)(CI)`, because an inherited grant that lost its
-/// flags reaches no descendant and is not the grant the caller asked for.
-///
-/// **The comparison is binary and that is the point of it**: a well-known SID is
-/// rendered by name wherever the tool prints it and by nothing the kernel
-/// compares, so the question this answers — "is this SID in the DACL with enough
-/// access" — has an answer that no locale, no display name and no unresolvable
-/// SID can change. [`has_ace`]'s doc carries the measurement that made the text
-/// route untenable.
-///
-/// **A wildcard path has no answer here, and that is a limitation of this read
-/// rather than of its caller.** [`Grants::apply_siblings`] grants through
-/// `<program directory>\*.dll` — the one `name` pattern `icacls` takes — and
-/// `GetNamedSecurityInfoW` resolves no pattern: measured on this host 2026-09-25,
-/// the literal path with the `*` in it fails `123` `ERROR_INVALID_NAME`, which is
-/// where `tests/acl.rs`'s sibling batch caught this. Answering `false` there
-/// would be a guess dressed as a decision, because the ACE lives on each matched
-/// file and not on the pattern; the caller is told instead that this path has no
-/// answer and writes. **That is also what the pre-API route did on this path in
-/// practice**: its literal-SID search never matched `S-1-15-2-1` (see
-/// [`sid_spellings`]), so the sibling batch has always written.
-///
-/// # Errors
-///
-/// [`Error::Launch`] when the DACL cannot be read, exactly as [`has_ace`]:
-/// answering "nothing granted" for a path that could not be read would skip a
-/// grant that is needed. A pattern is not one of those failures — it is
-/// [`GrantOutcome::Unanswerable`], which is an answer.
-fn already_granted(
-    path: &Path,
-    sid: &str,
-    target: Target,
-    access: AccessMode,
-) -> Result<GrantOutcome> {
-    if names_a_pattern(path) {
-        return Ok(GrantOutcome::Unanswerable);
-    }
-    let sid = OwnedSid::parse(sid, path)?;
-    Ok(if acl_grants(path, sid.raw(), target, access)? {
-        GrantOutcome::AlreadyGranted
-    } else {
-        GrantOutcome::Missing
-    })
-}
-
-/// What a read of a path's DACL says about the grant [`grant_to`] would write.
-///
-/// **Three answers rather than two, because a wildcard path is a third state and
-/// not a guess.** [`Self::Unanswerable`] is [`SiblingScan::pattern`]'s `*.dll`,
-/// which no DACL read can decide; it makes the caller write, and that is the safe
-/// direction — a write that was not needed costs the descriptor propagation, while
-/// a skip that was not due leaves a confined child without the access it was
-/// launched for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GrantOutcome {
-    /// The DACL carries the grant.
-    AlreadyGranted,
-    /// The DACL was read and does not carry it.
-    Missing,
-    /// The path is a tool pattern, which no DACL read can answer.
-    Unanswerable,
-}
-
-/// Whether `path`'s final component carries a wildcard — what
-/// [`SiblingScan::pattern`] builds, and what `GetNamedSecurityInfoW` has no
-/// equivalent for.
-///
-/// **Both pattern characters, because both of them are patterns to this tool.**
-/// `icacls` expands `*` and `?` alike — measured on this host 2026-09-25:
-/// `icacls <dir>\?.dll` lists `a.dll`, one character matched, exactly as the `*`
-/// form does — and neither character can be part of a real Win32 name, so the
-/// two together are the whole test rather than the `*` alone. The final component
-/// is what is tested because that is where a pattern is spelled; a path whose
-/// *directories* carry a wildcard is not a form this crate builds and would fail
-/// the read on its own.
-fn names_a_pattern(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.to_string_lossy().contains(['*', '?']))
 }
 
 /// A SID this module allocated and therefore has to release.
@@ -711,17 +1122,20 @@ fn names_a_pattern(path: &Path) -> bool {
 /// is its documented release, and `Drop` is where that happens — so an early
 /// return cannot leak one, and no call site derives the raw SID a second time.
 /// It exists only for the [`ALL_APPLICATION_PACKAGES`] route, where the SID
-/// arrives as text; a [`PackageSid`] already owns its own.
+/// arrives as text; a [`PackageSid`] already owns its own, which is why
+/// [`Grants::apply`] parses nothing and this type stays off the per-path hot
+/// path. Its caller parses once per standing *set* — the program directory, or one
+/// batch of sibling DLLs — rather than once per granted file.
 struct OwnedSid(PSID);
 
 impl OwnedSid {
     /// `text` as a SID, or [`Error::Launch`] naming `path` when it is not one.
     ///
-    /// **A malformed SID is an error rather than `Ok(false)`**, the same rule the
-    /// read itself answers under: `already_granted` would otherwise skip a grant
-    /// it never checked. The spelling that reaches here is one of this crate's
-    /// own two constants, so a failure is the API's contract breaking rather than
-    /// operator input.
+    /// **A malformed SID is an error rather than a skip**: a grant made for a
+    /// zero SID is an ACE for nobody that still rewrites the descriptor, and there
+    /// is no SID to compare against, so the failure has to be loud. The spelling
+    /// that reaches here is one of this crate's own two constants, so a failure is
+    /// the API's contract breaking rather than operator input.
     fn parse(text: &str, path: &Path) -> Result<Self> {
         let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
         let mut raw: PSID = null_mut();
@@ -796,7 +1210,8 @@ pub fn revoke(path: &Path, sid: &PackageSid) -> Result<()> {
 /// Whether `path`'s DACL carries an entry for `sid`.
 ///
 /// **The oracle is the kernel's DACL and not the tool's rendering of it**
-/// (`GetNamedSecurityInfoW`, then `EqualSid` against every access-allowed ACE),
+/// (`GetNamedSecurityInfoW`, then [`walk_dacl`]'s ACE-by-ACE comparison, which
+/// asks `EqualSid` and no rendering),
 /// and this predicate used to be wrong for the reason the module doc opens with:
 /// `icacls` renders a well-known SID by **name**. `S-1-5-32-545` comes back as
 /// `BUILTIN\Users` — localised to the host's display language — and
@@ -922,13 +1337,16 @@ impl Grants {
 
     /// Authorize `path` for **this root's** package SID, in `target`'s shape.
     ///
-    /// Idempotent, and free once satisfied: `grant_to` reads the DACL first and
-    /// writes only what is missing, so the second run on the same root costs a
-    /// read instead of a descriptor write.
+    /// Idempotent, and free once satisfied: `grant_to` reads the DACL of the object
+    /// it opened and writes only what is missing, so the second run on the same root
+    /// costs one open and one read instead of a descriptor write.
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
+    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to` when the path
+    /// cannot be opened or written, and
+    /// [`Error::BadPath`](crate::_core::Error::BadPath) when it is a reparse point or
+    /// an object of the wrong kind.
     ///
     /// # Examples
     ///
@@ -949,12 +1367,12 @@ impl Grants {
     ///     .unwrap();
     /// ```
     pub fn apply(&mut self, path: &Path, target: Target, access: AccessMode) -> Result<()> {
-        grant_to(path, target, access, self.sid.as_str()).map(drop)
+        grant_to(path, target, access, GrantSid::of(&self.sid)).map(drop)
     }
 
     /// Authorize `path` for [`ALL_APPLICATION_PACKAGES`] — **the one standing,
-    /// machine-wide grant**, for decision 22's program directory and the `*.dll`
-    /// files directly beside it.
+    /// machine-wide grant**, for decision 22's program directory and, one object at
+    /// a time, the `*.dll` files directly beside it ([`Self::apply_siblings`]).
     ///
     /// Every AppContainer token already carries that SID, so this grant outlives
     /// every root: a new root never rewrites the program directory's descriptor,
@@ -1000,34 +1418,40 @@ impl Grants {
         target: Target,
         access: AccessMode,
     ) -> Result<()> {
-        let written = grant_to(path, target, access, ALL_APPLICATION_PACKAGES)?;
-        // **`debug!`, because a grant is a per-ACE event and the phase is the
-        // `info!`** (P2's logging split): the phase's own line is
-        // `grant_whitelist`'s, once per launch, and this one would otherwise
-        // print the program directory and then every `*.dll` batch into the
-        // operator's log on every start. `written` still travels with it, so a
-        // reader at `debug` sees the skip as plainly as the write.
-        tracing::debug!(
-            step = "grant the ACLs",
-            path = %path.display(),
-            sid = ALL_APPLICATION_PACKAGES,
-            standing = true,
-            written
-        );
-        Ok(())
+        // **The one route that owes a parse, and it pays it once per call**: this
+        // SID is a constant string rather than a value the caller holds, and
+        // decision 22's program directory is the one remaining call site (the
+        // sibling batch resolves it once for the whole set — [`Self::apply_siblings`]).
+        // The `OwnedSid` keeps the allocation alive until the grant using it has
+        // returned, which is the only thing it is for.
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, path)?;
+        self.standing_grant(
+            path,
+            target,
+            access,
+            GrantSid {
+                raw: sid.raw(),
+                text: ALL_APPLICATION_PACKAGES,
+            },
+        )
     }
 
-    /// Authorize [`scan`](SiblingScan)'s files for [`ALL_APPLICATION_PACKAGES`] in
-    /// **one `icacls` invocation** — decision 22's sibling-DLL half (Ruling 78),
-    /// and a standing grant like the directory those files sit in.
+    /// Authorize [`scan`](SiblingScan)'s files for [`ALL_APPLICATION_PACKAGES`],
+    /// **one object at a time** — decision 22's sibling-DLL half (Ruling 78), and a
+    /// standing grant like the directory those files sit in.
     ///
-    /// **The batch is the tool's wildcard rather than a list of paths**: `icacls`
-    /// accepts a single `name` pattern and no second path (measured 2026-09-21 on
-    /// this host; the measurement and its refused forms are on
-    /// [`SiblingScan::pattern`]). It reaches [`Self::apply_standing`], so the SID
-    /// is the one every container already holds and the write is skipped once the
-    /// pattern's ACE is there — which, for a program directory that does not
-    /// change between roots, is every run after the first.
+    /// **The wildcard is gone because a wildcard is not an object.** The batch was
+    /// one `icacls <dir>\*.dll /grant:r …` invocation, and what it matched was the
+    /// tool's own reading of the *names* in the directory — a reading the
+    /// enumeration had already answered differently, because `is_file` follows a
+    /// link: a file symlink named `x.dll` had the machine-wide ACE written on its
+    /// **target**, outside the program's directory, and a junction named `x.dll`
+    /// left the enumeration's set entirely and still took the ACE on the link's own
+    /// object. Both measured on this host 2026-09-27. So the grant is per file and
+    /// by handle: each path the scan enumerated is opened, is refused if it is a
+    /// reparse point or is not a file, and is written through that handle — the two
+    /// sets are the same objects by construction, and a link named `*.dll` fails the
+    /// launch rather than being skipped or followed.
     ///
     /// **The scan is a parameter and not a `&Path`**, which is the whole reason
     /// [`SiblingScan`] exists: this call and the caller's own exposure set must
@@ -1035,12 +1459,15 @@ impl Grants {
     /// — a second answer to a question already answered, and a second chance for
     /// the grant to name a DLL the exposure set does not.
     ///
-    /// The `bool` is whether a sibling existed at all: `false` means the pattern
-    /// was never handed to the tool.
+    /// The `bool` is whether a sibling existed at all: `false` means no object was
+    /// opened.
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
+    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to` for a DLL
+    /// that cannot be opened or written, and
+    /// [`Error::BadPath`](crate::_core::Error::BadPath) for one that is a reparse
+    /// point or is not a file.
     ///
     /// # Examples
     ///
@@ -1064,13 +1491,50 @@ impl Grants {
     /// # let _ = granted;
     /// ```
     pub fn apply_siblings(&mut self, scan: &SiblingScan, access: AccessMode) -> Result<bool> {
-        match scan.pattern() {
-            Some(pattern) => {
-                self.apply_standing(&pattern, Target::File, access)?;
-                Ok(true)
-            }
-            None => Ok(false),
+        let Some(first) = scan.files().first() else {
+            return Ok(false);
+        };
+        // One parse for the whole set: the SID is the same constant for every file,
+        // and the allocation lives until the last grant of this batch.
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, first)?;
+        for file in scan.files() {
+            self.standing_grant(
+                file,
+                Target::File,
+                access,
+                GrantSid {
+                    raw: sid.raw(),
+                    text: ALL_APPLICATION_PACKAGES,
+                },
+            )?;
         }
+        Ok(true)
+    }
+
+    /// One standing grant, with the SID already resolved and the event emitted.
+    ///
+    /// **`debug!`, because a grant is a per-ACE event and the phase is the
+    /// `info!`** (P2's logging split): the phase's own line is
+    /// `grant_whitelist`'s, once per launch, and this one would otherwise print the
+    /// program directory and then every sibling DLL into the operator's log on
+    /// every start. `written` still travels with it, so a reader at `debug` sees the
+    /// skip as plainly as the write.
+    fn standing_grant(
+        &self,
+        path: &Path,
+        target: Target,
+        access: AccessMode,
+        sid: GrantSid<'_>,
+    ) -> Result<()> {
+        let written = grant_to(path, target, access, sid)?;
+        tracing::debug!(
+            step = "grant the ACLs",
+            path = %path.display(),
+            sid = sid.text,
+            standing = true,
+            written
+        );
+        Ok(())
     }
 }
 
@@ -1095,6 +1559,9 @@ fn checked(operation: &'static str, path: &Path, flags: &[&OsStr]) -> Result<Out
 
 /// Run `icacls` on `path`, with the path first as icacls' own syntax requires,
 /// and no shell in between.
+///
+/// The tool's write is [`revoke`]'s now — the grant does not go through it — and
+/// the one production caller is what this function and the two above are kept for.
 fn invoke(path: &Path, flags: &[&OsStr]) -> Result<Output> {
     let mut command = Command::new(icacls_binary());
     command.arg(path).args(flags);
@@ -1103,20 +1570,74 @@ fn invoke(path: &Path, flags: &[&OsStr]) -> Result<Output> {
         .map_err(|source| launch("run icacls", path.to_path_buf(), source))
 }
 
+/// The access masks this thread's opens have asked for, in order, for the test that
+/// pins the grant's two-open split.
+#[cfg(test)]
+mod opens {
+    use std::{cell::RefCell, mem};
+
+    thread_local! {
+        static OPENS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Record one open's requested access.
+    pub(super) fn note(access: u32) {
+        OPENS.with(|opens| opens.borrow_mut().push(access));
+    }
+
+    /// The masks since the last call, and empty from here on.
+    pub(super) fn take() -> Vec<u32> {
+        OPENS.with(|opens| mem::take(&mut *opens.borrow_mut()))
+    }
+}
+
+/// The descriptor writes this thread has made, for the tests that tell a skip from
+/// a write that happened to leave the same ACE.
+///
+/// **A thread-local in a `cfg(test)` module of its own**, because it exists for
+/// one test's question and because the counter's `Cell` is a path this module has
+/// no other use for: the crate lints `clippy::absolute_paths`, so a `std::cell::Cell`
+/// spelled inline in a `thread_local!` is a warning rather than a device.
+#[cfg(test)]
+mod writes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DACL_WRITES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Count one `SetSecurityInfo`.
+    pub(super) fn note() {
+        DACL_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
+    }
+
+    /// The count since the last call, and zero from here on.
+    pub(super) fn take() -> u32 {
+        DACL_WRITES.with(|writes| writes.replace(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, mem::size_of, path::Path, process::Command, sync::Arc};
 
-    // The three names only a measurement needs: `(F)`'s stored mask, the bit
-    // that marks an inherited entry, and the generic bit the read must *not*
-    // treat as one (they are imported here rather than above because the
-    // production read never names them).
+    // The names only a measurement needs: the ACE type a fixture builds, a `(F)`
+    // mask, the bit that marks an inherited entry, and the generic bit the read
+    // must *not* treat as one (they are imported here rather than above because
+    // the production read never names them).
+    use tinio_winsec::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::{
-        Foundation::GENERIC_ALL, Security::INHERITED_ACE, Storage::FileSystem::FILE_ALL_ACCESS,
+        Foundation::GENERIC_ALL,
+        Security::{ACE_HEADER, GetSecurityDescriptorControl, INHERITED_ACE},
+        Storage::FileSystem::FILE_ALL_ACCESS,
     };
 
     use super::*;
-    use crate::_core::AccessMode;
+    use crate::{
+        _core::AccessMode,
+        backend::SiblingScan,
+        sid::{PackageSid, package_name},
+    };
 
     #[test]
     fn only_an_exposed_directory_propagates_its_ace() {
@@ -1184,6 +1705,41 @@ mod tests {
         );
     }
 
+    /// **The two renderings of the one table agree**: [`ace_spec`]'s string is the
+    /// tool's spelling of the pair [`ace_bits`] writes, and this walks all six
+    /// shapes rather than the two a caller happens to use.
+    ///
+    /// The string is read structurally — the `(OI)(CI)` token iff the shape
+    /// propagates, and the mask's own alias — because a comparison of two
+    /// hand-written tables would be a third copy of them. What can still drift is
+    /// only the *spelling*, and that is what
+    /// `the_aliases_icacls_writes_are_the_masks_this_read_compares` measures against
+    /// the tool.
+    #[test]
+    fn the_spec_string_and_the_bits_are_one_table() {
+        for target in [Target::Directory, Target::ProgramDirectory, Target::File] {
+            for access in [AccessMode::ReadOnly, AccessMode::ReadWrite] {
+                let (mask, flags) = ace_bits(target, access);
+                let spec = ace_spec(target, access);
+                assert_eq!(
+                    spec.contains("(OI)(CI)"),
+                    flags != NO_INHERITANCE,
+                    "{target:?}/{access:?}: the string and the flags disagree"
+                );
+                assert_eq!(
+                    spec.ends_with("RX"),
+                    mask == READ_AND_EXECUTE,
+                    "{target:?}/{access:?}: the string and the mask disagree"
+                );
+                assert_eq!(
+                    spec.ends_with('M'),
+                    mask == MODIFY,
+                    "{target:?}/{access:?}: the string and the mask disagree"
+                );
+            }
+        }
+    }
+
     /// **`GENERIC_ALL` on its own is not the container**, and the disjunct that
     /// treated it as one was a false skip: bit 28 is a *request* bit that an
     /// access check expands into nothing, so an ACE whose mask carries only it
@@ -1193,7 +1749,7 @@ mod tests {
     /// removing it costs the skip nothing.
     #[test]
     fn a_mask_carrying_only_the_generic_bit_does_not_satisfy_a_grant() {
-        // The shape `any_ace_in` reads an ACE as: a header, a mask, the SID.
+        // The shape the walk hands a predicate: a header, a mask, the SID.
         let aced = |flags: u8, mask: u32| ACCESS_ALLOWED_ACE {
             Header: ACE_HEADER {
                 AceType: ACCESS_ALLOWED_ACE_TYPE,
@@ -1235,44 +1791,118 @@ mod tests {
     /// the false pass this parameter removes. `INHERITED_ACE` is the flag such
     /// an entry carries and the one the tool's own entry does not.
     ///
-    /// A test read and not the production one: `acl_grants` asks the kernel the
-    /// same question through `any_ace_in`, and this exists so a measurement of
-    /// what `icacls` *stored* can be asserted without a second `PackageSid`.
-    fn masks(path: &Path, explicit: bool) -> Vec<u32> {
-        let mut found = Vec::new();
+    /// **One walk, two readings**: this is [`descriptor_shape`]'s entry list with
+    /// the masks kept, so a second traversal of the same ACL — and the second
+    /// `unsafe` block that came with it — has no reason to exist.
+    fn masks(path: &Path, explicit: bool, sid: PSID) -> Vec<u32> {
+        let (_, entries) = descriptor_shape(path, sid);
+        entries
+            .into_iter()
+            .filter(|(flags, _)| !(explicit && u32::from(*flags) & INHERITED_ACE != 0))
+            .map(|(_, mask)| mask)
+            .collect()
+    }
+
+    /// A descriptor as the comparison below needs it: **the control word and the
+    /// sequence of access-allowed entries, each as its flags and its mask.**
+    ///
+    /// This is the whole of what "the same descriptor" means here — owner, group
+    /// and SACL are not asked for by either writer, and a byte comparison would
+    /// include an ACL revision that is not a behaviour.
+    ///
+    /// **The ACE walk is [`walk_dacl`]'s, like every other read in this module**,
+    /// and this measurement puts the two access-allowed cases it hands back
+    /// together again: the entry list it compares is every such entry whatever
+    /// trustee it names, so the SID handed to the walk only decides which case an
+    /// entry arrives as, never whether it is kept.
+    fn descriptor_shape(path: &Path, sid: PSID) -> (u16, Vec<(u8, u32)>) {
         let (dacl, descriptor) = read_dacl(path).expect("read").expect("a DACL");
-        let mut info = ACL_SIZE_INFORMATION::default();
-        // SAFETY: `dacl` is the ACL `read_dacl` returned and is alive until the
-        // free below; `info` is its out-parameter.
-        let counted = unsafe {
-            GetAclInformation(
-                dacl,
-                (&raw mut info).cast(),
-                size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            )
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: `descriptor` is live until the free below, and both
+        // out-parameters are writable.
+        let read = unsafe {
+            GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision)
         };
-        assert_ne!(counted, 0);
-        for index in 0..info.AceCount {
-            let mut ace: *mut c_void = null_mut();
-            // SAFETY: `dacl` is alive and `index` is below its own count.
-            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-                continue;
-            }
-            // SAFETY: `GetAce` returned this ACE inside the live ACL, and its
-            // type is tested before the mask is read off it.
-            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-            if header.AceType == ACCESS_ALLOWED_ACE_TYPE
-                && !(explicit && u32::from(header.AceFlags) & INHERITED_ACE != 0)
-            {
-                // SAFETY: the type above is this structure's.
-                found.push(unsafe { (&*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask });
-            }
+        assert_ne!(read, 0, "the control word of {}", path.display());
+        let mut entries = Vec::new();
+        // SAFETY: `dacl` is the ACL inside the descriptor `read_dacl` returned and
+        // `sid` is the caller's live SID; both outlive this walk, and `descriptor` is
+        // released once below, after it.
+        let walked = unsafe {
+            walk_dacl(path, dacl, sid, &mut |entry| {
+                if let Ace::Named(ace) | Ace::OtherTrustee(ace) = entry {
+                    entries.push((ace.Header.AceFlags, ace.Mask));
+                }
+                ControlFlow::Continue(())
+            })
+        };
+        free_descriptor(descriptor);
+        assert!(walked.is_ok(), "walk the DACL of {}", path.display());
+        (control, entries)
+    }
+
+    /// **The route changed and the descriptor did not, and this is the
+    /// measurement that says so.**
+    ///
+    /// Two trees of the same shape under one parent, so every entry they inherit
+    /// from it is the same and the writer is the only difference: one is granted
+    /// through [`grant_to`] — the handle route — and the other through
+    /// `icacls /grant:r` — the route this crate used until 2026-09-27. The
+    /// comparison is over the directory, a file and a subdirectory that were
+    /// **seeded before either grant**, so it covers the three things a route change
+    /// could quietly alter: the entry's mask and inheritance flags, the control
+    /// word (auto-inherited and *not* protected), and the propagation of an
+    /// inheritable ACE to the descendants that were already there.
+    ///
+    /// The tool is the oracle rather than a written-down constant, which is the
+    /// same rule `tests/acl.rs` follows for the whole layer: what the crate has to
+    /// keep is the behaviour `icacls` had, and only the tool can say what that was.
+    #[test]
+    fn the_descriptor_the_handle_route_writes_is_the_one_icacls_writes() {
+        const USERS: &str = "S-1-5-32-545";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut trees = Vec::new();
+        for name in ["by-handle", "by-tool"] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(root.join("sub")).expect("create the tree");
+            fs::write(root.join("pre.txt"), b"before the grant").expect("seed");
+            trees.push(root);
         }
-        // SAFETY: the descriptor is this test's own read, freed once here; the
-        // ACL inside it is not freed on its own.
-        unsafe { LocalFree(descriptor) };
-        found
+        let sid = OwnedSid::parse(USERS, dir.path()).expect("a SID");
+
+        assert!(
+            grant_to(
+                &trees[0],
+                Target::Directory,
+                AccessMode::ReadOnly,
+                GrantSid {
+                    raw: sid.raw(),
+                    text: USERS,
+                },
+            )
+            .expect("the handle route writes"),
+            "the handle route writes the first tree"
+        );
+        let granted = Command::new(icacls_binary())
+            .arg(&trees[1])
+            .args(["/grant:r", &format!("*{USERS}:(OI)(CI)RX"), "/q"])
+            .output()
+            .expect("run icacls");
+        assert!(
+            granted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&granted.stderr)
+        );
+
+        for relative in [Path::new(""), Path::new("pre.txt"), Path::new("sub")] {
+            assert_eq!(
+                descriptor_shape(&trees[0].join(relative), sid.raw()),
+                descriptor_shape(&trees[1].join(relative), sid.raw()),
+                "the two routes disagree about `{}`",
+                relative.display()
+            );
+        }
     }
 
     /// The access bits `icacls`'s aliases *stored*, read back out of a DACL the
@@ -1294,6 +1924,32 @@ mod tests {
         assert_eq!(RX, 0x0012_00A9);
         let modify = RX | FILE_GENERIC_WRITE | 0x0001_0000;
         assert_eq!(modify, 0x0013_01BF);
+        // **And the one table the write and the read share is that same pair**:
+        // [`ace_bits`] is what a grant is written with, so pinning the table here
+        // pins the masks a granted ACE carries against the aliases the tool stores
+        // — one definer behind the write, the read's containment and the listing
+        // below, rather than three that could drift apart.
+        let both = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        assert_eq!(
+            ace_bits(Target::Directory, AccessMode::ReadOnly),
+            (RX, both),
+            "the directory's read shape"
+        );
+        assert_eq!(
+            ace_bits(Target::Directory, AccessMode::ReadWrite),
+            (modify, both),
+            "the directory's write shape"
+        );
+        assert_eq!(
+            ace_bits(Target::File, AccessMode::ReadOnly),
+            (RX, NO_INHERITANCE),
+            "a file's shape propagates to nothing"
+        );
+        assert_eq!(
+            ace_bits(Target::ProgramDirectory, AccessMode::ReadWrite),
+            (modify, NO_INHERITANCE),
+            "the program directory's shape propagates to nothing"
+        );
 
         let dir = tempfile::tempdir().expect("temp dir");
         // **The oracle's control, and the false pass it removes.** Nothing has
@@ -1308,22 +1964,25 @@ mod tests {
         //
         // The two assertions are one demonstration: the inherited entry is
         // there, and it is not what the oracle counts.
+        // The SID every reading below is about, resolved once: the walk compares
+        // trustees with `EqualSid`, and this test names the one its grants name.
+        let users = "S-1-5-32-545";
+        let sid = OwnedSid::parse(users, dir.path()).expect("a SID");
         let untouched = dir.path().join("untouched");
         fs::create_dir_all(&untouched).expect("create");
         assert!(
-            masks(&untouched, false).contains(&RX),
+            masks(&untouched, false, sid.raw()).contains(&RX),
             "this host's temp volume puts no inherited (RX) entry on a new \
 directory, so the false pass this control is about is not exercised here: {:08X?}",
-            masks(&untouched, false)
+            masks(&untouched, false, sid.raw())
         );
         assert!(
-            !masks(&untouched, true).contains(&RX),
+            !masks(&untouched, true, sid.raw()).contains(&RX),
             "nothing has been granted here, so an oracle that answered RX from \
 an inherited entry is answering for the wrong reason: {:08X?}",
-            masks(&untouched, true)
+            masks(&untouched, true, sid.raw())
         );
 
-        let users = "S-1-5-32-545";
         for (spec, wanted) in [
             ("(OI)(CI)RX", RX),
             ("(OI)(CI)M", modify),
@@ -1342,9 +2001,9 @@ an inherited entry is answering for the wrong reason: {:08X?}",
                 String::from_utf8_lossy(&granted.stderr)
             );
             assert!(
-                masks(&path, true).contains(&wanted),
+                masks(&path, true, sid.raw()).contains(&wanted),
                 "icacls stored something other than 0x{wanted:08X} for {spec}: {:08X?}",
-                masks(&path, true)
+                masks(&path, true, sid.raw())
             );
         }
     }
@@ -1369,10 +2028,25 @@ an inherited entry is answering for the wrong reason: {:08X?}",
         ace_lines(listing).iter().any(|line| line.contains(sid))
     }
 
-    /// [`already_granted`] as the yes/no question the skip asks it.
+    /// What the skip asks of an object: whether its DACL already carries the
+    /// grant, read the way `grant_to` reads it — **[`Object::granted`] on an
+    /// opened handle**, so the answer is about the object the write would reach.
     fn satisfied(path: &Path, target: Target, access: AccessMode) -> bool {
-        already_granted(path, ALL_APPLICATION_PACKAGES, target, access).expect("read the DACL")
-            == GrantOutcome::AlreadyGranted
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, path).expect("a SID");
+        let object = Object::open(path).expect("open the object");
+        object.verify(target).expect("a plain object");
+        object
+            .granted(sid.raw(), target, access)
+            .expect("read the DACL")
+    }
+
+    /// The standing SID as the [`GrantSid`] pair a test hands `grant_to` — resolved
+    /// once here, exactly as the production route resolves it, rather than per path.
+    fn standing(sid: &OwnedSid) -> GrantSid<'_> {
+        GrantSid {
+            raw: sid.raw(),
+            text: ALL_APPLICATION_PACKAGES,
+        }
     }
 
     /// **The defect this module's read was rewritten for, as a test.**
@@ -1400,7 +2074,7 @@ an inherited entry is answering for the wrong reason: {:08X?}",
             "{}",
             String::from_utf8_lossy(&granted.stderr)
         );
-        let listing = checked("icacls (read the DACL)", dir.path(), &[]).expect("read");
+        let listing = checked("icacls (a test's own listing)", dir.path(), &[]).expect("read");
         let text = String::from_utf8_lossy(&listing.stdout);
         assert!(
             text.contains("ALL APPLICATION PACKAGES"),
@@ -1479,14 +2153,17 @@ an inherited entry is answering for the wrong reason: {:08X?}",
     /// asserted against the kernel's DACL rather than against the tool's text.
     ///
     /// The second call is the one that matters. A read that answered "not
-    /// granted" would rewrite the descriptor every run, which on a directory is
-    /// `SetNamedSecurityInfoW` propagating over the whole subtree — the cost the
-    /// skip exists to remove, and the cost the text oracle silently paid for a
+    /// granted" would rewrite the descriptor every run, which on a directory is a
+    /// descriptor write propagating over the whole subtree — the cost the skip
+    /// exists to remove, and the cost the text oracle silently paid for a
     /// well-known SID.
     #[test]
     fn a_satisfied_grant_is_not_written_twice() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path();
+        // The standing SID, resolved once — the pair every `grant_to` below takes,
+        // which is the resolve-once shape the production route uses.
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, path).expect("a SID");
 
         assert!(
             !satisfied(path, Target::Directory, AccessMode::ReadOnly),
@@ -1497,7 +2174,7 @@ an inherited entry is answering for the wrong reason: {:08X?}",
                 path,
                 Target::Directory,
                 AccessMode::ReadOnly,
-                ALL_APPLICATION_PACKAGES
+                standing(&sid)
             )
             .expect("grant"),
             "the first call writes"
@@ -1511,7 +2188,7 @@ an inherited entry is answering for the wrong reason: {:08X?}",
                 path,
                 Target::Directory,
                 AccessMode::ReadOnly,
-                ALL_APPLICATION_PACKAGES
+                standing(&sid)
             )
             .expect("grant"),
             "the second call is a read and nothing else"
@@ -1519,7 +2196,7 @@ an inherited entry is answering for the wrong reason: {:08X?}",
 
         // **And the mask is read as well as the SID**: `RX` does not satisfy a
         // read-write request, while the `M` the next call writes satisfies both,
-        // which is what `already_granted`'s doc states and what the old text
+        // which is what `Object::granted`'s predicate states and what the old text
         // comparison spelled `(RX)`/`(M)`/`(F)`.
         assert!(
             !satisfied(path, Target::Directory, AccessMode::ReadWrite),
@@ -1530,7 +2207,7 @@ an inherited entry is answering for the wrong reason: {:08X?}",
                 path,
                 Target::Directory,
                 AccessMode::ReadWrite,
-                ALL_APPLICATION_PACKAGES
+                standing(&sid)
             )
             .expect("grant"),
             "the wider grant is written"
@@ -1539,14 +2216,19 @@ an inherited entry is answering for the wrong reason: {:08X?}",
             satisfied(path, Target::Directory, AccessMode::ReadOnly),
             "`M` satisfies a read-only request"
         );
-        // **The flags are read as well as the mask**: a file-shaped question asks
-        // for none, so the same `(OI)(CI)M` entry answers it too — which is what
-        // `Target` being the caller's means, and what
-        // `the_flags_are_the_difference_between_the_two_directory_questions` pins
-        // the other way round.
+        // **A shape that disagrees with the object is refused, and that is the
+        // check the tool could not make**: a file-shaped grant on a directory
+        // carries no `(OI)(CI)`, so it would leave every descendant ungranted
+        // while `icacls` reported success. The handle answers what the object is,
+        // and the answer stops the grant before a descriptor is touched —
+        // `a_directory_shaped_grant_on_a_file_is_refused` pins the other
+        // direction, and `the_flags_are_the_difference_between_the_two_directory_
+        // questions` the read's own half of the same rule.
+        let refused = grant_to(path, Target::File, AccessMode::ReadOnly, standing(&sid))
+            .expect_err("a file-shaped grant on a directory is refused");
         assert!(
-            satisfied(path, Target::File, AccessMode::ReadOnly),
-            "the file-shaped question asks for no flags, and this entry carries a wide mask"
+            refused.to_string().contains("not the kind of object"),
+            "{refused}"
         );
 
         let taken_back = Command::new(icacls_binary())
@@ -1561,50 +2243,70 @@ an inherited entry is answering for the wrong reason: {:08X?}",
         );
     }
 
-    /// **The sibling batch's path has no DACL to read, and the answer says so
-    /// rather than guessing.**
+    /// **A wildcard is refused rather than expanded, and that is the fix rather
+    /// than a limitation.**
     ///
-    /// `GetNamedSecurityInfoW` resolves no wildcard — the literal `…\*.dll` fails
-    /// `123 ERROR_INVALID_NAME` on this host (measured 2026-09-25) — so the read
-    /// the batch's skip rests on cannot decide it. What must *not* happen is the
-    /// failure travelling: `apply_siblings` is a grant, and a batch that reported
-    /// an error would leave a confined child without the DLLs its own loader
-    /// reads. The skip's answer is therefore [`GrantOutcome::Unanswerable`] and
-    /// the write follows, which is what the text route did on this path in
-    /// practice.
+    /// A `*.dll` pattern was the sibling batch's grant: `icacls` matched it against
+    /// the directory and wrote an ACE on every file it named — including one the
+    /// enumeration had counted as a file because `is_file` followed the link. No
+    /// handle can be opened on a wildcard, so the batch is gone and this is what a
+    /// caller that still hands this crate a pattern gets: an open failure naming the
+    /// path, not a grant on whatever the pattern happened to match (measured on this
+    /// host 2026-09-27: `CreateFileW` on a literal `…\*.dll` fails
+    /// `ERROR_INVALID_NAME`, the same `123` the name-based DACL read reported).
     #[test]
-    fn a_wildcard_path_is_unanswerable_rather_than_an_error() {
+    fn a_wildcard_path_is_refused_rather_than_expanded() {
         let dir = tempfile::tempdir().expect("temp dir");
+        for name in ["one.dll", "two.dll"] {
+            fs::write(dir.path().join(name), b"not a library").expect("dll");
+        }
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, dir.path()).expect("a SID");
         let pattern = dir.path().join("*.dll");
-        assert!(names_a_pattern(&pattern));
-        assert!(
-            already_granted(
-                &pattern,
-                ALL_APPLICATION_PACKAGES,
-                Target::File,
-                AccessMode::ReadOnly
-            )
-            .expect("a pattern is an answer and not a failure")
-                == GrantOutcome::Unanswerable,
-            "the read has no DACL to ask about a wildcard path"
-        );
-        // **The guard is a wildcard in the file name and nothing else.** `?` is a
-        // pattern to this tool exactly as `*` is (measured 2026-09-25:
-        // `icacls <dir>\?.dll` lists `a.dll`), so a name carrying one has no DACL
-        // to read either; a missing concrete path stays the error it always was
-        // rather than becoming "unanswerable".
-        assert!(!names_a_pattern(dir.path()));
-        assert!(names_a_pattern(&dir.path().join("what?.txt")));
-        assert!(
-            already_granted(
-                &dir.path().join("never-created.dll"),
-                ALL_APPLICATION_PACKAGES,
-                Target::File,
-                AccessMode::ReadOnly
-            )
-            .is_err(),
-            "a concrete path that does not exist is still a failed read"
-        );
+
+        let error = grant_to(&pattern, Target::File, AccessMode::ReadOnly, standing(&sid))
+            .expect_err("a wildcard names no object a handle can be opened on");
+        let text = error.to_string();
+        assert!(text.contains("open the granted path"), "{text}");
+        assert!(text.contains("*.dll"), "the failure names the path: {text}");
+        // And nothing was written through the pattern: both files are untouched.
+        for name in ["one.dll", "two.dll"] {
+            assert!(
+                !acl_names(&dir.path().join(name), sid.raw()).expect("read the DACL"),
+                "{name} took an ACE through a pattern"
+            );
+        }
+    }
+
+    /// **The other direction of the kind check**: a directory-shaped grant on a
+    /// file is refused rather than written.
+    ///
+    /// Both directory shapes are wrong on a file and wrong differently:
+    /// `(OI)(CI)` is inherited by nothing, so the ACE reaches no one, and the
+    /// program-directory form is the plain one, which the child's loader would read
+    /// as an ACE on a file that is not the loader's. `icacls` writes neither (exit 0,
+    /// nothing stored — design §6's evidence row); this is the same rule answered by
+    /// the handle, and it is the check `backend::grant_whitelist` used to make with
+    /// `is_dir` for decision 22's entry alone — the handle makes it for every shape,
+    /// against the object the write would reach.
+    #[test]
+    fn a_directory_shaped_grant_on_a_file_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("plain.txt");
+        fs::write(&file, b"x").expect("write");
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, dir.path()).expect("a SID");
+
+        for target in [Target::Directory, Target::ProgramDirectory] {
+            let refused = grant_to(&file, target, AccessMode::ReadOnly, standing(&sid))
+                .expect_err("a directory-shaped grant needs a directory");
+            assert!(
+                refused.to_string().contains("not the kind of object"),
+                "{target:?}: {refused}"
+            );
+            assert!(
+                !acl_names(&file, sid.raw()).expect("read the DACL"),
+                "{target:?} wrote an ACE on a file it refused"
+            );
+        }
     }
 
     /// **The orphan shape**: an ACE that carries `(OI)(CI)` and `INHERIT_ONLY` at
@@ -1657,13 +2359,19 @@ an inherited entry is answering for the wrong reason: {:08X?}",
     /// reaches no descendant and is not the grant the caller asked for, while the
     /// file-shaped question asks for no flags at all. Both halves are read off a
     /// real DACL rather than off a synthetic ACE, because the flags travel through
-    /// the filesystem and the tool on the way in.
+    /// the filesystem and the tool on the way in — and the read is
+    /// [`Object::granted`]'s, the same one the skip makes against the handle the
+    /// write would use.
     #[test]
     fn the_flags_are_the_difference_between_the_two_directory_questions() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path();
         let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, path).expect("a SID");
-        let asked = |target| acl_grants(path, sid.raw(), target, AccessMode::ReadOnly);
+        let asked = |target| {
+            Object::open(path)
+                .expect("open")
+                .granted(sid.raw(), target, AccessMode::ReadOnly)
+        };
 
         // The plain directory ACE `icacls` writes for the file shape: the mask is
         // there and the flags are not, which is exactly the entry a grant that
@@ -1716,24 +2424,220 @@ an inherited entry is answering for the wrong reason: {:08X?}",
         assert!(!asked(Target::Directory).expect("read the DACL"));
     }
 
-    /// A path the kernel cannot read is an error and not "nothing granted", the
-    /// rule the suites that consult this as an oracle rest on.
+    /// **The two opens ask for what their half needs and nothing more**, which is
+    /// the fix for a regression this crate's first handle-based grant introduced:
+    /// one `READ_CONTROL | WRITE_DAC` open for every path turned a satisfied
+    /// grant — the steady state of a standing ACE, and every launch after the first
+    /// on a root — into a startup failure wherever the launcher may read a root but
+    /// may not re-ACL it.
+    ///
+    /// **It is pinned at the access mask rather than at a DACL, and the reason is
+    /// measured** (this host, 2026-09-27): an ACL experiment cannot show it, because
+    /// a `(WD)` **deny** for the account this process runs as does not take
+    /// `WRITE_DAC` away — Windows grants an object's owner `READ_CONTROL` and
+    /// `WRITE_DAC` implicitly, so the open succeeds with the deny ACE in place. What
+    /// the split is about is the *request*, and that is what this reads: a due grant
+    /// reads with `READ_CONTROL` and then asks for `WRITE_DAC` to write; a satisfied
+    /// grant asks once, for `READ_CONTROL`, and never mentions the write access.
     #[test]
-    fn the_read_refuses_a_path_it_cannot_see() {
+    fn a_satisfied_grant_asks_for_no_write_access() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path();
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, path).expect("a SID");
+
+        let _ = opens::take();
+        assert!(
+            grant_to(
+                path,
+                Target::Directory,
+                AccessMode::ReadOnly,
+                standing(&sid)
+            )
+            .expect("the first grant is due and is written"),
+            "the first call writes"
+        );
+        assert_eq!(
+            opens::take(),
+            vec![READ_CONTROL, READ_CONTROL | WRITE_DAC],
+            "a due grant reads, then opens again for the write"
+        );
+
+        assert!(
+            !grant_to(
+                path,
+                Target::Directory,
+                AccessMode::ReadOnly,
+                standing(&sid)
+            )
+            .expect("the second call is a read"),
+            "the second call skips"
+        );
+        assert_eq!(
+            opens::take(),
+            vec![READ_CONTROL],
+            "a satisfied grant never asks for WRITE_DAC"
+        );
+    }
+
+    /// **The sibling set is granted one object at a time, and the skip is what
+    /// makes a second launch free.**
+    ///
+    /// The count is descriptor writes rather than `icacls` invocations, because
+    /// the tool is no longer in this path at all: the first pass writes one ACE per
+    /// DLL — two, for the two files — and the second writes nothing, which is the
+    /// standing grant's whole point. Removing one DLL's ACE puts exactly that one
+    /// write back, which is what tells a skip from a write that happened to leave
+    /// the same ACE.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_second_sibling_pass_writes_only_the_dll_that_lost_the_ace() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in ["one.dll", "two.dll"] {
+            fs::write(dir.path().join(name), b"not a library").expect("dll");
+        }
+        let scan = SiblingScan::scan(dir.path());
+        let sid = PackageSid::derive(&package_name(dir.path())).expect("package SID");
+        let mut grants = Grants::new(Arc::new(sid));
+
+        let _ = writes::take();
+        assert!(
+            grants
+                .apply_siblings(&scan, AccessMode::ReadOnly)
+                .expect("first pass")
+        );
+        assert_eq!(
+            writes::take(),
+            2,
+            "the first pass is one ACE per DLL, each on its own handle"
+        );
+
+        assert!(
+            grants
+                .apply_siblings(&scan, AccessMode::ReadOnly)
+                .expect("second pass")
+        );
+        assert_eq!(
+            writes::take(),
+            0,
+            "every DLL already carries the ACE, so nothing is written again"
+        );
+
+        let removed = Command::new(icacls_binary())
+            .arg(dir.path().join("two.dll"))
+            .args(["/remove:g", "*S-1-15-2-1", "/q"])
+            .output()
+            .expect("remove one ACE");
+        assert!(
+            removed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        let _ = writes::take();
+        assert!(
+            grants
+                .apply_siblings(&scan, AccessMode::ReadOnly)
+                .expect("the pass runs again")
+        );
+        assert_eq!(
+            writes::take(),
+            1,
+            "one DLL without the ACE is one write: the other is skipped"
+        );
+    }
+
+    /// **A path the kernel cannot open is an error and not a satisfied grant** —
+    /// the rule [`has_ace`]'s callers rest on, one layer earlier: the grant opens
+    /// the object before it reads anything, so a path that does not exist fails
+    /// there, with the step named and the path attached.
+    #[test]
+    fn the_grant_refuses_a_path_it_cannot_open() {
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("never-created");
-        let error = already_granted(
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, &missing).expect("a SID");
+        let error = grant_to(
             &missing,
-            ALL_APPLICATION_PACKAGES,
             Target::Directory,
             AccessMode::ReadOnly,
+            standing(&sid),
         )
         .expect_err("a path that does not exist is an error, not a satisfied grant");
         let text = error.to_string();
         assert!(text.contains("never-created"), "{text}");
         assert!(
-            text.contains("icacls"),
-            "the read failure names the step the skip's history is written under: {text}"
+            text.contains("open the granted path"),
+            "the failure names the step it happened at: {text}"
+        );
+    }
+
+    /// **A deny ACE is not the grant it resembles, and the skip is the judgement
+    /// this pins.**
+    ///
+    /// `icacls /deny` stores an `ACCESS_DENIED_ACE` whose mask, flags and trustee are
+    /// the *same shape* an access-allowed entry has: `(OI)(CI)F` is
+    /// `FILE_ALL_ACCESS`, which contains every bit [`ace_bits`] asks for, and the
+    /// SID is the very one [`Object::granted`] compares — so a read that took the
+    /// entry's type for granted would call this DACL a satisfied grant, skip the
+    /// write, and leave a confined child with an ACE that denies it everything.
+    /// That is the fail-open [`Ace::Other`]'s `Continue` arm exists to refuse.
+    ///
+    /// The deny names [`ALL_APPLICATION_PACKAGES`] rather than another trustee on
+    /// purpose: for any other SID the verdict would be `false` even from a read
+    /// that ignored the type, so the entry would not discriminate. It is also the
+    /// one SID a deny can name without touching this process's own access — the
+    /// package SID is in no interactive token, which is what lets the test keep
+    /// opening and reading the object afterwards.
+    ///
+    /// The grant that follows is the second half of the same judgement: the read
+    /// answers "not granted", so the write is due, and the entry it writes is
+    /// found again with the deny still in the DACL — the walk passes the deny over
+    /// rather than stopping at it.
+    #[test]
+    fn a_deny_for_the_package_sid_is_not_the_grant_it_resembles() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path();
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, path).expect("a SID");
+
+        let denied = Command::new(icacls_binary())
+            .arg(path)
+            .args(["/deny", "*S-1-15-2-1:(OI)(CI)F", "/q"])
+            .output()
+            .expect("run icacls");
+        assert!(
+            denied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+
+        assert!(
+            !satisfied(path, Target::Directory, AccessMode::ReadOnly),
+            "a deny entry carries the mask and the flags a grant is recognized by, so a \
+             read that did not ask the entry's type would call this grant satisfied and \
+             skip the write the child needs"
+        );
+        assert!(
+            grant_to(
+                path,
+                Target::Directory,
+                AccessMode::ReadOnly,
+                standing(&sid)
+            )
+            .expect("the write is due and lands"),
+            "the read answered `not granted`, so the grant is written"
+        );
+        assert!(
+            satisfied(path, Target::Directory, AccessMode::ReadOnly),
+            "the walk passes the deny over and still reaches the entry the grant wrote"
+        );
+
+        let taken_back = Command::new(icacls_binary())
+            .arg(path)
+            .args(["/remove:d", "*S-1-15-2-1", "/q"])
+            .output()
+            .expect("run icacls");
+        assert!(
+            taken_back.status.success(),
+            "{}",
+            String::from_utf8_lossy(&taken_back.stderr)
         );
     }
 }

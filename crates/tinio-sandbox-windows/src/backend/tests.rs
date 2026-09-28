@@ -1,32 +1,29 @@
 //! The backend's unit tests, kept at the one path that can ask the policy's
 //! private questions: `shape_for`'s precedence rule and `CallerSet`'s membership
-//! answer are `pub(super)` in `exposures.rs`, and this module — a child of
+//! answer are `pub(in crate::backend)` in the `exposures` module, and this module — a child of
 //! `backend` — is the reader that visibility was widened for.
 //!
-//! **They live here rather than beside `exposures.rs`**, which is the move that
+//! **They live here rather than inside `exposures`**, which is the move that
 //! would have let every item stay private: a `mod tests` inside that file would
 //! also have renamed every test from `backend::tests::…` to
 //! `backend::exposures::tests::…`, and a rename is not a move. What the split
-//! had to widen, and why it stopped at `pub(super)`, is stated once in `mod.rs`'s
+//! had to widen, and why it stopped at `pub(in crate::backend)`, is stated once in `mod.rs`'s
 //! module doc.
 
 use std::{
     fs,
-    io::{self, Write},
-    mem,
+    os::windows::fs::symlink_file,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
-    thread::{self, ThreadId},
+    sync::Arc,
     time::Duration,
 };
 
 use tempfile::tempdir;
-use tinio_sandbox_core::{AccessMode, Exposure, Sandbox};
-use tracing::{Level, callsite::rebuild_interest_cache};
-use tracing_subscriber::fmt::MakeWriter;
+use tinio_sandbox_core::{AccessMode, Error, Exposure, Sandbox};
+use tinio_util::testing::{assert_recorded_at, assert_recorded_below, assert_step};
 
 // `CallerSet` is the one policy item `super::*` does not carry — the parent
-// imports `shape_for` and `canonical_caller` by name because `confine` calls
+// imports `shape_for` and `canonical_whitelist` by name because `confine` calls
 // them, and the type is named here for the same reason these tests ask it the
 // question: it is `pub(super)` for this module alone (`exposures.rs`'s module
 // doc).
@@ -35,7 +32,13 @@ use super::{
     grant::{GRANT_PHASE_WARN_AFTER, report_grant_phase},
     *,
 };
-use crate::{acl::Target, testing};
+// **The recording device is `testing`'s rather than this module's**: `capture` and
+// `recorder` used to be a copy here and a second, wider one in `tests/profile.rs`,
+// and that module's own doc states what the union folded together.
+use crate::{
+    acl::Target,
+    testing::{self, capture, recorder},
+};
 
 /// A junction at `dir/name` pointing at `target`, or a failed test.
 ///
@@ -45,144 +48,6 @@ fn junction(dir: &Path, name: &str, target: &Path) -> PathBuf {
     let link = dir.join(name);
     testing::junction(&link, target);
     link
-}
-
-/// The capture this binary records through, installed once.
-///
-/// **One subscriber for the whole process, as the global default, installed
-/// with `try_init` and never `init` (shared §7).** That is the fix for the
-/// flake this harness caused, and not a preference, because of a `tracing`
-/// detail worth writing down: `tracing` caches each callsite's `Interest` in a
-/// **process-global** cell, written both when a callsite is hit for the first
-/// time and when any dispatch is created — and while exactly one dispatch is
-/// registered, which is the whole of a `with_default` recording,
-/// `tracing-core`'s `Rebuilder::JustOne` consults *the calling thread's*
-/// default rather than the registry. A subscriber scoped to one thread is
-/// therefore invisible to every other thread, so a parallel test that happens
-/// to be the first to hit the same callsite writes `Interest::never` into the
-/// shared cell and the event this test exists to observe is dropped in
-/// silence: one run in thirty, and only when the other thread wins that race.
-/// A **global** default is visible from every thread, so the cell can only
-/// ever say "interested".
-///
-/// The capture is still this test's own: the writer records only while a
-/// recording owns the calling thread, which keeps the event count exact while
-/// other tests emit the same failures concurrently.
-fn capture() -> Capture {
-    static CAPTURE: OnceLock<Capture> = OnceLock::new();
-    CAPTURE
-        .get_or_init(|| {
-            let capture = Capture::default();
-            // A subscriber the caller already installed wins, and this
-            // crate's own test binary installs none; if one ever does, the
-            // capture stays empty and the test below fails loudly rather
-            // than passing on a subscriber that recorded nothing.
-            let _ = tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .with_max_level(Level::INFO)
-                .try_init();
-            // **`set_global_default` stores the dispatch without
-            // re-evaluating the callsite cache** — only `Dispatch::new` does
-            // that, and it runs before the default is visible — so a callsite
-            // another test already hit stays cached `never`. Rebuilding here,
-            // with the global default in place, is what turns those cells
-            // back to "interested".
-            rebuild_interest_cache();
-            capture
-        })
-        .clone()
-}
-
-/// The recorder: what was written, and the thread a recording owns, under one
-/// lock so that "clear, record, take" is a single state.
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<State>>);
-
-#[derive(Default)]
-struct State {
-    text: Vec<u8>,
-    recording: Option<ThreadId>,
-}
-
-impl Capture {
-    /// Own this thread's events until the guard drops.
-    fn record(&self) -> Recording {
-        let mut state = self.0.lock().expect("the capture mutex");
-        assert!(
-            state.recording.is_none(),
-            "one recording at a time, and {:?} has one",
-            state.recording
-        );
-        state.text.clear();
-        state.recording = Some(thread::current().id());
-        Recording(self.clone())
-    }
-
-    /// Give up this thread's ownership of the capture.
-    fn release(&self) {
-        self.0.lock().expect("the capture mutex").recording = None;
-    }
-
-    /// What the recording wrote, as UTF-8.
-    fn text(&self) -> String {
-        let text = mem::take(&mut self.0.lock().expect("the capture mutex").text);
-        String::from_utf8(text).expect("the capture is UTF-8")
-    }
-}
-
-impl Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut state = self.0.lock().expect("the capture mutex");
-        // Another test's event is dispatched here too — the subscriber is
-        // global — and the recording thread is what keeps it out.
-        if state.recording == Some(thread::current().id()) {
-            state.text.extend_from_slice(buf);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// One recording's lifetime: [`Capture::record`]'s guard.
-///
-/// A guard rather than a matching call at the end, so that a body which
-/// panics releases the capture instead of leaving a thread id behind that a
-/// later test's events could be attributed to.
-struct Recording(Capture);
-
-impl Drop for Recording {
-    fn drop(&mut self) {
-        self.0.release();
-    }
-}
-
-/// **One recording at a time across this binary's tests.**
-///
-/// The capture is process-wide and holds one buffer, so two tests that assert on
-/// it must not overlap: `Capture::record`'s "one recording at a time" is an
-/// *assertion*, and an assertion is the wrong shape for a rule two tests have to
-/// keep — the loser fails for the other test's timing rather than for its own
-/// subject, and the second recording clears the first's buffer with its own
-/// events. This is the same device `tests/profile.rs` uses for the same reason.
-/// It is taken once per test rather than once per `recorded` call, so a nested
-/// `recorded` inside one test is still what the assertion catches.
-fn recorder() -> MutexGuard<'static, ()> {
-    static RECORDER: Mutex<()> = Mutex::new(());
-    RECORDER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Run `body` with the capture recording this thread's events.
@@ -203,13 +68,16 @@ fn recorded<T>(body: impl FnOnce() -> T) -> (T, String) {
 /// the refused caller's file and the empty exposure set are `Error`s this
 /// module builds by hand.
 ///
-/// The assertions are on the **rendered fields**, not on the values as
-/// substrings, for the reason the core's test states at length: `step` appears
-/// inside the rendered error too, so a substring check would pass for an event
-/// whose field said something else. `with_ansi(false)` is what makes the field
-/// syntax visible at all (measured in that same test). The level is the one
-/// `serve`'s subscriber enables, so an event moved to `debug!` would stop being
-/// recorded and this test would lose the property rather than keep it.
+/// The assertions are on the **rendered fields and on the level each line
+/// carries**, not on the values as substrings, for the reason the core's test
+/// states at length: `step` appears inside the rendered error too, so a substring
+/// check would pass for an event whose field said something else. `with_ansi(false)`
+/// is what makes the field syntax visible at all (measured in that same test).
+/// **The level is read off the line** ([`assert_recorded_at`]) rather than selected
+/// by the recording, which records every level at `DEBUG`: a failure quietly moved
+/// to `debug!` is no longer dropped by a filter, so it is caught by that assertion
+/// instead — and a promotion away from `error!`, which the filter could never see,
+/// fails it too.
 ///
 /// The event count is the other half of the ruling: one failure emits one
 /// event, and the refusal is deliberately not routed through the core's
@@ -241,10 +109,14 @@ fn the_failures_this_module_builds_are_logged_where_they_are_built() {
         .expect_err("a junction is refused")
     });
     assert!(error.to_string().contains("reparse point"), "{error}");
-    assert!(
-        logged.contains(r#"step="resolve an exposed path""#),
-        "{logged}"
-    );
+    assert_step(&logged, "resolve an exposed path");
+    // **The needle is the refusal's own message, not its step.** `assert_recorded_at` answers about the
+    // first line carrying what it is given, and a step is not unique to a refusal: the caller's file
+    // below is refused on a path where an `info!` line carries the same `step` — the per-exposure
+    // resolution that logs *what* the run was about to grant — so the message that only a refusal
+    // writes is what names the line. The count assertion at the end of each recording is what makes it
+    // unique there.
+    assert_recorded_at(&logged, "sandbox step failed", tracing::Level::ERROR);
     assert!(
         logged.contains(&format!("path={}", link.display())),
         "{logged}"
@@ -256,14 +128,15 @@ fn the_failures_this_module_builds_are_logged_where_they_are_built() {
     let exposed_file = dir.path().join("exposed.txt");
     fs::write(&exposed_file, b"x").expect("write the caller's file");
     let (error, logged) = recorded(|| {
-        canonical_caller(&Sandbox::new().expose(&exposed_file, AccessMode::ReadOnly))
-            .expect_err("a caller's file is refused")
+        canonical_whitelist(
+            &Sandbox::new().expose(&exposed_file, AccessMode::ReadOnly),
+            None,
+        )
+        .expect_err("a caller's file is refused")
     });
     assert!(error.to_string().contains("is not a directory"), "{error}");
-    assert!(
-        logged.contains(r#"step="resolve an exposed path""#),
-        "{logged}"
-    );
+    assert_step(&logged, "resolve an exposed path");
+    assert_recorded_at(&logged, "sandbox step failed", tracing::Level::ERROR);
     assert!(
         logged.contains(&format!(
             "path={}",
@@ -278,7 +151,8 @@ fn the_failures_this_module_builds_are_logged_where_they_are_built() {
     let (error, logged) =
         recorded(|| served_root(&Sandbox::new()).expect_err("nothing exposed to confine to"));
     assert!(error.to_string().contains("nothing exposed"), "{error}");
-    assert!(logged.contains(r#"step="confine""#), "{logged}");
+    assert_step(&logged, "confine");
+    assert_recorded_at(&logged, "sandbox step failed", tracing::Level::ERROR);
     assert_eq!(logged.matches("sandbox step failed").count(), 1, "{logged}");
 }
 
@@ -288,12 +162,15 @@ fn the_failures_this_module_builds_are_logged_where_they_are_built() {
 /// either side of it.
 ///
 /// **The quiet half is the assertion that matters to an operator, and the
-/// capture is why it can be made at all.** This subscriber's max level is
-/// `INFO` — the level `serve` builds its own with — so a phase that stayed under
-/// the threshold emits **nothing**, and the `debug!` beside the warning is
-/// invisible to it on purpose. An event moved from `warn!` to `debug!`, or a
-/// threshold moved above the measured case, would leave this test's first half
-/// green and its second red, which is the pair of mistakes one warning can make.
+/// capture is why it can be made at all.** The device records every level at
+/// `DEBUG`, so a phase that stayed under the threshold still leaves its line in
+/// the buffer — what makes it quiet for an operator is that the line is *below*
+/// `INFO`, the level `serve` builds its subscriber with, and that is what the
+/// first half asserts ([`assert_recorded_below`]); the `debug!` beside the
+/// warning is invisible to such a subscriber on purpose. An event moved from
+/// `warn!` to `debug!`, or a threshold moved above the measured case, would
+/// leave this test's first half green and its second red, which is the pair of
+/// mistakes one warning can make.
 ///
 /// The remedy is asserted on too, because it is the half of the warning that
 /// cannot be derived from the code: the line has to point at the design's own
@@ -305,10 +182,7 @@ fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
     let _recorder = recorder();
     let just_under = GRANT_PHASE_WARN_AFTER - Duration::from_millis(1);
     let ((), quiet) = recorded(|| report_grant_phase(just_under, 3));
-    assert!(
-        quiet.is_empty(),
-        "a grant phase under the threshold is silent at INFO: {quiet}"
-    );
+    assert_recorded_below(&quiet, tracing::Level::INFO);
 
     let ((), loud) = recorded(|| report_grant_phase(GRANT_PHASE_WARN_AFTER, 3));
     assert!(loud.contains("WARN"), "{loud}");
@@ -338,6 +212,12 @@ fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
 /// prints at `INFO`, so a per-ACE line would put one entry in the log for every
 /// standing grant on every launch — the program directory and then the `*.dll`
 /// batch beside it — where what an operator reads is the phase's one line.
+///
+/// **The device records every level at `DEBUG`, so the assertion is on the level
+/// of the recorded lines rather than on their absence** ([`assert_recorded_below`]):
+/// a per-ACE grant left in the buffer is fine as long as a subscriber at `INFO`
+/// prints none of it, which is the property the split exists for — and what a
+/// `warn!` or an `info!` slipped into that path still fails.
 #[test]
 // `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
 // is deliberately neither `Send` nor `Sync` — the same allow, for the same
@@ -354,11 +234,7 @@ fn a_standing_grant_is_not_an_info_event() {
             .apply_standing(dir.path(), Target::ProgramDirectory, AccessMode::ReadOnly)
             .expect("grant the standing SID");
     });
-    assert!(
-        logged.is_empty(),
-        "a per-ACE grant belongs at the level a log shows the phase at, not \
-         above it: {logged}"
-    );
+    assert_recorded_below(&logged, tracing::Level::INFO);
 }
 
 #[test]
@@ -387,13 +263,198 @@ fn the_callers_access_survives_the_executable_exposure() {
     assert_eq!(all[0].access, AccessMode::ReadWrite);
 }
 
+/// **The sibling DLLs are listed and counted, and they are not resolved**: the
+/// banner names them and the count includes them, because an operator reads both
+/// and neither may quietly change meaning — while the entries the per-path grant
+/// loop walks are the caller's and the program's directory alone, which is the
+/// shape the one `*.dll` batch needs.
+///
+/// The spelling is the assertion that the resolution really was skipped: the
+/// listed DLL is the path [`SiblingScan`] found, not the verbatim form
+/// `fs::canonicalize` would have produced for it, while the program's directory
+/// beside it *is* the resolved spelling.
+#[test]
+fn the_sibling_dlls_are_listed_and_counted_without_being_resolved() {
+    let dir = tempdir().expect("temp dir");
+    let program_dir = dir.path().join("bin");
+    fs::create_dir_all(&program_dir).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    fs::write(program_dir.join("app-local.dll"), b"x").expect("write a sibling");
+    let served = dir.path().join("srv");
+    fs::create_dir_all(&served).expect("create the served root");
+
+    let sandbox = Sandbox::new().expose(&served, AccessMode::ReadOnly);
+    let scan = SiblingScan::scan(&program_dir);
+    let whitelist = canonical_whitelist(&sandbox, Some(&scan)).expect("the whitelist resolves");
+
+    // The grant's own set: the caller's root and the program's directory, both in
+    // the volume's spelling — and no DLL, because the batch is not the loop's.
+    assert_eq!(
+        whitelist.granted().len(),
+        2,
+        "the per-path loop walks the caller's and the program's directories: {:?}",
+        whitelist.granted()
+    );
+    let resolved = fs::canonicalize(&program_dir).expect("the program's directory resolves");
+    assert_eq!(
+        whitelist.granted()[1].host,
+        resolved,
+        "the program's directory is resolved on the one pass"
+    );
+    // **The same resolution is the value `shape_for` compares against**, so a
+    // third `fs::canonicalize` of it would be a second answer to a question this
+    // one has already answered.
+    assert_eq!(
+        whitelist.program_dir(),
+        Some(resolved.as_path()),
+        "the comparison value is the resolved entry, not a second resolution of it"
+    );
+
+    // The banner's list and its count: the same entries plus one per sibling DLL.
+    assert_eq!(whitelist.listed_len(), 3, "{}", whitelist.describe());
+    let listed = whitelist.describe();
+    // The DLL carries the scan's own spelling rather than the volume's, and the
+    // two are asserted to differ first, so the leg cannot pass vacuously on a
+    // host where the resolution is the identity.
+    let dll = &scan.files()[0];
+    let resolved_dll = fs::canonicalize(dll).expect("the sibling DLL resolves");
+    assert_ne!(*dll, resolved_dll, "the two spellings differ: {dll:?}");
+    assert!(
+        listed.contains(&format!("{} (read-only)", dll.display())),
+        "the listed DLL carries the scan's own spelling, because nothing resolved it: {listed}"
+    );
+    assert!(
+        !listed.contains(&format!("{} (read-only)", resolved_dll.display())),
+        "and not the resolved spelling, which is what resolving it would have produced: {listed}"
+    );
+}
+
+/// **A sibling DLL that is itself a reparse point is refused**, and the refusal is
+/// the one a caller's linked path earns: `icacls` followed a file symlink named
+/// `x.dll` and wrote the ACE on its **target** instead of beside the program — the
+/// defect `refuse_reparse_points` exists for, one component further in, and the
+/// defect the name-based enumeration closes. The sibling half is checked on the
+/// whitelist's own pass
+/// (`refuse_a_reparse_sibling`, one attribute read per DLL and no second walk), so
+/// this is the site that has to answer.
+///
+/// **A file symlink, and a junction cannot stand in for one**: a junction targets a
+/// directory, and the enumeration keeps only the entries `is_file` answers for —
+/// so the leg would assert nothing. Creating one needs
+/// `SeCreateSymbolicLinkPrivilege` or Developer Mode, and a host without it skips
+/// this leg rather than passing it on a whitelist the host never built
+/// (`testing::host_cannot`).
+#[test]
+fn a_sibling_dll_that_is_a_reparse_point_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    let program_dir = dir.path().join("bin");
+    fs::create_dir_all(&program_dir).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    let real = program_dir.join("app-local.dll");
+    fs::write(&real, b"x").expect("write a sibling");
+    let link = program_dir.join("linked.dll");
+    if symlink_file(&real, &link).is_err() {
+        testing::host_cannot(
+            "a sibling DLL that is a reparse point",
+            "creating a file symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode",
+            "; enable Developer Mode or run this suite with the privilege",
+        );
+        return;
+    }
+    let served = dir.path().join("srv");
+    fs::create_dir_all(&served).expect("create the served root");
+
+    let sandbox = Sandbox::new().expose(&served, AccessMode::ReadOnly);
+    let scan = SiblingScan::scan(&program_dir);
+    // **The link is enumerated, or the refusal below would be about a file set the
+    // launcher never saw**: `is_file` follows the link, so a linked sibling is one
+    // of the entries the `*.dll` pattern covers.
+    assert!(
+        scan.files().iter().any(|file| file == &link),
+        "the linked sibling is enumerated: {:?}",
+        scan.files()
+    );
+
+    let (error, logged) = recorded(|| {
+        canonical_whitelist(&sandbox, Some(&scan)).expect_err("a linked sibling is refused")
+    });
+    match &error {
+        Error::BadPath { path, reason } => {
+            assert_eq!(path, &link, "the refusal names the sibling: {error}");
+            assert!(reason.contains("is a reparse point"), "{reason}");
+        }
+        other => panic!("a reparse point is refused with a `BadPath`: {other}"),
+    }
+    // The step and the path are the ones a linked caller's path is refused with:
+    // one rule, and one place an operator finds it in a log.
+    assert_step(&logged, "resolve an exposed path");
+    assert!(
+        logged.contains(&format!("path={}", link.display())),
+        "{logged}"
+    );
+    assert_eq!(logged.matches("sandbox step failed").count(), 1, "{logged}");
+}
+
+/// **A junction named like a sibling DLL is enumerated and refused**, which is the
+/// half the old enumeration could not see.
+///
+/// `sibling_dlls` filtered with `path.is_file()`, which follows a link and keeps
+/// only regular files — so a junction to a directory answered "not a file" and was
+/// **dropped from the set**, while the grant that followed it was the tool's own
+/// `*.dll` wildcard, which matched the name and wrote through the link. A *file*
+/// symlink was worse: `is_file` answered true, the entry stayed, and `icacls`
+/// followed it and put the machine-wide ACE on the symlink's **target**, outside
+/// the program's directory (measured on this host 2026-09-27 — the file-symlink
+/// leg above pins the same enumeration, and the grant now opens every match by
+/// handle so no link is followed either way).
+///
+/// **A junction rather than a symlink, because it needs no privilege to create**:
+/// `mklink /J` is unprivileged, and a junction to a *directory* is exactly the
+/// entry the old filter dropped. A directory named `x.dll` is listed by name too
+/// and now fails the launch at the grant's kind check — the same fail-closed
+/// direction, for an entry that used to be silently skipped.
+#[test]
+fn a_junction_named_like_a_sibling_dll_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    let program_dir = dir.path().join("bin");
+    fs::create_dir_all(&program_dir).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create the junction's target");
+    let link = junction(&program_dir, "linked.dll", &outside);
+    let served = dir.path().join("srv");
+    fs::create_dir_all(&served).expect("create the served root");
+
+    let sandbox = Sandbox::new().expose(&served, AccessMode::ReadOnly);
+    let scan = SiblingScan::scan(&program_dir);
+    // **The link is enumerated, which is the fix**: by name and with no
+    // follow-the-link filter in front of it.
+    assert!(
+        scan.files().iter().any(|file| file == &link),
+        "the junction is enumerated by name: {:?}",
+        scan.files()
+    );
+
+    let (error, logged) =
+        recorded(|| canonical_whitelist(&sandbox, Some(&scan)).expect_err("a junction is refused"));
+    match &error {
+        Error::BadPath { path, reason } => {
+            assert_eq!(path, &link, "the refusal names the sibling: {error}");
+            assert!(reason.contains("is a reparse point"), "{reason}");
+        }
+        other => panic!("a reparse point is refused with a `BadPath`: {other}"),
+    }
+    assert_step(&logged, "resolve an exposed path");
+    assert_eq!(logged.matches("sandbox step failed").count(), 1, "{logged}");
+}
+
 /// **The shape the launcher gives each exposed directory, and the precedence
 /// that decides it** — the half of the Ruling 78 regression that no DACL check
 /// can see, because a grant written in the wrong shape still reports success.
 #[test]
 fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
     // **A real tree, because the caller's set is the type's now** (P1): the
-    // only way to build one is [`canonical_caller`], which resolves and checks
+    // only way to build one is [`canonical_whitelist`], which resolves and checks
     // every entry, so a literal spelling that names nothing would be a failed
     // `fs::canonicalize` rather than a test of the precedence rule. What the
     // two halves still separate is the question the test asks: the served root
@@ -411,9 +472,12 @@ fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
 
     let sandbox = Sandbox::new().expose(&root, AccessMode::ReadWrite);
     let all = canonical_exposures(exposures(&sandbox, &program)).expect("the entries resolve");
-    // **The caller's set is [`canonical_caller`]'s answer and nothing else**
+    // **The caller's set is [`canonical_whitelist`]'s answer and nothing else**
     // (P1): [`shape_for`] takes the type, so the raw set does not compile here.
-    let caller_set = canonical_caller(&sandbox).expect("the caller's root resolves");
+    // No sibling scan is behind it, because this test asks the precedence
+    // question and not what the launcher adds beside it.
+    let whitelist = canonical_whitelist(&sandbox, None).expect("the caller's root resolves");
+    let caller_set = whitelist.caller();
 
     // The caller's own exposure keeps the inherited form, which is what makes
     // a file already inside it readable by the child without a `/t` walk.
@@ -422,7 +486,7 @@ fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
         .find(|exposure| exposure.host == canonical_root)
         .expect("the caller's root is exposed");
     assert_eq!(
-        shape_for(&caller_set, caller, Some(&canonical_program_dir)),
+        shape_for(caller_set, caller, Some(&canonical_program_dir)),
         Target::Directory
     );
 
@@ -432,7 +496,7 @@ fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
         .find(|exposure| exposure.host == canonical_program_dir)
         .expect("the program's directory is exposed");
     assert_eq!(
-        shape_for(&caller_set, own, Some(&canonical_program_dir)),
+        shape_for(caller_set, own, Some(&canonical_program_dir)),
         Target::ProgramDirectory
     );
 
@@ -447,9 +511,11 @@ fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
         .find(|exposure| exposure.host == canonical_program_dir)
         .expect("the program's directory is exposed");
     assert_eq!(merged.access, AccessMode::ReadWrite);
+    let owns_whitelist =
+        canonical_whitelist(&caller_owns_it, None).expect("the caller's directory resolves");
     assert_eq!(
         shape_for(
-            &canonical_caller(&caller_owns_it).expect("the caller's directory resolves"),
+            owns_whitelist.caller(),
             merged,
             Some(&canonical_program_dir)
         ),
@@ -471,10 +537,11 @@ fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
 ///
 /// **The launcher's own file entries are the branch beside it and they are
 /// *not* refused**, because they never enter this set: [`exposures`] adds them
-/// to the granted set, which `confine` resolves through
-/// [`canonical_exposures`] and never hands to [`canonical_caller`]. The refusal
-/// exists because a caller's file would otherwise be granted nothing and the
-/// server would run on with a quiet fail-closed (the defect P7 records).
+/// to the spelled set, which the public path resolves through
+/// [`canonical_exposures`] and which [`canonical_whitelist`] keeps aside as the
+/// sibling batch rather than checking. The refusal exists because a caller's file
+/// would otherwise be granted nothing and the server would run on with a quiet
+/// fail-closed (the defect P7 records).
 #[test]
 fn a_caller_exposed_file_is_refused_rather_than_silently_dropped() {
     let dir = tempdir().expect("temp dir");
@@ -482,9 +549,9 @@ fn a_caller_exposed_file_is_refused_rather_than_silently_dropped() {
     fs::write(&file, b"x").expect("write the caller's file");
     let canonical = fs::canonicalize(&file).expect("the file resolves");
 
-    // The path that is wrong is the one the error has to name, and the one
-    // `icacls` would have been handed if the loop had not dropped it.
-    let err = canonical_caller(&Sandbox::new().expose(&file, AccessMode::ReadOnly))
+    // The path that is wrong is the one the error has to name, and the one the
+    // grant loop would have been handed if the refusal had not dropped it.
+    let err = canonical_whitelist(&Sandbox::new().expose(&file, AccessMode::ReadOnly), None)
         .expect_err("an exposed file is refused");
     assert!(
         err.to_string().contains(&canonical.display().to_string()),
@@ -513,7 +580,8 @@ fn a_caller_exposed_file_is_refused_rather_than_silently_dropped() {
         "the granted set carries the launcher's own file entry: {granted:?}"
     );
     // The caller's set, built from the same tree, is the caller's entries alone.
-    let caller = canonical_caller(&sandbox).expect("the served root is a directory");
+    let whitelist = canonical_whitelist(&sandbox, None).expect("the served root is a directory");
+    let caller = whitelist.caller();
     assert!(
         caller.exposed(&fs::canonicalize(&served).expect("the served root resolves")),
         "the caller's own directory is in its set: {caller:?}"
@@ -525,12 +593,12 @@ fn a_caller_exposed_file_is_refused_rather_than_silently_dropped() {
 }
 
 /// **The combination production actually builds, and it is this module's test
-/// because [`shape_for`] and [`canonical_caller`] are private**: a caller
+/// because [`shape_for`] and [`canonical_whitelist`] are private**: a caller
 /// exposes the launcher's own directory through a **raw** path, and the entry
 /// must still be the caller's — so it keeps [`Target::Directory`], the
 /// inherited form, with the caller's access.
 ///
-/// **It calls [`canonical_caller`] rather than reproducing it**, which is the
+/// **It calls [`canonical_whitelist`] rather than reproducing it**, which is the
 /// whole point of moving the assertion in here: the integration test that asked
 /// this question first re-implemented the function with `fs::canonicalize` (a
 /// private one is out of its reach), so it stayed green if the caller's set was
@@ -563,10 +631,11 @@ fn a_caller_who_exposed_the_launchers_own_directory_keeps_it_inherited() {
     let program = program_dir.join("serve.exe");
 
     // `confine`'s own two lines, called rather than reproduced: the caller's
-    // set from `canonical_caller` (`:363`) and the granted set from
+    // set from `canonical_whitelist` and the public spelled set from
     // `canonical_exposures(exposures(…))`.
     let canonical_dir = fs::canonicalize(&program_dir).expect("the program's directory resolves");
-    let caller = canonical_caller(&sandbox).expect("the caller's path resolves");
+    let whitelist = canonical_whitelist(&sandbox, None).expect("the caller's path resolves");
+    let caller = whitelist.caller();
     assert_eq!(
         caller.entries().len(),
         1,
@@ -603,7 +672,7 @@ fn a_caller_who_exposed_the_launchers_own_directory_keeps_it_inherited() {
         "the caller's access survives the merge: {all:?}"
     );
     assert_eq!(
-        shape_for(&caller, entry, Some(&canonical_dir)),
+        shape_for(caller, entry, Some(&canonical_dir)),
         Target::Directory,
         "the caller's own entry keeps the inherited shape, not decision 22's: {all:?}"
     );
@@ -618,11 +687,12 @@ fn a_caller_who_exposed_the_launchers_own_directory_keeps_it_inherited() {
 
     // The other half is the production expectation rather than a formality: a
     // caller set that does not name the program's directory goes through
-    // `canonical_caller` too, and answers decision 22's variant.
+    // `canonical_whitelist` too, and answers decision 22's variant.
     let served = dir.path().join("srv");
     fs::create_dir_all(&served).expect("create the served root");
     let launchers_own = Sandbox::new().expose(&served, AccessMode::ReadOnly);
-    let served_caller = canonical_caller(&launchers_own).expect("the served root resolves");
+    let served_whitelist =
+        canonical_whitelist(&launchers_own, None).expect("the served root resolves");
     let launchers_set =
         canonical_exposures(exposures(&launchers_own, &program)).expect("the entries resolve");
     let own = launchers_set
@@ -630,7 +700,7 @@ fn a_caller_who_exposed_the_launchers_own_directory_keeps_it_inherited() {
         .find(|exposure| exposure.host == canonical_dir)
         .expect("the program's directory is in the granted set");
     assert_eq!(
-        shape_for(&served_caller, own, Some(&canonical_dir)),
+        shape_for(served_whitelist.caller(), own, Some(&canonical_dir)),
         Target::ProgramDirectory,
         "the entry decision 22 adds is the launcher's own: {launchers_set:?}"
     );
@@ -716,11 +786,14 @@ fn the_served_root_is_the_first_exposure() {
 
 #[test]
 fn a_path_spelled_through_a_junction_is_refused_rather_than_followed() {
-    // Measured on this host, 2026-09-19: `icacls` resolves the path it is
-    // given, and `(OI)(CI)` is inheritable — so granting through a junction
-    // puts the ACE on the junction's *target*, outside the exposure, and that
-    // target's own children inherit it. A junction rather than a symlink
-    // because `mklink /J` needs no elevation and a symlink does.
+    // Measured on this host, 2026-09-27: a junction **above** the last component
+    // is resolved by every writer, so `…\link\tinio` put the ACE on
+    // `…\real\tinio` — outside the exposure, with that target's own children
+    // inheriting it — and a junction as the last component takes an ACE on the
+    // link's own object, which is an ACE on nothing the child can reach. Neither
+    // is the grant the caller asked for, so a spelled path that carries one
+    // anywhere is refused. A junction rather than a symlink because `mklink /J`
+    // needs no elevation and a symlink does.
     let dir = tempdir().expect("temp dir");
     let real = dir.path().join("real");
     fs::create_dir_all(&real).expect("create the target");

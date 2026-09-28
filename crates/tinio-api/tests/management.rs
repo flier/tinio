@@ -32,6 +32,7 @@ use http::Method;
 use hyper::{Request, client::conn::http1};
 #[cfg(windows)]
 use hyper_util::rt::TokioIo;
+use secrecy::ExposeSecret;
 use tempfile::TempDir;
 #[cfg(unix)]
 use tinio_api::bind::bind_unix;
@@ -237,7 +238,9 @@ impl Running {
             .as_ref()
             .expect("the state file it read")
             .token
-            .clone()
+            .expose_secret()
+            .as_str()
+            .to_owned()
     }
 
     fn status(&self) -> &StatusBody {
@@ -301,7 +304,13 @@ fn get<'a>(target: &'a str, token: Option<&'a str>) -> Call<'a> {
 /// Whether the plane answers yet: `state` is published at `publish`, *before* `serve` reaches
 /// its accept loop, so a probe that races it answers "stopped".
 async fn answers(dir: &Path, ready: &Ready) -> bool {
-    let token = State::read(dir).expect("read").expect("published").token;
+    let token = State::read(dir)
+        .expect("read")
+        .expect("published")
+        .token
+        .expose_secret()
+        .as_str()
+        .to_owned();
     match ready {
         Ready::State => client::status(dir).await.expect("state reads").running,
         Ready::Loopback => {

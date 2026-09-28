@@ -6,6 +6,7 @@ use crate::{
     _core::{AccessMode, Error, Result, Sandbox, refused},
     Mechanism,
     jail::mirror_under,
+    options::Options,
 };
 
 /// The four device files bound into every jail that asks for them.
@@ -30,10 +31,11 @@ pub const DEVICE_FILES: [&str; 4] = ["/dev/null", "/dev/zero", "/dev/random", "/
 /// use std::path::Path;
 ///
 /// use tinio_sandbox_core::{AccessMode, Sandbox};
-/// use tinio_sandbox_linux::{Mechanism, Mount, plan};
+/// use tinio_sandbox_linux::{Mechanism, Mount, Options, plan};
 ///
 /// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
-/// let mounts: Vec<Mount> = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root).unwrap();
+/// let opts = Options::default();
+/// let mounts: Vec<Mount> = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &opts).unwrap();
 /// assert_eq!(mounts[1].source, Path::new("/srv/data"));
 /// assert_eq!(mounts[1].target, Path::new("/tmp/j/srv/data"));
 /// ```
@@ -60,10 +62,11 @@ pub struct Mount {
 /// use std::path::Path;
 ///
 /// use tinio_sandbox_core::{AccessMode, Sandbox};
-/// use tinio_sandbox_linux::{Mechanism, MountKind, plan};
+/// use tinio_sandbox_linux::{Mechanism, MountKind, Options, plan};
 ///
 /// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
-/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root).unwrap();
+/// let opts = Options::default();
+/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &opts).unwrap();
 /// let data = mounts
 ///     .iter()
 ///     .find(|mount| mount.source == Path::new("/srv/data"))
@@ -140,6 +143,14 @@ pub struct OverlayDirs {
 /// into one — and it reaches this function with the guard below skipped, since
 /// the guard is keyed on the model it can check.
 ///
+/// **`opts` is read for one fact, and the model is deliberately not taken from
+/// it.** [`Options::device_files`] is this platform's own knob — the flag moved
+/// off `Sandbox`, which carried a Linux-only request on every platform — and it
+/// is read here because this is the function that appends the four device binds.
+/// The model stays an argument: `opts.model()` may be [`Mechanism::Auto`], and
+/// reading it here as well would put the unresolved request back in front of a
+/// guard that can only check the resolved one.
+///
 /// # Errors
 ///
 /// [`Error::BadPath`] for an exposure [`mirror_under`] rejects, and
@@ -155,13 +166,19 @@ pub struct OverlayDirs {
 /// use std::path::Path;
 ///
 /// use tinio_sandbox_core::{AccessMode, Sandbox};
-/// use tinio_sandbox_linux::{Mechanism, plan};
+/// use tinio_sandbox_linux::{Mechanism, Options, plan};
 ///
 /// let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
-/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root).unwrap();
+/// let opts = Options::default();
+/// let mounts = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &opts).unwrap();
 /// assert_eq!(mounts.len(), 2, "the jail tmpfs plus the one exposure");
 /// ```
-pub fn plan(sandbox: &Sandbox, jail: &Path, model: Mechanism) -> Result<Vec<Mount>> {
+pub fn plan(
+    sandbox: &Sandbox,
+    jail: &Path,
+    model: Mechanism,
+    opts: &Options,
+) -> Result<Vec<Mount>> {
     let mut mounts = vec![Mount {
         source: PathBuf::from("tmpfs"),
         target: jail.to_path_buf(),
@@ -211,7 +228,7 @@ pub fn plan(sandbox: &Sandbox, jail: &Path, model: Mechanism) -> Result<Vec<Moun
         });
     }
 
-    if sandbox.device_files_enabled() {
+    if opts.device_files() {
         for device in DEVICE_FILES {
             mounts.push(Mount {
                 source: PathBuf::from(device),
@@ -237,7 +254,8 @@ mod tests {
     #[test]
     fn the_jail_tmpfs_is_always_first() {
         let sandbox = Sandbox::new().expose("/srv/deep/data", AccessMode::ReadWrite);
-        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root).unwrap();
+        let opts = Options::default();
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root, &opts).unwrap();
         assert_eq!(mounts[0].kind, MountKind::JailTmpfs);
         assert_eq!(mounts[0].target, PathBuf::from(JAIL));
     }
@@ -246,7 +264,7 @@ mod tests {
     fn read_write_exposure_is_a_plain_bind_in_both_models() {
         let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
         for model in [Mechanism::UserNamespace, Mechanism::Root] {
-            let mounts = plan(&sandbox, Path::new(JAIL), model).unwrap();
+            let mounts = plan(&sandbox, Path::new(JAIL), model, &Options::default()).unwrap();
             let data = mounts
                 .iter()
                 .find(|m| m.source == Path::new("/srv/data"))
@@ -269,7 +287,7 @@ mod tests {
         // very hosts a served root lives on: the mistake this test catches.
         let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
         for model in [Mechanism::UserNamespace, Mechanism::Root] {
-            let mounts = plan(&sandbox, Path::new(JAIL), model).unwrap();
+            let mounts = plan(&sandbox, Path::new(JAIL), model, &Options::default()).unwrap();
             let data = mounts
                 .iter()
                 .find(|m| m.source == Path::new("/srv/data"))
@@ -284,7 +302,8 @@ mod tests {
         let sandbox = Sandbox::new()
             .expose("/srv/data", AccessMode::ReadOnly)
             .expose("/home/u/.tinio/roots/h", AccessMode::ReadWrite);
-        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace).unwrap();
+        let opts = Options::default();
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace, &opts).unwrap();
         let state = mounts
             .iter()
             .find(|m| m.source == Path::new("/home/u/.tinio/roots/h"))
@@ -299,10 +318,12 @@ mod tests {
 
     #[test]
     fn device_files_come_last_and_are_binds() {
-        let sandbox = Sandbox::new()
-            .expose("/srv/data", AccessMode::ReadWrite)
-            .device_files();
-        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root).unwrap();
+        // **The flag is the options' now**, so the fixture that used to ask the
+        // `Sandbox` for them builds the `Options` the plan reads instead — and
+        // this is the one test whose options are not the defaults.
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
+        let opts = Options::default().with_device_files(true);
+        let mounts = plan(&sandbox, Path::new(JAIL), Mechanism::Root, &opts).unwrap();
         let tail = &mounts[mounts.len() - DEVICE_FILES.len()..];
         let names: Vec<&Path> = tail.iter().map(|mount| mount.source.as_path()).collect();
         assert_eq!(
@@ -334,12 +355,13 @@ mod tests {
         let sandbox = Sandbox::new()
             .expose("/srv/data", AccessMode::ReadOnly)
             .expose("/srv/other", AccessMode::ReadOnly);
-        let err = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace).unwrap_err();
+        let opts = Options::default();
+        let err = plan(&sandbox, Path::new(JAIL), Mechanism::UserNamespace, &opts).unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
         assert!(err.to_string().contains("read-only exposure"), "{err}");
 
         // The same two exposures are fine under root, where the remount is not
         // refused and the pair is therefore never reached.
-        assert!(plan(&sandbox, Path::new(JAIL), Mechanism::Root).is_ok());
+        assert!(plan(&sandbox, Path::new(JAIL), Mechanism::Root, &opts).is_ok());
     }
 }

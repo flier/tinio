@@ -35,20 +35,22 @@ mod common;
 
 use std::{
     fs,
-    io::{self, Write},
-    mem,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc},
-    thread::{self, ThreadId},
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
 use tinio_sandbox_core::AccessMode;
+// The recording device comes from the library (`tinio_sandbox_windows::testing`),
+// which is where this file's copy and `src/backend/tests.rs`'s were folded into —
+// the second of the two had grown the `every_thread` filter the ordering test here
+// needs. `wait_for` stays in this file: polling for a marker is its own idiom, and
+// nothing else waits on a window that way.
 use tinio_sandbox_windows::{
     acl,
     sid::{PackageSid, ProfileLock, package_name},
+    testing::{Capture, capture, recorder},
 };
-use tracing::{Level, callsite::rebuild_interest_cache};
-use tracing_subscriber::fmt::MakeWriter;
 
 /// The confined child. The body lives in the harness because every suite that
 /// launches a child runs the same role, and this binary is one of them since
@@ -183,7 +185,7 @@ fn a_confined_launch_holds_the_window_across_its_acl_phase() {
     let run = thread::scope(|scope| {
         let launcher = scope.spawn(|| common::run_confined(&tree, AccessMode::ReadWrite));
         // The event the phase announces itself with is emitted *inside* the
-        // window — after the derive, before the first `icacls` — so waiting for
+        // window — after the derive, before the first grant — so waiting for
         // it is what turns the launcher's window into a signal rather than a
         // guess.
         wait_for(&capture, PHASE_MARKER, Duration::from_secs(60));
@@ -280,7 +282,7 @@ fn a_confine_waits_for_the_window_before_it_touches_the_tree() {
 }
 
 /// The phase's own `info!`, which [`grant_whitelist`](tinio_sandbox_windows::backend) emits
-/// once per launch *before* the first `icacls`: the mark of the window being
+/// once per launch *before* the first grant: the mark of the window being
 /// open, since the derive has happened by then and `CreateProcessW` has not.
 const PHASE_MARKER: &str = "step=\"grant the ACLs\"";
 
@@ -363,20 +365,6 @@ fn a_different_root_is_a_different_lock() {
     drop(held);
 }
 
-/// **The one recording at a time**: two tests in this binary assert on a
-/// captured window, and the capture holds one buffer, so each takes it to
-/// itself. What the lock cannot cover is the *other* tests' events, which is why
-/// the assertions name the package they are about.
-fn recorder() -> MutexGuard<'static, ()> {
-    static RECORDER: Mutex<()> = Mutex::new(());
-    // A test that panicked while recording poisons this, and the suite is
-    // already failing: the next reader takes the buffer rather than reporting a
-    // second failure that hides the first.
-    RECORDER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Wait until the recording carries `marker`, so that an event emitted inside a
 /// window becomes something a test can act on.
 ///
@@ -392,114 +380,5 @@ fn wait_for(capture: &Capture, marker: &str, bound: Duration) {
             capture.peek()
         );
         thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// What a recording saw, for the tests that assert on an event's fields or on
-/// the order of two events — the shape `src/backend/tests.rs`'s capture
-/// established, and here for the same two reasons it states: the subscriber is
-/// **global** (a `with_default` dispatch is invisible to `tracing`'s
-/// process-wide interest cache, which is the one-run-in-thirty flake that
-/// harness was fixed for), and what keeps an assertion exact is the filter — the
-/// **thread** for the field assertions, and every thread for the ordering one,
-/// because the two events it compares are written by two different threads.
-fn capture() -> Capture {
-    static CAPTURE: OnceLock<Capture> = OnceLock::new();
-    CAPTURE
-        .get_or_init(|| {
-            let capture = Capture::default();
-            let _ = tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .with_max_level(Level::INFO)
-                .try_init();
-            rebuild_interest_cache();
-            capture
-        })
-        .clone()
-}
-
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<State>>);
-
-#[derive(Default)]
-struct State {
-    text: Vec<u8>,
-    recording: Option<ThreadId>,
-    every_thread: bool,
-}
-
-impl Capture {
-    /// Own this thread's events until the guard drops.
-    fn record(&self) -> Recording {
-        let mut state = self.0.lock().expect("the capture mutex");
-        assert!(!state.every_thread, "another recording owns the capture");
-        state.text.clear();
-        state.recording = Some(thread::current().id());
-        Recording(self.clone())
-    }
-
-    /// Own **every** thread's events until the guard drops: the mode the
-    /// ordering assertion needs, and the reason the callers take [`recorder`]
-    /// first.
-    fn record_every_thread(&self) -> Recording {
-        let mut state = self.0.lock().expect("the capture mutex");
-        assert!(
-            state.recording.is_none() && !state.every_thread,
-            "another recording owns the capture"
-        );
-        state.text.clear();
-        state.every_thread = true;
-        Recording(self.clone())
-    }
-
-    fn release(&self) {
-        let mut state = self.0.lock().expect("the capture mutex");
-        state.recording = None;
-        state.every_thread = false;
-    }
-
-    /// What has been recorded so far, without taking it: the reader
-    /// [`wait_for`] polls with.
-    fn peek(&self) -> String {
-        let state = self.0.lock().expect("the capture mutex");
-        String::from_utf8_lossy(&state.text).into_owned()
-    }
-
-    /// What the recording wrote, as UTF-8.
-    fn text(&self) -> String {
-        let text = mem::take(&mut self.0.lock().expect("the capture mutex").text);
-        String::from_utf8(text).expect("the capture is UTF-8")
-    }
-}
-
-impl Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut state = self.0.lock().expect("the capture mutex");
-        if state.every_thread || state.recording == Some(thread::current().id()) {
-            state.text.extend_from_slice(buf);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// One recording's lifetime: [`Capture::record`]'s guard.
-struct Recording(Capture);
-
-impl Drop for Recording {
-    fn drop(&mut self) {
-        self.0.release();
     }
 }

@@ -586,12 +586,6 @@ fn launcher_parameters(sandbox: &Sandbox, extra: &[(&str, String)], report: &Pat
             format!("{access}:{}", exposure.host.display()),
         ));
     }
-    // **Carried although nothing on this platform reads it.** The product's own
-    // `sandbox_request` calls `.device_files()` for Linux's sake, and this fixture
-    // mirrors the set the product builds, so the flag travels with the exposures
-    // rather than being quietly dropped here; `profile.rs`'s module doc is where
-    // the reason it renders no rule is written.
-    text.push_str(&line("devices", u8::from(sandbox.device_files_enabled())));
     text
 }
 
@@ -613,15 +607,6 @@ fn sandbox_from_params(params: &[(String, String)]) -> Sandbox {
             };
             sandbox = sandbox.expose(host, access);
         }
-    }
-    if params
-        .iter()
-        .any(|(key, value)| key == "devices" && value == "1")
-    {
-        // The flag is put back because the set is the product's, and it stays
-        // inert: nothing in this crate renders a rule for it (`profile.rs`'s
-        // module doc), and the pruned render below is the launch's own generator.
-        sandbox = sandbox.device_files();
     }
     sandbox
 }
@@ -648,8 +633,11 @@ pub fn run_pruned(sandbox: &Sandbox, extra: &[(&str, String)], test_name: &str) 
     let params = parameters(extra, &report);
     let id = pruned_rule().unwrap_or_default();
 
-    let rendered =
-        profile(&with_canonical_paths(sandbox), Mechanism::SandboxExec).expect("profile");
+    let rendered = profile(
+        with_canonical_paths(sandbox).sandbox(),
+        Mechanism::SandboxExec,
+    )
+    .expect("profile");
     let pruned = match remove_rule(&rendered.text, &id) {
         Some(pruned) => pruned,
         // **Distinct from "required", and it has to stay distinct.** The id is
@@ -766,7 +754,7 @@ const LISTEN_ADDR: &str = "127.0.0.1:0";
 /// terminated, including the last**.
 ///
 /// The trailing newline is load-bearing rather than tidy: [`launcher_parameters`]
-/// appends its own `expose=`/`devices=` lines to this text, and a `join("\n")`
+/// appends its own `expose=` lines to this text, and a `join("\n")`
 /// without a final separator welds the last parameter here onto the first one
 /// added there — `listen=127.0.0.1:0expose=rw:/srv/root`. The child then reads a
 /// `listen` value it cannot parse and **no exposure at all**, which showed up as

@@ -208,7 +208,7 @@ impl Config {
             scanner: Some(scanner::Config::default()),
             auth: Some(auth::Config {
                 access_key: credentials.access_key,
-                secret_key: auth::SecretKey::from(credentials.secret_key).into(),
+                secret_key: credentials.secret_key,
             }),
             storage: Some(storage::Config::default()),
             api: Some(api::Config {

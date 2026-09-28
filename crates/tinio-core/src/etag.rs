@@ -163,6 +163,8 @@ impl From<&str> for ETag {
 
 #[cfg(test)]
 mod tests {
+    use std::{error::Error as StdError, time::SystemTime};
+
     use super::*;
     use crate::_util::testing::assert_send_sync;
 
@@ -206,5 +208,53 @@ mod tests {
         assert!(ETag::new(&format!("{hex}-0")).is_err());
         // An empty part list cannot compose an ETag.
         assert!(ETag::composed_from_parts(&[]).is_none());
+    }
+
+    #[test]
+    fn etag_composes_parts_and_rejects_an_overflowing_part_count() {
+        // The AWS composition: the MD5 over the RAW 16-byte part digests
+        // concatenated, then `-N`. The vector is the published one for
+        // ("hello", "world") — joining the part etags as HEX strings
+        // would compose a different digest and break every client that
+        // re-verifies the multipart etag.
+        let parts = [
+            PartInfo {
+                part_number: 1.into(),
+                size: 5,
+                etag: ETag::from_content(b"hello"),
+                last_modified: SystemTime::UNIX_EPOCH,
+                checksum: None,
+            },
+            PartInfo {
+                part_number: 2.into(),
+                size: 5,
+                etag: ETag::from_content(b"world"),
+                last_modified: SystemTime::UNIX_EPOCH,
+                checksum: None,
+            },
+        ];
+        let composed = ETag::composed_from_parts(&parts).expect("two parts compose");
+        assert_eq!(composed.as_str(), "065947336a2f2a95ba8899f3675c3be6-2");
+        // The suffix counts PARTS (the composed shape carries the count
+        // as a field), and the emitted form is what a client echoes back
+        // — it must re-parse to the same value.
+        assert_eq!(
+            composed,
+            ETag::new("065947336a2f2a95ba8899f3675c3be6-2").unwrap()
+        );
+
+        // A suffix that overflows `u32` is the only failing parse: the
+        // format checks reject non-digits and `-0` first, so the count
+        // parse is the single caller of `Error::PartCount` — it must
+        // stay that error and never degrade to `InvalidFormat` (the S3
+        // layer answers a different code for each).
+        let hex = "d41d8cd98f00b204e9800998ecf8427e";
+        let overflowing = format!("{hex}-{}", u64::from(u32::MAX) + 1);
+        let err = ETag::new(&overflowing).unwrap_err();
+        assert_eq!(err.to_string(), "invalid etag: invalid ETag part count");
+        // Both hops stay in the chain (the mapping layer logs them).
+        let etag_err = err.source().expect("the etag error is the source");
+        assert_eq!(etag_err.to_string(), "invalid ETag part count");
+        assert!(etag_err.source().is_some(), "the parse error is its source");
     }
 }

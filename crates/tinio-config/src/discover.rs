@@ -51,14 +51,18 @@ pub const CONFIG_ALIAS: &str = "config.toml";
 /// ```rust
 /// use tinio_config::discover::Outcome;
 ///
-/// assert_ne!(Outcome::Created, Outcome::Loaded);
+/// assert_ne!(Outcome::Created("port = 9000".into()), Outcome::Loaded);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// An existing file was parsed.
     Loaded,
-    /// A new file was written with generated credentials.
-    Created,
+    /// **A new file was written with generated credentials — and the text it was written from.**
+    /// The caller that asked for the create is the one assembling the launch payload, which
+    /// carries the document's text and never its path (decision 18); handing the text back is
+    /// what keeps that payload from being a second serialization of a `Config` this call has
+    /// already serialized once.
+    Created(String),
 }
 
 /// The configuration file for `root`, searched in decision 5's order.
@@ -124,7 +128,7 @@ pub fn resolve_path(
 /// let root = Path::new("/srv/data");
 /// let path = resolve_path(root, Path::new("/srv/data/.tinio"), None)?;
 /// let (_config, outcome) = load_or_create(root, &path, false)?;
-/// assert!(matches!(outcome, Outcome::Loaded | Outcome::Created));
+/// assert!(matches!(outcome, Outcome::Loaded | Outcome::Created(_)));
 /// # Ok::<(), tinio_config::Error>(())
 /// ```
 pub fn load_or_create(
@@ -155,7 +159,7 @@ pub fn load_or_create(
         .map_err(|err| error::io(path, err))?;
     #[cfg(windows)]
     restrict_or_remove(path, restrict_to_current_user)?;
-    Ok((config, Outcome::Created))
+    Ok((config, Outcome::Created(text)))
 }
 
 /// Creates `path` — which must not exist yet — with the created config's protection applied **at
@@ -353,7 +357,14 @@ mod tests {
         let path = resolve_path(root.path(), state.path(), None).expect("resolve");
         let (config, outcome) = load_or_create(root.path(), &path, false).expect("create");
 
-        assert!(matches!(outcome, Outcome::Created));
+        let Outcome::Created(text) = outcome else {
+            panic!("a first start writes the file");
+        };
+        assert_eq!(
+            text,
+            std::fs::read_to_string(&path).expect("read back"),
+            "the text it hands back is the text it wrote"
+        );
         assert!(path.exists());
         let auth = config.auth.as_ref().expect("generated credentials");
         assert!(auth.access_key.len() >= 16);
@@ -392,7 +403,7 @@ mod tests {
         let state = TempDir::new().expect("state");
         let path = resolve_path(root.path(), state.path(), None).expect("resolve");
         let (config, outcome) = load_or_create(root.path(), &path, true).expect("create");
-        assert!(matches!(outcome, Outcome::Created));
+        assert!(matches!(outcome, Outcome::Created(_)));
         assert!(
             path.starts_with(state.path()),
             "read-only never writes the served root"

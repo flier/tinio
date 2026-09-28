@@ -38,7 +38,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    _winsec::{CurrentUserDacl, descriptor_is_current_user_only, to_wide},
+    _winsec::{CurrentUserDacl, descriptor_is_current_user_only, to_wide, win32_error_message},
     Error,
 };
 
@@ -211,8 +211,15 @@ pub fn pipe_acl_is_current_user_only(name: &str) -> Result<bool, Error> {
     }
     // The walk is the file read-back's, unchanged: the ACEs, the mask and the trustee rule are
     // the same ones `full_control_acl` wrote into this pipe's descriptor at creation.
-    let verdict =
-        descriptor_is_current_user_only(path, descriptor).map_err(|err| state_error(path, err));
+    //
+    // SAFETY: `descriptor` is the allocation `GetSecurityInfo` returned above — the
+    // `status != ERROR_SUCCESS` return refused every path on which the out-parameter was not
+    // written, so what is left here is that call's own output: a live, aligned, readable
+    // security descriptor, with its DACL and ACEs inside the same allocation, which is exactly
+    // what `descriptor_is_current_user_only`'s `# Safety` section asks for. This function owns
+    // it and gives it up in the `LocalFree` below, after the walk.
+    let verdict = unsafe { descriptor_is_current_user_only(path, descriptor) }
+        .map_err(|err| state_error(path, err));
     unsafe { LocalFree(descriptor) };
     verdict
 }
@@ -251,16 +258,14 @@ fn open_for_read_control(name: &str) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
+/// The [`Error::State`] a failed Win32 call reports, in the one wording
+/// [`tinio_winsec::win32_error_message`] defines: the sentence is the shared part, and the path is
+/// this error type's own field rather than text spliced in front of it — which is what keeps the
+/// rendered error from naming the pipe twice.
 fn win32_error(path: &Path, call: &str, status: u32) -> Error {
-    let message = if status == ERROR_SUCCESS {
-        format!("{call} failed without a status")
-    } else {
-        let meaning = io::Error::from_raw_os_error(status as i32);
-        format!("{call} failed: {meaning} (status {status})")
-    };
     Error::State {
         path: path.to_path_buf(),
-        message,
+        message: win32_error_message(call, status),
     }
 }
 
@@ -268,5 +273,38 @@ fn state_error(path: &Path, err: io::Error) -> Error {
     Error::State {
         path: path.to_path_buf(),
         message: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{Error, win32_error};
+
+    /// **A read-back failure is `Error::State`'s and the path is its own field**, so the message is
+    /// [`tinio_winsec::win32_error_message`]'s sentence alone: this is the half of the wording
+    /// split that stays here, and what would break it — a message carrying the path as well —
+    /// renders the pipe's name twice, once from the field and once from the text.
+    #[test]
+    fn a_failed_call_reports_the_path_as_the_state_fields_own() {
+        let err = win32_error(Path::new(r"\\.\pipe\tinio-mine"), "GetSecurityInfo", 5);
+        let Error::State { path, message } = &err else {
+            panic!("a failed Win32 call is a state failure");
+        };
+        assert_eq!(path.as_path(), Path::new(r"\\.\pipe\tinio-mine"));
+        assert!(
+            message.starts_with("GetSecurityInfo failed: "),
+            "the shared sentence names the call that failed: {message}"
+        );
+        assert!(
+            message.ends_with(" (status 5)"),
+            "it closes with the decimal status, so a log reader can act on the code: {message}"
+        );
+        assert_eq!(
+            err.to_string().matches(r"\\.\pipe\tinio-mine").count(),
+            1,
+            "the path is the field's alone, so the rendered error must not repeat it: {err}"
+        );
     }
 }

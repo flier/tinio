@@ -6,3 +6,7 @@ crates/tinio-select/tests/fixtures/large/** filter=lfs diff=lfs merge=lfs -text
 # The unit file is read by systemd and by the macOS/WSL2 guest legs: an LF-only
 # file, whatever the checkout platform.
 packaging/tinio.service text eol=lf
+
+# Compiled into text a supervisor reads, or compared byte for byte with such a
+# file. LF-only, whatever the checkout platform.
+*.hbs text eol=lf

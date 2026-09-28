@@ -31,4 +31,4 @@ pub use signals::{
 #[allow(unused_imports)]
 pub use tree::{Tree, icacls, one_volume, tree, volumes};
 #[allow(unused_imports)]
-pub use wait::{TIMEOUT, answer, wait_for_exit};
+pub use wait::{TIMEOUT, accept, answer, wait_for_exit};

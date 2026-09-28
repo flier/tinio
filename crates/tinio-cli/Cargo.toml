@@ -17,7 +17,7 @@ clap = { workspace = true, features = [
 ] }
 either.workspace = true
 futures.workspace = true
-handlebars = { workspace = true, optional = true }
+handlebars.workspace = true
 hex.workspace = true
 parse-display.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -44,7 +44,7 @@ tinio-fs.workspace = true
 tinio-mem = { workspace = true, optional = true }
 tinio-sandbox.workspace = true
 tinio-server = { workspace = true, features = ["acl"] }
-tinio-util.workspace = true
+tinio-util = { workspace = true, features = ["render"] }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -67,7 +67,7 @@ windows-sys = { workspace = true, features = [
 
 [features]
 default = ["api", "mem", "sandbox"]
-api = ["dep:handlebars", "dep:tinio-api"]
+api = ["dep:tinio-api"]
 mem = ["dep:tinio-mem"]
 sandbox = ["api"]
 tls = ["api", "tinio-api/tls"]

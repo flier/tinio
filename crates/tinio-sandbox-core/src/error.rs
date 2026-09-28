@@ -39,6 +39,10 @@ pub enum Error {
     /// nothing in it is reported as [`Self::Step`] with the rejected step named,
     /// so that "unsupported here" keeps pointing at the platform rather than at
     /// the operator's argument.
+    ///
+    /// **One value of `detail` is an operator typo rather than a missing
+    /// platform**, and [`Error::is_usage`] is how a caller tells them apart
+    /// without matching the sentence: [`MACOS_MECHANISM_USAGE`].
     #[error("sandbox unsupported here: {detail}")]
     Unsupported {
         /// Why, in operator-facing terms, with the remedy where one exists.
@@ -84,6 +88,49 @@ pub enum Error {
     /// one of them happens by accident.
     #[error("sandbox could not wait for the confined child: {0}")]
     Wait(#[from] io::Error),
+}
+
+/// The macOS mechanism selector's refusal when the operator typed neither
+/// accepted value.
+///
+/// **This is the one [`Error::Unsupported`] a caller treats as usage** (exit 2).
+/// The sentence stays here so the platform that builds the error and
+/// [`Error::is_usage`] cannot drift.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::{Error, MACOS_MECHANISM_USAGE};
+///
+/// let err = Error::Unsupported {
+///     detail: MACOS_MECHANISM_USAGE,
+/// };
+/// assert!(err.is_usage());
+/// ```
+pub const MACOS_MECHANISM_USAGE: &str =
+    "TINIO_SANDBOX_MACOS_MECHANISM must be `sandbox-exec` or `sandbox-init`";
+
+impl Error {
+    /// Whether this failure is an operator typo (exit 2) rather than a platform
+    /// that cannot confine (exit 1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{Error, MACOS_MECHANISM_USAGE};
+    ///
+    /// let typo = Error::Unsupported {
+    ///     detail: MACOS_MECHANISM_USAGE,
+    /// };
+    /// let missing = Error::Unsupported {
+    ///     detail: "no user namespaces",
+    /// };
+    /// assert!(typo.is_usage());
+    /// assert!(!missing.is_usage());
+    /// ```
+    pub fn is_usage(&self) -> bool {
+        matches!(self, Self::Unsupported { detail } if *detail == MACOS_MECHANISM_USAGE)
+    }
 }
 
 /// Convenience alias.
@@ -265,7 +312,7 @@ mod tests {
     use tracing::subscriber::with_default;
 
     use super::*;
-    use crate::_util::testing::SharedBuf;
+    use crate::_util::testing::{SharedBuf, assert_step};
 
     #[test]
     fn a_step_error_names_the_operation() {
@@ -310,14 +357,10 @@ mod tests {
     /// the rule that the failure path cannot drift from the value the caller
     /// sees.
     ///
-    /// **The assertions are on the rendered fields, not on the values as
-    /// substrings, and that distinction is the property rather than a
-    /// pedantry.** A substring check would pass for an event whose `step` field
-    /// said something else entirely, since the operation's name is a string
-    /// shared with the error the caller gets back. `step="…"` is what the field
-    /// renders as, and it is what this crate's Linux sibling asserts for its
-    /// own recorder test (`tinio-sandbox-linux`'s `jail.rs`) and what P3's plan
-    /// asserts for its.
+    /// **The field assertion is [`assert_step`]'s**, which owns the rule and the
+    /// `with_ansi(false)` prerequisite it rests on; what this test adds is the
+    /// other half of shared §7's claim — that the `step` the event carries is the
+    /// `step` the returned error names.
     ///
     /// **What Ruling 45 changed is the line's shape, not the assertions, and
     /// P3 is told to cite this paragraph.** Until that ruling, the event
@@ -333,16 +376,24 @@ mod tests {
     /// one: a `launch` that went back to routing through [`refused`] keeps
     /// `step` and drops `path`, and this line is what fails when it does.
     ///
-    /// **`with_ansi(false)` is load-bearing for a field assertion**, and it is
-    /// measured rather than assumed: the default subscriber interleaves escape
-    /// sequences into the field *syntax* — `step=` arrives as
-    /// `\x1b[3mstep\x1b[0m\x1b[2m=\x1b[0m` — so `contains("step=\"…\"")` never
-    /// matches without it. The value substrings the old form of this test
-    /// checked survived that; the field names it now checks do not.
-    ///
     /// The level is the one `serve`'s subscriber enables (`Verbosity::Info`) and
     /// not `TRACE`, so a failure that was moved to `debug!` would stop being
     /// recorded and this test would lose the property rather than keep it.
+    ///
+    /// **Why this test is still thread-scoped while a shared device exists.**
+    /// `tinio_util::testing` carries one recording device for the workspace, and it installs a
+    /// **process** default — which this test binary already has: `launcher/adopt.rs`'s tests install a
+    /// structured recorder of their own with `set_global_default`, and two global installers in one
+    /// binary cannot both hold the default. Whoever installs first wins, the other stays empty, and its
+    /// assertions fail for a recording that never happened; that is the hazard the device's own doc
+    /// warns about. `with_default` is the one shape that composes with it — it overrides the default on
+    /// the thread this test runs on, and leaves adopt's recorder the process's.
+    ///
+    /// **What that costs is the callsite-cache hazard the device exists to remove**: while no process
+    /// default is installed, a parallel test that hits this callsite first can cache it `never` and drop
+    /// the event. That is the price of sharing a binary with the one recorder that cannot join the
+    /// device, so this is a documented exception rather than the shape to copy — a test in a binary
+    /// with no default of its own takes `tinio_util::testing::record_events` or the `capture` device.
     #[test]
     fn a_launch_failure_logs_the_step_and_path_it_reports() {
         let capture = SharedBuf::default();
@@ -365,7 +416,7 @@ mod tests {
         assert_eq!(*operation, "CreateProcessW");
         let logged = String::from_utf8(capture.0.lock().expect("the capture mutex").clone())
             .expect("the capture is UTF-8");
-        assert!(logged.contains(r#"step="CreateProcessW""#), "{logged}");
+        assert_step(&logged, "CreateProcessW");
         assert!(logged.contains("path=program"), "{logged}");
     }
 }

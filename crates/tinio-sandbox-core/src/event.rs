@@ -10,6 +10,13 @@ use sse_core::{SseDecoder, SseEvent};
 const DATA: &str = "data: ";
 const EVENT: &str = "event: ";
 
+/// The pinned field limit, in the plain integer the compile-time assertion below can police.
+const MAX_FIELD_LIMIT: usize = 64 * 1024;
+
+// A compile-time assertion and not a runtime one: a zero here stops the build, which is
+// what leaves the conversion below with no `None` arm any run could take.
+const _: () = assert!(MAX_FIELD_LIMIT != 0);
+
 /// The largest a single SSE field may be before the decoder discards the frame.
 ///
 /// Pinned rather than inherited: `SseDecoder::new()` carries a 512 KiB default,
@@ -24,16 +31,18 @@ const EVENT: &str = "event: ";
 /// while the relay pinned 64 KiB — the same crate, two limits, and the one this
 /// comment argues against at the site a consumer reaches.
 ///
-/// **The `unwrap()` is deliberate, and no form exists that avoids it.** Constitution
-/// II forbids one in library code, and the alternatives are all worse here:
-/// `NonZeroUsize::new_unchecked` is an `unsafe fn` this crate may not call
-/// (`unsafe_code = "forbid"`), and a fallible spelling would have to answer
-/// *something* for the zero that cannot occur — a second limit, silently
-/// different from this one. What the `unwrap()` costs is bounded by where it
-/// runs: the expression is a constant, so the panic it could in principle raise
-/// is a **compile error** rather than a runtime one, and the line cannot be
-/// reached by any input.
-pub(crate) const MAX_FIELD: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
+/// **The conversion to `NonZeroUsize` is written so that no input can panic it.** The
+/// limit is the plain integer above, and the assertion beside it refuses a zero *at
+/// compile time* — so the match's `None` arm is a build failure rather than a branch
+/// any run reaches. Constitution II forbids `unwrap()` in library code and the
+/// alternatives are worse here: `NonZeroUsize::new_unchecked` is an `unsafe fn` this
+/// crate may not call (`unsafe_code = "forbid"`), and a fallible spelling would have to
+/// answer *something* for the zero that cannot occur — a second limit, silently
+/// different from this one.
+pub(crate) const MAX_FIELD: NonZeroUsize = match NonZeroUsize::new(MAX_FIELD_LIMIT) {
+    Some(field) => field,
+    None => unreachable!(),
+};
 
 /// The event name that means "the listener is bound".
 const LISTENING: &str = "listening";

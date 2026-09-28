@@ -22,6 +22,7 @@ use std::{
 
 use tinio_sandbox_core::Event;
 use tinio_sandbox_windows::launch;
+use tinio_util::testing::kill_and_reap;
 
 /// The launcher's own role: run the production launch path and supervise it,
 /// with its stdout owned by the test.
@@ -113,8 +114,7 @@ fn read_launcher_output(launcher: &mut Child) -> String {
         Ok(Ok(text)) => text,
         Ok(Err(err)) => panic!("reading the launcher's stdout failed: {err}"),
         Err(_) => {
-            let _ = launcher.kill();
-            let _ = launcher.wait();
+            kill_and_reap(launcher);
             panic!(
                 "the launcher wrote nothing and did not exit within {:?}: its child never \
                  answered the handshake, or never exited",

@@ -27,6 +27,7 @@ use crate::{
         FsCleanup, FsStorage, Scanner, ScannerOptions,
         sweep::{self, Sweeper},
     },
+    _sandbox::platform_facts,
     _server::{
         Capabilities, DataPlane, Identity, PlaneConfig,
         identity::{self, IdentityFromConfig},
@@ -121,8 +122,7 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     // process whose supervisor forwards the stop, so both need somewhere for it to land. An
     // in-place platform never reaches this: Linux confines *this* process, so the supervisor
     // signals the server itself and there is nothing to forward.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if adopted.is_some() {
+    if adopted.is_some() && platform_facts().launches_child {
         let stopper = handles.stopper.clone();
         sandbox::on_stop(move || {
             let _ = stopper.send(true);
@@ -403,7 +403,7 @@ async fn repair(storage: &FsStorage, resolution: &Resolution) {
 ///
 /// **That guarantee belongs to the awaits that run to completion, and the serving half bounds
 /// its own** (`BACKGROUND_BOUND`): both loops re-check the channel only *between* chunks — the
-/// scanner's pacing sleeps in `max_wait` steps (`tinio_fs`'s `pacing::sleep_checked`) — so a
+/// scanner's pacing sleeps in `max_wait` steps (`tinio_util::pacing::sleep_checked`) — so a
 /// chunk up to 15 s long is what the bound is there to interrupt, and it does so on an ordinary
 /// graceful stop. A pass abandoned that way which then enqueues into a shut-down pipeline hits
 /// the same `Err(ShutDown)` and its loop logs it ("scanner pass failed"/"sweep pass failed") and

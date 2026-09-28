@@ -31,7 +31,6 @@ pub extern crate tinio_core as _core;
 /// copy per suite, and this is the dev-dependency that makes it a name here
 /// (`error.rs`'s capture sink is the one user — F32's `SharedBuf`, whose three
 /// removed copies this crate held one of).
-#[cfg(test)]
 #[doc(hidden)]
 pub extern crate tinio_util as _util;
 
@@ -63,16 +62,28 @@ pub(crate) mod testing;
 // test proves: `the_launcher_surface_is_re_exported` checks the names it lists,
 // so a name added here still has to be added there by hand — see the comment on
 // that test.
+// **The fork probe's three names, published only where a probe can exist.** The
+// handshake is a unix one — it is built on a `fork`, a pipe and a `waitpid` — so
+// the list above, which every build has to compile, cannot carry them. This is
+// the same rule the facade is edited under: its re-export of these three names
+// is gated the same way, so "exactly this surface, name for name" stays true on
+// each target rather than only on the one this file was edited on.
+#[cfg(unix)]
+pub use self::launcher::{ProbeSteps, await_verdict, report_verdict};
 pub use self::{
-    backend::{Backend, Confinement},
-    error::{Error, Result, fail, launch, refused, step},
+    backend::{Backend, Confinement, PlatformFacts},
+    error::{Error, MACOS_MECHANISM_USAGE, Result, fail, launch, refused, step},
     event::Event,
     launcher::{
         Adopted, CONTROL_FD_PREFIX, Child, ControlHandle, LISTENER_FD_PREFIX, LaunchPayload,
-        LaunchPlan, Observer, SandboxSpec, Terminal, adopt, control_fd_arg, control_fd_from_arg,
-        is_control_fd_arg, is_launcher_fd_arg, is_listener_fd_arg, listener_fd_arg,
-        listener_fd_from_arg, supervise,
+        LaunchPlan, Observer, Readiness, SandboxSpec, Terminal, adopt, control_fd_arg,
+        control_fd_from_arg, filter_argv, is_control_fd_arg, is_launcher_fd_arg,
+        is_listener_fd_arg, listener_fd_arg, listener_fd_from_arg, supervise,
     },
-    sandbox::{Exposure, Sandbox},
+    sandbox::{Exposure, Sandbox, describe_exposures, describe_exposures_iter},
 };
 pub use crate::_core::AccessMode;
+/// Shared secret box — used by [`crate`]'s consumers for token fields; not part of the
+/// confinement vocabulary re-exported by the facade.
+#[doc(hidden)]
+pub use crate::_util::secret::{Secret, SecretKey};

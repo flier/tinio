@@ -29,19 +29,42 @@ pub extern crate tinio_sandbox_macos as _macos;
 #[doc(hidden)]
 pub extern crate tinio_sandbox_windows as _windows;
 
+pub mod serve;
+
 // The platform items each launcher crate answers, bound under one alias per platform so the
 // facade's own bodies call a two-segment path: `clippy::absolute_paths` is `warn` for this
 // crate, and a path written straight from the crate root is three segments or more. The
 // `disarm` pair is not one alias for one body, because their answers differ — see
 // [`disarm_signal_relay`]. The rest are the adopted names' platform halves, which the facade
-// maps into the shared shape — see [`adopted_listener`].
-#[cfg(target_os = "macos")]
-use std::{net::TcpListener, os::unix::net::UnixListener};
+// maps into the shared shape — see [`adopted_listener`]; `macos_apply` is the child-side apply
+// [`apply_self_confinement`] delegates to, under the same rule.
+//
+// `io` is the one standard-library name of the facade's own (the errors it builds from the
+// platforms' refusals), so it is imported on every target rather than with the platform items
+// below.
+#[cfg(unix)]
+use std::os::{fd::BorrowedFd, unix::net::UnixListener};
+use std::{io, net::TcpListener};
 
+#[cfg(target_os = "macos")]
+use crate::_macos::apply::self_confinement as macos_apply;
 #[cfg(target_os = "macos")]
 use crate::_macos::launch::{control as macos_control, listener as macos_listener};
 #[cfg(target_os = "macos")]
 use crate::_macos::relay::on_forwarded_stop as macos_on_stop;
+#[cfg(target_os = "windows")]
+use crate::_windows::launch::{listener as windows_listener, on_stop as windows_on_stop};
+
+/// The socket [`adopted_control`] rebuilds. A unix listener where the platform has one.
+#[cfg(unix)]
+pub type ControlSocket = UnixListener;
+
+/// Success type of [`adopted_control`] where this platform has no unix control socket.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct ControlSocket {
+    _private: (),
+}
 
 /// The child-side **control-channel** rebuild: the unix socket the launcher bound,
 /// under the platform-neutral name the shared child path drives.
@@ -76,9 +99,23 @@ use crate::_macos::relay::on_forwarded_stop as macos_on_stop;
 /// # let _ = socket;
 /// # Ok::<(), Error>(())
 /// ```
-#[cfg(target_os = "macos")]
-pub fn adopted_control(adopted: &Adopted) -> Result<UnixListener> {
-    macos_control(adopted).map_err(step("rebuild the control channel"))
+pub fn adopted_control(adopted: &Adopted) -> Result<ControlSocket> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_control(adopted).map_err(step("rebuild the control channel"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(missing_handoff(
+            STEP_ADOPTED_CONTROL,
+            format!(
+                "this process inherited control descriptor {:?}, but this platform's confinement \
+                 never hands a control socket over: refusing rather than serving on a channel \
+                 this process did not bind",
+                adopted.controls()
+            ),
+        ))
+    }
 }
 /// The child-side listener rebuild, under the platform-neutral name the shared
 /// child path drives.
@@ -130,9 +167,27 @@ pub fn adopted_control(adopted: &Adopted) -> Result<UnixListener> {
 /// # let _ = listener;
 /// # Ok::<(), Error>(())
 /// ```
-#[cfg(target_os = "macos")]
 pub fn adopted_listener(adopted: &Adopted) -> Result<TcpListener> {
-    macos_listener(adopted).map_err(step("rebuild the adopted listener"))
+    #[cfg(target_os = "macos")]
+    {
+        macos_listener(adopted).map_err(step("rebuild the adopted listener"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_listener(adopted)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err(missing_handoff(
+            STEP_ADOPTED_LISTENER,
+            format!(
+                "this process inherited listener descriptor {:?}, but this platform's confinement \
+                 never hands one over: refusing rather than serving on a socket this process did \
+                 not bind",
+                adopted.listener()
+            ),
+        ))
+    }
 }
 /// The child-side stop hook: where a stop the launcher forwards lands, under the
 /// platform-neutral name the shared child path drives (design §3 step 9,
@@ -172,94 +227,177 @@ pub fn adopted_listener(adopted: &Adopted) -> Result<TcpListener> {
 /// })?;
 /// # Ok::<(), Error>(())
 /// ```
-#[cfg(target_os = "macos")]
 pub fn on_stop(hook: impl Fn() + Send + 'static) -> Result<()> {
-    macos_on_stop(hook).map_err(step("install stop-signal handling"))
+    #[cfg(target_os = "macos")]
+    {
+        macos_on_stop(hook).map_err(step("install stop-signal handling"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_on_stop(hook)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = hook;
+        Err(missing_handoff(
+            STEP_ON_STOP,
+            "this platform's confinement never forwards a stop: refusing rather than installing a \
+             hook nothing will call"
+                .to_owned(),
+        ))
+    }
 }
-/// The child-side listener rebuild, under the platform-neutral name the shared
-/// child path drives.
+
+/// The `step` a platform without a child-side handoff reports for it.
 ///
-/// **The name is what the `#[cfg]` is for, and the gate it answers sits one layer
-/// up** (design decision 2, §10): the re-export exists where a launcher does, so a
-/// call site that names it is `#[cfg]`-selected for those platforms already — which
-/// is exactly what the CLI's own wrapper is,
-/// `crates/tinio-cli/src/sandbox/mod.rs`'s `adopted_listener`. **That wrapper is
-/// not gated by the feature**: `sandbox/mod.rs` is compiled into every build
-/// (its own module doc says why — a capability that does not exist cannot refuse),
-/// and its platform arm is `#[cfg(any(target_os = "macos", target_os = "windows"))]`
-/// with a refusal in the other direction, while the shape that decides whether a
-/// wrapper is called at all is the call site's `adopted.is_some()`
-/// (`commands/start/serve.rs`'s listener arm, the other caller). What it does is
-/// delegate here on a launcher platform and refuse on a target whose confinement
-/// never hands one over. Nothing else
-/// from this platform's `launch` module rides along — the launcher's own argv
-/// construction and `disarm` have no shared call site — and the core's names,
-/// `adopt` among them, are already re-exported above rather than here.
+/// **Published because a caller classifies them.** `tinio-cli`'s `sandbox_err` maps exactly
+/// these three onto the operational sentence the [`Error::Step`] source already carries, so a
+/// caller matching the literals would have the CLI's answer change silently under a rename
+/// here. Handing the caller the names makes that a compile error instead.
+pub const STEP_ADOPTED_LISTENER: &str = "adopted-listener";
+/// See [`STEP_ADOPTED_LISTENER`].
+pub const STEP_ADOPTED_CONTROL: &str = "adopted-control";
+/// See [`STEP_ADOPTED_LISTENER`].
+pub const STEP_ON_STOP: &str = "on-stop";
+
+#[cfg(not(target_os = "macos"))]
+fn missing_handoff(step_name: &'static str, detail: String) -> Error {
+    Error::Step {
+        step: step_name,
+        source: io::Error::other(detail),
+    }
+}
+
+/// A confinement a confined child applied to **itself**, as its launcher's frame asked for it.
 ///
-/// **This arm is the identity of the shared shape**, and that is the only
-/// difference between the two: the Windows launcher's descriptor reconstruction
-/// already answers the core's [`Result`], so the facade has nothing to map — where
-/// the macOS arm has to carry its `io::Error` across. [`adopted_listener`] there
-/// states the rule the three adopted names share, and the mapping is why the
-/// facade exists at all: one name, one return type, whichever platform builds it.
+/// **The three facts the child's own `step = "sandbox-init"` event reports** (`tinio-cli`'s
+/// `sandbox::apply_self_confinement` is the caller that emits it): which mechanism the payload
+/// named, how many rules the text it applied grants, and how many parameters it referenced.
 ///
-/// # Examples
-///
-/// ```no_run
-/// use tinio_sandbox::{Adopted, Error, adopted_listener};
-///
-/// # fn main() -> Result<(), Error> {
-/// let adopted = Adopted::new(String::new(), Some(1040), Vec::new(), None, None);
-/// // The child serves on the socket the launcher bound; it never binds one.
-/// let listener = adopted_listener(&adopted)?;
-/// # let _ = listener;
-/// # Ok(())
-/// # }
-/// ```
-#[cfg(target_os = "windows")]
-pub use tinio_sandbox_windows::launch::listener as adopted_listener;
-/// The child-side stop hook: where a stop the launcher forwards lands, under the
-/// platform-neutral name the shared child path drives (design §3 step 9,
-/// decision 20's second half).
-///
-/// **This is the second of the two names the child side needs, and the pair is
-/// the whole of it.** `adopted_listener` above reconstructs the socket the
-/// launcher bound; this is what the child arms so that a forwarded stop gives it
-/// somewhere to drain from rather than the default disposition, which is to die
-/// where it stands. Both are reached by the CLI's confined child through **its own**
-/// wrappers rather than through these re-exports directly:
-/// `crates/tinio-cli/src/sandbox/mod.rs` carries an `on_stop` beside its
-/// `adopted_listener`, `#[cfg]`-selected for the two platforms that forward a stop,
-/// and the call site asks the process's own shape first — `adopted.is_some()`, the
-/// same question that decides whether this child was launched at all.
-///
-/// **One return type with the other two, and here it is the platform's already**
-/// ([`adopted_listener`] states the rule): the Windows hook answers the core's
-/// [`Result`] natively, so this arm is the identity while the macOS arm maps its
-/// `io::Result` — and a caller's `?` is one conversion either way.
-///
-/// **`disarm` deliberately does not ride along.** It is for a process that
-/// outlives one launch — the test harness, a CLI that serves twice — and no
-/// shared call site reaches it, which is the line the shared surface draws
-/// between the two names: `tinio_sandbox::windows::control::disarm` is where a
-/// caller that has already written a Windows-only branch finds it.
+/// **The platform's own value, projected onto the one shape a caller can name on every target.**
+/// macOS's `tinio_sandbox_macos::apply::Applied` carries that crate's `Mechanism` enum, which
+/// exists on that target alone; the mechanism travels here as its wire spelling — the string the
+/// launch payload and `Mechanism::as_str` already share — so a caller reads the same three
+/// fields whichever platform built the value, and a target whose mechanism applies no
+/// confinement of its own never builds one at all.
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use tinio_sandbox::on_stop;
-///
-/// # fn main() -> Result<(), tinio_sandbox::Error> {
-/// // The hook runs on a thread of its own, so what it does may allocate and
-/// // take locks: starting the runtime's shutdown here is what it is for.
-/// on_stop(|| {
-///     let _ = ();
-/// })?;
-/// # Ok(())
-/// # }
 /// ```
-#[cfg(target_os = "windows")]
-pub use tinio_sandbox_windows::launch::on_stop;
+/// use tinio_sandbox::Applied;
+///
+/// // What a child confined by the in-process mechanism reports: the mechanism its launcher
+/// // resolved, and the shape of the text it applied.
+/// let applied = Applied {
+///     mechanism: "sandbox-init",
+///     rules: 4,
+///     params: 1,
+/// };
+/// assert_eq!(applied.mechanism, "sandbox-init");
+/// assert_eq!(applied.rules, 4);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// The mechanism the frame named, as the wire spelling both processes share.
+    pub mechanism: &'static str,
+    /// How many rules the applied text grants.
+    pub rules: usize,
+    /// How many `(param "…")` values the profile referenced.
+    pub params: usize,
+}
+
+/// The step name this apply's failures carry — the mechanism's own wire spelling, and the
+/// `step` the child's own event is keyed by (shared §7's "the log's `step` and the error's are
+/// the same string").
+const SELF_CONFINEMENT_STEP: &str = "sandbox-init";
+
+/// Apply the confinement a launch payload carries to **this** process — the child side of the
+/// in-process mechanism, under one platform-neutral name.
+///
+/// **The rule is the contract's rather than one backend's, and that is what this name is for.**
+/// Which mechanisms a process may apply to itself is the platform's
+/// (`tinio_sandbox_macos::apply`, whose own doc owns that vocabulary); what a frame means on a
+/// platform whose confinement is applied **at process creation or in place** is the contract's,
+/// because a frame that asked for a confinement must never be served without one (design §11).
+/// The disagreement stops here, the way it does in [`disarm_signal_relay`]: macOS applies the
+/// payload's spec and answers what it applied, every other target answers the refusal below when
+/// the frame carries a spec, and a target that grows an in-process mechanism adds an arm here
+/// rather than a call site of its own.
+///
+/// **`Ok(None)` is every process that is not the child of one of these mechanisms** — a
+/// launcher, a `status` client, an unconfined run, the child of the mechanism that confines by
+/// wrapping its `exec` (whose confinement was applied to it at that exec) — **and a frame that
+/// carries no confinement at all**, on every target.
+///
+/// **It fails closed, and that is the whole contract.** The apply is one-shot and irreversible,
+/// so a process that continued past a refusal would be a server with **no** confinement under a
+/// launcher that reported one. The environment is never re-read: the launcher already resolved
+/// the mechanism, and a second reader would be a second answer.
+///
+/// # Errors
+///
+/// The platform's own refusal, carried as the diagnostic it is — libSystem's for a profile the
+/// kernel would not compile, and the frame's own for a mechanism this build does not know or one
+/// that cannot have written a spec — and, on a target whose confinement is applied when the
+/// process is created or in place, **any** frame that carries a spec.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox::{Adopted, apply_self_confinement};
+///
+/// // A launch that handed this process no confinement: nothing to apply, on every platform.
+/// let adopted = Adopted::new(String::new(), Some(7), Vec::new(), None, None);
+/// assert_eq!(
+///     apply_self_confinement(&adopted).expect("no confinement"),
+///     None
+/// );
+/// ```
+pub fn apply_self_confinement(adopted: &Adopted) -> Result<Option<Applied>> {
+    // **Two arms, and the `#[cfg]` is the platform fact** — the shape [`disarm_signal_relay`]
+    // uses for its own disagreement. macOS is the one target whose confinement a child applies
+    // to a *running* process, so it is the one arm that reads the payload's spec; the other arm
+    // is the contract's answer for every target that cannot, and it is compiled on the three
+    // targets this build serves as well as on a target with no backend at all.
+    #[cfg(target_os = "macos")]
+    {
+        macos_apply(adopted)
+            .map(|applied| {
+                applied.map(|applied| Applied {
+                    // The platform's enum as the wire spelling, which is the name the launch
+                    // payload carried and the one an operator reads in the event.
+                    mechanism: applied.mechanism.as_str(),
+                    rules: applied.rules,
+                    params: applied.params,
+                })
+            })
+            .map_err(|refused| fail(SELF_CONFINEMENT_STEP, io::Error::other(refused)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Some(spec) = adopted.confinement() else {
+            // The ordinary case of every platform: a launch whose confinement was already
+            // applied, or none at all. Nothing is read and nothing happens.
+            return Ok(None);
+        };
+        // **A spec here is a frame this process cannot honour, and serving it would be the
+        // failure the contract exists to prevent.** Windows' container and Linux's in-place
+        // jail are both established around a process this one is not, so there is no mechanism
+        // here to apply the spec with; the refusal names the mechanism the frame asked for,
+        // because a frame carrying one is either a launcher this build does not agree with or
+        // an argv someone assembled by hand.
+        Err(fail(
+            SELF_CONFINEMENT_STEP,
+            io::Error::other(format!(
+                "the launch payload asks this process to apply the confinement `{}` to itself, \
+                 but this platform's confinement is applied when the process is created or in \
+                 place — never by the process it confines: nothing was applied, so the run is \
+                 refused rather than served without the confinement the frame asked for",
+                spec.mechanism
+            )),
+        ))
+    }
+}
 
 #[cfg(target_os = "macos")]
 use crate::_macos::relay::disarm as macos_relay_disarm;
@@ -309,6 +447,217 @@ pub fn disarm_signal_relay() {
     let _ = windows_relay_disarm();
 }
 
+/// What a target's confinement does, so a caller branches on the fact and not on the OS.
+///
+/// **The type is the core's** ([`tinio_sandbox_core::PlatformFacts`]) and each backend answers
+/// for itself, beside its own mechanism: `tinio_sandbox_macos::FACTS`,
+/// `tinio_sandbox_windows::FACTS`, `tinio_sandbox_linux::FACTS`.
+pub use crate::_core::PlatformFacts;
+
+/// This target's [`PlatformFacts`] — **the one OS split a caller writes**.
+///
+/// The value is the target backend's own constant, so every field is a sentence the crate that
+/// owns the mechanism wrote. Which constant is the only `cfg` here.
+///
+/// # Examples
+///
+/// ```
+/// let facts = tinio_sandbox::platform_facts();
+/// assert_eq!(
+///     facts.launches_child,
+///     cfg!(any(target_os = "macos", target_os = "windows"))
+/// );
+/// ```
+///
+/// ```
+/// let facts = tinio_sandbox::platform_facts();
+/// assert_eq!(facts.refuses_derived_state_dir, cfg!(target_os = "macos"));
+/// assert_eq!(facts.control_socket, cfg!(target_os = "macos"));
+/// ```
+pub const fn platform_facts() -> PlatformFacts {
+    #[cfg(target_os = "linux")]
+    let facts = _linux::FACTS;
+    #[cfg(target_os = "macos")]
+    let facts = _macos::FACTS;
+    #[cfg(target_os = "windows")]
+    let facts = _windows::FACTS;
+    // No backend is wired for this target, which is the same answer an in-place backend gives:
+    // nothing is launched, so the three facts a launch owns are unstated rather than false.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let facts = PlatformFacts::NONE;
+    facts
+}
+
+/// The control descriptors a launcher hands to the plan — **on unix, the borrowed
+/// descriptors themselves**, so the type system carries the one fact the handoff is
+/// made of.
+///
+/// **A descriptor reaches this call as an object, because only an object proves it is
+/// open in this process.** [`ControlHandle::duplicate`] — the core's safe constructor,
+/// which duplicates with `F_DUPFD_CLOEXEC` — is what turns each borrow into the plan's
+/// own handle, so the launcher's own socket keeps every flag it had and the descriptor
+/// the child rebuilds is one the launcher really holds. **The shape used to be one
+/// `&[i64]` for every platform, and the change is the point rather than a tidy-up**: a
+/// number carries no evidence of anything, so the macOS crate had to rebuild a
+/// descriptor from a caller-supplied integer before it could duplicate one
+/// (`launch::duplicate_control`, deleted 2026-09-27) — an `unsafe` site where design
+/// decision 14 enumerates three for that crate, and one whose failure mode was a
+/// duplicate of an unrelated open descriptor that the child would adopt as its control
+/// channel. The integer exists only where the platform's own handoff form is an
+/// integer, which is the Windows half below.
+///
+/// **The borrow ends with the call, and nothing in the answer points back at the
+/// caller.** Every handle returned here owns its duplicate, so the caller must keep
+/// the borrowed descriptors alive for the call itself — which the signature enforces,
+/// since the slice's lifetime is anonymous and unconstrained — and the plan built from
+/// the answer may outlive the object the descriptors were borrowed from. That is the
+/// CLI's shape (`crates/tinio-cli/src/sandbox/confine.rs`): the channel borrows the
+/// socket it bound, one duplicate goes on the spec, and the channel itself lives for
+/// as long as the launch needs it.
+///
+/// **macOS is the one unix platform that hands a control channel over**, because it is
+/// the one whose confined child cannot bind a socket itself: its profile grants no
+/// `network-bind` at all. Every other unix target answers [`Error::Unsupported`] — a
+/// target whose confinement is applied in place starts no child, so there is no channel
+/// to hand over — which is the same fact [`platform_facts`] states from the other side.
+///
+/// # Errors
+///
+/// A descriptor that cannot be duplicated (a closed socket, or a full descriptor table),
+/// and [`Error::Unsupported`] on a platform whose confinement never hands a control
+/// channel to a child.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::{fs::File, os::fd::AsFd as _};
+///
+/// use tinio_sandbox::control_handles;
+///
+/// // The launcher's channel, borrowed from the object that owns it: the duplicate the
+/// // plan takes is made inside the call, so the socket may be closed after it returns.
+/// let channel = File::open("/dev/null")?;
+/// let handles = control_handles(&[channel.as_fd()])?;
+/// # let _ = handles;
+/// # Ok::<(), tinio_sandbox::Error>(())
+/// ```
+#[cfg(unix)]
+pub fn control_handles(controls: &[BorrowedFd<'_>]) -> Result<Vec<ControlHandle>> {
+    #[cfg(target_os = "macos")]
+    {
+        controls
+            .iter()
+            .map(|control| {
+                ControlHandle::duplicate(control).map_err(step("duplicate the control channel"))
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = controls;
+        Err(Error::Unsupported {
+            detail: "this platform does not hand a control channel to a child",
+        })
+    }
+}
+
+/// The control handle values a launcher hands to the plan — **the handoff's Windows
+/// form, where a value is what the platform passes and the channel stays the owner**.
+///
+/// **Nothing is duplicated here, and that is the platform's own rule**: a Windows handle
+/// is made inheritable by value (`SetHandleInformation`, taken immediately before
+/// `CreateProcessW`), so the plan carries the values the launcher's channel already
+/// holds — `tinio-api`'s `Channel::handoff_values` — and the channel remains their one
+/// owner, because a duplicate would be a second owner of a pipe the child still serves
+/// on. [`ControlHandle::inherited`] copies the value for the plan and takes no ownership,
+/// which is why this arm cannot fail; the core's own doc states the same argument for why
+/// its Windows form is a value where the unix one is an owned object.
+///
+/// **The values are unchecked, and the one call site is what makes that affordable.**
+/// What reaches this arm is what a launcher read off its own channel in the same process
+/// (`crates/tinio-cli/src/sandbox/confine.rs`), and what acts on the copied value is that
+/// same launcher's process creation — so no public step turns an arbitrary integer into a
+/// live handle. The unix arm above is where the type system can carry that fact, and it
+/// now does: there, an integer would have to be rebuilt into a descriptor before it could
+/// be duplicated, which is why the two platforms no longer share one signature.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] on a platform whose confinement never hands a control channel
+/// to a child.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox::control_handles;
+///
+/// // The handle values the launcher's channel keeps owning, copied for the plan.
+/// let handles = control_handles(&[1040])?;
+/// assert_eq!(handles[0].value(), 1040);
+/// # Ok::<(), tinio_sandbox::Error>(())
+/// ```
+#[cfg(not(unix))]
+pub fn control_handles(handles: &[i64]) -> Result<Vec<ControlHandle>> {
+    #[cfg(target_os = "windows")]
+    {
+        Ok(handles
+            .iter()
+            .copied()
+            .map(ControlHandle::inherited)
+            .collect())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = handles;
+        Err(Error::Unsupported {
+            detail: "this platform does not hand a control channel to a child",
+        })
+    }
+}
+
+/// Whether this build's platform has a confinement backend at all — the one answer a caller
+/// asks **before** it chooses a backend.
+///
+/// **The target list lives here because the selection lives here.** `platform()` is defined per
+/// target, one `#[cfg]`-gated arm per platform crate, and this answer names the same targets
+/// those arms are written for — so a new backend's target is added to the two in the same edit
+/// and to no other crate. A caller with a list of its own would be a second table, in a crate
+/// that owns neither the arms nor the selection, and the two would have to be kept in step by
+/// hand (`tinio-cli`'s `sandbox::BACKEND_IS_STUB` was that table, and is gone for that reason).
+///
+/// **It cannot be a method on [`Backend`]**, and the next reader should not have to work out
+/// why: a caller needs this answer *before* an arm chooses a backend — to refuse a request
+/// rather than reach an arm — and on a target with no backend there is no `Backend`
+/// implementation for a method to be called on at all. The trait answers "confine this"; this
+/// answers "is there anything here to confine with".
+///
+/// **`false` is a target this build refuses confinement on, never a silent no-op**: the caller
+/// that gets it must refuse the request rather than proceed unconfined (design §11). The three
+/// targets whose backends have landed — Linux, macOS and Windows — all answer `true`.
+///
+/// # Examples
+///
+/// ```rust
+/// // The answer is this host's, so the assertion is written as the platform fact it is: the
+/// // three targets whose backend has landed answer `true`, and any other target answers `false`
+/// // rather than failing to name a value at all.
+/// # #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// assert!(tinio_sandbox::backend_available());
+/// # #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+/// assert!(!tinio_sandbox::backend_available());
+/// ```
+pub const fn backend_available() -> bool {
+    // The list is `platform()`'s arms' own gate, one screen below: the three `#[cfg]`-selected
+    // re-exports, each of which resolves to a real backend. An unsupported target has neither an
+    // arm nor an implementation, which is the `false` above — a value rather than a failure to
+    // compile.
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
+}
+
 // **Exactly the core's public surface, name for name, and that equality is the
 // rule rather than an accident.** The consumers are `crates/tinio-cli` (the
 // serving process, which reaches this crate through the `sandbox` feature its
@@ -326,11 +675,18 @@ pub fn disarm_signal_relay() {
 // the comment on that test.
 pub use crate::_core::{
     AccessMode, Adopted, Backend, CONTROL_FD_PREFIX, Child, Confinement, ControlHandle, Error,
-    Event, Exposure, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, Observer, Result, Sandbox,
-    SandboxSpec, Terminal, adopt, control_fd_arg, control_fd_from_arg, fail, is_control_fd_arg,
+    Event, Exposure, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, MACOS_MECHANISM_USAGE,
+    Observer, Readiness, Result, Sandbox, SandboxSpec, Terminal, adopt, control_fd_arg,
+    control_fd_from_arg, describe_exposures, fail, filter_argv, is_control_fd_arg,
     is_launcher_fd_arg, is_listener_fd_arg, launch, listener_fd_arg, listener_fd_from_arg, refused,
     step, supervise,
 };
+// **The fork probe's names, published only where a probe can exist** — a `#[cfg]` the core's own
+// list carries for the same reason, and one this list has to repeat because the equality between
+// them is the rule: a probe is built on a fork, a pipe and a `waitpid`, so neither list can name
+// it on a target that has none of the three.
+#[cfg(unix)]
+pub use crate::_core::{ProbeSteps, await_verdict, report_verdict};
 /// The Linux backend's own crate, for the settings the shared surface does not
 /// carry — its `Options` (the model and the `tmpdir` knob) and its `Seccomp`
 /// answer.

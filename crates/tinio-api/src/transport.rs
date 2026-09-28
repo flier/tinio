@@ -556,6 +556,57 @@ pub enum LocalForm {
     Pipe(String),
 }
 
+/// Bind the local control channel `form` names.
+///
+/// The unix and pipe binds stay in this crate. A caller does not match the
+/// variant to pick a platform function.
+///
+/// # Errors
+///
+/// The bind failed, or `form` is the other platform's variant.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::PathBuf;
+///
+/// use tinio_api::transport::{LocalForm, bind_local};
+///
+/// let channel = bind_local(&LocalForm::Unix(PathBuf::from("/run/tinio/tinio.sock")))?;
+/// assert!(!channel.identity().is_empty());
+/// # Ok::<(), tinio_api::Error>(())
+/// ```
+pub fn bind_local(form: &LocalForm) -> Result<Channel, Error> {
+    match form {
+        LocalForm::Unix(path) => {
+            #[cfg(unix)]
+            {
+                bind::bind_unix(path)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Err(Error::Transport(
+                    "a unix control channel cannot be bound on this platform".into(),
+                ))
+            }
+        }
+        LocalForm::Pipe(name) => {
+            #[cfg(windows)]
+            {
+                bind::bind_pipe(name)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = name;
+                Err(Error::Transport(
+                    "a named-pipe control channel cannot be bound on this platform".into(),
+                ))
+            }
+        }
+    }
+}
+
 /// The HTTPS settings, present only when the transport is HTTPS.
 ///
 /// # Examples
@@ -1582,6 +1633,102 @@ impl Plane {
         Self::assemble(options, transport)
     }
 
+    /// Bind a new control channel, or adopt the one a launcher already handed this process.
+    ///
+    /// An empty `controls` list is every run that owns the single-instance claim itself: unconfined,
+    /// in-place, or a selection this process binds. A non-empty list is the inherited pool.
+    /// Windows adopts those values as pipe handles. macOS adopts `socket`, the listener the sandbox
+    /// rebuilt from the inherited descriptor — this crate does not turn a descriptor number back
+    /// into a socket. Any other target refuses a non-empty list: an in-place process was not handed
+    /// a channel.
+    ///
+    /// **`socket` is a parameter on macOS alone, and it is `#[cfg]`'d rather than passed by every
+    /// caller.** It used to be an `Option<InheritedSocket>` everywhere — a placeholder struct with
+    /// an `absent()` constructor on the targets that inherit no unix control socket — which made
+    /// four places agree about a value two of the three platforms never read: the two type
+    /// definitions, the caller's conversion into them, and the `let _ = socket;` this body used to
+    /// write. The axis is the sandbox facade's own (`tinio_sandbox::platform_facts` reports a
+    /// control socket on macOS alone, and `tinio_sandbox::adopted_control` succeeds for that target
+    /// only), so the parameter carries the same `#[cfg]`. Windows never names it — its control
+    /// channel is a named pipe whose handles travel as `controls` values — and neither does Linux,
+    /// whose confinement is in place and whose serving process is the one that bound. **The
+    /// signature therefore differs by target**, which is the honest spelling of a handoff only one
+    /// mechanism performs.
+    ///
+    /// # Errors
+    ///
+    /// The bind's errors, the adopt's errors, a macOS handoff with no socket, or a non-empty list
+    /// on a target that does not launch a child.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::path::PathBuf;
+    ///
+    /// use tinio_api::{Options, Plane, transport::Selection};
+    /// use tokio::sync::watch;
+    ///
+    /// # fn main() -> Result<(), tinio_api::Error> {
+    /// let (stop, _rx) = watch::channel(false);
+    /// let options = Options {
+    ///     selection: Selection {
+    ///         http: Some("127.0.0.1:9001".parse().expect("addr")),
+    ///         ..Selection::default()
+    ///     },
+    ///     state_dir: PathBuf::from("/run/tinio"),
+    ///     root: PathBuf::from("/srv/data"),
+    ///     host: "127.0.0.1".to_string(),
+    ///     stop,
+    ///     gauges: None,
+    ///     token: None,
+    /// };
+    /// // An empty list binds on every target, which is the arm this example can spell once — and
+    /// // the argument macOS alone carries is spelled on the arm that has it.
+    /// # #[cfg(target_os = "macos")]
+    /// let plane = Plane::open(options, &[], None)?;
+    /// # #[cfg(not(target_os = "macos"))]
+    /// let plane = Plane::open(options, &[])?;
+    /// let _ = plane;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open(
+        options: Options,
+        controls: &[i64],
+        #[cfg(target_os = "macos")] socket: Option<UnixListener>,
+    ) -> Result<Self, Error> {
+        if controls.is_empty() {
+            return Self::bind(options);
+        }
+        #[cfg(windows)]
+        {
+            let raws: Vec<RawHandle> = controls
+                .iter()
+                .copied()
+                .map(|raw| raw as usize as RawHandle)
+                .collect();
+            Self::adopt(options, &raws)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(socket) = socket else {
+                return Err(Error::Transport(
+                    "a confined child must be handed a unix control channel: the inherited \
+                     descriptors name one, and this process was not given the socket"
+                        .to_string(),
+                ));
+            };
+            Self::adopt(options, socket)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            Err(Error::Transport(
+                "this platform confines in place and does not adopt an inherited control channel"
+                    .to_string(),
+            ))
+        }
+    }
+
     /// Applies the three-choose-one rule and binds the winner — which **is** the
     /// single-instance lock (decision 12) — then builds the router around it.
     ///
@@ -1922,6 +2069,7 @@ mod tests {
     use http::Method;
     #[cfg(windows)]
     use hyper::{Request, client::conn::http1};
+    use secrecy::ExposeSecret;
     use tempfile::TempDir;
     use tokio::sync::watch;
     #[cfg(unix)]
@@ -1997,7 +2145,7 @@ mod tests {
         let path = sock(&dir);
         let channel = bind_unix(&path).expect("bind");
         let (shared, stop) = shared();
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving = tokio::spawn(serve_local(channel, shared, stop));
         let status = client::get_local(&path, get("/status", Some(&token)))
@@ -2117,11 +2265,19 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let token = "ab".repeat(32);
         let adopted = state_for(Some(token.clone()), "127.0.0.1:9001", dir.path()).expect("state");
-        assert_eq!(adopted.token, token, "the caller's token, verbatim");
+        assert_eq!(
+            adopted.token.expose_secret().as_str(),
+            token.as_str(),
+            "the caller's token, verbatim"
+        );
 
         let own = state_for(None, "127.0.0.1:9001", dir.path()).expect("state");
-        assert_eq!(own.token.len(), 64, "a fresh token, as `State::new` writes");
-        assert_ne!(own.token, token);
+        assert_eq!(
+            own.token.expose_secret().len(),
+            64,
+            "a fresh token, as `State::new` writes"
+        );
+        assert_ne!(own.token.expose_secret().as_str(), token.as_str());
     }
 
     /// The gate is released before the deletions: `serve` returns the moment the shared channel
@@ -2200,7 +2356,7 @@ mod tests {
             State::new(addr.to_string(), Some(addr.port()), Path::new("/srv/data")).expect("state");
         let (tx, stop) = watch::channel(false);
         let (shared, _) = gauged(Context::new(state, "127.0.0.1", Auth::for_bind(addr), tx));
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving = tokio::spawn(serve_tcp(listener, shared, stop));
         // A loopback bind has the local channel's trust level, so `/metrics` is open there:
@@ -2242,7 +2398,7 @@ mod tests {
         .expect("state");
         let (tx, stop) = watch::channel(false);
         let (shared, _) = gauged(Context::new(state, "0.0.0.0", Auth::for_bind(bound), tx));
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving = tokio::spawn(serve_tcp(listener, shared, stop));
         // Every registered endpoint, `/metrics` included: a wildcard bind is the strict one, so
@@ -2294,7 +2450,7 @@ mod tests {
             State::new(addr.to_string(), Some(addr.port()), Path::new("/srv/data")).expect("state");
         let (tx, stop) = watch::channel(false);
         let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::for_bind(addr), tx));
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
 
         // The pair is moved into the spawned future rather than borrowed from the test body:
         // `tokio::spawn` wants `'static`, and a `&cert`/`&key` here would outlive nothing.
@@ -2334,7 +2490,7 @@ mod tests {
             State::new(addr.to_string(), Some(addr.port()), Path::new("/srv/data")).expect("state");
         let (tx, stop) = watch::channel(false);
         let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::for_bind(addr), tx));
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving =
             tokio::spawn(async move { serve_https(listener, &cert, &key, shared, stop).await });
@@ -2380,7 +2536,7 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let state = State::new(name.clone(), Some(9000), Path::new("/srv/data")).expect("state");
         let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::Local, tx.clone()));
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving = tokio::spawn(serve_local(channel, shared, rx));
         let mut retried = 0usize;
@@ -2462,7 +2618,7 @@ mod tests {
             .expect("bind"),
         );
         plane.publish(9000).expect("publish");
-        let token = plane.shared.state.token.clone();
+        let token = plane.shared.state.token.expose_secret().as_str().to_owned();
         let serving = tokio::spawn({
             let plane = Arc::clone(&plane);
             async move { plane.serve(rx).await }

@@ -4,7 +4,7 @@
 
 - Async: `#[tokio::test]` / `async fn` — no `Runtime::block_on` / `rt(...)`.
 - Sync: `#[test]`. Exempt: runtime-shape tests.
-- Conformance: `tinio-util` `testing` in `[dev-dependencies]`. Cucumber: no repeat asserts.
+- Conformance: `tinio-util` `testing` in `[dev-dependencies]`; a crate's own harness module is a **non-default feature** its dev edges turn on (`tinio-sandbox-windows`'s `testing`, whose `default` is empty), because the module has to be lib code to cross the `tests/` boundary at all. Cucumber: no repeat asserts.
 
 ## Scripts
 
@@ -64,7 +64,7 @@ Supervisor + elevation — no auto leg. Pure halves: `tinio-cli/tests/service.rs
 
 - Gate script: `crates/tinio-sandbox-macos/scripts/macos-sandbox-verify.sh` (real Mac). CI records refusals; script asserts against `EXPECTED`.
 - Crate is macos-only `cfg` — off-Mac certifies nothing; exemption home = script header. Fail-closed without `sandbox-exec`.
-- **Two mechanisms, so the gate has two modes**: `TINIO_SANDBOX_MACOS_MECHANISM` (`sandbox-exec` default, `sandbox-init` alternative, any other value a usage error) is read by `crates/tinio-cli/src/sandbox/macos.rs`'s `launcher_backend` and by the crate's own harness, so `cargo test -p tinio-sandbox-macos` and `cargo test -p tinio-server --test sandbox_macos_e2e` each run green under **both** values — the e2e asserts the mechanism's own check off the value it was started with (`preflight` vs `sandbox-init validator`). The in-process mode never invokes `sandbox-exec`; its fail-closed surface is the validator's fork and the child's own apply.
+- **Two mechanisms, so the gate has two modes**: `TINIO_SANDBOX_MACOS_MECHANISM` (`sandbox-exec` default, `sandbox-init` alternative, any other value a usage error) is read by `crates/tinio-sandbox-macos/src/mechanism.rs` (`Options::from_env`, reached through the facade's `serve::Spec` since 2026-09-27; the CLI names no platform backend) and by the crate's own harness, so `cargo test -p tinio-sandbox-macos` and `cargo test -p tinio-server --test sandbox_macos_e2e` each run green under **both** values — the e2e asserts the mechanism's own check off the value it was started with (`preflight` vs `sandbox-init validator`). The in-process mode never invokes `sandbox-exec`; its fail-closed surface is the validator's fork and the child's own apply.
 - Readiness = SSE `listening` event (decision 19), not scraped line. Nested Seatbelt → fail as environment limit, not product defect.
 - Short roots: `sun_path` 104 bytes — deep `$TMPDIR` is harness, not sandbox ([Guest runs](#guest-runs-wsl2-and-macos-vms) trap 3).
 - Crate suites: `startup`, `exposures`, `network`, `relay`, `injection`, `handover` — the last reads a spawned child's fd table via `/usr/sbin/lsof`: control handle crosses `execve` once, launcher's own socket does not.

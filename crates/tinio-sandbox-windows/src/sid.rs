@@ -8,15 +8,15 @@
 #![allow(unsafe_code)]
 
 use std::{
-    borrow::Cow,
-    ffi::OsString,
     io,
-    os::windows::ffi::{OsStrExt, OsStringExt},
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr,
 };
 
 use sha2::{Digest, Sha256};
+use tinio_util::path::plain_spelling;
+use tinio_winsec::to_wide;
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0},
     Security::{
@@ -36,6 +36,7 @@ use windows_sys::Win32::{
 
 use crate::{
     _core::{Result, launch},
+    backend::Capability,
     handles::last_error,
 };
 
@@ -64,9 +65,9 @@ const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
 /// **The program directory is granted this SID, once per machine, and that is a
 /// cost decision whose security price is stated rather than hidden.** Every other
 /// grant this crate makes is for the package SID of one *root* ([`package_name`]),
-/// so a new root is a new SID: `icacls /grant:r` on the program directory would
-/// then rewrite that directory's security descriptor on every launch — and
-/// `SetNamedSecurityInfoW` propagates eagerly over the whole subtree, measured at
+/// so a new root is a new SID: rewriting the program directory's ACE per root
+/// would rewrite that directory's security descriptor on every launch — and a
+/// descriptor write propagates eagerly over the whole subtree, measured at
 /// ≈0.04 ms per object for this shape on ReFS and 10–20 s for this workspace's
 /// `target\debug` (71 757 objects, `docs/tests.md`'s Windows section). The program
 /// directory does not depend on the root, so authorizing it once for a SID every
@@ -94,10 +95,12 @@ pub const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
 ///
 /// **The normalisation is what makes the takeover work**, and it is lexical
 /// rather than a filesystem call. A `\\?\` or `\\?\UNC\` prefix is stripped
-/// first — `Path::components` keeps it, so `\\?\E:\data` would otherwise hash
-/// apart from `E:\data`. `Path::components` then drops a trailing separator,
-/// drops `.` components and collapses repeated separators, so `E:\data`,
-/// `E:\data\`, `E:\data\.` and `\\?\E:\data` are one name. Case is folded
+/// first — [`plain_spelling`], whose own doc carries the unit-level rule that
+/// strip is written under — because `Path::components` keeps the prefix, so
+/// `\\?\E:\data` would otherwise hash apart from `E:\data`. `Path::components`
+/// then drops a trailing separator, drops `.` components and collapses repeated
+/// separators, so `E:\data`, `E:\data\`, `E:\data\.` and `\\?\E:\data` are one
+/// name. Case is folded
 /// for the same reason (`E:\Data` is that directory on Windows) and separators
 /// are normalised because `/` and `\` are interchangeable to the filesystem and
 /// to nothing else. `..` is deliberately left alone: resolving it lexically
@@ -141,7 +144,7 @@ pub fn package_name(root: &Path) -> String {
     // UTF-16 units under it. `components` does the lexical work the doc above
     // describes — it drops `.` components and a trailing separator, collapses
     // repeated separators, and the `PathBuf` re-joins with this volume's own.
-    let normalised = plain_root(root).components().collect::<PathBuf>();
+    let normalised = plain_spelling(root).components().collect::<PathBuf>();
     let folded = normalised
         .to_string_lossy()
         .replace('/', r"\")
@@ -184,35 +187,6 @@ fn fold_unit(unit: u16) -> u16 {
         }
         _ => unit,
     }
-}
-
-/// The plain spelling of `root`.
-///
-/// `\\?\E:\data` and `\\?\UNC\server\share\data` become `E:\data` and
-/// `\\server\share\data`. A path with no verbatim prefix is returned unchanged.
-///
-/// **The strip runs on the UTF-16 units and never on a `&str`.** A Windows path is
-/// arbitrary UTF-16, so the root behind a verbatim prefix need not be text at all:
-/// a `to_str` that fails there is not a reason to skip the strip, and skipping it
-/// would be one more way for `\\?\E:\data` and `E:\data` — one directory — to
-/// derive two names and so two profiles (decision 21). Both prefixes are ASCII,
-/// which is what makes the comparison meaningful on a unit stream.
-fn plain_root(root: &Path) -> Cow<'_, Path> {
-    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
-    let units: Vec<u16> = root.as_os_str().encode_wide().collect();
-    let Some(rest) = units.strip_prefix(verbatim.as_slice()) else {
-        return Cow::Borrowed(root);
-    };
-    let unc: Vec<u16> = r"UNC\".encode_utf16().collect();
-    let stripped = match rest.strip_prefix(unc.as_slice()) {
-        Some(share) => {
-            let mut joined: Vec<u16> = r"\\".encode_utf16().collect();
-            joined.extend_from_slice(share);
-            joined
-        }
-        None => rest.to_vec(),
-    };
-    Cow::Owned(PathBuf::from(OsString::from_wide(&stripped)))
 }
 
 /// The lock one root's launch window and one root's profile deletion exclude each
@@ -288,7 +262,7 @@ impl ProfileLock {
         // the behaviour every launcher had before this lock existed — stated in
         // a warning rather than papered over with a second scope that would
         // exclude only part of the window's peers.
-        let wide = crate::wide(&format!(r"Global\tinio.profile.{package}"));
+        let wide = to_wide(format!(r"Global\tinio.profile.{package}"));
         // SAFETY: `wide` is NUL-terminated and alive for the call, a null
         // security descriptor gives the object this process's default DACL, and
         // `binitialowner = 0` leaves the ownership to the wait below — so the
@@ -435,7 +409,7 @@ impl PackageSid {
     /// assert!(sid.as_str().starts_with("S-1-15-2-"));
     /// ```
     pub fn derive(name: &str) -> Result<Self> {
-        let wide = crate::wide(name);
+        let wide = to_wide(name);
         let mut raw: PSID = ptr::null_mut();
         // SAFETY: `wide` is a NUL-terminated UTF-16 buffer alive for the call and
         // `raw` is a valid out-parameter; the display name and the description
@@ -532,9 +506,10 @@ impl PackageSid {
         })
     }
 
-    /// The `S-1-15-2-…` form: what `icacls` is given, what a log line prints,
-    /// and what a test compares against. One accessor, not two — an earlier
-    /// draft carried `sid_text` as a second name for exactly this string.
+    /// The `S-1-15-2-…` form: what a log line prints, what `icacls` is given
+    /// where a test or an operator runs it, and what a test compares against. One
+    /// accessor, not two — an earlier draft carried `sid_text` as a second name for
+    /// exactly this string.
     ///
     /// # Examples
     ///
@@ -576,7 +551,7 @@ impl Drop for PackageSid {
         // A running child is unharmed either way, which is why the lock is taken
         // around the delete rather than held for the child's life.
         let _lock = ProfileLock::acquire(&self.name);
-        let wide = crate::wide(&self.name);
+        let wide = to_wide(&self.name);
         // SAFETY: `wide` is NUL-terminated and alive for the call, and the name
         // is the one this value created the profile under.
         let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
@@ -648,46 +623,75 @@ impl Drop for PackageSid {
 /// assert!(caps.is_empty());
 /// ```
 pub struct CapabilitySids {
+    /// **The one owner of every SID this value resolved.** The entries carry each
+    /// SID as the kernel takes it, and `Drop` releases the same pointer rather
+    /// than a second vector kept index-aligned with this one.
     entries: Vec<SID_AND_ATTRIBUTES>,
-    owned: Vec<PSID>,
 }
 
 impl CapabilitySids {
-    /// Resolve capability SID strings (`S-1-15-3-3`, …) into entries.
+    /// Resolve the capabilities a container may hold into entries.
+    ///
+    /// **The argument is [`Capability`], and that is a security boundary rather
+    /// than a convenience for the caller.** Every entry below is stamped
+    /// [`SE_GROUP_ENABLED`], and an enabled group SID is what the kernel honours
+    /// — so every SID this function resolves is a group the container really
+    /// holds. While the argument was `&[&str]` any text reached it, and a caller
+    /// inside this workspace passing `S-1-5-32-544` (`BUILTIN\Administrators`)
+    /// would have handed the container that group. The three-variant enum makes
+    /// every SID outside the AppContainer capability range unspellable, because
+    /// [`Capability::sid`] is the only producer of the text below.
+    ///
+    /// **There is no string-taking form beside this one, private or `pub(crate)`**,
+    /// because nothing needs one: the enum is the crate's only source of
+    /// capability SIDs, and the reverse direction does not exist either — a
+    /// capability arrives as the name an operator wrote
+    /// ([`Capability::from_name`]), never as a SID to parse back
+    /// (`backend`'s `capability_names_round_trip_through_from_name` states why).
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) for a string that is
-    /// not a SID.
+    /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when
+    /// `ConvertStringSidToSidW` refuses to resolve a SID. **The refusal the
+    /// string-taking signature used to document — "not a SID" — is unreachable
+    /// through this one**: the three inputs are compile-time constants of the
+    /// `S-1-15-3-N` form the conversion accepts, which
+    /// `every_capability_the_enum_names_resolves_to_its_own_enabled_sid` pins by
+    /// resolving all three, and which
+    /// `tests/confine.rs`'s `a_capability_from_the_options_reaches_the_container`
+    /// drives end to end. What is left is the FFI call failing for its own reason
+    /// (its allocation refused), and that is still reported rather than
+    /// unwrapped: the null check cannot be dropped, because a null `Sid` in the
+    /// list is a failed `CreateProcessW` rather than a capability.
     ///
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_windows::sid::CapabilitySids;
+    /// use tinio_sandbox_windows::{backend::Capability, sid::CapabilitySids};
     ///
-    /// let caps = CapabilitySids::resolve(&["S-1-15-3-1"]).unwrap();
+    /// let caps = CapabilitySids::resolve(&[Capability::InternetClient]).unwrap();
     /// assert_eq!(caps.len(), 1);
     ///
-    /// assert!(CapabilitySids::resolve(&["not-a-sid"]).is_err());
+    /// // Empty is the default, and the configuration the outbound guarantee
+    /// // rests on (design §7).
+    /// assert!(CapabilitySids::resolve(&[]).unwrap().is_empty());
     /// ```
-    pub fn resolve(sids: &[&str]) -> Result<Self> {
+    pub fn resolve(capabilities: &[Capability]) -> Result<Self> {
         // Built incrementally as a `Self`, so the failure below drops the SIDs
         // already resolved instead of leaking them: the value is the only thing
         // that owns them, and it exists from the first iteration onwards.
         let mut this = Self {
-            entries: Vec::with_capacity(sids.len()),
-            owned: Vec::with_capacity(sids.len()),
+            entries: Vec::with_capacity(capabilities.len()),
         };
-        for text in sids {
-            let wide = crate::wide(text);
+        for text in capabilities.iter().map(|capability| capability.sid()) {
+            let wide = to_wide(text);
             let mut raw: PSID = ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated and alive for the call; the
             // returned SID is freed in `Drop` with LocalFree, as documented.
             let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw) };
             if ok == 0 || raw.is_null() {
-                return Err(launch("resolve a capability SID", *text, last_error()));
+                return Err(launch("resolve a capability SID", text, last_error()));
             }
-            this.owned.push(raw);
             // **The attribute is not decoration, and leaving it zero made every
             // capability this crate granted inert.** Measured 2026-09-22 on this
             // host: a container launched with `internetClient` and
@@ -716,9 +720,9 @@ impl CapabilitySids {
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_windows::sid::CapabilitySids;
+    /// use tinio_sandbox_windows::{backend::Capability, sid::CapabilitySids};
     ///
-    /// let caps = CapabilitySids::resolve(&["S-1-15-3-1"]).unwrap();
+    /// let caps = CapabilitySids::resolve(&[Capability::InternetClient]).unwrap();
     /// // One pointer, one count, and `len` is the count that goes with it.
     /// let _entries = caps.as_ptr();
     /// assert_eq!(caps.len(), 1);
@@ -732,10 +736,15 @@ impl CapabilitySids {
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_windows::sid::CapabilitySids;
+    /// use tinio_sandbox_windows::{backend::Capability, sid::CapabilitySids};
     ///
     /// assert_eq!(CapabilitySids::resolve(&[]).unwrap().len(), 0);
-    /// assert_eq!(CapabilitySids::resolve(&["S-1-15-3-1"]).unwrap().len(), 1);
+    /// assert_eq!(
+    ///     CapabilitySids::resolve(&[Capability::InternetClient])
+    ///         .unwrap()
+    ///         .len(),
+    ///     1
+    /// );
     /// ```
     pub fn len(&self) -> u32 {
         self.entries.len() as u32
@@ -747,10 +756,14 @@ impl CapabilitySids {
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_windows::sid::CapabilitySids;
+    /// use tinio_sandbox_windows::{backend::Capability, sid::CapabilitySids};
     ///
     /// assert!(CapabilitySids::resolve(&[]).unwrap().is_empty());
-    /// assert!(!CapabilitySids::resolve(&["S-1-15-3-1"]).unwrap().is_empty());
+    /// assert!(
+    ///     !CapabilitySids::resolve(&[Capability::InternetClient])
+    ///         .unwrap()
+    ///         .is_empty()
+    /// );
     /// ```
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -759,10 +772,10 @@ impl CapabilitySids {
 
 impl Drop for CapabilitySids {
     fn drop(&mut self) {
-        for sid in self.owned.drain(..) {
-            // SAFETY: each `sid` came from ConvertStringSidToSidW, which
+        for entry in &self.entries {
+            // SAFETY: each `entry.Sid` came from ConvertStringSidToSidW, which
             // documents LocalFree as the release, and each is freed once.
-            unsafe { LocalFree(sid.cast()) };
+            unsafe { LocalFree(entry.Sid.cast()) };
         }
     }
 }
@@ -776,6 +789,23 @@ mod tests {
     };
 
     use super::*;
+
+    /// A SID's `S-1-…` text, for the tests that compare a raw SID against the
+    /// spelling this module or [`Capability`] carries.
+    fn render_sid(sid: PSID) -> String {
+        let mut text: *mut u16 = ptr::null_mut();
+        // SAFETY: `sid` is a live SID (the caller's own) and `text` is a valid
+        // out-parameter; the string is freed below with LocalFree.
+        let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
+        assert_ne!(ok, 0, "a live SID renders");
+        // SAFETY: `text` is a NUL-terminated UTF-16 string the conversion just
+        // allocated, and the copy above was its last use.
+        let rendered = unsafe { crate::from_wide(text) };
+        // SAFETY: `text` came from the conversion, whose documented release is
+        // LocalFree, and it is freed exactly once here.
+        unsafe { LocalFree(text.cast()) };
+        rendered
+    }
 
     #[test]
     fn the_package_name_is_root_derived_and_stable() {
@@ -839,7 +869,7 @@ mod tests {
         // a name that differed only because the text differed would be
         // indistinguishable from the collapse.
         let folded = |path: &Path| {
-            plain_root(path)
+            plain_spelling(path)
                 .components()
                 .collect::<PathBuf>()
                 .to_string_lossy()
@@ -932,26 +962,16 @@ mod tests {
         let sid = PackageSid::derive(&name).unwrap();
         assert!(sid.as_str().starts_with("S-1-15-2-"), "{}", sid.as_str());
 
-        let wide = crate::wide(&name);
+        let wide = to_wide(&name);
         let mut derived: PSID = ptr::null_mut();
         // SAFETY: `wide` is NUL-terminated and alive for the call, and `derived`
         // is a valid out-parameter; the SID is freed below with FreeSid.
         let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut derived) };
         assert_eq!(hr, 0, "hr=0x{hr:08X}");
-        let mut text: *mut u16 = ptr::null_mut();
-        // SAFETY: `derived` is the SID just returned and `text` is a valid
-        // out-parameter; the string is freed below with LocalFree.
-        let ok = unsafe { ConvertSidToStringSidW(derived, &mut text) };
-        assert_ne!(ok, 0);
-        // SAFETY: `text` is a NUL-terminated UTF-16 string the conversion just
-        // allocated, and it is the last use of the buffer.
-        let rendered = unsafe { crate::from_wide(text) };
-        // SAFETY: `text` came from the conversion, whose documented release is
-        // LocalFree, and `derived` from the derivation, whose release is FreeSid.
-        unsafe {
-            LocalFree(text.cast());
-            FreeSid(derived);
-        }
+        let rendered = render_sid(derived);
+        // SAFETY: `derived` came from the derivation above, whose documented
+        // release is FreeSid, and it is freed exactly once here.
+        unsafe { FreeSid(derived) };
         assert_eq!(
             rendered,
             sid.as_str(),
@@ -994,20 +1014,10 @@ mod tests {
         // a valid out-parameter; the SID is freed below with FreeSid.
         let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut reused) };
         assert_eq!(hr, 0, "hr=0x{hr:08X}");
-        let mut reused_text: *mut u16 = ptr::null_mut();
-        // SAFETY: `reused` is the SID just returned and `reused_text` is a valid
-        // out-parameter; the string is freed below with LocalFree.
-        let ok = unsafe { ConvertSidToStringSidW(reused, &mut reused_text) };
-        assert_ne!(ok, 0);
-        // SAFETY: `reused_text` is a NUL-terminated UTF-16 string the conversion
-        // just allocated, and it is the last use of the buffer.
-        let reused_rendered = unsafe { crate::from_wide(reused_text) };
-        // SAFETY: `reused_text` came from the conversion, whose documented release
-        // is LocalFree, and `reused` from the derivation, whose release is FreeSid.
-        unsafe {
-            LocalFree(reused_text.cast());
-            FreeSid(reused);
-        }
+        let reused_rendered = render_sid(reused);
+        // SAFETY: `reused` came from the derivation above, whose documented
+        // release is FreeSid, and it is freed exactly once here.
+        unsafe { FreeSid(reused) };
         assert_eq!(
             reused_rendered,
             sid.as_str(),
@@ -1031,8 +1041,32 @@ mod tests {
         assert_eq!(caps.len(), 0);
     }
 
+    /// **The property the string-taking signature could not state**: what this
+    /// value hands `CreateProcessW` is one of the enum's own SIDs — no caller
+    /// spells one — and every entry is enabled, since an inert `Attributes: 0` is
+    /// what made each capability this crate granted do nothing (the measurement
+    /// is on [`CapabilitySids::resolve`]).
+    ///
+    /// **That an enabled SID is honoured is not assertable here**, because it
+    /// takes a container: `tests/network.rs` reads it out of the child's token
+    /// through an ACL and a socket, and that is where the measurement lives.
     #[test]
-    fn a_capability_string_that_is_not_a_sid_is_an_error() {
-        assert!(CapabilitySids::resolve(&["not-a-sid"]).is_err());
+    fn every_capability_the_enum_names_resolves_to_its_own_enabled_sid() {
+        let all = [
+            Capability::InternetClient,
+            Capability::InternetClientServer,
+            Capability::PrivateNetworkClientServer,
+        ];
+        let caps = CapabilitySids::resolve(&all).unwrap();
+        assert_eq!(caps.len(), all.len() as u32);
+        for (index, capability) in all.iter().enumerate() {
+            // SAFETY: `as_ptr` points at `len` initialized entries and `index` is
+            // below that count, because it enumerates the list they were resolved
+            // from; the reference borrows the array for the loop body, which ends
+            // before the value drops.
+            let entry = unsafe { &*caps.as_ptr().add(index) };
+            assert_eq!(entry.Attributes, SE_GROUP_ENABLED as u32, "{capability:?}");
+            assert_eq!(render_sid(entry.Sid), capability.sid(), "{capability:?}");
+        }
     }
 }

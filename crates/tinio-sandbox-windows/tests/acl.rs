@@ -41,6 +41,7 @@ use tinio_sandbox_windows::{
     acl::Target,
     backend::SiblingScan,
     sid::{ALL_APPLICATION_PACKAGES, PackageSid, package_name},
+    testing,
 };
 
 /// The SID this run derives for `root` — the same question the launcher asks.
@@ -273,23 +274,70 @@ fn dropping_the_grants_leaves_them_standing() {
 #[test]
 fn the_predicate_refuses_a_path_it_cannot_read() {
     // `has_ace` is the oracle the rest of this phase's suites consult, and an
-    // oracle that answered "no entry for this SID" for a path `icacls` refused to
+    // oracle that answered "no entry for this SID" for a path that could not be
     // read would make every "the ACE is gone" assertion pass for the wrong reason.
-    // It is also what [`acl::Grants::apply`]'s skip rests on, where answering
-    // "nothing granted yet" for a path that could not be read would skip a grant
-    // that is needed. Measured on this host 2026-09-21: a path that does not exist
-    // makes `icacls` exit 2 with the reason on stderr.
+    // Measured on this host 2026-09-21: a path that does not exist fails the read
+    // with `ERROR_FILE_NOT_FOUND`. The read asks the DACL through
+    // `GetNamedSecurityInfoW` and no longer through `icacls`, so the step the
+    // failure names is the read's own.
     let dir = tempfile::tempdir().expect("temp dir");
     let missing = dir.path().join("never-created");
     let sid = sid_for(dir.path());
 
-    let err = acl::has_ace(&missing, &sid).expect_err("a path icacls cannot read is an error");
+    let err = acl::has_ace(&missing, &sid).expect_err("a path the read cannot see is an error");
     let text = err.to_string();
-    assert!(text.contains("icacls"), "{text}");
+    assert!(text.contains("read the DACL"), "{text}");
     assert!(
         text.contains("never-created"),
         "the failure names the path it was about: {text}"
     );
+}
+
+/// **The object the grant checks is the object it writes**, which is the defect
+/// the handle route closed: a junction is planted at the path the whitelist
+/// resolved — the window Fix 1 is about — and the grant refuses it rather than
+/// following it to wherever it points.
+///
+/// **What the refusal protects is measured rather than asserted** (this host,
+/// 2026-09-27): `icacls /grant:r` through a junction **above** the last component
+/// resolved it and wrote the ACE on the target, outside the exposed tree, and the
+/// target's pre-existing children inherited it. The second half of this test is
+/// that no ACE reached the target: the crate's own predicate *and* the tool's own
+/// rendering both say so, because an assertion that rested on `has_ace` alone
+/// would also pass for a DACL nothing had looked at.
+#[test]
+fn a_grant_refuses_a_junction_instead_of_following_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let real = dir.path().join("real");
+    fs::create_dir_all(&real).expect("create the junction's target");
+    let link = dir.path().join("swapped");
+    testing::junction(&link, &real);
+    let sid = Arc::new(sid_for(dir.path()));
+    let sid_text = sid.as_str().to_string();
+
+    let mut grants = acl::Grants::new(Arc::clone(&sid));
+    let err = grants
+        .apply(&link, Target::Directory, AccessMode::ReadOnly)
+        .expect_err("a junction is refused, not followed");
+    assert!(err.to_string().contains("is a reparse point"), "{err}");
+
+    assert!(
+        !acl::has_ace(&real, &sid).expect("read the DACL"),
+        "the ACE landed on the junction's target: {}",
+        icacls(&real, &[])
+    );
+    assert!(
+        !icacls(&real, &[]).contains(&sid_text),
+        "the target carries no package ACE: {}",
+        icacls(&real, &[])
+    );
+
+    // **The junction's own object is untouched too**, which is the half the old
+    // wildcard-style route could take: a grant that follows the link writes there
+    // instead of nowhere, and the confined child cannot use an ACE on a link
+    // object. A DACL read of the link's own object is what sees it.
+    let internal = acl::has_ace(&link, &sid).expect("read the link's own DACL");
+    assert!(!internal, "nothing was written on the link's object either");
 }
 
 #[test]

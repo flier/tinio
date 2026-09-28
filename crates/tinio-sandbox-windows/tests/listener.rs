@@ -9,12 +9,44 @@ mod common;
 
 use std::{
     env,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
+    os::windows::io::IntoRawSocket,
     process::Command,
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
-use tinio_sandbox_windows::socket;
+use tinio_sandbox_core::Adopted;
+use tinio_sandbox_windows::{launch, socket};
+
+/// The socket a child serves on must not block: a `std` listener is created blocking on Windows,
+/// and an inherited one keeps that mode unless the rebuild clears it.
+#[test]
+fn the_rebuilt_listener_accepts_without_blocking() {
+    let bound = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = bound.local_addr().expect("address");
+    let raw = bound.into_raw_socket();
+    let adopted = Adopted::new(String::new(), Some(raw as i64), Vec::new(), None, None);
+    let listener = launch::listener(&adopted).expect("rebuild the listener");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let kind = listener.accept().map(|_| ()).map_err(|err| err.kind());
+        let _ = tx.send(kind);
+    });
+    match rx.recv_timeout(Duration::from_millis(300)) {
+        Ok(Err(ErrorKind::WouldBlock)) => {}
+        Ok(other) => panic!("accept returned {other:?}, expected WouldBlock"),
+        Err(_) => {
+            // A blocking accept is stuck until a client arrives. Connect so the thread can
+            // finish, then fail: the harness must not hang on the bug this test exists to catch.
+            let _ = TcpStream::connect(address);
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+            panic!("accept blocked: the rebuilt listener is still a blocking socket");
+        }
+    }
+}
 
 #[test]
 fn child_role() {

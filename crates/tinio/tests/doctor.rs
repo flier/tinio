@@ -12,6 +12,11 @@ mod common;
 
 use common::*;
 use tinio_util::testing::json_keys;
+// The two teardowns below are the `api` graph's: no plane means no live server to
+// stop, so this name has no caller in a `--no-default-features` build and is gated
+// with them rather than imported unused.
+#[cfg(feature = "api")]
+use tinio_util::testing::kill_and_reap;
 
 #[test]
 fn a_root_with_stale_state_is_diagnosed_and_left_alone() {
@@ -264,8 +269,7 @@ fn fix_refuses_while_a_server_is_running() {
     );
 
     let _ = spawn(dir.path()).arg("stop").arg(&root).output();
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(&mut child);
 }
 
 /// A `state` file this build cannot read is **not** proof that nobody is behind it: one of
@@ -324,8 +328,7 @@ fn fix_leaves_a_foreign_version_state_file_alone_while_its_channel_answers() {
     );
 
     let _ = spawn(dir.path()).arg("stop").arg(&root).output();
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(&mut child);
 }
 
 #[test]

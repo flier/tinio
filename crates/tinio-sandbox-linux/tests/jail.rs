@@ -4,104 +4,25 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    env, fs,
+    fs,
     net::{SocketAddr, TcpListener},
     path::Path,
-    process::{Command, Stdio},
+    process::Command,
 };
 
-use tinio_sandbox_linux::Mechanism;
-
-/// The one way past a missing precondition, and it is a deliberate opt-in.
-///
-/// **A suite that certifies a security boundary does not get to skip in
-/// silence**: a precondition that is absent fails the run by default, so a host
-/// that cannot confine can never report `2 passed` for a jail that was never
-/// built. An operator who knows this machine cannot confine sets this variable
-/// and means it.
-const ALLOW_SKIP: &str = "TINIO_SANDBOX_ALLOW_SKIP";
-
-/// The model the WSL2 script asked for, read the way the child reads it: the
-/// same variable through the same one reader.
-fn requested_model() -> Mechanism {
-    Mechanism::from_env(env::var("TINIO_SANDBOX_MODEL").ok().as_deref())
-        .expect("TINIO_SANDBOX_MODEL must name a model")
-}
-
-/// Whether this host can confine under `model` — asked **before** the child
-/// runs, and asked as a capability rather than as a substring of a failure.
-///
-/// **This is the whole difference between a green suite and a quiet one.** The
-/// earlier shape skipped whenever the child's log contained `confine-failed:`,
-/// which made every confinement bug indistinguishable from a host that cannot
-/// confine: a mount table that never built, a device node created as a
-/// directory (Task 5's `apply_mount`) or a `prctl` that was refused all printed
-/// `skipping:` and exited 0. The question has a positive answer, it is
-/// answerable here, and asking it first is what lets the child's failure be a
-/// failure.
-///
-/// `Ok(())` when the kernel granted every namespace the model needs. `Err` with
-/// the `unshare(1)` invocations that answered no, spelled as an operator would
-/// retype them — carried out rather than logged, because [`run_child`] is where
-/// the answer decides between failing and skipping, and its message has to name
-/// the command it tried.
-///
-/// **`unshare(1)` rather than the backend's own `userns_available()`**: that
-/// probe forks, and its safety argument is that nothing else exists in the
-/// process yet (design §10) — a libtest worker thread is not that place. The
-/// command is the one the WSL2 script gates on, so the script and the test
-/// agree by construction rather than by review. It is also a *lower* bound on
-/// this binary's capability, and knowingly so: `mechanism.rs` tells operators to
-/// give the binary an AppArmor profile, which confines a profiled child where
-/// plain `unshare(1)` still fails — so a host can answer this probe with "no"
-/// and still confine the child. That is the residual fuzziness a skip has to be
-/// deliberate to cross, and it is why the opt-in above exists.
-fn host_can_confine(model: Mechanism) -> Result<(), String> {
-    // Each variant is asked for the namespaces it actually needs: `--user
-    // --map-root-user` for the user-namespace model, and a bare `--mount` for
-    // the root model, whose single capability is `CAP_SYS_ADMIN`. Asking the
-    // kernel rather than reading `geteuid()` is the point — a container can run
-    // as uid 0 and still refuse a mount namespace, which is a host where this
-    // model would fail at the first mount rather than at the probe.
-    let user: &[&str] = &["--user", "--map-root-user"];
-    let mount: &[&str] = &["--mount"];
-    let probes: &[&[&str]] = match model {
-        Mechanism::UserNamespace => &[user],
-        Mechanism::Root => &[mount],
-        Mechanism::Auto => &[user, mount],
-    };
-    if probes.iter().any(|flags| unshare_probe(flags)) {
-        return Ok(());
-    }
-    Err(probes
-        .iter()
-        .map(|flags| format!("unshare {} true", flags.join(" ")))
-        .collect::<Vec<_>>()
-        .join(" and "))
-}
-
-/// `unshare(1)` with `flags`, as a process of its own.
-///
-/// A missing `unshare(1)` panics rather than skipping: the precondition is then
-/// unknowable, and a suite that cannot tell "this host cannot confine" from "I
-/// could not ask" is the shape this function exists to delete.
-fn unshare_probe(flags: &[&str]) -> bool {
-    Command::new("unshare")
-        .args(flags)
-        .arg("true")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or_else(|err| panic!("the precondition needs util-linux's `unshare(1)`: {err}"))
-}
+// **The host precondition is the crate's** (`tinio_sandbox_linux::testing`), so
+// this suite and `tinio-server/tests/sandbox_e2e.rs` ask the kernel the same way
+// instead of keeping a copy each; what stays here is the part that is this
+// suite's own — the child, the listener and the assertions.
+use tinio_sandbox_linux::testing::{host_can_confine, requested_model};
+use tinio_util::testing::host_cannot;
 
 /// Spawn the confined child and return its report.
 ///
-/// **It fails rather than skips when this host cannot confine**, unless
-/// [`ALLOW_SKIP`] was set deliberately. `eprintln!` is not enough on its own:
-/// libtest swallows it without `--nocapture`, so the "loud" skip of the earlier
-/// shape was a silent one on every ordinary invocation.
+/// **It fails rather than skips when this host cannot confine**, unless the
+/// operator opted out through [`host_cannot`]'s variable — a skip printed by
+/// libtest alone is swallowed without `--nocapture`, which is the silent green
+/// run that rule exists to delete.
 ///
 /// The skip, when it is taken, is decided before the child exists, so
 /// everything the child reports afterwards is a failure (design §12).
@@ -114,16 +35,10 @@ fn run_child(
 ) -> Option<String> {
     let model = requested_model();
     if let Err(tried) = host_can_confine(model) {
-        assert!(
-            env::var(ALLOW_SKIP).is_ok_and(|value| !value.is_empty()),
-            "this host cannot confine under {model:?}: the precondition `{tried}` failed, so this \
-             run would certify a jail that was never built. WSL2 is where both legs are verified \
-             (design §12). Set {ALLOW_SKIP}=1 to skip deliberately on a host that genuinely \
-             cannot confine."
-        );
-        eprintln!(
-            "skipping: this host cannot confine under {model:?} and {ALLOW_SKIP} is set (design \
-             §12)"
+        host_cannot(
+            &format!("a jail under {model:?}"),
+            &format!("the precondition `{tried}` failed"),
+            ". WSL2 is where both legs are verified (design §12)",
         );
         return None;
     }

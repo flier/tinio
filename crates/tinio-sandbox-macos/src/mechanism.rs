@@ -14,11 +14,12 @@
 //! that asks, so the exec and the dynamic loader have already run and that rule
 //! is not needed — see `apply`'s module doc for what the route costs.
 
-use std::{env, fmt};
+use std::{env, result};
 
+use parse_display::{Display, FromStr};
 use tracing::error;
 
-use crate::_core::{Error, Result};
+use crate::_core::{Error, MACOS_MECHANISM_USAGE, Result};
 
 /// Which mechanism confines a macOS child (design decision 6).
 ///
@@ -29,11 +30,11 @@ use crate::_core::{Error, Result};
 /// one-shot, irreversible, and leaves the confined process unable to `fork` or
 /// `exec`), so it is never selected by accident and never selected as a fallback.
 ///
-/// **`Display` is the wire spelling**, and it is the same string
-/// [`Self::from_env`] accepts and [`Self::as_str`] returns: the launch payload
-/// carries it so the child can report which mechanism its launcher resolved,
-/// which would be three spellings of one fact if any of them were written
-/// separately.
+/// **`Display` is the wire spelling, and it is the parser's spelling too**: the
+/// `kebab-case` render is derived from the variant names, so what this crate prints
+/// and what [`Self::from_env`] accepts cannot drift apart. [`Self::as_str`], the
+/// `&'static str` projection the launch payload and the facade's `Applied` take, is
+/// pinned to both by the test at the foot of this file.
 ///
 /// # Examples
 ///
@@ -44,8 +45,20 @@ use crate::_core::{Error, Result};
 /// assert_eq!(Mechanism::SandboxInit.to_string(), "sandbox-init");
 /// assert_ne!(Mechanism::SandboxExec, Mechanism::SandboxInit);
 /// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Display,
+    FromStr,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
+#[display(style = "kebab-case")]
 pub enum Mechanism {
     /// Apply the profile with `/usr/bin/sandbox-exec -p <text> -D …`, which
     /// confines the child at the `exec` the helper performs.
@@ -64,19 +77,17 @@ impl Mechanism {
     /// variable and its two values**, because a typo that silently ran the
     /// default mechanism would be a confinement nobody chose.
     pub const ENV: &'static str = "TINIO_SANDBOX_MACOS_MECHANISM";
-    /// The **one** name for the `sandbox-exec` mechanism, and the one for the
-    /// other: the spelling the environment variable takes, the payload carries,
-    /// `Display` prints and every refusal names.
-    ///
-    /// It is an associated constant rather than a literal at each of those sites
-    /// for the reason `launch::PREFLIGHT_STEP` is one: a rename that reached
-    /// three of the four spellings would leave an operator reading a mechanism
-    /// name the parser does not accept.
-    pub const SANDBOX_EXEC: &'static str = "sandbox-exec";
-    /// The in-process mechanism's name, paired with [`Self::SANDBOX_EXEC`].
-    pub const SANDBOX_INIT: &'static str = "sandbox-init";
 
-    /// The mechanism's name, in the one spelling every surface shares.
+    /// The wire spelling as a `&'static str`.
+    ///
+    /// **`Display` is the home of the spelling and this is its projection**, not a second list:
+    /// the derive renders each variant's name in `kebab-case`, and the two literals below are held
+    /// to it by the round-trip test at the foot of this file, so a rename that reached one side
+    /// fails there rather than in an operator's event.
+    ///
+    /// **The `'static` borrow is what this is for**: `tinio-sandbox`'s `Applied.mechanism` is a
+    /// `&'static str` — its `apply_self_confinement` reads this — and a rendered `String` cannot
+    /// serve that field. The launcher takes it the same way for the payload's mechanism marker.
     ///
     /// # Examples
     ///
@@ -91,12 +102,16 @@ impl Mechanism {
     /// ```
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::SandboxExec => Self::SANDBOX_EXEC,
-            Self::SandboxInit => Self::SANDBOX_INIT,
+            Self::SandboxExec => "sandbox-exec",
+            Self::SandboxInit => "sandbox-init",
         }
     }
 
     /// Read [`Self::ENV`]. Absent or empty means [`Mechanism::SandboxExec`].
+    ///
+    /// **The accepted values are `Display`'s, through the derived `FromStr`**: a spelling the
+    /// parser takes is a spelling the payload's marker and the operator's variable share, because
+    /// there is no second list of literals here to fall out of step with the render.
     ///
     /// **Absent and empty are the same answer, and neither is guessed**: the
     /// variable is how an operator *asks*, so saying nothing takes the default
@@ -106,7 +121,7 @@ impl Mechanism {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`](tinio_sandbox_core::Error::Unsupported) for any
+    /// [`Error::Unsupported`] for any
     /// other value.
     ///
     /// # Examples
@@ -128,9 +143,10 @@ impl Mechanism {
     pub fn from_env(raw: Option<&str>) -> Result<Self> {
         match raw {
             None | Some("") => Ok(Self::default()),
-            Some(Self::SANDBOX_EXEC) => Ok(Self::SandboxExec),
-            Some(Self::SANDBOX_INIT) => Ok(Self::SandboxInit),
-            Some(wrong) => {
+            // **The parse is the derive's and the refusal is this arm's**: a value one of the
+            // derived spellings accepts is the value `Display` writes, so the only thing left to
+            // decide here is what to say about a value none of them accepts.
+            Some(wrong) => wrong.parse().map_err(|_| {
                 // Logged where the `Error` is built (shared §7), for the reason
                 // the Linux model's refusal is: the caller's `?` only prints it
                 // on the way out, and the value that was wrong is the whole
@@ -140,10 +156,10 @@ impl Mechanism {
                     value = wrong,
                     "unsupported confinement mechanism"
                 );
-                Err(Error::Unsupported {
-                    detail: "TINIO_SANDBOX_MACOS_MECHANISM must be `sandbox-exec` or `sandbox-init`",
-                })
-            }
+                Error::Unsupported {
+                    detail: MACOS_MECHANISM_USAGE,
+                }
+            }),
         }
     }
 
@@ -173,12 +189,6 @@ impl Mechanism {
             Self::SandboxExec => true,
             Self::SandboxInit => false,
         }
-    }
-}
-
-impl fmt::Display for Mechanism {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
     }
 }
 
@@ -214,10 +224,16 @@ impl Options {
     /// it cannot fail and cannot depend on how the test process was started —
     /// the same split the Linux `Options` makes.
     ///
+    /// **A value that is present but not valid Unicode is refused too**, rather
+    /// than read as unset: it is a value this build cannot compare against either
+    /// spelling, and treating it as absent would silently run the mechanism the
+    /// operator did not pick.
+    ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`](tinio_sandbox_core::Error::Unsupported) for a value
-    /// that is neither `sandbox-exec` nor `sandbox-init`, so a typo cannot
+    /// [`Error::Unsupported`] for a value
+    /// that is neither `sandbox-exec` nor `sandbox-init` — and for one that is not
+    /// valid Unicode at all — so neither a typo nor an unreadable value can
     /// silently select the other mechanism.
     ///
     /// # Examples
@@ -236,8 +252,7 @@ impl Options {
     /// }
     /// ```
     pub fn from_env() -> Result<Self> {
-        let raw = env::var(Mechanism::ENV).ok();
-        Ok(Self::default().with_mechanism(Mechanism::from_env(raw.as_deref())?))
+        Ok(Self::default().with_mechanism(read_mechanism(env::var(Mechanism::ENV))?))
     }
 
     /// The requested mechanism (design decision 6).
@@ -269,8 +284,47 @@ impl Options {
     }
 }
 
+/// The mechanism the environment asks for, from the variable's raw answer.
+///
+/// **`NotPresent` and `NotUnicode` are two different answers**, which is why the
+/// match is written out rather than collapsed by `env::var(..).ok()`: an absent
+/// (or empty) value is the operator saying nothing and takes
+/// [`Mechanism::SandboxExec`], while a value that is *present* and not valid
+/// Unicode is one this build cannot read at all. The two mechanisms are not
+/// interchangeable — one confines the child at the `exec` the helper performs,
+/// the other applies inside the child before it serves — so the unreadable value
+/// is refused in the same shape as an unknown one rather than read as unset.
+///
+/// A free function rather than a body inside [`Options::from_env`] so that the
+/// third answer is testable: putting a non-Unicode value into the environment
+/// needs `unsafe` `env::set_var` (Rust 2024), which this crate may not call, so
+/// the test hands this function the `VarError` instead.
+fn read_mechanism(raw: result::Result<String, env::VarError>) -> Result<Mechanism> {
+    match raw {
+        Ok(value) => Mechanism::from_env(Some(&value)),
+        Err(env::VarError::NotPresent) => Mechanism::from_env(None),
+        // Logged where the `Error` is built (shared §7), for the reason the
+        // unknown value's refusal is: the caller's `?` only prints the sentence
+        // on the way out, and the variable that was wrong is the whole diagnosis.
+        // The value itself is not printable — a non-Unicode variable is the
+        // platform's own bytes — so the log names the error rather than a value.
+        Err(error @ env::VarError::NotUnicode(_)) => {
+            error!(
+                step = Mechanism::ENV,
+                error = %error,
+                "unsupported confinement mechanism"
+            );
+            Err(Error::Unsupported {
+                detail: MACOS_MECHANISM_USAGE,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     #[test]
@@ -300,6 +354,46 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_value_is_refused_and_never_the_default() {
+        // **The one arm `env::var(..).ok()` used to swallow.** A value that is
+        // present and not valid Unicode is one this build cannot read, and reading
+        // it as unset would run `sandbox-exec` for an operator who asked for
+        // something this build could not name — the silent fallback this module's
+        // contract rules out. The refusal is driven through the `VarError` rather
+        // than the environment, because putting a non-Unicode value there needs
+        // `unsafe` `env::set_var` in Rust 2024.
+        let raw = Err(env::VarError::NotUnicode(OsString::from("sandbox-init")));
+        let error = read_mechanism(raw).expect_err("an unreadable value must not select");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("TINIO_SANDBOX_MACOS_MECHANISM"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("sandbox-exec"), "{rendered}");
+        assert!(rendered.contains("sandbox-init"), "{rendered}");
+    }
+
+    #[test]
+    fn only_an_absent_variable_is_unset() {
+        // The other half of the same match, so the pair pins the distinction the
+        // unreadable case turns on: `NotPresent` — and the empty string, which the
+        // parser reads as the operator saying nothing — are unset, and every other
+        // answer goes through [`Mechanism::from_env`].
+        assert_eq!(
+            read_mechanism(Err(env::VarError::NotPresent)).unwrap(),
+            Mechanism::SandboxExec
+        );
+        assert_eq!(
+            read_mechanism(Ok(String::new())).unwrap(),
+            Mechanism::SandboxExec
+        );
+        assert_eq!(
+            read_mechanism(Ok(String::from("sandbox-init"))).unwrap(),
+            Mechanism::SandboxInit
+        );
+    }
+
+    #[test]
     fn a_typo_is_refused_and_names_the_variable_and_both_values() {
         // **Never a silent fallback**: the refusal is the whole reason this
         // parser exists rather than a `==` at the call site, and it is a
@@ -317,10 +411,14 @@ mod tests {
 
     #[test]
     fn the_display_spelling_is_the_parsed_spelling() {
-        // One fact, one set of spellings: the payload's mechanism marker, the
-        // environment variable's values and `Display` all round-trip through
-        // each other, so a launch cannot report a mechanism the parser does not
-        // accept.
+        // **The pin between the two spellings that remain, and the reason `as_str` may keep its
+        // literals**: `Display`/`FromStr` are one derivation, and `as_str` is the `&'static str`
+        // projection the facade's `Applied` and this crate's payload need. The first two
+        // assertions name the wire bytes every reader takes — those two, the environment variable
+        // and the e2e legs — and the loop then holds the projection, the render and the parser to
+        // each other, so a launch cannot report a mechanism the parser does not accept.
+        assert_eq!(Mechanism::SandboxExec.to_string(), "sandbox-exec");
+        assert_eq!(Mechanism::SandboxInit.to_string(), "sandbox-init");
         for mechanism in [Mechanism::SandboxExec, Mechanism::SandboxInit] {
             assert_eq!(mechanism.to_string(), mechanism.as_str());
             assert_eq!(

@@ -425,8 +425,8 @@ pub struct Located {
     /// ([`state_dir_candidates`]), and that answer must be the same one `.env`'s own location
     /// was resolved from — read once, before the load, or the two could disagree. **It is copied
     /// onto the [`super::Resolution`] this value is consumed by**, which is where the two readers
-    /// that would otherwise have to take it off `Located` *before* the move find it:
-    /// [`super::Resolution::state_dir_source`] (the confinement's read-only macOS rule) and
+    /// that would otherwise have to take it off `Located` *before* the move find it: the
+    /// confinement's read-only macOS rule (which reads whether it is there) and
     /// [`super::state_dir_candidates`]'s caller.
     pub state_dir_override: Option<PathBuf>,
 }

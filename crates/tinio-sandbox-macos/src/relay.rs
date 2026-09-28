@@ -78,17 +78,12 @@ use tracing::debug;
 /// Anything outside this set is not a shutdown request, and forwarding
 /// everything would make the launcher a signal-transparent proxy it is not.
 ///
-/// **Written as raw numbers so the constant is the whole set in one place**,
-/// which is what lets the pure decision below be tested without a signal ever
-/// being sent. The numbers are not magic: the `const` assertion below fails at
-/// compile time if they ever stop being `SIGTERM` and `SIGINT`.
-pub const RELAYED_SIGNALS: &[i32] = &[15, 2];
-
-/// `SIGTERM` is 15 and `SIGINT` is 2 — checked against the names, not assumed.
-const _: () = {
-    assert!(RELAYED_SIGNALS[0] == SIGTERM);
-    assert!(RELAYED_SIGNALS[1] == SIGINT);
-};
+/// **The names rather than raw numbers, because `signal_hook`'s constants are
+/// `const c_int`s** — the same values the relay compares against, spelled once
+/// here and once in the module that owns them. The set is still one constant a
+/// caller cannot narrow, and the pure decision below is still testable without a
+/// signal ever being sent.
+pub const RELAYED_SIGNALS: &[i32] = &[SIGTERM, SIGINT];
 
 /// The child's pid while it lives; `0` once the relay is disarmed or the child
 /// is gone.

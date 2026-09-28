@@ -581,21 +581,9 @@ pub fn answer(addr: SocketAddr) -> Result<String, String> {
 /// server would be matching a pattern it never created; the leg this exists for,
 /// the macOS e2e leg's `fail`, is reached only after its own launcher exists.
 ///
-/// **The `cfg` is why the sweep is not a no-op elsewhere.** Every platform but
-/// macOS needs no sweep — the process a kill ends *is* the server — so on any
-/// other target this function does not exist and a call site cannot forget the
-/// gate. The e2e crate's CLI harness has its own copy for the same reason this
-/// module exists: two `tests/` trees are not importable from each other.
+/// **The rule is [`tinio_util::testing::sweep_confined_grandchild`]'s, re-exported
+/// rather than copied.** The e2e crate's CLI harness needs the same sweep, and a
+/// `tests/` tree is not importable from another one — a crate both dev-depend on
+/// is, which is what removes the copy this module used to keep.
 #[cfg(target_os = "macos")]
-pub fn sweep_confined_grandchild(root: &Path) {
-    // A root that is not UTF-8 cannot be matched by a command line, and the
-    // legs that call this build theirs from a pid and a name (see the macOS e2e
-    // leg's fixture) — so the guard is a fact about the fixture rather than a
-    // silent skip.
-    let Some(root) = root.to_str() else {
-        return;
-    };
-    let _ = Command::new("pkill")
-        .args(["-f", &format!("tinio server {root}")])
-        .status();
-}
+pub use tinio_util::testing::sweep_confined_grandchild;

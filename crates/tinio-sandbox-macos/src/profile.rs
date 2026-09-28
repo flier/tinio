@@ -22,7 +22,7 @@
 //! "just in case".
 //!
 //! **The text is a template, and its layout is one file.** [`profile`] collects
-//! the exposure set and the allowances as data and renders [`TEMPLATE`] — the
+//! the exposure set and the allowances as data and renders `TEMPLATE` — the
 //! `.hbs` beside this module — so a rule's line lives where a reader looks for
 //! the profile's shape rather than inside a chain of `format!` calls. The
 //! rendered bytes are the contract and did not change with the move: they were
@@ -32,15 +32,14 @@
 //!
 //! # What this platform does *not* spend
 //!
-//! **The device-file flag is inert here.** [`Sandbox::device_files`] still
-//! travels — `crates/tinio-cli/src/sandbox/mod.rs`'s `sandbox_request` sets it
-//! for Linux, where the jail binds the four nodes into it (design §4), and the
-//! flag is an argument of the one construction both arms share — but no rule in
-//! this text is rendered for it, and `device_files_enabled()` is read by
-//! nothing in this crate. The four literals plus the two standard streams this
-//! profile used to carry were measured unnecessary on both paths — the startup
-//! probe and the real binary — and deleted rather than kept, which is the whole
-//! of the allowance audit's verdict for them (`docs/superpowers/specs/2026-09-18-sandbox-design.md`
+//! **Device files are Linux's concept and this module renders nothing for them.**
+//! The flag is not on [`Sandbox`] at all — the jail that binds the four nodes is
+//! Linux's (design §4), so the flag belongs to that backend rather than to the set
+//! every platform is handed — which leaves this text with nothing to read and no
+//! rule to render. The four literals plus the two standard streams this profile
+//! used to carry were measured unnecessary on both paths — the startup probe and
+//! the real binary — and deleted rather than kept, which is the whole of the
+//! allowance audit's verdict for them (`docs/superpowers/specs/2026-09-18-sandbox-design.md`
 //! §5, whose audit paragraph is that record).
 //!
 //! **No home grant is spent at all**, and that is a measurement rather than a
@@ -57,8 +56,8 @@
 
 use std::{ffi::OsString, fs::canonicalize, io, path::Path};
 
-use handlebars::{Handlebars, no_escape};
 use serde::Serialize;
+use tinio_util::render::renderer;
 use tracing::{error, info};
 
 use crate::_core::{Error, Exposure, Result, Sandbox, step};
@@ -67,7 +66,7 @@ use crate::_core::{Error, Exposure, Result, Sandbox, step};
 // table, and this table's render needs the predicate that module owns.
 use crate::Mechanism;
 
-/// The profile's layout. Values live in [`ProfileView`], and the one thing this
+/// The profile's layout. Values live in `ProfileView`, and the one thing this
 /// file must not carry is a path: every exposure is a `(param "E<i>")`
 /// reference, and the values travel beside the text as `-D` pairs.
 const TEMPLATE: &str = include_str!("profile.hbs");
@@ -87,7 +86,7 @@ const TEMPLATE: &str = include_str!("profile.hbs");
 /// measurement behind it.
 ///
 /// **`Serialize` is what the template renders, and that is the whole of this
-/// type's relationship to it**: [`TEMPLATE`] reads `this.rule`, `this.id` and
+/// type's relationship to it**: `TEMPLATE` reads `this.rule`, `this.id` and
 /// `this.evidence`, which are these three fields by name — `mechanism` is
 /// deliberately *not* one of them, so the field can never reach the text. There is
 /// deliberately no separate view type — a wrapper holding the same fields would be
@@ -122,7 +121,7 @@ pub struct Allowance {
     /// A `bool` rather than a `Mechanism` list because exactly one rule is
     /// conditional today, and the question the render asks is the same one this
     /// field's name asks — whether the *exec* mechanism is the one being
-    /// rendered. The predicate that reads it is [`Allowance::keeps`], so the day a
+    /// rendered. The predicate that reads it is `Allowance::keeps`, so the day a
     /// second conditional rule arrives it is that function and not this field that
     /// grows.
     pub for_every_mechanism: bool,
@@ -158,7 +157,8 @@ impl Allowance {
 /// than the startup probe and both paths agreed it was not needed: `process-fork`,
 /// `signal-self`, `system`, `bin` and `private-etc` are five of them, and the
 /// five device literals were a sixth row of the same verdict (that table is gone
-/// entirely — this module renders nothing for `device_files`; see its own doc). The
+/// entirely — device files are Linux's concept, so this module has no flag to read
+/// and no literals to render; see its own doc). The
 /// measurements, with the probe's column beside the product path's, are design
 /// §5's audit paragraph; the rule this crate follows is that an entry which
 /// survives without an observation naming what broke without it is deleted.
@@ -383,7 +383,7 @@ pub struct Profile {
 /// and legible rather than the only thing between an operator and a silent grant.
 const MAX_EXPOSURES: usize = 4096;
 
-/// The values [`TEMPLATE`] interpolates — the whole of what a rendered profile
+/// The values `TEMPLATE` interpolates — the whole of what a rendered profile
 /// is, as data.
 ///
 /// Serde's field names are what the template reads, and there is deliberately no
@@ -406,26 +406,27 @@ struct ExposureView {
     writable: bool,
 }
 
-/// The rendered profile: [`TEMPLATE`] over `view`, with nothing escaped.
+/// The rendered profile: `TEMPLATE` over `view`, with nothing escaped.
 ///
 /// **`no_escape` is the decision, not the default.** Handlebars escapes HTML by
 /// default, which would rewrite every `'` in an `evidence` string to `&#x27;`
 /// and every `"` to `&quot;` — corrupting the provenance comments the tested
 /// text is made of — so the escape function is replaced with the one that leaves
 /// the template's own bytes alone. There is nothing to escape *for*: no field of
-/// [`ProfileView`] is a path, and the text is SBPL, not HTML.
+/// `ProfileView` is a path, and the text is SBPL, not HTML.
 ///
 /// # Errors
 ///
-/// [`Error::Step`] when the template does not render. [`TEMPLATE`] is
+/// [`Error::Step`] when the template does not render. `TEMPLATE` is
 /// compile-time text and the view is built from it, so this is a programming
 /// error rather than an operator-facing one; it is still an `Err` because
 /// library code does not panic.
 fn render(view: &ProfileView<'_>) -> Result<String> {
-    let mut hbs = Handlebars::new();
-    hbs.set_strict_mode(true);
-    hbs.register_escape_fn(no_escape);
-    hbs.render_template(TEMPLATE, view)
+    // **The renderer is the workspace's one**, not three lines spelled here: strict mode and
+    // the escape function are decisions about rendering, and this module's copy was the third
+    // of them (`tinio_util::render` owns the rule and states why).
+    renderer()
+        .render_template(TEMPLATE, view)
         .map_err(|err| step("render the SBPL profile")(io::Error::other(err.to_string())))
 }
 
@@ -540,16 +541,16 @@ pub fn network_operation(text: &str) -> Option<&'static str> {
 /// nothing conditional after it — so a diff of two profiles reads as a diff of
 /// two exposure sets.
 /// **Everything the text interpolates is collected once, as data, and
-/// [`TEMPLATE`] renders it**: this function builds a [`ProfileView`] and the
+/// `TEMPLATE` renders it**: this function builds a `ProfileView` and the
 /// template turns that into bytes, so the text's shape is one file rather than
 /// a sequence of `format!` calls. One traversal still produces both halves:
-/// exposure `i` is collected as an [`ExposureView`] whose template line is
+/// exposure `i` is collected as an `ExposureView` whose template line is
 /// `(allow file-read* (subpath (param "E<i>")))`, or with `file-write*` before
 /// the `(subpath …)` when it is writable, and `("E<i>", host)` is appended to
 /// [`Profile::params`] as it goes.
 ///
 /// **`mechanism` is which process applies this text, and it decides one entry.**
-/// [`Allowance::keeps`] filters the baseline, so a `sandbox-exec` render carries
+/// `Allowance::keeps` filters the baseline, so a `sandbox-exec` render carries
 /// the `process-exec` rule that lets the helper `exec` its target and an
 /// in-process render carries every other rule and not that one — the exec having
 /// already happened by the time the child applies it
@@ -558,8 +559,9 @@ pub fn network_operation(text: &str) -> Option<&'static str> {
 /// exposures and the mechanisms' difference one table entry.
 ///
 /// **The rendering does not escape anything, and that is deliberate rather than
-/// `render`'s default forgotten.** `status.rs` registers the same
-/// [`no_escape`], and the reason is sharper here: Handlebars' default escape
+/// `render`'s default forgotten.** The shared renderer registers `no_escape` for
+/// every caller ([`tinio_util::render`], which the status report takes it from
+/// too), and the reason is sharper here: Handlebars' default escape
 /// function is HTML's, so it would rewrite the `'` in an `evidence` string to
 /// `&#x27;` and corrupt the provenance comment the rule's trailing `; tinio:<id>
 /// — <evidence>` carries — and the byte-for-byte text
@@ -583,9 +585,9 @@ pub fn network_operation(text: &str) -> Option<&'static str> {
 /// cannot express.
 ///
 /// The template itself is the one failure this function did not have before the
-/// text moved into [`TEMPLATE`], and [`render`] maps it to [`Error::Step`] rather
+/// text moved into `TEMPLATE`, and `render` maps it to [`Error::Step`] rather
 /// than letting library code panic. A caller cannot reach it — the template is
-/// compile-time text and [`ProfileView`] is built to fit it — so the operator's
+/// compile-time text and `ProfileView` is built to fit it — so the operator's
 /// error surface is unchanged.
 ///
 /// # Examples
@@ -651,15 +653,11 @@ pub fn profile(sandbox: &Sandbox, mechanism: Mechanism) -> Result<Profile> {
         params.push((param, exposure.host.as_os_str().to_os_string()));
     }
 
-    // Nothing is rendered for `sandbox.device_files_enabled()` here, and that is
-    // the decision rather than an omission: the flag travels — `sandbox_request`
-    // sets it for Linux, where the jail binds the four nodes into it — and this
-    // platform spends nothing on it. The literals this position used to emit were
-    // measured unnecessary on both paths and deleted; the module doc says so, and
-    // `with_canonical_paths` still carries the flag through so the caller's set
-    // is not silently rewritten. The flag is therefore read by nothing in this
-    // crate, which is the honest state rather than a caller kept alive for a
-    // grant nothing needs.
+    // Nothing is rendered for device files here, and that is the decision rather
+    // than an omission: they are Linux's concept, the jail that binds the four
+    // nodes is Linux's, and the flag never reaches this crate at all. The literals
+    // this position used to emit were measured unnecessary on both paths and
+    // deleted; the module doc says so.
 
     // **No conditional grant is collected here.** The only one this function ever
     // had was the home read, and the list it was appended to is now exactly the
@@ -747,18 +745,19 @@ pub fn profile(sandbox: &Sandbox, mechanism: Mechanism) -> Result<Profile> {
 /// let out = with_canonical_paths(&Sandbox::new().expose("/srv/data", AccessMode::ReadOnly));
 /// assert_eq!(out.exposures().len(), 1);
 /// ```
-pub fn with_canonical_paths(sandbox: &Sandbox) -> Sandbox {
+pub fn with_canonical_paths(sandbox: &Sandbox) -> CanonicalExposures {
     let mut exposures = sandbox.exposures().to_vec();
     for exposure in sandbox.exposures() {
         let Ok(canonical) = canonicalize(&exposure.host) else {
             continue;
         };
-        // Deduplicated here rather than by `expose`: `from_exposures` takes the
-        // set as given, so adding a canonical form that is already present (or
-        // that another exposure canonicalises to) would otherwise double the
-        // rule.
-        let already = exposures.iter().any(|existing| existing.host == canonical);
-        if canonical != exposure.host && !already {
+        // **A canonical form joins the set as it stands and the merge below folds
+        // it**, which is the Windows arm's spelling too: the most-permissive rule
+        // for one path is [`Sandbox::from_exposures`]'s, so a canonical form that
+        // is already present — or that another exposure canonicalises to — is its
+        // to reconcile rather than this loop's to test for. The guard is only the
+        // one rewrite this function exists for.
+        if canonical != exposure.host {
             exposures.push(Exposure {
                 host: canonical,
                 access: exposure.access,
@@ -766,9 +765,39 @@ pub fn with_canonical_paths(sandbox: &Sandbox) -> Sandbox {
         }
     }
 
-    // The flag travels as an argument rather than as state the rebuilt set
-    // carries, so there is nothing to re-apply afterwards.
-    Sandbox::from_exposures(exposures, sandbox.device_files_enabled())
+    // Nothing of the caller's set is left behind: the rebuilt one is the exposures
+    // this function canonicalised, and a `Sandbox` carries nothing else.
+    CanonicalExposures(Sandbox::from_exposures(exposures))
+}
+
+/// An exposure set that has been through [`with_canonical_paths`] — **the distinction a raw
+/// [`Sandbox`] cannot carry.**
+///
+/// `Sandbox` is what both stages are made of, so nothing but a comment separated "the set as the
+/// caller spelled it" from "the set the profile may name": Seatbelt compares a rule's path
+/// against the *real* path, so a rule rendered from the caller's spelling matches nothing, and a
+/// launch that rendered the set as it arrived would be confined by rules that never fire. This
+/// layer is that distinction — [`with_canonical_paths`] hands back no other value, and it is the
+/// only way to reach [`Self::sandbox`].
+///
+/// **The renderer still takes a raw `Sandbox`**, and that is deliberate rather than an oversight:
+/// a test that renders the set *as it stands* is how "this rule is the canonicalisation's doing"
+/// is proved (see `tests/injection.rs`), so narrowing [`profile`]'s parameter would make that
+/// property unstatable. What the layer buys is that a caller reaching the renderer from a launch
+/// has to have gone through the canonicalisation to say so.
+#[derive(Debug)]
+pub struct CanonicalExposures(Sandbox);
+
+impl CanonicalExposures {
+    /// The set, for the renderer — the one crossing point this layer has.
+    pub fn sandbox(&self) -> &Sandbox {
+        &self.0
+    }
+
+    /// The exposures: the canonical spellings, and the caller's own where they differed.
+    pub fn exposures(&self) -> &[Exposure] {
+        self.0.exposures()
+    }
 }
 
 /// Refuse a path this profile cannot name, logging where the `Error` is built.
@@ -1073,16 +1102,13 @@ mod tests {
     }
 
     #[test]
-    fn the_device_file_flag_is_not_spent_on_this_platform() {
-        // The flag still travels — `sandbox_request` sets it for Linux, where the
-        // jail binds the four nodes — and this platform renders nothing for it.
-        // The five literals this profile used to carry were measured unnecessary
-        // on both paths and deleted (design §5's audit paragraph); this leg is
-        // what fails if a rule for the flag comes back without a measurement.
-        let sandbox = Sandbox::new()
-            .expose("/srv/data", AccessMode::ReadWrite)
-            .device_files();
-        assert!(sandbox.device_files_enabled());
+    fn no_device_literal_is_rendered_on_this_platform() {
+        // Device files are Linux's concept and this crate has no flag for them, so
+        // the only thing left to assert is the text: the literals this profile used
+        // to carry were measured unnecessary on both paths and deleted (design §5's
+        // audit paragraph), and this leg is what fails if one comes back without a
+        // measurement.
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
         let rendered = profile(&sandbox, Mechanism::SandboxExec).unwrap();
         for device in [
             "/dev/null",
@@ -1334,12 +1360,9 @@ mod tests {
     }
 
     #[test]
-    fn canonicalisation_leaves_access_and_device_files_alone() {
-        let sandbox = Sandbox::new()
-            .expose("/srv/data", AccessMode::ReadOnly)
-            .device_files();
+    fn canonicalisation_leaves_the_access_mode_alone() {
+        let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
         let out = with_canonical_paths(&sandbox);
-        assert!(out.device_files_enabled());
         assert!(
             out.exposures()
                 .iter()

@@ -12,7 +12,7 @@ use std::{
     io::{Error as IoError, ErrorKind},
     path::Path,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -30,27 +30,30 @@ use crate::{
         acl, bucket, checksum,
         pipeline::{self, Completion, Error::ShutDown, Reply, Runner, Stats, Task},
     },
-    _util::testing::wait_for as util_wait_for,
+    _util::testing::{
+        checksum_tee as util_checksum_tee, conform_group_read_grant, conform_other_owner,
+        conform_owner, wait_for as util_wait_for,
+    },
     Error, FsOptions, FsStorage, etag, testing,
 };
 
-/// A canonical owner id for the ACL tests (64 lowercase hex).
+/// A canonical owner id for the ACL tests (64 lowercase hex) — the shared
+/// `tinio_util::testing::conform_owner` fixture.
 pub(crate) fn owner_id() -> acl::OwnerId {
-    acl::OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap()
+    conform_owner()
 }
 
-/// A second canonical owner id, distinct from [`owner_id`].
+/// A second canonical owner id, distinct from [`owner_id`] — the shared
+/// `tinio_util::testing::conform_other_owner` fixture.
 pub(crate) fn other_owner_id() -> acl::OwnerId {
-    acl::OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap()
+    conform_other_owner()
 }
 
 /// A group-read grant over the documented AllUsers URI — the standard
-/// test grant.
+/// test grant, the shared `tinio_util::testing::conform_group_read_grant`
+/// fixture.
 pub(crate) fn all_users_read_grant() -> acl::Grant {
-    acl::Grant {
-        grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
-        permission: acl::Permission::Read,
-    }
+    conform_group_read_grant()
 }
 
 /// The effective uid of the test process (unix): the probe file's uid IS
@@ -70,20 +73,13 @@ pub(crate) fn euid() -> u32 {
 /// holds `algorithm`/`base64_value`, so a staged body commits it as the
 /// object's recorded checksum. The server's tee would fill the cell while
 /// the body streamed; tests preset it — the backends never validate the
-/// value against the bytes.
+/// value against the bytes. The shared `tinio_util::testing::checksum_tee`
+/// fixture.
 pub(crate) fn checksum_tee(
     algorithm: checksum::Algorithm,
     base64_value: &str,
 ) -> Arc<checksum::PartChecksum> {
-    let tee = Arc::new(checksum::PartChecksum {
-        digest: OnceLock::new(),
-        etag: None,
-    });
-    let _ = tee.digest.set(checksum::Part {
-        algorithm,
-        value: checksum::Value(base64_value.into()),
-    });
-    tee
+    util_checksum_tee(algorithm, base64_value)
 }
 
 /// The base64 wire value of `data`'s content MD5 — the honest digest of

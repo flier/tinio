@@ -9,7 +9,6 @@
 //! from the same root the Windows pipe's name comes from.
 
 use std::{
-    fmt::{Debug, Formatter, Result as FmtResult},
     fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
@@ -22,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub use crate::_util::secret::Secret;
 #[cfg(windows)]
 use crate::_winsec::{acl_is_current_user_only, create_restricted, restrict_to_current_user};
-use crate::Error;
+use crate::{_util::secret::SecretKey, Error};
 
 /// The file's name inside the state directory.
 ///
@@ -110,16 +110,17 @@ fn channel_stem(root: &Path) -> Result<String, Error> {
 
 /// What a running server records about itself.
 ///
-/// **The token is redacted from `Debug`** — a manual impl, not the derive. This value rides
-/// inside the client's `Report`, so any `tracing::debug!(?report)` in a CLI would print the
-/// bearer token into the operational log; the redaction costs one field and removes the class.
-/// Every other field renders as the derive would, so nothing else loses detail.
+/// **The token is a [`Secret`]** — the shared `SecretBox` layer (`tinio_util::secret`);
+/// redacted from `Debug` by construction. This value rides inside the client's `Report`, so
+/// any `tracing::debug!(?report)` in a CLI would otherwise print the bearer token into the
+/// operational log. Every other field renders as the derive would.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use std::path::Path;
 ///
+/// use secrecy::ExposeSecret;
 /// use tinio_api::state::State;
 ///
 /// let state = State::new(
@@ -131,12 +132,15 @@ fn channel_stem(root: &Path) -> Result<String, Error> {
 /// assert_eq!(state.version, 1);
 /// assert_eq!(state.port, Some(9000));
 /// // The token is readable where it is used — and never through `Debug`.
-/// assert_eq!(state.token.len(), 64);
+/// assert_eq!(state.token.expose_secret().len(), 64);
 /// let printed = format!("{state:?}");
-/// assert!(printed.contains("<redacted>"), "{printed}");
-/// assert!(!printed.contains(&state.token), "{printed}");
+/// assert!(printed.contains("REDACTED"), "{printed}");
+/// assert!(
+///     !printed.contains(state.token.expose_secret().as_str()),
+///     "{printed}"
+/// );
 /// ```
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub struct State {
     /// [`STATE_VERSION`] at the time of writing; a different value is refused on read.
     pub version: u32,
@@ -144,7 +148,10 @@ pub struct State {
     /// liveness — an absent control channel, not a stale pid, is what "stopped" means.
     pub pid: u32,
     /// The `X-Tinio-Token` value, hex-encoded `TOKEN_BYTES`.
-    pub token: String,
+    ///
+    /// [`Secret`]: bearer credential via the shared box; `Debug` redacts it so a log line
+    /// that dumps a `State` cannot print the value that guards `/status` and `/stop`.
+    pub token: Secret,
     /// The control channel's identity: the socket path (absolute — the derived default or
     /// the `[api.unix] path` override), the pipe name, or the TCP address. Clients read this
     /// and never re-derive it.
@@ -155,21 +162,6 @@ pub struct State {
     pub root: PathBuf,
     /// RFC3339, UTC.
     pub started_at: String,
-}
-
-// The struct's doc states why this is manual rather than derived.
-impl Debug for State {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_struct("State")
-            .field("version", &self.version)
-            .field("pid", &self.pid)
-            .field("token", &"<redacted>")
-            .field("control_name", &self.control_name)
-            .field("port", &self.port)
-            .field("root", &self.root)
-            .field("started_at", &self.started_at)
-            .finish()
-    }
 }
 
 /// The `state` file's path inside `state_dir`.
@@ -232,6 +224,7 @@ impl State {
     /// ```rust
     /// use std::path::Path;
     ///
+    /// use secrecy::ExposeSecret;
     /// use tinio_api::state::State;
     ///
     /// let state = State::new(
@@ -241,7 +234,7 @@ impl State {
     /// )
     /// .expect("state");
     /// assert_eq!(state.pid, std::process::id());
-    /// assert_eq!(state.token.len(), 64);
+    /// assert_eq!(state.token.expose_secret().len(), 64);
     /// ```
     pub fn new(
         control_name: impl Into<String>,
@@ -271,6 +264,7 @@ impl State {
     /// ```rust
     /// use std::path::Path;
     ///
+    /// use secrecy::ExposeSecret;
     /// use tinio_api::state::State;
     ///
     /// let token = "00".repeat(32);
@@ -281,19 +275,19 @@ impl State {
     ///     token.clone(),
     /// )
     /// .expect("state");
-    /// assert_eq!(state.token, token);
+    /// assert_eq!(state.token.expose_secret().as_str(), token.as_str());
     /// assert_eq!(state.pid, std::process::id());
     /// ```
     pub fn with_token(
         control_name: impl Into<String>,
         port: Option<u16>,
         root: &Path,
-        token: String,
+        token: impl Into<String>,
     ) -> Result<Self, Error> {
         Ok(Self {
             version: STATE_VERSION,
             pid: process::id(),
-            token,
+            token: SecretKey::from(token.into()).into(),
             control_name: control_name.into(),
             port,
             root: root.to_path_buf(),

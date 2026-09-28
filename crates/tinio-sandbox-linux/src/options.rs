@@ -9,10 +9,7 @@ use std::{env, path::PathBuf};
 
 use rustix::process::geteuid;
 
-use crate::{
-    _core::{AccessMode, Result},
-    Mechanism,
-};
+use crate::{_core::Result, Mechanism};
 
 /// How to confine, and the facts the backend needs that the sandbox does not
 /// own.
@@ -29,9 +26,9 @@ use crate::{
 pub struct Options {
     model: Mechanism,
     local_uid_configured: bool,
+    device_files: bool,
     tmpdir: Option<PathBuf>,
     euid: Option<u32>,
-    served_root_access: AccessMode,
 }
 
 impl Options {
@@ -141,19 +138,27 @@ impl Options {
         self
     }
 
-    /// The access the served root gets; decides the capability set.
+    /// Bind the four [`DEVICE_FILES`](crate::DEVICE_FILES) into the jail.
+    ///
+    /// **This is the request's flag moved onto this crate's own options, with
+    /// the default it had there.** `Sandbox` used to carry it — a
+    /// cross-platform type holding a knob only this backend reads, and a no-op
+    /// on the other two — while the facts the plan needs that the sandbox does
+    /// not own belong here (this module's own doc, and design decision 4).
+    /// **Unset means no device nodes**: a caller that does not ask gets the
+    /// smaller jail, which is what the `Sandbox` builder answered before the
+    /// move, and `plan` reads the flag from here.
     ///
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_core::AccessMode;
     /// use tinio_sandbox_linux::Options;
     ///
-    /// let options = Options::default().with_served_root_access(AccessMode::ReadOnly);
-    /// assert!(options.served_root_access().is_read_only());
+    /// assert!(!Options::default().device_files());
+    /// assert!(Options::default().with_device_files(true).device_files());
     /// ```
-    pub fn with_served_root_access(mut self, access: AccessMode) -> Self {
-        self.served_root_access = access;
+    pub fn with_device_files(mut self, device_files: bool) -> Self {
+        self.device_files = device_files;
         self
     }
 
@@ -187,21 +192,20 @@ impl Options {
         self.tmpdir.as_ref()
     }
 
-    /// The access the served root gets.
+    /// Whether the four device files are bound into the jail.
     ///
     /// # Examples
     ///
     /// ```
-    /// use tinio_sandbox_core::AccessMode;
     /// use tinio_sandbox_linux::Options;
     ///
-    /// assert_eq!(
-    ///     Options::default().served_root_access(),
-    ///     AccessMode::ReadWrite
+    /// assert!(
+    ///     !Options::default().device_files(),
+    ///     "unset binds no device node"
     /// );
     /// ```
-    pub fn served_root_access(&self) -> AccessMode {
-        self.served_root_access
+    pub fn device_files(&self) -> bool {
+        self.device_files
     }
 
     /// Whether a `local_uid` mapping is configured.
@@ -259,14 +263,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::_core::AccessMode;
+    use crate::_core::Error;
 
     #[test]
-    fn defaults_are_a_read_write_root_with_an_automatic_model() {
+    fn defaults_are_an_automatic_model_and_a_jail_with_nothing_extra_in_it() {
+        // **The served root's access is deliberately absent from this list** —
+        // it is the request's first exposure, and `enter` reads it from there
+        // rather than from a second spelling that could disagree with it. What
+        // is left is what `Options` really owns: the model, the `local_uid`
+        // mapping, and the device-file flag.
         let opts = Options::default();
         assert_eq!(opts.model(), Mechanism::Auto);
-        assert_eq!(opts.served_root_access(), AccessMode::ReadWrite);
         assert!(!opts.local_uid_configured());
+        assert!(!opts.device_files());
     }
 
     #[test]
@@ -274,13 +283,65 @@ mod tests {
         let opts = Options::default()
             .with_model(Mechanism::Root)
             .with_local_uid(true)
+            .with_device_files(true)
             .with_tmpdir(PathBuf::from("/tmp"))
-            .with_euid(1000)
-            .with_served_root_access(AccessMode::ReadOnly);
+            .with_euid(1000);
         assert_eq!(opts.model(), Mechanism::Root);
         assert!(opts.local_uid_configured());
+        assert!(opts.device_files());
         assert_eq!(opts.tmpdir(), Some(&PathBuf::from("/tmp")));
         assert_eq!(opts.euid(), 1000);
-        assert_eq!(opts.served_root_access(), AccessMode::ReadOnly);
+    }
+
+    #[test]
+    fn the_environment_is_read_through_its_one_reader() {
+        // **The production entry, and the only caller of `Mechanism::from_env`**:
+        // the WSL2 script's two legs differ exactly by this variable (design
+        // §12), so a reader that quietly picked `Auto` would run the same leg
+        // twice and the root model would never be exercised.
+        //
+        // **The variable is read here and never written**, because `set_var` is
+        // `unsafe` in edition 2024 and this crate forbids `unsafe` — so the
+        // expectation is spelled out from the environment beside the call, as the
+        // function's own doc example does, and the test holds whether this
+        // process was started with the variable absent, empty, or naming a model.
+        // What it pins is the mapping and the refusal's own words, which is
+        // everything the function owns.
+        let raw = env::var("TINIO_SANDBOX_MODEL").ok();
+        let expected = match raw.as_deref() {
+            None | Some("") => Ok(Mechanism::Auto),
+            Some("userns") => Ok(Mechanism::UserNamespace),
+            Some("root") => Ok(Mechanism::Root),
+            Some(_) => Err("a value that names no model"),
+        };
+        match (Options::from_env(), expected) {
+            (Ok(options), Ok(model)) => assert_eq!(options.model(), model),
+            (Err(error), Err(_)) => assert!(
+                matches!(error, Error::Unsupported { .. })
+                    && error.to_string().contains("TINIO_SANDBOX_MODEL"),
+                "{error}"
+            ),
+            (options, expected) => panic!("{options:?} against {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn the_tmpdir_resolves_to_the_environments_answer_when_unset() {
+        // **Unset is `env::temp_dir()`, and that is the jail's parent rather than
+        // a default**: the jail tmpfs is created inside it, so the `$TMPDIR` this
+        // answers is the path the `create jail root in $TMPDIR` refusal names.
+        assert_eq!(
+            Options::default().resolved_tmpdir(),
+            env::temp_dir(),
+            "unset means the environment's answer"
+        );
+        let set = PathBuf::from("/var/tmp");
+        assert_eq!(
+            Options::default()
+                .with_tmpdir(set.clone())
+                .resolved_tmpdir(),
+            set,
+            "and a set one is handed back unchanged"
+        );
     }
 }

@@ -17,7 +17,7 @@ use std::{
 
 use rustix::process::{Signal, getpid, kill_process};
 use tinio_sandbox_macos::relay::{disarm, on_stop};
-use tinio_util::testing::poll_exit;
+use tinio_util::testing::{kill_and_reap, poll_exit};
 
 /// The two tests below share this module's process-wide state — the armed pid
 /// and the installed handlers — and **libtest runs tests in parallel by
@@ -89,6 +89,5 @@ fn a_disarmed_relay_leaves_the_child_alone() {
         child.try_wait().expect("try_wait").is_none(),
         "a disarmed relay must not forward"
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(&mut child);
 }

@@ -30,6 +30,8 @@ use rustix::process::{Pid, Signal, kill_process};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
 
+#[cfg(windows)]
+use crate::_util::process::kill_and_reap;
 use crate::{
     _api::state::{self as api_state, State},
     Error,
@@ -252,8 +254,7 @@ fn windows_detach(
         Ok(()) => process::exit(0),
         Err(err) => {
             // Failure must not leave a "false fail, still running" child.
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             eprintln!("tinio: {err}");
             process::exit(1);
         }

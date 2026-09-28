@@ -224,7 +224,7 @@ fn the_callers_access_survives_the_exposure_of_its_own_directory() {
 /// invocation, not through the per-path loop the caller's entries take — so a
 /// refusal that read the *granted* set would refuse the launcher's own launch.
 /// This pins both halves on the public surface, with the caller-file refusal
-/// itself asserted where `canonical_caller` is reachable
+/// itself asserted where the caller's set is built
 /// (`src/backend/tests.rs`).
 #[test]
 fn the_executables_own_file_entries_are_granted_rather_than_refused() {
@@ -267,13 +267,15 @@ fn the_executables_own_file_entries_are_granted_rather_than_refused() {
 }
 
 /// A program directory with no DLL is one entry and no pattern, and a directory
-/// with one is a pattern the tool matches against that directory — the shape
-/// the grant goes through.
+/// with one is the pattern that spells the set.
 ///
-/// The negative half is the assertion that matters: an unmatched pattern is an
-/// `icacls` error rather than a no-op (measured 2026-09-21), so answering `None`
-/// for a directory with no sibling is what keeps `Grants` from recording a grant
-/// that never landed.
+/// **The pattern is the set's own spelling now and no longer the grant's
+/// mechanism**: the grant opens each enumerated DLL by handle, because a wildcard
+/// names objects no handle can be opened on — and because the tool's pattern
+/// matching was the half that let a linked `x.dll` be granted through the link.
+/// What this test still pins is the public contract the enumeration is read
+/// through: `None` exactly when the directory holds no DLL, and `dir\*.dll`
+/// otherwise, never the parent's.
 #[test]
 fn the_sibling_pattern_covers_exactly_the_directly_inside_dlls() {
     let dir = tempfile::tempdir().expect("temp dir");

@@ -5,6 +5,7 @@ use std::{
     ffi::CString,
     fs,
     io::{self, Write as _},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -23,7 +24,7 @@ use rustix::{
 use tracing::{Span, debug, field, info, instrument};
 
 use crate::{
-    _core::{Confinement, Error, Exposure, Result, Sandbox},
+    _core::{Confinement, Error, Exposure, Result, Sandbox, describe_exposures},
     Mechanism,
     caps::{self, Cap},
     jail::{EXPOSE_STEP, jail_root, mirror_under},
@@ -65,15 +66,38 @@ impl crate::Backend {
     /// Returns [`Confinement::InPlace`] on success; the process is jailed by
     /// then, and every failure is fatal (design §11).
     ///
+    /// # Preconditions
+    ///
+    /// **The calling process must be single-threaded, and this call enforces
+    /// that rather than assuming it** (design §8, §10). Every operation the
+    /// confinement performs on itself — `unshare`, `no_new_privs`, the
+    /// capability drop and the seccomp filter — applies to the calling task
+    /// alone, so a process that arrived here with a second thread would leave it
+    /// holding the host mount namespace, the full credentials and an unfiltered
+    /// network while this call still answered [`Confinement::InPlace`]. A
+    /// process with more than one thread is refused by [`refuse_when_threaded`],
+    /// which names the count; it runs before the first irreversible step, so
+    /// nothing is left behind by the refusal.
+    ///
     /// # Errors
     ///
     /// [`Error::BadPath`] before anything irreversible happens;
     /// [`Error::Unsupported`] when the model is unavailable or a combination
     /// the design refuses was asked for; [`Error::Step`] for any refusing
-    /// syscall, named by the step.
+    /// syscall, named by the step — and for the thread precondition, which is
+    /// the one refusal here that is not a syscall's answer but this sequence's
+    /// own.
     #[instrument(skip_all, fields(model = ?opts.model(), euid = opts.euid()))]
     pub(crate) fn enter(&mut self, sandbox: &Sandbox, opts: &Options) -> Result<Confinement> {
         let prepared = validate_and_plan(sandbox, opts)?;
+        // **The precondition every step below shares, checked before the first
+        // of them** (design §8, §10). It sits after validation so an operator's
+        // own mistake is still reported as itself, and before
+        // `create_jail_root` — the first thing the confinement does to the host
+        // — so a refusal cannot leave a jail directory behind.
+        // `refuse_when_threaded` owns the reasoning; what matters here is the
+        // position, which is what makes the guarantee rather than the check.
+        refuse_when_threaded()?;
         create_jail_root(&prepared.jail)?;
         let map_fds = enter_user_namespace(prepared.resolved, opts)?;
         enter_mount_namespace()?;
@@ -88,8 +112,18 @@ impl crate::Backend {
         //    The filter's outcome is recorded on the backend rather than
         //    dropped: `serve` reads it to warn when the one degradable step
         //    degraded (design §11).
+        //
+        //    **The access is the served root's own exposure, not a second field
+        //    that could disagree with it.** It used to be an `Options` knob the
+        //    caller set beside the request, and its default was the wrong answer
+        //    for a `--read-only` run: the exposure set said read-only while this
+        //    value stayed read-write, so the jail served the root **writable** —
+        //    the kernel-level half of FR-023, absent with nothing to say so.
+        //    There is one spelling now: the first exposure, the same entry the
+        //    jail was built from, and it cannot fail here because
+        //    [`validate_and_plan`] already refused an empty set.
         drop_capabilities(caps::retained(
-            opts.served_root_access(),
+            sandbox.served_root()?.access,
             opts.local_uid_configured(),
         ))?;
         self.seccomp = Some(seccomp::install()?);
@@ -133,20 +167,20 @@ fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
         return Err(refused("local_uid", local_uid_conflicts_with_userns()));
     }
 
-    // Nothing exposed is the caller's bug, not the platform's shortcoming,
-    // and it is decided **before the probe** so the answer does not depend on
-    // what this host happens to allow. `Error::Unsupported` would send the
-    // operator to look at their kernel, which is the wrong place (design §11).
-    let served_root = sandbox
-        .exposures()
-        .first()
-        .map(|e| e.host.clone())
-        .ok_or_else(|| fail("confine", io::Error::other("nothing exposed to confine to")))?;
+    // Nothing exposed is the caller's bug, not the platform's shortcoming, and
+    // it is decided **before the probe** so the answer does not depend on what
+    // this host happens to allow. `Error::Unsupported` would send the operator
+    // to look at their kernel, which is the wrong place (design §11). **The
+    // refusal itself is the core's now** — `Sandbox::served_root` is that
+    // convention's one home, because every backend spelled the same two lines —
+    // and it is the same `Error::Step` with the same `confine` step and the same
+    // message this block used to build by hand.
+    let served_root = &sandbox.served_root()?.host;
 
     let resolved = resolve_model(opts)?;
     validate_exposures(sandbox)?;
 
-    let jail = jail_root(&opts.resolved_tmpdir(), &served_root);
+    let jail = jail_root(&opts.resolved_tmpdir(), served_root);
     let overlay = OverlayDirs {
         upper: jail.join(".overlay/upper"),
         work: jail.join(".overlay/work"),
@@ -159,7 +193,7 @@ fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
     // twice for this caller, while the caller the rule is actually about (one
     // outside the crate, which never reaches this line) was the one with no
     // record of it at all.
-    let mounts = plan(sandbox, &jail, resolved)?;
+    let mounts = plan(sandbox, &jail, resolved, opts)?;
 
     Ok(Prepared {
         resolved,
@@ -224,7 +258,12 @@ fn resolve_model(opts: &Options) -> Result<Mechanism> {
     // because `Auto` is a request that becomes one of the two, and an operator
     // asking "was this process confined, and how" is asking about the one that
     // ran. `Debug`-level detail belongs to the spans this function keeps; this
-    // is the event that has to survive `serve`'s fixed `Verbosity::Info`.
+    // is the event that has to survive a subscriber at a fixed
+    // `Verbosity::Info`, which is what `serve` builds — **and on this platform
+    // that subscriber is installed after `confine`, so `serve` itself reads
+    // neither this event nor any other the confinement emits** (the ordering
+    // `refuse_when_threaded` states). The level is chosen for the caller that
+    // does install one before confining.
     info!(
         step = "model",
         model = ?resolved,
@@ -235,9 +274,15 @@ fn resolve_model(opts: &Options) -> Result<Mechanism> {
     Ok(resolved)
 }
 
-/// Refuse a missing or un-mirrorable exposure before a directory is created.
+/// Refuse a symlink, a missing path, or an un-mirrorable exposure before a
+/// directory is created.
 fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
-    // Existence first: `/tmp/does-not-exist` should say so, not report a
+    // The symlink check is first, and it does not follow. `exists` does follow,
+    // so a link to a real directory would otherwise pass and the bind below
+    // would mount the target. A component that cannot be stat'd is left to the
+    // existence check: that one names a path that is not there.
+    //
+    // Existence next: `/tmp/does-not-exist` should say so, not report a
     // jail-root mismatch, and the jail directory created just below must
     // not be the thing that makes a mistyped path look present.
     //
@@ -247,6 +292,7 @@ fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
     // — as well as a relative one, and it does it before a directory is
     // created anywhere.
     for exposure in sandbox.exposures() {
+        refuse_symlink_exposure(&exposure.host)?;
         if !exposure.host.exists() {
             return Err(refused(
                 EXPOSE_STEP,
@@ -263,6 +309,183 @@ fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
         mirror_under(Path::new("/"), &exposure.host)?;
     }
     Ok(())
+}
+
+/// A bind follows a symlink, so an exposure through one would mount the target.
+const SYMLINK_EXPOSURE: &str =
+    "is a symlink, and a bind of it would mount the target rather than the path that was exposed";
+
+/// Refuse `path` when it, or any directory above it, is a symlink.
+///
+/// The whole chain, not the last component: a directory reached through a
+/// linked parent is the target's directory. `symlink_metadata` reports the
+/// link itself. A component that cannot be read is not this check's to refuse
+/// — the existence check that follows reports a path that is not there.
+fn refuse_symlink_exposure(path: &Path) -> Result<()> {
+    for component in path.ancestors() {
+        let Ok(metadata) = fs::symlink_metadata(component) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(refused(
+                EXPOSE_STEP,
+                Error::BadPath {
+                    path: component.to_path_buf(),
+                    reason: SYMLINK_EXPOSURE,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `/proc/self/task`: one entry per task in this thread group, which is the
+/// whole of what the single-thread precondition reads.
+///
+/// **`/proc/self` rather than `/proc/<pid>`**, because the question is about the
+/// task group the confinement is about to change and nothing else — the same
+/// group every per-thread operation below is scoped to.
+const TASK_DIR: &str = "/proc/self/task";
+
+/// The step both refusals of the single-thread precondition carry.
+///
+/// **One name for the two ways it fails, because they are one precondition**
+/// (shared §7): more than one task in [`TASK_DIR`], and a [`TASK_DIR`] that
+/// cannot be read at all, are the same answer to the same question — this
+/// process was not *shown* to be single-threaded, so it is not confined. What
+/// separates them is the [`Error::Step`]'s source: the count, or the `read_dir`
+/// error. An operator greps one string for both.
+const THREAD_STEP: &str = "confine single-threaded";
+
+/// Refuse to confine a process that has more than one thread.
+///
+/// **Every operation of the sequence is per-thread, which is why one thread is a
+/// precondition rather than a preference.** `unshare` moves the calling task's
+/// own `nsproxy` — the threads of a process share one until a thread unshares
+/// it — `PR_SET_NO_NEW_PRIVS`, the bounding-set drops and the `capset` write the
+/// calling task's credentials, and `PR_SET_SECCOMP` installs its filter on the
+/// calling task alone. A sibling thread therefore keeps the host mount
+/// namespace, the full credentials and an unfiltered network for as long as the
+/// process lives, while [`crate::Backend::enter`] returns
+/// [`Confinement::InPlace`] and the run reports a confinement that covers one
+/// task of several. **The root model is where that was silent**: its only
+/// `unshare` is `CLONE_NEWNS`, which a multi-threaded process may make. The
+/// user-namespace model fails earlier instead — `unshare(CLONE_NEWUSER)` is
+/// `EINVAL` with more than one thread, the design's own measured evidence row —
+/// but its `Error::Step` names `unshare` rather than the thread count, which is
+/// the wrong diagnosis for the operator who has to act on it, and no diagnosis
+/// at all for the capabilities and the filter, which the root model reaches in
+/// the same state.
+///
+/// **The entry point is where that was reachable, and both sides are ordered
+/// against it now.** `serve` builds a subscriber that carries an OTLP endpoint
+/// in an `otel` build with `[telemetry]` configured, and `opentelemetry_sdk`'s
+/// batch exporter spawns its `OpenTelemetry.Traces.BatchProcessor` thread when
+/// the provider is built — so a subscriber installed *before* the confinement
+/// is a thread the confinement would leave outside, which is what the CLI used
+/// to do and what made this reachable. It installs the subscriber *after*
+/// `confine` on this platform now, so the thread it starts is created inside the
+/// namespaces, the dropped capability set and the filter. **Neither half
+/// replaces the other**: the order belongs to the entry point and cannot be
+/// enforced from here, and this check belongs to this crate and does not depend
+/// on any entry point getting that order right.
+///
+/// **Refusal rather than `SECCOMP_FILTER_FLAG_TSYNC`, which would be the half
+/// measure.** TSYNC synchronises the *filter* across the threads that exist when
+/// it is passed and nothing else: the mount namespace, the user namespace,
+/// `no_new_privs` and the capability sets would still be the calling task's
+/// alone. It would shrink the hole rather than close it, and it would leave a
+/// process reporting [`Confinement::InPlace`] whose siblings are still reachable
+/// exactly the way the mount view and the ptrace family exist to prevent. The
+/// remedy belongs to the sequence and not to a flag: start the process
+/// single-threaded, or do not confine it in place.
+///
+/// **Fail-closed, so an unreadable [`TASK_DIR`] is a refusal too** (design §11):
+/// the check's whole job is to say the process was *shown* to be
+/// single-threaded, and answering "carry on" for a `/proc` that could not be
+/// read is precisely the silent under-confinement it exists to refuse. A process
+/// that cannot be inspected before it is jailed is not confined, and that is the
+/// answer even where the read failed for an unrelated reason.
+///
+/// **Cheap**, which the call site's position depends on: one `read_dir` at
+/// startup, counted by iterating the entries and allocating nothing.
+///
+/// # Errors
+///
+/// [`Error::Step`] with [`THREAD_STEP`], whose source carries either the task
+/// count or the errno the directory read failed with.
+fn refuse_when_threaded() -> Result<()> {
+    require_single_thread(task_count(Path::new(TASK_DIR))?)
+}
+
+/// The policy [`refuse_when_threaded`] applies to a count.
+///
+/// **Split out so the decision is reachable from a test without a
+/// single-threaded process**: libtest runs every test on a worker thread beside
+/// the harness's own, so the refusal can be asserted against the real
+/// [`TASK_DIR`] and the *acceptance* cannot — it is asserted here, over the
+/// count, and the two tests together are the property: [`task_count`] reads the
+/// kernel's count, and one task is what that count has to be.
+/// `src/bin/sandbox-child.rs` is the end-to-end half, a `fn main` that is
+/// single-threaded and confines for real.
+///
+/// # Errors
+///
+/// [`Error::Step`] with [`THREAD_STEP`] when `tasks` is more than one, whose
+/// source is the operator-facing sentence: how many threads there are, how many
+/// the confinement would leave outside, and what those would keep.
+fn require_single_thread(tasks: usize) -> Result<()> {
+    if tasks <= 1 {
+        return Ok(());
+    }
+    Err(fail(
+        THREAD_STEP,
+        io::Error::other(format!(
+            "this process has {tasks} threads, and confining it in place would leave {} of them \
+             outside: unshare, no_new_privs, the capability drop and the seccomp filter all apply \
+             to the calling task alone, so the rest would keep the host mount namespace, the full \
+             credentials and an unfiltered network while this run reported itself confined. \
+             Confine before anything spawns a thread — the tracing subscriber and the async \
+             runtime both do — or do not confine in place",
+            tasks - 1
+        )),
+    ))
+}
+
+/// The task count in `dir` — one directory read, by [`refuse_when_threaded`].
+///
+/// **The read is the precondition's whole cost, and its failure is the refusal**
+/// (see [`refuse_when_threaded`]): an entry that cannot be read is the same
+/// answer as a directory that cannot be opened, because a count taken from a
+/// listing that lost entries could be wrong in the direction that matters, and
+/// this count is never one to guess at.
+///
+/// `read_dir` yields one entry per task and no `.`/`..` of its own — measured on
+/// the acceptance kernel: `1` for a single-threaded process and `2` with one
+/// thread spawned — so the count is the length of the iteration rather than a
+/// filtered subset of it.
+///
+/// `dir` is [`TASK_DIR`] at the call site and a parameter here so that the
+/// fail-closed half — an unreadable directory refuses rather than passes — is a
+/// property a test can lose.
+///
+/// # Errors
+///
+/// [`Error::Step`] with [`THREAD_STEP`] and a source naming `dir` and the errno,
+/// whichever of the read's two steps failed.
+fn task_count(dir: &Path) -> Result<usize> {
+    let unreadable = |source: io::Error| {
+        fail(
+            THREAD_STEP,
+            io::Error::new(source.kind(), format!("{}: {source}", dir.display())),
+        )
+    };
+    let mut tasks = 0usize;
+    for entry in fs::read_dir(dir).map_err(unreadable)? {
+        entry.map_err(unreadable)?;
+        tasks += 1;
+    }
+    Ok(tasks)
 }
 
 /// The jail root inside `$TMPDIR` — created before the first `unshare`.
@@ -391,36 +614,14 @@ fn announce_exposures(exposures: &[Exposure], mounts: usize) {
         step = "exposures",
         count = exposures.len(),
         mounts,
+        // **The renderer is the core's**, and this file's private copy of it is
+        // gone: both spelled `path (access)` with `read-only`/`read-write`, which
+        // is exactly the state that let a third platform render the same set as
+        // the enum's `Debug`. `describe_exposures` owns the spelling and the
+        // history.
         exposures = %describe_exposures(exposures),
         "the exposure set the jail applied"
     );
-}
-
-/// The exposure set as one field value: `path (access)` per entry, comma
-/// separated.
-///
-/// **A rendered list is a field value and not a sentence**, which is the shape
-/// §7's "fields, not sentences" asks for: `step`, `path` and `access` stay field
-/// names, and what a *set* needs is one field whose value is the set — the same
-/// shape `tinio-sandbox-windows`' grant phase announces its own with. The access
-/// is spelled rather than debug-printed because this line is read by an operator
-/// asking what the jail let through.
-fn describe_exposures(exposures: &[Exposure]) -> String {
-    exposures
-        .iter()
-        .map(|exposure| {
-            format!(
-                "{} ({})",
-                exposure.host.display(),
-                if exposure.access.is_read_only() {
-                    "read-only"
-                } else {
-                    "read-write"
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Pivot into the jail and detach the old root.
@@ -518,20 +719,9 @@ fn refused_remount_needs_the_overlay(source: Errno) -> bool {
 /// configuration that is already as read-only as the exposure asks for. The
 /// mount's own options are the sixth field, and `rw` is always one of them.
 ///
-/// **The fifth whitespace-separated field is the mount point, escaped** —
-/// `\040` for a space, `\011` for a tab, `\012` for a newline and `\134` for a
-/// backslash — and it is decoded before the comparison, which is the only reason
-/// a target with a space in its name can match its own submounts. No raw
-/// whitespace can appear in the field, so splitting on it is safe.
+/// The two fields it compares are [`mount_entries`]'s, parsed and decoded there.
 fn writable_nested_mounts_in(table: &str, target: &Path) -> Vec<PathBuf> {
-    table
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let mount_point = fields.nth(4)?;
-            let options = fields.next()?;
-            Some((decode_mountinfo(mount_point), options))
-        })
+    mount_entries(table)
         .filter(|(mount, options)| {
             mount.starts_with(target)
                 && mount != target
@@ -539,6 +729,26 @@ fn writable_nested_mounts_in(table: &str, target: &Path) -> Vec<PathBuf> {
         })
         .map(|(mount, _)| mount)
         .collect()
+}
+
+/// Every line of a `/proc/self/mountinfo` table as its mount point and its own
+/// options — **the two fields both readers below ask for, parsed and decoded
+/// once**.
+///
+/// The mount point is the fifth whitespace-separated field, escaped — `\040` for
+/// a space, `\011` for a tab, `\012` for a newline and `\134` for a backslash —
+/// and it is decoded here so that a caller's comparison sees one spelling of a
+/// path, which is the only reason a target with a space in its name can match
+/// its own submounts. The options are the sixth field, in which no option name
+/// can contain a comma. No raw whitespace can appear in either, so splitting on
+/// it is safe.
+fn mount_entries(table: &str) -> impl Iterator<Item = (PathBuf, &str)> + '_ {
+    table.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let mount_point = fields.nth(4)?;
+        let options = fields.next()?;
+        Some((decode_mountinfo(mount_point), options))
+    })
 }
 
 /// Decode one mountinfo field: the kernel escapes exactly `\040`, `\011`,
@@ -613,19 +823,10 @@ fn read_mountinfo() -> Result<String> {
 /// mounts share a mount point and the table lists the topmost last, which is
 /// the one the bind inherited from.
 ///
-/// The mount point is decoded before it is compared, for [`decode_mountinfo`]'s
-/// reason, and the options are the mount's own sixth field — the same field
-/// [`writable_nested_mounts_in`] reads — in which no option name can contain a
-/// comma, so splitting on one is safe.
+/// The mount point and the options are [`mount_entries`]'s two fields, decoded
+/// there for [`decode_mountinfo`]'s reason.
 fn source_mount_flags_in(table: &str, source: &Path) -> MountFlags {
-    let options = table
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let mount_point = fields.nth(4)?;
-            let options = fields.next()?;
-            Some((decode_mountinfo(mount_point), options))
-        })
+    let options = mount_entries(table)
         .filter(|(mount, _)| source.starts_with(mount))
         // `max_by_key` answers the **last** of several equal maxima, which is
         // the topmost of a stack of mounts sharing one mount point.
@@ -812,14 +1013,31 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     // cannot be resolved is a mount the confinement did not establish, and the
     // process exits before it serves anything.
     let source = fs::canonicalize(&entry.source).map_err(step("canonicalize mount source"))?;
-    let inherited = source_mount_flags_in(&read_mountinfo()?, &source);
+    // **One read of the table answers both of this function's questions, and the
+    // earlier read is the one to keep.** A non-recursive `MS_REMOUNT|MS_BIND`
+    // changes only the target mount's own per-mount flags: every nested submount
+    // below it keeps the flags it had, and `writable_nested_mounts_in` excludes
+    // the target itself — so the pre-remount table answers the nested-mount
+    // question *identically* to the post-remount one it used to be read for, and
+    // this file stops reading and parsing a table that runs to tens or hundreds
+    // of KiB twice per read-only exposure.
+    //
+    // **The check that consumes it is fail-closed, so the argument above is the
+    // reason this line is allowed to be one line**: if a remount could change a
+    // submount's flags, this read would report a read-only exposure while a
+    // writable mount stayed reachable inside it, which is the one outcome
+    // `refuse_writable_nested_mounts` exists to prevent. It cannot — that is what
+    // "non-recursive" means for a remount — and both readers below take their
+    // fields from the one parser, [`mount_entries`].
+    let table = read_mountinfo()?;
+    let inherited = source_mount_flags_in(&table, &source);
     match mount_remount(
         &entry.target,
         MountFlags::RDONLY | MountFlags::BIND | inherited,
         "",
     ) {
         Ok(()) => {
-            refuse_writable_nested_mounts(entry)?;
+            refuse_writable_nested_mounts(entry, &table)?;
             trace_mount(entry);
             Ok(())
         }
@@ -841,7 +1059,12 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
 }
 
 /// A successful remount leaves nested mounts writable; refuse that hole.
-fn refuse_writable_nested_mounts(entry: &Mount) -> Result<()> {
+///
+/// `table` is the caller's one `/proc/self/mountinfo` read, taken **before** the
+/// remount — the call site carries the argument for why the earlier table answers
+/// this question identically. Taking it as an argument rather than reading it
+/// here is what makes the two readers of one exposure share one read.
+fn refuse_writable_nested_mounts(entry: &Mount, table: &str) -> Result<()> {
     // **The landed remount is the only branch that needs the
     // nested-mount check, and the second arm is why.** It
     // makes the *top* mount read-only and leaves the
@@ -856,10 +1079,10 @@ fn refuse_writable_nested_mounts(entry: &Mount) -> Result<()> {
     // flags and a submount — `/dev` with `/dev/pts` and
     // `/dev/shm` — where the overlay copes.
     //
-    // Read here, after the remount, because this is when
-    // both facts are settled, and `/proc` is still the
-    // host's, the pivot having not happened yet. The table
-    // reports *resolved* paths — measured: a mount made
+    // The table is the caller's, read after the bind and before the
+    // remount: `/proc` is still the host's, the pivot having not
+    // happened yet, so the paths are the host's own. It reports
+    // *resolved* paths — measured: a mount made
     // through the symlink `/tmp/x/link/j` is listed as
     // `/tmp/x/real/j` — so a `$TMPDIR` under a symlinked
     // ancestor would make an unresolved target miss its own
@@ -877,7 +1100,7 @@ fn refuse_writable_nested_mounts(entry: &Mount) -> Result<()> {
     // function exists to prevent, and a missing canonical name
     // is not a reason to skip the search for it.
     let target = fs::canonicalize(&entry.target).map_err(step("canonicalize mount target"))?;
-    let nested = writable_nested_mounts_in(&read_mountinfo()?, &target);
+    let nested = writable_nested_mounts_in(table, &target);
     if let Some(mount) = nested.first() {
         // **The nested mount is named by its *host* path**,
         // which is the exposure's plus the remainder below
@@ -912,23 +1135,13 @@ fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     // the mechanism a `MountKind` rather than an inline branch is what
     // lets that substitution reuse this body instead of a second copy
     // of it.
+    //
+    // The option string is built before any directory is created, so a path
+    // this fallback cannot express fails without leaving overlay dirs behind.
+    let options = overlay_mount_options(&entry.source, &overlay.upper, &overlay.work)?;
     fs::create_dir_all(&entry.target).map_err(step("create overlay mount point"))?;
     fs::create_dir_all(&overlay.upper).map_err(step("create overlay upper"))?;
     fs::create_dir_all(&overlay.work).map_err(step("create overlay work"))?;
-    let options = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        entry.source.display(),
-        overlay.upper.display(),
-        overlay.work.display()
-    );
-    let options = CString::new(options).map_err(|_| {
-        refused(
-            "mount overlay",
-            Error::Unsupported {
-                detail: "an exposed path contains a NUL byte",
-            },
-        )
-    })?;
     // **`as_c_str()` and not `&options`**: `mount`'s data parameter is
     // `Data: Into<Option<&CStr>>`, and a `CString` reference is not one
     // of those — the conversion is explicit all the way down.
@@ -940,6 +1153,52 @@ fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
         Some(options.as_c_str()),
     )
     .map_err(step("mount overlay ro"))
+}
+
+/// `,`, `:`, and `\` are overlay option grammar, not path bytes.
+const OVERLAY_OPTION_META: &str =
+    "contains ',', ':' or '\\', which an overlay mount option would read as a separator";
+
+/// The `lowerdir`/`upperdir`/`workdir` string, or a refusal when one of the
+/// three paths contains a byte the option grammar splits on.
+///
+/// overlayfs separates options on `,` and lower directories on `:`. A `\` is
+/// an escape on kernels that implement one and an ordinary byte on kernels
+/// that do not, so writing the escape is not safe: a kernel that ignores it
+/// still splits, and the mount would take a second host tree as `lowerdir`.
+/// A path that contains any of the three cannot be this fallback, and the
+/// launch stops before `mount`.
+fn overlay_mount_options(source: &Path, upper: &Path, work: &Path) -> Result<CString> {
+    for path in [source, upper, work] {
+        if path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b',' | b':' | b'\\'))
+        {
+            return Err(refused(
+                "mount overlay",
+                Error::BadPath {
+                    path: path.to_path_buf(),
+                    reason: OVERLAY_OPTION_META,
+                },
+            ));
+        }
+    }
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        source.display(),
+        upper.display(),
+        work.display()
+    );
+    CString::new(options).map_err(|_| {
+        refused(
+            "mount overlay",
+            Error::Unsupported {
+                detail: "an exposed path contains a NUL byte",
+            },
+        )
+    })
 }
 
 #[instrument(level = "debug", skip_all, ret, fields(retained = ?keep, effective = field::Empty))]
@@ -1123,20 +1382,33 @@ const ALL_CAPABILITIES: [CapabilitySet; 41] = [
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        ffi::OsStr,
+        fs,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+        path::{Path, PathBuf},
+        sync::mpsc,
+        thread,
+    };
 
     use rustix::{io::Errno, mount::MountFlags, thread::CapabilitySet};
 
     use super::{
-        announce_capset, announce_exposures, announce_no_new_privs, announce_retained,
-        refused_remount_needs_the_overlay, resolve_model, source_mount_flags_in,
-        writable_nested_mounts_in,
+        OVERLAY_OPTION_META, SYMLINK_EXPOSURE, TASK_DIR, THREAD_STEP, announce_capset,
+        announce_exposures, announce_no_new_privs, announce_retained, create_jail_root,
+        decode_mountinfo, enforce_bind_read_only, enter_user_namespace, open_map,
+        overlay_mount_options, read_mountinfo, refuse_symlink_exposure, refuse_when_threaded,
+        refuse_writable_nested_mounts, refused_remount_needs_the_overlay, require_single_thread,
+        resolve_model, source_mount_flags_in, task_count, validate_and_plan, validate_exposures,
+        writable_nested_mounts_in, write_map,
     };
     use crate::{
         _core::{AccessMode, Backend as BackendTrait, Error, Exposure, LaunchPlan, Sandbox},
         Backend, Mechanism,
         caps::Cap,
+        jail::jail_root,
         options::Options,
+        plan::{Mount, MountKind, OverlayDirs},
         testing::{assert_step, record_events},
     };
 
@@ -1144,9 +1416,14 @@ mod tests {
     fn the_exposure_set_is_traced_with_its_step() {
         // **The second of the three events, and the "to what" half of shared
         // §7's question.** The set is rendered as one field value — the per-mount
-        // `debug!`s are the item detail and are invisible under `serve`'s
-        // subscriber — so this asserts both halves of what an operator reads:
-        // the counts and the set itself, in the access spelling the run used.
+        // `debug!`s are the item detail and are invisible to a subscriber at the
+        // `Info` level this event exists for — so this asserts both halves of
+        // what an operator reads: the counts and the set itself, in the access
+        // spelling the run used.
+        // **The rendering is the core's `describe_exposures` now**, and that is
+        // a second property this line pins: the shared renderer's spelling is
+        // what lands on this crate's log, so a change to it shows up here rather
+        // than in a downstream reader's parser.
         let exposures = [
             Exposure {
                 host: PathBuf::from("/srv/data"),
@@ -1195,10 +1472,15 @@ mod tests {
     fn the_resolved_model_is_traced_with_its_step() {
         // **Shared §7's check on the event the plan names first**: the resolved
         // model is what answers "was this process confined, and to how", and a
-        // `debug!`-only record of it is invisible under `serve`'s subscriber,
-        // which is built at a fixed `Verbosity::Info` with no environment
-        // filter. The refusal tests reach this function too, which is why the
-        // recorder is a global one (`crate::testing` states the mechanism).
+        // `debug!`-only record of it would be invisible to a reader whose
+        // subscriber runs at `Verbosity::Info`, which is what `serve` builds.
+        // **On this platform that subscriber is installed after `confine`** (the
+        // ordering `refuse_when_threaded` states), so `serve` reads this event in
+        // no case; the reader the level is chosen for is a caller that has one
+        // installed when it confines. The refusal tests reach this function too,
+        // which is why the recorder is a global one
+        // (`tinio_util::testing::record_events`, re-exported by `crate::testing`,
+        // states the mechanism).
         //
         // The options are injected and the model is *forced*, so no probe forks:
         // what this asserts is the event, not the host's answer.
@@ -1210,6 +1492,108 @@ mod tests {
         );
         assert_step(&logged, "model");
         assert!(logged.contains("model=Root"), "{logged}");
+    }
+
+    #[test]
+    fn a_threaded_process_cannot_confine_itself_in_place() {
+        // **The refusal against the real `/proc/self/task`, which is the half no
+        // pure test can reach.** libtest cannot run this test single-threaded —
+        // the harness's own thread waits beside this worker — so the thread
+        // spawned below is a *named* second task and not the only one; what the
+        // assertions pin is that the count is the kernel's (two live threads,
+        // two entries) and that a count above one refuses. A check that never
+        // fired would leave the process confined on one task of several, which
+        // is the hole it exists to close (design §8, §10).
+        let (release, gate) = mpsc::channel::<()>();
+        let second = thread::spawn(move || {
+            // Held until the checks below are through, so the count read here
+            // includes a thread this test named.
+            let _ = gate.recv();
+        });
+
+        let counted = task_count(Path::new(TASK_DIR)).expect("a readable /proc/self/task");
+        assert!(counted >= 2, "the harness and the thread above: {counted}");
+        let err = refuse_when_threaded().expect_err("a threaded process must be refused");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: THREAD_STEP,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let refused = err.to_string();
+        // **No equality on the count, and the first run of this test is why**:
+        // libtest runs it beside its own workers, so the task set changes
+        // between the read above and the read inside the refusal — that run
+        // measured `3` and then refused with `4`. What the sentence has to carry
+        // is a count and the number it would leave outside, which is the half
+        // an operator acts on:
+        assert!(
+            refused.contains("this process has") && refused.contains("of them outside"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("host mount namespace") && refused.contains("seccomp"),
+            "the refusal names what the other threads would keep: {refused}"
+        );
+
+        let _ = release.send(());
+        second.join().expect("the named second thread");
+    }
+
+    #[test]
+    fn one_task_is_what_the_thread_precondition_accepts() {
+        // **The acceptance half, over the count rather than over a process**,
+        // because libtest has no single-threaded one to offer: the test above
+        // pins that `task_count` reads the kernel's real count, and this one
+        // pins that one task is the count that passes. `src/bin/sandbox-child.rs`
+        // is where both halves meet a process that really confines itself — its
+        // `fn main` is single-threaded, and that suite fails if this predicate
+        // ever becomes stricter than the kernel's answer.
+        require_single_thread(1).expect("one task is exactly the precondition");
+        // Nothing below one is a count this kernel reports for a live process,
+        // and the rule is "more than one" rather than "exactly one": the refusal
+        // is the half that has to be exact, and `<= 1` is the same predicate
+        // read from the other side.
+        require_single_thread(0).expect("there is nothing to leave outside");
+        let err = require_single_thread(2).expect_err("two tasks cannot both be confined");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: THREAD_STEP,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("2 threads"), "{err}");
+    }
+
+    #[test]
+    fn a_task_directory_that_cannot_be_read_refuses_rather_than_passes() {
+        // **Design §11's fail-closed, on the check's own read**: a `/proc` that
+        // answers nothing must not be read as "one thread". The directory is a
+        // parameter of `task_count` for this test — the alternative is a
+        // `/proc/self/task` that cannot be read, which no test can arrange in
+        // its own process — and the refusal names the path, so the operator
+        // learns which read failed rather than only that one did.
+        let missing = Path::new("/proc/self/task/one-task/does-not-exist");
+        let err = task_count(missing).expect_err("an unreadable directory is a refusal");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: THREAD_STEP,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("does-not-exist"), "{err}");
     }
 
     #[test]
@@ -1470,6 +1854,412 @@ mod tests {
         assert_eq!(
             source_mount_flags_in(escaped, Path::new("/srv/my data/served")),
             MountFlags::NOEXEC
+        );
+    }
+
+    #[test]
+    fn a_symlink_exposure_is_refused_before_the_bind() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let real = root.path().join("real");
+        fs::create_dir(&real).expect("target");
+        fs::create_dir(real.join("child")).expect("child");
+        let link = root.path().join("link");
+        symlink(&real, &link).expect("symlink");
+
+        let exposed = Sandbox::new().expose(&link, AccessMode::ReadOnly);
+        let err = validate_exposures(&exposed).expect_err("the link itself");
+        assert!(
+            matches!(err, Error::BadPath { ref path, reason } if path == &link && reason == SYMLINK_EXPOSURE),
+            "{err:?}"
+        );
+
+        // An intermediate link is the same rule: the component that is the
+        // link is the one named, not the directory reached through it.
+        let through = link.join("child");
+        let err = validate_exposures(&Sandbox::new().expose(&through, AccessMode::ReadOnly))
+            .expect_err("the linked parent");
+        assert!(
+            matches!(err, Error::BadPath { ref path, reason } if path == &link && reason == SYMLINK_EXPOSURE),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_symlink_can_be_exposed() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let dir = root.path().join("data");
+        fs::create_dir(&dir).expect("dir");
+        // A symlinked ancestor (a `/tmp` that is itself a link) is the same
+        // refusal, and it names that ancestor. The fixture only asserts a
+        // clean accept when the host path has no link in it.
+        let linked = dir.ancestors().find(|component| {
+            fs::symlink_metadata(component).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        });
+        let result = validate_exposures(&Sandbox::new().expose(&dir, AccessMode::ReadOnly));
+        match linked {
+            Some(component) => {
+                let err = result.expect_err("an ancestor is a symlink");
+                assert!(
+                    matches!(err, Error::BadPath { ref path, reason } if path == component && reason == SYMLINK_EXPOSURE),
+                    "{err:?}"
+                );
+            }
+            None => assert!(result.is_ok(), "{result:?}"),
+        }
+        // The helper and the validator agree on a path that is not a link.
+        assert!(refuse_symlink_exposure(Path::new("/")).is_ok());
+    }
+
+    #[test]
+    fn overlay_options_refuse_separator_bytes() {
+        let upper = Path::new("/tmp/jail/upper");
+        let work = Path::new("/tmp/jail/work");
+        let built =
+            overlay_mount_options(Path::new("/srv/data"), upper, work).expect("plain paths");
+        assert_eq!(
+            built.to_str().expect("utf-8"),
+            "lowerdir=/srv/data,upperdir=/tmp/jail/upper,workdir=/tmp/jail/work"
+        );
+
+        for path in ["/srv/a:b", "/srv/a,b", "/srv/a\\b"] {
+            let err = overlay_mount_options(Path::new(path), upper, work).expect_err(path);
+            assert!(
+                matches!(
+                    err,
+                    Error::BadPath {
+                        reason: OVERLAY_OPTION_META,
+                        ..
+                    }
+                ),
+                "{path}: {err:?}"
+            );
+        }
+
+        // The upper dir is our path, and a separator there is the same injection.
+        let err = overlay_mount_options(Path::new("/srv/data"), Path::new("/tmp/a:b"), work)
+            .expect_err("upper");
+        assert!(
+            matches!(err, Error::BadPath { ref path, reason: OVERLAY_OPTION_META } if path == Path::new("/tmp/a:b")),
+            "{err:?}"
+        );
+
+        let raw = OsStr::from_bytes(b"/srv/x,y");
+        let err = overlay_mount_options(Path::new(raw), upper, work).expect_err("bytes");
+        assert!(
+            matches!(
+                err,
+                Error::BadPath {
+                    reason: OVERLAY_OPTION_META,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // **The fourth byte that cannot be expressed, and the one the loop above
+        // does not catch**: a NUL is not a separator, so the option string is
+        // built — and `CString::new` is what refuses it. Left to pass, the
+        // mount would read a path cut short at the NUL, which is a *different*
+        // lowerdir rather than a failed one. Design §11's fail-closed, on the
+        // last byte a `Path` can hold.
+        let raw = OsStr::from_bytes(b"/srv/x\0y");
+        let err = overlay_mount_options(Path::new(raw), upper, work).expect_err("a NUL byte");
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported {
+                    detail: "an exposed path contains a NUL byte"
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn every_escape_the_kernel_does_not_use_is_copied_through() {
+        // **`decode_mountinfo` is the one place a mount point becomes a path, and
+        // an escape it does not know must not become a guess.** The kernel
+        // escapes exactly four byte values, so anything else — a `\9` sequence,
+        // a three-character escape that is not one of the four, a backslash at
+        // the very end of the field — is copied through with its backslash. A
+        // decoder that dropped an unknown escape would answer a path the kernel
+        // never wrote, which is the under-enforcement the two readers above it
+        // exist to prevent.
+        assert_eq!(
+            decode_mountinfo("/srv/a\\999b"),
+            PathBuf::from("/srv/a\\999b")
+        );
+        assert_eq!(
+            decode_mountinfo("/srv/a\\04x"),
+            PathBuf::from("/srv/a\\04x")
+        );
+        assert_eq!(
+            decode_mountinfo("/srv/trailing\\"),
+            PathBuf::from("/srv/trailing\\")
+        );
+        // And the four it does know still decode, so the pass-through above is
+        // not a decoder that gave up on all of them.
+        assert_eq!(
+            decode_mountinfo("/srv/a\\040b\\134c"),
+            PathBuf::from("/srv/a b\\c")
+        );
+    }
+
+    #[test]
+    fn the_mount_table_that_decides_a_remount_is_the_kernels() {
+        // **Both readers of one read-only exposure take their two fields from
+        // this table, so a table that cannot be read is a confinement that
+        // cannot be decided** — and the fifth field is where the mount point is,
+        // which is the fact the parser is built on. The root mount is the one
+        // entry every table has, so the assertion holds on any kernel this
+        // backend runs on.
+        let table = read_mountinfo().expect("this kernel publishes /proc/self/mountinfo");
+        assert!(
+            table
+                .lines()
+                .any(|line| line.split_whitespace().nth(4) == Some("/")),
+            "no root mount in:\n{table}"
+        );
+    }
+
+    #[test]
+    fn a_writable_mount_below_the_target_is_refused_by_its_host_path() {
+        // **The hole this whole check exists for** (design §4): the bind is
+        // recursive, so a nested mount is carried into the jail, and a
+        // successful remount makes only the top mount read-only — a write
+        // through the nested one would reach the host.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let served = tmp.path().join("served");
+        let target = tmp.path().join("jail/served");
+        fs::create_dir_all(&target).expect("the mount point the bind landed on");
+        let entry = Mount {
+            source: served.clone(),
+            target: target.clone(),
+            access: AccessMode::ReadOnly,
+            kind: MountKind::Bind,
+        };
+        // The table is the caller's one read, so a test can hand it the shape it
+        // needs — and what it hands is a real `/proc/self/mountinfo` line. Its
+        // sixth field is the mount's own options and the field after the `-` is
+        // the superblock's, which is the pair the predicate has to tell apart:
+        // `ro` there beside `rw` here is the shape a remounted top mount reads
+        // back as, and a helper reading the wrong one would report nothing.
+        let resolved = fs::canonicalize(&target).expect("the jail path resolves");
+        let table = format!(
+            "24 30 0:23 / {} rw - tmpfs tmpfs rw\n\
+             25 24 8:1 / {} rw - ext4 /dev/sdb1 rw\n\
+             26 24 8:2 / {} ro - ext4 /dev/sdc1 rw\n",
+            resolved.display(),
+            resolved.join("cache").display(),
+            resolved.join("archive").display(),
+        );
+
+        let err = refuse_writable_nested_mounts(&entry, &table)
+            .expect_err("a writable mount below the target");
+        // **Named by its host path, not the jail path**: the jail name is one the
+        // operator never chose and would have to translate, which is the whole
+        // content of this message.
+        let named = served.join("cache").display().to_string();
+        assert!(
+            matches!(&err, Error::Step { step, .. } if *step == "read-only exposure"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(&named), "{err}");
+
+        // **A submount that is already `ro` is not the hole**: it cannot be
+        // written through, and the confined process cannot remount it writable
+        // once the capability drop has run — so reporting it would refuse a
+        // configuration that is already as read-only as the exposure asks for.
+        let read_only = format!(
+            "26 24 8:2 / {} ro - ext4 /dev/sdc1 rw\n",
+            resolved.join("archive").display()
+        );
+        assert!(
+            refuse_writable_nested_mounts(&entry, &read_only).is_ok(),
+            "an already-read-only submount is not a writable hole"
+        );
+        // And a table with nothing below the target at all is the ordinary case.
+        assert!(
+            refuse_writable_nested_mounts(&entry, table.lines().next().unwrap_or_default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_resolved_refuses_before_the_remount() {
+        // **The fail-open this replaced is the reason the line is a `?`** (design
+        // §11): the fallback was the unresolved string, which would make
+        // `source_mount_flags_in` match a shallower mount point and re-assert
+        // *less* than the bind inherited — a read-only exposure quietly keeping a
+        // locked flag's protection off. The bind of this source has just
+        // succeeded on the production path, so a path that cannot be resolved is
+        // a mount the confinement did not establish.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let overlay = OverlayDirs {
+            upper: tmp.path().join("upper"),
+            work: tmp.path().join("work"),
+        };
+        let entry = Mount {
+            source: tmp.path().join("gone"),
+            target: tmp.path().join("jail/gone"),
+            access: AccessMode::ReadOnly,
+            kind: MountKind::Bind,
+        };
+        let err = enforce_bind_read_only(&entry, &overlay)
+            .expect_err("a source that is not there cannot be resolved");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: "canonicalize mount source",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_plan_is_built_while_the_process_can_still_exit_cleanly() {
+        // **`validate_and_plan` is the whole half of the sequence that runs before
+        // anything irreversible**, and its output is the jail, its overlay and the
+        // mount table — none of which a test could observe afterwards, because
+        // after the first `unshare` there is no afterwards for the test process.
+        // A forced root model resolves without the probe, so this needs no
+        // namespace and gives the same answer on every host.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let served = tmp.path().join("served");
+        fs::create_dir(&served).expect("the served root");
+        let jails = tmp.path().join("jails");
+        fs::create_dir(&jails).expect("the jail parent");
+
+        let opts = Options::default()
+            .with_model(Mechanism::Root)
+            .with_euid(0)
+            .with_tmpdir(jails.clone());
+        let sandbox = Sandbox::new().expose(&served, AccessMode::ReadWrite);
+        let prepared = validate_and_plan(&sandbox, &opts).expect("a served root on a root host");
+
+        assert_eq!(
+            prepared.resolved,
+            Mechanism::Root,
+            "the resolved model is what is carried, never the `Auto` request"
+        );
+        assert_eq!(prepared.jail, jail_root(&jails, &served));
+        assert_eq!(prepared.overlay.upper, prepared.jail.join(".overlay/upper"));
+        assert_eq!(prepared.overlay.work, prepared.jail.join(".overlay/work"));
+        assert_eq!(
+            prepared.mounts.first().map(|mount| mount.kind),
+            Some(MountKind::JailTmpfs),
+            "the jail tmpfs is always first, so every later target has a parent"
+        );
+        assert_eq!(prepared.mounts.len(), 2, "the tmpfs and the one exposure");
+        assert_eq!(
+            prepared.mounts.last().map(|mount| mount.kind),
+            Some(MountKind::Bind)
+        );
+        // **Planning is not creating**: the jail root is the first thing the
+        // confinement does to the host, and a refusal from `plan` has to leave
+        // nothing behind for the next run to take over.
+        assert!(!prepared.jail.exists(), "{}", prepared.jail.display());
+    }
+
+    #[test]
+    fn the_map_descriptors_name_the_map_that_failed() {
+        // **The three maps fail identically and are diagnosed by the name their
+        // caller gave them** — a `/proc` that is missing answers `ENOENT` for all
+        // three, so an error that does not say which one leaves the operator to
+        // guess. The failure names are the only thing these two wrappers own.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let missing = tmp.path().join("uid_map");
+        let err = open_map(&missing.to_string_lossy(), "open uid map")
+            .expect_err("a map that is not there");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: "open uid map",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // The write travels through the descriptor that was opened for it (design
+        // decision 12: the maps are only writable from the namespace they
+        // describe, so the open is what has to happen after the `unshare`), and
+        // the map's own name is what its failure carries.
+        let path = tmp.path().join("gid_map");
+        let mut writable = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("a fresh map file");
+        write_map(&mut writable, "gid_map", "0 1000 1").expect("a writable map");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the map back"),
+            "0 1000 1"
+        );
+
+        let mut read_only = fs::File::open(&path).expect("the same map, opened read-only");
+        let err = write_map(&mut read_only, "setgroups", "deny")
+            .expect_err("a descriptor with no write access");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: "setgroups",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_jail_root_is_created_and_a_temp_directory_that_cannot_hold_it_is_named() {
+        // **This is the first host resource the confinement touches and the one
+        // whose failure names nothing on its own**: the jail's parent is
+        // `$TMPDIR` unless `Options::with_tmpdir` says otherwise, so an `EACCES`
+        // about a path the operator never chose is the diagnosis this step string
+        // exists to replace.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let jail = tmp.path().join("jails/served");
+        create_jail_root(&jail).expect("a fresh directory below a writable temp directory");
+        assert!(jail.is_dir(), "the jail root the mounts land under");
+
+        let file = tmp.path().join("not-a-directory");
+        fs::write(&file, b"a file where the jail's parent would be").expect("a file");
+        let err =
+            create_jail_root(&file.join("jailed")).expect_err("a parent that is not a directory");
+        assert!(
+            matches!(
+                err,
+                Error::Step {
+                    step: "create jail root in $TMPDIR",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_model_never_enters_a_user_namespace() {
+        // **The branch that keeps `Mechanism::Root` from mapping its own uid.**
+        // The user-namespace model writes `0 <euid> 1` into `/proc/self/uid_map`
+        // and is then uid 0 *inside* the namespace; the root model keeps the
+        // credentials it was started with, which is the whole reason it is the
+        // fallback for a host that refuses the namespace. Reaching the early
+        // return is the property, and it is the half of this function a test can
+        // reach: everything below it is `unshare`, which no libtest worker may
+        // do (a threaded process is exactly what `CLONE_NEWUSER` refuses).
+        let unshared = enter_user_namespace(Mechanism::Root, &Options::default().with_euid(0))
+            .expect("the root model touches no map");
+        assert!(
+            unshared.is_none(),
+            "no descriptor is opened, because no map was entered"
         );
     }
 }

@@ -20,17 +20,12 @@ use std::{
     str::FromStr,
 };
 
-use clap::ArgAction;
+use clap::{ArgAction, ValueEnum};
 use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceManagerKind,
     ServiceStartCtx, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx, TypedServiceManager,
 };
 use sha2::{Digest, Sha256};
-
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-pub(crate) use windows::try_run_as_service;
 
 #[cfg(unix)]
 use crate::notify;
@@ -39,6 +34,11 @@ use crate::{
     commands::{EnvArgs, parse_switch},
     resolve,
 };
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::try_run_as_service;
 
 /// The service's name, in one place: `windows-service`'s dispatcher entry point takes it, and
 /// `notify.rs` does not declare a second copy (Task 6).
@@ -58,15 +58,12 @@ pub const SERVICE_NAME: &str = "tinio";
 ///
 /// ```rust
 /// use clap::ValueEnum;
-/// use tinio_cli::service::ServiceVerb;
+/// use tinio_cli::service::Verb;
 ///
-/// assert!(matches!(
-///     ServiceVerb::from_str("query", false),
-///     Ok(ServiceVerb::Query)
-/// ));
+/// assert!(matches!(Verb::from_str("query", false), Ok(Verb::Query)));
 /// ```
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum ServiceVerb {
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Verb {
     /// Register the service with the platform's supervisor.
     Install,
     /// Remove it.
@@ -79,7 +76,7 @@ pub enum ServiceVerb {
     Query,
 }
 
-impl ServiceVerb {
+impl Verb {
     /// The verb as the operator types it — the word every refusal names, so the message and
     /// the command cannot drift.
     fn name(self) -> &'static str {
@@ -113,7 +110,7 @@ impl ServiceVerb {
 /// use clap::{CommandFactory, FromArgMatches};
 /// use tinio_cli::{
 ///     cli::{Cli, Command},
-///     service::ServiceVerb,
+///     service::Verb,
 /// };
 ///
 /// let matches = Cli::command()
@@ -123,13 +120,13 @@ impl ServiceVerb {
 /// let Command::Service(args) = cli.command else {
 ///     panic!("the service arm");
 /// };
-/// assert!(matches!(args.verb, ServiceVerb::Query));
+/// assert!(matches!(args.verb, Verb::Query));
 /// ```
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// The verb to run.
     #[arg(value_name = "VERB")]
-    pub verb: ServiceVerb,
+    pub verb: Verb,
     /// The storage root; absent: walk up from the current directory to the nearest ancestor
     /// containing `.tinio/`.
     #[arg(value_name = "DIR")]
@@ -290,7 +287,7 @@ pub fn install_context(
     label: &str,
 ) -> Result<ServiceInstallCtx, Error> {
     #[cfg(unix)]
-    let contents = Some(notify::unit_text(program, &args, state_dir));
+    let contents = Some(notify::unit_text(program, &args, state_dir)?);
     #[cfg(not(unix))]
     let contents = None;
     Ok(ServiceInstallCtx {
@@ -368,11 +365,11 @@ pub fn permission_remedy(kind: ServiceManagerKind, level: ServiceLevel) -> &'sta
 /// ```no_run
 /// use std::path::PathBuf;
 ///
-/// use tinio_cli::service::{Args, ServiceVerb, run};
+/// use tinio_cli::service::{Args, Verb, run};
 ///
 /// # fn main() -> Result<(), tinio_cli::Error> {
 /// let args = Args {
-///     verb: ServiceVerb::Query,
+///     verb: Verb::Query,
 ///     dir: Some(PathBuf::from("/srv/data")),
 ///     name: None,
 ///     user: false,
@@ -422,7 +419,7 @@ pub fn run(args: Args) -> Result<ExitCode, Error> {
         .map_err(|err| level_failure(kind, level, verb, err))?;
 
     match verb {
-        ServiceVerb::Install => {
+        Verb::Install => {
             // Only `install` needs the running executable's path: the other verbs name a
             // service the supervisor already holds.
             let program = env::current_exe().map_err(|err| {
@@ -439,28 +436,28 @@ pub fn run(args: Args) -> Result<ExitCode, Error> {
                 .install(for_backend(kind, context))
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
-        ServiceVerb::Uninstall => {
+        Verb::Uninstall => {
             manager
                 .uninstall(ServiceUninstallCtx {
                     label: parse_label(&label)?,
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
-        ServiceVerb::Start => {
+        Verb::Start => {
             manager
                 .start(ServiceStartCtx {
                     label: parse_label(&label)?,
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
-        ServiceVerb::Stop => {
+        Verb::Stop => {
             manager
                 .stop(ServiceStopCtx {
                     label: parse_label(&label)?,
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
-        ServiceVerb::Query => {
+        Verb::Query => {
             let status = manager
                 .status(ServiceStatusCtx {
                     label: parse_label(&label)?,
@@ -540,12 +537,7 @@ fn kind_of(manager: &TypedServiceManager) -> ServiceManagerKind {
 /// operator nothing (decision 22's risk row). Everything else keeps the backend's own message,
 /// with the error and its kind logged at `debug!`, so the platform detail is demoted rather
 /// than lost.
-fn failure(
-    kind: ServiceManagerKind,
-    level: ServiceLevel,
-    verb: ServiceVerb,
-    err: io::Error,
-) -> Error {
+fn failure(kind: ServiceManagerKind, level: ServiceLevel, verb: Verb, err: io::Error) -> Error {
     tracing::debug!(error = %err, kind = ?err.kind(), "the service verb failed");
     if is_permission_denied(&err) {
         return Error::Operational(format!(
@@ -609,7 +601,7 @@ const PERMISSION_MARKERS: [&str; 3] = [
 fn level_failure(
     kind: ServiceManagerKind,
     level: ServiceLevel,
-    verb: ServiceVerb,
+    verb: Verb,
     err: io::Error,
 ) -> Error {
     if err.kind() == io::ErrorKind::Unsupported {

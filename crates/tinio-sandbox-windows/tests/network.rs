@@ -133,7 +133,8 @@ fn host_ready(target: SocketAddr) -> bool {
         "the network suite",
         &reason,
         ", or set TINIO_SANDBOX_TEST_TARGET to an address this host reaches (design §7)",
-    )
+    );
+    false
 }
 
 /// What the confined child reports about reaching out.

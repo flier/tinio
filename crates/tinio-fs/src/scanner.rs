@@ -14,8 +14,8 @@
 //! Pacing per contracts/config.md (Minio-aligned): `delay` between entry
 //! batches (throttle), `max_wait` bounds a single sleep, `cycle` is the
 //! minimum interval between full-tree passes. **Promptness on a stop is not
-//! `max_wait`'s any more**: `pacing::sleep_checked` wakes on the shutdown
-//! watch and the timer together, so the pause ends the moment a stop
+//! `max_wait`'s any more**: `tinio_util::pacing::sleep_checked` wakes on the
+//! shutdown watch and the timer together, so the pause ends the moment a stop
 //! arrives whatever the bound is (measured 2026-09-21 — before that fix a
 //! stop was answered only between chunks, which pinned a clean exit 15 s
 //! after the child's own start). `TINIO_SCANNER` (`0`/`1`) overrides the
@@ -42,13 +42,14 @@ use tokio::{
 use crate::{
     _core::{bucket, cleanup::CleanupOptions, mode::AccessMode, object, pipeline::Completion},
     _store::meta,
+    _util::pacing,
     FsCleanup,
     backend::FsStorage,
     error::Error,
     etag, fsutil,
     listing::MetaBatchAccumulator,
     meta::entry_matches,
-    pacing, tombstone,
+    tombstone,
 };
 
 /// Entries per batch: after each batch of **enqueued compute tasks** the

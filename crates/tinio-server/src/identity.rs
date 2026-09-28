@@ -5,6 +5,8 @@
 //! config consumers of the identity types (feature `acl`).
 
 use std::collections::HashMap;
+#[cfg(not(unix))]
+use std::path::Path;
 #[cfg(feature = "acl")]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -90,7 +92,7 @@ impl IdentityFromConfig for Identity {
                     access_key: user.access_key.clone(),
                     canonical_id: user.resolved_canonical_id(),
                     display_name: user.effective_display_name(),
-                    secret: SecretKey::from(&**user.secret_key.expose_secret()),
+                    secret: SecretKey::from(user.secret_key.expose_secret().as_str()),
                 },
             );
         }
@@ -109,7 +111,6 @@ impl IdentityFromConfig for Identity {
 /// private temp file inside `dir` rather than testing `geteuid()` only,
 /// so a CAP_CHOWN-only process (the mitigation the design prefers over
 /// full root) verifies as privileged too.
-#[cfg(unix)]
 use crate::_config;
 #[cfg(unix)]
 pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), _config::Error> {
@@ -127,6 +128,26 @@ pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), _config
             ),
         )
     })
+}
+
+/// Windows never maps `local_uid` — the parser rejects the key — so there is nothing to probe.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(not(unix))]
+/// # {
+/// use std::path::Path;
+///
+/// use tinio_server::_config::Config;
+/// tinio_server::identity::ensure_chown_privilege(&Config::default(), Path::new("."))
+///     .expect("no mapping");
+/// # }
+/// ```
+#[cfg(not(unix))]
+pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), _config::Error> {
+    let _ = (config, dir);
+    Ok(())
 }
 
 /// The chown probe: create a private 0700 dir + file under `dir`, chown

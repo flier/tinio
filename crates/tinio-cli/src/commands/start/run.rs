@@ -1,44 +1,30 @@
 //! §1's pre-runtime half: steps a–j, resolve through the control-channel bind.
 
-use std::fs;
-// The inherited control handles the launcher put in argv: the type the plane's `adopt` takes
-// them back as, and only the launcher arm has any.
-#[cfg(all(feature = "api", target_os = "windows"))]
-use std::os::windows::io::RawHandle;
-// The launcher arm's half of the `state` lifecycle needs the module; nothing else in this file
-// does, and neither does a target with no launcher (see `remove_launcher_state`).
-#[cfg(all(feature = "api", any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(feature = "api", target_os = "macos"))]
+use std::os::unix::net::UnixListener;
+#[cfg(feature = "api")]
 use std::process;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::process::{ExitCode, ExitStatus};
 #[cfg(feature = "api")]
 use std::sync::Arc;
+use std::{
+    fs,
+    process::{ExitCode, ExitStatus},
+};
 
 use tracing::subscriber::set_global_default;
 
 #[cfg(feature = "api")]
 use super::metrics::ServerMetrics;
 use super::{Args, Ready, Server};
-// Gated on the launcher arm rather than on the feature: the one caller is
-// `remove_launcher_state`, which only a launching target reaches.
-#[cfg(all(feature = "api", any(target_os = "macos", target_os = "windows")))]
+#[cfg(feature = "api")]
 use crate::_api::state::State;
 #[cfg(feature = "api")]
 use crate::_api::{
     Options as ApiOptions, Plane,
     metrics::{DEFAULT_TTL, Gauges, MetricsSource},
 };
-// `Terminal` is the record `launcher_exit` reads; the other two are the arm's own calls.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::_sandbox::{Terminal, disarm_signal_relay, supervise};
-#[cfg(unix)]
-use crate::_server::identity;
 #[cfg(feature = "api")]
 use crate::daemon;
-// The frame writer the launcher arm's own refusal goes through, and the launcher arm's own
-// gate: the in-place platforms never reach `launcher_exit`, so they compile neither name.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::events;
 use crate::{
     _config::{
         Config,
@@ -46,10 +32,11 @@ use crate::{
         state::prepare_home_derived,
     },
     _fs::FsStorage,
-    _sandbox::Adopted,
-    _server::log,
+    _sandbox::{Adopted, Terminal, disarm_signal_relay, supervise},
+    _server::{identity, log},
     Error,
     cli::Provenance,
+    events,
     resolve::{self, Located, Pipelines, Resolution},
     sandbox, signal,
 };
@@ -62,7 +49,9 @@ use crate::{
 /// repair is the first thing [`serve()`](crate::commands::start::serve) does. The full order
 /// is: the sandbox's static half (step f) → create the state dir and, read-write, the root
 /// (step h, because the bind sources and the storage both need the paths to exist) →
-/// daemonize (step g) → confine (step i) → the signal handlers (step j) → pipelines and
+/// daemonize (step g) → confine (step i), which installs the subscriber at the position its own
+/// doc states — around the launch or after the in-place confinement, and **not** a position this
+/// function picks → FR-036's OTLP warning → the signal handlers (step j) → pipelines and
 /// storage → single-instance bind → (in [`serve()`](crate::commands::start::serve)) startup
 /// repair → data plane bound → api plane bound → `state` published → readiness line →
 /// `READY=1`.
@@ -74,12 +63,11 @@ use crate::{
 /// the startup: the bind sources must exist before anything binds, and the storage opens under
 /// the root — which is why step h still lands before the fork.
 ///
-/// The exposure set's own rules belong to the platform backend that would apply the confinement,
-/// and the two launcher arms answer them differently: `tinio-sandbox-windows`'
-/// `canonical_exposures` canonicalises and **refuses** a path it cannot resolve, while macOS
-/// rebuilds the set through `tinio-sandbox-macos`'s `profile::with_canonical_paths` — the
-/// resolved spelling beside the operator's, an unresolvable path left alone. Each `confine` arm
-/// rebuilds from this function's resolution, on every target whose backend has landed.
+/// The exposure set's own rules belong to the platform crate `serve::Spec` confines with.
+/// `tinio-sandbox-windows`' `canonical_exposures` canonicalises and **refuses** a path it cannot
+/// resolve, while macOS rebuilds the set through `tinio-sandbox-macos`'s
+/// `profile::with_canonical_paths` — the resolved spelling beside the operator's, an unresolvable
+/// path left alone. [`crate::sandbox::confine`] applies one spec from this function's resolution.
 ///
 /// # Errors
 ///
@@ -139,8 +127,9 @@ pub fn run(
     // request this build refuses has not already created the **served root** in the tree it
     // refuses to serve. **The plan runs on every target, because the refusal is the point** — its
     // answer is read again by the platforms' `confine` arm below, and no target is left out of
-    // that: `sandbox/mod.rs` is `BACKEND_IS_STUB`'s one authority, and it is `false` on Linux (P1),
-    // macOS (P3) and Windows (P2) alike, so every one of them honours a request `plan` cleared.
+    // that: whether this target has a backend is `tinio_sandbox::backend_available`'s one answer,
+    // it names Linux (P1), macOS (P3) and Windows (P2) alike, so every one of them honours a
+    // request `plan` cleared.
     // **A confined child asks for nothing**: it is already inside the container its launcher
     // built, and re-entering the launcher would launch a child of a child — the payload's
     // presence is the whole discriminator (decision 17). The static refusals `plan` runs are the
@@ -156,16 +145,14 @@ pub fn run(
     // also why `refuse_underived_state_dir` decides on whether the directory was *named* rather
     // than on whether it exists.
     let request = if adopted.is_some() {
-        sandbox::Request { enabled: false }
+        sandbox::Request { channel: None }
     } else {
-        // The refusal's own input travels **on the resolution** (`Resolution::state_dir_source`):
+        // The refusal's own input travels **on the resolution** (`Resolution::state_dir_override`):
         // a read-only confinement whose state directory would be derived rather than named is one
         // macOS cannot grant (`refuse_underived_state_dir`), and the launcher is where the remedy
         // is named. Nothing is threaded through this call site for it.
         sandbox::plan(&resolution, &args, provenance)?
     };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = &request; // read only by the launcher platforms' `confine` arm below
 
     // h: the bind sources must exist before anything binds — the data plane and the plane's
     // control channel both bind below — and the storage opens under the root, so a missing state
@@ -208,13 +195,13 @@ pub fn run(
     #[cfg(feature = "api")]
     daemon::publish_launch_token(&resolution.state_dir)?;
 
-    // **The subscriber is installed before the confinement, and that placement is the fix for a
-    // measured loss.** The launcher platforms emit the events an operator reconstructs a failed
-    // launch with *inside* `sandbox::confine` — the backend's `step = "CreateProcessW"`, the
-    // profile's `taken_over=`, the ACL grant the launcher reports before it makes it — and a
-    // subscriber installed after that arm drops every one of them. The position is also the only
-    // one that covers both processes: a launcher returns from this function at the `confine` arm
-    // below, so it would never reach a subscriber built after it.
+    // **The subscriber is `sandbox::confine`'s to install, and its doc is where the ordering rule
+    // lives.** The two positions are facts about the confinement — a launcher emits the events an
+    // operator reconstructs a failed launch with *inside* that call, while an in-place target
+    // confines the **calling thread**, so a thread the subscriber started beforehand would stay
+    // outside the namespaces, the capability set and the seccomp filter for the life of the
+    // process — and neither is this caller's to know. `install_subscriber` therefore travels as
+    // an action (`FnOnce`, so it cannot be run twice), and the position is the confinement's.
     //
     // It needs no storage. The access-log file lives in the state directory the **resolution**
     // named, which `resolve::fs_options` hands to `FsStorage` unchanged (`state_dir:
@@ -230,30 +217,48 @@ pub fn run(
     // its access log away. `a_read_only_run_appends_its_access_log_in_the_state_directory` pins
     // the pair, so this reads as the contract rather than as a leak.
     //
-    // **After `daemon::detach_if_requested`, not before**: that call is §1's step g, the
-    // process's fork, and a subscriber built with an OTLP export layer is a thread the fork must
-    // not meet. The subscriber's error is `Box<dyn Error + Send + Sync>`, which no variant of
-    // this crate's `Error` converts from — so it is named, not propagated with a bare `?`.
-    let subscriber = log::build_subscriber(
-        verbosity(&resolution),
-        format(&resolution),
-        &access_format(&resolution),
-        &resolution.state_dir.join("access.log"),
-        otlp_endpoint(&resolution.config),
-    )
-    .map_err(|err| Error::Log(err.to_string()))?;
-    // Once per process by construction: the one call site is here, and a run that gets this
-    // far has not installed one. The failure is still not fatal — a server with no subscriber
-    // serves, it only logs nothing.
-    set_global_default(subscriber).ok();
+    // **After `daemon::detach_if_requested`, not before**: that call is §1's step g, the process's
+    // fork, and a subscriber built with an OTLP export layer is a thread the fork must not meet.
+    // Both of `confine`'s positions are after this line, which is what keeps that true.
+    //
+    // i, on **every** target. A launcher hands back a child this process supervises and never
+    // serves behind; an in-place target confines **this** process and answers `None`, which is
+    // "carry on to serve" (decision 6). The `None` call is not decoration: it is where the jail
+    // is entered, so a target that skipped it would serve unconfined while `plan` had already
+    // promised the confinement. Which answer comes back is `platform_facts().launches_child`,
+    // inside `confine` — this arm matches the child and does not name the OS.
+    let launched = sandbox::confine(&resolution, &args, &request, || {
+        install_subscriber(&resolution)
+    })?;
 
-    // i, on **every** target. The launcher platforms hand back a child this process supervises
-    // and never serves behind; the in-place platforms confine **this** process and answer
-    // `None`, which is "carry on to serve" (decision 6). The in-place call is not decoration:
-    // it is where the jail is entered, so a target that skipped it would serve unconfined while
-    // `plan` had already promised the confinement.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Some(mut child) = sandbox::confine(&resolution, &args, &request)? {
+    // **FR-036's trade: a configured OTLP endpoint and a confinement cannot both be honoured, and
+    // the combination is warned about, naming both, rather than refused** (design decision 25,
+    // `contracts/cli.md`). The confinement cuts the confined process's outbound connections and the
+    // exporter is the only outbound path this product has, so what is lost is the export — and
+    // losing an observer is not grounds for refusing to serve, so the run proceeds.
+    //
+    // **It sits on the one line both arms reach with the log live**, and that is now the
+    // confinement's guarantee rather than this call's position: `confine` above installs the
+    // subscriber on every path it returns `Ok` from — before a launch, after an in-place
+    // confinement — so the log exists here whichever arm this target took. **Once per run by
+    // construction**: a confined **child**
+    // asks for nothing (`Request::enabled` is false for it — the payload's presence is the whole
+    // discriminator, decision 17), so the warning is the launcher's alone and the child inherits the
+    // stderr it is written on. A `warn!` and not a frame, because stdout carries event frames and
+    // nothing else (decision 19) while this is the operational log's — and `sandbox::lost_export` is
+    // the rule (both facts, one reader), so this call site only emits it.
+    if let Some((channel, endpoint)) =
+        sandbox::lost_export(&request, otlp_endpoint(&resolution.config))
+    {
+        tracing::warn!(
+            channel = %channel,
+            endpoint = %endpoint,
+            "the confinement cuts the outbound path the OTLP exporter is the only user of, so \
+             this run's export is lost: the confinement proceeds and the observer does not"
+        );
+    }
+
+    if let Some(mut child) = launched {
         // The facade's **two-argument** `supervise(&mut Child, teardown)`: it waits for the
         // confined child, runs the teardown on every path, and answers the child's status,
         // which is this process's answer. The launcher stops here: it builds no runtime.
@@ -322,10 +327,6 @@ pub fn run(
         }
         return Ok(Server::Launched(ExitCode::from(code)));
     }
-    // The in-place shape: the call happens for its own side effect, and its `None` is the answer
-    // this process acts on by continuing to the runtime that serves.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = sandbox::confine(&resolution, &args, &request)?;
 
     // FR-033's fail-closed privilege probe: any configured `[owner]`/`[[users]]` `local_uid`
     // mapping needs chown privilege (root or CAP_CHOWN) at startup, and a process without it
@@ -333,8 +334,7 @@ pub fn run(
     // after the served root exists and before anything binds — and it is skipped read-only,
     // because the probe writes a private file into the served root (design decision 14).
     // Windows never carries a mapping: the config parser rejects the key there, so the
-    // identity's uid map is empty by construction.
-    #[cfg(unix)]
+    // probe is a no-op and the identity's uid map is empty by construction.
     if !resolution.read_only {
         identity::ensure_chown_privilege(&resolution.config, &resolution.root)?;
     }
@@ -384,8 +384,8 @@ pub fn run(
             // write**, and the cause is ownership instead: `state` must name the launcher, whose
             // `--daemon` readiness check compares the file's pid against the pid it spawned and
             // whose `Plane::shutdown` removal guard expects itself, and the token is minted by the
-            // process that publishes. `crate::sandbox::macos`'s module doc is that reason's home,
-            // as it is for the channel handoff below. Either way a plane here that minted its own
+            // process that publishes. `platform_facts` and `serve::Spec` are that reason's home,
+            // as they are for the channel handoff below. Either way a plane here that minted its own
             // token would refuse every client that read that file: `/status` and `/stop` would
             // answer 401 for a server that is running and discoverable. `None` is every run that
             // owns its own `state`: the unconfined ones, and the in-place platforms.
@@ -409,37 +409,21 @@ pub fn run(
         // **Every inherited instance, not the first** (Windows): one instance answers a client and
         // then stops listening, and this process cannot create the next one, so the pool it was
         // handed is the whole of what it will ever serve on. A unix channel is one socket, and the
-        // platform crate refuses any other count.
-        #[cfg(windows)]
-        {
-            let inherited = adopted.as_ref().map(Adopted::controls).unwrap_or_default();
-            if inherited.is_empty() {
-                // The plane's single-instance gate: the control-channel bind, before the repair.
-                Plane::bind(options)?
-            } else {
-                // The handle values the launcher put in argv, spelled back the way the
-                // platform typed them (`RawHandle` is a pointer there, `as` is the cast).
-                let raws: Vec<RawHandle> = inherited
-                    .iter()
-                    .map(|raw| *raw as usize as RawHandle)
-                    .collect();
-                Plane::adopt(options, &raws)?
-            }
-        }
+        // platform crate refuses any other count. `Plane::open` is that split: empty controls bind,
+        // Windows adopts the handle values, macOS adopts the socket `inherited_socket` rebuilt
+        // (`sandbox::adopted_control` — an object, never a number this process turns back into a
+        // socket), and an in-place target refuses a non-empty list.
+        //
+        // **The call is spelled twice because the signature is two signatures**: the socket
+        // argument is `#[cfg(target_os = "macos")]` on `Plane::open`, so the targets that inherit
+        // no unix socket name a shorter call rather than a placeholder value — which is the whole
+        // of what the deleted `InheritedSocket::absent()` was.
+        let controls = adopted.as_ref().map(Adopted::controls).unwrap_or(&[]);
         #[cfg(target_os = "macos")]
-        match adopted.as_ref() {
-            // The descriptor the launcher put in argv, rebuilt into the socket it names — the
-            // platform crate's job, and the conversion that is its single enumerated `unsafe` site
-            // (`sandbox::adopted_control`). What reaches the plane is an object, never a number.
-            Some(adopted) if !adopted.controls().is_empty() => {
-                Plane::adopt(options, sandbox::adopted_control(adopted)?)?
-            }
-            // No handoff: this process is the one that owns the single-instance claim, and the
-            // bind is where it makes it.
-            _ => Plane::bind(options)?,
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        Plane::bind(options)? // the plane's single-instance gate, before the repair
+        let plane = Plane::open(options, controls, inherited_socket(adopted.as_ref())?)?;
+        #[cfg(not(target_os = "macos"))]
+        let plane = Plane::open(options, controls)?;
+        plane
     };
 
     Ok(Server::Ready(Box::new(Ready {
@@ -456,6 +440,31 @@ pub fn run(
     // k is `run::on_runtime`'s: no runtime is created anywhere in this module.
 }
 
+/// The unix socket [`Plane::open`] adopts — **macOS's function, because macOS is the one target
+/// whose launcher hands a listener over.**
+///
+/// [`Plane::open`]'s parameter exists on macOS alone (it is `#[cfg(target_os = "macos")]` there,
+/// and its doc carries the axis), so a target that inherits no unix control socket has neither the
+/// argument nor this call: Windows' launcher passes pipe *handle values* in `controls`, and an
+/// in-place target never gets this far — the process that serves is the one that bound.
+/// [`sandbox::adopted_control`] turns the inherited descriptor into the listener; this function is
+/// the shape of *when* to ask — a process that was launched at all.
+///
+/// [`Plane::open`]: crate::_api::Plane::open
+#[cfg(all(feature = "api", target_os = "macos"))]
+fn inherited_socket(adopted: Option<&Adopted>) -> Result<Option<UnixListener>, Error> {
+    let Some(adopted) = adopted else {
+        return Ok(None);
+    };
+    // A launcher hands the inherited descriptors over in the launch payload, so an empty list is
+    // the process that owns the single-instance claim itself — and one that has no socket to
+    // adopt.
+    if adopted.controls().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sandbox::adopted_control(adopted)?))
+}
+
 /// What this launcher owes once the child it supervised is gone: the frame stdout gets, and the
 /// exit code this process answers with.
 ///
@@ -468,10 +477,12 @@ pub fn run(
 /// that `None` rather than a guess.
 ///
 /// **The status is forwarded either way, and the frame does not rewrite it.** §3 step 8 makes the
-/// launcher's own answer the child's status, which is what a `--daemon` parent's readiness probe
-/// and every harness reading this process's exit code are given; the frame is added information
-/// about a startup the parent watched fail, not a replacement for what the child said. `1` stands
-/// in only where there is no code to forward at all — a child killed by a signal.
+/// launcher's own answer the child's status, which is what every harness and supervisor that reads
+/// this process's exit code is given — the CLI's `--daemon` parent is not one of them, because it
+/// polls the published `state` file and the control channel and answers its own readiness timeout
+/// (`crate::daemon`); the frame is added information about a startup the parent watched fail, not a
+/// replacement for what the child said. `1` stands in only where there is no code to forward at all
+/// — a child killed by a signal.
 ///
 /// **It answers rather than emits because the emission is the caller's**: `crate::events` owns
 /// stdout on this path (decision 19's "stdout carries event frames and nothing else"), so a
@@ -479,7 +490,6 @@ pub fn run(
 /// and could not be driven by a test at all.
 ///
 /// [`Child::terminal`]: crate::_sandbox::Child::terminal
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn launcher_exit(status: ExitStatus, reported: Option<&Terminal>) -> (Option<String>, u8) {
     // A child killed by a signal has no exit code; 1 is the operational failure that is. A code
     // outside `u8` is not this process's to invent either, and answers the same way — the shape
@@ -520,7 +530,7 @@ fn launcher_exit(status: ExitStatus, reported: Option<&Terminal>) -> (Option<Str
 /// Best-effort by contract — `supervise`'s teardown callback cannot report a failure, and a
 /// launcher that refused to exit over a file the next `doctor --fix` reclaims would be the worse
 /// failure.
-#[cfg(all(feature = "api", any(target_os = "macos", target_os = "windows")))]
+#[cfg(feature = "api")]
 fn remove_launcher_state(resolution: &Resolution) {
     let Ok(Some(state)) = State::read(&resolution.state_dir) else {
         return;
@@ -528,6 +538,32 @@ fn remove_launcher_state(resolution: &Resolution) {
     if state.pid == process::id() {
         let _ = State::remove(&resolution.state_dir);
     }
+}
+
+/// Build this process's subscriber and install it as the global default — **the one construction
+/// site, handed to `sandbox::confine` as the action it calls at the one position this target's
+/// shape requires** (that function's doc is the ordering's home, and its `FnOnce` is what makes
+/// the install exactly one).
+///
+/// **A subscriber that cannot be built is fatal; one that cannot be installed is not.** The build
+/// reads the access log and, in an `otel` build with `[telemetry] otlp_endpoint` configured, starts
+/// the exporter's thread — a failure there is a startup failure (`Error::Log`, exit 1), and the
+/// error is named rather than propagated with a bare `?` because
+/// `Box<dyn Error + Send + Sync>` is no variant of this crate's [`Error`]. `set_global_default`'s
+/// own failure is ignored: a server with no subscriber serves, it only logs nothing, and a process
+/// that got this far has installed none — `confine`'s `FnOnce` is what keeps it to one install
+/// rather than a flag.
+fn install_subscriber(resolution: &Resolution) -> Result<(), Error> {
+    let subscriber = log::build_subscriber(
+        verbosity(resolution),
+        format(resolution),
+        &access_format(resolution),
+        &resolution.state_dir.join("access.log"),
+        otlp_endpoint(&resolution.config),
+    )
+    .map_err(|err| Error::Log(err.to_string()))?;
+    set_global_default(subscriber).ok();
+    Ok(())
 }
 
 /// The effective verbosity the subscriber is built with.
@@ -568,6 +604,10 @@ fn access_format(resolution: &Resolution) -> AccessFormat {
 /// The OTLP endpoint, when `[telemetry]` names one — `None` without the section, which is what
 /// switches the export layer off (`build_subscriber` builds it only when the `otel` feature is
 /// compiled in **and** this is `Some`).
+///
+/// **Two readers, and they are the trade's two halves**: `install_subscriber` hands it to the
+/// subscriber, and the FR-036 warning reads it to name what a confinement costs. One function, so
+/// "an endpoint is configured" cannot be answered two ways.
 fn otlp_endpoint(config: &Config) -> Option<&str> {
     config
         .telemetry
@@ -577,20 +617,16 @@ fn otlp_endpoint(config: &Config) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    // The launcher arm's own names, under the launcher arm's own gate: a host whose platform
-    // confines in place drives neither test below, so it compiles neither the import.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    use std::process::Command;
     use std::{
         fs::{OpenOptions, create_dir_all, read_dir, read_to_string},
         io::Write as _,
         path::{Path, PathBuf},
+        process::Command,
     };
 
     use tempfile::TempDir;
 
     use super::*;
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use crate::_sandbox::{Child, Terminal};
 
     /// A confined child that exits with `code` and relays nothing.
@@ -601,16 +637,16 @@ mod tests {
     /// that carries no relay. That is also exactly the shape of a child which died before its
     /// first frame — nothing recorded a terminal event, so `terminal` answers `None` once the
     /// wait has returned rather than because the test said so.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn dying(code: u8) -> Child {
-        #[cfg(windows)]
-        let mut command = Command::new("cmd");
-        #[cfg(windows)]
-        command.args(["/c", &format!("exit {code}")]);
-        #[cfg(not(windows))]
-        let mut command = Command::new("sh");
-        #[cfg(not(windows))]
-        command.args(["-c", &format!("exit {code}")]);
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/c", &format!("exit {code}")]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            command
+        };
         let mut process = command.spawn().expect("spawn the child stand-in");
         Child::new(move || Ok(process.wait()?))
     }
@@ -624,7 +660,6 @@ mod tests {
     /// write and the `Server::Launched` it returns — because both need the spawned binary rather
     /// than a library call. `crates/tinio-e2e`'s `@confinement` legs own that half (they spawn
     /// `tinio` and read its streams); this one pins the decision those effects are made on.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn a_child_that_never_reported_is_the_parents_own_refusal() {
         let mut child = dying(3);
@@ -652,7 +687,6 @@ mod tests {
     /// **The other direction, and the one a launcher that framed unconditionally would break**: a
     /// child that did report is a server that started, so a perfectly good run must carry no
     /// `error` frame for its consumer to misread.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn a_child_that_reported_is_never_framed() {
         let mut child = dying(0);

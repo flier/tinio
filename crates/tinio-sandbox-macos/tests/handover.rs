@@ -48,7 +48,7 @@ use std::{
 };
 
 use tinio_sandbox_core::{AccessMode, Sandbox};
-use tinio_util::testing::poll_exit;
+use tinio_util::testing::{kill_and_reap, poll_exit, wait_for_path};
 
 /// This test's name, which is also the filter the confined child runs under.
 ///
@@ -67,6 +67,10 @@ const RELEASE: &str = "release";
 
 /// The parent's bound on the child coming up (profile render, pre-flight, spawn, libtest start).
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the parent looks for the child's marker: this leg reads a table the child is holding
+/// still, so the poll is a lookup and not a resource.
+const READY_POLL: Duration = Duration::from_millis(20);
 
 /// The parent's bound on the launcher copy after the release.
 const REAP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -140,9 +144,7 @@ fn parent_role() {
     let ready = root.join(READY);
     let release = root.join(RELEASE);
 
-    let sandbox = Sandbox::new()
-        .expose(&root, AccessMode::ReadWrite)
-        .device_files();
+    let sandbox = Sandbox::new().expose(&root, AccessMode::ReadWrite);
     let extra = [
         (harness::CONTROL_PARAM, control.display().to_string()),
         (READY, ready.display().to_string()),
@@ -157,7 +159,7 @@ fn parent_role() {
     //    than polling the pid: a table read while `sandbox-exec` still held the image would show
     //    the descriptor even if the clear had never happened.
     assert!(
-        await_path(&ready, READY_TIMEOUT),
+        wait_for_path(&ready, READY_TIMEOUT, READY_POLL),
         "the confined child never wrote its ready marker ({}) within {READY_TIMEOUT:?}; the \
          launcher copy's stderr carries its side of the failure",
         ready.display()
@@ -306,8 +308,7 @@ impl Drop for Children {
             let pid_arg = pid.to_string();
             let _ = Command::new(KILL).args(["-9", pid_arg.as_str()]).status();
         }
-        let _ = self.launcher.kill();
-        let _ = self.launcher.wait();
+        kill_and_reap(&mut self.launcher);
     }
 }
 
@@ -405,16 +406,4 @@ fn listen_port(line: &str) -> Option<u16> {
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse().ok())
     })
-}
-
-/// Whether `path` appears within `within`.
-fn await_path(path: &Path, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    path.exists()
 }

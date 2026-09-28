@@ -51,14 +51,17 @@ use serde::{Deserialize, Serialize};
 
 /// What the parent sends and the child validates.
 ///
-/// **`decode` is `serde`'s, and `adopt` spells it** (`serde_json::from_str` over
-/// the whole stream): a wrapper method would be a second spelling of "use serde"
-/// with nothing of its own to add. **The two `encode`s are not**, and they are the
-/// methods here that do something: a launcher holds the frame's three values as
-/// borrows on the path that blocks until the child drains stdin, so the borrowed
-/// spelling ([`Self::encode_frame`]) writes a *view* of this type rather than an
-/// owned copy of it — see [`Self::encode`] for the owned spelling, and the
-/// crate-internal `Wire` for the view both are written on.
+/// **This is the reader's half of the frame, and `Wire` is the writer's.**
+/// `Deserialize` is derived because the child is the one that decodes a launch
+/// (`adopt` spells it as `serde_json::from_str::<Self>` over the whole stream);
+/// nothing on the writing path builds one of these at all. **`Serialize` is
+/// deliberately not derived, and the reason is that it would be a second
+/// definition of the frame's shape**: the names, their order and their
+/// `skip_serializing_if`s would have to be kept in step with `Wire`'s by
+/// inspection, and a field added to one side and not the other would reach a
+/// child as a frame that disagrees with the launcher's own word about it.
+/// [`Self::encode_frame`] is the one writer, and the tests below pin the bytes it
+/// produces as text.
 ///
 /// The one thing a caller must not forget is that **the whole stream is the
 /// payload**: the parent writes the object and closes stdin, and a child that
@@ -69,16 +72,14 @@ use serde::{Deserialize, Serialize};
 /// ```
 /// use tinio_sandbox_core::LaunchPayload;
 ///
-/// let payload = LaunchPayload {
-///     config: "port = 9000".into(),
-///     token: Some("00".repeat(32)),
-///     confinement: None,
-/// };
-/// let line = serde_json::to_string(&payload)?;
-/// assert_eq!(serde_json::from_str::<LaunchPayload>(&line)?, payload);
+/// // The launcher's spelling of the frame, and the child's read of it back.
+/// let frame = LaunchPayload::encode_frame("port = 9000", None, None)?;
+/// let payload: LaunchPayload = serde_json::from_slice(&frame)?;
+/// assert_eq!(payload.config, "port = 9000");
+/// assert_eq!(payload.token, None);
 /// # Ok::<(), serde_json::Error>(())
 /// ```
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::Debug)]
+#[derive(Clone, PartialEq, Eq, Deserialize, derive_more::Debug)]
 pub struct LaunchPayload {
     /// The configuration file's text, unparsed.
     ///
@@ -119,52 +120,8 @@ pub struct LaunchPayload {
 }
 
 impl LaunchPayload {
-    /// This payload as the borrowed wire view of it, which is what a launcher that
-    /// already holds the values serializes.
-    ///
-    /// **Crate-visible rather than public**, with the wire view it returns: a public
-    /// name here would have to be published through this crate's root list and the
-    /// `tinio-sandbox` facade's, and the view is the launcher's own encoding detail.
-    /// [`Self::encode_frame`] is the borrowed spelling's public door.
-    pub(crate) fn wire(&self) -> Wire<'_> {
-        Wire {
-            config: &self.config,
-            token: self.token.as_deref(),
-            confinement: self.confinement.as_ref(),
-        }
-    }
-
-    /// The frame's bytes: one JSON object, exactly the shape a child decodes back
-    /// into this type.
-    ///
-    /// **The same bytes [`Self::encode_frame`] writes**, and the two are one
-    /// implementation rather than two: this is the owned payload's spelling, for a
-    /// caller that has one to write.
-    ///
-    /// # Errors
-    ///
-    /// [`serde_json::Error`] for a value the serializer refuses, which no payload
-    /// this crate builds can produce.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tinio_sandbox_core::LaunchPayload;
-    ///
-    /// let payload = LaunchPayload {
-    ///     config: "port = 9000".into(),
-    ///     token: None,
-    ///     confinement: None,
-    /// };
-    /// assert_eq!(payload.encode()?, "{\"config\":\"port = 9000\"}".as_bytes());
-    /// # Ok::<(), serde_json::Error>(())
-    /// ```
-    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
-        self.wire().encode()
-    }
-
-    /// The frame's bytes, **from the three values a launcher holds** — the borrowed
-    /// spelling, and the one a launcher that never builds a payload writes.
+    /// The frame's bytes, **from the three values a launcher holds** — the one
+    /// spelling of the frame, and every writer writes it.
     ///
     /// **Every argument is a borrow, and that is the point.** The frame goes into
     /// the child's stdin and the write **blocks until the child drains it** (design
@@ -174,11 +131,12 @@ impl LaunchPayload {
     /// its parameters. Here the serializer reads the caller's own bytes, and the
     /// only allocation left on the path is the frame itself.
     ///
-    /// **The frame is the same frame, field for field.** The names, their order and
-    /// their two `skip_serializing_if`s are the owned type's, which is what keeps the
-    /// bytes a child decodes (`adopt`'s `serde_json::from_str::<LaunchPayload>`) and
-    /// the bytes an earlier reader was written against unchanged — pinned as text by
-    /// the tests below rather than left to two definitions agreeing by inspection.
+    /// **The frame is one frame because it is one definition.** `Wire` is the
+    /// only writer and [`Self`] derives `Deserialize` alone, so the bytes a child
+    /// decodes and the bytes an earlier reader was written against come from one
+    /// list of names, their order and their two `skip_serializing_if`s — pinned as
+    /// text by the tests below rather than left to two definitions agreeing by
+    /// inspection.
     ///
     /// # Errors
     ///
@@ -207,28 +165,28 @@ impl LaunchPayload {
     }
 }
 
-/// The **borrowed** wire view of a payload: what a launcher that already holds the
-/// three fields serializes.
+/// The **borrowed** wire view of a payload: the frame, and the **one definition
+/// of its shape**.
 ///
-/// **A second type rather than a change to [`LaunchPayload`], and what it buys is a
-/// copy the launcher cannot afford.** The frame is written into the child's stdin
-/// and the write **blocks until the child drains it** (design decision 17), so
+/// **The only writer.** [`LaunchPayload::encode_frame`] is this type's public
+/// door, and nothing else spells the frame: the reader derives `Deserialize` and
+/// deliberately no `Serialize`, so the field names, their order and their two
+/// `skip_serializing_if`s exist here alone and neither side of the wire can gain
+/// a field the other never heard of.
+///
+/// **A second type rather than a `Serialize` on [`LaunchPayload`], and what it buys
+/// is a copy the launcher cannot afford.** The frame is written into the child's
+/// stdin and the write **blocks until the child drains it** (design decision 17), so
 /// everything ahead of the `write` is startup latency — and the owned payload the
 /// launcher used to build cost two deep copies of the largest strings in the
 /// process: the whole configuration text and the whole rendered profile, text and
-/// parameters together. Here they are borrowed, and the only allocation left on the
-/// path is the frame's own bytes.
+/// parameters together. Here they are borrowed from the caller, and the only
+/// allocation left on the path is the frame's own bytes.
 ///
 /// **Crate-visible, and its public door is [`LaunchPayload::encode_frame`]** — a
 /// public name would have to be published through this crate's root list and the
 /// facade's, and how a launch is *encoded* is not part of the confinement contract a
 /// consumer names.
-///
-/// **The frame is the same frame, field for field.** The names, their order and
-/// their two `skip_serializing_if`s are [`LaunchPayload`]'s, which is what keeps the
-/// bytes a child decodes (`adopt`'s `serde_json::from_str::<LaunchPayload>`) and the
-/// bytes an earlier reader was written against unchanged — pinned as text by the
-/// tests below rather than left to the two definitions agreeing by inspection.
 #[derive(Serialize, derive_more::Debug)]
 pub(crate) struct Wire<'a> {
     /// The configuration file's text, unparsed — [`LaunchPayload::config`]'s value,
@@ -251,8 +209,7 @@ pub(crate) struct Wire<'a> {
 
 impl<'a> Wire<'a> {
     /// The frame a launcher writes from the three values it holds — **the one
-    /// constructor, and it takes borrows only**: a caller that owns any of the
-    /// three has [`LaunchPayload::wire`] to turn it into this view.
+    /// constructor, and it takes borrows only.**
     pub fn new(
         config: &'a str,
         token: Option<&'a str>,
@@ -361,6 +318,24 @@ impl SandboxSpec {
 /// core spells it, not because they agree.
 pub const LISTENER_FD_PREFIX: &str = "tinio-sandbox-fd=";
 
+/// One descriptor element: the prefix and the number, which is the whole of what
+/// separates the two handoffs' spellings.
+fn fd_arg(prefix: &str, fd: i64) -> OsString {
+    OsString::from(format!("{prefix}{fd}"))
+}
+
+/// The number a descriptor element carries, or `None` when `arg` is not that
+/// element.
+///
+/// **A malformed element — the right prefix, an unparseable tail — is *not* the
+/// element rather than an error**, so a caller filtering argv cannot
+/// accidentally strip an argument it does not understand. One implementation for
+/// both prefixes, so the two predicates cannot come to different answers about
+/// the same tail.
+fn fd_from_arg(prefix: &str, arg: &OsStr) -> Option<i64> {
+    arg.to_str()?.strip_prefix(prefix)?.parse().ok()
+}
+
 /// The argv element carrying the listener descriptor `fd`.
 ///
 /// # Examples
@@ -371,7 +346,7 @@ pub const LISTENER_FD_PREFIX: &str = "tinio-sandbox-fd=";
 /// assert_eq!(listener_fd_arg(7), "tinio-sandbox-fd=7");
 /// ```
 pub fn listener_fd_arg(fd: i64) -> OsString {
-    OsString::from(format!("{LISTENER_FD_PREFIX}{fd}"))
+    fd_arg(LISTENER_FD_PREFIX, fd)
 }
 
 /// Whether `arg` is the listener-descriptor element.
@@ -411,7 +386,7 @@ pub fn is_listener_fd_arg(arg: &OsStr) -> bool {
 /// assert_eq!(listener_fd_from_arg(OsStr::new("tinio-sandbox-fd=x")), None);
 /// ```
 pub fn listener_fd_from_arg(arg: &OsStr) -> Option<i64> {
-    arg.to_str()?.strip_prefix(LISTENER_FD_PREFIX)?.parse().ok()
+    fd_from_arg(LISTENER_FD_PREFIX, arg)
 }
 
 /// The argv element that carries the inherited **control-channel** descriptor number.
@@ -441,7 +416,7 @@ pub const CONTROL_FD_PREFIX: &str = "tinio-sandbox-control-fd=";
 /// assert_eq!(control_fd_arg(7), "tinio-sandbox-control-fd=7");
 /// ```
 pub fn control_fd_arg(fd: i64) -> OsString {
-    OsString::from(format!("{CONTROL_FD_PREFIX}{fd}"))
+    fd_arg(CONTROL_FD_PREFIX, fd)
 }
 
 /// Whether `arg` is the control-channel-descriptor element.
@@ -489,9 +464,10 @@ pub fn is_launcher_fd_arg(arg: &OsStr) -> bool {
 /// The descriptor number `arg` carries, when it is the control element and the number
 /// parses.
 ///
-/// The malformed-tail rule is [`listener_fd_from_arg`]'s, word for word: a right prefix
-/// with an unparseable tail is *not* the element, so a caller filtering argv cannot
-/// accidentally strip an argument it does not understand.
+/// The malformed-tail rule is [`listener_fd_from_arg`]'s, and one implementation
+/// rather than two: a right prefix with an unparseable tail is *not* the element,
+/// so a caller filtering argv cannot accidentally strip an argument it does not
+/// understand.
 ///
 /// # Examples
 ///
@@ -510,7 +486,7 @@ pub fn is_launcher_fd_arg(arg: &OsStr) -> bool {
 /// );
 /// ```
 pub fn control_fd_from_arg(arg: &OsStr) -> Option<i64> {
-    arg.to_str()?.strip_prefix(CONTROL_FD_PREFIX)?.parse().ok()
+    fd_from_arg(CONTROL_FD_PREFIX, arg)
 }
 
 #[cfg(test)]
@@ -527,12 +503,27 @@ mod tests {
         }
     }
 
+    /// The frame a launcher writes, from a payload assembled by hand.
+    ///
+    /// **The borrow is the whole point of the writer**, so a test that wants a
+    /// payload's bytes has to spell the three values out exactly as a launcher
+    /// does — there is no `Serialize` on the payload to reach for, and this is
+    /// what that costs a test.
+    fn frame(payload: &LaunchPayload) -> Vec<u8> {
+        Wire::new(
+            payload.config.as_str(),
+            payload.token.as_deref(),
+            payload.confinement.as_ref(),
+        )
+        .encode()
+        .expect("a payload this module builds always serializes")
+    }
+
     #[test]
     fn a_payload_survives_a_round_trip() {
         let payload = sample();
-        let line = serde_json::to_string(&payload).unwrap();
         assert_eq!(
-            serde_json::from_str::<LaunchPayload>(&line).unwrap(),
+            serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
             payload
         );
     }
@@ -547,9 +538,8 @@ mod tests {
             token: Some("00".repeat(32)),
             confinement: None,
         };
-        let line = serde_json::to_string(&payload).unwrap();
         assert_eq!(
-            serde_json::from_str::<LaunchPayload>(&line).unwrap(),
+            serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
             payload
         );
     }
@@ -565,10 +555,7 @@ mod tests {
             token: None,
             confinement: None,
         };
-        assert_eq!(
-            serde_json::to_string(&payload).unwrap(),
-            "{\"config\":\"port = 9000\"}"
-        );
+        assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
     }
 
     #[test]
@@ -597,9 +584,8 @@ mod tests {
                 ],
             }),
         };
-        let line = serde_json::to_string(&payload).unwrap();
         assert_eq!(
-            serde_json::from_str::<LaunchPayload>(&line).unwrap(),
+            serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
             payload
         );
     }
@@ -615,10 +601,7 @@ mod tests {
             token: None,
             confinement: None,
         };
-        assert_eq!(
-            serde_json::to_string(&payload).unwrap(),
-            "{\"config\":\"port = 9000\"}"
-        );
+        assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
         // And the other direction: a frame with no such field decodes to `None` rather than
         // failing, so a payload written by a launcher that predates it is still a payload.
         let decoded: LaunchPayload = serde_json::from_str("{\"config\":\"port = 9000\"}").unwrap();
@@ -626,12 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn the_borrowed_frame_is_the_owned_frame() {
-        // **The property that makes `Wire` usable at all**: the launcher that serializes from
-        // borrows (`hand_over`) writes the bytes a child decodes, which are the bytes the owned
-        // payload writes (`LaunchPayload::encode`). Asserted for every field combination, so a
-        // field added to one definition and not the other fails here rather than reaching a child
-        // as a frame that disagrees with the launcher's own word about it.
+    fn every_field_combination_of_the_frame_decodes_back() {
+        // **The property the wire has to keep now that `Wire` is its only writer**: the frame
+        // the launcher writes is the payload the child decodes, field for field. Asserted for
+        // every combination rather than one, because a field the writer learned to carry and the
+        // reader never heard of fails here rather than reaching a child as a frame the two ends
+        // disagree about — which is the failure the shape is pinned against.
         let confinement = SandboxSpec {
             mechanism: "sandbox-init".into(),
             profile: "(version 1)\n(deny default)\n(allow file-read* (subpath (param \"E0\")))\n"
@@ -659,20 +642,8 @@ mod tests {
                 confinement: Some(confinement),
             },
         ] {
-            let owned = serde_json::to_vec(&payload).unwrap();
-            assert_eq!(payload.encode().unwrap(), owned, "{payload:?}");
-            let borrowed = Wire::new(
-                &payload.config,
-                payload.token.as_deref(),
-                payload.confinement.as_ref(),
-            )
-            .encode()
-            .unwrap();
-            assert_eq!(borrowed, owned, "{payload:?}");
-            // And the borrowed frame decodes to the same payload, so the equality above is not
-            // two spellings of one mistake: the child's own read of it is the launcher's value.
             assert_eq!(
-                serde_json::from_slice::<LaunchPayload>(&borrowed).unwrap(),
+                serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
                 payload
             );
         }
@@ -680,9 +651,9 @@ mod tests {
 
     #[test]
     fn a_tokenless_borrowed_frame_is_the_one_field_frame_it_always_was() {
-        // The pinned text, for the borrowed writer: `skip_serializing_if` on a borrowed `Option`
-        // is what keeps an absent field absent rather than a `null` — the same rule the owned
-        // payload's tests assert, restated for the shape the launcher actually serializes.
+        // The pinned text, for the writer the launcher actually uses: `skip_serializing_if` on a
+        // borrowed `Option` is what keeps an absent field absent rather than a `null` — the same
+        // rule the round-trip tests above assert, stated for the frame a launch writes.
         assert_eq!(
             Wire::new("port = 9000", None, None).encode().unwrap(),
             "{\"config\":\"port = 9000\"}".as_bytes()
@@ -712,9 +683,8 @@ mod tests {
             token: None,
             confinement: None,
         };
-        let line = serde_json::to_string(&payload).unwrap();
         assert_eq!(
-            serde_json::from_str::<LaunchPayload>(&line).unwrap(),
+            serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
             payload
         );
     }
@@ -728,10 +698,7 @@ mod tests {
             token: None,
             confinement: None,
         };
-        assert_eq!(
-            serde_json::to_string(&payload).unwrap(),
-            "{\"config\":\"port = 9000\"}"
-        );
+        assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
     }
 
     #[test]
@@ -740,10 +707,10 @@ mod tests {
         // and `serde_json` escapes them, which is what keeps the payload one
         // object rather than several lines.
         let payload = sample();
-        let line = serde_json::to_string(&payload).unwrap();
-        assert!(!line.contains('\n'), "{line}");
+        let frame = frame(&payload);
+        assert!(!frame.contains(&b'\n'), "{frame:?}");
         assert_eq!(
-            serde_json::from_str::<LaunchPayload>(&line).unwrap(),
+            serde_json::from_slice::<LaunchPayload>(&frame).unwrap(),
             payload
         );
     }
@@ -751,8 +718,9 @@ mod tests {
     #[test]
     fn trailing_bytes_are_rejected() {
         // A child must be certain the whole stream was meant for it.
-        let line = serde_json::to_string(&sample()).unwrap();
-        assert!(serde_json::from_str::<LaunchPayload>(&format!("{line}junk")).is_err());
+        let mut line = frame(&sample());
+        line.extend_from_slice(b"junk");
+        assert!(serde_json::from_slice::<LaunchPayload>(&line).is_err());
     }
 
     #[test]

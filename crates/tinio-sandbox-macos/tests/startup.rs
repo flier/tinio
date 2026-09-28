@@ -82,15 +82,12 @@ fn a_confined_process_starts() {
     let marker = root.join("marker.txt");
     fs::write(&marker, "confined\n").expect("seed");
 
-    // `.device_files()`, because `serve` asks for them (design §4) and this
-    // fixture mirrors the set the product builds. **Nothing renders a rule for
-    // the flag on this platform**: the literals this profile used to carry were
-    // measured unnecessary on both paths and deleted, so the flag travels and is
-    // inert (`profile.rs`'s module doc, and its
-    // `the_device_file_flag_is_not_spent_on_this_platform` leg).
-    let sandbox = Sandbox::new()
-        .expose(&root, AccessMode::ReadWrite)
-        .device_files();
+    // **The fixture is the exposure set `serve` builds, and nothing else**: device
+    // files are Linux's concept, so this platform's set carries no flag for them
+    // and no rule is rendered for one (`profile.rs`'s module doc, and its
+    // `no_device_literal_is_rendered_on_this_platform` leg — the literals this
+    // profile used to carry were measured unnecessary on both paths and deleted).
+    let sandbox = Sandbox::new().expose(&root, AccessMode::ReadWrite);
     let params = [("marker", marker.display().to_string())];
 
     // Two modes, one probe. Normally the child is launched through `confine`,

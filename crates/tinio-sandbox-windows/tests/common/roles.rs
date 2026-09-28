@@ -134,8 +134,10 @@ pub fn child_role_body(config: &str, listener: TcpListener) {
     }
 
     // The listener this process inherited: answer one connection, which is what
-    // the parent is waiting for.
-    let (mut stream, _) = listener.accept().expect("accept");
+    // the parent is waiting for. **The accept is retried, because the listener the
+    // child rebuilt is non-blocking** (see `super::wait::accept` for the mode, the
+    // race it used to lose and the bound the retry keeps).
+    let mut stream = super::wait::accept(&listener, "the confined child's listener");
     stream.write_all(b"pong").expect("answer");
     stream.flush().expect("flush the answer");
 }

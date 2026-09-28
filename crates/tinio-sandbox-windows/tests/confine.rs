@@ -87,9 +87,9 @@ fn the_whitelist_holds_the_loopback_round_trip_and_the_standing_grants() {
         // performs no `icacls` on the way out at all), and it is also what makes a
         // second run on this root free: the SID is root-derived, so the ACE the
         // first run wrote is the one the second finds and skips. **`has_ace`
-        // refusing a non-zero `icacls` exit is what makes these assertions mean
-        // anything** (Task 4): as an oracle it would otherwise have reported "no
-        // entry" for a path it could not read at all.
+        // refusing a path whose DACL cannot be read is what makes these assertions
+        // mean anything** (Task 4): as an oracle it would otherwise have reported
+        // "no entry" for a path nothing had looked at.
         assert!(
             acl::has_ace(&tree.root, &sid).expect("read the DACL"),
             "on {}: the served root's grant is standing",
@@ -287,15 +287,13 @@ fn a_capability_from_the_options_reaches_the_container() {
 
 #[test]
 fn a_grant_that_fails_leaves_the_earlier_ones_standing() {
-    // **The one failure path a test cannot drive through `confine`, and the
-    // reason.** `confine` canonicalises every exposure before it grants anything,
-    // so the only grant failures that reach its loop are `icacls`'s own refusals
-    // — and `canonical_exposures` accepts anything that resolves, including the
-    // shapes a test could hand it (a file, a deep path, an unusual spelling), all
-    // of which `icacls` grants happily. What is left is the guard: the object
-    // `confine` holds, and what dropping it does. It deletes the profile and takes
-    // **nothing** back, so the grant that landed before the failure is still there
-    // — the state a subsequent run on the same root finds and skips.
+    // **The failure a test can drive here, and the reason it is not driven through
+    // `confine`.** `confine` canonicalises every exposure before it grants anything,
+    // so what reaches its loop are paths that resolve — and a resolved path this
+    // process may read is one a grant opens and writes. What is left is the guard:
+    // the object `confine` holds, and what dropping it does. It deletes the profile
+    // and takes **nothing** back, so the grant that landed before the failure is
+    // still there — the state a subsequent run on the same root finds and skips.
     let (_dir, tree) = common::tree(&common::one_volume());
     let sid = Arc::new(common::sid_for(&tree));
     let mut grants = acl::Grants::new(Arc::clone(&sid));
@@ -311,8 +309,12 @@ fn a_grant_that_fails_leaves_the_earlier_ones_standing() {
     let vanished = tree.report.join("vanished");
     let err = grants
         .apply(&vanished, Target::Directory, AccessMode::ReadWrite)
-        .expect_err("a grant on a path icacls cannot see fails");
-    assert!(err.to_string().contains("icacls"), "{err}");
+        .expect_err("a grant on a path that does not exist fails");
+    // The step is the open's now — the grant opens the object before it reads or
+    // writes anything, which is what pins the ACE to the object the check approved
+    // — and the failure still names the path it was about.
+    assert!(err.to_string().contains("open the granted path"), "{err}");
+    assert!(err.to_string().contains("vanished"), "{err}");
 
     drop(grants);
     assert!(

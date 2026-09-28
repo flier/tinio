@@ -36,6 +36,7 @@ use assert_cmd::cargo::cargo_bin;
 use cucumber::{gherkin::Step, given, then, when};
 use tempfile::TempDir;
 use tinio_sandbox::Event;
+use tinio_util::testing::kill_and_reap;
 use tokio::time::sleep;
 
 use super::World;
@@ -314,8 +315,7 @@ impl Cli {
                 break;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child);
                 panic!(
                     "`{command}` neither exited nor became ready within {}s\nstdout:\n{}\nstderr:\n{}",
                     budget.as_secs(),
@@ -390,8 +390,7 @@ impl Cli {
     /// no such step, because the process this kill ends *is* the server.
     fn kill_servers(&mut self) {
         for mut child in self.children.drain(..) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
         }
         // **The gate is the precondition the sweep's doc states**: only a run that asked for a
         // confinement can have left the grandchild, and the sweep is a `pkill -f` over the whole
@@ -459,8 +458,7 @@ impl Cli {
             while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 thread::sleep(POLL);
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
         }
         let file = state_file(root);
         let deadline = Instant::now() + TEARDOWN_TIMEOUT;

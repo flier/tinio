@@ -3,18 +3,25 @@
 
 #[cfg(unix)]
 use std::fs::File;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::net::TcpListener;
-#[cfg(target_os = "macos")]
-use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::os::fd::{BorrowedFd, OwnedFd};
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     ffi::{OsStr, OsString},
     io,
+    net::TcpListener,
     path::PathBuf,
     process::ExitStatus,
     thread::JoinHandle,
 };
 
+// The pid the fork-probe handshake takes, under the same `#[cfg]` the names that
+// use it are: `tinio-sandbox` re-exports the probe because the equality with the
+// core's surface is the rule, and a `#[cfg(unix)]` dev-dependency is what lets
+// this file name the one foreign type in that surface.
+#[cfg(unix)]
+use rustix::process::Pid;
 // The core crate, under the facade's own alias for it: this is the path the **type
 // half** of every binding in `the_launcher_surface_is_re_exported` names, so a name the
 // core stops publishing fails there rather than only on the facade's side.
@@ -24,7 +31,10 @@ use tinio_sandbox::_core as core;
 // the same `#[cfg]` the test carries rather than in its body.
 #[cfg(target_os = "macos")]
 use tinio_sandbox::macos::{Mechanism, Options};
-use tinio_sandbox::{AccessMode, Backend, LaunchPlan, Sandbox, platform};
+use tinio_sandbox::{
+    AccessMode, Adopted, Applied, Backend, ControlSocket, LaunchPlan, Sandbox, SandboxSpec,
+    apply_self_confinement, platform, serve,
+};
 
 #[test]
 fn the_facade_resolves_exactly_one_backend() {
@@ -48,11 +58,12 @@ fn the_vocabulary_is_re_exported() {
 
 /// Every item the facade publishes, named through `tinio_sandbox::`.
 ///
-/// **Each binding names both crates, and that is what makes this list the core's
-/// list rather than a second hand-copy of it.** The *type* half of every binding
-/// is the core's path (`tinio_sandbox::_core::…`, the facade's own alias for the
-/// core crate) and the *value* half is the facade's, so one line fails for either
-/// of the two ways the surface can drift: a name the core stops publishing (or
+/// **Every name this list puts in a type position is bound through both crates,
+/// and that is what makes this list the core's list rather than a second
+/// hand-copy of it.** The *type* half of a binding that names a core item is the
+/// core's path (`tinio_sandbox::_core::…`, the facade's own alias for the core
+/// crate) and its *value* half is the facade's, so one line fails for either of
+/// the two ways the surface can drift: a name the core stops publishing (or
 /// publishes with another shape, which the `fn`-pointer half catches) fails the
 /// type, and a name the core publishes but the facade does not re-export fails
 /// the value. An earlier draft enforced only the facade's side, which let a core
@@ -111,10 +122,19 @@ fn the_launcher_surface_is_re_exported() {
         }
     };
 
+    // serve::Spec is the facade's own confine entry (not a core re-export): bind the constructor
+    // and apply so a rename or drop fails here rather than only at a CLI call site.
+    let _: fn() -> serve::Spec = serve::Spec::new;
+    let _: fn(serve::Spec) -> tinio_sandbox::Result<Option<tinio_sandbox::Child>> =
+        serve::Spec::apply;
+
     // The vocabulary — Task 1's half of the surface.
     let _: fn() -> core::Sandbox = tinio_sandbox::Sandbox::new;
     let _: fn(&core::Sandbox) -> &[core::Exposure] = tinio_sandbox::Sandbox::exposures;
-    let _: fn(Vec<core::Exposure>, bool) -> core::Sandbox = tinio_sandbox::Sandbox::from_exposures;
+    let _: fn(&core::Sandbox) -> core::Result<&core::Exposure> =
+        tinio_sandbox::Sandbox::served_root;
+    let _: fn(Vec<core::Exposure>) -> core::Sandbox = tinio_sandbox::Sandbox::from_exposures;
+    let _: fn(&[core::Exposure]) -> String = tinio_sandbox::describe_exposures;
     let _: fn(core::AccessMode) -> bool = tinio_sandbox::AccessMode::is_read_only;
     let _: fn(&core::Error) -> String = |err| err.to_string();
     let _: core::Result<()> = Ok(());
@@ -160,6 +180,11 @@ fn the_launcher_surface_is_re_exported() {
     ) -> core::Result<core::Confinement> = <dyn Backend as Backend>::confine;
     let _: fn(String) -> core::LaunchPlan = tinio_sandbox::LaunchPlan::for_launch;
     let _: fn(&core::LaunchPlan) -> &str = tinio_sandbox::LaunchPlan::config;
+    // **The predicate beside the text it qualifies**, and the pair a launcher's precondition
+    // reads: `config()` answers the text, `has_config()` answers whether there is one at all —
+    // an empty text being a configuration the child parses into defaults rather than a plan
+    // nothing was ever handed.
+    let _: fn(&core::LaunchPlan) -> bool = tinio_sandbox::LaunchPlan::has_config;
     let _: fn(&str) -> Option<core::Event> = tinio_sandbox::Event::decode;
     let _: fn(&mut core::Observer<Vec<u8>>, &str, &str) -> Option<core::Event> =
         tinio_sandbox::Observer::record;
@@ -167,6 +192,12 @@ fn the_launcher_surface_is_re_exported() {
         tinio_sandbox::Observer::terminal;
     let _: fn(Vec<OsString>, io::Empty) -> core::Result<Option<core::Adopted>> =
         tinio_sandbox::adopt;
+    // **`filter_argv` is the one binding here whose answer is a pair**, and the tuple nested in a
+    // `Result` in a `fn` pointer is what took this line over clippy's `type_complexity`
+    // threshold. The pair is named once, beside the binding that spells it, rather than at the
+    // file top: no other name in the list carries the filtered argv with the adopted record.
+    type Filtered = (Vec<OsString>, Option<core::Adopted>);
+    let _: fn(Vec<OsString>, io::Empty) -> core::Result<Filtered> = tinio_sandbox::filter_argv;
     let _: fn(i64) -> OsString = tinio_sandbox::listener_fd_arg;
     let _: fn(&OsStr) -> bool = tinio_sandbox::is_listener_fd_arg;
     let _: fn(&OsStr) -> Option<i64> = tinio_sandbox::listener_fd_from_arg;
@@ -219,6 +250,18 @@ fn the_launcher_surface_is_re_exported() {
         token: None,
         confinement: None,
     };
+    // **The fork probe's three names, bound where a probe exists** — the core publishes them under
+    // the same `#[cfg]`, because a probe is a unix handshake (a fork, a pipe, a `waitpid`) and the
+    // list above has to compile on every target. `await_verdict` is the `fn`-pointer binding and
+    // the other two are values: the step names through the constructor, and the child's half
+    // through the report it writes.
+    #[cfg(unix)]
+    {
+        let _: fn(OwnedFd, Pid, core::ProbeSteps, Duration) -> core::Result<bool> =
+            tinio_sandbox::await_verdict;
+        let _: fn(OwnedFd, bool) -> io::Result<()> = tinio_sandbox::report_verdict;
+        let _: core::ProbeSteps = tinio_sandbox::ProbeSteps::named("probe");
+    }
 }
 
 /// The **launch-failure pair** — the killer a launcher may hand over, and the call that runs it —
@@ -227,9 +270,9 @@ fn the_launcher_surface_is_re_exported() {
 ///
 /// **Its own test rather than two bindings in the list above, because neither half is a `fn`
 /// pointer.** `with_kill` is generic over the closure the caller writes and `kill` is an inherent
-/// method rather than a free function, so what resolves is the name at the shape the macOS launcher
-/// writes (`crates/tinio-cli/src/sandbox/macos.rs`'s `retract`: install the platform's kill, then
-/// call it on the failure path). **The pair is reachable on every target and only *used* on the
+/// method rather than a free function, so what resolves is the name at the shape the launcher
+/// writes (`crates/tinio-cli/src/sandbox/confine.rs`'s failed-publish path: `child.abort()`, which
+/// runs the platform's killer and reaps). **The pair is reachable on every target and only *used* on the
 /// launcher platforms**: `tinio-sandbox-core`'s `Child` carries both methods unconditionally, while
 /// the `Option` is `None` for every child whose platform already owns the process's lifetime — see
 /// `crates/tinio-sandbox-core/src/launcher/supervise.rs` for why a dropped child is not an ended
@@ -242,6 +285,30 @@ fn the_launch_failure_surface_is_re_exported() {
     ended
         .kill()
         .expect("the child reaches the killer `with_kill` installed");
+}
+
+/// **The control handoff carries the platform's own form, and this leg is where that is
+/// pinned** — the one facade shape the 2026-09-27 change split in two.
+///
+/// A unix launcher hands **borrowed descriptors**, so the "this descriptor is open in this
+/// process" fact is the type system's before any code runs, while Windows hands the
+/// **handle values** its channel keeps owning — the form `CreateProcessW` marks inheritable.
+/// A facade that went back to one `&[i64]` fails the unix binding here, and one that gave
+/// Windows the unix shape fails the other arm: the equality this test keeps is with the
+/// platform's handoff form, which is why the two arms are `#[cfg]`-selected rather than
+/// bent into one signature.
+#[test]
+fn the_control_handoff_carries_the_platforms_own_form() {
+    #[cfg(unix)]
+    {
+        let _: fn(&[BorrowedFd<'_>]) -> core::Result<Vec<core::ControlHandle>> =
+            tinio_sandbox::control_handles;
+    }
+    #[cfg(not(unix))]
+    {
+        let _: fn(&[i64]) -> core::Result<Vec<core::ControlHandle>> =
+            tinio_sandbox::control_handles;
+    }
 }
 
 /// **The three adopted names answer one type on every platform that publishes
@@ -259,15 +326,61 @@ fn the_launch_failure_surface_is_re_exported() {
 /// `on_stop` is bound by instantiating its `impl Fn()` parameter with `fn()`
 /// (`fn()` is `Fn() + Send + 'static`), which is the only shape a `fn`-pointer
 /// binding can name.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
 fn the_adopted_names_answer_one_error_type() {
     let _: fn(&tinio_sandbox::Adopted) -> tinio_sandbox::Result<TcpListener> =
         tinio_sandbox::adopted_listener;
     let _: fn(fn()) -> tinio_sandbox::Result<()> = tinio_sandbox::on_stop;
-    #[cfg(target_os = "macos")]
-    let _: fn(&tinio_sandbox::Adopted) -> tinio_sandbox::Result<UnixListener> =
+    let _: fn(&tinio_sandbox::Adopted) -> tinio_sandbox::Result<ControlSocket> =
         tinio_sandbox::adopted_control;
+    let _: &'static str = tinio_sandbox::MACOS_MECHANISM_USAGE;
+    assert!(
+        tinio_sandbox::Error::Unsupported {
+            detail: tinio_sandbox::MACOS_MECHANISM_USAGE,
+        }
+        .is_usage()
+    );
+}
+
+/// **The self-confinement step answers one shape on every platform, and refuses what the platform
+/// cannot apply** — the child-side rule the contract owns, pinned the way
+/// `the_adopted_names_answer_one_error_type` pins the adopted names: a `fn`-pointer binding at the
+/// shared [`tinio_sandbox::Result`], so a platform arm that went back to its own error type stops
+/// compiling here rather than in a launch nobody runs on this host.
+///
+/// **The frame is one macOS cannot have been handed, and that is deliberate.** `sandbox-exec`
+/// confines the child's `exec`, so a launcher that resolved it never puts a profile on the frame:
+/// the refusal is that disagreement between the two processes, and the apply is never reached. A
+/// frame this build would really apply is not a case this test can hold — the apply is one-shot
+/// and irreversible, so driving it here would confine the test binary and every leg after it.
+///
+/// **The no-op half is the other side of the rule**, and it is what every ordinary run takes: a
+/// frame carrying no confinement is nothing to apply on any platform.
+#[test]
+fn the_self_confinement_step_refuses_what_the_platform_cannot_apply() {
+    let _: fn(&Adopted) -> tinio_sandbox::Result<Option<Applied>> = apply_self_confinement;
+
+    let plain = Adopted::new(String::new(), Some(7), Vec::new(), None, None);
+    assert_eq!(
+        apply_self_confinement(&plain).expect("no confinement to apply"),
+        None,
+        "a frame that carries none is a no-op everywhere"
+    );
+
+    let framed = Adopted::new(
+        String::new(),
+        Some(7),
+        Vec::new(),
+        None,
+        Some(SandboxSpec {
+            mechanism: String::from("sandbox-exec"),
+            profile: String::new(),
+            params: Vec::new(),
+        }),
+    );
+    let err = apply_self_confinement(&framed)
+        .expect_err("a frame this process cannot apply is refused, never served");
+    assert!(!err.to_string().is_empty(), "{err}");
 }
 
 #[cfg(target_os = "linux")]

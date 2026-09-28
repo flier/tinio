@@ -26,6 +26,7 @@ use std::{
     ptr,
 };
 
+use tinio_winsec::to_wide;
 // **The core's builder is imported under an alias here, and it has to be.**
 // `use tinio_sandbox_core::launch;` beside this module's own `pub fn launch`
 // below is `E0255` — one name cannot bind two functions — and `launch` is what
@@ -355,12 +356,12 @@ impl Drop for LaunchedProcess {
 /// before the child's parser ever sees it, so the argv the child reads is not the
 /// argv the operator passed — this launcher's own arguments filtered, with
 /// `tinio-sandbox-fd=<n>` among them. The NUL is appended here rather than by
-/// `crate::wide`, because what this returns is units and not text.
+/// [`to_wide`], because what this returns is units and not text.
 ///
 /// The program path is the same rule through a second route, and it is not the
 /// program's argv element that decides it: [`launch`] hands the path to
-/// `CreateProcessW` as `lpApplicationName` through `crate::wide_os`, so the image
-/// the kernel opens is the one the caller named whatever this line says.
+/// `CreateProcessW` as `lpApplicationName` through [`to_wide`], so the image the
+/// kernel opens is the one the caller named whatever this line says.
 ///
 /// # Examples
 ///
@@ -673,7 +674,7 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
         };
 
         let mut line = command_line(spec.program, spec.args);
-        let application = crate::wide_os(spec.program.as_os_str());
+        let application = to_wide(spec.program.as_os_str());
         let mut info = PROCESS_INFORMATION {
             hProcess: ptr::null_mut(),
             hThread: ptr::null_mut(),

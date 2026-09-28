@@ -36,6 +36,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 #[cfg(feature = "openapi")]
@@ -426,7 +427,7 @@ async fn authorize(
             .and_then(|value| value.to_str().ok())
             .or_else(|| bearer(&headers))
             .unwrap_or_default();
-        if !tokens_match(presented, &shared.state.token) {
+        if !tokens_match(presented, shared.state.token.expose_secret().as_str()) {
             return Error::Unauthorized.into_response();
         }
     }
@@ -663,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn status_answers_with_the_state_on_the_local_channel() {
         let (shared, _rx) = shared(Auth::Local);
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
         let response = router(shared)
             .oneshot(get("/status", Some(&token)))
             .await
@@ -704,11 +705,17 @@ mod tests {
         // character is chosen against the one this test removes — comparing it with the
         // character now at the end would leave the token unchanged in one run out of 256.
         let (shared, _rx) = shared(Auth::Local);
-        let mut token = shared.state.token.clone();
+        let mut token = shared.state.token.expose_secret().as_str().to_owned();
         let last = token.pop().expect("a 64-character token");
         token.push(if last == 'a' { 'b' } else { 'a' });
-        assert!(!tokens_match(&token, &shared.state.token));
-        assert!(tokens_match(&shared.state.token, &shared.state.token));
+        assert!(!tokens_match(
+            &token,
+            shared.state.token.expose_secret().as_str()
+        ));
+        assert!(tokens_match(
+            shared.state.token.expose_secret().as_str(),
+            shared.state.token.expose_secret().as_str()
+        ));
         let response = router(shared)
             .oneshot(get("/status", Some(&token)))
             .await
@@ -765,7 +772,7 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(untokened.status(), StatusCode::UNAUTHORIZED);
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
         let tokened = router(shared)
             .oneshot(get("/metrics", Some(&token)))
             .await
@@ -789,7 +796,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{auth:?}");
         }
         let (shared, _rx) = shared(Auth::Tcp);
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
         let response = router(shared)
             .oneshot(get("/metrics", Some(&token)))
             .await
@@ -842,7 +849,7 @@ mod tests {
         // header (`management-api.md:15`), so the alias holds on every transport.
         for auth in [Auth::Local, Auth::Loopback, Auth::Tcp] {
             let (shared, _rx) = shared(auth);
-            let token = shared.state.token.clone();
+            let token = shared.state.token.expose_secret().as_str().to_owned();
             let request = Request::builder()
                 .uri("/status")
                 .method("GET")
@@ -857,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn stop_flips_the_shutdown_channel_and_answers_202() {
         let (shared, mut rx) = shared(Auth::Local);
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
         let response = router(shared)
             .oneshot(
                 Request::builder()
@@ -880,7 +887,7 @@ mod tests {
         // doc's — so both requests get the contract's plain `404` (`management-api.md:50`) and
         // nothing about the plane leaks.
         let (shared, _rx) = shared(Auth::Local);
-        let token = shared.state.token.clone();
+        let token = shared.state.token.expose_secret().as_str().to_owned();
         let with_token = router(shared.clone())
             .oneshot(get("/nope", Some(&token)))
             .await
@@ -912,7 +919,7 @@ mod tests {
             "the route answers the document: {text}"
         );
         let (remote, _rx) = shared(Auth::Tcp);
-        let token = remote.state.token.clone();
+        let token = remote.state.token.expose_secret().as_str().to_owned();
         let untokened = router(remote.clone())
             .oneshot(get("/openapi.json", None))
             .await

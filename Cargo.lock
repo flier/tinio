@@ -4228,6 +4228,7 @@ name = "tinio-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "derive_more",
  "getrandom 0.4.3",
  "hex",
  "http",
@@ -4236,6 +4237,7 @@ dependencies = [
  "hyper-util",
  "prometheus",
  "rustls-pemfile",
+ "secrecy",
  "serde",
  "serde_json",
  "sha1",
@@ -4427,10 +4429,13 @@ dependencies = [
 name = "tinio-sandbox"
 version = "0.1.0"
 dependencies = [
+ "rustix 1.1.4",
+ "secrecy",
  "tinio-sandbox-core",
  "tinio-sandbox-linux",
  "tinio-sandbox-macos",
  "tinio-sandbox-windows",
+ "tracing",
 ]
 
 [[package]]
@@ -4439,6 +4444,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "derive_more",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sse-core",
@@ -4460,8 +4466,9 @@ dependencies = [
  "sha2",
  "tempfile",
  "tinio-sandbox-core",
+ "tinio-sandbox-linux",
+ "tinio-util",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4470,16 +4477,17 @@ version = "0.1.0"
 dependencies = [
  "handlebars",
  "libc",
+ "parse-display",
  "rustix 1.1.4",
  "serde",
  "serde_json",
  "signal-hook",
  "tempfile",
+ "thiserror 2.0.20",
  "tinio-sandbox-core",
  "tinio-util",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4487,12 +4495,12 @@ name = "tinio-sandbox-windows"
 version = "0.1.0"
 dependencies = [
  "hex",
- "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.20",
  "tinio-sandbox-core",
+ "tinio-sandbox-windows",
  "tinio-util",
+ "tinio-winsec",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4565,6 +4573,8 @@ dependencies = [
  "tinio-fs",
  "tinio-mem",
  "tinio-sandbox",
+ "tinio-sandbox-linux",
+ "tinio-sandbox-windows",
  "tinio-select",
  "tinio-util",
  "tokio",
@@ -4589,11 +4599,17 @@ name = "tinio-util"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "derive_more",
  "futures",
+ "handlebars",
  "papaya",
+ "secrecy",
+ "serde",
  "serde_json",
  "tinio-core",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

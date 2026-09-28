@@ -96,7 +96,9 @@
 #[doc(hidden)]
 pub extern crate tinio_sandbox_core as _core;
 
-use crate::_core::{Backend as BackendTrait, Confinement, LaunchPlan, Result, Sandbox};
+use crate::_core::{
+    Backend as BackendTrait, Confinement, LaunchPlan, PlatformFacts, Result, Sandbox,
+};
 
 pub mod apply;
 pub mod launch;
@@ -107,6 +109,25 @@ pub mod relay;
 pub use self::{
     launch::{SANDBOX_EXEC, command_args, confine, self_args},
     mechanism::{Mechanism, Options},
+};
+
+/// What this mechanism does, for a caller that branches on the fact rather than the OS.
+///
+/// **Every field is true for Seatbelt**, and each is a sentence about this crate's own launch:
+/// it starts a supervised child; it grants the state directory without its parent (the `home`
+/// paragraph of design §5); it proves that directory can take a file before it launches; and it
+/// rebuilds the inherited control channel as a unix socket rather than reading an inherited
+/// handle.
+///
+/// **Ending the child of a failed launch is this crate's act and not a fact it publishes.**
+/// [`launch::confine`] installs a killer on the child — a `SIGKILL` to the pid it spawned — and
+/// the core's `Child::abort` is what calls it, on every launcher platform alike. No caller
+/// consults a fact before ending a child, so none is answered here.
+pub const FACTS: PlatformFacts = PlatformFacts {
+    launches_child: true,
+    refuses_derived_state_dir: true,
+    probe_state_dir_writable: true,
+    control_socket: true,
 };
 
 /// The macOS backend — the type the facade's `platform()` selects.

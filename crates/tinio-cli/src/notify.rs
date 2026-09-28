@@ -22,7 +22,14 @@ use std::{
 };
 
 use sd_notify::{self, NotifyState, watchdog_enabled};
+use serde::Serialize;
 use tokio::time;
+
+use crate::{_util::render::renderer, Error};
+
+/// The unit's layout. Values live in [`UnitView`], already systemd-quoted; the
+/// registry does not escape them.
+const TEMPLATE: &str = include_str!("unit.hbs");
 
 /// The `READY=1` that follows readiness.
 pub fn ready() {
@@ -75,34 +82,38 @@ pub fn watchdog() {
     });
 }
 
-/// The unit, rendered from the one template (decision 21).
+/// The values [`TEMPLATE`] interpolates. Both strings are already systemd-quoted.
+#[derive(Serialize)]
+struct UnitView {
+    work: String,
+    exec: String,
+}
+
+/// The unit, rendered from [`TEMPLATE`] (decision 21).
 ///
 /// Paths and argv are systemd-quoted so spaces / `#` / quotes cannot break the unit or inject
 /// extra directives. `WatchdogSec=30` is a default the operator may edit; heartbeat cadence
 /// still comes from `WATCHDOG_USEC`.
-pub fn unit_text(program: &Path, args: &[OsString], state_dir: &Path) -> String {
+///
+/// # Errors
+///
+/// The template is static and [`UnitView`] supplies every field it names. A failure is a
+/// broken template; the handlebars error is [`Error::Render`]'s source.
+pub fn unit_text(program: &Path, args: &[OsString], state_dir: &Path) -> Result<String, Error> {
     let exec = iter::once(systemd_quote(program.as_os_str()))
         .chain(args.iter().map(|a| systemd_quote(a)))
         .collect::<Vec<_>>()
         .join(" ");
-    format!(
-        "[Unit]\n\
-         Description=tinio S3-compatible local storage server\n\
-         After=network.target\n\
-         \n\
-         [Service]\n\
-         Type=notify\n\
-         WatchdogSec=30\n\
-         WorkingDirectory={work}\n\
-         ExecStart={exec}\n\
-         Restart=on-failure\n\
-         RestartSec=5\n\
-         \n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
-        work = systemd_quote(state_dir.as_os_str()),
-        exec = exec,
-    )
+    let view = UnitView {
+        work: systemd_quote(state_dir.as_os_str()),
+        exec,
+    };
+    renderer()
+        .render_template(TEMPLATE, &view)
+        .map_err(|source| Error::Render {
+            context: "the systemd unit could not be rendered",
+            source,
+        })
 }
 
 /// Quote a unit-file value the way `systemd-escape --path` is *not*: shell-like double quotes
@@ -146,7 +157,8 @@ mod tests {
             Path::new("/usr/local/bin/tinio"),
             &["server".into(), "/srv/tinio".into()],
             Path::new("/srv/tinio/.tinio"),
-        );
+        )
+        .expect("the unit");
         assert!(
             text.contains("Type=notify"),
             "otherwise READY=1 is inert:\n{text}"
@@ -168,7 +180,8 @@ mod tests {
             Path::new("/usr/local/bin/tinio"),
             &["server".into(), "/srv/tinio data".into()],
             Path::new("/srv/tinio/.tinio"),
-        );
+        )
+        .expect("the unit");
         assert!(
             text.contains(r#"ExecStart=/usr/local/bin/tinio server "/srv/tinio data""#),
             "{text}"
@@ -177,7 +190,8 @@ mod tests {
             Path::new("/usr/bin/tinio"),
             &["server".into(), "/tmp/x\nEvil=1".into()],
             Path::new("/tmp/state"),
-        );
+        )
+        .expect("the unit");
         assert!(
             injected.contains(r#"\n"#) && !injected.contains("\nEvil=1"),
             "newlines in paths must not inject unit lines:\n{injected}"
@@ -195,7 +209,8 @@ mod tests {
             Path::new("/usr/local/bin/tinio"),
             &["server".into(), "/srv/tinio".into()],
             Path::new("/srv/tinio/.tinio"),
-        );
+        )
+        .expect("the unit");
         assert_eq!(
             checked_in, rendered,
             "the file an operator reads and the file a machine installs must be the same text"

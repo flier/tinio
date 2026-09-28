@@ -101,19 +101,19 @@ pub(crate) const GRANT_PHASE_WARN_AFTER: Duration = Duration::from_secs(15);
 /// **The fields carry what is cheap and true, and what is missing is the point.**
 /// `elapsed_ms` is the phase's whole-millisecond duration; `exposures` is the
 /// resolved exposure set's length — the same number `grant_whitelist`'s `info!`
-/// event carries, and deliberately not the number of `icacls` invocations, which
-/// the batched sibling grant makes a different number — and `threshold_ms` rides
-/// the warning alone, so the rule a run crossed is in the line rather than only
-/// in this source. **No field states the size of any tree**, because this
+/// event carries, and one this phase now writes one entry for, so it is also the
+/// count of `SetSecurityInfo` calls a first run makes and the per-path grants of a
+/// second — and `threshold_ms` rides the warning alone, so the rule a run crossed
+/// is in the line rather than only in this source. **No field states the size of any tree**, because this
 /// launcher does not know it and cannot learn it cheaply: an estimate is a walk
 /// of the corpus, which is the O(corpus) pass on the very path whose budget is
 /// short, and one `read_dir` of a directory is not the size of the tree beneath
 /// it. **The program's own directory is not a field either, and that is a
 /// decision**: it is the one exposed directory whose ACE does not propagate
-/// (decision 22, as Ruling 78 reshaped it — one ACE on the directory and one
-/// batched ACE on the `*.dll` files directly beside the program), so naming it
-/// in a message about cost would point the reader at the one entry that is not
-/// one.
+/// (decision 22, as Ruling 78 reshaped it — one ACE on the directory and one ACE
+/// per `*.dll` file directly beside the program, each on its own handle), so
+/// naming it in a message about cost would point the reader at the one entry that
+/// is not one.
 ///
 /// **It is a free function rather than a block inside `confine`, so that a test
 /// can pin the threshold and the level without a launch**: `backend::tests` calls

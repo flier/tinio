@@ -26,6 +26,7 @@ use http::Method;
 use http_body_util::BodyExt;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
+use secrecy::ExposeSecret;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(windows)]
@@ -220,7 +221,7 @@ fn call_for<'a>(state: &'a State, target: &'a str, method: Method) -> Call<'a> {
     Call {
         target,
         method,
-        token: Some(state.token.as_str()),
+        token: Some(state.token.expose_secret().as_str()),
     }
 }
 

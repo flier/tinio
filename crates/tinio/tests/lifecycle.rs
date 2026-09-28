@@ -35,6 +35,9 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
+#[cfg(windows)]
+use tinio_util::testing::kill_and_reap;
+
 /// The `tinio` binary under test.
 ///
 /// `CARGO_BIN_EXE_*` is defined for bins of the package under test, which is why this file lives
@@ -53,8 +56,7 @@ struct Serving(Child);
 #[cfg(windows)]
 impl Drop for Serving {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        kill_and_reap(&mut self.0);
     }
 }
 

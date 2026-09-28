@@ -18,7 +18,7 @@ use std::os::windows::io::{AsRawHandle as _, OwnedHandle, RawHandle};
 use std::{
     fs,
     os::{
-        fd::{AsFd as _, BorrowedFd},
+        fd::{AsFd as _, AsRawFd as _, BorrowedFd},
         unix::{
             ffi::OsStrExt,
             fs::PermissionsExt,
@@ -184,6 +184,25 @@ impl Channel {
     pub fn socket(&self) -> BorrowedFd<'_> {
         self.listener.as_fd()
     }
+
+    /// The descriptor a launcher duplicates into the child's plan.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(unix)]
+    /// # {
+    /// use std::path::Path;
+    ///
+    /// use tinio_api::bind::bind_unix;
+    ///
+    /// let channel = bind_unix(Path::new("/run/tinio/tinio-0123456789abcdef.sock")).expect("bind");
+    /// assert_eq!(channel.handoff_values().len(), 1);
+    /// # }
+    /// ```
+    pub fn handoff_values(&self) -> Vec<i64> {
+        vec![i64::from(self.socket().as_raw_fd())]
+    }
 }
 
 #[cfg(windows)]
@@ -263,6 +282,26 @@ impl Channel {
         self.handles
             .iter()
             .map(|handle| handle.as_raw_handle())
+            .collect()
+    }
+
+    /// Every pipe handle a launcher copies into the child's plan.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(windows)]
+    /// # {
+    /// use tinio_api::bind::bind_pipe;
+    ///
+    /// let channel = bind_pipe("tinio-mine").expect("bind");
+    /// assert!(!channel.handoff_values().is_empty());
+    /// # }
+    /// ```
+    pub fn handoff_values(&self) -> Vec<i64> {
+        self.raw_handles()
+            .into_iter()
+            .map(|raw| raw as usize as i64)
             .collect()
     }
 }

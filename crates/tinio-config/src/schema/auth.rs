@@ -1,70 +1,14 @@
-use std::ops;
-
-use derive_more::{Deref, From, PartialEq};
 use garde::Validate;
-use secrecy::{CloneableSecret, ExposeSecret, SecretBox, SerializableSecret, zeroize::Zeroize};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+
+pub use crate::_util::secret::{Secret, SecretKey};
 
 fn validate_auth_secret_key(value: &Secret, _context: &()) -> garde::Result {
     super::reject_empty(
         "auth.secret_key must not be empty",
         value.expose_secret().is_empty(),
     )
-}
-
-/// Secret key material: zeroized on drop; [`SerializableSecret`] opts into serde
-/// serialization for config round-trips.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SecretKey(String);
-
-impl Zeroize for SecretKey {
-    fn zeroize(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-impl SerializableSecret for SecretKey {}
-
-impl CloneableSecret for SecretKey {}
-
-impl ops::Deref for SecretKey {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<&str> for SecretKey {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for SecretKey {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<SecretKey> for SecretBox<SecretKey> {
-    fn from(key: SecretKey) -> Self {
-        SecretBox::new(Box::new(key))
-    }
-}
-
-/// Zeroizing secret-key box. [`PartialEq`] compares the exposed material —
-/// `SecretBox` itself is not comparable.
-#[derive(Clone, Debug, Deref, From, Serialize, Deserialize)]
-#[from(forward)]
-#[serde(transparent)]
-pub struct Secret(SecretBox<SecretKey>);
-
-impl PartialEq for Secret {
-    fn eq(&self, other: &Self) -> bool {
-        self.expose_secret() == other.expose_secret()
-    }
 }
 
 /// S3 credentials (`[auth]`; optional section — when present, both keys are

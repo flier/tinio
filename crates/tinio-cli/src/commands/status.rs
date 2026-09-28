@@ -15,12 +15,12 @@
 
 use std::process::ExitCode;
 
-use handlebars::{Handlebars, no_escape};
 use serde::Serialize;
 
 pub use super::DirArgs as Args;
 use super::{Answer, client_resolution, probe_pair};
 use crate::{
+    _util::render::renderer,
     Error,
     resolve::{Located, Resolution, authority},
 };
@@ -99,13 +99,12 @@ pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
 /// error rather than an operator-facing one; it is still an `Err` because library code does not
 /// panic.
 fn render(answer: &Answer, resolution: &Resolution) -> Result<String, Error> {
-    let mut hbs = Handlebars::new();
-    hbs.set_strict_mode(true);
-    hbs.register_escape_fn(no_escape);
-    hbs.render_template(TEMPLATE, &StatusView::new(answer, resolution))
+    renderer()
+        .render_template(TEMPLATE, &StatusView::new(answer, resolution))
         .map(|text| text.trim_end().to_string())
-        .map_err(|err| {
-            Error::Operational(format!("the status report could not be rendered: {err}"))
+        .map_err(|source| Error::Render {
+            context: "the status report could not be rendered",
+            source,
         })
 }
 

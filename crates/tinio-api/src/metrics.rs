@@ -25,12 +25,9 @@
 //! reader's cadence, there is no cache, and the design's two sentences are corrected in the
 //! same commit.
 
-use std::{
-    fmt::{Debug, Formatter, Result as FmtResult},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
+use derive_more::Debug;
 use prometheus::{Encoder, TextEncoder, default_registry};
 use tokio::{
     sync::watch,
@@ -165,6 +162,9 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 /// `ttl` — and the reader is a single task, so "one scan at a time" is a property of the shape
 /// rather than of a lock or a timestamp comparison.
 ///
+/// **`source` is opaque in `Debug`** via `#[debug("<injected>")]`: a scrape drives it and
+/// never reads it back; the trait object has no useful `Debug` of its own.
+///
 /// # Examples
 ///
 /// ```rust
@@ -186,19 +186,11 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 /// assert!(printed.contains("<injected>"), "{printed}");
 /// assert!(printed.contains("30s"), "{printed}");
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Gauges {
+    #[debug("<injected>")]
     source: Arc<dyn MetricsSource>,
     ttl: Duration,
-}
-
-impl Debug for Gauges {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_struct("Gauges")
-            .field("source", &"<injected>")
-            .field("ttl", &self.ttl)
-            .finish()
-    }
 }
 
 impl Gauges {

@@ -4,8 +4,8 @@
 //! The list is empty by default and that is the whole of the Windows network
 //! guarantee (design §7), so this module is the two spellings and nothing else:
 //! the name an operator writes in `TINIO_SANDBOX_CAPABILITIES` or in the
-//! configuration file, and the `S-1-15-3-N` SID [`Capability::sid`] hands to
-//! `sid::CapabilitySids`.
+//! configuration file, and the `S-1-15-3-N` SID the container is created with —
+//! [`Capability::sid`], the one text `sid::CapabilitySids` resolves.
 //!
 //! **The rationale did not move without the code it explains**: each variant's
 //! meaning, the round trip between the two spellings and the refusal of an
@@ -22,6 +22,13 @@ use crate::_core::{Error, Result};
 /// non-loopback listener adds
 /// [`PrivateNetworkClientServer`](Self::PrivateNetworkClientServer) and accepts
 /// that the container may then reach the private network.
+///
+/// **The enum is closed, and that is what bounds the container's capability
+/// list**: every SID one of the three variants names is inside the AppContainer
+/// capability range, and `sid::CapabilitySids` stamps what it resolves enabled —
+/// so a signature that took SID text would be one a caller could hand
+/// `S-1-5-32-544` (`BUILTIN\Administrators`) through. The three variants are the
+/// whole of what this crate can put in that list.
 ///
 /// # Examples
 ///
@@ -47,9 +54,11 @@ pub enum Capability {
 impl Capability {
     /// The capability's SID.
     ///
-    /// `S-1-15-3-N` is the AppContainer capability range, and it is what
-    /// `sid::CapabilitySids::resolve` is handed: the name is the operator's
-    /// spelling and the SID is the kernel's.
+    /// `S-1-15-3-N` is the AppContainer capability range: the name is the
+    /// operator's spelling and this is the kernel's, and it is the one text
+    /// `sid::CapabilitySids::resolve` turns into the entry a container is created
+    /// with — which is what makes a group SID outside that range unspellable
+    /// there.
     ///
     /// # Examples
     ///

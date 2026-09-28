@@ -66,9 +66,13 @@ pub fn jail_root(tmpdir: &Path, served_root: &Path) -> PathBuf {
     let jail = tmpdir.join(format!(".tinio-jail-{}", &digest[..16]));
     // One event per operation, with the operation's own arguments as fields
     // rather than as a sentence (shared §7). The crate installs no subscriber,
-    // so this writes nothing unless the process that owns the runtime has
-    // installed one; in `serve` that is the stderr subscriber, and the jail's
-    // path is what an operator needs when a mount does not land.
+    // so this writes nothing unless the process that owns the runtime installed
+    // one — and **on this platform `serve` installs its subscriber *after*
+    // `confine`** (the ordering `enter`'s `refuse_when_threaded` states), so a
+    // production run drops this line the way it drops every other event emitted
+    // inside the confinement. What an operator has for a mount that does not
+    // land is the returned `Error::Step`, which names the step; a caller that
+    // installs a subscriber before confining still reads the path here.
     debug!(step = "jail_root", root = %served_root.display(), jail = %jail.display(), "jail directory derived");
     jail
 }
@@ -327,10 +331,11 @@ mod tests {
         // **The `debug!` half of shared §7, and the event an operator reaches
         // for when a mount does not land**: the jail's own path is not in the
         // mount plan's `info!` set, so this is where it is recorded. The
-        // recorder is `crate::testing`'s — one for the whole crate, because the
-        // `step` field is the assertion in every module that makes it and the
-        // helper's doc carries the reason it is a global capture rather than a
-        // thread-scoped one.
+        // recorder is `tinio_util::testing::record_events`, re-exported by
+        // `crate::testing` — one for the whole crate, because the `step` field
+        // is the assertion in every module that makes it, and its own doc
+        // carries the reason it is a global capture rather than a thread-scoped
+        // one.
         let (jail, log) = record_events(|| jail_root(Path::new("/tmp"), Path::new("/srv/data")));
         assert_step(&log, "jail_root");
         assert!(log.contains(&jail.display().to_string()), "{log}");

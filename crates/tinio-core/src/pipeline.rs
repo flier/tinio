@@ -47,7 +47,6 @@
 
 use std::{
     error::Error as StdError,
-    fmt,
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
@@ -55,6 +54,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use derive_more::Debug;
 use futures::channel::oneshot;
 
 /// Unit-success [`Task::Output`]: `Ok(())` or a type-erased error.
@@ -132,7 +132,13 @@ impl<T> Reply<T> {
 /// is this handle: await it for `run()`'s value (`Ok(output)`), or drop
 /// it to fire-and-forget. If the task is dropped before `send` (panic or
 /// shutdown), the handle yields [`Error::Dropped`].
+///
+/// **`Debug` is the type name only** (`#[debug("Completion")]`): the oneshot
+/// half has no useful diagnostic and `T` need not implement `Debug`.
+#[derive(Debug)]
+#[debug("Completion")]
 pub struct Completion<T> {
+    #[debug(skip)]
     rx: oneshot::Receiver<T>,
 }
 
@@ -141,12 +147,6 @@ impl<T> Completion<T> {
     pub fn pair() -> (Reply<T>, Self) {
         let (tx, rx) = oneshot::channel();
         (Reply { tx: Some(tx) }, Self { rx })
-    }
-}
-
-impl<T> fmt::Debug for Completion<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Completion")
     }
 }
 

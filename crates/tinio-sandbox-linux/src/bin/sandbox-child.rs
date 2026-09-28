@@ -70,7 +70,7 @@ fn main() {
     };
     let state = env::var("TINIO_SANDBOX_TEST_STATE").ok();
 
-    let mut sandbox = Sandbox::new().expose(&root, access).device_files();
+    let mut sandbox = Sandbox::new().expose(&root, access);
     if let Some(state) = &state {
         sandbox = sandbox.expose(state, AccessMode::ReadWrite);
     }
@@ -96,8 +96,16 @@ fn main() {
     // No `with_euid`: this process *is* the one being confined, so
     // `Options::euid()` reads the kernel — the production path, and the one
     // worth exercising.
+    //
+    // **`with_device_files(true)` is what the production caller asks for too**:
+    // `serve` exposes the four device files, and the jail is a tmpfs that
+    // carries none of them unless they are bound in. **The served root's access
+    // is deliberately not set here**: `enter` derives it from the exposure
+    // above — the same `access` this process exposed the root with — and that
+    // second spelling is what once handed a `--read-only` run a read-write
+    // served root.
     let options = match Options::from_env() {
-        Ok(options) => options.with_served_root_access(access),
+        Ok(options) => options.with_device_files(true),
         Err(err) => {
             // **Not `confine-failed:`.** A typo in the variable is a
             // configuration error the parent has to fail on, not a host that
