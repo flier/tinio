@@ -35,6 +35,7 @@ pub extern crate tinio_core as _core;
 pub extern crate tinio_util as _util;
 
 pub mod backend;
+pub mod enforcement;
 mod error;
 pub mod event;
 pub mod launcher;
@@ -72,6 +73,7 @@ pub(crate) mod testing;
 pub use self::launcher::{ProbeSteps, await_verdict, report_verdict};
 pub use self::{
     backend::{Backend, Confinement, PlatformFacts},
+    enforcement::{Attribution, Denial, Diagnostics, Enforcement, Refused},
     error::{Error, MACOS_MECHANISM_USAGE, Result, fail, launch, refused, step},
     event::Event,
     launcher::{

@@ -1,24 +1,37 @@
 //! The AppContainer package SID, and the capability SIDs a container is created
 //! with.
 //!
+//! **The package name is derived from the served root and this user's salt**, and
+//! the salt is the one piece of persistent state the confinement keeps: 32 CSPRNG
+//! bytes in `%LOCALAPPDATA%\tinio\acl-salt`, mixed into the digest so that a local
+//! user who cannot read that file cannot compute a served root's SID — which,
+//! without it, is a pure function of the root and so computable by anyone
+//! ([`package_name`] and [`Salt`] carry the exposure and the degradation).
+//!
 //! This module is one of the crate's enumerated `unsafe` sites (design decision
 //! 14): the SID derivation and the two SID/string conversions are the crate's
-//! only security-identifier FFI.
+//! only security-identifier FFI. **The salt's file API is not one of them** —
+//! [`tinio_winsec::create_restricted`] owns the create-time descriptor and this
+//! module only names the file — so the enumeration is unchanged by it.
 
 #![allow(unsafe_code)]
 
 use std::{
-    io,
+    env,
+    fmt::Display,
+    fs,
+    io::{self, Write as _},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr,
+    sync::{Mutex, OnceLock},
 };
 
 use sha2::{Digest, Sha256};
 use tinio_util::path::plain_spelling;
 use tinio_winsec::to_wide;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Security::{
         Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW},
         FreeSid,
@@ -84,48 +97,43 @@ const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
 /// cross-root hole the per-root derivation exists to prevent.
 pub const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
 
-/// The AppContainer package name for `root`.
+/// The prefix every name this crate derives starts with — **and the whole of the
+/// claim the launch-path sweep makes about a name it may reap** (`crate::sweep`,
+/// design decision 21): a directory under `%LOCALAPPDATA%\Packages` whose name
+/// starts with this, or a `Storage` key whose name does, is this crate's; nothing
+/// else in either place is ever touched. One constant rather than a literal per
+/// derivation, so a change to the spelling cannot leave the sweep reaping yesterday's
+/// names — or, worse, a name that only *looks* like this crate's.
+pub(crate) const PACKAGE_PREFIX: &str = "tinio.sandbox.";
+
+/// The AppContainer package name for `root` — **under this user's persisted
+/// salt, which is what the product path always derives with.**
 ///
 /// Derived, so a hard kill's residue is the *same* SID on the next run and the
 /// launcher takes its own residue over instead of accumulating new ACEs (design
 /// decision 21). Root-derived rather than a constant so that two servers serving
 /// different roots do not share a package SID — a shared SID would let either
 /// one read the other's granted tree — and bounded so that the residue stays one
-/// directory per root, the same reasoning as decision 10's jail name.
+/// directory per root, the same reasoning as decision 10's jail name. **Salted
+/// because the root alone is public knowledge**: without the salt the name is a
+/// pure function of the canonical root, so any local user can compute a served
+/// root's SID, create a profile under it and read everything the standing grants
+/// expose — design §6 owns the exposure and what each layer does about it.
 ///
-/// **The normalisation is what makes the takeover work**, and it is lexical
-/// rather than a filesystem call. A `\\?\` or `\\?\UNC\` prefix is stripped
-/// first — [`plain_spelling`], whose own doc carries the unit-level rule that
-/// strip is written under — because `Path::components` keeps the prefix, so
-/// `\\?\E:\data` would otherwise hash apart from `E:\data`. `Path::components`
-/// then drops a trailing separator, drops `.` components and collapses repeated
-/// separators, so `E:\data`, `E:\data\`, `E:\data\.` and `\\?\E:\data` are one
-/// name. Case is folded
-/// for the same reason (`E:\Data` is that directory on Windows) and separators
-/// are normalised because `/` and `\` are interchangeable to the filesystem and
-/// to nothing else. `..` is deliberately left alone: resolving it lexically
-/// would let one spelling derive another directory's name without that directory
-/// being the one exposed.
+/// **The normalisation is what makes the takeover work**, and it is
+/// `normalised_root`'s, which carries the lexical rule and the reasons for each
+/// half of it; what is derived from that value is `name_digest`'s, whose doc
+/// carries the two readings the digest is taken over and where the salt joins
+/// them. What this function is is the name: the digest in the form a profile, a
+/// log line and an operator's package listing spell it.
 ///
-/// **The digest is taken over two readings of that one normalisation, because only
-/// one of them can be a string.** The folded text below is the readable half, and
-/// it is lossy by construction: `to_string_lossy` replaces every unit of a path
-/// that is not valid UTF-8 with U+FFFD, so two roots that differ only in such a
-/// unit — `E:\data\<U+D800>` and `E:\data\<U+DC00>`, both legal directory names
-/// and neither of them text — fold to one string, one package name, one SID and so
-/// one AppContainer profile. One profile means one ACE tree shared by two roots,
-/// and the first `Drop` deletes the profile the other is still launching under.
-/// The UTF-16 units of the same normalised path are the second reading, they go
-/// into the digest losslessly, and those two roots are two names again.
-///
-/// **The units are the *normalised* path's and not those of the spelling that
-/// arrived**, which is the one thing this could get wrong in the other direction:
-/// hashing the raw spelling would split `E:\Data` from `e:/data` and
-/// `\\?\E:\data` from `E:\data` — one directory each — and a second name is a
-/// second profile, a second ACE and a residue no run ever takes over (decision 21).
-/// What those units are folded by is `fold_unit`'s business, and it is not
-/// `str::to_lowercase`: that doc carries the many-to-one mapping which is the
-/// reason the lossy half could not be the whole digest.
+/// **This is the one function that touches the salt file**, and it degrades
+/// rather than failing: an unreadable or uncreatable salt warns through
+/// `Salt::load` and this call answers [`package_name_unsalted`] — the name every
+/// grant made before the salt existed was made under, which is exactly the
+/// exposure the salt closes, for that run and for the residue that run leaves.
+/// Nothing is silent about it: the warning names the file and says which
+/// derivation ran.
 ///
 /// # Examples
 ///
@@ -140,11 +148,692 @@ pub const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
 /// assert_eq!(name, package_name(Path::new(r"e:/srv/tinio/.")));
 /// ```
 pub fn package_name(root: &Path) -> String {
+    match Salt::load() {
+        Some(salt) => package_name_with(root, &salt),
+        None => package_name_unsalted(root),
+    }
+}
+
+/// The same derivation under one given salt — **the pure function
+/// [`package_name`] is built from**, and what a leg that needs two names for one
+/// root calls.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_sandbox_windows::sid::{Salt, package_name_with};
+///
+/// let root = Path::new(r"E:\srv\tinio");
+/// let one = Salt::from_bytes([0x11; 32]);
+/// let other = Salt::from_bytes([0x22; 32]);
+/// // Stable under one salt, and two names under two.
+/// assert_eq!(package_name_with(root, &one), package_name_with(root, &one));
+/// assert_ne!(
+///     package_name_with(root, &one),
+///     package_name_with(root, &other)
+/// );
+/// ```
+pub fn package_name_with(root: &Path, salt: &Salt) -> String {
+    format!("{PACKAGE_PREFIX}{}", name_digest(root, Some(salt)))
+}
+
+/// The derivation with the salt's step left out — **what the product runs when no
+/// salt can be read**, and the name every grant made before the salt landed was
+/// made under.
+///
+/// It exists as a named function rather than as a branch inside [`package_name`]
+/// because two readers need to say what it is: the degradation, which warns and
+/// falls back to it, and a test or a tool that has to reproduce a pre-salt name.
+/// **Nothing in the product derives a name this way when a salt is readable**,
+/// and a caller that reaches for it where a salt exists has chosen the
+/// pre-computation exposure that the salt closes.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_sandbox_windows::sid::{Salt, package_name_unsalted, package_name_with};
+///
+/// let root = Path::new(r"E:\srv\tinio");
+/// assert!(package_name_unsalted(root).starts_with("tinio.sandbox."));
+/// // The salt is the only difference between the two derivations.
+/// assert_ne!(
+///     package_name_unsalted(root),
+///     package_name_with(root, &Salt::from_bytes([0x11; 32]))
+/// );
+/// ```
+pub fn package_name_unsalted(root: &Path) -> String {
+    format!("{PACKAGE_PREFIX}{}", name_digest(root, None))
+}
+
+/// How many bytes the salt is: **32, the CSPRNG's own width and a SHA-256's**, so
+/// the value is not the digest's weak half. `getrandom` fills exactly this many
+/// (`Salt::create_at`) and a file holding anything else is refused rather than
+/// stretched or padded ([`Salt::from_bytes`]).
+pub const SALT_BYTES: usize = 32;
+
+/// The crate's per-user state directory under `%LOCALAPPDATA%`, and the two files
+/// this crate keeps in it: the salt the derivation is mixed with, and the ACL
+/// grant ledger (`crate::ledger`).
+///
+/// **One directory for both, and it is the directory the profile machinery's own
+/// data sits under** — `%LOCALAPPDATA%\Packages\<name>` is where
+/// `CreateAppContainerProfile` puts a profile (measured 2026-09-26:
+/// `DeleteAppContainerProfile` takes that directory with it).
+const STATE_DIRECTORY: &str = "tinio";
+const SALT_FILE: &str = "acl-salt";
+
+/// The directory this crate keeps its per-user state in: `%LOCALAPPDATA%\tinio`.
+///
+/// **Resolved from the environment variable rather than through a platform API,
+/// and that is not a defence being claimed** — the same rule
+/// [`crate::acl::icacls_binary`] states: an actor who can set this launcher's
+/// environment is a local actor, and local actors are outside this feature's
+/// threat model, so what the variable buys is that the state directory is the
+/// operator's own even on a host where a shell API would answer differently.
+///
+/// `None` when the variable is unset, which is the degradation both callers warn
+/// about rather than an error either of them can act on.
+pub(crate) fn state_directory() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join(STATE_DIRECTORY))
+}
+
+/// **The state directory, created if it is not there and put back to the current
+/// user's alone if it is not** — the descriptor of `%LOCALAPPDATA%\tinio`, made
+/// intentional rather than inherited (finding 1 of the 2026-09-28 review, which
+/// measured `FLIER-WIN11\CodexSandboxUsers:(I)(OI)(CI)(M)` on it beside an
+/// unresolved SID).
+///
+/// **It repairs a directory it found as well as one it made, and that is deliberate
+/// after measurement rather than before it.** An earlier revision of this crate
+/// created the directory through `create_dir_all`, so every machine that has run it
+/// carries `%LOCALAPPDATA%`'s inherited grants on the directory — and an account
+/// those grants reach can *create* a file in it, which is the plant vector both
+/// files answer on their own descriptors. Putting the directory back is two calls
+/// (`tinio_winsec::acl_is_current_user_only`, then
+/// `tinio_winsec::restrict_to_current_user` when it answers no) and it is
+/// **idempotent**: the steady state is one `GetNamedSecurityInfoW` and no write.
+///
+/// **What re-describing a container costs, measured on this host 2026-09-28 and
+/// stated rather than hidden**: the system propagates the new (non-inheritable)
+/// DACL over the children that already exist and their inherited entries are
+/// dropped — a scratch directory showed exactly that, the child's DACL empty
+/// afterwards. The two children this crate keeps there answer for themselves, and
+/// in this order:
+///
+/// - the **salt** carries `create_restricted`'s `SE_DACL_PROTECTED` descriptor, and
+///   a protected DACL is what propagation does not touch — measured: `acl-salt`
+///   kept its single current-user entry across the first run of this revision;
+/// - the **ledger** may be emptied by it, and the same launch's append reads the
+///   file back and puts the descriptor right *before* the first byte of its run's
+///   lines (`crate::ledger`'s `ensure_private`), so what an operator can find is a
+///   repaired file rather than an unreadable one (measured: one current-user entry
+///   after the append).
+///
+/// **A third file placed under this directory by anything else would lose its
+/// inherited entries**, and that is the price of the repair: the directory is this
+/// crate's own state directory (`state_directory`'s doc says so), the owner can
+/// always re-describe what it owns, and the alternative — leaving the descriptor
+/// inherited on every machine that has already run a launcher — is the exposure
+/// this call exists to close.
+///
+/// **It is the call both writers make**, so the two files' directory cannot be
+/// created with an inherited descriptor by one path while the other creates it
+/// with a private one: the salt's first use and the ledger's first run are the
+/// same directory, and this is where it is made.
+///
+/// **A failure to set the descriptor is warned about and not returned**, because
+/// what it costs is the directory's own hardening rather than either file's: both
+/// files carry their own protection (the salt's `create_restricted` from its first
+/// instant and its read-back before use, the ledger's re-assertion before each
+/// run's lines), so a directory left as `%LOCALAPPDATA%` made it is not a reason to
+/// lose a salt or a ledger line. The caller's error is the directory's *creation*, which is
+/// the one thing this call cannot proceed without.
+pub(crate) fn create_state_directory(directory: &Path) -> io::Result<()> {
+    if !directory.is_dir() {
+        fs::create_dir_all(directory)?;
+    }
+    let isolated = tinio_winsec::acl_is_current_user_only(directory).and_then(|isolated| {
+        if isolated {
+            Ok(())
+        } else {
+            tinio_winsec::restrict_to_current_user(directory)
+        }
+    });
+    if let Err(error) = isolated {
+        tracing::warn!(
+            step = "create the state directory",
+            path = %directory.display(),
+            error = %error,
+            "this user's state directory keeps the descriptor %LOCALAPPDATA% gave \
+             it, so another account that descriptor reaches can create a file in \
+             it — the salt and the ledger each refuse or repair a file that is not \
+             this user's alone (design §6)"
+        );
+    }
+    Ok(())
+}
+
+/// Report a derivation that ran without the salt, and answer the `None` every
+/// such path returns.
+///
+/// **The sentence lives here rather than at the nine sites that earn it**, because
+/// it is one statement about one exposure — *the name this run derives is the one
+/// any local user can derive, so they can compute the served root's SID and create
+/// the same AppContainer profile* (design §6) — and only its cause clause varies.
+/// Nine hand-kept copies would let the exposure be described two ways in one log.
+///
+/// `cause` is that clause: what the file, the environment or the CSPRNG did. The
+/// error is rendered into the event rather than into the sentence, so an operator
+/// reading structured logs gets it as a field and a reader of the sentence still
+/// gets the whole of what was lost.
+fn degrade(file: Option<&Path>, cause: &str, error: &dyn Display) -> Option<Salt> {
+    tracing::warn!(
+        step = "load the ACL salt",
+        path = file.map(|file| file.display().to_string()),
+        error = %error,
+        "{cause}, so this run derives the unsalted package name for its served root: \
+         any local user can compute that root's SID and create the same AppContainer \
+         profile (design §6)"
+    );
+    None
+}
+
+/// Where a private file is written before it is published: **beside the published
+/// name, and named after the value being published**, so no two publishing runs can
+/// name one file.
+fn temporary_beside(file: &Path, bytes: &[u8]) -> PathBuf {
+    let stem = file
+        .file_stem()
+        .expect("a file name this module built")
+        .to_string_lossy();
+    file.with_file_name(format!(
+        "{stem}.{}.tmp",
+        hex::encode(&Sha256::digest(bytes)[..8])
+    ))
+}
+
+/// Write `bytes` into a private file at `temporary` and publish that same object at
+/// `file` by linking it — **the one spelling of "the published name never exists
+/// without its value and its descriptor"**, shared by the salt ([`Salt::create_at`])
+/// and the ledger (`crate::ledger`).
+///
+/// **The temporary is removed on every path out, the failure path included**, so the
+/// only residue this can leave is one private file nothing ever reads — and a
+/// removal this process could not make is warned about under `step` rather than
+/// swallowed.
+///
+/// **`link` is where a caller's own rule goes**, and the ledger's is the one caller
+/// that has one: it reads the descriptor back before the name is published
+/// ([`crate::ledger`]'s `ensure_private`). The salt has no such rule by construction
+/// — `tinio_winsec::create_restricted` is what created the object, so there is
+/// nothing to read back and repair.
+pub(crate) fn publish_private(
+    file: &Path,
+    bytes: &[u8],
+    step: &str,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let temporary = temporary_beside(file, bytes);
+    let published = link(&temporary, file);
+    if let Err(error) = fs::remove_file(&temporary)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            step = step,
+            path = %temporary.display(),
+            error = %error,
+            "the private file a value was published through could not be removed"
+        );
+    }
+    published
+}
+
+/// [`create_state_directory`], **once per process** — the call the salt's first use
+/// and every ledger run both make.
+///
+/// **The repair inside it cannot answer differently a second time**, so the read
+/// that decides it is not repeated: `acl_is_current_user_only` costs a token open,
+/// two `GetTokenInformation` calls and a descriptor read with an ACE walk, and the
+/// ledger reached this once per line until `crate::ledger`'s `record_run` made the
+/// run its unit of work — which is where that figure is now spent, once per run
+/// rather than once per path. The guard is a `Mutex<()>` rather than a `Once`
+/// because the directory path is the caller's — a leg points it at a temporary
+/// directory — and the answer is "this path has been done", which is what the map
+/// holds.
+///
+/// A failure is not cached: the path is left out of the map, so the next line
+/// reports the same creation error the first one did rather than a stale silence.
+pub(crate) fn ensure_state_directory(directory: &Path) -> io::Result<()> {
+    static DONE: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let done = DONE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // **The membership test borrows**: `contains` would need the value to look for as a
+    // `PathBuf`, so asking it here would allocate one per call for a comparison that
+    // reads two paths.
+    if done.iter().any(|done| done == directory) {
+        return Ok(());
+    }
+    create_state_directory(directory)?;
+    done.push(directory.to_path_buf());
+    Ok(())
+}
+
+/// One live SID's `S-1-…` text — **the one call that renders a raw SID**, so the
+/// production path, [`PackageSid::derive`], and the legs that compare a raw SID
+/// against a spelling ([`crate::acl`], this module's own tests) all read the same
+/// conversion and the same failure.
+///
+/// `None` when `ConvertSidToStringSidW` refuses, which is the API's contract
+/// breaking rather than a condition a caller can act on: the callers differ only in
+/// what they say about it — a launch error in production, a panic in a test.
+pub(crate) fn sid_text(sid: PSID) -> Option<String> {
+    let mut text: *mut u16 = ptr::null_mut();
+    // SAFETY: `sid` is a live SID the caller holds — the one
+    // `CreateAppContainerProfile` returned, or one inline in an ACE — and `text` is
+    // a valid out-parameter; the buffer is freed below with LocalFree, its
+    // documented release.
+    let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
+    if ok == 0 || text.is_null() {
+        return None;
+    }
+    // SAFETY: `text` is the NUL-terminated UTF-16 buffer the conversion just
+    // allocated, and nothing else reads it.
+    let rendered = unsafe { crate::from_wide(text) };
+    // SAFETY: `text` is the conversion's own allocation, freed exactly once.
+    unsafe { LocalFree(text.cast()) };
+    Some(rendered)
+}
+
+/// The per-user salt: **the one secret the derivation holds, and the one value
+/// this module never renders.**
+///
+/// **What it is for.** `name_digest`'s own doc carries the placement; what this
+/// type owns is the lifecycle: `Self::load` reads (or creates) the file, and the
+/// value it returns is what [`package_name`] mixes in. A user who cannot read the
+/// file cannot compute the name for any root, which is the exposure the salt
+/// closes; a user who *can* — the same account, or an administrator reading the
+/// profile — is not stopped by it, and design §6 says so rather than implying
+/// otherwise.
+///
+/// **No accessor, and that is a decision rather than an omission.** The value is a
+/// secret, and every way out of this module is either a file name or a digest of
+/// it: a `bytes()`/`to_vec()`/`Display` on it would put the salt into whatever
+/// collects log lines and error messages, which is a place another local user can
+/// read. [`Self::from_bytes`] is the one constructor a caller reaches, so a test
+/// or a tool can build a value to derive with and cannot read one back out of a
+/// loaded file.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tinio_sandbox_windows::sid::{Salt, package_name_unsalted, package_name_with};
+///
+/// // A value a caller already holds — nothing here touches the file
+/// // `package_name` reads and creates.
+/// let salt = Salt::from_bytes([0x11; 32]);
+/// let root = Path::new(r"E:\srv\tinio");
+/// // What the value is for: the same root derives a different name under the
+/// // salt than it does without one, which is the pre-computation the salt
+/// // closes (design §6).
+/// assert_ne!(package_name_with(root, &salt), package_name_unsalted(root));
+/// // And it is the only input that moves the name, so the normalisation is
+/// // still what decides which root a name is about.
+/// assert_eq!(
+///     package_name_with(root, &salt),
+///     package_name_with(Path::new(r"e:/srv/tinio/."), &salt)
+/// );
+/// ```
+pub struct Salt {
+    /// The 32 bytes, private for the reason the type's doc gives.
+    bytes: [u8; SALT_BYTES],
+}
+
+impl Salt {
+    /// A salt from its bytes — the constructor a test or a tool uses to derive
+    /// under a value it already holds, and the only public one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_windows::sid::{Salt, package_name_with};
+    ///
+    /// let salt = Salt::from_bytes([0x11; 32]);
+    /// let name = package_name_with(std::path::Path::new(r"E:\srv\tinio"), &salt);
+    /// assert!(name.starts_with("tinio.sandbox."));
+    /// ```
+    pub fn from_bytes(bytes: [u8; SALT_BYTES]) -> Self {
+        Self { bytes }
+    }
+
+    /// This user's salt, **creating the file on first use**.
+    ///
+    /// `None` means the run derives without one, and **every way of reaching it is
+    /// warned here rather than at the call site** — [`ProfileLock::acquire`]'s
+    /// precedent, and for its reason: the caller's answer is the same either way
+    /// (it derives a name and confines a server), so the place that knows *what*
+    /// was lost is the one that has to say it. Every such warning is a launch that
+    /// continues with the exposure the salt exists to close, which is the
+    /// operator's to see in the log and not to infer from a name that looks
+    /// plausible.
+    fn load() -> Option<Self> {
+        let Some(file) = salt_file() else {
+            return degrade(
+                None,
+                "no per-user salt directory could be resolved (`LOCALAPPDATA` is \
+                 unset)",
+                &"(unset environment variable)",
+            );
+        };
+        Self::load_at(&file)
+    }
+
+    /// The load-or-create sequence for the file `file` names — `Self::load`'s
+    /// body, and the seam a leg points at a temporary directory.
+    ///
+    /// **The read is the whole of the steady state**: a salt file that is there is
+    /// 32 bytes, is this user's alone and is used as it stands, so a run after the
+    /// first costs one read of 32 bytes and one descriptor read-back. Everything
+    /// else — a file that is not there, is not 32 bytes, cannot be read, or is not
+    /// this user's alone — is [`Self::create_at`] or a warned `None`.
+    pub(crate) fn load_at(file: &Path) -> Option<Self> {
+        match fs::read(file) {
+            Ok(bytes) => Self::from_bytes_at(file, bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::create_at(file),
+            Err(error) => degrade(Some(file), "this user's salt file cannot be read", &error),
+        }
+    }
+
+    /// The bytes a salt file holds, or the degradation a file that is not this
+    /// user's alone earns.
+    ///
+    /// **A file that is not [`SALT_BYTES`] long is refused rather than stretched,
+    /// padded or re-created**: the file is either this crate's own value or
+    /// something that is not this crate's value, and a name derived from half a
+    /// salt is a name nobody can reproduce — including the next run, whose
+    /// residue takeover decision 21 rests on would then never find its SID
+    /// again.
+    ///
+    /// **Then the descriptor is read back, and a file that is not the current
+    /// user's alone is not used at all** — warned about at the same step, and the
+    /// run takes the same degrade-to-unsalted path the other refusals here take.
+    /// **What it closes is the plant**: an account with access to the state
+    /// directory can create `acl-salt` before this crate's first run, with 32
+    /// bytes of its own choosing and under whatever descriptor the directory gives
+    /// it, and a run that trusted the file as found would derive every name under
+    /// a value that account already knows — which is the whole of what the salt is
+    /// for. **What it is not is an ownership check**: the verdict is
+    /// [`tinio_winsec::acl_is_current_user_only`]'s, so a file whose DACL names
+    /// this user alone passes it whoever created it, and reading the owner is a
+    /// call this crate does not have. It is the *use* that is refused and never
+    /// the launch: this returns `None`, the caller derives the unsalted name, and
+    /// the warning beside the refusal is the only thing distinguishing the two
+    /// (design §6).
+    ///
+    /// **The creation path is deliberately not checked this way**: a file this
+    /// crate published carries `create_restricted`'s descriptor from its first
+    /// instant, and the race's loser reads a value a peer published through the
+    /// same call — so a read here covers every file that was not written by this
+    /// code, which is the set the check is about.
+    fn from_bytes_at(file: &Path, bytes: Vec<u8>) -> Option<Self> {
+        let Ok(bytes) = <[u8; SALT_BYTES]>::try_from(bytes.as_slice()) else {
+            return degrade(
+                Some(file),
+                &format!(
+                    "this user's salt file does not hold a salt: {} bytes where \
+                     {SALT_BYTES} are",
+                    bytes.len()
+                ),
+                &"a file that is not a salt",
+            );
+        };
+        match tinio_winsec::acl_is_current_user_only(file) {
+            Ok(true) => Some(Self { bytes }),
+            Ok(false) => degrade(
+                Some(file),
+                "this user's salt file is not this user's alone",
+                &"a file another account can read",
+            ),
+            Err(error) => degrade(
+                Some(file),
+                "this user's salt file's DACL cannot be read",
+                &error,
+            ),
+        }
+    }
+
+    /// Publish a fresh salt at `file` — **or read the one a peer published
+    /// first**, when this call loses the creation race.
+    ///
+    /// **The value is published whole, and that is why the create is a link and
+    /// not an open.** The file appears under its final name only once it holds all
+    /// [`SALT_BYTES`]: the bytes go into a private temporary file named after them,
+    /// and `fs::hard_link` — which fails rather than replacing when the name is
+    /// taken — is what puts that object at the salt's name. A create-then-write at
+    /// the final name would leave a window in which a concurrent first launch reads
+    /// a file with no bytes in it and degrades; a rename would *replace* a winner's
+    /// salt with the loser's, and the two runs would then hold different salts while
+    /// only one of them stood on disk. Measured on this host 2026-09-28: eight
+    /// threads released together on one fresh path all read one value, and the file
+    /// held 32 bytes (the legs are `eight_races_on_a_fresh_salt_file_agree_on_one_
+    /// value` and `the_salt_file_is_created_once_and_a_second_launch_reads_it`).
+    ///
+    /// The temporary file carries the same descriptor as the published one — a hard
+    /// link names one object — so it is [`tinio_winsec::create_restricted`]'s
+    /// current-user-only DACL from its first instant, and it is removed on every
+    /// path out of this function, the failure path included.
+    fn create_at(file: &Path) -> Option<Self> {
+        let Some(directory) = file.parent() else {
+            // `salt_file` always joins a name onto a directory, so this is the
+            // type's contract rather than a host's state.
+            return None;
+        };
+        // **One directory create per process rather than per call**: the repair
+        // inside it cannot answer differently a second time, and the ledger beside
+        // this asks the same question once per run.
+        if let Err(error) = ensure_state_directory(directory) {
+            return degrade(
+                Some(file),
+                "this user's state directory could not be created",
+                &error,
+            );
+        }
+        let mut bytes = [0u8; SALT_BYTES];
+        if let Err(error) = getrandom::fill(&mut bytes) {
+            return degrade(Some(file), "the CSPRNG refused", &error);
+        }
+        let published = publish_private(file, &bytes, "load the ACL salt", |temporary, file| {
+            publish_whole(temporary, file, &bytes)
+        });
+        match published {
+            Ok(()) => Some(Self { bytes }),
+            // **The race's loser reads the winner's value**, which is the state
+            // the brief rule asks for: one machine, one salt, whichever run got
+            // there first. A hard link fails rather than replacing, so
+            // `AlreadyExists` is exactly "someone else published first" — and the
+            // file it published is complete by construction, so this read cannot
+            // see a partially written one.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match fs::read(file) {
+                Ok(bytes) => Self::from_bytes_at(file, bytes),
+                Err(error) => degrade(
+                    Some(file),
+                    "another run published this user's salt file and it cannot \
+                         be read",
+                    &error,
+                ),
+            },
+            Err(error) => degrade(
+                Some(file),
+                "this user's salt could not be published",
+                &error,
+            ),
+        }
+    }
+}
+
+/// [`publish_private`]'s link step for the salt: the private file is created, the
+/// value goes into it, and the name is published — **in the order that makes the
+/// salt's name appear with its value already in it**.
+///
+/// The handle is closed before the link, so the two names never name an object
+/// another handle is still writing through; the value is on disk by then and the
+/// link is what publishes it.
+fn publish_whole(temporary: &Path, file: &Path, bytes: &[u8]) -> io::Result<()> {
+    // **`create_restricted` is what makes the file private from its first
+    // instant** — the descriptor travels in the create call, so the file never
+    // exists under the state directory's inherited ACL, and `CREATE_NEW` refuses a
+    // name that appeared between the check and the call. Measured on this host
+    // 2026-09-28: the published file carries one access-allowed entry, the current
+    // user's own SID at `0x001F01FF` with no inherited copy, and its control word is
+    // `0x9004` — `SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_SELF_RELATIVE` —
+    // (`crate::acl`'s `the_salt_file_is_current_user_only_and_inherits_nothing` is
+    // the leg, and that module's own reader is what the descriptor is read with).
+    let mut handle = tinio_winsec::create_restricted(temporary)?;
+    handle.write_all(bytes)?;
+    drop(handle);
+    fs::hard_link(temporary, file)
+}
+
+/// The salt file this thread's derivation reads, **or the path a leg pointed it
+/// at** — `None` when `%LOCALAPPDATA%` is unset.
+fn salt_file() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = test_path::get() {
+        return Some(path);
+    }
+    state_directory().map(|directory| directory.join(SALT_FILE))
+}
+
+/// The state-directory path a test points the reader at, so a leg can drive the
+/// whole create/read cycle on a temporary directory instead of the operator's own
+/// state directory — **the seam both the salt and [`crate::ledger`] read**, since
+/// the two files it resolves are one directory's.
+///
+/// **A thread-local, the shape `acl`'s `opens`/`overlap` seams take**, and it
+/// exists because the product path resolves the path itself: the alternative was a
+/// `package_name`-shaped function taking a file argument, which is a second
+/// product entry point whose only caller would be a test.
+#[cfg(test)]
+pub(crate) mod test_path {
+    use std::{
+        cell::RefCell,
+        path::{Path, PathBuf},
+    };
+
+    thread_local! {
+        static PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Run `body` with this thread's state-directory file pointed at `path`.
+    pub fn with<T>(path: &Path, body: impl FnOnce() -> T) -> T {
+        let previous = PATH.with(|slot| slot.replace(Some(path.to_path_buf())));
+        let value = body();
+        PATH.with(|slot| *slot.borrow_mut() = previous);
+        value
+    }
+
+    /// This thread's pointed-at path, if a leg pointed one.
+    pub fn get() -> Option<PathBuf> {
+        PATH.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// One path's lexical normalisation — **the identity of the directory, as every
+/// derivation from a root reads it**: a package name ([`package_name`]) and a
+/// per-path ACL lock key ([`crate::acl`]'s) are both built from this one value, so
+/// two spellings of one directory cannot take two profiles or two locks.
+///
+/// **The normalisation is lexical rather than a filesystem call.** A `\\?\` or
+/// `\\?\UNC\` prefix is stripped first — [`plain_spelling`], whose own doc carries
+/// the unit-level rule that strip is written under — because `Path::components`
+/// keeps the prefix, so `\\?\E:\data` would otherwise hash apart from `E:\data`.
+/// `Path::components` then drops a trailing separator, drops `.` components and
+/// collapses repeated separators, so `E:\data`, `E:\data\`, `E:\data\.` and
+/// `\\?\E:\data` are one value. Case is folded for the same reason (`E:\Data` is
+/// that directory on Windows) and separators are normalised because `/` and `\`
+/// are interchangeable to the filesystem and to nothing else.
+/// **`..` is deliberately left alone**: resolving it lexically would let one
+/// spelling derive another directory's name without that directory being the one
+/// exposed, and a lock key that named a different directory than the grant writes
+/// would exclude nothing.
+///
+/// **The units are the *normalised* path's and not those of the spelling that
+/// arrived**, which is the one thing a derivation could get wrong in the other
+/// direction: hashing the raw spelling would split `E:\Data` from `e:/data` and
+/// `\\?\E:\data` from `E:\data` — one directory each — and a second name is a
+/// second profile, a second ACE and a residue no run ever takes over, and a
+/// second lock key is a spelling the exclusion does not cover (decision 21).
+pub(crate) fn normalised_root(root: &Path) -> PathBuf {
+    // `components` does the lexical work the doc above describes — it drops `.`
+    // components and a trailing separator, collapses repeated separators, and the
+    // `PathBuf` re-joins with this volume's own.
+    plain_spelling(root).components().collect()
+}
+
+/// The 16-hex digest of [`normalised_root`] — **the *unsalted* reading, and the one
+/// path's ACL lock file is named after**.
+///
+/// **It is taken over two readings of that one normalisation, because only one of
+/// them can be a string.** The folded text below is the readable half, and it is
+/// lossy by construction: `to_string_lossy` replaces every unit of a path that is
+/// not valid UTF-8 with U+FFFD, so two roots that differ only in such a unit —
+/// `E:\data\<U+D800>` and `E:\data\<U+DC00>`, both legal directory names and
+/// neither of them text — fold to one string, one package name, one SID and so one
+/// AppContainer profile. One profile means one ACE tree shared by two roots, and
+/// the first `Drop` deletes the profile the other is still launching under. The
+/// UTF-16 units of the same normalised path are the second reading, they go into
+/// the digest losslessly, and those two roots are two names again.
+///
+/// What those units are folded by is `fold_unit`'s business, and it is not
+/// `str::to_lowercase`: that doc carries the many-to-one mapping which is the
+/// reason the lossy half could not be the whole digest.
+///
+/// **This spelling passes no salt, and the lock file's exclusion is why**: a run
+/// that could read this user's salt file and a run that could not — the degraded
+/// one, warned about beside the derivation — must still take **one** lock for one
+/// path, or the two runs that are most likely to be concurrent on a shared root
+/// are the two that do not exclude each other. The name is what has to be salted;
+/// the exclusion is a property of the path.
+pub(crate) fn root_digest(root: &Path) -> String {
+    name_digest(root, None)
+}
+
+/// The digest [`package_name`] appends, under an optional per-user salt — **the one
+/// hash body behind every name this crate derives.**
+///
+/// **The salt is hashed last, and the placement is what makes "unsalted" the same
+/// derivation with one `update` left out.** Both readings of the normalised path go
+/// in first — the lossy folded text and the UTF-16 units under it, which
+/// [`root_digest`]'s doc carries — and the 32 salt bytes are appended to that
+/// input. Two things follow, and both are the reason rather than a description of
+/// it:
+///
+/// - **Nothing computes a name without the file that holds the salt.** With the
+///   salt in the preimage, an account that cannot read `%LOCALAPPDATA%\tinio\acl-salt`
+///   cannot evaluate this function at all for any root, which is the entire
+///   difference between "a local user can compute this root's SID" and "a local
+///   user cannot".
+/// - **A secret at the *end* of the preimage is the one shape SHA-256's length
+///   extension cannot reach.** Against a secret prefix, a holder of one
+///   `(input, digest)` pair can extend it into the digest of that input plus
+///   padding plus anything else they choose; against a digest whose last 32 input
+///   bytes are the secret there is no such continuation, so a name an observer has
+///   already seen yields nothing about a second one. Both orders hide the *name*;
+///   the suffix is the one that also survives the pair being known, and neither
+///   claims anything against a reader of the salt file itself (design §6).
+///
+/// **`None` is [`package_name_unsalted`]'s derivation** — the input this function
+/// hashed before the salt existed, byte for byte — so the degraded name is the
+/// historical one rather than a second derivation that happens to look similar.
+fn name_digest(root: &Path, salt: Option<&Salt>) -> String {
     // One lexical normalisation, read twice: as the folded text below and as the
-    // UTF-16 units under it. `components` does the lexical work the doc above
-    // describes — it drops `.` components and a trailing separator, collapses
-    // repeated separators, and the `PathBuf` re-joins with this volume's own.
-    let normalised = plain_spelling(root).components().collect::<PathBuf>();
+    // UTF-16 units under it.
+    let normalised = normalised_root(root);
     let folded = normalised
         .to_string_lossy()
         .replace('/', r"\")
@@ -154,8 +843,13 @@ pub fn package_name(root: &Path) -> String {
     for unit in normalised.as_os_str().encode_wide() {
         hasher.update(fold_unit(unit).to_le_bytes());
     }
-    let digest = hex::encode(hasher.finalize());
-    format!("tinio.sandbox.{}", &digest[..16])
+    // **The one input the path does not determine, appended rather than
+    // interleaved**: it is not a second spelling of the path and not a second
+    // normalization, so it joins the readings after them.
+    if let Some(salt) = salt {
+        hasher.update(salt.bytes);
+    }
+    hex::encode(hasher.finalize())[..16].to_string()
 }
 
 /// One UTF-16 unit with the case fold the name's identity is derived under.
@@ -256,30 +950,11 @@ impl ProfileLock {
     /// logged, because a guarantee that is not in force has to be visible.
     #[must_use]
     pub fn acquire(package: &str) -> Option<Self> {
-        // **`Global\` and no fallback to the session namespace.** Measured on
-        // this host 2026-09-27: a non-elevated process creates and shares it. A
-        // host that refuses it is a host where the exclusion is absent, which is
-        // the behaviour every launcher had before this lock existed — stated in
-        // a warning rather than papered over with a second scope that would
-        // exclude only part of the window's peers.
-        let wide = to_wide(format!(r"Global\tinio.profile.{package}"));
-        // SAFETY: `wide` is NUL-terminated and alive for the call, a null
-        // security descriptor gives the object this process's default DACL, and
-        // `binitialowner = 0` leaves the ownership to the wait below — so the
-        // create itself never owns the mutex and never needs a release of its
-        // own. The handle is closed by `Drop` on every path below.
-        let handle = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
-        if handle.is_null() {
-            let error = last_error();
-            tracing::warn!(
-                step = "CreateMutexW",
-                package = package,
-                error = %error,
-                "no per-root launch lock, so a peer's exit may delete this \
-                 root's profile while a launch is in flight"
-            );
-            return None;
-        }
+        let handle = open(
+            package,
+            "no per-root launch lock, so a peer's exit may delete this root's \
+             profile while a launch is in flight",
+        )?;
         // SAFETY: `handle` is the mutex the call above returned and is live for
         // the call; the wait is INFINITE and not alertable, so it returns only
         // when the mutex is this thread's — or when the kernel releases an
@@ -319,6 +994,96 @@ impl ProfileLock {
             }
         }
     }
+
+    /// The same lock, **taken only if no peer is holding it** — the non-blocking
+    /// form the launch-path sweep drives (`crate::sweep`, design decision 21), and
+    /// `None` whenever the name must be left alone.
+    ///
+    /// **Three states are `None`, and all three mean "do not touch this name"**: a
+    /// peer is inside its window on this root (`WAIT_TIMEOUT` — the mutex is held),
+    /// a launcher **died** inside its window (`WAIT_ABANDONED` — the kernel would
+    /// hand the object over, and the sweep has nothing to gain from taking a lock
+    /// whose window ended in a crash; the next sweep sees a fresh object once this
+    /// handle is closed), and the kernel refusing the object at all, which is
+    /// [`Self::acquire`]'s degradation and must not be read as "nobody is in the
+    /// window". A caller that wanted to wait would use [`Self::acquire`]; this
+    /// function's whole point is that a sweep has no business waiting on a name it
+    /// can simply leave for the next run.
+    #[must_use]
+    pub(crate) fn try_acquire(package: &str) -> Option<Self> {
+        let handle = open(
+            package,
+            "no per-root launch lock could be created, so this name cannot be shown \
+             to be outside a peer's launch window and is left alone",
+        )?;
+        // SAFETY: `handle` is the mutex the call above returned and is live for the
+        // call; a zero timeout makes the wait a probe rather than a block, so the
+        // only outcomes are "this thread owns it" and the states below.
+        let waited = unsafe { WaitForSingleObject(handle, 0) };
+        match waited {
+            WAIT_OBJECT_0 => Some(Self { handle }),
+            WAIT_TIMEOUT => {
+                // SAFETY: `handle` is this call's own and no wait took it.
+                unsafe { CloseHandle(handle) };
+                None
+            }
+            WAIT_ABANDONED => {
+                // SAFETY: as above — the abandoned object is closed rather than
+                // taken, which is what the warning says was decided.
+                unsafe { CloseHandle(handle) };
+                tracing::warn!(
+                    step = "WaitForSingleObject",
+                    package = package,
+                    "the per-root launch lock was abandoned by a launcher that died \
+                     holding it; this name is left alone rather than swept"
+                );
+                None
+            }
+            other => {
+                // SAFETY: the same handle, this call's own.
+                unsafe { CloseHandle(handle) };
+                tracing::warn!(
+                    step = "WaitForSingleObject",
+                    package = package,
+                    error = %io::Error::other(format!("WaitForSingleObject: WAIT_EVENT 0x{other:08X}")),
+                    "the per-root launch lock could not be probed, so this name is \
+                     left alone rather than swept"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The per-root mutex, created or opened — **the create both [`ProfileLock::acquire`]
+/// and [`ProfileLock::try_acquire`] stand on**, so the name, the call and what a
+/// refusal costs an operator have one home.
+///
+/// **`Global\` and no fallback to the session namespace.** Measured on this host
+/// 2026-09-27: a non-elevated process creates and shares it. A host that refuses it
+/// is a host where the exclusion is absent, which is the behaviour every launcher
+/// had before this lock existed — stated in `refusal` rather than papered over with
+/// a second scope that would exclude only part of the window's peers.
+///
+/// The handle is the caller's, and is closed by `ProfileLock`'s `Drop` or by the
+/// caller directly when no wait took it.
+fn open(package: &str, refusal: &str) -> Option<HANDLE> {
+    let wide = to_wide(format!(r"Global\tinio.profile.{package}"));
+    // SAFETY: `wide` is NUL-terminated and alive for the call, a null security
+    // descriptor gives the object this process's default DACL, and `binitialowner = 0`
+    // leaves the ownership to the caller's wait — so the create itself never owns the
+    // mutex and never needs a release of its own.
+    let handle = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
+    if handle.is_null() {
+        tracing::warn!(
+            step = "CreateMutexW",
+            package = package,
+            error = %last_error(),
+            "{refusal}"
+        );
+        return None;
+    }
+    Some(handle)
 }
 
 impl Drop for ProfileLock {
@@ -472,22 +1237,12 @@ impl PackageSid {
                 io::Error::other("the package SID was not filled in"),
             ));
         }
-        let mut text: *mut u16 = ptr::null_mut();
-        // SAFETY: `raw` is the SID `CreateAppContainerProfile` just returned, and
-        // `text` is a valid out-parameter; the string is freed below.
-        let ok = unsafe { ConvertSidToStringSidW(raw, &mut text) };
-        if ok == 0 || text.is_null() {
+        let Some(rendered) = sid_text(raw) else {
             // SAFETY: `raw` is this call's own allocation and nothing else has
             // taken it.
             unsafe { FreeSid(raw) };
             return Err(launch("render the package SID", name, last_error()));
-        }
-        // SAFETY: `text` is a NUL-terminated UTF-16 string the conversion just
-        // allocated.
-        let rendered = unsafe { crate::from_wide(text) };
-        // SAFETY: `text` is the buffer the conversion allocated for us, and the
-        // copy above was its last use.
-        unsafe { LocalFree(text.cast()) };
+        };
         // `info!`, and it is the event an operator's "was this process confined,
         // and to what" question is answered from: the name the profile was created
         // under and the SID it returned, as fields rather than a sentence. When a
@@ -521,6 +1276,31 @@ impl PackageSid {
     /// ```
     pub fn as_str(&self) -> &str {
         &self.text
+    }
+
+    /// The profile's name — **the value this SID was created (or taken over)
+    /// under**, which is the derivation's own name for the served root and not a
+    /// second reading of it.
+    ///
+    /// It is what the ACL grant ledger (`crate::ledger`) carries beside the SID:
+    /// an operator
+    /// greps the profile in the shell's package list by this name, and the
+    /// `S-1-15-2-…` string is what an ACE renders. **Nothing here re-derives it**:
+    /// a second call to [`package_name`] would read the salt file again and could
+    /// answer with a different name than this value's profile exists under, which
+    /// is the one thing the takeover rule (decision 21) cannot survive.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tinio_sandbox_windows::sid::{PackageSid, package_name};
+    ///
+    /// let name = package_name(std::path::Path::new(r"E:\srv\tinio"));
+    /// let sid = PackageSid::derive(&name).unwrap();
+    /// assert_eq!(sid.name(), name);
+    /// ```
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The raw SID, for the `SECURITY_CAPABILITIES` value the launch builds.
@@ -784,27 +1564,32 @@ impl Drop for CapabilitySids {
 mod tests {
     use std::{
         ffi::OsString,
+        fs,
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
+        process::Command,
+        sync::{Arc, Barrier},
+        thread,
     };
 
+    use tinio_util::testing::{assert_recorded_at, assert_step};
+
     use super::*;
+    use crate::{
+        acl::{grant_everyone_read, icacls_binary},
+        testing::{capture, recorder},
+    };
+
+    /// How many runs the creation race is opened with. **Eight rather than two**,
+    /// because the window a loser reads in is the winner's create-to-link interval:
+    /// a single pair can miss it by scheduling alone, and the value of the leg is
+    /// that it does not depend on which runner won.
+    const RUNNERS: usize = 8;
 
     /// A SID's `S-1-…` text, for the tests that compare a raw SID against the
     /// spelling this module or [`Capability`] carries.
     fn render_sid(sid: PSID) -> String {
-        let mut text: *mut u16 = ptr::null_mut();
-        // SAFETY: `sid` is a live SID (the caller's own) and `text` is a valid
-        // out-parameter; the string is freed below with LocalFree.
-        let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
-        assert_ne!(ok, 0, "a live SID renders");
-        // SAFETY: `text` is a NUL-terminated UTF-16 string the conversion just
-        // allocated, and the copy above was its last use.
-        let rendered = unsafe { crate::from_wide(text) };
-        // SAFETY: `text` came from the conversion, whose documented release is
-        // LocalFree, and it is freed exactly once here.
-        unsafe { LocalFree(text.cast()) };
-        rendered
+        sid_text(sid).expect("a live SID renders")
     }
 
     #[test]
@@ -946,6 +1731,317 @@ mod tests {
             package_name(Path::new(r"\\?\UNC\server\share\data")),
             package_name(Path::new(r"\\server\share\data"))
         );
+    }
+
+    /// **One salt, one name; two salts, two names** — the derivation's own half of
+    /// the hardening, with no file involved.
+    ///
+    /// It would fail without the salt in [`name_digest`]'s input: two accounts would
+    /// derive one name for one root, which is the pre-computation exposure the salt
+    /// exists to close. The one-byte case is there because a salt that only differed
+    /// in its whole-width pattern would be a coarser knob than the 32 bytes suggest,
+    /// and the unsalted comparison is what makes the degradation a *different* name
+    /// rather than the same name with a different story.
+    #[test]
+    fn one_salt_gives_one_name_and_two_salts_two() {
+        let root = Path::new(r"E:\srv\tinio");
+        let one = Salt::from_bytes([0x11; SALT_BYTES]);
+        let other = Salt::from_bytes([0x22; SALT_BYTES]);
+        assert_eq!(package_name_with(root, &one), package_name_with(root, &one));
+        assert_ne!(
+            package_name_with(root, &one),
+            package_name_with(root, &other)
+        );
+        assert_ne!(
+            package_name_with(root, &one),
+            package_name_with(root, &Salt::from_bytes([0x12; SALT_BYTES])),
+            "one byte of salt is enough to move the name"
+        );
+        assert_ne!(package_name_with(root, &one), package_name_unsalted(root));
+        // The salt changes the name and nothing else about it.
+        assert!(package_name_with(root, &one).starts_with("tinio.sandbox."));
+        assert_eq!(
+            package_name_with(root, &one).len(),
+            "tinio.sandbox.".len() + 16
+        );
+        // The normalisation is still what decides which *root* a name is about, so
+        // the salt did not take over the spelling rule the takeover rests on.
+        assert_eq!(
+            package_name_with(root, &one),
+            package_name_with(Path::new(r"e:/srv/tinio/."), &one)
+        );
+    }
+
+    /// **The salt file is created once, holds [`SALT_BYTES`], and a second run
+    /// derives under the value it reads** rather than under a fresh one.
+    ///
+    /// It would fail without [`Salt::load_at`]'s read path: a run that generated a
+    /// value every time would leave every ACE of the previous run standing under a
+    /// SID nothing derives again — decision 21's takeover would never fire — and the
+    /// replacement half is what tells a read from a create, because both produce a
+    /// 32-byte file.
+    #[test]
+    fn the_salt_file_is_created_once_and_a_second_launch_reads_it() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let file = directory.path().join("acl-salt");
+        let root = Path::new(r"E:\srv\tinio");
+
+        let first = test_path::with(&file, || package_name(root));
+        let created = fs::read(&file).expect("the first run created the salt file");
+        assert_eq!(created.len(), SALT_BYTES, "the file holds a salt");
+        let created: [u8; SALT_BYTES] = created.as_slice().try_into().expect("32 bytes");
+        assert_eq!(
+            first,
+            package_name_with(root, &Salt::from_bytes(created)),
+            "the name the first run derived is the one the bytes it wrote give"
+        );
+
+        assert_eq!(
+            test_path::with(&file, || package_name(root)),
+            first,
+            "a second run reads the value the first one published"
+        );
+
+        // **The value on disk is what decides**, which is the difference between
+        // reading the file and caching a value per process.
+        let replaced = [0x5A; SALT_BYTES];
+        fs::write(&file, replaced).expect("replace the salt");
+        assert_eq!(
+            test_path::with(&file, || package_name(root)),
+            package_name_with(root, &Salt::from_bytes(replaced)),
+            "the derivation follows the file, not a remembered value"
+        );
+    }
+
+    /// **A fresh salt file and eight runs released together derive one name.**
+    ///
+    /// The window is real: the file is created by whichever run gets there first and
+    /// every other run finds it — or finds the name taken, which is the loser's path
+    /// — and the value that ends up on disk is one of them. It would fail without the
+    /// publish [`Salt::create_at`] makes: a create-then-write at the final name lets a
+    /// loser read a file with no bytes in it and degrade to the unsalted derivation,
+    /// and a *rename* publish lets a loser replace the winner's salt, after which the
+    /// two runs derive two names while only one of them stands on disk — the residue
+    /// of the other is then never taken over (decision 21).
+    #[test]
+    fn eight_races_on_a_fresh_salt_file_agree_on_one_value() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let file = directory.path().join("acl-salt");
+        let root = Path::new(r"E:\srv\tinio");
+        let barrier = Arc::new(Barrier::new(RUNNERS));
+
+        let names: Vec<String> = thread::scope(|scope| {
+            let runners: Vec<_> = (0..RUNNERS)
+                .map(|_| {
+                    let file = file.clone();
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        test_path::with(&file, || package_name(root))
+                    })
+                })
+                .collect();
+            runners
+                .into_iter()
+                .map(|runner| runner.join().expect("no runner panicked"))
+                .collect()
+        });
+
+        assert!(
+            names.iter().all(|name| *name == names[0]),
+            "the runners derived different names for one root and one salt file — a \
+             loser read a file the winner had not finished publishing: {names:?}"
+        );
+        let published = fs::read(&file).expect("the salt file was created");
+        assert_eq!(published.len(), SALT_BYTES, "{published:?}");
+        assert_eq!(
+            names[0],
+            package_name_with(
+                root,
+                &Salt::from_bytes(published.as_slice().try_into().expect("32 bytes"))
+            ),
+            "the value every runner derived under is the one on disk"
+        );
+    }
+
+    /// **A salt that cannot be created degrades — to the historical name, with a
+    /// warning, and never silently.**
+    ///
+    /// The injection is a file standing where the state directory would be, so the
+    /// directory create fails: the earliest of the calls the create makes, and one no
+    /// permission on the salt file alone would reach. What the leg asserts is the two
+    /// halves of the policy — the derivation falls back to
+    /// [`package_name_unsalted`], and the fallback is *said*, at `WARN`, with the
+    /// step that decided it. Without the warning a run would derive a name whose
+    /// exposure the salt exists to close and nothing would say so.
+    #[test]
+    fn a_salt_that_cannot_be_created_degrades_to_the_unsalted_name() {
+        let _serial = recorder();
+        let directory = tempfile::tempdir().expect("temp dir");
+        let blocker = directory.path().join("a-file");
+        fs::write(&blocker, b"not a directory").expect("seed the blocker");
+        let file = blocker.join("acl-salt");
+        let root = Path::new(r"E:\srv\tinio");
+
+        let capture = capture();
+        let recording = capture.record();
+        let name = test_path::with(&file, || package_name(root));
+        let logged = capture.text();
+        drop(recording);
+
+        assert_eq!(
+            name,
+            package_name_unsalted(root),
+            "the degraded run derives the unsalted name and does not pretend"
+        );
+        assert_step(&logged, "load the ACL salt");
+        assert_recorded_at(&logged, "unsalted package name", tracing::Level::WARN);
+        assert!(!file.exists(), "nothing was created behind the blocker");
+    }
+
+    /// **A salt file of another length is refused rather than stretched, padded or
+    /// written over.**
+    ///
+    /// It would fail if [`Salt::from_bytes_at`] accepted any non-empty file: half a
+    /// salt derives a name no run can reproduce — the next run reads a different
+    /// value, so decision 21's takeover never finds its own residue — and padding
+    /// would put a name behind a value the file does not hold. The refusal is the
+    /// same warned fallback as an uncreatable file, for the same reason.
+    #[test]
+    fn a_salt_file_of_the_wrong_length_is_refused_rather_than_used() {
+        let _serial = recorder();
+        let directory = tempfile::tempdir().expect("temp dir");
+        let file = directory.path().join("acl-salt");
+        fs::write(&file, b"not a salt, only sixteen").expect("seed the wrong file");
+        let root = Path::new(r"E:\srv\tinio");
+
+        let capture = capture();
+        let recording = capture.record();
+        let name = test_path::with(&file, || package_name(root));
+        let logged = capture.text();
+        drop(recording);
+
+        assert_eq!(name, package_name_unsalted(root));
+        assert_step(&logged, "load the ACL salt");
+        assert_recorded_at(&logged, "does not hold a salt", tracing::Level::WARN);
+        assert_eq!(
+            fs::read(&file).expect("the file is still there").len(),
+            b"not a salt, only sixteen".len(),
+            "a file that is not a salt is left as it was found"
+        );
+    }
+
+    /// **A salt file that is not this user's alone is refused rather than used** —
+    /// the plant an account with access to the state directory can make before this
+    /// crate's first run, and the degradation [`Salt::from_bytes_at`] warns about.
+    ///
+    /// It would fail without the descriptor read-back: a run that trusted a file it
+    /// found would derive every name — and so the ACEs of every grant it leaves —
+    /// under a value the account that planted it already knows, which is exactly the
+    /// pre-computation the salt exists to close. The foreign trustee is granted
+    /// through `icacls` rather than left to whatever this machine's `%TEMP%` passes
+    /// down, so the leg is about the refusal on any host. **The other half is
+    /// asserted with it**: the refused value is not used at all — the name is the
+    /// unsalted one — and the planted file is left exactly as it was found, because
+    /// this path never writes over a file that is not this user's alone.
+    #[test]
+    fn a_salt_file_that_is_not_this_users_alone_is_refused_rather_than_used() {
+        let _serial = recorder();
+        let directory = tempfile::tempdir().expect("temp dir");
+        let file = directory.path().join("acl-salt");
+        let planted = [0x11u8; SALT_BYTES];
+        fs::write(&file, planted).expect("plant a salt");
+        let granted = Command::new(icacls_binary())
+            .arg(&file)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .output()
+            .expect("run icacls");
+        assert!(
+            granted.status.success(),
+            "icacls /grant on {}: {}",
+            file.display(),
+            String::from_utf8_lossy(&granted.stdout)
+        );
+        assert!(
+            !tinio_winsec::acl_is_current_user_only(&file).expect("read the DACL back"),
+            "the planted salt is already this user's alone, so this leg would prove \
+             nothing"
+        );
+        let root = Path::new(r"E:\srv\tinio");
+
+        let capture = capture();
+        let recording = capture.record();
+        let name = test_path::with(&file, || package_name(root));
+        let logged = capture.text();
+        drop(recording);
+
+        assert_eq!(
+            name,
+            package_name_unsalted(root),
+            "the run derived a name under a value an account it cannot trust planted"
+        );
+        assert_ne!(
+            name,
+            package_name_with(root, &Salt::from_bytes(planted)),
+            "the planted bytes decided the name after all"
+        );
+        assert_step(&logged, "load the ACL salt");
+        assert_recorded_at(&logged, "is not this user's alone", tracing::Level::WARN);
+        assert_eq!(
+            fs::read(&file).expect("the file is still there"),
+            planted,
+            "a file that is not this user's alone is left as it was found"
+        );
+    }
+
+    /// **The state directory's own descriptor is made intentional rather than
+    /// inherited** — the part of the 2026-09-28 review's finding that is about the
+    /// directory the two files live in, and the plant vector it closes: an account
+    /// that the inherited descriptor reaches can *create* a file in the directory,
+    /// which is how a salt or a ledger is planted before this crate's first run.
+    ///
+    /// It would fail if the directory were only created and never put back: on this
+    /// host `%LOCALAPPDATA%\tinio` carries the operator's group at `(I)(OI)(CI)(M)`
+    /// beside SYSTEM and Administrators, and the copy made by a plain
+    /// `fs::create_dir_all` inherits the same grants. **The second half is the one
+    /// the repair could break and therefore the one worth pinning**: re-describing a
+    /// container propagates over its children, so a file that carries
+    /// `create_restricted`'s `SE_DACL_PROTECTED` descriptor has to survive it —
+    /// which is what lets the salt's first use run before the directory is put back.
+    #[test]
+    fn the_state_directory_is_put_back_to_the_current_user() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let state = parent.path().join("tinio");
+        fs::create_dir_all(&state).expect("create the directory under the temp grants");
+        grant_everyone_read(&state);
+        assert!(
+            !tinio_winsec::acl_is_current_user_only(&state).expect("read the DACL back"),
+            "the directory is already this user's alone, so this leg would prove nothing"
+        );
+        // The child a repair must not break: the salt, as `create_restricted` makes
+        // it, created while the directory still carries the foreign entry.
+        let salt = state.join("acl-salt");
+        drop(tinio_winsec::create_restricted(&salt).expect("the salt file"));
+
+        create_state_directory(&state).expect("the repair reports nothing");
+        assert!(
+            tinio_winsec::acl_is_current_user_only(&state).expect("read the DACL back"),
+            "the directory kept a descriptor another account is named in"
+        );
+        assert!(
+            tinio_winsec::acl_is_current_user_only(&salt).expect("read the DACL back"),
+            "the repair's propagation reached a child that carries a protected \
+             descriptor, so the salt would be lost by it"
+        );
+
+        // **Idempotent**: the steady state is one read and no write, so the call a
+        // first run makes on every launch after it costs nothing.
+        create_state_directory(&state).expect("the steady state reports nothing");
+        assert!(tinio_winsec::acl_is_current_user_only(&state).expect("read the DACL back"));
+        // And a directory this call *creates* is private from its first instant.
+        let fresh = parent.path().join("fresh");
+        create_state_directory(&fresh).expect("the directory is created");
+        assert!(tinio_winsec::acl_is_current_user_only(&fresh).expect("read the DACL back"));
     }
 
     #[test]

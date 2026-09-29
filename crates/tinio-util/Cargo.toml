@@ -27,11 +27,27 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "time",
 ] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, optional = true, features = ["process"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [features]
 render = ["dep:handlebars"]
 testing = [
     "dep:tinio-core",
+    "dep:rustix",
     "dep:serde_json",
     "dep:tracing",
     "dep:tracing-subscriber",
@@ -41,4 +57,4 @@ testing = [
 absolute_paths = "warn"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

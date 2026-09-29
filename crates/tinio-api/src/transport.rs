@@ -92,25 +92,38 @@ use crate::{
 /// that is still attached **after its response has been written**, before the instance is
 /// force-reclaimed.
 ///
-/// **The waiting it bounds is at kernel speed, and the bound is ~1 400× its worst measurement.**
+/// **The waiting it bounds is at kernel speed, and the bound is ~1 100× its worst measurement.**
 /// On a client that hangs up after reading, which is every client this crate ships, the wait ends
 /// the moment the client's handle closes: measured over 201 sequential dials on this branch's host
-/// (`the_pipe_pool_serves_back_to_back_dials_with_no_gap`), 80 µs to 181 µs — p50 97 µs, p99
-/// 177 µs, max 181 µs. A quarter of a second is four orders of magnitude above the mean, so a
+/// (`the_pipe_pool_serves_back_to_back_dials_with_no_gap`), 83 µs to 222 µs — p50 95 µs, p99
+/// 182 µs, max 222 µs, re-measured 2026-09-28 with the whole-chunk read below (the earlier one-byte
+/// read measured 80–181 µs, p50 97 µs, p99 177 µs: the distribution is the wait for the close, not
+/// the size of the read). A quarter of a second is three orders of magnitude above the mean, so a
 /// **healthy** client cannot reach this bound, whatever the scheduler does to it.
 ///
 /// **What the bound buys, and what it costs.** A client that completes an exchange and then holds
 /// its handle open — measured with both instances wedged, `two_stalled_clients_do_not_deafen_the_name`
 /// — otherwise parks that instance forever: `DisconnectNamedPipe` is only safe after the peer is
 /// gone, so the loop waits, and with `bind::INSTANCES` of them wedged the *name* goes deaf, which
-/// no retry can repair. At the limit the instance is disarmed anyway, which discards whatever the
-/// pipe still holds unread — and that is exactly what cannot be lost: the response has already
-/// been **written**, and `tokio`'s write on a pipe handle is `WriteFile` + `FlushFileBuffers`,
-/// which blocks until the client has consumed it. What a wedged client holding the connection open
-/// has taken is the whole response; what it is holding is the *connection*, and nothing this
-/// server sends after it — `keep_alive(false)` means there is nothing after it. So the discarded
-/// bytes are at most what that client already chose not to read, and it is the client that is
-/// wrong, not the response that is lost.
+/// no retry can repair. At the limit the instance is disarmed anyway, and that is what cannot be
+/// lost: the response has already been **written**. `tokio`'s write on a pipe handle is a
+/// `WriteFile` into the pipe's buffer — `poll_flush` is a no-op there (`NamedPipeServer`'s
+/// `poll_flush` answers `Ready` without touching the handle, `tokio-1.53.1`'s
+/// `net/windows/named_pipe.rs:918`; the `FlushFileBuffers` an earlier version of this note claimed
+/// was measured false on 2026-09-28 by a client that read nothing — its answer was still in the
+/// pipe, whole, when the client finally read it) — so what a wedged client holding the connection
+/// open is sitting on is that buffered response; what it cannot take is anything after it, because
+/// `keep_alive(false)` means there is nothing after it, and what it is holding is the
+/// *connection*. So the bytes the disarm discards are at most what that client chose not to read,
+/// and it is the client that is wrong, not the response that is lost.
+///
+/// **What the disarm does not discard is the runtime's own read state, and the limit is answered
+/// with that rather than with the disarm alone.** Measured on 2026-09-28: the read the dropped wait
+/// leaves in flight answers for the *next* connection on the same instance — one byte of its
+/// request, or the `ERROR_PIPE_NOT_CONNECTED` the disarm gives it — and a request whose first byte
+/// went that way reaches the router as `ET /status HTTP/1.1`, refused `405 Method Not Allowed`.
+/// [`wait_for_peer_close`] carries what was done about it and why the two ways of throwing that
+/// state away are closed, and [`Pool::poll_read`] is where the connection that inherits it is told.
 ///
 /// **It is not a request timeout and must not become one.** The wait starts *after* hyper has
 /// returned the connection, so no request is in flight inside it; a request that is slow to be
@@ -269,6 +282,15 @@ async fn serve_pipe(
 /// a branch of the `select!` — so the client that got in before the shutdown is still answered
 /// (`management.rs`'s leg with a connection open at the stop is the assertion), which is the same
 /// property the previous single-instance loop got from its `JoinSet`.
+///
+/// **An instance whose drain did not see a clean close carries the previous connection's runtime
+/// state, and that is what the loop carries forward.** [`serve_pipe_connection`] answers with it,
+/// and it is handed to the *next* connection's [`Pool`], which is the one place the difference can
+/// still be told apart — before that connection has read a byte, an error off the instance is the
+/// association's answer rather than the client's ([`Pool::poll_read`] carries the measurement and
+/// the retry). The two mechanisms that would have thrown the state away instead are both refused
+/// by the platform on this crate's own serving processes, and [`wait_for_peer_close`]'s doc has
+/// both.
 #[cfg(windows)]
 async fn pipe_instance_loop(
     mut pipe: NamedPipeServer,
@@ -276,16 +298,17 @@ async fn pipe_instance_loop(
     mut stop: watch::Receiver<bool>,
     identity: String,
 ) -> Result<(), Error> {
+    // Whether the connection that just ended left this instance carrying the runtime's own answer
+    // — its drain's report, spent by the connection that follows.
+    let mut stale = false;
     loop {
         tokio::select! {
             _ = stop.changed() => break,
             connected = pipe.connect() => {
-                eprintln!("PROBE: instance connected");
                 connected.map_err(|err| Error::Transport(format!("{identity}: pipe connect: {err}")))?;
             }
         }
-        pipe = serve_pipe_connection(pipe, app.clone(), &identity).await?;
-        eprintln!("PROBE: instance released back to the loop");
+        (pipe, stale) = serve_pipe_connection(pipe, stale, app.clone(), &identity).await?;
     }
     Ok(())
 }
@@ -304,12 +327,22 @@ async fn pipe_instance_loop(
 /// `Io: 'static`, while tokio implements `AsyncRead`/`AsyncWrite` for `NamedPipeServer` itself
 /// rather than for `&NamedPipeServer` — so the connection owns the instance through [`Pool`] and
 /// its end is where the loop gets it back.
+///
+/// **The pair it answers with is the instance and whether its drain saw a clean close.** The
+/// second half is not diagnostics: a drain that ended without the client's close hands the
+/// instance back carrying an answer of its own — the read the disarm cancelled, or the bytes the
+/// drain's own read took — and the connection that follows is the one that has to be told
+/// ([`Pool::poll_read`]).
+///
+/// `stale` is the *previous* connection's report, which this one's stream is built with; the
+/// answer returned is this connection's own (see [`wait_for_peer_close`]).
 #[cfg(windows)]
 async fn serve_pipe_connection(
     pipe: NamedPipeServer,
+    stale: bool,
     app: axum::Router,
     identity: &str,
-) -> Result<NamedPipeServer, Error> {
+) -> Result<(NamedPipeServer, bool), Error> {
     // `http1` borrows the builder mutably (`hyper-util`'s `auto::Builder::http1(&mut self)`), so
     // the binding is `mut`.
     let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -320,9 +353,8 @@ async fn serve_pipe_connection(
     // The stream the connection is served on: `hyper`'s bridge over [`Pool`], which owns the
     // instance for the connection's life. The slot this frame shares with the stream is what lets
     // the instance come back out once the connection is over.
-    let io = TokioIo::new(Pool::new(pipe));
+    let io = TokioIo::new(Pool::new(pipe, stale));
     let slot = io.inner().slot();
-    eprintln!("PROBE: serving a connection");
     if let Err(err) = builder
         .http1()
         // The pipe has no half-close, so keep-alive would let a client wait forever for a
@@ -340,7 +372,7 @@ async fn serve_pipe_connection(
     })?;
     // Before the disarm, and never after it: this is the drain that keeps the response the client
     // has not read yet from being thrown away (see this function's doc).
-    wait_for_peer_close(&mut pipe, identity).await;
+    let clean = wait_for_peer_close(&mut pipe, identity).await;
     // Back to the listening state, so this instance's next `connect` can accept. `ERROR_NO_DATA`
     // is the client having hung up first: the instance is disconnected either way, which is the
     // state the next `connect` wants, so it is not a failure.
@@ -351,18 +383,39 @@ async fn serve_pipe_connection(
             "{identity}: pipe disconnect: {err}"
         )));
     }
-    Ok(pipe)
+    Ok((pipe, !clean))
 }
 
 /// Waits until the client's end is gone, so the [`DisconnectNamedPipe`] that follows has nothing
 /// left to discard — **bounded by [`DRAIN_LIMIT`]**, after which the instance is reclaimed anyway
-/// and the reclaim is reported as an event.
+/// and the reclaim is reported as an event. Answers **whether the client's close was the thing
+/// that ended the wait**, which is not the same as "the wait ended": a client that writes after
+/// its response ends the wait without ever closing, and an instance that comes back from either
+/// that or the bound is one whose next connection has to be told ([`serve_pipe_connection`]).
 ///
 /// A zero-length read is `Ok` in tokio's `poll_read` spelling; the broken-pipe error is the same
 /// news on an abrupt close, and any other failure is the client's own teardown. The wait is
 /// wrapped in a `timeout` rather than given a deadline of its own so the cancellation is the
-/// usual one: the read is simply dropped, which loses nothing it had consumed (it reads one byte
-/// and nothing else), and the disarm below follows either way.
+/// usual one — and **that cancellation is not free, which is what the answer is about**: the
+/// dropped read is neither cancelled in the kernel nor cancelled in the runtime's read state, it
+/// merely stops being ours. Measured on this host: that read goes on to answer for the *next*
+/// connection — one byte of its request, or the `ERROR_PIPE_NOT_CONNECTED` the disarm gives it —
+/// and the request then reaches the router as `ET /status HTTP/1.1`, refused `405 Method Not
+/// Allowed`.
+///
+/// **Neither of the two mechanisms that would retire the state instead is available**, and both
+/// were measured or are written down rather than assumed. A *successor* instance — close this one
+/// and create the next at the same name — is refused to the process that serves these: inside a
+/// container its identity is the package SID and `CreateNamedPipeW` on a current-user-only DACL
+/// answers `ERROR_ACCESS_DENIED` (`dacl::adopted_pipe`'s note; `bind::INSTANCES` says the same
+/// about the name going deaf for good). And *renewing* the instance in place — duplicate the
+/// handle, drop the association that holds the state, wrap the duplicate — is refused by the
+/// kernel: the duplicate makes `DuplicateHandle` succeed, but the fresh association's
+/// registration is `CreateIoCompletionPort` on an object that is already associated with the
+/// completion port, and that answers `ERROR_INVALID_PARAMETER (87)` (measured on this host
+/// 2026-09-28, the two steps apart so the error's site was not inferred). What is left is the
+/// state itself: the read above takes **a whole chunk**, never the one byte that would leave a
+/// request's tail behind in it, and the connection after it is the one told about the rest.
 ///
 /// A client that connects and never lets go holds this instance **for at most the limit** — the
 /// measurement and the argument that nothing it could still be owed is discarded are on
@@ -377,33 +430,51 @@ async fn serve_pipe_connection(
 ///
 /// [`DisconnectNamedPipe`]: https://learn.microsoft.com/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe
 #[cfg(windows)]
-async fn wait_for_peer_close(pipe: &mut NamedPipeServer, identity: &str) {
+async fn wait_for_peer_close(pipe: &mut NamedPipeServer, identity: &str) -> bool {
     use std::time::Instant;
 
     let started = Instant::now();
-    let mut buf = [0u8; 1];
+    // **A whole chunk, not one byte**: the read is what takes the client's trailing bytes away,
+    // and one byte of a chunk is what leaves the rest of it in the runtime's buffer for the next
+    // connection to read as its request. 4 KiB is the runtime's own chunk (`mio`'s named-pipe
+    // reads go through a buffer of exactly that size, `mio-1.2.3/src/sys/windows/named_pipe.rs`'s
+    // `get_buffer(4 * 1024)`), so a read this size empties it whole.
+    let mut buf = [0u8; 4096];
     let closed = timeout(
         DRAIN_LIMIT,
         poll_fn(|cx| {
             let mut read = ReadBuf::new(&mut buf);
             match Pin::new(&mut *pipe).poll_read(cx, &mut read) {
-                Poll::Ready(Ok(())) => Poll::Ready(()),
+                // The client's close: nothing was delivered, so the instance is in step.
+                Poll::Ready(Ok(())) if read.filled().is_empty() => Poll::Ready(true),
+                // A chunk of the client still being there. One read per poll, so a client that
+                // keeps writing cannot hold this loop: what is taken is bounded, the disarm
+                // discards the rest, and the answer says the close was not seen.
+                Poll::Ready(Ok(())) => Poll::Ready(false),
                 Poll::Ready(Err(err)) if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => {
-                    Poll::Ready(())
+                    Poll::Ready(true)
                 }
-                Poll::Ready(Err(_)) => Poll::Ready(()),
+                Poll::Ready(Err(_)) => Poll::Ready(true),
                 Poll::Pending => Poll::Pending,
             }
         }),
     )
     .await;
-    if closed.is_err() {
-        tracing::warn!(
-            %identity,
-            limit = ?DRAIN_LIMIT,
-            waited = ?started.elapsed(),
-            "the client did not close after its response; reclaiming the pipe instance"
-        );
+    match closed {
+        // The client's close, the only clean end of a wait.
+        Ok(true) => true,
+        // The client wrote after its response: the bytes are taken, and the next connection is
+        // told the instance's state is not trustworthy (`Pool::poll_read`).
+        Ok(false) => false,
+        Err(_) => {
+            tracing::warn!(
+                %identity,
+                limit = ?DRAIN_LIMIT,
+                waited = ?started.elapsed(),
+                "the client did not close after its response; reclaiming the pipe instance"
+            );
+            false
+        }
     }
 }
 
@@ -421,18 +492,36 @@ async fn wait_for_peer_close(pipe: &mut NamedPipeServer, identity: &str) {
 /// one bridge to `hyper`'s traits that `serve_connection` wants — putting the slot behind a second
 /// `TokioIo` would mean going tokio -> `TokioIo` -> tokio -> `TokioIo`, which is why this wrapper
 /// implements the tokio side and lets one `TokioIo` sit on top of it.
+///
+/// **It is also where a connection is told that its instance came back from a drain that did not
+/// see a clean close**, which is the one place that difference is still tellable: the runtime
+/// reads a pipe through a per-handle state machine that the disarm does not clear, so the first
+/// read of such a connection can be answered by the *previous* connection's read — the
+/// `ERROR_PIPE_NOT_CONNECTED` its cancellation produced, or, before the drain took whole chunks,
+/// the tail of a request (`[`Pool::poll_read`] has the measurement). A connection that has not
+/// read a byte yet can tell that apart from the client's own teardown, and does; a later error is
+/// the client's, as it always was.
 #[cfg(windows)]
 struct Pool {
     /// `Some` until the connection's stream is dropped; `None` only once it has been taken out.
     slot: Arc<Mutex<Option<NamedPipeServer>>>,
+    /// Whether the instance this connection is served on came back from a drain that did not see
+    /// the client's close ([`serve_pipe_connection`]'s pair).
+    stale: bool,
+    /// Whether this connection has read a byte of its own yet: the retry below is for the state a
+    /// connection *inherits*, and a connection that has already been served is past that.
+    delivered: bool,
 }
 
 #[cfg(windows)]
 impl Pool {
-    /// Wraps `inner` for one connection.
-    fn new(inner: NamedPipeServer) -> Self {
+    /// Wraps `inner` for one connection, which `stale` marks as one whose drain did not see the
+    /// client's close.
+    fn new(inner: NamedPipeServer, stale: bool) -> Self {
         Self {
             slot: Arc::new(Mutex::new(Some(inner))),
+            stale,
+            delivered: false,
         }
     }
 
@@ -455,25 +544,71 @@ impl Pool {
             .lock()
             .expect("the instance slot is not poisoned while a connection is served")
     }
+
+    /// `body` against the instance in the slot, with the guard taken and given back around it —
+    /// **the one spelling of the forwarded-poll shape**, so the four `AsyncWrite` methods and the
+    /// read retry below cannot disagree about it.
+    fn with_instance<T>(&mut self, body: impl for<'a> FnOnce(Pin<&'a mut NamedPipeServer>) -> T) -> T {
+        let mut held = self.held();
+        body(Pin::new(
+            held.as_mut()
+                .expect("the instance is in the slot for the connection's life"),
+        ))
+    }
 }
 
 #[cfg(windows)]
 impl AsyncRead for Pool {
+    /// **The first read of a connection whose instance came back from an unclean drain is retried
+    /// once, and the retry is the whole of the fix for it.** Measured on this host, the drain's
+    /// abandoned read answers for the connection that follows — `ERROR_PIPE_NOT_CONNECTED`, the
+    /// error the disarm gives the read it cancels — and with that error handed to it hyper ends the
+    /// connection before reading a byte, so a dial that should have been answered `200` was
+    /// answered `Transport("/status: connection error")` and the dials after it were served a
+    /// previous request's tail. One retry is enough because the runtime's own read of an error
+    /// schedules the next one, and that next read is the one that carries the client's request: by
+    /// the time the second poll runs, the state the connection inherited has been spent.
+    ///
+    /// **It cannot hide anything that was not already lost**: the retry runs only while this
+    /// connection has read no byte, and only on an instance the caller marked (a clean drain marks
+    /// nothing, which is why the back-to-back dials leg still sees `0` retries at the dial level —
+    /// this retry is inside one connection and never a second dial). A client that really has gone
+    /// answers the retry with the same error, or with the close, and hyper ends the connection
+    /// exactly as it would have.
+    ///
+    /// **What this does not fix, and what was measured rather than assumed**: the runtime's read
+    /// state can also hold *bytes* the previous connection never read — a client that writes after
+    /// its response and never closes leaves its tail in the buffer (the drain's read takes a whole
+    /// chunk now, which is what keeps the drain itself from being the one that leaves it, but a
+    /// client that writes more than a chunk still can). Bytes have no marker that tells them from
+    /// a request, so no connection can tell those apart, and the two mechanisms that would retire
+    /// them — a successor instance, or the same instance renewed — are refused to the confined
+    /// server ([`wait_for_peer_close`]'s doc has both).
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut held = self.held();
-        eprintln!("PROBE: server poll_read");
-        let out = Pin::new(
-            held.as_mut()
-                .expect("the instance is in the slot for the connection's life"),
-        )
-        .poll_read(cx, buf);
-        eprintln!("PROBE: server poll_read -> {out:?}");
+        let this = self.as_mut().get_mut();
+        let before = buf.filled().len();
+        let out = poll_instance(this, cx, buf);
+        let out = match out {
+            Poll::Ready(Err(_)) if this.stale && !this.delivered => poll_instance(this, cx, buf),
+            decided => decided,
+        };
+        this.delivered |= buf.filled().len() != before;
         out
     }
+}
+
+/// One poll of the instance in `pool`'s slot, with the guard taken and given back around it.
+#[cfg(windows)]
+fn poll_instance(
+    pool: &mut Pool,
+    cx: &mut TaskContext<'_>,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<io::Result<()>> {
+    pool.with_instance(|instance| instance.poll_read(cx, buf))
 }
 
 #[cfg(windows)]
@@ -483,33 +618,18 @@ impl AsyncWrite for Pool {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut held = self.held();
-        eprintln!("PROBE: server poll_write {} bytes", buf.len());
-        let out = Pin::new(
-            held.as_mut()
-                .expect("the instance is in the slot for the connection's life"),
-        )
-        .poll_write(cx, buf);
-        eprintln!("PROBE: server poll_write -> {out:?}");
-        out
+        self.get_mut()
+            .with_instance(|instance| instance.poll_write(cx, buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let mut held = self.held();
-        Pin::new(
-            held.as_mut()
-                .expect("the instance is in the slot for the connection's life"),
-        )
-        .poll_flush(cx)
+        self.get_mut()
+            .with_instance(|instance| instance.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let mut held = self.held();
-        Pin::new(
-            held.as_mut()
-                .expect("the instance is in the slot for the connection's life"),
-        )
-        .poll_shutdown(cx)
+        self.get_mut()
+            .with_instance(|instance| instance.poll_shutdown(cx))
     }
 
     /// Forwarded rather than left to the default, which buffers: the pipe has a vectored write of
@@ -519,12 +639,8 @@ impl AsyncWrite for Pool {
         cx: &mut TaskContext<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let mut held = self.held();
-        Pin::new(
-            held.as_mut()
-                .expect("the instance is in the slot for the connection's life"),
-        )
-        .poll_write_vectored(cx, bufs)
+        self.get_mut()
+            .with_instance(|instance| instance.poll_write_vectored(cx, bufs))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -2079,6 +2195,11 @@ mod tests {
     use tokio::{net::windows::named_pipe::ClientOptions, time::sleep};
 
     use super::*;
+    // The drain test's recording device, named here rather than at its two use sites: this crate
+    // reaches its shared crates through the root's `_util`/`_core` aliases (`lib.rs`, `error.rs`'s
+    // test module), and clippy's `absolute_paths` wants a `use` either way.
+    #[cfg(windows)]
+    use crate::_util::testing::{capture, recorder};
     #[cfg(feature = "tls")]
     use crate::test_support::{fixture_pair, https_get};
     #[cfg(unix)]
@@ -2592,6 +2713,165 @@ mod tests {
             .await
             .expect("the serve task ends rather than panicking")
             .expect("serve returns Ok");
+    }
+
+    /// Writes one canned HTTP request into the raw pipe, in a `poll_write` loop: the crate's tokio
+    /// graph carries no `io-util`, so there is no `AsyncWriteExt` here (`client.rs`'s R29 test
+    /// states the same fact), and this is the whole of what one request needs.
+    #[cfg(windows)]
+    async fn write_request(pipe: &mut (impl AsyncWrite + Unpin), mut bytes: &[u8]) {
+        poll_fn(|cx| {
+            while !bytes.is_empty() {
+                match Pin::new(&mut *pipe).poll_write(cx, bytes) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::other(
+                            "the pipe stopped accepting the request",
+                        )));
+                    }
+                    Poll::Ready(Ok(written)) => bytes = &bytes[written..],
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            Poll::Ready(Ok(()))
+        })
+        .await
+        .expect("the request reaches the server");
+    }
+
+    /// **A client that never closes holds its instance only under the bounded drain** — §5's
+    /// second scenario, and the measurement [`DRAIN_LIMIT`] and [`wait_for_peer_close`] state.
+    ///
+    /// Every instance is answered and then left open — the client writes a request and then neither
+    /// reads nor closes — so each serving task sits in [`wait_for_peer_close`] until the bound,
+    /// reclaims its instance and reports the reclaim; the pool then serves a fresh dial again. That
+    /// last fact is the property the bound exists for: unbounded, a client that never lets go would
+    /// hold its instance for as long as it lived, and every instance held at once is the name gone
+    /// deaf.
+    ///
+    /// **The client is raw and speaks HTTP by hand, and that is forced rather than chosen**: a held
+    /// `SendRequest` does not keep a pipe open (measured: the server released the instance ~100 µs
+    /// after the exchange, because the handle lives in hyper's connection future), so a client
+    /// built out of `hyper` cannot be the client this scenario is about. The flavor is the other
+    /// half of what made the scenario untestable: the dial path's `ClientOptions::open` blocks the
+    /// calling thread (`plans/2026-09-25-sandbox-followups.md` §5).
+    ///
+    /// **What the loop waits for is a `200`, not "an answer", and the reclaim is why.** A reclaim
+    /// is a cancellation: the drain's read is dropped at the bound, and the instance that comes
+    /// back carries the runtime's own read state into the next connection — measured *before* the
+    /// drain defect was fixed, as this test's own transcript: the first dial after the reclaims
+    /// ends in `Transport("/status: connection error")` (the error the disarm gives the read it
+    /// cancelled), the dials after it are answered `405 Method Not Allowed` because the request
+    /// reached the router as `ET /status HTTP/1.1` with its first byte taken by the drain's
+    /// one-byte read, and the pool only converges on a clean `200` after a dozen to sixty further
+    /// dials. Two rules in the implementation are what removed that ([`wait_for_peer_close`] reads
+    /// a whole chunk and answers whether the client's close ended the wait; [`Pool::poll_read`]
+    /// retries a pre-first-byte error once on an instance that came back unclean), and **the
+    /// assertion below pins both**: with the retry disabled and the drain's buffer back at one byte
+    /// the test fails with exactly that transcript (measured 2026-09-28).
+    ///
+    /// The dials that cannot *connect* are waited through rather than counted — `ERROR_PIPE_BUSY`
+    /// while both instances are still held or being disarmed is the pool working, not a dial — so
+    /// the budget is that wait's: 250 ticks of 20 ms, five seconds, against a bound of 250 ms.
+    // **`recorder`'s guard is held across this test's awaits on purpose**, which is the one thing
+    // the lint cannot see: the guard is the process-wide serialisation of every-thread recordings,
+    // and the recording it protects is the whole test, so there is no earlier point at which it
+    // could be dropped.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_never_closes_holds_its_instance_only_under_the_bounded_drain() {
+        let name = bind::pipe_name(&format!(r"\\.\pipe\tinio-drain-{}", process::id()));
+        let channel = bind::bind_pipe(&name).expect("bind");
+        let (tx, rx) = watch::channel(false);
+        let state = State::new(name.clone(), Some(9000), Path::new("/srv/data")).expect("state");
+        let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::Local, tx.clone()));
+        let token = shared.state.token.expose_secret().as_str().to_owned();
+        let serving = tokio::spawn(serve_local(channel, shared, rx));
+
+        // The reclaim's own event, recorded across threads: the warning is emitted by a serving
+        // task, never by this one.
+        let capture = capture();
+        let _serialise = recorder();
+        let recording = capture.record_every_thread();
+
+        // Both instances claimed and answered, then held rather than dialled and released: the
+        // handles are the pool's occupancy, so what the drain waits on is real. The request is
+        // written by hand because the client that has to hold is a client that speaks HTTP itself,
+        // and nothing is read afterwards — holding the connection is the whole scenario.
+        let request =
+            format!("GET /status HTTP/1.1\r\nhost: 127.0.0.1\r\nx-tinio-token: {token}\r\n\r\n");
+        let mut held = Vec::new();
+        for _ in 0..bind::INSTANCES {
+            let mut pipe = ClientOptions::new().open(&name).expect("take an instance");
+            write_request(&mut pipe, request.as_bytes()).await;
+            held.push(pipe);
+        }
+
+        // **The first dial that connects is answered `200`, and every dial of the two that follow
+        // it is too** — the property the bound is for, and the one the old code could not reach:
+        // its reclaimed instances answered a connection error and then a previous request's tail
+        // (`405 Method Not Allowed`, the request parsed as `ET /status HTTP/1.1`). Dials that
+        // cannot *connect* are not dials at all and are waited through — `ERROR_PIPE_BUSY` while
+        // both instances are still held or being re-armed is the pool working — and the budget is
+        // that wait's, five seconds of 20 ms ticks rather than a count tuned to the pool.
+        // What a failing dial saw is kept so the assertion can show the whole transcript.
+        let mut transcript = Vec::new();
+        let mut dials = 0usize;
+        let mut answer = None;
+        for _ in 0..250 {
+            // Not being able to *connect* is not a dial: `ERROR_PIPE_BUSY` while both instances
+            // are still held (or between a disarm and its re-arm) is the pool working, and it is
+            // waited through rather than counted.
+            let Ok(stream) = ClientOptions::new().open(&name) else {
+                sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            // From here on it is a dial, and every dial has to be answered: a connection that is
+            // taken and then answered nothing, or answered something other than `/status`, is the
+            // instance the bound handed back putting its own read state in front of the request.
+            let reply = client::exchange(TokioIo::new(stream), get("/status", Some(&token)))
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "dial {} was answered nothing at all: {err}. Transcript: {transcript:#?}",
+                        dials + 1
+                    )
+                });
+            dials += 1;
+            transcript.push(format!("{} {}", reply.status, reply.body));
+            assert_eq!(
+                reply.status, 200,
+                "dial {dials} after the reclaims was not answered `/status`. Transcript: \
+                 {transcript:#?}"
+            );
+            answer = Some(reply);
+            if dials == 3 {
+                break;
+            }
+        }
+        let answer = answer.expect("the bound reclaims the instances, so the pool serves again");
+        assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
+        eprintln!("pipe drain: {dials} dials answered /status after the reclaims");
+
+        drop(recording);
+        // Every held instance is a reclaim of its own, and the identity is part of what is asserted:
+        // an every-thread recording collects the other tests' events too, and this crate's pipe
+        // tests share the one warning text.
+        let logged = capture.text();
+        let reclaims = logged
+            .lines()
+            .filter(|line| line.contains("reclaiming the pipe instance") && line.contains(&name))
+            .count();
+        assert!(
+            reclaims >= bind::INSTANCES,
+            "each of the {INSTANCES} held instances reports its own forced reclaim, and {reclaims} \
+             were reported: {logged}",
+            INSTANCES = bind::INSTANCES
+        );
+
+        drop(held);
+        serving.abort();
     }
 
     /// The same sequential dials through `Plane`: the path `management.rs` drives, kept here so a

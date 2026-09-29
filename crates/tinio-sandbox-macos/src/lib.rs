@@ -97,7 +97,8 @@
 pub extern crate tinio_sandbox_core as _core;
 
 use crate::_core::{
-    Backend as BackendTrait, Confinement, LaunchPlan, PlatformFacts, Result, Sandbox,
+    Backend as BackendTrait, Confinement, Diagnostics, Enforcement, LaunchPlan, PlatformFacts,
+    Result, Sandbox,
 };
 
 pub mod apply;
@@ -128,6 +129,33 @@ pub const FACTS: PlatformFacts = PlatformFacts {
     refuses_derived_state_dir: true,
     probe_state_dir_writable: true,
     control_socket: true,
+};
+
+/// How much of its guarantee this backend's mechanism applies — **the strength the mechanism
+/// answers for**, published beside [`FACTS`] so the crate that owns the mechanism is the crate
+/// that answers for it (the rule [`PlatformFacts`]'s own doc states).
+///
+/// **`Full`, and what that covers**: every exposure the profile names is granted at the access
+/// it was exposed with, and everything else is refused — the `(deny default)` profile
+/// `profile::render` writes, applied either by `sandbox-exec` around the child's `exec` or by
+/// the child itself through `sandbox_init` (design decision 6, `Mechanism`). It is the whole
+/// guarantee this build's contract claims for this mechanism; the one shape it does not span is
+/// macOS's own — a profile is textual, so a parameter travels as a rendered path rather than
+/// as a structural grant — and that is `docs/sandbox.md`'s to state, not a gap in what is
+/// applied.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::Enforcement;
+///
+/// assert_eq!(
+///     tinio_sandbox_macos::DIAGNOSTICS.enforcement,
+///     Enforcement::Full
+/// );
+/// ```
+pub const DIAGNOSTICS: Diagnostics = Diagnostics {
+    enforcement: Enforcement::Full,
 };
 
 /// The macOS backend — the type the facade's `platform()` selects.

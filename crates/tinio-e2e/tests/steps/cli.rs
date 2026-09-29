@@ -36,7 +36,7 @@ use assert_cmd::cargo::cargo_bin;
 use cucumber::{gherkin::Step, given, then, when};
 use tempfile::TempDir;
 use tinio_sandbox::Event;
-use tinio_util::testing::kill_and_reap;
+use tinio_util::testing::{job, kill_and_reap};
 use tokio::time::sleep;
 
 use super::World;
@@ -280,6 +280,13 @@ impl Cli {
     /// proved the daemon ready, so for that command the exit is what the scenario asserts and
     /// the event is only read afterwards. Every other run that reports it *is* the server,
     /// and is kept — [`Cli::children`] kills and reaps it on the way out.
+    ///
+    /// **The spawn goes through the job guard** (`tinio_util::testing::job::spawn`), and the
+    /// `--daemon` scenario is the one that shows what it buys: the parent exits and the daemon
+    /// survives it — a grandchild no handle here may ever name — while the job makes that daemon a
+    /// member of this test process's job, so a scenario killed from outside (the abort or the hard
+    /// kill that runs no `Drop` and no `kill_servers`) takes it too. The reaping is unchanged: the
+    /// guard is what covers the paths that reach no teardown at all.
     async fn run(&mut self, command: &str) {
         let argv = self.argv(command);
         let detached = argv.iter().any(|arg| arg == "--daemon");
@@ -296,7 +303,7 @@ impl Cli {
                 fs::File::create(&err_path).expect("the run's stderr file"),
             ));
         let started = Instant::now();
-        let mut child = cmd.spawn().expect("spawn the tinio binary");
+        let mut child = job::spawn(&mut cmd).expect("spawn the tinio binary");
         let budget = if self.confined(&argv) {
             CONFINED_RUN_TIMEOUT
         } else {
@@ -453,7 +460,7 @@ impl Cli {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Ok(mut child) = cmd.spawn() {
+        if let Ok(mut child) = job::spawn(&mut cmd) {
             let deadline = Instant::now() + TEARDOWN_TIMEOUT;
             while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 thread::sleep(POLL);

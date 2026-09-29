@@ -488,6 +488,50 @@ pub const fn platform_facts() -> PlatformFacts {
     facts
 }
 
+/// How much of its guarantee this target's confinement applies — **the strength the backend
+/// answers for, reached the way [`platform_facts`] reaches the facts**.
+///
+/// The value is the target backend's own constant, so it is a sentence the crate that owns the
+/// mechanism wrote: `tinio_sandbox_macos::DIAGNOSTICS`, `tinio_sandbox_windows::DIAGNOSTICS`,
+/// `tinio_sandbox_linux::DIAGNOSTICS`. Which constant is the only `cfg` here, and a target this
+/// build wires no backend for answers [`Diagnostics::NOT_REPORTED`] — never
+/// [`Enforcement::Unimplemented`], which would be a claim about a mechanism that is not there
+/// to make it.
+///
+/// **A caller that needs the strength reads this rather than assuming one**: the value a
+/// backend that has not answered returns is `NotReported`, and treating that as "nothing is
+/// applied" is the one reading this function exists to prevent.
+///
+/// [`Enforcement::Unimplemented`]: crate::Enforcement::Unimplemented
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox::{Enforcement, backend_available, diagnostics};
+///
+/// // The three targets whose backend has landed answer `Full`; any other target answers the
+/// // honest `NotReported` rather than failing to name a value at all.
+/// let expected = if backend_available() {
+///     Enforcement::Full
+/// } else {
+///     Enforcement::NotReported
+/// };
+/// assert_eq!(diagnostics().enforcement, expected);
+/// ```
+pub const fn diagnostics() -> Diagnostics {
+    #[cfg(target_os = "linux")]
+    let diagnostics = _linux::DIAGNOSTICS;
+    #[cfg(target_os = "macos")]
+    let diagnostics = _macos::DIAGNOSTICS;
+    #[cfg(target_os = "windows")]
+    let diagnostics = _windows::DIAGNOSTICS;
+    // No backend is wired for this target, so nothing has answered the strength question: the
+    // value is "not reported" rather than a claim that no mechanism is applied.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let diagnostics = Diagnostics::NOT_REPORTED;
+    diagnostics
+}
+
 /// The control descriptors a launcher hands to the plan — **on unix, the borrowed
 /// descriptors themselves**, so the type system carries the one fact the handoff is
 /// made of.
@@ -674,12 +718,12 @@ pub const fn backend_available() -> bool {
 // later. A name *added* to the core is still this list's to gain by hand: see
 // the comment on that test.
 pub use crate::_core::{
-    AccessMode, Adopted, Backend, CONTROL_FD_PREFIX, Child, Confinement, ControlHandle, Error,
-    Event, Exposure, LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, MACOS_MECHANISM_USAGE,
-    Observer, Readiness, Result, Sandbox, SandboxSpec, Terminal, adopt, control_fd_arg,
-    control_fd_from_arg, describe_exposures, fail, filter_argv, is_control_fd_arg,
-    is_launcher_fd_arg, is_listener_fd_arg, launch, listener_fd_arg, listener_fd_from_arg, refused,
-    step, supervise,
+    AccessMode, Adopted, Attribution, Backend, CONTROL_FD_PREFIX, Child, Confinement,
+    ControlHandle, Denial, Diagnostics, Enforcement, Error, Event, Exposure, LISTENER_FD_PREFIX,
+    LaunchPayload, LaunchPlan, MACOS_MECHANISM_USAGE, Observer, Readiness, Refused, Result,
+    Sandbox, SandboxSpec, Terminal, adopt, control_fd_arg, control_fd_from_arg, describe_exposures,
+    fail, filter_argv, is_control_fd_arg, is_launcher_fd_arg, is_listener_fd_arg, launch,
+    listener_fd_arg, listener_fd_from_arg, refused, step, supervise,
 };
 // **The fork probe's names, published only where a probe can exist** — a `#[cfg]` the core's own
 // list carries for the same reason, and one this list has to repeat because the equality between

@@ -197,4 +197,20 @@ $env:TINIO_E2E_CONFINEMENT = '1'
 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036' --concurrency 1
 Assert-Exit "cargo test -p tinio-e2e --test cucumber --tags '@cli and @FR-036' --concurrency 1" $LASTEXITCODE
 
+# **No server process outlives the legs, and the check is the gate rather than tidiness.** A
+# finished run once left 19 `tinio server <root> --port 0` processes alive after their parent had
+# died; they held `target\debug\tinio.exe` open, so the next `cargo build -p tinio` failed at the
+# uplift step (`failed to remove ... target\debug\tinio.exe: access denied`) and every later
+# measurement ran against a stale binary until a hash comparison caught it. The check lives here
+# because libtest has no run-level teardown to hang it on. **Run this script on a host with no
+# other `tinio` server running**: it asserts the whole process table, which is the plan's own
+# shape (`plans/2026-09-25-sandbox-followups.md` §13).
+$leftover = @(Get-Process -Name tinio -ErrorAction SilentlyContinue)
+if ($leftover.Count -ne 0) {
+    [Console]::Error.WriteLine(
+        "$($leftover.Count) tinio process(es) outlived the legs (PIDs $($leftover.Id -join ', ')): " +
+        "a leaked server holds the binary open and the next build fails at the uplift step")
+    exit 1
+}
+
 Write-Host 'verify-windows.ps1: every leg passed'

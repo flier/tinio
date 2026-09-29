@@ -99,12 +99,17 @@ fn a_confined_server_serves() {
     // root it was handed — so a leg that wants a serving server makes the directory first.
     fs::create_dir_all(&root).expect("the served root");
 
-    let mut child = Command::new(tinio_bin())
+    // **`job::spawn` rather than `Command::spawn`, and on this leg it is not a
+    // formality**: the child is a confined `tinio server` — the process shape and the
+    // platform arm the orphan incident was about — so the parent-death signal is what
+    // keeps a killed test runner from leaving a jailed server holding its listener and
+    // its state lock.
+    let mut command = Command::new(tinio_bin());
+    command
         .args(["server", root.to_str().unwrap(), "--port", "0", "--sandbox"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn tinio server");
+        .stderr(Stdio::piped());
+    let mut child = tinio_util::job::spawn(&mut command).expect("spawn tinio server");
 
     // No precondition is left to blame here, so the wait's own failure is the
     // failure — with the child killed and its stderr quoted, because an `Error`
@@ -170,7 +175,8 @@ fn a_confined_read_only_server_refuses_writes_through_the_served_root() {
     fs::create_dir_all(&state).expect("the relocated state dir");
     fs::write(root.join("obj.txt"), "hello from the served root\n").expect("seed the root");
 
-    let mut child = Command::new(tinio_bin())
+    let mut command = Command::new(tinio_bin());
+    command
         .args([
             "server",
             root.to_str().unwrap(),
@@ -184,9 +190,8 @@ fn a_confined_read_only_server_refuses_writes_through_the_served_root() {
         // real home of whoever runs this leg.
         .env("TINIO_STATE_DIR", &state)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn serve");
+        .stderr(Stdio::piped());
+    let mut child = tinio_util::job::spawn(&mut command).expect("spawn serve");
 
     // Still serving: the jail built with a read-only served root and a
     // writable state directory, the plane opened its database inside the

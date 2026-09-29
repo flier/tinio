@@ -42,6 +42,7 @@ Layout / tags / env: `crates/tinio-e2e/README.md`. Features ↔ `specs/001-s3-lo
 
 - T056 via `Plane` API, never raw transport. CLI process legs → `@cli` cucumber.
 - Pipe successor (`ERROR_PIPE_BUSY`): do not paper over — **T147** owns.
+- Pipe-pool tests need two workers: `ClientOptions::open` blocks the calling thread, so a busy or draining pool is observable only from a multi-thread runtime — the two scenarios are `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` and the crate's **dev** edge carries tokio's `rt-multi-thread`, dev-only (`plans/2026-09-25-sandbox-followups.md` §5 owns the scenarios).
 
 ## CLI (tinio)
 

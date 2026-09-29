@@ -2702,6 +2702,16 @@ pub fn sweep_confined_grandchild(root: &Path) {
         .status();
 }
 
+/// The guard a harness's spawn sites go through, so that a test process which dies without
+/// unwinding takes its servers with it: a job object on Windows, the parent-death signal on Linux.
+///
+/// **Re-exported rather than defined here**, for [`kill_and_reap`]'s reason and one more: the
+/// module is deliberately outside this feature so that its own tests run in the default graph
+/// (`crate::job`), while every harness that spawns a server reaches `testing` already. A caller
+/// therefore spells one path — `tinio_util::testing::job::spawn` — whichever half of the two it
+/// stands on. The mechanism, its per-thread caveat on Linux and the target that has none are the
+/// module's own doc.
+pub use crate::job;
 /// Kill `child` and reap it, ignoring both answers — the silent sibling of [`wait_for_exit`], for
 /// every path that has already decided what to report.
 ///
@@ -2748,25 +2758,18 @@ pub fn wait_for_exit(child: &mut Child, within: Duration, what: &str) -> ExitSta
 }
 
 /// The bounded `try_wait` poll both wait shapes are written on: `Some` when the child exits inside
-/// `within`, `None` when the deadline passes with it still running.
+/// `within`, `None` when the deadline passes with it not seen to exit.
 ///
-/// **The poll is shared and the failing path is not, which is why this half is public.** Above,
-/// `None` means kill the child and panic. A launcher leg cannot do only that: the confined
-/// **grandchild** outlives a launcher that never exits (the accepted no-job-object gap), so the leg
-/// has to sweep that process before it fails — [`wait_for_exit`] cannot reach it and the leg cannot
-/// use [`wait_for_exit`]. One poll, two endings, neither expressible as the other.
-pub fn poll_exit(child: &mut Child, within: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + within;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll the child") {
-            return Some(status);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
+/// **Re-exported rather than defined here**, for [`kill_and_reap`]'s reason one step further: this
+/// poll needs nothing the `testing` feature provides — `std` and a child handle are the whole of it
+/// — so its home is `crate::process`, beside the kill, where a caller that must not turn the
+/// feature on can still reach it. `tinio-util`'s own job guard is the first such caller: its module
+/// is deliberately outside this feature so that its tests run in the default graph, and this is the
+/// bounded wait those tests are written against.
+///
+/// **Why one poll serves two endings lives with the definition** (`crate::process::poll_exit`):
+/// the argument is about the shipped module's surface, so it is written once, there.
+pub use crate::process::poll_exit;
 
 /// Whether `path` exists before `within` passes, polling every `poll` — the sync sibling of
 /// [`wait_for`] and one family with [`poll_exit`].
@@ -2997,6 +3000,12 @@ fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
 ///
 /// The child inherits this process's environment; a harness that must remove or set a variable does
 /// it on the [`Command`] before [`spawn`](Self::spawn).
+///
+/// **The spawn goes through the job guard** ([`crate::job::spawn`]), which is what makes the legs
+/// that hold one of these — `tinio-server`'s `serve_read_only` and the sandbox-channel harness
+/// beside it — take their servers with them when the test process dies without unwinding. The
+/// guard is the backstop for that path; the `Drop` below stays what reaps on every path that
+/// returns. What the guard covers, per target, is its module's doc.
 pub struct PipedChild {
     child: Child,
     stdout: Lines,
@@ -3012,9 +3021,15 @@ impl PipedChild {
     /// contract: a caller that forgot `Stdio::piped()` would get a child whose output nobody reads,
     /// which is the hang the type exists to prevent. A spawn failure panics — every caller is a
     /// test or a harness, and a binary that cannot be spawned is the leg's own precondition.
+    ///
+    /// **The child is spawned through the job guard** ([`crate::job::spawn`]) rather than through
+    /// the [`Command`] directly, which is the one spelling every harness's spawn site uses: the
+    /// guard is what covers a test process that dies without unwinding, and a leg that spawns a
+    /// server any other way is exactly the orphan it exists to prevent. The call is made here, on
+    /// the caller's thread, because the guard is only as wide as the thread it was taken on.
     pub fn spawn(cmd: &mut Command) -> Self {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().unwrap_or_else(|e| {
+        let mut child = job::spawn(cmd).unwrap_or_else(|e| {
             panic!("cannot spawn {}: {e}", cmd.get_program().to_string_lossy())
         });
         let stdout = Arc::new(Mutex::new(Vec::new()));

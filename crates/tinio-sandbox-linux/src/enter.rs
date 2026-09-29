@@ -585,9 +585,12 @@ fn enter_mount_namespace() -> Result<()> {
     fields(mounts = mounts.len(), exposures = ?sandbox.exposures())
 )]
 fn apply_planned_mounts(sandbox: &Sandbox, mounts: &[Mount], overlay: &OverlayDirs) -> Result<()> {
-    // 6. The mounts, in plan order.
+    // 6. The mounts, in plan order. **No inherited flags**: a planned mount is
+    //    not a remount of anything — `plan` emits no `OverlayReadOnly` — and the
+    //    one caller that has them is the read-only arm's fallback, which
+    //    re-enters `apply_mount` with them so the trace stays one event per mount.
     for entry in mounts {
-        apply_mount(entry, overlay)?;
+        apply_mount(entry, overlay, MountFlags::empty())?;
     }
     announce_exposures(sandbox.exposures(), mounts.len());
     Ok(())
@@ -681,7 +684,7 @@ fn open_map(path: &str, step_name: &'static str) -> Result<fs::File> {
 /// and which errno takes the fallback is everything about it worth pinning.
 ///
 /// **The unlocked case is the same rule's other side, and it is why the caller
-/// re-asserts the source's own `nosuid`/`nodev`/`noexec` before it asks.**
+/// re-asserts every flag [`source_mount_flags_in`] reads before it asks.**
 /// `lock_mnt_tree` runs only where the new mount namespace belongs to a
 /// different user namespace, so the root leg's mounts arrive unlocked, the
 /// partial `MS_REMOUNT|MS_BIND|MS_RDONLY` request is **accepted** — and a
@@ -789,15 +792,34 @@ fn read_mountinfo() -> Result<String> {
     fs::read_to_string("/proc/self/mountinfo").map_err(step("read /proc/self/mountinfo"))
 }
 
-/// The `nosuid`/`nodev`/`noexec` flags of the mount that contains `source`, as
-/// read from a `/proc/self/mountinfo` table.
+/// The `nosuid`/`nodev`/`noexec`/`nosymfollow` flags of the mount that contains
+/// `source`, as read from a `/proc/self/mountinfo` table.
 ///
-/// **These three are what an `MS_REMOUNT|MS_BIND` request has to re-assert, and
-/// every other flag is deliberately left out of it.** A bind remount *replaces*
+/// **These are what an `MS_REMOUNT|MS_BIND` request has to re-assert, and every
+/// other flag is deliberately left out of it.** A bind remount *replaces*
 /// the target's per-mount flag set with the request's rather than adding to it,
-/// so the three a bind inherits and drops are the three that must be carried;
+/// so the flags a bind inherits and drops are the flags that must be carried;
 /// the rule is design decision 8's, with its measured evidence row in the
 /// design's evidence table and its restatement in design §4.
+///
+/// **`nosymfollow` joined the set on 2026-09-28, and it is the one member the
+/// kernel never refuses to drop.** `MNT_NOSYMFOLLOW` sits inside
+/// `MNT_USER_SETTABLE_MASK` (`include/linux/mount.h`), so a bind remount that
+/// does not name it clears it; and unlike `nosuid`/`nodev`/`noexec` there is
+/// **no `MNT_LOCK_NOSYMFOLLOW`** — `lock_mnt_tree` sets `MNT_LOCK_ATIME`
+/// unconditionally and `MNT_LOCK_READONLY`/`NODEV`/`NOSUID`/`NOEXEC` for the
+/// flags a mount carries, and `can_change_locked_flags` tests exactly those five
+/// (`fs/namespace.c`) — so a `nosymfollow` source produces no `EPERM` to send it
+/// to the overlay arm and nothing reports the loss. Measured with a bare
+/// `mount(2)` on `6.18.33.2-microsoft-standard-WSL2`, from a nested user
+/// namespace: a bind of a `rw,relatime,nosymfollow` tmpfs, remounted
+/// `MS_REMOUNT|MS_BIND|MS_RDONLY`, returned `0` and read back `ro,relatime`; the
+/// same request naming `MS_NOSYMFOLLOW` read back `ro,relatime,nosymfollow`.
+/// The end-to-end half is `tests/jail.rs`'s opt-in nested-user-namespace leg,
+/// whose child reads a symlink inside the served root: that read is `ELOOP`
+/// exactly while this flag survives. The full measurement and the arm it leaves
+/// uncovered are `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §7's
+/// note.
 ///
 /// **`ro` is not read here, and that is the whole point of the remount.** The
 /// served root is usually `rw` on the host — it is the exposure's own source —
@@ -839,20 +861,29 @@ fn source_mount_flags_in(table: &str, source: &Path) -> MountFlags {
             "nosuid" => MountFlags::NOSUID,
             "nodev" => MountFlags::NODEV,
             "noexec" => MountFlags::NOEXEC,
+            "nosymfollow" => MountFlags::NOSYMFOLLOW,
             _ => MountFlags::empty(),
         };
     }
     flags
 }
 
-fn apply_mount(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+/// `inherited` is the source mount's own per-mount flags as
+/// [`source_mount_flags_in`] read them, and **one arm consumes it**:
+/// [`MountKind::OverlayReadOnly`], whose mount is fresh and therefore has
+/// nothing to inherit from. It is an argument rather than a second read of the
+/// mount table inside that arm because the read already exists one frame up in
+/// [`enforce_bind_read_only`], the only caller that builds that kind; a planned
+/// mount passes [`MountFlags::empty()`], there being no source it was bound
+/// from.
+fn apply_mount(entry: &Mount, overlay: &OverlayDirs, inherited: MountFlags) -> Result<()> {
     match entry.kind {
         MountKind::JailTmpfs => apply_jail_tmpfs(entry)?,
         // `return`: the overlay fallback re-enters this function, and that
         // recursive call is the one that traces — falling through would emit a
         // second `mount applied` with the bind's kind (design decision 8).
         MountKind::Bind => return apply_bind(entry, overlay),
-        MountKind::OverlayReadOnly => apply_overlay_read_only(entry, overlay)?,
+        MountKind::OverlayReadOnly => apply_overlay_read_only(entry, overlay, inherited)?,
     }
     trace_mount(entry);
     Ok(())
@@ -945,7 +976,7 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     // confinement and the operator has none, which is exactly the
     // class of failure design §11 refuses.
     //
-    // **The request carries the source's own `nosuid`/`nodev`/`noexec`, and
+    // **The request carries every flag [`source_mount_flags_in`] reads, and
     // that is design decision 8's rule rather than a belt.** `MS_REMOUNT|MS_BIND`
     // has to re-assert **every** locked per-mount flag to get past
     // `can_change_locked_flags()` — that is the `EPERM` the arm below catches —
@@ -970,9 +1001,16 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     // path serves a `tempfile::tempdir()` under `/tmp`, so this is not a
     // hypothetical host.
     //
+    // **`NOSYMFOLLOW` is in that set for the second half of this paragraph
+    // alone** (2026-09-28): the kernel never locks it — there is no
+    // `MNT_LOCK_NOSYMFOLLOW` — so it is the one member whose loss no `EPERM`
+    // reports, and a request that does not name it clears it on the unlocked and
+    // the locked path alike. `source_mount_flags_in`'s own doc carries the
+    // measurement.
+    //
     // **`RDONLY` is the request's and never the source's.** The source is
     // usually `rw` — it is the served root — and read-only is what this call
-    // adds; the three inherited flags are read from the mount that *contains*
+    // adds; the inherited flags are read from the mount that *contains*
     // [`Mount::source`] by [`source_mount_flags_in`], which can therefore only
     // reproduce what the bind already carried and never widen the exposure.
     //
@@ -980,8 +1018,23 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     // to it** — it is now the **rarer** arm, which is the cost design §4 records
     // against the simplification this line adopts. Where the request re-asserts
     // what a locked mount demands, the `EPERM` arm is reached only by a
-    // per-mount flag this request does not name — the kernel locks more than
-    // these three — and there the `MS_RDONLY` overlay is what makes the exposure
+    // per-mount flag this request does not name — and the kernel's locked set is
+    // **exactly** `READONLY`, `ATIME`, and **three** of `source_mount_flags_in`'s
+    // four (`NOSUID`, `NODEV`, `NOEXEC`: the members that have an `MNT_LOCK_*`
+    // behind them at all, `nosymfollow` having none), with `ATIME` preserved by
+    // the kernel on a remount that does not name an atime flag
+    // (`lookup_mnt`'s rule in `do_mount`: "the default atime for remount is
+    // preservation"), so on this kernel **no mount flag can refuse this request
+    // any more** and the arm is reached by none. **What that rule is worth is
+    // measured by breaking it, in the guest**: with one member deleted from
+    // [`source_mount_flags_in`]'s match — `noexec`, whose lock is real — the
+    // opt-in nested-user-namespace leg's `noexec` source is refused `EPERM` by
+    // this remount and reports `read-only-arm: overlay` instead, so the arm is
+    // one un-named locked flag away on this host and it is the request that
+    // closes the route rather than the kernel. That is measured, and it is
+    // `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §7's note — the
+    // arm stays because the kernel's answer is what picks it, not this code, and
+    // there the `MS_RDONLY` overlay is what makes the exposure
     // read-only. Measured after the change, with a bare `mount(2)`: in a user
     // namespace the partial request is `EPERM` and the re-asserted one is
     // accepted with the flags intact, and `tests/jail.rs`'s user-namespace leg —
@@ -1052,7 +1105,7 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
                 kind: MountKind::OverlayReadOnly,
                 ..entry.clone()
             };
-            apply_mount(&fallback, overlay)
+            apply_mount(&fallback, overlay, inherited)
         }
         Err(source) => Err(fail("remount ro", source)),
     }
@@ -1129,7 +1182,11 @@ fn refuse_writable_nested_mounts(entry: &Mount, table: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+fn apply_overlay_read_only(
+    entry: &Mount,
+    overlay: &OverlayDirs,
+    inherited: MountFlags,
+) -> Result<()> {
     // **The fallback arm, and the only way in is the substitution
     // above.** `plan` emits no entry of this kind (Task 2), and keeping
     // the mechanism a `MountKind` rather than an inline branch is what
@@ -1142,6 +1199,11 @@ fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
     fs::create_dir_all(&entry.target).map_err(step("create overlay mount point"))?;
     fs::create_dir_all(&overlay.upper).map_err(step("create overlay upper"))?;
     fs::create_dir_all(&overlay.work).map_err(step("create overlay work"))?;
+    // **Which flags this mount carries is [`overlay_read_only_flags`]'s own
+    // doc, and it is a function rather than four lines here for the reason
+    // [`refused_remount_needs_the_overlay`] gives: this *is* the fallback arm's
+    // read-only decision, and a test cannot mount an overlay to read it back.**
+    let flags = overlay_read_only_flags(inherited);
     // **`as_c_str()` and not `&options`**: `mount`'s data parameter is
     // `Data: Into<Option<&CStr>>`, and a `CString` reference is not one
     // of those — the conversion is explicit all the way down.
@@ -1149,10 +1211,54 @@ fn apply_overlay_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
         "overlay",
         &entry.target,
         "overlay",
-        MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV,
+        flags,
         Some(options.as_c_str()),
     )
     .map_err(step("mount overlay ro"))
+}
+
+/// The flag set [`apply_overlay_read_only`] mounts with — **the fallback arm's
+/// answer to "which of the source's own per-mount flags must a fresh mount
+/// carry?"**, and a pure function because that answer is the whole of this arm's
+/// read-only decision and the `mount` that consumes it cannot be called from a
+/// test.
+///
+/// **`NOSUID`/`NODEV` are unconditional and `NOEXEC`/`NOSYMFOLLOW` follow the
+/// source, and the difference is what each flag can break.** The overlay is a
+/// fresh mount, so it inherits nothing and the request *is* its flag set:
+/// `nosuid` and `nodev` narrow nothing a served root can legitimately do, which
+/// is why the fallback has always carried them whatever the source says.
+/// `nosymfollow` and `noexec` do narrow — the first stops every symlink inside
+/// the served data from resolving, the second stops every file in it from being
+/// executed — so naming either for a source that does not carry it would change
+/// what the exposure means, and **would make this arm serve the same root
+/// differently from the remount arm**, which re-asserts the source's own
+/// spelling. The two arms have to mean the same thing (design §4), so both flags
+/// follow the source.
+///
+/// **`NOEXEC` joined on those terms, and it was the asymmetry that made it a
+/// defect rather than a nicety**: the remount arm has carried the source's
+/// `noexec` since the flag fix of 2026-09-24, so a served root on a `noexec`
+/// mount was exec-capable under this arm and not under that one
+/// ([`source_mount_flags_in`] reads it, and the request names it).
+///
+/// **Nothing in this jail executes from a served root, which is why following
+/// the source costs nothing.** Linux confines the process it is already running
+/// in (design decisions 6, 26): the image is mapped before `pivot_root`, nothing
+/// `exec`s afterwards — the sequence is the two `unshare`s, the mounts, the
+/// `pivot_root`, the capability drop and the seccomp filter, and the map
+/// descriptors are closed by hand for exactly that reason — and the jail holds
+/// no `/proc` and no other executable path. A `noexec` source is therefore a
+/// host policy the exposure inherits rather than one the jail would have to
+/// lift, and a source without it is served exec-capable by both arms alike.
+fn overlay_read_only_flags(inherited: MountFlags) -> MountFlags {
+    let mut flags = MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV;
+    for flag in [MountFlags::NOEXEC, MountFlags::NOSYMFOLLOW] {
+        if inherited.contains(flag) {
+            flags |= flag;
+        }
+    }
+    flags
 }
 
 /// `,`, `:`, and `\` are overlay option grammar, not path bytes.
@@ -1397,10 +1503,10 @@ mod tests {
         OVERLAY_OPTION_META, SYMLINK_EXPOSURE, TASK_DIR, THREAD_STEP, announce_capset,
         announce_exposures, announce_no_new_privs, announce_retained, create_jail_root,
         decode_mountinfo, enforce_bind_read_only, enter_user_namespace, open_map,
-        overlay_mount_options, read_mountinfo, refuse_symlink_exposure, refuse_when_threaded,
-        refuse_writable_nested_mounts, refused_remount_needs_the_overlay, require_single_thread,
-        resolve_model, source_mount_flags_in, task_count, validate_and_plan, validate_exposures,
-        writable_nested_mounts_in, write_map,
+        overlay_mount_options, overlay_read_only_flags, read_mountinfo, refuse_symlink_exposure,
+        refuse_when_threaded, refuse_writable_nested_mounts, refused_remount_needs_the_overlay,
+        require_single_thread, resolve_model, source_mount_flags_in, task_count, validate_and_plan,
+        validate_exposures, writable_nested_mounts_in, write_map,
     };
     use crate::{
         _core::{AccessMode, Backend as BackendTrait, Error, Exposure, LaunchPlan, Sandbox},
@@ -1773,24 +1879,31 @@ mod tests {
     }
 
     #[test]
-    fn the_remount_reasserts_the_sources_own_lock_flags() {
-        // **The three flags and only the three** (design decision 8): a bind
-        // remount replaces the target's per-mount flag set with the request's,
-        // so a request that does not carry `nosuid`/`nodev`/`noexec` silently
-        // clears them — measured with a bare `mount(2)` on
+    fn the_remount_reasserts_the_sources_own_mount_flags() {
+        // **The flags a bind inherits, and only those** (design decision 8): a
+        // bind remount replaces the target's per-mount flag set with the
+        // request's, so a request that does not carry one of them silently
+        // clears it — measured with a bare `mount(2)` on
         // `6.18.33.2-microsoft-standard-WSL2`, where a bind of the host's
-        // `rw,nosuid,nodev` `/tmp` read back as plain `ro`. `rdonly` appears in
-        // no row here on purpose: the source is usually `rw`, so `ro` is the
-        // request's and never the source's, and `relatime` is left out because
-        // a mount that locks it takes the `EPERM` arm instead, which the
-        // overlay covers.
+        // `rw,nosuid,nodev` `/tmp` read back as plain `ro`. **`nosymfollow` is
+        // in the set for that half alone** and is the member no `EPERM` protects:
+        // the kernel locks `READONLY`/`ATIME` and three of the set's four
+        // (`NOSUID`/`NODEV`/`NOEXEC`) and has no `MNT_LOCK_NOSYMFOLLOW`, so a
+        // request that omits it drops it rather than being refused
+        // (`source_mount_flags_in`'s doc carries the measurement,
+        // `tests/jail.rs`'s opt-in nested-usernamespace leg the end-to-end half).
+        // `rdonly` appears in no row here on purpose: the source is usually `rw`,
+        // so `ro` is the request's and never the source's, and `relatime` is left
+        // out because the kernel preserves the atime bits of a remount that names
+        // no atime flag.
         let table = "\
             24 30 0:23 / / rw,relatime - ext4 /dev/sda1 rw\n\
             25 24 0:24 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n\
             26 24 0:25 / /srv/data rw,nosuid,nodev,noexec - ext4 /dev/sdb1 rw\n\
-            27 24 0:26 / /srv/data/cache rw - ext4 /dev/sdc1 rw\n";
+            27 24 0:26 / /srv/data/cache rw - ext4 /dev/sdc1 rw\n\
+            28 24 0:27 / /run/credentials/x rw,nosuid,nodev,noexec,nosymfollow - tmpfs tmpfs ro\n";
 
-        // The root filesystem carries none of the three, and the read-only
+        // The root filesystem carries none of the four, and the read-only
         // request is then exactly the old one.
         assert_eq!(
             source_mount_flags_in(table, Path::new("/mnt/elsewhere/root")),
@@ -1813,7 +1926,7 @@ mod tests {
         assert_eq!(
             source_mount_flags_in(table, Path::new("/srv/data/cache/leaf")),
             MountFlags::empty(),
-            "`cache` is the containing mount and carries none of the three"
+            "`cache` is the containing mount and carries none of the four"
         );
         // Component-wise, so a sibling whose name merely starts the same way is
         // not below the mount that shares its spelling.
@@ -1827,6 +1940,70 @@ mod tests {
         assert_eq!(
             source_mount_flags_in("", Path::new("/tmp/x")),
             MountFlags::empty()
+        );
+        // **The row the 2026-09-28 fix added, and it is the only route this flag
+        // has into the request.** A `nosymfollow` source (`/run/credentials/*`
+        // are the ones this host carries) keeps the flag across the remount only
+        // because the request names it; the containing-mount rule applies to it
+        // like the other three, so a source below such a mount inherits it too.
+        assert_eq!(
+            source_mount_flags_in(table, Path::new("/run/credentials/x")),
+            MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC | MountFlags::NOSYMFOLLOW
+        );
+        assert_eq!(
+            source_mount_flags_in(table, Path::new("/run/credentials/x/served")),
+            MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC | MountFlags::NOSYMFOLLOW,
+            "a source below the nosymfollow mount inherits it"
+        );
+    }
+
+    /// **The fallback arm's flag set, and the rule the two arms share** (design
+    /// §4): `noexec` and `nosymfollow` follow the source, `nosuid`/`nodev` do not,
+    /// and `rdonly` is the request's whatever the source says.
+    ///
+    /// **This assertion is where the overlay arm's flags are pinned, and the
+    /// reason is measured**: the arm itself is unreachable end to end on this
+    /// kernel — every flag the kernel locks is one the remount request names, so
+    /// nothing is left for the `EPERM` branch to be refused for
+    /// (`docs/superpowers/plans/2026-09-25-sandbox-followups.md` §7) — and the
+    /// two arms serving one root differently is a defect rather than a nuance: a
+    /// `noexec` source the remount arm serves cannot be executed from, and the
+    /// same source served by this arm could be.
+    #[test]
+    fn the_overlay_carries_the_sources_noexec_and_nosymfollow() {
+        assert_eq!(
+            overlay_read_only_flags(MountFlags::empty()),
+            MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV,
+            "the flagless source, which is the arm's original request"
+        );
+        assert_eq!(
+            overlay_read_only_flags(MountFlags::NOEXEC),
+            MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+            "a `noexec` source is served `noexec` here too, as the remount arm serves it"
+        );
+        assert_eq!(
+            overlay_read_only_flags(MountFlags::NOSYMFOLLOW),
+            MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOSYMFOLLOW
+        );
+        // **A real source carries these together** — the host's
+        // `/run/credentials/*` mounts are `nosuid,nodev,noexec,nosymfollow` — so
+        // this row is the one that says one flag's arm does not stop the other's.
+        assert_eq!(
+            overlay_read_only_flags(MountFlags::NOEXEC | MountFlags::NOSYMFOLLOW),
+            MountFlags::RDONLY
+                | MountFlags::NOSUID
+                | MountFlags::NODEV
+                | MountFlags::NOEXEC
+                | MountFlags::NOSYMFOLLOW
+        );
+        // The other half of the rule, and the deliberate difference in spelling
+        // from the remount arm: `nosuid`/`nodev` are carried for a source that
+        // does not have them, because they narrow nothing a served root can
+        // legitimately do (`overlay_read_only_flags`'s doc), and an inherited
+        // `rdonly` changes nothing — read-only is this arm's own.
+        assert_eq!(
+            overlay_read_only_flags(MountFlags::RDONLY),
+            MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV
         );
     }
 

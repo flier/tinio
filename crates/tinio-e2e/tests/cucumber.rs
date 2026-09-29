@@ -25,7 +25,7 @@
 //! failures — a feature/step that drifts out of sync with its step
 //! definitions must fail the run, never pass silently as "skipped".
 
-use std::{env, fs::File, io};
+use std::{env, fs::File, io, process, thread};
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
@@ -45,6 +45,27 @@ use cucumber::{
 };
 use steps::{World, configure};
 use tokio::runtime::Builder;
+
+/// The stack the runner's own thread is given: 32 MiB.
+///
+/// **The Windows main thread's stack is what aborted the `@interop` multipart leg.** A Rust
+/// binary inherits the PE's stack reserve, and this test binary carries **1 048 576 bytes**
+/// (`SizeOfStackReserve`; `SizeOfStackCommit` 4 KiB), read from
+/// `target\debug\deps\cucumber-70617418b044b36b.exe`'s optional header after the run died with
+/// `STATUS_STACK_OVERFLOW` (`0xC00000FD`) on `thread 'main'`; a Linux main thread gets 8 MiB,
+/// which is why the same scenarios are green there. The whole run is polled from that one thread
+/// (`rt.block_on` in [`run`]), so every synchronous helper a step calls rides its stack — the
+/// harness's largest single frame is `files_equal`'s two 64 KiB buffers
+/// (`tests/steps/clients.rs`), and **nothing in the leg holds the 10 MiB itself**: the scratch
+/// file is a heap `Vec` from `deterministic_bytes`.
+///
+/// 32 MiB is 32× the reserve that failed and the number `crates/tinio-select/src/parquet.rs`
+/// already gives its own enlarged-stack test thread. **Only the reserve is virtual**: the commit
+/// stays at the OS default and grows on demand, so this costs address space, not memory.
+///
+/// Measured 2026-09-28: the `@interop and @aws` selection — the 10 MiB multipart leg included —
+/// passes with this stack, where the 1 MiB default aborted it.
+const RUNNER_STACK: usize = 32 * 1024 * 1024;
 
 fn main() {
     // Must run before the tokio runtime starts: CUCUMBER_FILTER_TAGS is
@@ -89,16 +110,37 @@ fn main() {
         }
     }
 
-    let rt = Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
     // The report file opens BEFORE the runtime starts — no blocking fs
     // inside the async block (style.md). The Json writer takes a std
     // `Write`, so the file must be a std one.
     let report_file = env::var("TINIO_E2E_REPORT")
         .ok()
         .map(|path| File::create(&path).expect("create report file"));
+
+    // The runtime, and with it every scenario the runner polls, belongs to a thread of its own —
+    // `main`'s stack is the platform's, and on Windows that is not enough (see [`RUNNER_STACK`]).
+    // Nothing thread-bound crosses the boundary: the report file is moved in, and the runtime,
+    // the world, the writer and the summary are all built inside.
+    let runner = thread::Builder::new()
+        .name("cucumber-runner".to_owned())
+        .stack_size(RUNNER_STACK)
+        .spawn(move || run(report_file))
+        .expect("spawn the cucumber runner thread");
+    if runner.join().is_err() {
+        // A failed run reports itself by panicking on the runner thread, and the default hook
+        // has already printed that summary there. Carry the code a panicking `main` would have
+        // left (101) rather than panicking here and printing the same summary a second time.
+        process::exit(101);
+    }
+}
+
+/// Build the runtime and run the suite. **Not `main`**, so the runner gets [`RUNNER_STACK`] and
+/// not the stack the platform gives the process's first thread.
+fn run(report_file: Option<File>) {
+    let rt = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
     rt.block_on(async {
         if let Some(file) = report_file {
             // Pretty output to stdout + Cucumber-JSON to the file, mirroring

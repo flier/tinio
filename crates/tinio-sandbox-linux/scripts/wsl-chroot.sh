@@ -113,3 +113,16 @@ echo "== the confined scenarios, end to end =="
 # which reads as a random red (six identical runs on the phase's Windows host:
 # 4.6 s, 8.7 s, 8.7 s, 18.1 s, 57.7 s, and one killed at >120 s).
 TINIO_E2E_CONFINEMENT=1 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036' --concurrency 1
+
+# **No server process outlives the legs, and the check is the gate rather than tidiness.** A
+# finished run once left 19 `tinio server <root> --port 0` processes alive after their parent had
+# died; they held the built binary open, the next build failed at the uplift step, and every later
+# measurement ran against a stale binary until a hash comparison caught it. The check lives here
+# because libtest has no run-level teardown to hang it on. **Run this script in a guest with no
+# other `tinio` server running**: it asserts the whole process table, which is the plan's own shape
+# (`plans/2026-09-25-sandbox-followups.md` §13).
+if pgrep -x tinio > /dev/null 2>&1; then
+  echo "a tinio server process outlived the legs:" >&2
+  pgrep -ax tinio >&2 || true
+  exit 1
+fi

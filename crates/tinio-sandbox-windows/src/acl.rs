@@ -7,7 +7,7 @@
 //! 2026-09-27, and the defect that ended it is the check-then-use between the
 //! whitelist's reparse refusal and the tool's own re-resolution of the name it was
 //! handed: a writer who replaced an exposed directory with a junction inside
-//! the grant window got the ACE written somewhere the check never saw. [`Object`]
+//! the grant window got the ACE written somewhere the check never saw. `Object`
 //! opens the spelled path with `FILE_FLAG_OPEN_REPARSE_POINT`, so the *object
 //! named* is opened rather than followed; the opened object is asked what it is (a
 //! reparse point is refused, and so is an object of the wrong kind), and both the
@@ -79,18 +79,25 @@
 #![allow(unsafe_code)]
 
 use std::{
+    env,
     ffi::OsStr,
-    io,
+    fmt::Display,
+    fs, io,
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::{Command, Output},
     ptr::{from_mut, null, null_mut},
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    thread,
+    time::{Duration, Instant},
 };
 
 use tinio_winsec::{Ace, to_wide, walk_dacl};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
+    Foundation::{
+        CloseHandle, ERROR_LOCK_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        INVALID_HANDLE_VALUE, LocalFree,
+    },
     Security::{
         ACCESS_ALLOWED_ACE, ACL,
         Authorization::{
@@ -102,19 +109,21 @@ use windows_sys::Win32::{
         OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
-        WRITE_DAC,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
+        UnlockFileEx, WRITE_DAC,
     },
+    System::IO::OVERLAPPED,
 };
 
 use crate::{
     _core::{AccessMode, Error, Result, launch},
     backend::SiblingScan,
     handles::{self, system_directory},
-    sid::{ALL_APPLICATION_PACKAGES, PackageSid},
+    sid::{ALL_APPLICATION_PACKAGES, PackageSid, root_digest},
 };
 
 /// `DELETE` (`0x0001_0000`), which `icacls` folds into `(M)` and not into `(RX)`;
@@ -288,7 +297,7 @@ pub enum Target {
 /// from both of the others.
 ///
 /// **The string and the numbers a grant is actually written with are one table
-/// read twice**: [`ace_bits`] is the mask and the inheritance flags
+/// read twice**: `ace_bits` is the mask and the inheritance flags
 /// `SetSecurityInfo` takes, this is the tool's spelling of the same pair, and
 /// `the_aliases_icacls_writes_are_the_masks_this_read_compares` pins the two
 /// against each other on a real DACL.
@@ -361,7 +370,7 @@ const fn ace_bits(target: Target, access: AccessMode) -> (u32, u32) {
 ///
 /// **The launcher no longer hands this to the tool — the tool is what an
 /// operator, a fixture and [`revoke`] still use** — so what the function is for
-/// now is that one table describes both writers: [`ace_bits`] is what
+/// now is that one table describes both writers: `ace_bits` is what
 /// `SetSecurityInfo` is told and this is the same pair in the tool's own spelling,
 /// which is what `tests/acl.rs` and `tinio-server`'s Windows fixtures need to
 /// write an ACE the launcher's read will recognize.
@@ -397,7 +406,7 @@ pub fn grant_spec(sid: &str, target: Target, access: AccessMode) -> String {
 /// through the environment — is what this function makes true of the code rather
 /// than an intention stated beside it.
 ///
-/// **The grant no longer goes through the tool** ([`Object`] writes on a handle);
+/// **The grant no longer goes through the tool** (`Object` writes on a handle);
 /// what still does is [`revoke`], the operator's own primitive, and every suite
 /// and fixture that uses the tool as an independent oracle — which is why this
 /// path is still the system directory's rather than `PATH`'s.
@@ -425,7 +434,7 @@ pub fn icacls_binary() -> PathBuf {
 /// rather than duplicated (measured 2026-09-27: a second write with a different
 /// mask **and** different inheritance flags leaves one entry for the SID, not two).
 ///
-/// **The path is opened, not resolved**: see [`Object`] for the handle the read and
+/// **The path is opened, not resolved**: see `Object` for the handle the read and
 /// the write share and for the two refusals — a reparse point, and an object whose
 /// kind disagrees with `target` — that `icacls` could not report (its
 /// inheritance-flagged grant on a file exits 0 and writes nothing).
@@ -439,9 +448,9 @@ pub fn icacls_binary() -> PathBuf {
 ///
 /// # Errors
 ///
-/// [`Error::Launch`](crate::_core::Error::Launch) naming the path and carrying the
+/// [`Error::Launch`] naming the path and carrying the
 /// Win32 status when the object cannot be opened or the descriptor cannot be
-/// written, and [`Error::BadPath`](crate::_core::Error::BadPath) for a path that is
+/// written, and [`Error::BadPath`] for a path that is
 /// a reparse point or an object of the wrong kind.
 ///
 /// # Examples
@@ -827,6 +836,289 @@ impl Drop for Object {
     }
 }
 
+/// The directory under the caller's temp directory the per-path lock files live
+/// in, and the extension their names carry. **One file per distinct path ever
+/// granted, and they are left behind on purpose** — [`AclLock`]'s doc states why
+/// neither reaping them nor sharing delete is sound.
+const ACL_LOCK_DIRECTORY: &str = "tinio-acl-locks";
+const ACL_LOCK_SUFFIX: &str = ".lock";
+
+/// What an operator reads when the exclusion is not in force — **one sentence for every way
+/// [`AclLock::acquire`] can fail to take it**, because what it costs is the same exposure
+/// whichever call refused and only the error field differs.
+///
+/// The `lock` field is the one thing the call sites do not all carry: a failure to resolve the
+/// directory has no lock file to name, and inventing the path it would have had would report a
+/// file the call never reached.
+const NO_LOCK: &str =
+    "no per-path ACL lock, so a peer run's concurrent grant to this path may be lost";
+
+/// The lock directory, created — **once per process**, because both of its inputs
+/// are process constants and [`AclLock::acquire`] runs once per granted path.
+///
+/// **Resolving it per call would be the expensive half**: `env::temp_dir()` is a
+/// `GetTempPath2W` and an allocation std does not cache, and `create_dir_all` on a
+/// directory that is there is a failing `mkdir` plus a `stat`. One grant phase
+/// writes an ACE per sibling DLL, so that is the whole set of them re-resolved for
+/// a value that cannot have moved.
+///
+/// A failure is not cached, so the second path reports the same error the first one
+/// did rather than a silence.
+fn lock_directory() -> io::Result<&'static Path> {
+    static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+    match DIRECTORY.get() {
+        Some(directory) => Ok(directory),
+        None => {
+            let directory = env::temp_dir().join(ACL_LOCK_DIRECTORY);
+            fs::create_dir_all(&directory)?;
+            Ok(DIRECTORY.get_or_init(|| directory))
+        }
+    }
+}
+
+/// How long a waiter may hold the lock before its wait is reported: **one
+/// second**, at [`tracing::warn!`].
+///
+/// **The number is a judgement about which wait is ordinary and which is worth an
+/// operator's eye, and both halves of that are measured elsewhere in this
+/// module.** The critical section is one descriptor write plus the read that
+/// decides it: a satisfied path is a read and no write at all, and a write was
+/// measured at **0.136 ms per object** for this workspace's own tree
+/// (`Grants`'s doc), so a peer's ordinary grant is milliseconds and a wait of a
+/// second means the peer is inside a whole-tree descriptor write — design §6's
+/// seconds-per-phase case, the same magnitude [`crate::backend::grant`]'s 15 s
+/// phase threshold is set against. A threshold below a second would speak for a
+/// peer's routine grant; a threshold at the phase warning would be silent for
+/// exactly the wait a second launcher on a shared root is most likely to see.
+const ACL_LOCK_WARN_AFTER: Duration = Duration::from_secs(1);
+
+/// The interval a waiter polls at while a peer holds the lock — **the kernel's
+/// own quantum, not a spin**: `LockFileEx` is asked again every 10 ms, so a
+/// contended wait costs one thread wake per interval and no busy loop, and an
+/// uncontended lock costs no sleep at all, because the first attempt takes it.
+/// **The sleep blocks the calling thread, and this phase already is a blocking
+/// one**: the opens, the descriptor reads and the `icacls` spawn that wrote here
+/// until 2026-09-27 are all synchronous calls on the same path, so a waiter that
+/// blocks it — for as long as a peer's whole-tree write takes — is the shape the
+/// grant phase has rather than a new one.
+const ACL_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// **The one lock per path, held across the whole read-merge-write.**
+///
+/// **What it serialises is the pair of operations this module makes on one DACL,
+/// and the race is real rather than theoretical.** A grant reads the object's
+/// descriptor, merges its SID's entry into what it read, and writes the result
+/// back; two of those overlapping on one path lose an ACE, because the second
+/// writer's merge is built from the descriptor it read *before* the first wrote —
+/// so its `SetSecurityInfo` replaces the whole DACL with a copy that never had
+/// the peer's entry in it. The two callers that meet here are two confined runs
+/// sharing a served root: their package SIDs are per-root and so *different* for
+/// different roots, and `SET_ACCESS` only replaces the same SID's entry, which is
+/// why the loss is silent — each run's own grant is present, and the other run's
+/// is gone.
+///
+/// **A file lock and not a mutex, because the holder can be a process rather than
+/// a thread.** The file is named by [`root_digest`] of the *normalised* path —
+/// the same normalisation [`package_name`](crate::sid::package_name) derives under,
+/// and deliberately its **unsalted** reading, so two spellings of one directory take
+/// one lock rather than one each and a salted run and a degraded one still take
+/// **one** lock for one path ([`root_digest`]'s own doc carries that reason) — lives
+/// under `tinio-acl-locks\` in the caller's temp
+/// directory, is opened without `FILE_SHARE_DELETE`, and is held exclusively for
+/// the duration of one [`grant_to`] or one [`revoke`]. **The kernel releases it
+/// when the holder dies**, which is the property a lock file cannot have and the
+/// reason this is not an advisory marker: a crashed run cannot wedge a directory
+/// for every later run, and no stale-lock rule has to be written.
+///
+/// **The wait is reported rather than bounded.** A holder is inside a real ACL
+/// phase, which is seconds on a large tree, so a bounded wait would fail a grant
+/// that was about to succeed — this is not the profile lock, whose own bound is
+/// the launch window and whose `INFINITE` wait is defensible for exactly that
+/// reason (`ProfileLock`'s doc). A waiter therefore keeps polling and emits one
+/// [`tracing::warn!`] when its wait crosses [`ACL_LOCK_WARN_AFTER`], naming the
+/// path and the time waited; the per-path grant event that follows is where the
+/// wait ends. Nothing here is silent: a host that cannot create the lock file or
+/// cannot lock it warns with the Win32 status and proceeds **without** the
+/// exclusion — the behaviour every run had before this lock existed — because
+/// refusing to confine a server over a lock file would trade a rare lost ACE for
+/// a guaranteed start failure, which is the same ruling the profile lock
+/// carries.
+///
+/// **The lock files are left behind, and that is one decision with the share
+/// mode.** A lock file is never reaped and never opened for deletion:
+/// `FILE_SHARE_DELETE` is deliberately withheld, so no process can unlink a lock
+/// a peer holds — which is exactly what makes unlinking harmless-looking and
+/// wrong, since a second waiter would then create a *new* file at the same name
+/// and lock that instead of the one the holder has. What accumulates instead is
+/// one zero-byte file per distinct path this crate has ever granted, in one
+/// directory a cleaner or an operator can delete once nothing is serving —
+/// **measured on this host 2026-09-28, after a handful of this crate's own suite
+/// runs: 450 files, 0 bytes in total**, every name a 16-hex digest and
+/// `.lock`.
+///
+/// **The exclusion is between processes of one account**, because the temp
+/// directory is the caller's own: two accounts granting one directory are not
+/// serialised. That is the shape of the hazard this closes — a served root is one
+/// operator's, and the two runs that race on it run as that operator — and the
+/// alternative (a `Global\` object, the profile lock's route) would need a name
+/// every account may open, which is a broader object than this one for a case no
+/// run here creates. `Drop` releases the lock and closes the handle on every path
+/// out of [`grant_to`], panics included.
+///
+/// **Measured on this host, 2026-09-28**, with a probe that speaks to the file the
+/// way a *process* rather than a thread does (a PowerShell `FileStream.Lock` over
+/// the same byte range in a second process): while that peer held it for 20 s,
+/// this process's [`AclLock::acquire`] waited **18 770 ms** — the remaining hold —
+/// and then took the lock, so the exclusion really is cross-process and not only
+/// cross-thread; an uncontended acquire took the lock on its **first attempt, with
+/// no sleep at all**; and a holder killed with `TerminateProcess` inside its hold
+/// left the range takeable **0 ms later**, which is the property this primitive
+/// was chosen for — a killed run cannot wedge a directory for the runs after it.
+/// The race this lock closes, and the failure the test beside it reproduces, are
+/// in `acl`'s own tests.
+///
+/// **The other writer that meets here is [`crate::ledger`]'s append**, which takes
+/// this lock on the *ledger's own path* so that two runs appending to one record
+/// are a sequence rather than an interleaving. Nothing about the primitive changes
+/// for it — the byte range is per path, the lock file is created once and left
+/// behind, and a failure to take it warns and proceeds — which is why the ledger
+/// shares it rather than keeping a second copy of the `LockFileEx` loop; that
+/// module's doc carries what its exclusion is per.
+pub(crate) struct AclLock {
+    /// The lock file's handle, open without share-delete and held exclusively.
+    handle: HANDLE,
+}
+
+impl AclLock {
+    /// Take this path's lock, waiting — and reporting a long wait — until the
+    /// peer that holds it is done.
+    ///
+    /// `None` when no lock could be created or taken, which the crate treats as
+    /// "no exclusion" rather than as a failure: both reasons are logged, because
+    /// a guarantee that is not in force has to be visible.
+    pub(crate) fn acquire(path: &Path) -> Option<Self> {
+        let file = match lock_directory() {
+            Ok(directory) => directory.join(format!("{}{ACL_LOCK_SUFFIX}", root_digest(path))),
+            Err(error) => {
+                // **No `lock` field here, because there is no lock file to name** — the
+                // sentence is [`NO_LOCK`]'s either way, which is what keeps the three
+                // refusals below from drifting into three descriptions of one exposure.
+                tracing::warn!(
+                    step = "lock the granted path",
+                    path = %path.display(),
+                    error = %error,
+                    NO_LOCK
+                );
+                return None;
+            }
+        };
+        // **The warning the two failures below earn**, over the fields all three share.
+        let no_lock = |error: &dyn Display| {
+            tracing::warn!(
+                step = "lock the granted path",
+                path = %path.display(),
+                lock = %file.display(),
+                error = %error,
+                NO_LOCK
+            );
+        };
+        let name = to_wide(file.as_os_str());
+        // SAFETY: `name` is NUL-terminated and alive for the call, the access is
+        // the read and write a lock needs, the share mode deliberately withholds
+        // `FILE_SHARE_DELETE` (the type's doc says why), no security attributes
+        // or template are passed, and `OPEN_ALWAYS` creates the zero-byte file on
+        // first use and opens the existing one after that. A successful call
+        // returns a handle this value owns and closes exactly once in `Drop`.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            no_lock(&handles::last_error());
+            return None;
+        }
+        let started = Instant::now();
+        let mut reported = false;
+        loop {
+            // One `OVERLAPPED` per attempt, zeroed: the byte range below is at
+            // offset 0 of the lock file and the structure carries nothing else a
+            // synchronous `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY` reads.
+            let mut overlapped = OVERLAPPED::default();
+            // SAFETY: `handle` is the live handle this call opened, the flags ask
+            // for an exclusive lock that fails rather than blocks, the byte range
+            // is the single byte at offset 0 (the same range every waiter uses,
+            // so they conflict by construction), and `overlapped` is a correctly
+            // sized value alive for the call.
+            let locked = unsafe {
+                LockFileEx(
+                    handle,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    1,
+                    0,
+                    &raw mut overlapped,
+                )
+            };
+            if locked != 0 {
+                return Some(Self { handle });
+            }
+            let error = handles::last_error();
+            if error.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+                // A failure that is not contention: the lock is not taken, and
+                // the handle goes with the attempt.
+                // SAFETY: `handle` is this call's own handle and nothing else has
+                // taken it.
+                unsafe { CloseHandle(handle) };
+                no_lock(&error);
+                return None;
+            }
+            let waited = started.elapsed();
+            if waited >= ACL_LOCK_WARN_AFTER && !reported {
+                // **Once, at the crossing.** A repeated event would fill a log
+                // for a peer that is legitimately inside a whole-tree descriptor
+                // write, and what the operator needs from this line is which path
+                // is being waited on and how long the wait has been — the grant's
+                // own per-path event, emitted when this function finishes, is
+                // where the wait ends.
+                reported = true;
+                tracing::warn!(
+                    step = "wait for the ACL lock",
+                    path = %path.display(),
+                    waited_ms = waited.as_millis() as u64,
+                    threshold_ms = ACL_LOCK_WARN_AFTER.as_millis() as u64,
+                    "another run holds this path's ACL lock and is inside its ACL \
+                     phase (a descriptor write propagates over the whole subtree, \
+                     which is seconds on a large tree, design §6); this grant \
+                     waits for it — the lock is released by the kernel if the \
+                     holder dies, so the wait is not stranded"
+                );
+            }
+            thread::sleep(ACL_LOCK_POLL);
+        }
+    }
+}
+
+impl Drop for AclLock {
+    fn drop(&mut self) {
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: `handle` is this value's own handle and the range is the one
+        // byte `acquire` locked at offset 0, so the unlock is this handle's own;
+        // the `OVERLAPPED` is a correctly sized value alive for the call. The
+        // return value is not read: closing the handle below releases the lock
+        // anyway, so an unlock that failed would change nothing.
+        unsafe { UnlockFileEx(self.handle, 0, 1, 0, &raw mut overlapped) };
+        // SAFETY: the same handle, closed exactly once, here.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
 /// Grant `access` to `sid` on the object `path` denotes, in `target`'s shape.
 ///
 /// **Open, verify, read, and — only when the read says the grant is due — open
@@ -837,6 +1129,12 @@ impl Drop for Object {
 /// The `bool` says whether the descriptor was written, which is what the per-path
 /// event and [`Grants::apply_standing`] report.
 ///
+/// **The whole of it is held under one [`AclLock`], taken before the first read
+/// and released when this function returns** — the lock file's open and its
+/// exclusive hold are the per-call constant on top of the opens above, and
+/// [`Grants::apply`], [`Grants::apply_standing`] and [`Grants::apply_siblings`]
+/// all reach it through here, so no caller can write a DACL outside it.
+///
 /// **The event is the phase's own step name**, because that is what this is: one
 /// ACE of the `grant the ACLs` phase, at `debug!` with `written` telling the skip
 /// from the write (shared §7's per-operation event).
@@ -845,6 +1143,7 @@ impl Drop for Object {
 /// read and the write both compare and store the value the caller already holds,
 /// and the derived text only ever reaches a log line.
 fn grant_to(path: &Path, target: Target, access: AccessMode, sid: GrantSid<'_>) -> Result<bool> {
+    let _lock = AclLock::acquire(path);
     let read = Object::open(path)?;
     read.verify(target)?;
     if read.granted(sid.raw, target, access)? {
@@ -857,6 +1156,14 @@ fn grant_to(path: &Path, target: Target, access: AccessMode, sid: GrantSid<'_>) 
         );
         return Ok(false);
     }
+    // **The gap the whole lock exists for, widened on request by the test that
+    // proves it is a real gap**: a `#[cfg(test)]` sleep a concurrency test arms
+    // in two threads, so that both reads are certainly before either write when
+    // the lock is absent — which is what makes the lost ACE reproducible rather
+    // than a matter of scheduling luck (`acl`'s `two_grants_to_one_path_from_two_
+    // threads_keep_both_aces`). Production builds compile this to nothing.
+    #[cfg(test)]
+    overlap::settle();
     // The read handle is given up before the second open, so at most one handle to
     // this object is live at a time and the write never depends on the read's.
     drop(read);
@@ -1168,6 +1475,40 @@ impl Drop for OwnedSid {
     }
 }
 
+/// Grant the well-known `Everyone` SID (`S-1-1-0`) read access to `path` —
+/// **the fixture that makes a descriptor which is not the current user's alone,
+/// on any host.**
+///
+/// **Two legs need one and neither owns it**: the salt's read-back (`sid.rs`'s
+/// `a_salt_file_that_is_not_this_users_alone_is_refused_rather_than_used`) and the
+/// ledger's repair (`ledger.rs`'s
+/// `an_append_puts_a_ledger_that_is_not_the_current_users_alone_back`) — and so does
+/// the state directory's (`sid.rs`'s
+/// `the_state_directory_is_put_back_to_the_current_user`). A leg that left the
+/// descriptor to whatever the machine's `%TEMP%` happens to pass down would be
+/// about that host rather than about the refusal, and `%TEMP%`'s inherited grants
+/// are not the same on every Windows installation. The tool is the workspace's own
+/// recorded one ([`icacls_binary`], the system directory's rather than `PATH`'s)
+/// and the leading `*` is what stops it resolving `S-1-1-0` as an account name.
+///
+/// `#[cfg(test)]`, and here rather than in `crate::testing`: that module is the
+/// device **more than one crate's** tests need (its own doc states the rule), and
+/// this fixture's three readers are three legs of this crate's unit tests.
+#[cfg(test)]
+pub(crate) fn grant_everyone_read(path: &Path) {
+    let granted = Command::new(icacls_binary())
+        .arg(path)
+        .args(["/grant", "*S-1-1-0:(R)"])
+        .output()
+        .expect("run icacls");
+    assert!(
+        granted.status.success(),
+        "icacls /grant *S-1-1-0:(R) on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&granted.stdout)
+    );
+}
+
 /// Remove this SID's entries from `path`, leaving every other ACE alone.
 ///
 /// Idempotent, and measured rather than assumed: `icacls <dir> /remove:g
@@ -1178,9 +1519,17 @@ impl Drop for OwnedSid {
 /// the operator's primitive rather than the launcher's: nothing on the exit path
 /// calls it (`Grants`'s doc states the standing contract).
 ///
+/// **It takes the same per-path `AclLock` a grant does, because it writes the
+/// same DACL.** A revoke and a grant are separate operations on one descriptor,
+/// so a `remove` that lands between a peer grant's read and its write is undone
+/// by that write and a `remove` that reads nothing is not a merge at all — the
+/// lock is what makes the two shapes of one directory's DACL a sequence rather
+/// than an interleaving. The launcher itself never revokes (decision 15), so what
+/// this costs is one file open and one lock per operator invocation.
+///
 /// # Errors
 ///
-/// [`Error::Launch`](crate::_core::Error::Launch), as [`grant`].
+/// [`Error::Launch`], as [`grant`].
 ///
 /// # Examples
 ///
@@ -1197,6 +1546,7 @@ impl Drop for OwnedSid {
 /// acl::revoke(root, &sid).unwrap();
 /// ```
 pub fn revoke(path: &Path, sid: &PackageSid) -> Result<()> {
+    let _lock = AclLock::acquire(path);
     let spec = format!("*{}", sid.as_str());
     run(
         "icacls /remove:g",
@@ -1232,7 +1582,7 @@ pub fn revoke(path: &Path, sid: &PackageSid) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Launch`](crate::_core::Error::Launch) naming `path` when the DACL
+/// [`Error::Launch`] naming `path` when the DACL
 /// cannot be read at all, with the Win32 error as its source.
 ///
 /// # Examples
@@ -1339,13 +1689,15 @@ impl Grants {
     ///
     /// Idempotent, and free once satisfied: `grant_to` reads the DACL of the object
     /// it opened and writes only what is missing, so the second run on the same root
-    /// costs one open and one read instead of a descriptor write.
+    /// costs one open and one read instead of a descriptor write. What is left is
+    /// the per-call constant `AclLock` adds — one lock file's open and one
+    /// exclusive hold on it, per path.
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to` when the path
+    /// [`Error::Launch`] from `grant_to` when the path
     /// cannot be opened or written, and
-    /// [`Error::BadPath`](crate::_core::Error::BadPath) when it is a reparse point or
+    /// [`Error::BadPath`] when it is a reparse point or
     /// an object of the wrong kind.
     ///
     /// # Examples
@@ -1390,7 +1742,7 @@ impl Grants {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to`.
+    /// [`Error::Launch`] from `grant_to`.
     ///
     /// # Examples
     ///
@@ -1464,9 +1816,9 @@ impl Grants {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](crate::_core::Error::Launch) from `grant_to` for a DLL
+    /// [`Error::Launch`] from `grant_to` for a DLL
     /// that cannot be opened or written, and
-    /// [`Error::BadPath`](crate::_core::Error::BadPath) for one that is a reparse
+    /// [`Error::BadPath`] for one that is a reparse
     /// point or is not a file.
     ///
     /// # Examples
@@ -1591,6 +1943,43 @@ mod opens {
     }
 }
 
+/// The read-to-write gap [`grant_to`] holds open for a test, so that the race the
+/// per-path lock closes can be reproduced on purpose.
+///
+/// **A thread-local, armed by the thread it applies to**, because that is exactly
+/// the scope the test needs: two threads armed and released together from a
+/// barrier have certainly both read their DACL before either writes, which is the
+/// interleaving that loses an ACE when [`AclLock`] is not there. Nothing arms it
+/// in a production build — the module is `#[cfg(test)]` and the call site compiles
+/// to nothing without it — and no other test in this module arms it, so no other
+/// test pays the sleep.
+#[cfg(test)]
+mod overlap {
+    use std::{cell::Cell, thread, time::Duration};
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// How long an armed thread holds the gap open: long enough that a peer
+    /// thread started from the same barrier is inside its own gap whatever the
+    /// scheduler does with it, and short enough that the test that uses it stays
+    /// fast.
+    const SETTLE: Duration = Duration::from_millis(50);
+
+    /// Hold this thread's next read-to-write gap open.
+    pub(super) fn arm() {
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    /// Hold the gap open, if this thread was armed.
+    pub(super) fn settle() {
+        if ARMED.with(Cell::get) {
+            thread::sleep(SETTLE);
+        }
+    }
+}
+
 /// The descriptor writes this thread has made, for the tests that tell a skip from
 /// a write that happened to leave the same ACE.
 ///
@@ -1619,8 +2008,19 @@ mod writes {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, mem::size_of, path::Path, process::Command, sync::Arc};
+    use std::{
+        ffi::c_void,
+        fs,
+        mem::{MaybeUninit, size_of},
+        path::{Path, PathBuf},
+        process::Command,
+        ptr::addr_of,
+        slice,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
+    use tinio_util::testing::{assert_recorded_at, assert_step};
     // The names only a measurement needs: the ACE type a fixture builds, a `(F)`
     // mask, the bit that marks an inherited entry, and the generic bit the read
     // must *not* treat as one (they are imported here rather than above because
@@ -1636,7 +2036,9 @@ mod tests {
     use crate::{
         _core::AccessMode,
         backend::SiblingScan,
-        sid::{PackageSid, package_name},
+        ledger::{self, PathKind},
+        sid::{PackageSid, Salt, package_name, sid_text},
+        testing::{capture, recorder},
     };
 
     #[test]
@@ -1816,24 +2218,45 @@ mod tests {
     /// trustee it names, so the SID handed to the walk only decides which case an
     /// entry arrives as, never whether it is kept.
     fn descriptor_shape(path: &Path, sid: PSID) -> (u16, Vec<(u8, u32)>) {
+        dacl_reading(path, sid, |entry, entries| {
+            if let Ace::Named(ace) | Ace::OtherTrustee(ace) = entry {
+                entries.push((ace.Header.AceFlags, ace.Mask));
+            }
+        })
+    }
+
+    /// **The one descriptor read and ACE walk the two readings above are made of**:
+    /// a path's control word, and whatever `project` keeps of each access-allowed
+    /// entry. `read_dacl` and `walk_dacl` are the module's own, so what either
+    /// reading says is what a grant's read would see.
+    ///
+    /// `None`-shaped entries are dropped by the walk's own contract; the two
+    /// projections differ only in what they keep of the two access-allowed cases.
+    fn dacl_reading<T>(
+        path: &Path,
+        sid: PSID,
+        mut project: impl FnMut(Ace<'_>, &mut Vec<T>),
+    ) -> (u16, Vec<T>) {
         let (dacl, descriptor) = read_dacl(path).expect("read").expect("a DACL");
-        let mut control = 0u16;
-        let mut revision = 0u32;
+        let mut control = MaybeUninit::<u16>::uninit();
+        let mut revision = MaybeUninit::<u32>::uninit();
         // SAFETY: `descriptor` is live until the free below, and both
         // out-parameters are writable.
         let read = unsafe {
-            GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision)
+            GetSecurityDescriptorControl(descriptor, control.as_mut_ptr(), revision.as_mut_ptr())
         };
         assert_ne!(read, 0, "the control word of {}", path.display());
+        // SAFETY: the call above reported success, and a successful
+        // `GetSecurityDescriptorControl` writes both out-parameters. The revision
+        // is deliberately dropped: it is not a behaviour either reading compares.
+        let (control, _) = unsafe { (control.assume_init(), revision.assume_init()) };
         let mut entries = Vec::new();
         // SAFETY: `dacl` is the ACL inside the descriptor `read_dacl` returned and
         // `sid` is the caller's live SID; both outlive this walk, and `descriptor` is
         // released once below, after it.
         let walked = unsafe {
             walk_dacl(path, dacl, sid, &mut |entry| {
-                if let Ace::Named(ace) | Ace::OtherTrustee(ace) = entry {
-                    entries.push((ace.Header.AceFlags, ace.Mask));
-                }
+                project(entry, &mut entries);
                 ControlFlow::Continue(())
             })
         };
@@ -2638,6 +3061,471 @@ an inherited entry is answering for the wrong reason: {:08X?}",
             taken_back.status.success(),
             "{}",
             String::from_utf8_lossy(&taken_back.stderr)
+        );
+    }
+
+    /// **The race the per-path lock closes, reproduced on purpose: two threads
+    /// grant two SIDs to one directory, and both ACEs have to survive.**
+    ///
+    /// **It is a real race rather than a theoretical one, and this test is built
+    /// so that it fires.** `grant_to` reads the object's DACL, merges its own
+    /// SID's entry into what it read, and writes the whole descriptor back, so a
+    /// second writer whose read happened before the first's write replaces that
+    /// write with a copy that never carried the peer's entry. Both threads here arm
+    /// [`overlap`], which holds each thread's read-to-write gap open for 50 ms, and
+    /// a barrier releases them together — so both reads are certainly before either
+    /// write, whatever the scheduler does with them. **With `AclLock::acquire`
+    /// removed from `grant_to` this test fails, and it was measured rather than
+    /// argued** (this host, 2026-09-28): three consecutive runs each failed the
+    /// first assertion below, naming the losing SID, with the failed run's own
+    /// `icacls` output carrying **one** package-SID entry for the directory the two
+    /// threads had just granted. What that failure looks like in production is
+    /// silence, and that is why the assertions have to come after both threads are
+    /// done: each thread's *own* grant is present, and the missing one belongs to
+    /// the peer.
+    ///
+    /// **Two SIDs and not one SID twice**, because that is the shape two confined
+    /// runs sharing a served root have: `package_name` is a digest of the root and
+    /// this user's salt (decision 21, and `crate::sid::Salt` for the second input),
+    /// so two roots are two SIDs, and `SET_ACCESS` replaces only the
+    /// same SID's entry — which is why neither run can notice the other's loss.
+    ///
+    /// The oracle is both halves this suite uses elsewhere: this crate's own read
+    /// ([`acl_names`], `GetNamedSecurityInfoW` plus `EqualSid`) and `icacls`'s
+    /// rendering of the same directory, so the assertion does not rest on this
+    /// crate's view of the DACL alone.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn two_grants_to_one_path_from_two_threads_keep_both_aces() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path();
+        // Two roots under one directory, which are two package names and so two
+        // profiles and two SIDs — the derivation is lexical, so neither has to
+        // exist for it.
+        let roots = [path.join("first"), path.join("second")];
+        let barrier = Barrier::new(roots.len());
+        // **One profile per thread, created where it is used**: a `PackageSid` owns
+        // a raw SID and the profile behind it and crosses no thread boundary, so
+        // what each thread hands back is the rendered SID — which is what the
+        // assertions below need, and which is still true of the ACE after the
+        // profile is gone (every grant is standing, decision 15).
+        let granted: Vec<String> = thread::scope(|scope| {
+            let handles: Vec<_> = roots
+                .iter()
+                .map(|root| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        // Armed before anything else: the gap this thread's
+                        // `grant_to` will hold open is the whole race.
+                        overlap::arm();
+                        let sid = PackageSid::derive(&package_name(root)).expect("a profile");
+                        let text = sid.as_str().to_owned();
+                        let mut grants = Grants::new(Arc::new(sid));
+                        // Past the barrier, both threads are inside `grant_to` and
+                        // before their own read-to-write gap.
+                        barrier.wait();
+                        grants
+                            .apply(path, Target::Directory, AccessMode::ReadWrite)
+                            .expect("grant");
+                        text
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("no thread panicked"))
+                .collect()
+        });
+
+        let listing = checked("icacls (a test's own listing)", path, &[]).expect("read");
+        let rendered = String::from_utf8_lossy(&listing.stdout);
+        for text in &granted {
+            // The SID is resolved from the thread's own rendering: the profile it
+            // was created under is already deleted, and the ACE is not.
+            let sid = OwnedSid::parse(text, path).expect("the SID the thread granted");
+            assert!(
+                acl_names(path, sid.raw()).expect("read the DACL"),
+                "{text} lost the race: one thread's merge was built from a DACL read \
+                 before the other's write, so that write is not in the descriptor — \
+                 which is what one lock per path around the read-merge-write exists to \
+                 prevent (directory DACL:\n{rendered})"
+            );
+            assert!(
+                rendered.contains(text.as_str()),
+                "the tool's own rendering of the directory does not carry {text}, so \
+                 this crate's read and the oracle disagree:\n{rendered}"
+            );
+        }
+    }
+
+    /// Every access-allowed entry of `path`'s DACL, each with the trustee's SID
+    /// rendered — **the reading the profile-directory measurement is made of**.
+    /// The walk and the descriptor read are the module's own (`read_dacl`,
+    /// `walk_dacl`), so what the report says is what a grant's read would see.
+    fn dacl_entries(path: &Path, sid: PSID) -> (u16, Vec<String>) {
+        dacl_reading(path, sid, |entry, entries| {
+            let rendered = match entry {
+                Ace::Named(ace) => render_ace(ace, "(this SID)"),
+                Ace::OtherTrustee(ace) => {
+                    // The trustee's SID is inline in the ACE, so its address is
+                    // the one the conversion below reads — and it stays live
+                    // for as long as the descriptor this walk borrows.
+                    let trustee = addr_of!(ace.SidStart).cast_mut().cast::<c_void>();
+                    render_ace(ace, &render_sid(trustee))
+                }
+                Ace::Other => "an ACE of another type".to_string(),
+            };
+            entries.push(rendered);
+        })
+    }
+
+    /// One access-allowed entry as its mask and flags.
+    fn render_ace(ace: &ACCESS_ALLOWED_ACE, trustee: &str) -> String {
+        format!(
+            "allow {trustee} mask=0x{:08X} flags=0x{:02X}",
+            ace.Mask, ace.Header.AceFlags
+        )
+    }
+
+    /// A SID's `S-1-…` text — [`crate::sid::sid_text`]'s conversion, with this
+    /// module's own reading of a refusal.
+    fn render_sid(sid: PSID) -> String {
+        sid_text(sid).unwrap_or_else(|| "a SID that would not render".to_string())
+    }
+
+    /// **The AppContainer profile's own directory carries exactly its parent's
+    /// descriptor — and leaves with the profile.**
+    ///
+    /// The accumulation half of that item was answered when it was measured that
+    /// `DeleteAppContainerProfile` removes `%LOCALAPPDATA%\Packages\<name>`; what
+    /// had never been measured is what that directory *says* while it exists, which
+    /// is the question this test asks and pins. **Measured on this host,
+    /// 2026-09-28**:
+    ///
+    /// - the directory exists as soon as `CreateAppContainerProfile` returns, and
+    ///   it is gone once the [`PackageSid`] drops — the delete's own half, asked of
+    ///   the same directory rather than inferred;
+    /// - its DACL is the parent `%LOCALAPPDATA%\Packages`' DACL **entry for
+    ///   entry**, with the same control word — `0x8404`, that is `SE_DACL_PRESENT |
+    ///   SE_DACL_AUTO_INHERITED | SE_SELF_RELATIVE` — and five access-allowed
+    ///   entries, every one of them inherited (`flags=0x13`, `INHERITED_ACE` plus
+    ///   `(OI)(CI)`): on this host `FLIER-WIN11\CodexSandboxUsers` and one SID this
+    ///   host cannot resolve, both `(I)(OI)(CI)(M)` (`mask=0x001301BF`), then
+    ///   `NT AUTHORITY\SYSTEM`, `BUILTIN\Administrators` and the operator, all
+    ///   `(I)(OI)(CI)(F)` (`mask=0x001F01FF`);
+    /// - **no package SID and no capability SID appears in it**, so the directory
+    ///   gives the confined child nothing beyond what the parent directory of every
+    ///   package on the machine already gives it;
+    /// - a second run for the same name produces the same descriptor, so the
+    ///   per-run directory is not a per-run widening either.
+    ///
+    /// **The answer is therefore "nothing to do"**, which the design's residue row
+    /// records: no cleanup step is added beside [`PackageSid`]'s `Drop` — the delete
+    /// already takes the directory with it — and no ACE of this crate's own is
+    /// written here, because an entry this crate added would be the only thing in
+    /// the tree that widens the directory.
+    ///
+    /// The reading is the module's own ([`dacl_entries`]: `GetNamedSecurityInfoW`,
+    /// the control word, and [`walk_dacl`]'s entries with their SIDs rendered), and
+    /// the SID handed to the walk is the profile's own — which is what makes an
+    /// entry naming the container arrive as `(this SID)` rather than as a string to
+    /// search for.
+    #[test]
+    fn the_profile_directory_inherits_its_descriptor_and_leaves_with_the_profile() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Lexical, like every other derivation here: the served root does not have
+        // to exist for its package name to.
+        let name = package_name(&dir.path().join("served"));
+        let packages =
+            PathBuf::from(env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA")).join("Packages");
+        let target = packages.join(&name);
+
+        let mut runs = Vec::new();
+        for run in 0..2 {
+            let sid = PackageSid::derive(&name).expect("a profile");
+            assert!(
+                target.is_dir(),
+                "run {run}: the profile creation made {} — the directory this \
+                 measurement is about",
+                target.display()
+            );
+            let reading = dacl_entries(&target, sid.raw());
+            assert!(
+                !reading.1.is_empty(),
+                "run {run}: an empty DACL would make every comparison below vacuous"
+            );
+            // The parent's own descriptor, read with the same SID so the two
+            // readings are one question asked of two directories.
+            assert_eq!(
+                reading,
+                dacl_entries(&packages, sid.raw()),
+                "run {run}: the profile directory's DACL is not the one it inherits \
+                 from {}",
+                packages.display()
+            );
+            assert!(
+                reading.1.iter().all(|entry| entry.contains("flags=0x1")),
+                "run {run}: every entry is inherited rather than explicit: {:?}",
+                reading.1
+            );
+            assert!(
+                !reading.1.iter().any(|entry| entry.contains("S-1-15-")),
+                "run {run}: the directory names a container SID, so it is reachable \
+                 by a confined child that was granted nothing: {:?}",
+                reading.1
+            );
+            runs.push(reading);
+            drop(sid);
+            assert!(
+                !target.is_dir(),
+                "run {run}: the profile is gone and {} is still there",
+                target.display()
+            );
+        }
+        assert_eq!(
+            runs[0], runs[1],
+            "a second run for the same name made a directory with a different \
+             descriptor"
+        );
+    }
+
+    /// **The salt file's descriptor is the current user's alone — measured with this
+    /// module's own reader rather than assumed from the call that created it.**
+    ///
+    /// The file holds the one value the package-name derivation is mixed with
+    /// (`crate::sid::Salt`), so its descriptor is the whole of what keeps a
+    /// *different local account* from computing a served root's SID: the salt closes
+    /// the pre-computation exposure only while another user cannot read it, and a
+    /// file that inherited the state directory's grants would leave that exposure
+    /// standing behind a mitigation nobody measured.
+    ///
+    /// **The reading is [`dacl_entries`]'s, this module's own ACE walk** — the
+    /// `GetNamedSecurityInfoW` + [`walk_dacl`] pair a grant's skip uses — and the SID
+    /// handed to the walk is not in the file, so every entry renders as its own
+    /// trustee rather than as "(this SID)". What the leg asserts is what the file
+    /// must be: one access-allowed entry, for a trustee that is not a container, with
+    /// no inherited copy and with the descriptor's `SE_DACL_PROTECTED` bit set —
+    /// which is what [`tinio_winsec::create_restricted`]'s create-time descriptor
+    /// asks for, read back by `acl_is_current_user_only`.
+    ///
+    /// It would fail if the salt were created through `std::fs::File::create`: the
+    /// file would then carry whatever the state directory passes down — on this host
+    /// the operator's group at `(I)(M)` beside SYSTEM and Administrators at `(I)(F)`,
+    /// which is the reading the profile-directory leg above records for
+    /// `%LOCALAPPDATA%`'s children — and a second local account in that group could
+    /// read the value and derive every name the salt exists to hide.
+    #[test]
+    fn the_salt_file_is_current_user_only_and_inherits_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("acl-salt");
+        // The load is what the leg is about: it creates the file this reading is
+        // then made of, and nothing needs the value itself.
+        Salt::load_at(&file).expect("the salt is created");
+        // A SID certainly absent from the file: the well-known ALL APPLICATION
+        // PACKAGES text, parsed rather than derived (nothing here needs a profile).
+        let absent = OwnedSid::parse(ALL_APPLICATION_PACKAGES, &file).expect("the constant");
+        let reading = dacl_entries(&file, absent.raw());
+
+        // **The measurement, printed so `crate::sid`'s own doc can quote it** — that
+        // doc carries this host's reading, and this line is where the value came from.
+        println!(
+            "measured: the salt file's DACL control=0x{:04X} entries={:?}",
+            reading.0, reading.1
+        );
+        assert_eq!(
+            reading.1.len(),
+            1,
+            "the salt file carries exactly one entry: {:?}",
+            reading.1
+        );
+        assert!(
+            !reading.1.iter().any(|entry| entry.contains("S-1-15-")),
+            "a container SID in the salt file's DACL would let a confined process \
+             read the salt: {:?}",
+            reading.1
+        );
+        assert!(
+            reading.1.iter().all(|entry| !entry.contains("flags=0x1")),
+            "the entry is explicit and not inherited: {:?}",
+            reading.1
+        );
+        // `SE_DACL_PROTECTED` (`0x1000`): the directory's inheritable ACEs are kept
+        // out of this file's DACL, which is what stops a later change to the state
+        // directory widening it.
+        assert_ne!(
+            reading.0 & 0x1000,
+            0,
+            "the salt file's DACL is not protected (control=0x{:04X})",
+            reading.0
+        );
+        assert!(
+            tinio_winsec::acl_is_current_user_only(&file).expect("read the DACL back"),
+            "the current user's read-back disagrees with this module's walk: {:?}",
+            reading.1
+        );
+    }
+
+    /// **The ledger file is the salt file's sibling in protection as well as in
+    /// directory: current-user-only, explicit and protected from its first
+    /// instant, read with this module's own reader.**
+    ///
+    /// The file records the package name and the full `S-1-15-2-…` SID of every
+    /// grant a run made (`crate::ledger`), and a reader of one line can call
+    /// `CreateAppContainerProfile` with that name to obtain a token carrying the SID
+    /// every standing ACE names — so a ledger created under the state directory's
+    /// inherited grants publishes exactly what the salt exists to hide. **Measured
+    /// on this host 2026-09-28, and the reason this leg exists**: the file was
+    /// created through a plain append open, `icacls` showed
+    /// `FLIER-WIN11\CodexSandboxUsers:(I)(M)` beside an unresolved SID at `(I)(M)`
+    /// on it, while `acl-salt` beside it carried its own single entry — the finding
+    /// this leg answers.
+    ///
+    /// It would fail if the first line were written through
+    /// `std::fs::OpenOptions::new().create(true).append(true)`: the file would then
+    /// carry whatever the state directory passes down — on this host the operator's
+    /// group at `(I)(M)` beside SYSTEM and Administrators at `(I)(F)`, the reading
+    /// the salt leg above records for `%LOCALAPPDATA%`'s children — and a second
+    /// local account in that group could read the name and the SID of every grant.
+    /// **The append is asserted too**, because the steady state of this file is a
+    /// line written into the one a previous run published: the descriptor must be
+    /// the same before and after.
+    #[test]
+    fn the_ledger_file_is_current_user_only_and_inherits_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("acl-ledger.jsonl");
+        let recorded = crate::ledger::Grant {
+            kind: PathKind::ServedRoot,
+            root: Path::new(r"E:\srv\tinio"),
+            package: "tinio.sandbox.0123456789abcdef",
+            sid: "S-1-15-2-1-2-3-4-5-6-7",
+            program_directory: None,
+        };
+        // The first line publishes the file, which is the create this reading is
+        // about; the second is the append every later run makes.
+        ledger::record_run_at(&file, slice::from_ref(&recorded));
+        // A SID certainly absent from the file: the well-known ALL APPLICATION
+        // PACKAGES text, parsed rather than derived (nothing here needs a profile).
+        let absent = OwnedSid::parse(ALL_APPLICATION_PACKAGES, &file).expect("the constant");
+        let reading = dacl_entries(&file, absent.raw());
+
+        // **The measurement, printed so `crate::ledger`'s own doc can quote it** —
+        // that doc carries this host's reading, and this line is where the value
+        // came from.
+        println!(
+            "measured: the ledger file's DACL control=0x{:04X} entries={:?}",
+            reading.0, reading.1
+        );
+        assert_eq!(
+            reading.1.len(),
+            1,
+            "the ledger file carries exactly one entry: {:?}",
+            reading.1
+        );
+        assert!(
+            !reading.1.iter().any(|entry| entry.contains("S-1-15-")),
+            "a container SID in the ledger's DACL would let a confined process read \
+             every grant this machine recorded: {:?}",
+            reading.1
+        );
+        assert!(
+            reading.1.iter().all(|entry| !entry.contains("flags=0x1")),
+            "the entry is explicit and not inherited: {:?}",
+            reading.1
+        );
+        // `SE_DACL_PROTECTED` (`0x1000`): the directory's inheritable ACEs are kept
+        // out of this file's DACL, which is what stops a later change to the state
+        // directory widening it.
+        assert_ne!(
+            reading.0 & 0x1000,
+            0,
+            "the ledger's DACL is not protected (control=0x{:04X})",
+            reading.0
+        );
+        assert!(
+            tinio_winsec::acl_is_current_user_only(&file).expect("read the DACL back"),
+            "the current user's read-back disagrees with this module's walk: {:?}",
+            reading.1
+        );
+
+        ledger::record_run_at(&file, slice::from_ref(&recorded));
+        assert_eq!(
+            dacl_entries(&file, absent.raw()),
+            reading,
+            "the second line — the append — changed the ledger's descriptor"
+        );
+    }
+
+    /// **Shape constraint 2 of the item this lock landed under, as a test: the
+    /// wait is reported and never silent** — at `warn!`, naming the path and the
+    /// time waited, and once rather than once per poll.
+    ///
+    /// The lock is held by this thread and waited on by a second one, because a
+    /// wait has to be observed while it is happening and only the holder can end
+    /// it. What the assertion is about is the crossing: the hold is
+    /// [`ACL_LOCK_WARN_AFTER`] plus a margin, so the waiter polls many times and
+    /// exactly one line crosses the threshold.
+    ///
+    /// **The quiet half is not pinned here and the reason is the wall clock**: "a
+    /// wait under the threshold emits nothing" would need a second hold of nearly
+    /// the threshold to be meaningful, which is the same second again for the
+    /// absence of one line. The count assertion below is the half that costs
+    /// nothing and is worth having: a report per poll would fill a log with the
+    /// same sentence.
+    ///
+    /// **The recording is the waiting thread's own, not an every-thread one**,
+    /// which is a rule rather than a preference: the warning is emitted on the
+    /// waiter, and an every-thread recording is a process-wide buffer that a
+    /// `record()` in another test's thread asserts against while it is open —
+    /// measured here, as two `backend::tests` legs that take a thread-local
+    /// recording failed the first time this test was written the other way.
+    #[test]
+    fn a_wait_past_the_threshold_is_reported_once() {
+        let _serial = recorder();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path();
+        let held = AclLock::acquire(path).expect("the first holder");
+        let (waited, logged) = thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let capture = capture();
+                let recording = capture.record();
+                let started = Instant::now();
+                let taken = AclLock::acquire(path);
+                let waited = started.elapsed();
+                drop(taken);
+                let logged = capture.text();
+                drop(recording);
+                (waited, logged)
+            });
+            // Longer than the threshold and short enough to keep the suite quick:
+            // what is asserted is the crossing, not a bound on the wait.
+            thread::sleep(ACL_LOCK_WARN_AFTER + Duration::from_millis(300));
+            drop(held);
+            waiter.join().expect("the waiter did not panic")
+        });
+
+        assert!(
+            waited >= ACL_LOCK_WARN_AFTER,
+            "the wait did not cross the threshold, so this recording proves nothing: \
+             {waited:?}"
+        );
+        assert_step(&logged, "wait for the ACL lock");
+        assert_recorded_at(
+            &logged,
+            "another run holds this path's ACL lock",
+            tracing::Level::WARN,
+        );
+        assert!(
+            logged.contains(&format!("path={}", path.display())),
+            "the report names the path it is waiting on:\n{logged}"
+        );
+        assert!(
+            logged.contains(&format!("threshold_ms={}", ACL_LOCK_WARN_AFTER.as_millis())),
+            "the rule the wait crossed is in the line, not only in this source:\n{logged}"
+        );
+        assert_eq!(
+            logged.matches("wait for the ACL lock").count(),
+            1,
+            "one wait reports once, however many polls it took:\n{logged}"
         );
     }
 }

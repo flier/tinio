@@ -10,7 +10,7 @@ use std::{
 
 use tracing::{debug, error, info};
 
-use crate::{error::Result, launcher::Terminal};
+use crate::{Attribution, error::Result, launcher::Terminal};
 
 /// A confined child the platform started. The core only ever waits for it, so
 /// the platform keeps its own handle — a `std::process::Child` for
@@ -631,6 +631,77 @@ impl Child {
     /// ```
     pub fn terminal(&self) -> Option<&Terminal> {
         self.terminal.as_ref()
+    }
+
+    /// What one exit says about this launch's confinement — **the launcher's own
+    /// two facts read together**, because only a value that holds both can tell
+    /// them apart.
+    ///
+    /// **The readiness half is [`Self::terminal`], not a parameter.** A caller that
+    /// passed it in would be restating what this value already carries, and the one
+    /// that hardcoded it would be pinning an arm no launch can produce: the two
+    /// inputs are the exit status and *this* child's readiness, and both are here.
+    ///
+    /// **Ask it about an exit that went wrong, and the answer does not change what
+    /// that exit is.** A child that reported and then exited successfully is a server
+    /// that stopped — a run that worked — and [`Attribution::Ran`] is what this
+    /// answers for it, exactly as for a refusal after readiness: nothing this process
+    /// observed tells the two apart. What the answer is owed for is the exit a caller
+    /// has to give its own caller words for, and only [`Attribution::Broken`] carries
+    /// any.
+    ///
+    /// **Nothing here reads a refusal out of the status.** The child's stderr is the
+    /// operator's, unmediated (decision 19), so a refusal after readiness and any
+    /// other non-zero exit are one fact at this boundary — which is why a child that
+    /// reported and then ended answers [`Attribution::Ran`], the arm that classifies
+    /// nothing, rather than a [`Attribution::Denied`] whose subject this process never
+    /// saw.
+    ///
+    /// # Examples
+    ///
+    /// **`no_run` because it spawns a process** (constitution III):
+    ///
+    /// ```no_run
+    /// use std::{process::Command, thread};
+    ///
+    /// use tinio_sandbox_core::{Attribution, Child, Terminal};
+    ///
+    /// let mut process = Command::new("false").spawn().unwrap();
+    /// let mut child = Child::new(move || Ok(process.wait()?));
+    /// let status = child.wait().expect("the child is reaped");
+    /// // The relay saw no announcement, so the confinement never applied.
+    /// let attribution = child.attribution(&status);
+    /// assert!(matches!(attribution, Attribution::Broken { .. }));
+    ///
+    /// // A relay that did announce is the other side of the decision: the child served
+    /// // through the mechanism, and what ended it is nothing this side can classify.
+    /// let mut process = Command::new("true").spawn().unwrap();
+    /// let addr = "127.0.0.1:9000".parse().expect("addr");
+    /// let relay = thread::spawn(move || Some(Terminal::Listening(addr)));
+    /// let mut child = Child::new(move || Ok(process.wait()?)).with_relay(relay);
+    /// let status = child.wait().expect("the child is reaped");
+    /// assert!(matches!(child.attribution(&status), Attribution::Ran));
+    /// ```
+    pub fn attribution(&self, status: &ExitStatus) -> Attribution {
+        if self.terminal().is_none() {
+            // **The mechanism never got the child as far as announcing a server**,
+            // which is the one thing this process observed: the sentence is the
+            // launcher's own, and the classification adds a value to it rather than
+            // rewriting it.
+            return Attribution::Broken {
+                detail: format!(
+                    "the confined child exited ({status}) without reporting readiness"
+                ),
+            };
+        }
+        // **The child announced a server and then ended, and that is the third case
+        // rather than a refusal**: the mechanism got it as far as serving, so nothing
+        // here is broken, and a refusal after readiness is one fact with any other
+        // non-zero exit at this boundary — the child's stderr is the operator's
+        // (decision 19), so reading one out of the status would name a subject this
+        // process never saw. The caller's rule that such a child gets no frame is one
+        // match away rather than a second test of `terminal`.
+        Attribution::Ran
     }
 }
 

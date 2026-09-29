@@ -67,8 +67,10 @@ pub fn filter_argv(argv: Vec<OsString>) -> Result<(Vec<OsString>, Option<Adopted
 ///
 /// # Errors
 ///
-/// [`Error::Operational`] when the apply is refused — carrying the platform's own diagnostic —
-/// and when the frame asks for a confinement this build cannot apply to a running process.
+/// [`Error::SandboxBroken`] when the apply is refused — carrying the platform's own diagnostic —
+/// and when the frame asks for a confinement this build cannot apply to a running process. The
+/// variant is the classification and not decoration: the confinement never applied, so nothing
+/// ran confined.
 ///
 /// # Examples
 ///
@@ -104,9 +106,18 @@ pub fn apply_self_confinement(adopted: &Adopted) -> Result<(), Error> {
         // for the *run* is the CLI's to say. One tail rather than one per class: the diagnosis
         // already names which case it is, and a second sentence per variant would be a copy of a
         // classification the contract owns.
-        Err(err) => Err(Error::Operational(format!(
-            "{err}: the run is refused rather than served unconfined"
-        ))),
+        //
+        // **The classification is the error's variant, and this is the one site that raises
+        // `SandboxBroken`** (follow-up §4): a frame this process could not apply is a confinement
+        // that never applied, so *nothing* ran confined — the failure a caller must be able to
+        // tell from a refusal that happened *inside* an applied confinement
+        // (`Error::SandboxDenied`, which names its subject). The text is unchanged from the
+        // `Operational` refusal this replaced, because the detail is what the variant's sentence
+        // is (`Error::SandboxBroken` renders it verbatim) and every existing refusal sentence
+        // stays as it was.
+        Err(err) => Err(Error::SandboxBroken {
+            detail: format!("{err}: the run is refused rather than served unconfined"),
+        }),
     }
 }
 

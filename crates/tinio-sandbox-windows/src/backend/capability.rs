@@ -3,8 +3,9 @@
 //!
 //! The list is empty by default and that is the whole of the Windows network
 //! guarantee (design §7), so this module is the two spellings and nothing else:
-//! the name an operator writes in `TINIO_SANDBOX_CAPABILITIES` or in the
-//! configuration file, and the `S-1-15-3-N` SID the container is created with —
+//! the name an operator writes — `TINIO_SANDBOX_CAPABILITIES`, or the
+//! [`Options::capabilities`](super::Options::capabilities) a library caller
+//! builds — and the `S-1-15-3-N` SID the container is created with —
 //! [`Capability::sid`], the one text `sid::CapabilitySids` resolves.
 //!
 //! **The rationale did not move without the code it explains**: each variant's
@@ -76,7 +77,7 @@ impl Capability {
         }
     }
 
-    /// The name used in configuration and in `TINIO_SANDBOX_CAPABILITIES`.
+    /// The name `TINIO_SANDBOX_CAPABILITIES` accepts.
     ///
     /// # Examples
     ///

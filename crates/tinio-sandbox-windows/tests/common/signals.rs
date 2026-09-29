@@ -10,6 +10,7 @@ use std::{
 };
 
 use tinio_sandbox_windows::launch;
+use tinio_util::job;
 
 use super::roles::{append_to_report, child_role_body, probe_dir};
 
@@ -129,14 +130,19 @@ pub fn unrelayed_child_role(probe: &str) -> ! {
 /// put it (design decision 19); `stderr` is inherited because that is the log
 /// channel and a child's panic has to be readable.
 pub fn spawn_unrelayed_child_in_own_group(probe: &Path) -> Child {
-    Command::new(env::current_exe().expect("the test executable"))
+    // **The process group is this fixture's address and the guard is its lifetime**: the child
+    // beats until the test ends it, so a run that dies without unwinding would otherwise leave it
+    // beating — and `CREATE_NEW_PROCESS_GROUP` and the job membership the guard hands out are two
+    // different attributes, which is why taking the guard changes nothing about the stop this
+    // child is spawned to receive.
+    let mut command = Command::new(env::current_exe().expect("the test executable"));
+    command
         .args(["child_role", "--exact"])
         .env("TINIO_SANDBOX_TEST_PROBE", probe)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn the unrelayed child")
+        .stderr(Stdio::inherit());
+    job::spawn(&mut command).expect("spawn the unrelayed child")
 }
 
 /// A launcher of this test binary, in its own process group — **which is the
@@ -157,14 +163,19 @@ pub fn spawn_unrelayed_child_in_own_group(probe: &Path) -> Child {
 /// environment**, and the flag is the whole mechanism: the copy in the events
 /// suite did exactly that, which is the defect this signature closes.
 pub fn spawn_launcher(tree: &Path, stdout: Stdio, quiet: bool) -> Child {
-    Command::new(env::current_exe().expect("the test executable"))
+    // **Through the guard, and the flag is still the whole mechanism**: the launcher is the process
+    // a stop is addressed to, and a launcher left behind by a run that died without unwinding holds
+    // the listener, the product's job and the grants — the leak `tinio_util::job`'s module doc is
+    // written around. The creation flag below is untouched by the guard: it is an attribute of the
+    // spawned process, not of the `Command` the guard is handed.
+    let mut command = Command::new(env::current_exe().expect("the test executable"));
+    command
         .args(["launcher_role", "--exact"])
         .args(quiet.then_some("--quiet"))
         .env("TINIO_SANDBOX_TEST_LAUNCHER", "1")
         .env("TINIO_SANDBOX_TEST_TREE", tree)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(stdout)
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn the launcher")
+        .stderr(Stdio::inherit());
+    job::spawn(&mut command).expect("spawn the launcher")
 }

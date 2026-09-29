@@ -38,8 +38,8 @@ use crate::{
 /// **A caller's file is refused where this set is built, and that is the site
 /// that knows the entries are the caller's** (P7, Ruling 95): `confine`'s per-path
 /// loop grants the `(OI)(CI)`/plain directory forms, and the only shape that lands
-/// on a file is [`Grants::apply_siblings`]' batched `*.dll` pattern — the
-/// launcher's own entries, added by [`exposures`] and never handed to this type.
+/// on a file is [`Grants::apply_siblings`]'s per-file grant — the launcher's own
+/// entries, added by [`exposures`] and never handed to this type.
 /// A caller's file would therefore be granted nothing at all while the launch
 /// continued, so [`canonical_whitelist`] refuses the entry instead
 /// ([`Error::BadPath`]; design §6 owns the rule): a loud startup failure rather
@@ -164,7 +164,8 @@ pub(in crate::backend) fn shape_for(
 const NOT_A_DIRECTORY: &str = "is not a directory, and this launcher grants the caller's paths as directories (the inherited (OI)(CI) form, or the plain form on the program's own directory), which a file cannot take; expose the directory holding it";
 
 /// **The launch's whitelist, in the two shapes its grant takes** — the entries
-/// granted one by one, and the sibling DLLs granted through a single pattern.
+/// granted one by one, and the sibling DLLs enumerated by a pattern and granted
+/// one file at a time.
 ///
 /// **One resolution, two readers**: the caller's paths are walked, refused and
 /// logged exactly once, and both things that need them are built from that one

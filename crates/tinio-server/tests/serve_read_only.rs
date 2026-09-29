@@ -129,6 +129,11 @@ impl Serve {
     /// and the resolution folds them onto `[auth]` before the plane is
     /// built. The caller's `env` is applied after, so a leg could still
     /// override them.
+    ///
+    /// **The spawn is guarded** — [`PipedChild::spawn`] goes through
+    /// `tinio_util::job::spawn` — so a leg that dies without unwinding takes
+    /// its servers with it. What the guard covers on each target, and the
+    /// thread it has to be taken on, are that module's doc.
     fn spawn(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
         let bin = tinio_bin();
         let mut cmd = Command::new(&bin);

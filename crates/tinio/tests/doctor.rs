@@ -203,18 +203,22 @@ fn fix_refuses_while_a_server_is_running() {
     // A live control channel is an error for `--fix` (the doctor section's `--fix` rule) and the
     // **finding in the report**, never a bare `Err`: stdout carries it, the exit code is the
     // report's, and `--fix --json` on the same fixture is still a document a consumer can parse.
-    // The server is started the way plan B's lifecycle test starts one.
+    // The server is started the way plan B's lifecycle test starts one — **through the job guard**
+    // (`tinio_util::job::spawn`), the one spelling a harness's spawn sites use: it is started to be
+    // found *running*, and a test binary that died without unwinding would otherwise leave it
+    // holding the root's store and `target\<profile>\tinio.exe` open, the orphan `tinio_util::job`'s
+    // module doc is written around.
     let dir = tempfile::TempDir::new().expect("temp");
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).expect("root");
-    let mut child = spawn(dir.path())
+    let mut command = spawn(dir.path());
+    command
         .arg("server")
         .arg(&root)
         .args(["--port", "0"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn");
+        .stderr(std::process::Stdio::null());
+    let mut child = tinio_util::job::spawn(&mut command).expect("spawn");
     let mut line = String::new();
     std::io::BufRead::read_line(
         &mut std::io::BufReader::new(child.stdout.take().expect("stdout")),
@@ -289,14 +293,16 @@ fn fix_leaves_a_foreign_version_state_file_alone_while_its_channel_answers() {
     let dir = tempfile::TempDir::new().expect("temp");
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).expect("root");
-    let mut child = spawn(dir.path())
+    // The same guarded spawn as the leg above: this channel's server is the process the dial below
+    // reaches, and it must die with this test like any other (`tinio_util::job`).
+    let mut command = spawn(dir.path());
+    command
         .arg("server")
         .arg(&root)
         .args(["--port", "0"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn");
+        .stderr(std::process::Stdio::null());
+    let mut child = tinio_util::job::spawn(&mut command).expect("spawn");
     let mut line = String::new();
     std::io::BufRead::read_line(
         &mut std::io::BufReader::new(child.stdout.take().expect("stdout")),

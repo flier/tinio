@@ -63,7 +63,11 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create root");
 
-    let mut child = Command::new(tinio_bin())
+    // **`job::spawn`, the harness's one spelling** — a no-op on this platform, where the module
+    // has no call to make, but the sites that spawn the process under test do not each decide
+    // that for themselves, so a leg moved to a platform the guard exists on is already guarded.
+    let mut command = Command::new(tinio_bin());
+    command
         .args([
             "server",
             root.to_str().expect("utf-8 root"),
@@ -80,9 +84,8 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
         // assertion sets it, an operator does not have to.
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn tinio server");
+        .stderr(Stdio::piped());
+    let mut child = tinio_util::job::spawn(&mut command).expect("spawn tinio server");
 
     // The launcher's own record travels on stderr, which the confined child
     // inherits, and shared §7's checking rule is that the `info!` half is

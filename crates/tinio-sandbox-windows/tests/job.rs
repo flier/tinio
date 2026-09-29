@@ -11,6 +11,7 @@ use std::{
 };
 
 use tinio_sandbox_windows::job::Job;
+use tinio_util::job;
 use windows_sys::Win32::Foundation::HANDLE;
 
 /// The raw process handle behind a `std::process::Child`.
@@ -19,12 +20,18 @@ fn raw_handle(child: &Child) -> HANDLE {
 }
 
 /// A child that comfortably outlives the test.
+///
+/// **Through the guard, like every other spawn site in this crate's tests** (`tinio_util::job`):
+/// the child outlives the test by design, so a run that died without unwinding would otherwise
+/// leave the `cmd.exe`/`ping.exe` pair behind. What the suite then does with it is unchanged —
+/// membership of the job this file tests is what `Job::assign` and the assertions below read, and
+/// the guard's job is a different one.
 fn sleeper() -> Child {
-    Command::new("cmd.exe")
+    let mut command = Command::new("cmd.exe");
+    command
         .args(["/c", "ping -n 60 127.0.0.1 > nul"])
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn a child that outlives the test")
+        .stdout(Stdio::null());
+    job::spawn(&mut command).expect("spawn a child that outlives the test")
 }
 
 /// Assert `child` is still running, and fail the test if it is not.

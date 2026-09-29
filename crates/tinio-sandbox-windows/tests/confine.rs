@@ -39,6 +39,7 @@ use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, LaunchPlan, Sandbo
 use tinio_sandbox_windows::{
     Backend, Capability, Options,
     acl::{self, Target},
+    ledger,
     sid::{ALL_APPLICATION_PACKAGES, PackageSid},
 };
 
@@ -105,6 +106,59 @@ fn the_whitelist_holds_the_loopback_round_trip_and_the_standing_grants() {
         acl::revoke(&tree.root, &sid).expect("take the root's grant back");
         acl::revoke(&tree.report, &sid).expect("take the report's grant back");
     }
+}
+
+/// **Every path a run granted reaches the ledger, not only its root** — the state
+/// directory's case, driven end to end: the harness exposes the tree's report
+/// directory beside the served root, which is the same shape as a `TINIO_STATE_DIR`
+/// outside the root (one more caller exposure, granted read-write, standing).
+///
+/// It would fail with a ledger hook that recorded the root alone (finding 3 of the
+/// 2026-09-28 review): the report directory's ACE names this run's package SID and
+/// stands after the run, and an audit that listed only the root would not name it.
+/// The oracle is the operator's own file — `ledger::path()`, the crate's own
+/// spelling of `%LOCALAPPDATA%\tinio\acl-ledger.jsonl`, so neither half of that
+/// path is re-spelled here and a rename arrives as a leg that read the wrong file
+/// rather than as one that found none — and what is searched for is *this* run's
+/// line: the tree is a fresh temporary directory, so its spelling and the SID
+/// derived from it are unique to this leg.
+///
+/// **Only lines that parse are looked at**: a peer leg appending under the same
+/// lock may be mid-write while this reads, and what this leg asserts is a match
+/// rather than the file's every line (the unit tests pin the line's shape).
+#[test]
+fn a_run_records_every_path_it_granted_and_not_only_its_root() {
+    let (_dir, tree) = common::tree(&common::one_volume());
+    let sid = common::sid_for(&tree);
+    let run = common::run_confined(&tree, AccessMode::ReadWrite);
+    assert_eq!(run.status, 0, "{}", run.report);
+
+    let ledger = ledger::path().expect("LOCALAPPDATA is set");
+    let text = fs::read_to_string(&ledger)
+        .unwrap_or_else(|error| panic!("read {}: {error}", ledger.display()));
+    let recorded: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let root = tree.root.display().to_string();
+    let report = tree.report.display().to_string();
+    let line = |path: &String, kind: &str| {
+        recorded.iter().find(|entry| {
+            entry["root"] == *path && entry["kind"] == kind && entry["sid"] == sid.as_str()
+        })
+    };
+    assert!(
+        line(&root, "served-root").is_some(),
+        "this run's served root is not in the ledger ({root}):\n{text}"
+    );
+    assert!(
+        line(&report, "exposure").is_some(),
+        "this run's second exposure ({report}) never reached the ledger, so an \
+         operator's audit of the standing ACEs it left is incomplete:\n{text}"
+    );
+
+    acl::revoke(&tree.root, &sid).expect("take the root's grant back");
+    acl::revoke(&tree.report, &sid).expect("take the report's grant back");
 }
 
 #[test]

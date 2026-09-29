@@ -28,7 +28,7 @@ use tinio_sandbox_windows::{launch, socket};
 // leg for this rule takes too: what the two measure is the same "was stdin read at all",
 // and only a reader that fails on being read can tell that from a reader that returns
 // nothing.
-use tinio_util::testing::Untouchable;
+use tinio_util::{job, testing::Untouchable};
 use windows_sys::Win32::Foundation::HANDLE;
 
 /// The marker that makes [`child_role`] inert in this binary's own test run.
@@ -72,13 +72,17 @@ fn a_child_reads_the_frame_the_parent_wrote() {
     socket::mark_inheritable(&listener).expect("mark the listener inheritable");
     let element = listener_fd_arg(socket::value(&listener) as i64);
 
-    let mut child = Command::new(env::current_exe().expect("current exe"))
+    // **The child role is spawned through the guard** (`tinio_util::job`), like every other spawn
+    // in this crate's tests: the frame is written after it is up, so a test binary that died
+    // without unwinding would leave this copy of itself holding the inherited handle and the
+    // target dir.
+    let mut command = Command::new(env::current_exe().expect("current exe"));
+    command
         .args(["child_role", "--exact", &element.to_string_lossy()])
         .env(CHILD, "1")
         .env(REPORT, &report)
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("spawn the child");
+        .stdin(Stdio::piped());
+    let mut child = job::spawn(&mut command).expect("spawn the child");
 
     // The frame comes from the core's one writer — the payload derives no
     // `Serialize` — so this is the byte string a launch really writes, config

@@ -9,6 +9,11 @@
 
 - Untrusted → ctor (`bucket::name`, …). Qualify (`bucket::Name`); import module. `From<&str>`: literals (panic). `SmartDefault`/`#[serde(default)]`.
 
+## JSON
+
+- Prod: `#[derive(Serialize)]` struct (borrowed fields) + `to_string()`, never `json!`. `json!` → map → `serde_json` key order (sorted; graph `preserve_order` → same file, two byte orders). Struct: declaration order; drop/rename = compile error.
+- `json!` OK: tests; `Value`-typed (`Value::Json`) where untyped shape *is* value.
+
 ## Derives
 
 - derive `Display`/`FromStr` → `parse-display`; rest → `derive_more`; `Default` → `SmartDefault`; `impl` only thiserror `Error` (`#[error]`/`#[from]`; nest `#[from(forward)]`/ctor).
@@ -40,8 +45,6 @@
 
 ## Docs & scripts
 
-- English bullets. Scripts → `/tmp`.
-- Prose compression (intent-only + caveman): `docs/compress.md`.
-- Documents (plans/specs/design): NO hard line wraps — paragraphs, list items, and blockquotes stay single-line; only structural breaks remain (blank lines, table rows, code fences, headings).
-- CLAUDE.md = always-loaded pointer (name branches, then the doc); each `docs/*.md` = source of truth for its branch. No restating a rule in both. Git: `docs/git.md`.
-- Gherkin / cucumber e2e: `docs/tests.md`.
+- English bullets. Scripts → `/tmp`. Prose: `docs/compress.md`. Git: `docs/git.md`. Gherkin/e2e: `docs/tests.md`.
+- Plans/specs/design: no hard wraps — single-line paras/items/blockquotes; break only on blank/table/fence/heading.
+- CLAUDE.md = always-loaded pointer (name branches → doc); each `docs/*.md` = SoT for its branch. No restating in both.

@@ -31,6 +31,7 @@ fn main() {
         env, fs,
         net::{TcpListener, TcpStream},
         path::Path,
+        process::Command,
     };
 
     use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, Sandbox};
@@ -151,6 +152,36 @@ fn main() {
     match fs::write(Path::new(&root).join("bucket/should-not-exist"), b"nope") {
         Ok(()) => println!("served-root-write: ALLOWED"),
         Err(err) => println!("served-root-write: refused ({})", err.kind()),
+    }
+    // **A symlink in the served root, and whether this view follows it.** A
+    // per-mount flag is invisible from in here unless something it governs is
+    // reachable: `nosuid`/`nodev` want a setuid binary or a device node and
+    // `noexec` an executable, while `nosymfollow` wants one symlink — one line of
+    // the parent's fixture, and the only one of the four whose loss nothing else
+    // reports (`source_mount_flags_in`'s doc says why). The opt-in
+    // nested-user-namespace leg seeds `alias`, and beside it the executable the
+    // `noexec` probe below runs; on the legs that seed neither, `NotFound` is
+    // the honest reading of "this root has none".
+    match fs::read(Path::new(&root).join("alias")) {
+        Ok(_) => println!("served-root-symlink: followed"),
+        Err(err) => println!("served-root-symlink: refused ({:?})", err.kind()),
+    }
+    // **Whether this view may execute a file in the served root, on the same
+    // terms** — the wrapper of the opt-in nested-user-namespace leg seeds an
+    // executable `exec-probe` inside its `noexec` tmpfs, and the legs that seed
+    // nothing answer `NotFound`.
+    //
+    // **The kind is the assertion, never the failure**, and the reason is what
+    // this probe is for: `EACCES` (`PermissionDenied`) is the *mount* refusing
+    // the exec, while a run whose arm dropped the flag gets past that check and
+    // dies later on the interpreter the jail does not carry (`NotFound`: the
+    // seeded file's `#!/bin/sh` names a `/bin/sh` no jail exposes) — so "the
+    // exec did not succeed" would hold in both states and pin neither. That is
+    // also why the file is a script rather than this very binary: a copy of a
+    // dynamic executable would fail the same way for the same missing reason.
+    match Command::new(Path::new(&root).join("exec-probe")).output() {
+        Ok(_) => println!("served-root-exec: allowed"),
+        Err(err) => println!("served-root-exec: refused ({:?})", err.kind()),
     }
     // **Which of the two read-only implementations actually ran**, reported as
     // the one fact that separates them: the overlay arm creates `OverlayDirs`'

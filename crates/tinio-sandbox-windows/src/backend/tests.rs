@@ -745,10 +745,10 @@ fn capabilities_parse_by_name() {
 
 /// **`from_name`'s half of the round trip, which is the half the product
 /// takes**: a capability arrives as the name an operator wrote — in
-/// `TINIO_SANDBOX_CAPABILITIES` or in the configuration file — and is turned
-/// into the SID the container is created with by [`Capability::sid`]. Nothing
-/// produces a SID for this crate to parse back, which is why there is no
-/// `from_sid` to round-trip through.
+/// `TINIO_SANDBOX_CAPABILITIES`, or in the `Options` a library caller builds —
+/// and is turned into the SID the container is created with by
+/// [`Capability::sid`]. Nothing produces a SID for this crate to parse back,
+/// which is why there is no `from_sid` to round-trip through.
 #[test]
 fn capability_names_round_trip_through_from_name() {
     for cap in [
@@ -782,6 +782,43 @@ fn the_served_root_is_the_first_exposure() {
         .expose(r"E:\state", AccessMode::ReadWrite);
     assert_eq!(served_root(&sandbox).unwrap(), Path::new(r"E:\srv\tinio"));
     assert!(served_root(&Sandbox::new()).is_err());
+}
+
+/// **Every exposed path a launch's ledger records besides its root, as one leg** —
+/// finding 3 of the 2026-09-28 review, which is that a `TINIO_STATE_DIR` outside
+/// the root was granted read-write and never reached the file.
+///
+/// It would fail if the selection named the root by position alone, or compared
+/// spellings literally: a second spelling of the root is one directory, one ACE and
+/// one grant, and a line for it would claim a standing ACE the run did not write
+/// twice. What the product's set is — the served root, then the state directory
+/// when it lies outside the root — is the shape the first assertion pins, and the
+/// empty cases are the run whose state directory needs no entry of its own.
+#[test]
+fn the_paths_a_run_records_besides_its_root_are_its_other_exposures() {
+    let sandbox = Sandbox::new()
+        .expose(r"E:\srv\tinio", AccessMode::ReadOnly)
+        .expose(r"E:\state", AccessMode::ReadWrite);
+    assert_eq!(
+        other_exposed_paths(&sandbox, Path::new(r"E:\srv\tinio")),
+        vec![PathBuf::from(r"E:\state")],
+        "the state directory is the ACE the root's own line does not name"
+    );
+    // **The root's own second spelling is not a second path.** `E:\Data` and
+    // `e:/data` are one directory to this volume, so they are one canonical
+    // resolution, one grant and one line — the digest is the crate's identity rule
+    // and not the spelling (`sid::root_digest`).
+    let respelled = Sandbox::new()
+        .expose(r"E:\Data", AccessMode::ReadOnly)
+        .expose(r"e:/data", AccessMode::ReadWrite);
+    assert!(
+        other_exposed_paths(&respelled, Path::new(r"E:\Data")).is_empty(),
+        "a second spelling of the root earned a line of its own"
+    );
+    // A root with nothing beside it records nothing extra at all, which is the
+    // in-root state directory's case.
+    let alone = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
+    assert!(other_exposed_paths(&alone, Path::new(r"E:\srv\tinio")).is_empty());
 }
 
 #[test]

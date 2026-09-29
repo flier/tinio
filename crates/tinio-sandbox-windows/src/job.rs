@@ -26,30 +26,26 @@
 //! must not conclude from this module is that the child is never unowned; what
 //! they can conclude is that an unowned child is a child that cannot serve.
 //!
-//! This module is one of the crate's enumerated `unsafe` sites (design decision
-//! 14).
+//! **The Win32 sequence is `tinio_util::job_object`'s, and this module is the policy over it.**
+//! That primitive creates the job with the limits it is handed, hands back a value whose `Drop`
+//! closes the handle exactly once, and is what both jobs in this workspace are made of — and it is
+//! the part of `tinio-util` a production build on Windows compiles, which is why it is gated on the
+//! target rather than on a feature. What stays here is this crate's own decisions: the one limit
+//! (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and deliberately not
+//! `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, which the test-side guard beside it sets), the
+//! per-launch lifetime this value owns, the `step` each call reports under (design §7) and the
+//! error type it surfaces ([`Error::Launch`](tinio_sandbox_core::Error::Launch)). **This module is
+//! therefore no longer one of the crate's enumerated `unsafe` sites** (design decision 14): the
+//! module-level `#![allow(unsafe_code)]` that used to sit at the top of this file moved with the
+//! calls into `tinio-util`'s `job_object`, and a reader counting this crate's sites should count
+//! that one as gone.
 
-#![allow(unsafe_code)]
-
-use std::{
-    ffi::c_void,
-    mem::size_of,
-    ptr::{from_ref, null},
-};
-
+use tinio_util::job_object::JobObject;
 use windows_sys::Win32::{
-    Foundation::HANDLE,
-    System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
-    },
+    Foundation::HANDLE, System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
-use crate::{
-    _core::{Result, launch},
-    handles::{self, last_error},
-};
+use crate::_core::{Result, launch};
 
 /// A job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set.
 ///
@@ -57,6 +53,11 @@ use crate::{
 /// exits — cleanly, by panic, or by `TerminateProcess` — the kernel closes this
 /// handle, the last handle to the job goes with it, and the confined server dies
 /// rather than surviving as an orphan holding a listener.
+///
+/// **The drop is the kill, and the close site is the primitive's.** This type carries no `Drop` of
+/// its own, because [`JobObject`]'s closes the handle for it — which is what makes kill-on-close a
+/// guarantee rather than a promise: every exit path from the launcher reaches that close, including
+/// the ones that never return.
 ///
 /// # Examples
 ///
@@ -70,7 +71,7 @@ use crate::{
 /// # Ok::<(), tinio_sandbox_core::Error>(())
 /// ```
 pub struct Job {
-    handle: HANDLE,
+    object: JobObject,
 }
 
 impl Job {
@@ -78,7 +79,10 @@ impl Job {
     ///
     /// The limit is set before the handle is handed back, so no caller can hold a
     /// job that does not yet kill: a failure to set it drops the job — and closes
-    /// the handle — rather than returning one whose guarantee is missing.
+    /// the handle — rather than returning one whose guarantee is missing. **The
+    /// sequence itself is `tinio_util::job_object`'s**, which is where that
+    /// invariant is kept and argued; what this call adds is the limit, and the
+    /// step the failure is reported under.
     ///
     /// # Errors
     ///
@@ -93,45 +97,8 @@ impl Job {
     /// assert!(job.is_ok(), "{:?}", job.err());
     /// ```
     pub fn create() -> Result<Self> {
-        // SAFETY: a null security descriptor and a null name are both documented
-        // as valid, and mean "unnamed, default security".
-        let handle = unsafe { CreateJobObjectW(null(), null()) };
-        if handle.is_null() {
-            return Err(launch("CreateJobObjectW", "job", last_error()));
-        }
-        // The `Self` is built before the limit is set so that the failure path
-        // below closes the handle it was just given; nothing observes the job in
-        // between, and `Drop` is the single close site for every path out of this
-        // function.
-        let job = Self { handle };
-        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // The information *class* and the structure said class expects are two
-        // different names that read alike: `JobObjectExtendedLimitInformation` is
-        // this argument, the `9i32` that selects the layout, and
-        // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` is the layout below. Swapping
-        // them compiles into a wrong call rather than failing to compile, which is
-        // why the two are written together here.
-        //
-        // SAFETY: `handle` is the job just created, `limits` is a correctly sized
-        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION that outlives the call, and the
-        // class matches the structure passed.
-        let ok = unsafe {
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                from_ref(&limits).cast::<c_void>(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            return Err(launch("SetInformationJobObject", "job", last_error()));
-        }
+        let object = JobObject::create(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+            .map_err(|failure| launch(failure.call, "job", failure.source))?;
         // `info!`: the job is one of the two mechanisms that make the confinement
         // a *lifetime* rather than a permission, so it belongs on the "to what"
         // side of shared §7's split.
@@ -139,7 +106,7 @@ impl Job {
             step = "CreateJobObjectW",
             limit = "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE"
         );
-        Ok(job)
+        Ok(Self { object })
     }
 
     /// Assign `process` to the job.
@@ -183,16 +150,14 @@ impl Job {
     // signature should hide: the contract — a live process handle the caller owns
     // and keeps — is proven by the caller, and marking the method `unsafe` would
     // put an unsafe block at every call site, which is what design decision 14
-    // confines to this module. [`crate::handles::mark_inheritable`] carries the
-    // same allow for the same reason.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    // confines to the module that owns the raw calls —
+    // `tinio_util::job_object`, which this method is a delegation to.
+    // [`crate::handles::mark_inheritable`] carries the same allow for the same
+    // reason.
     pub fn assign(&self, process: HANDLE) -> Result<()> {
-        // SAFETY: both handles are live and owned by the caller for the duration
-        // of the call; the job takes no ownership of the process handle.
-        let ok = unsafe { AssignProcessToJobObject(self.handle, process) };
-        if ok == 0 {
-            return Err(launch("AssignProcessToJobObject", "job", last_error()));
-        }
+        self.object
+            .assign(process)
+            .map_err(|source| launch("AssignProcessToJobObject", "job", source))?;
         tracing::info!(step = "AssignProcessToJobObject", process = ?process);
         Ok(())
     }
@@ -219,21 +184,8 @@ impl Job {
     /// # Ok::<(), tinio_sandbox_core::Error>(())
     /// ```
     pub fn terminate(&self, code: u32) -> Result<()> {
-        // SAFETY: `self.handle` is the job this value owns, and TerminateJobObject
-        // takes an exit code and no other precondition.
-        let ok = unsafe { TerminateJobObject(self.handle, code) };
-        if ok == 0 {
-            return Err(launch("TerminateJobObject", "job", last_error()));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Job {
-    // Close the job handle, which is what makes kill-on-close a guarantee rather
-    // than a promise: every exit path from the launcher reaches this, including
-    // the ones that never return.
-    fn drop(&mut self) {
-        handles::close(self.handle);
+        self.object
+            .terminate(code)
+            .map_err(|source| launch("TerminateJobObject", "job", source))
     }
 }

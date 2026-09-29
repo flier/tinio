@@ -33,7 +33,7 @@ use std::{
 use assert_cmd::{Command as AssertCmd, cargo::cargo_bin};
 use cucumber::{given, then, when};
 use tinio_sandbox::Event;
-use tinio_util::testing::kill_and_reap;
+use tinio_util::testing::{job, kill_and_reap};
 
 use super::{FsKind, World, common::deterministic_bytes, has_tag};
 use crate::_server::{
@@ -163,6 +163,13 @@ pub struct SpawnedServer {
 /// `contracts/config.md:110` lists (not the `MINIO_*` names, which are the
 /// data plane's fallback and not this chain's), and the resolution applies
 /// them to `[auth]` — env, then `.env`, then the config file.
+///
+/// **The child is spawned through the job guard** (`tinio_util::testing::job::spawn`): on Windows
+/// it is put in this test process's job, so a leg that dies **without unwinding** — the abort or
+/// the killed run that no `Drop` reaches — takes the server with it instead of leaving an orphan
+/// holding the redb lock and `target\<profile>\tinio.exe`. [`terminate`] and the two `Drop` impls
+/// stay what they were: the guard is the backstop for the path that runs no `Drop`, never the
+/// reaping.
 fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, SocketAddr) {
     let mut cmd = Command::new(cargo_bin("tinio"));
     cmd.arg("server").arg(root).args(["--port", "0"]);
@@ -179,9 +186,8 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
         cmd.env("TINIO_SCANNER", if s { "1" } else { "0" });
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn `tinio server`: {e}"));
+    let mut child =
+        job::spawn(&mut cmd).unwrap_or_else(|e| panic!("failed to spawn `tinio server`: {e}"));
     let stdout = child.stdout.take().expect("piped stdout");
     let endpoint = match wait_for_ready(stdout) {
         // The address travels as the value the child bound: it comes out of the event's typed

@@ -12,7 +12,7 @@
 //! the full credentials and an unfiltered network for the life of the process
 //! while the run reported itself confined (design §8, §10; the design's own
 //! §10 wiring is what used to carry this, and a subscriber built before
-//! `confine` is the shape that breaks it). [`Backend`]'s `confine` reads
+//! `confine` is the shape that breaks it). [`Backend`](tinio_sandbox_core::Backend)'s `confine` reads
 //! `/proc/self/task` and refuses with the count before the first irreversible
 //! step, and the refusal is fail-closed: a `/proc` that cannot be read refuses
 //! too. The remedy belongs to the entry point — build the subscriber and the
@@ -37,7 +37,8 @@
 pub extern crate tinio_sandbox_core as _core;
 
 use crate::_core::{
-    Backend as BackendTrait, Confinement, LaunchPlan, PlatformFacts, Result, Sandbox,
+    Backend as BackendTrait, Confinement, Diagnostics, Enforcement, LaunchPlan, PlatformFacts,
+    Result, Sandbox,
 };
 
 pub mod caps;
@@ -74,6 +75,33 @@ pub use self::{
 /// **The in-place answer**: this backend confines the calling process (design decision 6), so it
 /// launches nothing and none of the three facts a *launch* owns are its to state.
 pub const FACTS: PlatformFacts = PlatformFacts::NONE;
+
+/// How much of its guarantee this backend's mechanism applies — **the strength the mechanism
+/// answers for**, published beside [`FACTS`] so the crate that owns the mechanism is the crate
+/// that answers for it (the rule [`PlatformFacts`]'s own doc states).
+///
+/// **`Full`, and what that covers**: the user namespace and the mount namespace this process
+/// `unshare`s for itself, the mirror plus `pivot_root` that is the mount view, the capability
+/// drop, and the seccomp filter on top (design decisions 6, 12, 13) — the same set
+/// [`Enforcement::Full`]'s own doc names, and the whole of it. **There is no PID, IPC or UTS
+/// namespace here**, which is design decision 12 rather than a gap in this list — v1 mounts no
+/// `/proc` in the jail, a `/proc` without a PID namespace of its own being the host's process
+/// table handed in. It is not a claim that every syscall a confined process could make is
+/// filtered either, which is `docs/sandbox.md`'s to state.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::Enforcement;
+///
+/// assert_eq!(
+///     tinio_sandbox_linux::DIAGNOSTICS.enforcement,
+///     Enforcement::Full
+/// );
+/// ```
+pub const DIAGNOSTICS: Diagnostics = Diagnostics {
+    enforcement: Enforcement::Full,
+};
 
 /// The Linux backend.
 ///

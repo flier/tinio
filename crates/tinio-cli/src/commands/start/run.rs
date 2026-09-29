@@ -20,7 +20,7 @@ use super::{Args, Ready, Server};
 use crate::_api::state::State;
 #[cfg(feature = "api")]
 use crate::_api::{
-    Options as ApiOptions, Plane,
+    Error as ApiError, Options as ApiOptions, Plane,
     metrics::{DEFAULT_TTL, Gauges, MetricsSource},
 };
 #[cfg(feature = "api")]
@@ -31,8 +31,8 @@ use crate::{
         log::{AccessFormat, Format, Verbosity},
         state::prepare_home_derived,
     },
-    _fs::FsStorage,
-    _sandbox::{Adopted, Terminal, disarm_signal_relay, supervise},
+    _fs::{Error as FsError, FsStorage},
+    _sandbox::{Adopted, Attribution, Child, Refused, disarm_signal_relay, supervise},
     _server::{identity, log},
     Error,
     cli::Provenance,
@@ -180,9 +180,25 @@ pub fn run(
     if resolution.read_only {
         prepare_home_derived(&resolution.root, &resolution.state_dir)?;
     }
-    fs::create_dir_all(&resolution.state_dir)?;
+    // **A confined child's permission refusal is the confinement's own answer, and the four
+    // sites below are where it can arrive** (follow-up §4's wiring caveat): `?` on these calls
+    // used to turn any of them into a path-less `Error::Io`, which left a confined operator
+    // with "Permission denied" and nothing to expose. Each site names the subject — the state
+    // directory, the served root, or the control channel — so a denial reaches the caller as a
+    // value with a path in it rather than as a sentence to read.
+    //
+    // **The gate is `adopted.is_some()`, and it has to be**: a confined child is the one
+    // process whose refusals can be the mechanism's, while a launcher's own io errors are the
+    // operator's filesystem answering an unconfined process — the same discriminator the
+    // process entry uses to identify a child at all (design decision 17).
+    let confined = adopted.is_some();
+    fs::create_dir_all(&resolution.state_dir).map_err(|err| {
+        sandbox::classify_io(err, Refused::Path(resolution.state_dir.clone()), confined)
+    })?;
     if !resolution.read_only {
-        fs::create_dir_all(&resolution.root)?;
+        fs::create_dir_all(&resolution.root).map_err(|err| {
+            sandbox::classify_io(err, Refused::Path(resolution.root.clone()), confined)
+        })?;
     }
 
     // g: forks before any thread exists; the parent waits and exits (Task 5).
@@ -321,7 +337,7 @@ pub fn run(
         // **This is not a second frame for one failure.** The arm below returns
         // `Ok(Server::Launched(…))`, so `run`'s serving arm never sees an `Err` for this path and
         // never frames one: the sentence travels on stdout once, from here.
-        let (refusal, code) = launcher_exit(status, child.terminal());
+        let (refusal, code) = launcher_exit(status, &child);
         if let Some(message) = refusal {
             events::emit_error(&message);
         }
@@ -351,7 +367,17 @@ pub fn run(
     let mut storage = FsStorage::new(
         &resolution.root,
         resolve::fs_options(&resolution, Some(&pipelines)),
-    )?;
+    )
+    .map_err(|err| match err {
+        // The storage constructor's own io failure, classified like the two above: what it
+        // opens under the root — the state database and the staging areas — is the path a
+        // confinement refuses first, and it arrives wrapped in the backend's error rather than
+        // as an io error of its own.
+        FsError::Io(io) => {
+            sandbox::classify_io(io, Refused::Path(resolution.root.clone()), confined)
+        }
+        other => Error::from(other),
+    })?;
     if let Some(s3) = resolution.config.s3.as_ref() {
         // `[s3] max_concurrent_uploads` caps in-progress multipart uploads, so an
         // authenticated client cannot accumulate an unbounded number of them.
@@ -420,9 +446,10 @@ pub fn run(
         // of what the deleted `InheritedSocket::absent()` was.
         let controls = adopted.as_ref().map(Adopted::controls).unwrap_or(&[]);
         #[cfg(target_os = "macos")]
-        let plane = Plane::open(options, controls, inherited_socket(adopted.as_ref())?)?;
+        let plane = Plane::open(options, controls, inherited_socket(adopted.as_ref())?)
+            .map_err(|err| classify_plane(err, confined))?;
         #[cfg(not(target_os = "macos"))]
-        let plane = Plane::open(options, controls)?;
+        let plane = Plane::open(options, controls).map_err(|err| classify_plane(err, confined))?;
         plane
     };
 
@@ -465,6 +492,33 @@ fn inherited_socket(adopted: Option<&Adopted>) -> Result<Option<UnixListener>, E
     Ok(Some(sandbox::adopted_control(adopted)?))
 }
 
+/// The control channel's own name, as a refusal about it names the subject: the plane's
+/// transports are a pipe name or a unix socket, and the choice is `api_options`' — nothing here
+/// re-derives which one this run resolved.
+#[cfg(feature = "api")]
+const CONTROL_CHANNEL: &str = "control";
+
+/// [`Plane::open`]'s failure, classified — **the child's own control-channel step**, and the
+/// fourth site §4's wiring caveat names.
+///
+/// A confined child that cannot open what it inherited (or, with no local channel in the
+/// selection, what it must bind itself) is refused by its confinement rather than by the plane:
+/// the launcher hands the channel over precisely because a process inside the container cannot
+/// create a pipe whose DACL names the user, and the child that tries anyway is answered
+/// `ERROR_ACCESS_DENIED` — which arrives here as an io failure and would otherwise read as
+/// "I/O error: Access is denied" with nothing naming the channel.
+///
+/// **The subject is the channel and not the state directory**, which is the one thing this site
+/// says differently from the three path sites: naming the directory would be naming the wrong
+/// thing on Windows, where the control channel is a pipe name and never a path under the root.
+#[cfg(feature = "api")]
+fn classify_plane(err: ApiError, confined: bool) -> Error {
+    match err {
+        ApiError::Io(io) => sandbox::classify_io(io, Refused::Channel(CONTROL_CHANNEL), confined),
+        other => Error::from(other),
+    }
+}
+
 /// What this launcher owes once the child it supervised is gone: the frame stdout gets, and the
 /// exit code this process answers with.
 ///
@@ -489,8 +543,29 @@ fn inherited_socket(adopted: Option<&Adopted>) -> Result<Option<UnixListener>, E
 /// function that both decided the sentence and wrote it would put the one writer in two places —
 /// and could not be driven by a test at all.
 ///
+/// **The refusal is a classification before it is a sentence** (follow-up §4): the child that
+/// never reported readiness is [`Child::attribution`]'s `Broken` answer — the confinement never
+/// applied, so nothing ran confined — and the text this function returns is that value rendered
+/// by `sandbox::describe`, not a string assembled here from the status.
+///
+/// **Only the never-reported child is framed, and the classification says so rather than this
+/// function re-testing it** (follow-up §4): the child's stderr is the operator's, unmediated
+/// (decision 19), so a refusal that happened *after* readiness and any other non-zero exit are one
+/// fact at this boundary, and a status read as a refusal would name a subject this process never
+/// saw. The child that reported and then ended is [`Attribution::Ran`] — the arm that classifies
+/// nothing — and the frame is withheld by matching that arm. Nothing is missing from stdout over
+/// it: a child that reported already spoke on its own stream, and the status is forwarded beside
+/// that rather than reclassified here.
+///
+/// **Both inputs are the child's, so the child is what this reads them from**: the exit status and
+/// whether the relay ever saw a terminal event are one value's own state, and
+/// [`Child::attribution`] reads both of them — a caller that tested the readiness record beside the
+/// classification would be restating what that value already carries.
+///
+/// [`Attribution::Ran`]: crate::_sandbox::Attribution::Ran
+/// [`Child::attribution`]: crate::_sandbox::Child::attribution
 /// [`Child::terminal`]: crate::_sandbox::Child::terminal
-fn launcher_exit(status: ExitStatus, reported: Option<&Terminal>) -> (Option<String>, u8) {
+fn launcher_exit(status: ExitStatus, child: &Child) -> (Option<String>, u8) {
     // A child killed by a signal has no exit code; 1 is the operational failure that is. A code
     // outside `u8` is not this process's to invent either, and answers the same way — the shape
     // the exit-code mapping had before the decision moved here.
@@ -498,14 +573,22 @@ fn launcher_exit(status: ExitStatus, reported: Option<&Terminal>) -> (Option<Str
         Some(code) => u8::try_from(code).unwrap_or(1),
         None => 1,
     };
-    match reported {
-        Some(_) => (None, code),
-        None => (
-            Some(format!(
-                "the confined child exited ({status}) without reporting readiness"
-            )),
-            code,
-        ),
+    // **The classification is the child's own, and this is the one match on it** (follow-up §4):
+    // `attribution` answers `Broken` for the child that never reported and `Ran` for the child
+    // that reported and then ended. Only the first is framed, and the text is that value rendered
+    // by `describe` rather than a string assembled here — a second definer of one sentence would
+    // let the classification and the operator's text drift.
+    let attribution = child.attribution(&status);
+    match &attribution {
+        Attribution::Broken { .. } => (Some(sandbox::describe(&attribution)), code),
+        // **The child that reported owes stdout nothing** — a listener, or a fatal startup
+        // failure it already framed on its own stream: the code is forwarded alone, and
+        // deliberately without a classification, because a refusal after readiness is
+        // indistinguishable here from any other non-zero exit (decision 19 leaves this side no
+        // text to read). `Denied` is matched beside it because the frame is exactly one thing —
+        // the confinement that never applied — and no launcher builds a denial for this function
+        // to frame anyway (the enum's own note is where that limit lives).
+        Attribution::Ran | Attribution::Denied(_) => (None, code),
     }
 }
 
@@ -622,12 +705,13 @@ mod tests {
         io::Write as _,
         path::{Path, PathBuf},
         process::Command,
+        thread,
     };
 
     use tempfile::TempDir;
 
     use super::*;
-    use crate::_sandbox::{Child, Terminal};
+    use crate::_sandbox::{Attribution, Child, Terminal};
 
     /// A confined child that exits with `code` and relays nothing.
     ///
@@ -669,7 +753,7 @@ mod tests {
             "nothing relayed, so the record is the 'never reported' answer"
         );
 
-        let (refusal, code) = launcher_exit(status, child.terminal());
+        let (refusal, code) = launcher_exit(status, &child);
 
         let expected = format!("the confined child exited ({status}) without reporting readiness");
         assert_eq!(
@@ -684,16 +768,71 @@ mod tests {
         );
     }
 
+    /// **The launcher's own refusal is a classification before it is a sentence** (follow-up
+    /// §4): the exit that produces the frame above is [`Attribution::Broken`] — the confinement
+    /// never applied, so nothing ran confined — which is the value [`Child::attribution`] answers
+    /// for a child that never reported and the text `sandbox::describe` renders back out.
+    ///
+    /// **What this leg adds to the one above is the value rather than the text**: that leg pins
+    /// the sentence an operator reads, while this one pins that the sentence is not assembled at
+    /// the call site — a `launcher_exit` that built its own string would fail here even with the
+    /// same words, because the classification behind them would have drifted out of reach.
+    #[test]
+    fn the_launchers_refusal_is_the_attributions_own_rendering() {
+        let mut child = dying(3);
+        let status = supervise(&mut child, || ()).expect("the child is reaped");
+        assert!(
+            child.terminal().is_none(),
+            "nothing relayed, so the record is the 'never reported' answer"
+        );
+
+        let attribution = child.attribution(&status);
+        assert!(
+            matches!(attribution, Attribution::Broken { .. }),
+            "a child that never reported is a confinement that never applied: {attribution:?}"
+        );
+        let expected = sandbox::describe(&attribution);
+
+        let (refusal, code) = launcher_exit(status, &child);
+
+        assert_eq!(
+            refusal.as_deref(),
+            Some(expected.as_str()),
+            "the frame is the classification's rendering, not a second spelling of it"
+        );
+        assert_eq!(
+            code, 3,
+            "and the status is still forwarded rather than rewritten"
+        );
+    }
+
     /// **The other direction, and the one a launcher that framed unconditionally would break**: a
     /// child that did report is a server that started, so a perfectly good run must carry no
     /// `error` frame for its consumer to misread.
+    ///
+    /// **The relay is a real thread rather than an `Option` handed to the classifier**, which is
+    /// the whole of what moved here: the readiness a caller reasoned about by hand is now the
+    /// child's own record, joined by [`Child::wait`] exactly as a launch joins it — and the
+    /// classification this leg pins beside the frame is the same value's own answer
+    /// ([`Child::attribution`]'s `Ran`), so the rule that such a child is framed nothing has one
+    /// home rather than one here and one at the match.
     #[test]
     fn a_child_that_reported_is_never_framed() {
-        let mut child = dying(0);
+        // A thread that already knows the answer stands in for the relay: what the wait joins is
+        // the handle, and what it keeps is the thread's own return value.
+        let relay = thread::spawn(|| Some(Terminal::Listening("127.0.0.1:9000".parse().expect("addr"))));
+        let mut child = dying(0).with_relay(relay);
         let status = supervise(&mut child, || ()).expect("the child is reaped");
-        let reported = Terminal::Listening("127.0.0.1:9000".parse().expect("addr"));
+        assert!(
+            child.terminal().is_some(),
+            "the relay announced, so this is the child that served"
+        );
+        assert!(
+            matches!(child.attribution(&status), Attribution::Ran),
+            "a child that reported and then ended has nothing this side can classify"
+        );
 
-        let (refusal, code) = launcher_exit(status, Some(&reported));
+        let (refusal, code) = launcher_exit(status, &child);
 
         assert_eq!(refusal, None, "a child that reported owes stdout nothing");
         assert_eq!(code, 0, "and its status is still the launcher's answer");

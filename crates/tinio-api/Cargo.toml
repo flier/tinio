@@ -28,9 +28,16 @@ sha1.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros"] }
-tokio-rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
 tracing.workspace = true
-utoipa = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true, features = [
+    "axum_extras",
+    "macros",
+] }
 
 tinio-core.workspace = true
 tinio-util.workspace = true
@@ -45,6 +52,8 @@ tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 tinio-util = { workspace = true, features = ["testing"] }
+
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 tinio-winsec.workspace = true

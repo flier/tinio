@@ -9,12 +9,12 @@ use std::env::consts::OS;
 // this host's test build.
 #[cfg(feature = "sandbox")]
 use std::fs;
-use std::path::Path;
 #[cfg(all(feature = "sandbox", unix))]
 use std::{
     fs::{OpenOptions, Permissions},
     os::unix::fs::{PermissionsExt, symlink},
 };
+use std::{io, path::Path};
 
 use clap::parser::ValueSource;
 
@@ -29,6 +29,11 @@ use super::*;
 use crate::_core::mode::AccessMode;
 #[cfg(feature = "sandbox")]
 use crate::_sandbox;
+// The enforcement vocabulary the legs below drive: the strength a backend answers for, the
+// target question the answer is written against, and the denial a rendering is exercised with.
+// Unconditional, like the seam they come through — this module is compiled in every build, so
+// its tests are too.
+use crate::_sandbox::{Denial, Enforcement, backend_available};
 #[cfg(all(feature = "sandbox", unix))]
 use crate::_util::path::path_contains;
 use crate::{_config::Config, cli::Provenance, commands::start::Args, resolve::Resolution};
@@ -791,6 +796,136 @@ fn the_mapping_follows_the_config() {
             "a configured `local_uid` mapping is what the Linux jail keeps `CAP_CHOWN` for"
         );
     }
+}
+
+/// **A permission refusal a confined child meets is the confinement's own answer, and the
+/// sentence names what was refused** — the classification follow-up §4 asks for, driven at the
+/// one function that makes it.
+///
+/// **Both directions are asserted, because the gate is the whole rule**: outside a confinement
+/// the same syscall failure is the filesystem's own answer, and reclassifying it would put a
+/// sentence about a mechanism on a failure that mechanism never saw. The gate is
+/// `adopted.is_some()` at the call sites (`commands::start::run`), which is the same
+/// discriminator the process entry uses to identify a confined child at all.
+///
+/// **The three kinds are asserted separately**: `PermissionDenied` is what all three mechanisms
+/// answer with, `ReadOnlyFilesystem` is the same fact from a filesystem that spells it `EROFS`
+/// (a read-only mount), and anything else — a missing path under a refused parent is the case
+/// the design's macOS rows measured — must stay the io error it was, because an `ENOENT` is
+/// indistinguishable from a genuine absence at the syscall boundary.
+#[test]
+fn a_confined_childs_permission_refusal_is_the_confinements_own_answer() {
+    let path = Path::new("/srv/data/.tinio");
+    let refused = || Refused::Path(path.to_path_buf());
+    let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+
+    // Inside the confinement: the mechanism is what refused, and the path is in the sentence.
+    let err = classify_io(denied(), refused(), true);
+    let text = format!("{err}");
+    assert!(
+        matches!(&err, Error::SandboxDenied { platform, refused } if *platform == OS && refused.contains("/srv/data/.tinio")),
+        "a confined child's refusal names the path: {text}"
+    );
+    assert_eq!(err.exit_code(), 1, "a startup error, not a bad argument");
+
+    // Outside it, the identical failure is an ordinary io error.
+    let unconfined = classify_io(denied(), refused(), false);
+    assert!(
+        matches!(unconfined, Error::Io(_)),
+        "an unconfined process's filesystem said no: {unconfined}"
+    );
+
+    // The read-only spelling of the same refusal, inside the confinement.
+    let read_only = classify_io(
+        io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
+        refused(),
+        true,
+    );
+    assert!(
+        matches!(read_only, Error::SandboxDenied { .. }),
+        "a read-only mount's `EROFS` is the same denial: {read_only}"
+    );
+
+    // And a kind that is not a refusal stays what it was, confinement or not.
+    let missing = classify_io(io::Error::from(io::ErrorKind::NotFound), refused(), true);
+    assert!(
+        matches!(missing, Error::Io(_)),
+        "an absent path is not a denial, even inside a confinement: {missing}"
+    );
+
+    // The fourth site's subject is a channel rather than a path, and it reads as one.
+    let channel = classify_io(denied(), Refused::Channel("control"), true);
+    let text = format!("{channel}");
+    assert!(
+        text.contains("the `control` channel"),
+        "the control channel's refusal names the channel: {text}"
+    );
+}
+
+/// **The launcher's classification is a value, and the sentence is its rendering** —
+/// [`describe`]'s three arms, driven directly, because the run site's own legs
+/// (`commands::start::run`'s `launcher_exit`) assert the sentences and nothing here needs a
+/// process to prove the classification behind them.
+#[test]
+fn an_attribution_renders_as_the_sentence_it_is() {
+    let broken = Attribution::Broken {
+        detail: "the confined child exited (exit status: 3) without reporting readiness".to_owned(),
+    };
+    assert_eq!(
+        describe(&broken),
+        "the confined child exited (exit status: 3) without reporting readiness",
+        "`Broken`'s text is the detail the refusing site already emits, verbatim"
+    );
+
+    let denied = Attribution::Denied(Denial {
+        platform: OS,
+        refused: Refused::Path(Path::new("/srv/data/.tinio").to_path_buf()),
+        evidence: "Operation not permitted (os error 1)".to_owned(),
+    });
+    let text = describe(&denied);
+    assert!(
+        text.contains("refused `/srv/data/.tinio`") && text.contains("os error 1"),
+        "`Denied`'s sentence names the subject and the evidence: {text}"
+    );
+
+    // **The unnamed refusal is a phrase rather than an empty space**: a launcher that forwarded a
+    // child's exit cannot see what that child was refused (decision 19), and the value says so
+    // in as many words instead of leaving a sentence with a hole in it.
+    let unnamed = describe(&Attribution::Denied(Denial {
+        platform: OS,
+        refused: Refused::Unnamed,
+        evidence: "exit status: 1".to_owned(),
+    }));
+    assert!(
+        unnamed.contains("an operation the platform did not name"),
+        "nothing named is said rather than implied: {unnamed}"
+    );
+
+    // **The third arm is the one no frame is built from, and it still renders a fact**: the
+    // launcher withholds it by matching `Ran` before it renders (`launcher_exit`), so this is
+    // what a caller that renders one anyway reads — the exit named, and no refusal invented
+    // over a child whose stream this side never had (decision 19).
+    let ran = describe(&Attribution::Ran);
+    assert!(
+        ran.contains("reported readiness"),
+        "the arm that classifies nothing still says what happened: {ran}"
+    );
+}
+
+/// The strength this build's confinement applies is the backend's own answer, and the one value
+/// that is not a claim is `NotReported` — never `Unimplemented`, which would name a mechanism
+/// nobody disabled.
+#[test]
+fn the_enforcement_is_the_target_backends_own_answer() {
+    let expected = if backend_available() {
+        Enforcement::Full
+    } else {
+        Enforcement::NotReported
+    };
+    // **The facade's own answer, read where the CLI reads every other platform fact** —
+    // `_sandbox::platform_facts()` above in this file: the crate that owns the mechanism is the
+    // one that answers, and a wrapper here would be a second name for a value with one home.
+    assert_eq!(_sandbox::diagnostics().enforcement, expected);
 }
 
 /// **FR-036's trade names both halves or says nothing** — the four combinations, driven directly,

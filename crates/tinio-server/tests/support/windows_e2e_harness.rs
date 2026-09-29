@@ -20,7 +20,7 @@ use tinio_sandbox::{
         control, sid, testing,
     },
 };
-use tinio_util::testing::kill_and_reap;
+use tinio_util::testing::{job, kill_and_reap};
 
 use super::common::{SECRET_KEY, answer as probe, tinio_bin, wait_for_listening};
 
@@ -134,6 +134,23 @@ fn launcher_command(root: &Path, port: u16) -> Command {
     command
 }
 
+/// Spawn a launcher the one way both run shapes below spawn one: through the job guard, so a leg
+/// that dies **without unwinding** still takes its launcher — and the confined child the launcher's
+/// own job ties to it — with it.
+///
+/// **The guard is not the reaping.** `Drop for Run`/`Exit` still kills and reaps on every path that
+/// returns; what no `Drop` can cover is an abort or a killed test process, and that is the case
+/// this guard exists for (`tinio_util::job`'s module doc owns the mechanism and its limits,
+/// `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §13 the incident).
+///
+/// **The launcher is the process this harness must not leak**, which is why the call is here rather
+/// than at each `.spawn()`: a launcher left alive holds the listener, the job, the ACEs and
+/// `target\<profile>\tinio.exe` open, and the next build of the binary fails at the uplift step
+/// with `access denied` — the failure the legs' own `Drop` doc states from measurement.
+fn spawn_launcher(command: &mut Command) -> Child {
+    job::spawn(command).expect("spawn tinio server")
+}
+
 /// One `tinio server <root> --sandbox` run, from the test's side.
 pub struct Run {
     pub(super) launcher: Child,
@@ -244,11 +261,9 @@ impl Run {
     pub(super) fn spawn(root: &Path, port: u16) -> Self {
         let log = root.with_file_name("launcher.log");
         let stderr = fs::File::create(&log).expect("create the launcher's log");
-        let mut launcher = launcher_command(root, port)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn tinio server");
+        let mut command = launcher_command(root, port);
+        command.stdout(Stdio::piped()).stderr(Stdio::from(stderr));
+        let mut launcher = spawn_launcher(&mut command);
         // The handshake is the harness's; the failure is this leg's, because a
         // launcher's log survives the kill that a child's stderr pipe does not.
         let address = match wait_for_listening(&mut launcher) {
@@ -388,15 +403,15 @@ impl Exit {
     pub(super) fn spawn(root: &Path, port: u16) -> Self {
         let stdout = root.with_file_name("launcher.stdout");
         let log = root.with_file_name("launcher.log");
-        let launcher = launcher_command(root, port)
+        let mut command = launcher_command(root, port);
+        command
             .stdout(Stdio::from(
                 fs::File::create(&stdout).expect("create the launcher's stdout file"),
             ))
             .stderr(Stdio::from(
                 fs::File::create(&log).expect("create the launcher's log"),
-            ))
-            .spawn()
-            .expect("spawn tinio server");
+            ));
+        let launcher = spawn_launcher(&mut command);
         Self {
             launcher,
             stdout,

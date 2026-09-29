@@ -62,6 +62,11 @@ impl Serve {
     /// change what it scans) — and only then is the caller's `env` applied.
     /// The rationale is `clients.rs`'s `spawn_child`; each leg here sets
     /// exactly what it means to set.
+    ///
+    /// **The spawn is guarded** — [`PipedChild::spawn`] goes through
+    /// `tinio_util::job::spawn` — so a leg that dies without unwinding takes
+    /// its servers with it. What the guard covers on each target, and the
+    /// thread it has to be taken on, are that module's doc.
     pub(super) fn spawn(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
         let bin = tinio_bin();
         let mut cmd = Command::new(&bin);

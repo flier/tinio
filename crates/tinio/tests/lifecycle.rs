@@ -36,7 +36,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use tinio_util::testing::kill_and_reap;
+use tinio_util::{job, testing::kill_and_reap};
 
 /// The `tinio` binary under test.
 ///
@@ -117,17 +117,21 @@ fn the_console_handler_reaches_the_shutdown_path() {
 
     // `CREATE_NEW_PROCESS_GROUP` is what makes the child reachable by a console control event:
     // `GenerateConsoleCtrlEvent` targets a process **group**, and without the flag the child
-    // shares this test runner's group — signalling it would signal the runner.
-    let child = Command::new(tinio())
+    // shares this test runner's group — signalling it would signal the runner. **The guard's job
+    // membership is a different attribute and does not touch that address**: the child is still in
+    // the group named here, and it is now also a member of this process's job, so a runner killed
+    // from outside takes the server with it (`tinio_util::job`'s module doc owns the window the
+    // signal keeps).
+    let mut command = Command::new(tinio());
+    command
         .arg("server")
         .arg(&root)
         .args(["--port", "0"])
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(Stdio::from(fs::File::create(&stdout).expect("stdout")))
-        .stderr(Stdio::from(fs::File::create(&stderr).expect("stderr")))
-        .spawn()
-        .expect("spawn");
+        .stderr(Stdio::from(fs::File::create(&stderr).expect("stderr")));
+    let child = job::spawn(&mut command).expect("spawn");
     let mut serving = Serving(child);
 
     // Readiness, out of the file the server is writing: bounded, so a server that never gets

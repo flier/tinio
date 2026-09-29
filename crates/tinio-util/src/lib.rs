@@ -1,6 +1,21 @@
 //! Shared runtime utilities for tinio: small backend-agnostic helpers
 //! built on by both the storage backends and the server.
 //!
+//! - `job` — the guard that makes a test-spawned process die with the test
+//!   process, and `job::spawn`, the one spelling a harness's spawn sites
+//!   use for it. A job object on Windows (`GuardJob`, `guard`), the
+//!   parent-death signal on Linux, nothing on macOS; reachable without the
+//!   `testing` feature, so that its own tests run in the default graph;
+//!   `testing` re-exports the module. **The gate `tests/spawn_guard.rs`
+//!   holds that spelling up**: it fails on a raw `Command::spawn` under
+//!   `crates/*/tests/**` that its allowlist does not name with a reason,
+//!   and a `#[cfg(test)]` module inside `src/` is outside that scan.
+//! - `job_object` — the Win32 job-object call sequence itself (create with
+//!   its limits already set, assign, terminate, close on `Drop`), the one
+//!   primitive `job`'s guard and `tinio-sandbox-windows`'s per-launch `Job`
+//!   are both expressed on. `#[cfg(windows)]` and **not** feature-gated:
+//!   the launcher creates its job in a production build, so this is the one
+//!   part of the crate's Windows FFI that a shipped binary compiles.
 //! - [`lockmap`] — the evicting per-key lock map (multipart part-write
 //!   locks, per-object conditional-PUT locks, per-bucket directory
 //!   mutation locks).
@@ -11,7 +26,9 @@
 //!   the one definer the filesystem backend's read-only guard and the
 //!   server launcher's exposure set share.
 //! - [`process`] — [`kill_and_reap`](process::kill_and_reap), the one
-//!   silent kill-and-reap a spawned child's teardown paths share.
+//!   silent kill-and-reap a spawned child's teardown paths share, and
+//!   [`poll_exit`](process::poll_exit), the bounded poll every wait on a
+//!   child is written on.
 //! - `render` — the one Handlebars renderer (strict mode, no escaping)
 //!   behind the `render` feature, for the status report, the systemd unit
 //!   and the Seatbelt profile.
@@ -35,6 +52,24 @@ pub mod process;
 pub mod render;
 pub mod secret;
 pub mod switch;
+
+// **The job guard sits outside the `testing` feature on purpose.** The feature exists for the
+// conformance suite and everything that pulls in `tinio-core` behind it; the guard needs `std`, a
+// child handle and — on Windows — `GetCurrentProcess`, plus the job-object calls `job_object` owns
+// — on Linux, one `prctl` — and its own tests have to run in the default graph (`cargo test -p
+// tinio-util`, which is what each platform's leg runs) rather than only for a caller who asked for
+// a feature. `testing` re-exports the module, so a harness still spells it `tinio_util::testing::job`.
+#[cfg(any(test, feature = "testing"))]
+pub mod job;
+
+// **`job_object` is the one part of this crate's Windows FFI that a production build compiles**,
+// and the gate above is what keeps that sentence narrow: `tinio-sandbox-windows` creates its
+// per-launch job inside the launcher's own build (design decision 20), so the call sequence the
+// guard and the launcher used to spell twice is gated on the target alone. The guard stays out of
+// those builds, and so does everything behind `testing` — nothing here needs a feature, a
+// `tinio-core` type or `tracing`.
+#[cfg(windows)]
+pub mod job_object;
 
 #[cfg(feature = "testing")]
 pub mod testing;

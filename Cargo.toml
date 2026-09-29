@@ -83,21 +83,14 @@ thiserror = "2.0"
 thread-priority = "3.1"
 time = "0.3"
 tokio = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = [
-    "ring",
-    "tls12",
-    "logging",
-] }
+tokio-rustls = { version = "0.26", default-features = false }
 toml = "1.1"
 tower = "0.5"
 tracing = "0.1"
 tracing-opentelemetry = "0.34"
 tracing-subscriber = "0.3"
 unicode-properties = { version = "0.1", default-features = false }
-utoipa = { version = "6", default-features = false, features = [
-    "axum_extras",
-    "macros",
-] }
+utoipa = { version = "6", default-features = false }
 uuid = "1"
 winapi-util = "0.1"
 windows-service = "0.8"

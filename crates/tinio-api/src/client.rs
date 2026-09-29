@@ -585,7 +585,7 @@ mod tests {
     // Windows, so *their* imports are gated rather than the module: the TCP test at the bottom
     // is platform-neutral and runs on both hosts (it is the only leg of this module that
     // exercises `Control::Tcp`). The Windows pipe dialer and the DACL are Task 10's, gated there.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::sync::Arc;
     use std::{
         io::{Read, Write},
@@ -595,18 +595,24 @@ mod tests {
     };
 
     use tempfile::TempDir;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use tokio::sync::watch;
 
     use super::*;
     use crate::state::State;
-    #[cfg(unix)]
+    // The busy-pool leg's pool name is per-process, and `process` is named by that leg alone: the
+    // unix legs derive their own path from the temp dir they bind in.
+    #[cfg(windows)]
+    use std::process;
+    #[cfg(windows)]
+    use crate::bind::{INSTANCES, bind_pipe, pipe_name};
+    #[cfg(any(unix, windows))]
     use crate::{
-        bind::bind_unix,
         router::{Auth, Context},
-        state::socket_path,
         transport::serve_local,
     };
+    #[cfg(unix)]
+    use crate::{bind::bind_unix, state::socket_path};
 
     #[cfg(unix)]
     #[tokio::test]
@@ -656,6 +662,47 @@ mod tests {
             stop(dir.path()).await.is_err(),
             "stop with nothing to stop is an error"
         );
+    }
+
+    /// **A dial that finds every instance busy is [`Error::Busy`], not a dead channel** — the
+    /// first of §5's two parked scenarios, made a test by this crate's own multi-thread flavor.
+    ///
+    /// Every instance is taken by a connection that stays open, so each attempt inside the retry
+    /// budget answers `ERROR_PIPE_BUSY` and what is left of it is classified rather than raised.
+    /// That classification is the fact two callers part on: [`status`] reports a channel that
+    /// answered nothing as *not running*, while [`stop`] lets the refusal through.
+    ///
+    /// **The flavor is the point, not a detail.** `ClientOptions::open` on the dial path is a
+    /// blocking call, so on the current-thread runtime this test's own dial would stop the only
+    /// thread that could serve it — the reason neither scenario could be written before
+    /// `rt-multi-thread` joined the dev-dependencies (`plans/2026-09-25-sandbox-followups.md` §5).
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_that_finds_the_whole_pool_busy_is_reported_as_busy() {
+        let name = pipe_name(&format!(r"\\.\pipe\tinio-busy-{}", process::id()));
+        let channel = bind_pipe(&name).expect("bind the pool");
+        let (tx, rx) = watch::channel(false);
+        let state = State::new(name.clone(), Some(9000), Path::new("/srv/data")).expect("state");
+        let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::Local, tx));
+        let serving = tokio::spawn(serve_local(channel, shared, rx));
+
+        // Every instance claimed, and held for longer than the whole retry budget (~31 ms). The
+        // handles are the pool's occupancy: a client that drops one gives the instance back, so
+        // they are kept rather than dialled and released.
+        let mut held = Vec::new();
+        for _ in 0..INSTANCES {
+            held.push(ClientOptions::new().open(&name).expect("take an instance"));
+        }
+        sleep(Duration::from_millis(100)).await;
+
+        let err = dial_pipe(&name).await.expect_err("every instance is held");
+        assert!(
+            matches!(err, Error::Busy(_)),
+            "a busy pool is a channel that is there and full, never a missing one: {err:?}"
+        );
+
+        drop(held);
+        serving.abort();
     }
 
     /// R29, pinned: a `200` whose body is not this plane's contract is `false`, not an `Err`.

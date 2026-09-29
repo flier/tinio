@@ -20,6 +20,7 @@ use std::{
 
 use tinio_sandbox_core::Adopted;
 use tinio_sandbox_windows::{launch, socket};
+use tinio_util::job;
 
 /// The socket a child serves on must not block: a `std` listener is created blocking on Windows,
 /// and an inherited one keeps that mode unless the rebuild clears it.
@@ -74,15 +75,18 @@ fn an_inherited_handle_is_the_same_socket_in_the_child() {
     let address = listener.local_addr().expect("address");
     socket::mark_inheritable(&listener).expect("mark inheritable");
 
-    let mut child = Command::new(env::current_exe().expect("current exe"))
+    let mut command = Command::new(env::current_exe().expect("current exe"));
+    command
         .args(["child_role", "--exact"])
         .env("TINIO_SANDBOX_TEST_LISTENER_CHILD", "1")
         .env(
             "TINIO_SANDBOX_TEST_LISTENER",
             socket::value(&listener).to_string(),
-        )
-        .spawn()
-        .expect("spawn the child");
+        );
+    // **The child role is spawned through the guard** (`tinio_util::job`), like every other spawn
+    // in this crate's tests: a test binary that dies without unwinding would otherwise leave this
+    // copy of itself holding the inherited socket and the target dir.
+    let mut child = job::spawn(&mut command).expect("spawn the child");
 
     let mut stream = TcpStream::connect(address).expect("connect through the parent's socket");
     // Bounded before anything reads: a child that failed to rebuild the listener

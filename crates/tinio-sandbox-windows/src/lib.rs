@@ -49,7 +49,8 @@ pub extern crate tinio_sandbox_core as _core;
 use std::slice::from_raw_parts;
 
 use crate::_core::{
-    Backend as BackendTrait, Confinement, LaunchPlan, PlatformFacts, Result, Sandbox,
+    Backend as BackendTrait, Confinement, Diagnostics, Enforcement, LaunchPlan, PlatformFacts,
+    Result, Sandbox,
 };
 
 pub mod acl;
@@ -58,9 +59,24 @@ pub mod control;
 pub mod handles;
 pub mod job;
 pub mod launch;
+// **`pub`, and `path` is the one item that makes it so**: the record's fields,
+// `record_run` and its test seam stay `pub(crate)`, so what a consumer can do with
+// the module is ask where the ledger is — which
+// `tests/confine.rs` asks, because a leg that spelled
+// `%LOCALAPPDATA%\tinio\acl-ledger.jsonl` by hand would pass a rename on this side
+// and then fail with a ledger that is "not there" rather than a path that moved.
+// The crate that owns the file is still the crate that writes the lines.
+pub mod ledger;
 pub mod process;
 pub mod sid;
 pub mod socket;
+// **`pub(crate)`, because the module's only entry point already is**: the launch
+// path calls it and an operator's own process reads its log line, so a `pub` here
+// would expose an empty module to every consumer — a name in the public API that
+// no outside caller can do anything with. What it owns is the AppContainer
+// profiles an unclean exit leaves behind and the sweep that reaps them at launch
+// (design decision 21).
+pub(crate) mod sweep;
 // **Behind this crate's `testing` feature, which no production build turns on.**
 // The module is the conformance device `tinio-server`'s Windows e2e suite and this
 // crate's own suites compose, and `docs/tests.md` puts conformance support in
@@ -102,6 +118,31 @@ pub use self::backend::{Backend, Capability, Options};
 pub const FACTS: PlatformFacts = PlatformFacts {
     launches_child: true,
     ..PlatformFacts::NONE
+};
+
+/// How much of its guarantee this backend's mechanism applies — **the strength the mechanism
+/// answers for**, published beside [`FACTS`] so the crate that owns the mechanism is the crate
+/// that answers for it (the rule [`PlatformFacts`]'s own doc states).
+///
+/// **`Full`, and what that covers**: the child runs inside an AppContainer whose capability
+/// set is the configured one and whose ACL grants name exactly the exposed paths, written
+/// before `CreateProcessW` and left standing afterwards (design §6, §11). It is the whole
+/// guarantee this build's contract claims for the container; the two things the container is
+/// not — a filesystem view (the path namespace stays visible, and access is what is denied) and
+/// a network filter — are `docs/sandbox.md`'s to state, not a gap in what is applied.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::Enforcement;
+///
+/// assert_eq!(
+///     tinio_sandbox_windows::DIAGNOSTICS.enforcement,
+///     Enforcement::Full
+/// );
+/// ```
+pub const DIAGNOSTICS: Diagnostics = Diagnostics {
+    enforcement: Enforcement::Full,
 };
 
 /// The backend for this platform, with its defaults.

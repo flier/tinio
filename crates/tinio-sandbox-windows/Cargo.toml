@@ -6,8 +6,12 @@ description = "Windows AppContainer confinement for tinio: DACL whitelist, conta
 publish = false
 
 [dependencies]
+getrandom.workspace = true
 hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha2.workspace = true
+time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "rt"] }
 tracing.workspace = true
 # **Optional, and on the `testing` feature, because what wants it is lib code**: the
@@ -23,8 +27,11 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
