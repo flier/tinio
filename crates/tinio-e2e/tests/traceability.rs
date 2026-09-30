@@ -45,6 +45,15 @@ use std::{
 #[allow(dead_code)]
 mod sigv4;
 
+/// The runner's default tag filter (Task A1): the platform rule is one
+/// function over the target, and the cucumber binary is `harness = false`, so
+/// its unit tests ride this default-harness binary — the same include
+/// `steps/sigv4.rs` above uses. `default_filter` is what the cucumber
+/// binary's `main` calls, so nothing here is test-only dead code.
+#[cfg(test)]
+#[path = "steps/tag_filter.rs"]
+mod tag_filter;
+
 /// IDs referenced by the spec documents but verified outside the cucumber
 /// suite, each with the reason (mirrored in the s3-surface.md "Automated
 /// coverage" section note).
@@ -57,8 +66,9 @@ mod sigv4;
 /// `tests/features/cli_lifecycle.feature` — the same assertions, driven through
 /// the real binary from the cucumber suite. FR-016 stays: the two scenarios
 /// that prove the environment and `.env` levels reach the parser are
-/// `cli_lifecycle.feature`'s, while the chain's flag and config-file levels are
-/// still the config layer's own tests (T018).
+/// `cli_lifecycle.feature`'s, the chain's flag and config-file levels are
+/// `confinement.feature`'s precedence rows, and `.env` loading itself is still
+/// the config layer's (T018).
 const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // FR-001: meta-requirement ("serve an S3-compatible interface over
     // HTTP for a user-chosen local storage root") — verified by the suite
@@ -75,10 +85,13 @@ const NOT_COVERED_BY_CUCUMBER: &[&str] = &[
     // script (T089) and the Rust streaming-mechanics tests.
     "FR-010",
     // FR-016: configuration precedence / `.env` loading — not
-    // S3-observable; the flag and config-file levels are the tinio-config
-    // tests' (T018), and the environment and `.env` levels are the two
-    // cli_lifecycle.feature scenarios' (a child spawned with `TINIO_PORT`
-    // and a `.env` written into the state dir).
+    // S3-observable; the two halves have different homes: `.env` *loading*
+    // (reading and parsing the file) is still the config layer's (T018),
+    // while every *level* of the chain is a process-surface leg now — the
+    // flag and config-file levels are `confinement.feature`'s precedence
+    // rows, and the environment and `.env` levels are that file's dotenv
+    // rows plus `cli_lifecycle.feature`'s two spawn legs (a child with
+    // `TINIO_PORT`, a `.env` written into the state dir).
     "FR-016",
     // FR-017: access logging / OTel export — not S3-observable; verified
     // by the tinio-server log tests (T052/T053).

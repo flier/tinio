@@ -41,8 +41,6 @@ mod tests;
 
 use std::{env::consts::OS, io};
 
-use parse_display::Display;
-
 pub(crate) use child::on_stop;
 pub use child::{adopted_control, adopted_listener, apply_self_confinement, filter_argv};
 pub use confine::confine;
@@ -55,7 +53,7 @@ pub(crate) use product::{
 };
 
 use crate::{
-    _sandbox::{self, Attribution, Denial, Refused},
+    _sandbox::{self, Attribution, Refused},
     Error,
 };
 
@@ -63,9 +61,7 @@ use crate::{
 /// with and the sentence it reports**.
 ///
 /// `Broken`'s text is its `detail`, so a caller that reports a broken confinement prints the
-/// same words whether it went through this function or read the field; `Denied` has no
-/// sentence of its own until here, because the denial is a value with a subject and the
-/// sentence is what a report adds.
+/// same words whether it went through this function or read the field.
 ///
 /// **`Ran`'s text is the one no frame is built from, and `launcher_exit` withholds it by
 /// matching the arm rather than by rendering it**: a child that reported readiness and then
@@ -77,18 +73,7 @@ use crate::{
 ///
 /// ```
 /// use tinio_cli::sandbox::describe;
-/// use tinio_sandbox::{Attribution, Denial, Refused};
-///
-/// let denial = Attribution::Denied(Denial {
-///     platform: "linux",
-///     refused: Refused::Channel("control"),
-///     evidence: "Operation not permitted (os error 1)".to_owned(),
-/// });
-/// assert_eq!(
-///     describe(&denial),
-///     "the confinement on `linux` refused the `control` channel: \
-///      Operation not permitted (os error 1)"
-/// );
+/// use tinio_sandbox::Attribution;
 ///
 /// // The arm no frame is built from renders the fact rather than a refusal: the child
 /// // reported readiness and then ended, and nothing on this side can say more than that.
@@ -100,56 +85,12 @@ use crate::{
 pub fn describe(attribution: &Attribution) -> String {
     match attribution {
         Attribution::Broken { detail } => detail.clone(),
-        // **The sentence and its evidence, in that order, through [`denied_sentence`]** — the
-        // frame's one definer ([`DeniedSentence`]), which `Error::SandboxDenied`'s `Display`
-        // reads too.
-        Attribution::Denied(denial) => {
-            format!("{}: {}", denied_sentence(denial), denial.evidence)
-        }
         // **The arm that classifies nothing still renders what happened rather than an empty
         // string**: no run frames this one — `launcher_exit` emits nothing for a child that
         // reported and then ended (decision 19 leaves its stderr the operator's) — and the
         // sentence is here so that a caller rendering it anyway reads a fact instead of a hole.
         Attribution::Ran => "the confined child reported readiness and then exited".to_owned(),
     }
-}
-
-/// `the confinement on <platform> refused <subject>` — **the frame both renderings of a denial
-/// are built on**: [`describe`] for an [`Attribution`] and `Error::SandboxDenied`'s `Display`
-/// for the error a confined child's io failure becomes.
-///
-/// **One definer, because the two are one operator-facing sentence.** A denied write and a
-/// denied channel are the same fact about the same mechanism, and two `format!`s a file apart
-/// would let a rewording reach one and not the other — `Error::SandboxDenied`'s doc already
-/// states the rule this type is what keeps.
-///
-/// **It holds the two fields borrowed rather than a sentence already built, and that shape is
-/// the `#[error]` attribute's.** The variant's `Display` is generated against `&self`, so the
-/// expression the attribute carries is evaluated against borrows of the variant's own fields: a
-/// `String` built there would allocate on every rendering of the error, and a `&str` cut from
-/// those fields cannot be returned at all — a `Display` that writes the frame straight into the
-/// formatter needs neither. [`denied_sentence_for`] is the constructor the attribute names, and
-/// it takes exactly the two fields the variant holds.
-#[derive(Display)]
-#[display("the confinement on `{platform}` refused {refused}")]
-pub(super) struct DeniedSentence<'a> {
-    /// The platform whose confinement refused.
-    platform: &'a str,
-    /// What it refused, as the core's `Refused` renders it.
-    refused: &'a str,
-}
-
-/// [`DeniedSentence`] over the two fields `Error::SandboxDenied` holds — **the entry point its
-/// `#[error]` attribute calls**, and the one [`denied_sentence`] is expressed on, so the frame
-/// has one format string rather than two.
-pub(super) fn denied_sentence_for<'a>(platform: &'a str, refused: &'a str) -> DeniedSentence<'a> {
-    DeniedSentence { platform, refused }
-}
-
-/// [`denied_sentence_for`] over the core's own value: the platform is the denial's, and the
-/// subject is [`describe_refused`]'s rendering of the [`Refused`] it names.
-pub(super) fn denied_sentence(denial: &Denial) -> String {
-    denied_sentence_for(denial.platform, &describe_refused(&denial.refused)).to_string()
 }
 
 /// The confinement's own answer to an io failure this process met — **or the failure itself,
@@ -217,26 +158,29 @@ fn refused_by_confinement(kind: io::ErrorKind) -> bool {
 }
 
 /// A refusal's subject, as this crate's sentences spell it: the core's vocabulary rendered
-/// rather than re-derived, so the word for "a path" and the word for "nothing was named" have
-/// one home each.
+/// rather than re-derived, so the word for "a path" and the word for a channel have one home
+/// each. It is the subject half of `Error::SandboxDenied`'s frame, and that variant owns the
+/// operator-facing sentence around it.
 fn describe_refused(refused: &Refused) -> String {
     match refused {
         Refused::Path(path) => format!("`{}`", path.display()),
         Refused::Channel(name) => format!("the `{name}` channel"),
-        Refused::Unnamed => "an operation the platform did not name".to_owned(),
     }
 }
 
 /// Map a facade confinement error into the CLI's exit-code vocabulary.
 ///
-/// An operator typo ([`tinio_sandbox::Error::is_usage`]) is usage (exit 2). A child-side
-/// handoff this platform does not perform stays the operational sentence the facade's source
-/// carries. Every other sandbox failure stays operational (exit 1).
+/// An operator typo ([`tinio_sandbox::Error::Usage`]) is usage (exit 2); its message is the
+/// operator-facing sentence the platform built, rendered by the core error it arrived as. A
+/// child-side handoff this platform does not perform stays the operational sentence the facade's
+/// source carries. Every other sandbox failure stays operational (exit 1).
 fn sandbox_err(err: _sandbox::Error) -> Error {
-    if err.is_usage() {
-        return Error::Usage(err.to_string());
-    }
     match err {
+        // The class is the core's variant, not a sentence a caller matches: one operator mistake
+        // answers one exit code whichever platform's selector raised it. The `@` binding renders
+        // the core error itself, so the operator's text stays byte-identical to what the
+        // `Unsupported` days printed.
+        usage @ _sandbox::Error::Usage { .. } => Error::Usage(usage.to_string()),
         // The three handoff steps, named by the crate that raises them: a caller matching the
         // literals here would have this answer (exit 1, operational) change silently under a
         // rename in the facade.

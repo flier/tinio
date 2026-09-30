@@ -16,9 +16,6 @@
 //! contains/omits/equals) live here too, so a new feature does not have
 //! to hunt for them in a feature-specific step module.
 
-/// Not used on every target: the sweep below is macOS's alone.
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::{
     io,
     io::ErrorKind,
@@ -51,6 +48,7 @@ use crate::{
         identity::IdentityFromConfig,
     },
 };
+use tinio_sandbox::Event;
 
 /// Repeatable body of length `n`: `(i * 31 + 7) % 256` at position `i`.
 /// The ONE byte generator the steps share (F14): the upload-vs-verify
@@ -647,6 +645,35 @@ pub(super) async fn sorted_entries(dir: &Path) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+/// Feed one line of a child's event stream into `frame`, returning the event when the line closes
+/// a frame, and clearing `frame` either way.
+///
+/// **A frame is not a line** (design decision 19): `Event::encode` writes an `event:` line, a
+/// `data:` line and the blank line that closes them, so a decoder fed one line at a time sees an
+/// event name with no payload and drops it; accumulating to the blank line is what makes that
+/// line the frame's end rather than a line to skip. Text that is not one of our frames is dropped
+/// rather than fatal, which is what makes a stray write to stdout harmless.
+///
+/// The line's own terminator is not significant: it is trimmed and re-emitted as `\n`, so a
+/// reader holding a pipe's raw CRLF and one holding an already trimmed line build the same frame
+/// text, which `sse-core` dispatches alike.
+///
+/// **The one home in this crate**: `steps/cli.rs`'s `frames` reads a whole captured stream with it
+/// and `steps/clients.rs`'s readiness reader reads a live pipe with it, so a frame means the same
+/// thing on both — a captured file and a stream still being written.
+/// (`crates/tinio-server/tests/common/mod.rs`'s `frame_line` is the same rule for the legs that
+/// live beside that crate, whose `tests/` tree this one cannot import.)
+pub fn frame_line(frame: &mut String, line: &str) -> Option<Event> {
+    if line.trim_end().is_empty() {
+        let event = Event::decode(frame);
+        frame.clear();
+        return event;
+    }
+    frame.push_str(line.trim_end());
+    frame.push('\n');
+    None
 }
 
 /// Split a raw HTTP response into status, headers, and (de-chunked) body.

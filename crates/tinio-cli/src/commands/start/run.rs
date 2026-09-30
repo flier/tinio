@@ -585,10 +585,8 @@ fn launcher_exit(status: ExitStatus, child: &Child) -> (Option<String>, u8) {
         // failure it already framed on its own stream: the code is forwarded alone, and
         // deliberately without a classification, because a refusal after readiness is
         // indistinguishable here from any other non-zero exit (decision 19 leaves this side no
-        // text to read). `Denied` is matched beside it because the frame is exactly one thing —
-        // the confinement that never applied — and no launcher builds a denial for this function
-        // to frame anyway (the enum's own note is where that limit lives).
-        Attribution::Ran | Attribution::Denied(_) => (None, code),
+        // text to read).
+        Attribution::Ran => (None, code),
     }
 }
 
@@ -820,7 +818,8 @@ mod tests {
     fn a_child_that_reported_is_never_framed() {
         // A thread that already knows the answer stands in for the relay: what the wait joins is
         // the handle, and what it keeps is the thread's own return value.
-        let relay = thread::spawn(|| Some(Terminal::Listening("127.0.0.1:9000".parse().expect("addr"))));
+        let relay =
+            thread::spawn(|| Some(Terminal::Listening("127.0.0.1:9000".parse().expect("addr"))));
         let mut child = dying(0).with_relay(relay);
         let status = supervise(&mut child, || ()).expect("the child is reaped");
         assert!(

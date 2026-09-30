@@ -3,20 +3,26 @@
 //!
 //! Default tag filter: scenarios that cannot pass in this build are excluded
 //! unless the user passes an explicit `--tags` on the CLI. The four exclusion
-//! axes are independent: `@parquet` drops out unless the binary was compiled
-//! `--features parquet` (the parquet input reader lives behind
-//! `tinio-server/select-parquet`, off by default); the platform-bound
-//! scenarios (`@unix`/`@windows`) drop out on the platform whose step
-//! definitions do not exist, because `fail_on_skipped()` would turn their
-//! undefined steps into a failure; the external client tags
+//! axes are independent (`steps/tag_filter.rs` owns the composition): `@parquet`
+//! drops out unless the binary was compiled `--features parquet` (the parquet
+//! input reader lives behind `tinio-server/select-parquet`, off by default);
+//! a platform-bound scenario (`@linux`/`@macos`/`@windows`/`@unix`) drops out on
+//! every target its tags do not match — the step definitions exist only where
+//! it may run, and `fail_on_skipped()` would turn their absence into a failure —
+//! so a scenario carrying several platform tags runs where at least one
+//! matches; the external client tags
 //! (`@interop`/`@boto3`/`@mc`) drop out unless `TINIO_E2E_EXTERNAL=1` — the
 //! same "opt-in" semantics the old `#[ignore]` integration tests had; and the
-//! host-bound confinement scenarios (`@confinement`) run on macOS, whose
-//! launcher binds and spawns the confined child rather than paying a grant, and
-//! drop out elsewhere unless `TINIO_E2E_CONFINEMENT=1` — a Windows target pays
-//! the launcher's ACL grant, and no budget here covers what `docs/tests.md`'s
-//! "Grant cost" measures (see that section's owner rule; the platform
-//! scripts are the real gate).
+//! host-bound confinement scenarios (`@confinement`) run by default on macOS,
+//! whose launcher binds and spawns the confined child rather than paying a
+//! grant, and drop out elsewhere — `TINIO_E2E_CONFINEMENT` overrides that
+//! per-host default in both directions (`1`/`true` keeps the family on every
+//! target, `0`/`false` drops it on every target, macOS included — CI's macOS
+//! parallel pass is that state's reader), and any other value stops the run
+//! rather than picking a side (`steps/tag_filter.rs` owns the grammar): a
+//! Windows target pays the launcher's ACL grant, and no budget here covers what
+//! `docs/tests.md`'s "Grant cost" measures (see that section's owner rule; the
+//! platform scripts are the real gate).
 //!
 //! `TINIO_E2E_REPORT=<path>` additionally writes a Cucumber-JSON report
 //! to the given file (CI uses this for the PR test report).
@@ -43,7 +49,7 @@ use cucumber::{
     WriterExt as _,
     writer::{Basic as BasicWriter, Coloring, Json as JsonWriter, Verbosity},
 };
-use steps::{World, configure};
+use steps::{World, configure, tag_filter};
 use tokio::runtime::Builder;
 
 /// The stack the runner's own thread is given: 32 MiB.
@@ -74,36 +80,34 @@ fn main() {
     //
     // Three independent axes: the cargo feature decides `@parquet` (without the
     // reader compiled in, those scenarios can only 501), the target platform
-    // decides `@unix`/`@windows` (each platform-bound scenario's steps exist
-    // only where it can run — the systemd notify socket is a unix datagram)
-    // and `@confinement` (macOS runs the confinement: its launcher binds and
-    // spawns, with no grant to budget; a Windows target owes an ACE grant whose
-    // measured cost tens of seconds of variance), and the env opt-ins decide
-    // the external-client tags (they need third-party binaries) and the
-    // confinement scenarios off macOS.
+    // decides the platform tags (each platform-bound scenario's steps exist
+    // only where its tags match — the systemd notify socket is a unix datagram,
+    // and a launcher scenario tagged `@macos @windows` runs on both) and
+    // `@confinement` (macOS runs the confinement by default: its launcher binds
+    // and spawns, with no grant to budget; a Windows target owes an ACE grant
+    // whose measured cost tens of seconds of variance), and the env opt-ins
+    // decide the external-client tags (they need third-party binaries) and,
+    // through `TINIO_E2E_CONFINEMENT`'s explicit states, the confinement
+    // scenarios on every target.
     if !env::args().any(|a| a == "--tags") {
-        let mut excluded = Vec::new();
-        if !cfg!(feature = "parquet") {
-            excluded.push("@parquet");
+        // The confinement switch is three-state — unset (the target's own
+        // default), `1`/`true` (force in) and `0`/`false` (force out) — and a
+        // value that is none of those stops the run here, before any scenario
+        // starts, rather than silently defaulting (`tag_filter` owns the
+        // grammar, the same one `TINIO_SANDBOX` reads).
+        let confinement = match env::var("TINIO_E2E_CONFINEMENT") {
+            Ok(value) => tag_filter::parse_confinement(Some(&value)),
+            Err(env::VarError::NotPresent) => Ok(tag_filter::Confinement::Platform),
+            Err(env::VarError::NotUnicode(value)) => Err(format!("not valid UTF-8: {value:?}")),
         }
-        excluded.push(if cfg!(windows) { "@unix" } else { "@windows" });
-        if env::var_os("TINIO_E2E_EXTERNAL").is_none() {
-            excluded.extend(["@interop", "@boto3", "@mc"]);
-        }
-        // `@confinement` is host-bound, and macOS is the one arm a leg gets:
-        // its launcher binds and spawns the confined child, with no grant to
-        // budget. A Windows target pays the launcher's ACL grant — measured
-        // here at 4.6 s one run and past 120 s the next — so no leg can budget
-        // it and the capable host opts in.
-        if !cfg!(target_os = "macos") && env::var_os("TINIO_E2E_CONFINEMENT").is_none() {
-            excluded.push("@confinement");
-        }
-        if !excluded.is_empty() {
-            let filter = excluded
-                .iter()
-                .map(|tag| format!("not {tag}"))
-                .collect::<Vec<_>>()
-                .join(" and ");
+        .unwrap_or_else(|refusal| panic!("TINIO_E2E_CONFINEMENT: {refusal}"));
+        let filter = tag_filter::default_filter(
+            env::consts::OS,
+            cfg!(feature = "parquet"),
+            env::var_os("TINIO_E2E_EXTERNAL").is_some(),
+            confinement,
+        );
+        if !filter.is_empty() {
             unsafe {
                 env::set_var("CUCUMBER_FILTER_TAGS", filter);
             }

@@ -6,6 +6,13 @@ expected-bucket-owner mismatch, list_buckets per principal. Driven by the
 @boto3 cucumber scenario (`interop/journey.feature`): `python3
 boto3_journey.py <endpoint>`. Best-effort client per FR-025 (targeted/
 manual, NOT CI-gated).
+
+A second argument, `--read-only`, swaps the journey for the SDK's own
+read-only expectations (G22 of the sandbox BDD plan): the server behind the
+endpoint was spawned `--read-only --sandbox`, so every mutating operation
+answers `AccessDenied` and this asserts the *SDK's* rendering of that
+refusal. The journey body below is untouched by that arm — it `sys.exit`s
+before reaching it.
 """
 
 import sys
@@ -26,6 +33,57 @@ s3 = boto3.client(
     region_name="us-east-1",
     config=Config(signature_version="s3v4"),
 )
+
+
+def read_only_checks(client):
+    """The read-only arm (G22): the SDK's own refusal shape for the mutating
+    operations `contracts/s3-surface.md` §Read-only mode lists — sampled one per
+    class (bucket and object) rather than swept, because the server-side answer
+    itself is `confinement.feature`'s G9 and this leg is about how botocore
+    renders it. The fixture is discovered rather than named: the scenario plants
+    a bucket with one object on disk, and the read of that object is asserted so
+    a dead or unauthenticated endpoint cannot pass this."""
+
+    def refused(label, call):
+        """Assert `call()` raises botocore's ClientError carrying the service's
+        own refusal — the SDK's shape, not a generic failure."""
+        try:
+            call()
+        except client.exceptions.ClientError as err:
+            error = err.response["Error"]
+            status = err.response["ResponseMetadata"]["HTTPStatusCode"]
+            assert (error["Code"], status, error["Message"]) == (
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ), f"{label}: {error['Code']} {status} {error['Message']!r}"
+        else:
+            raise AssertionError(f"{label} was not refused")
+
+    buckets = [b["Name"] for b in client.list_buckets()["Buckets"]]
+    assert buckets, "the read-only fixture planted no bucket"
+    bucket = buckets[0]
+    keys = [o["Key"] for o in client.list_objects_v2(Bucket=bucket).get("Contents", [])]
+    assert keys, f"the read-only fixture planted no object under {bucket}"
+    body = client.get_object(Bucket=bucket, Key=keys[0])["Body"].read()
+    assert body, "a read of the planted object answered no body"
+
+    refused("CreateBucket", lambda: client.create_bucket(Bucket="boto3-refused"))
+    refused(
+        "PutObject",
+        lambda: client.put_object(Bucket=bucket, Key="new.txt", Body=b"refused"),
+    )
+    refused(
+        "DeleteObject",
+        lambda: client.delete_object(Bucket=bucket, Key=keys[0]),
+    )
+    refused("DeleteBucket", lambda: client.delete_bucket(Bucket=bucket))
+
+
+if "--read-only" in sys.argv[2:]:
+    read_only_checks(s3)
+    print("BOTO3 READ-ONLY OK")
+    sys.exit(0)
 
 # Basic journey.
 s3.create_bucket(Bucket="boto3-bucket")

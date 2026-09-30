@@ -107,9 +107,8 @@ pub use self::backend::{Backend, Capability, Options};
 /// What this mechanism does, for a caller that branches on the fact rather than the OS.
 ///
 /// **The launcher answer, minus the macOS facts**: this backend starts a supervised child, and
-/// the three facts a *launch* owns are Seatbelt's rather than its — it refuses no derived state
-/// directory, proves nothing writable before launching, and reads handle values rather than
-/// rebuilding a socket.
+/// the two facts a *launch* owns are Seatbelt's rather than its — it refuses no derived state
+/// directory and proves nothing writable before launching.
 ///
 /// **Ending the child is not among these facts**, and this backend does end one: like every
 /// launcher platform it installs a killer (`TerminateJobObject` on the job it holds), so a launch

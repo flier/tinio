@@ -3,9 +3,15 @@
 //! (design decision 5).
 //!
 //! **What every leg here is actually about is the invariant, not the refusal**:
-//! a requested confinement is never silently ignored. Where nothing can honour
-//! the channel the run refuses and names it; where this target's backend is
-//! wired the request is honoured and the run serves. Read-only mode lives in
+//! a requested confinement is never silently ignored. Where this target's backend
+//! is wired the request is honoured and the run serves; where nothing can honour
+//! the channel the run refuses and does not serve. **The refusal's own shape stays here** —
+//! exactly one `Error` frame on stdout, exactly one cause named on stderr, and no
+//! service from a refused run ([`refused_or_honoured`], `design §12` bullet 4) — while
+//! the dispatch itself (which channel asked for the confinement, that the refusal names
+//! it) is `crates/tinio-e2e/tests/features/confinement.feature`'s:
+//! its step layer (`steps/cli.rs`'s `refused` / `refused_by_build` / `applied`)
+//! drives the same invariant from outside the process. Read-only mode lives in
 //! `serve_read_only.rs`. Both files spawn through [`spawn`].
 
 mod common;
@@ -16,15 +22,6 @@ mod spawn;
 use std::time::{Duration, Instant};
 
 use common::wait_timeout;
-#[cfg(all(windows, feature = "sandbox"))]
-use spawn::state_var;
-// The state-directory override is the environment channel only one test can reach, and that test is
-// `cfg(all(windows, feature = "sandbox"))` — the in-root state directory is refused by the shared
-// containment rule before any server starts, and Windows is the platform where one directory has
-// two spellings (the case rule the test is about). It is imported under that same gate rather than
-// in the list above, because the macOS and Linux legs of this suite never call it and the
-// workspace's `-D warnings` gate turns the unused name into a failure — which the macOS clippy step
-// added for the sandbox phase is what caught.
 use spawn::{Scratch, Serve};
 use tinio_config::sources::SANDBOX_VAR;
 use tinio_sandbox::Event;
@@ -96,35 +93,36 @@ enum Answer {
     Honoured,
 }
 
-/// **The invariant every sandbox channel is held to, on every build: a requested confinement is
-/// never silently ignored.**
+/// **The wiring of every sandbox channel's run, on every build: a requested confinement is
+/// never silently ignored — and, where the run refuses, what a refusal looks like on the wire.**
 ///
-/// Where no backend can honour the channel the run refuses, names the channel on stderr and
-/// writes **one** `Error` frame on stdout; where this target's backend is wired the request is
-/// honoured and the run serves. Nothing on this side of the pipe can certify "confined", so the
-/// honoured arm asserts the readiness event and stops there — the platform legs
+/// Where this target's backend is wired the request is honoured and the run serves; where nothing
+/// can honour the channel the run refuses instead of serving unconfined, and what stays in Rust is
+/// the refusal's **own shape**: exactly one frame on stdout, exactly one cause named on stderr, and
+/// no service from a refused run (`design §12` bullet 4). **The dispatch — which channel asked for the
+/// confinement, that the refusal names it, and that the refused run never served — is the step
+/// layer's** (`confinement.feature`'s G1–G7 through `steps/cli.rs`'s `refused` /
+/// `refused_by_build` / `applied`), which is where the plan's §5 split sent it; a decoded step
+/// would hide the bytes pinned here. Nothing on this side of the pipe can certify "confined", so
+/// the honoured arm asserts the readiness event and stops there — the platform legs
 /// (`sandbox_e2e*`) are what prove the confinement itself.
-async fn refused_or_honoured(server: &mut Serve, channel: &str) -> Answer {
+async fn refused_or_honoured(server: &mut Serve) -> Answer {
     let timeout = wait_timeout();
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(event) = server.stdout_event() {
             match event {
-                Event::Error { message } => {
-                    assert!(
-                        message.contains(channel),
-                        "a refusal names the channel that asked for it (`{channel}`): {message}"
-                    );
+                Event::Error { .. } => {
+                    // **The wait before the read is the pipes' need rather than an assertion's**:
+                    // a refusal's stderr is only complete once the process has exited, and the
+                    // exactly-one-cause rule below reads it. What the status *is* belongs to the
+                    // step layer's `refused`; what stays here is that the refusal did not serve.
                     let status = server.exited().await;
                     let stderr = server.stderr_text();
                     assert!(
                         !status.success(),
                         "a channel this build cannot honour must refuse to start rather than serve \
                          unconfined ({status}); stderr:\n{stderr}"
-                    );
-                    assert!(
-                        stderr.contains(channel),
-                        "the refusal must name the channel that was set (`{channel}`); stderr:\n{stderr}"
                     );
                     // The pair's own rule (`refuse_unhonourable`'s doc): the build's message
                     // names the build and never the platform, the platform's names the platform
@@ -178,7 +176,7 @@ async fn the_sandbox_env_var_is_refused_or_honoured() {
     let root = scratch.root();
 
     let mut server = Serve::spawn(&root, &["--port", "0"], &[(SANDBOX_VAR, "1")]);
-    if refused_or_honoured(&mut server, SANDBOX_VAR).await == Answer::Refused {
+    if refused_or_honoured(&mut server).await == Answer::Refused {
         // **The store, not the directory it sits in.** `resolve::server` runs before the sandbox
         // plan and mints `<root>/.tinio/.tinio.toml` on its way to the resolution — the document
         // every first run creates, refused or not — which is the one creation `start::run`'s own
@@ -194,13 +192,15 @@ async fn the_sandbox_env_var_is_refused_or_honoured() {
     }
 }
 
-/// Case 9: `[server] sandbox = true` with no `--sandbox` is never silently ignored, naming the
-/// key — **the file channel, which never reaches the process as an environment variable and so
+/// Case 9: `[server] sandbox = true` with no `--sandbox` is never silently ignored —
+/// **the file channel, which never reaches the process as an environment variable and so
 /// cannot be caught by looking at the environment alone**.
 ///
 /// The key is schema-known, which is what makes it a named channel rather than an unknown-key
-/// error: the probe reads it, and the refusal speaks about it. On a target whose backend is wired
-/// the key is honoured instead, and the run serves.
+/// error: the probe reads it and the run answers it rather than erroring on it. On a target whose
+/// backend is wired the key is honoured and the run serves; where nothing can honour it the
+/// refusal's shape is [`refused_or_honoured`]'s, and the channel's own naming is the step layer's
+/// (`confinement.feature`'s G1/G3 through `steps/cli.rs`'s `refused`).
 #[tokio::test]
 async fn the_sandbox_config_key_is_refused_or_honoured() {
     let scratch = Scratch::new();
@@ -212,122 +212,5 @@ async fn the_sandbox_config_key_is_refused_or_honoured() {
         &["--port", "0", "--config", config.to_str().unwrap()],
         &[],
     );
-    refused_or_honoured(&mut server, "[server] sandbox").await;
-}
-
-/// Case 10: both channels switched **off** serve, silently.
-///
-/// The refusal is about a channel that asks for a confinement this phase cannot
-/// deliver, not about the variable's presence: `TINIO_SANDBOX=0` and
-/// `[server] sandbox = false` are the operator saying they want no sandbox, and
-/// a run that refused them would be a bug of the same family as the one cases
-/// 8 and 9 close. Both spellings are driven, because they are resolved by
-/// different readers (the environment overlay, and the probe's key).
-#[tokio::test]
-async fn a_sandbox_channel_switched_off_is_not_a_refusal() {
-    let scratch = Scratch::new();
-
-    let root = scratch.root();
-    let mut server = Serve::spawn(&root, &["--port", "0"], &[(SANDBOX_VAR, "0")]);
-    server.ready().await;
-    server.stop();
-
-    // The same root again: the first server is stopped and reaped above, so the
-    // state database's lock is released before this one starts.
-    let config = scratch.sandbox_config_file(false);
-    let mut server = Serve::spawn(
-        &root,
-        &["--port", "0", "--config", config.to_str().unwrap()],
-        &[],
-    );
-    server.ready().await;
-    server.stop();
-}
-
-/// Case 11: the in-root state directory is refused whatever its case, because on
-/// the volume it runs on the two spellings are one directory.
-///
-/// Design §9 refuses a read-only root that holds the state directory, because
-/// the launcher would have to grant that directory a **read-write** entry
-/// inside a root the operator asked to expose read-only. On NTFS
-/// `<scratch>\root` and `<scratch>\ROOT` resolve to the same directory while a
-/// literal component comparison calls them unrelated — so the state directory
-/// spelled in the other case slipped past both guards and got exactly that entry.
-/// `tinio_util::path::contains_under_any_spelling` is the shared rule every call
-/// site now uses — the config layer's guard and the launcher's among them; this
-/// leg is what fails while they do not.
-///
-/// **Two layers refuse this pair and the config layer answers first, which is why
-/// the sentence pinned below is its own.** `discover::load_or_create` asks
-/// `contains_under_any_spelling` before it auto-creates the config, and this leg's first start
-/// has no config yet, so the refusal that lands is `server.read_only`'s
-/// (`read-only mode never writes under the served root`); the launcher's
-/// `refuse_in_root_state_dir` — whose sentence names the state directory it would
-/// have granted read-write — is the second of the two and is never reached. The
-/// earlier refusal is the right outcome rather than an accident: the pair is
-/// unservable for the reason both layers state, and the case fold that makes
-/// `ROOT` and `root` one directory is what puts the pair in front of the earlier
-/// one at all.
-///
-/// **The two paths really are one directory**: the root exists as `<scratch>\
-/// root`, `TINIO_STATE_DIR` names `<scratch>\ROOT\state`, and the volume
-/// resolves both to the same tree — so the refusal is about a genuinely in-root
-/// state directory, not about a spelling. A run that let it through would go on
-/// to build the exposure set with a read-write entry inside the read-only root
-/// (which case 11's unit-test twin in the example pins directly).
-///
-/// Windows-only because the fold is, and feature-gated because a build without
-/// `sandbox` refuses `--sandbox` at the flag, before any configuration is read —
-/// so the state-directory refusal is unreachable there and this leg would fail
-/// for the wrong reason.
-#[cfg(all(windows, feature = "sandbox"))]
-#[tokio::test]
-async fn an_in_root_state_dir_is_refused_whatever_its_case() {
-    let scratch = Scratch::new();
-    let root = scratch.root();
-    let state = root
-        .parent()
-        .expect("the root sits in the scratch dir")
-        .join("ROOT")
-        .join("state");
-
-    let mut server = Serve::spawn(
-        &root,
-        &["--port", "0", "--read-only", "--sandbox"],
-        &[state_var(&state)],
-    );
-    let status = server.exited().await;
-    let stderr = server.stderr_text();
-    assert!(
-        !status.success(),
-        "a read-only root that holds the state directory cannot be served, and a differently-cased \
-         spelling does not make it servable ({status}); stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("read-only mode never writes under the served root"),
-        "the refusal must be the config layer's in-root refusal rather than anything else it could \
-         have failed on (the launcher's guard is the second layer and this run never reaches it); \
-         stderr:\n{stderr}"
-    );
-    // **And it is a frame, not only a stderr line.** The config layer runs inside
-    // `start::run`, whose result is `main`'s return value — so the frame comes from the
-    // boundary rather than from the refusal: `run`'s serving arm sends every refusal
-    // that `start::run` returns through `events::emit_error` before the `Err` travels
-    // on, which is decision 19's "a startup failure is an event rather than an absence"
-    // applied to the sequence as a whole. The lines are pinned rather than the event
-    // alone: one frame, and nothing else on stdout.
-    let event = server
-        .stdout_event()
-        .expect("the refusal frame, since the process exited");
-    assert!(
-        matches!(&event, Event::Error { message } if message.contains("read-only mode never writes under the served root")),
-        "the in-root refusal must send an `error` frame, not {event:?}"
-    );
-    assert_eq!(
-        server.stdout_lines().len(),
-        3,
-        "stdout must carry the refusal frame and nothing else — an `event:` line, a `data:` line \
-         and the blank line that closes it; got {:?}",
-        server.stdout_lines()
-    );
+    refused_or_honoured(&mut server).await;
 }

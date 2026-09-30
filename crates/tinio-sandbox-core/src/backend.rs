@@ -111,13 +111,12 @@ pub trait Backend {
 /// ```
 /// use tinio_sandbox_core::PlatformFacts;
 ///
-/// // What a backend that confines in place answers: it launches nothing, so the three facts a
+/// // What a backend that confines in place answers: it launches nothing, so the two facts a
 /// // launch has are not its to state.
 /// let in_place = PlatformFacts {
 ///     launches_child: false,
 ///     refuses_derived_state_dir: false,
 ///     probe_state_dir_writable: false,
-///     control_socket: false,
 /// };
 /// assert!(!in_place.launches_child);
 /// ```
@@ -129,18 +128,14 @@ pub struct PlatformFacts {
     pub refuses_derived_state_dir: bool,
     /// The launcher proves the state directory can take a file before it launches.
     pub probe_state_dir_writable: bool,
-    /// The launcher rebuilds the inherited control channel as a unix socket, rather than reading
-    /// handle values the child inherited.
-    pub control_socket: bool,
 }
 
 impl PlatformFacts {
     /// No mechanism at all: what a target with no backend wired answers, and what an in-place
-    /// backend answers for the three facts a launch would own.
+    /// backend answers for the two facts a launch would own.
     pub const NONE: Self = Self {
         launches_child: false,
         refuses_derived_state_dir: false,
         probe_state_dir_writable: false,
-        control_socket: false,
     };
 }

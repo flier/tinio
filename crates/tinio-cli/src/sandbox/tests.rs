@@ -17,25 +17,39 @@ use std::{
 use std::{io, path::Path};
 
 use clap::parser::ValueSource;
+// `Level` is the re-emit's level assertion; imported rather than spelled in the call for the
+// same reason `api_state` below is named — `clippy::absolute_paths` counts a three-segment
+// expression path.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use tracing::Level;
 
 #[cfg(all(feature = "sandbox", feature = "api"))]
 use super::confine::Handoff;
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use super::confine::announce_in_place;
 #[cfg(feature = "sandbox")]
 use super::confine::local_uid_configured;
 #[cfg(feature = "sandbox")]
 use super::product::exposures;
 use super::*;
+// The rule that mints a control token — what a leaking line would carry — read by the re-emit's
+// leg alone.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::_api::state as api_state;
 #[cfg(feature = "sandbox")]
 use crate::_core::mode::AccessMode;
 #[cfg(feature = "sandbox")]
 use crate::_sandbox;
-// The enforcement vocabulary the legs below drive: the strength a backend answers for, the
-// target question the answer is written against, and the denial a rendering is exercised with.
+// The enforcement vocabulary the legs below drive: the strength a backend answers for and the
+// target question the answer is written against.
 // Unconditional, like the seam they come through — this module is compiled in every build, so
 // its tests are too.
-use crate::_sandbox::{Denial, Enforcement, backend_available};
+use crate::_sandbox::{Enforcement, backend_available};
 #[cfg(all(feature = "sandbox", unix))]
 use crate::_util::path::path_contains;
+// The shared recording device (`tinio_util::testing`), which this crate's dev edge turns on.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::_util::testing::{assert_recorded_at, assert_step, record_events};
 use crate::{_config::Config, cli::Provenance, commands::start::Args, resolve::Resolution};
 
 /// A resolution whose config asked for the confinement, with `root` and `state_dir` as given —
@@ -862,8 +876,38 @@ fn a_confined_childs_permission_refusal_is_the_confinements_own_answer() {
     );
 }
 
+/// **The core's usage class maps to the CLI's own, whichever platform's selector raised it** —
+/// one operator mistake, one exit code. The core carries the class as its `Usage` variant now, so
+/// this drives the mapping the way a caller reads it: a `Usage` error built from the Linux
+/// sentence answers the CLI's `Usage` (exit 2) with the sentence intact, and its neighbour — the
+/// same `detail` shape, but the platform's own refusal — is not promoted to usage.
+#[test]
+fn a_selector_typo_is_the_usage_class_whichever_platform_raised_it() {
+    let typo = sandbox_err(_sandbox::Error::Usage {
+        detail: _sandbox::LINUX_MODEL_USAGE,
+    });
+    assert!(
+        matches!(&typo, Error::Usage(text) if text.contains("TINIO_SANDBOX_MODEL")),
+        "a selector typo is the usage class, sentence intact: {typo}"
+    );
+    assert_eq!(typo.exit_code(), 2, "and the CLI answers exit 2 for it");
+
+    let platform = sandbox_err(_sandbox::Error::Unsupported {
+        detail: "no user namespaces",
+    });
+    assert!(
+        matches!(platform, Error::Sandbox(_)),
+        "a platform that cannot confine is operational, not usage: {platform}"
+    );
+    assert_eq!(
+        platform.exit_code(),
+        1,
+        "exit 1 for the platform's own refusal"
+    );
+}
+
 /// **The launcher's classification is a value, and the sentence is its rendering** —
-/// [`describe`]'s three arms, driven directly, because the run site's own legs
+/// [`describe`]'s two arms, driven directly, because the run site's own legs
 /// (`commands::start::run`'s `launcher_exit`) assert the sentences and nothing here needs a
 /// process to prove the classification behind them.
 #[test]
@@ -877,31 +921,7 @@ fn an_attribution_renders_as_the_sentence_it_is() {
         "`Broken`'s text is the detail the refusing site already emits, verbatim"
     );
 
-    let denied = Attribution::Denied(Denial {
-        platform: OS,
-        refused: Refused::Path(Path::new("/srv/data/.tinio").to_path_buf()),
-        evidence: "Operation not permitted (os error 1)".to_owned(),
-    });
-    let text = describe(&denied);
-    assert!(
-        text.contains("refused `/srv/data/.tinio`") && text.contains("os error 1"),
-        "`Denied`'s sentence names the subject and the evidence: {text}"
-    );
-
-    // **The unnamed refusal is a phrase rather than an empty space**: a launcher that forwarded a
-    // child's exit cannot see what that child was refused (decision 19), and the value says so
-    // in as many words instead of leaving a sentence with a hole in it.
-    let unnamed = describe(&Attribution::Denied(Denial {
-        platform: OS,
-        refused: Refused::Unnamed,
-        evidence: "exit status: 1".to_owned(),
-    }));
-    assert!(
-        unnamed.contains("an operation the platform did not name"),
-        "nothing named is said rather than implied: {unnamed}"
-    );
-
-    // **The third arm is the one no frame is built from, and it still renders a fact**: the
+    // **The other arm is the one no frame is built from, and it still renders a fact**: the
     // launcher withholds it by matching `Ran` before it renders (`launcher_exit`), so this is
     // what a caller that renders one anyway reads — the exit named, and no refusal invented
     // over a child whose stream this side never had (decision 19).
@@ -913,8 +933,8 @@ fn an_attribution_renders_as_the_sentence_it_is() {
 }
 
 /// The strength this build's confinement applies is the backend's own answer, and the one value
-/// that is not a claim is `NotReported` — never `Unimplemented`, which would name a mechanism
-/// nobody disabled.
+/// that is not a claim is `NotReported` — a backend that has not answered says so rather than
+/// claiming a mechanism applies nothing.
 #[test]
 fn the_enforcement_is_the_target_backends_own_answer() {
     let expected = if backend_available() {
@@ -962,5 +982,60 @@ fn the_otlp_trade_is_named_together_or_not_at_all() {
         lost_export(&unasked, None),
         None,
         "and neither half is a trade"
+    );
+}
+
+/// The in-place re-emit **names its facts and carries nothing else** — §7's fields, at the level
+/// the serving subscriber enables, with no value the run holds as a secret among them.
+///
+/// **Two assertions of deliberately different kinds.** The values say what the line reports; the
+/// field list says what it *can* report, which is the half a later edit would break — a fourth
+/// field is the only route a token could take into this line, and the emitter's own signature (a
+/// count, a flag and the platform's own model enum, with no string among them) is the other end of
+/// the same argument. The sandbox review's STD-01 — a control token printed into CI logs — is the
+/// precedent, so the token is minted by the rule that mints them rather than spelled here.
+///
+/// **Driven directly rather than through `confine`**, the call site running behind a real
+/// confinement on a Linux host — but the model is not spelled here: it is
+/// [`requested_model`](crate::_sandbox::requested_model)'s answer, the facade reader the call
+/// site resolves it with, so what the emission carries is what a run under this environment
+/// hands it — and the value the spec carried into the arm that applied it. The recording is the
+/// shared device (`tinio_util::testing`), which installs the process's default subscriber with
+/// `try_init` — this crate's test binary installs none of its own, which is why the capture is
+/// this test's to read.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+#[test]
+fn the_in_place_re_emit_names_its_facts_and_carries_no_token() {
+    let token = api_state::generate_token().expect("a control token");
+    let requested = _sandbox::requested_model().expect("a model the environment spells");
+    let ((), logged) = record_events(|| announce_in_place(3, true, requested));
+
+    assert_step(&logged, "confined in place");
+    // §7's level for "was this process confined, and to what" — the one `serve`'s subscriber
+    // enables, and the reason this event is an `info!` rather than the `debug!` per-mount half.
+    assert_recorded_at(&logged, "the facts this process re-resolves", Level::INFO);
+    assert!(
+        logged.contains(&format!("requested={requested:?}"))
+            && logged.contains("count=3")
+            && logged.contains("local_uid=true"),
+        "the three facts the caller handed over: {logged}"
+    );
+    // Every `name=value` token on the line, in the order it declares them: the message precedes
+    // them and carries no `=`, so this is exactly the field set — and its two names are §7's for
+    // *these* facts (`requested`, `count`), never the two its sibling events use for the resolved
+    // mechanism and the rendered path list (`model`, `exposures`).
+    let fields: Vec<&str> = logged
+        .split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        fields,
+        ["step", "requested", "count", "local_uid"],
+        "the fields this event declares, and no others: {logged}"
+    );
+    assert!(
+        !logged.contains(&token),
+        "the line carries a control token: {logged}"
     );
 }

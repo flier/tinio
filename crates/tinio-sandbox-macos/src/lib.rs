@@ -116,9 +116,7 @@ pub use self::{
 ///
 /// **Every field is true for Seatbelt**, and each is a sentence about this crate's own launch:
 /// it starts a supervised child; it grants the state directory without its parent (the `home`
-/// paragraph of design §5); it proves that directory can take a file before it launches; and it
-/// rebuilds the inherited control channel as a unix socket rather than reading an inherited
-/// handle.
+/// paragraph of design §5); and it proves that directory can take a file before it launches.
 ///
 /// **Ending the child of a failed launch is this crate's act and not a fact it publishes.**
 /// [`launch::confine`] installs a killer on the child — a `SIGKILL` to the pid it spawned — and
@@ -128,7 +126,6 @@ pub const FACTS: PlatformFacts = PlatformFacts {
     launches_child: true,
     refuses_derived_state_dir: true,
     probe_state_dir_writable: true,
-    control_socket: true,
 };
 
 /// How much of its guarantee this backend's mechanism applies — **the strength the mechanism

@@ -14,7 +14,7 @@ use rustix::{
 };
 use tracing::{debug, error};
 
-use crate::_core::{Error, ProbeSteps, Result, await_verdict, report_verdict};
+use crate::_core::{Error, LINUX_MODEL_USAGE, ProbeSteps, Result, await_verdict, report_verdict};
 // **The failure builders are the core's, and they are re-exported here rather
 // than re-imported by each module.** This file defined all three until the
 // phase-basis correction moved them to `tinio-sandbox-core`, beside the other
@@ -75,7 +75,7 @@ impl Mechanism {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for any other value, so a typo cannot silently
+    /// [`Error::Usage`] for any other value, so a typo cannot silently
     /// select a different mechanism.
     ///
     /// # Examples
@@ -102,8 +102,8 @@ impl Mechanism {
                     value = wrong,
                     "unsupported model"
                 );
-                Err(Error::Unsupported {
-                    detail: "TINIO_SANDBOX_MODEL must be `userns` or `root`",
+                Err(Error::Usage {
+                    detail: LINUX_MODEL_USAGE,
                 })
             }
         }

@@ -178,16 +178,45 @@ fn confine_enabled(
     let facts = _sandbox::platform_facts();
     let access = AccessMode::from(resolution.read_only);
     let sandbox = sandbox_request(resolution, access)?;
-    let spec =
-        serve::Spec::from_sandbox(sandbox).local_uid(local_uid_configured(&resolution.config));
+    // Read once, off the rule that owns it, and carried as a value: the spec takes it and the
+    // in-place arm's re-emit states it after the confinement, where a second read of the
+    // configuration would be a second answer to what the run applied.
+    let local_uid = local_uid_configured(&resolution.config);
+    // The mechanism the environment asks for, carried the same way and for the same reason: the
+    // re-emit below states it **after** the confinement has run, where a second read of the
+    // variable would be a second answer to what the confinement applied. Its refusal is the
+    // reader's own, taken here rather than after the confinement: a malformed
+    // `TINIO_SANDBOX_MODEL` ends the run as `Spec::apply`'s own read of it would, never
+    // downgraded to the default a confined run did not apply. **The read is the facade's**
+    // (`tinio_sandbox::requested_model`), on the backend's own parser, so the value this call
+    // site carries is the one the Linux arm applies instead of reading the variable again.
+    #[cfg(target_os = "linux")]
+    let requested = _sandbox::requested_model().map_err(sandbox_err)?;
+    let spec = serve::Spec::from_sandbox(sandbox).local_uid(local_uid);
+    // **The model travels on the spec rather than being read again behind the confinement's
+    // back**: `Spec::apply`'s Linux arm builds its options from this value when it carries one,
+    // and from the environment's own read only when it does not — which is the shape a caller
+    // with no model to carry keeps.
+    #[cfg(target_os = "linux")]
+    let spec = spec.model(requested);
     if !facts.launches_child {
         let _ = args;
         // **The confinement first, the subscriber second** — this thread is the one being
         // confined, so every thread the subscriber starts has to start inside it. A confinement
         // that failed returns through `?` with nothing installed, which is the same answer a
         // process that never reached the subscriber gave before this parameter existed.
+        //
+        // The exposure set's size is one of the facts the re-emit below states, and `apply`
+        // consumes the spec that holds it — so it is read here, off the very set this confinement
+        // is about to apply rather than re-derived from the resolution.
+        #[cfg(target_os = "linux")]
+        let exposures = spec.sandbox().exposures().len();
         let child = spec.apply().map_err(sandbox_err)?;
         install()?;
+        // **The re-emit this arm's ordering owes** — `announce_in_place`'s doc owns what it says
+        // and why, and the `cfg` is the target whose in-place arm can succeed.
+        #[cfg(target_os = "linux")]
+        announce_in_place(exposures, local_uid, requested);
         return Ok(child);
     }
     // **The subscriber first, the launch second**: everything the launcher reports from here on
@@ -239,6 +268,56 @@ fn confine_enabled(
 #[cfg(feature = "sandbox")]
 pub(super) fn local_uid_configured(config: &Config) -> bool {
     !identity::owner_uids_for(config).is_empty()
+}
+
+/// The facts this process re-resolves **after** confining itself in place — the line an operator
+/// has for the one arm whose confinement runs with no subscriber installed.
+///
+/// **Why a re-emit rather than a second install point.** The subscriber's position is a rule about
+/// this confinement and not a choice the caller can make: on this arm every thread `build_subscriber`
+/// starts has to start inside the namespaces, the dropped capability set and the filter, so the
+/// subscriber is built *after* `apply`. `tracing` drops an event emitted before a subscriber
+/// exists, so the events the confinement itself emits (`enter`'s `model`, `exposures`,
+/// `retained capabilities`, `no_new_privs`, `capset`, and `seccomp`'s skip warning) are written
+/// into nothing on this arm, however real the facts behind them are. What can be said again is
+/// what the CLI can answer for itself, and these three are that: the model the environment asks
+/// for, how many paths were exposed to the jail, and whether the `local_uid` mapping is
+/// configured.
+///
+/// **The three field names are `sandbox-shared.md §7`'s, and the two that would collide are
+/// deliberately not borrowed**: `requested` is the model the operator *asked* for, which is what
+/// `enter`'s model event calls that fact (`model` there is the *resolved* mechanism — a value this
+/// arm cannot know, since `Spec::apply` drops it with the backend), and `count` is the exposure
+/// set's size, which is what the exposure event calls it (`exposures` there is the rendered path
+/// list, which this line does not carry). The values are pure re-derivations rather than runtime
+/// facts — anything that only exists at runtime (which read-only arm an exposure took, whether the
+/// filter was skipped) is a metric the backends record, never a line from here.
+///
+/// **The model is the requested one, and it arrives as a value rather than being read here.**
+/// `Spec::apply` resolves `Auto` against a probe and returns only the child, so the resolved
+/// mechanism is dropped with the backend; asking the probe again here would be a second
+/// confinement-time decision taken outside the confinement. What arrives is
+/// [`requested_model`](crate::_sandbox::requested_model)'s answer — the facade's one read of
+/// `TINIO_SANDBOX_MODEL`, the same value the spec carried into the arm that applies it — so this
+/// function reads nothing and the environment is never a second time answered.
+///
+/// **This is the Linux arm's alone.** `platform_facts().launches_child` is false only here, and a
+/// target with no backend is refused by `plan` before `confine` is ever entered — so a launcher
+/// platform has no re-emit to make (its subscriber is installed *before* the launch, and sees
+/// everything already).
+///
+/// **`pub(super)` because the call site is not a test's to reach**: the arm runs after a real
+/// confinement, and the crate's own test drives the emission instead — asserting §7's fields, the
+/// level `serve` enables and that nothing the run holds as a secret is among them.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+pub(super) fn announce_in_place(exposures: usize, local_uid: bool, requested: _sandbox::Mechanism) {
+    tracing::info!(
+        step = "confined in place",
+        requested = ?requested,
+        count = exposures,
+        local_uid,
+        "the facts this process re-resolves after confining itself in place"
+    );
 }
 
 /// How long the launcher waits for the child's readiness frame — **the bound the `state` publish

@@ -22,18 +22,44 @@ cucumber = { workspace = true, features = ["output-json", "tracing"] }
 flate2 = { workspace = true }
 futures = { workspace = true }
 hmac = { workspace = true }
+# The `@cli` scrape's request line: `tinio_api::client::Call` takes an `http::Method`, and the
+# Windows named-pipe arm hands an already-dialed stream to the client's own `exchange`, which
+# takes a `hyper_util::rt::TokioIo`. Both are the product's own types rather than this suite's.
+http = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
+secrecy = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 
+# The `@cli` steps read the management plane's own artifacts: `state` is parsed by the type that
+# writes it (`State`, the document that carries the bearer token) rather than quoted as text, and
+# the control channel's name and token come from the same parse. `default-features = false`: the
+# harness needs the state file and nothing the plane's router, TLS or OpenAPI layers carry.
+tinio-api = { path = "../tinio-api", default-features = false }
 tinio-core = { path = "../tinio-core" }
 tinio-fs = { path = "../tinio-fs" }
 tinio-mem = { path = "../tinio-mem" }
 tinio-sandbox = { path = "../tinio-sandbox" }
+# **The `@cli` Windows legs' shared devices, and only their tests need them**: `icacls` (the
+# independent DACL oracle, whose checked exit status is what keeps a failed read from reading as
+# "no package ACE") and `junction` are `tinio-sandbox-windows`'s `testing` module, so the edge
+# that turns it on is a dev-dependency — and the facade above re-exports the crate, which is how
+# these steps spell it (`tinio_sandbox::windows::testing`). Cargo unifies the two edges, so the
+# facade's Windows backend and this one are one build of that crate; on a host the crate is not
+# built for it is the empty library its root `#![cfg]` makes it.
+tinio-sandbox-windows = { workspace = true, features = ["testing"] }
 tinio-server = { path = "../tinio-server" }
 tinio-util = { path = "../tinio-util", features = ["testing"] }
+
+# The `I send the server SIGTERM` step (`tests/steps/cli.rs`), and nothing else: a signal cannot be
+# sent from `std`, and `rustix` is the crate this tree already names a `Signal` with. Linux only —
+# the step it serves is, because the in-place arm is the only one where the signal reaches the
+# server rather than a launcher.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [features]
 parquet = ["tinio-server/select-parquet"]

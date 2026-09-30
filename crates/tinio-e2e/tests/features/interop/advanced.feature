@@ -180,3 +180,74 @@ Feature: Interop advanced scenarios (multipart, copy, cold listing, edges)
     And I run mc cp "{work}/v2.txt" tinio/edge-bucket/ov.txt
     And I run mc cp tinio/edge-bucket/ov.txt "{work}/ov-dl.txt"
     Then the scratch file "ov-dl.txt" equals the scratch file "v2.txt"
+
+  # The confined arm (plan 2026-09-29-sandbox-bdd-e2e §3d, G19/G21/G22): **two of this file's
+  # journeys — the aws multipart/ETag one and the rclone multipart-copy one — replayed** through
+  # a `--sandbox` server, plus the mc pair (its basic journey and its read-only refusals). A
+  # sample rather than the whole file: range download, cold listing, special-character keys,
+  # pagination, size boundary and the error legs keep their unconfined-only arms. What keeps
+  # these off a host that cannot confine is the composed default filter and CI's own
+  # `@interop and not @confinement`; an explicit `--tags` replaces the composed filter, so a
+  # hand-written interop selection has to carry `and not @confinement` itself. The read-only
+  # list they are sampled against is `contracts/s3-surface.md` §Read-only mode's.
+
+  @interop @aws @confinement @FR-036
+  Scenario: Multipart upload above 8 MiB answers a composed ETag under confinement
+    When I run aws s3 mb s3://adv-bucket
+    Given I write 10485760 deterministic bytes to the scratch file "big.bin"
+    When I run aws s3 cp "{work}/big.bin" s3://adv-bucket/big.bin
+    And I run aws s3api head-object --bucket adv-bucket --key big.bin --query ETag --output text
+    Then the external client output contains "-"
+    When I run aws s3 cp s3://adv-bucket/big.bin "{work}/big-downloaded.bin"
+    Then the scratch file "big-downloaded.bin" equals the scratch file "big.bin"
+
+  @interop @aws @rclone @confinement @FR-036
+  Scenario: rclone multipart copy and server-side copy round-trip under confinement
+    When I run aws s3 mb s3://adv-bucket
+    Given I write 10485760 deterministic bytes to the scratch file "big.bin"
+    When I configure the rclone remote
+    And I run rclone copy "{work}/big.bin" tinio:adv-bucket/
+    And I run rclone copy tinio:adv-bucket/big.bin "{work}/rclone-dl"
+    Then the scratch file "rclone-dl/big.bin" equals the scratch file "big.bin"
+    When I run rclone copy tinio:adv-bucket/big.bin tinio:adv-bucket/
+    And I run rclone check tinio:adv-bucket "{work}/rclone-dl" --include "big.bin"
+
+  @mc @confinement @FR-036
+  Scenario: The mc basic journey runs under confinement
+    When I configure the mc alias
+    And I run mc mb tinio/mc-bucket
+    Given I write "hello from mc" to the scratch file "hello.txt"
+    When I run mc cp "{work}/hello.txt" tinio/mc-bucket/hello.txt
+    And I run mc cp tinio/mc-bucket/hello.txt "{work}/downloaded.txt"
+    Then the scratch file "downloaded.txt" equals the scratch file "hello.txt"
+    Given I write "" to the scratch file "zero"
+    When I run mc cp "{work}/zero" tinio/mc-bucket/zero
+    And I run mc stat tinio/mc-bucket/zero
+    Then the external client output contains "0 B"
+    When I run mc stat tinio/mc-bucket/hello.txt
+    Then the external client output contains "etag" ignoring case
+    Given I write 10485760 deterministic bytes to the scratch file "big.bin"
+    When I run mc cp "{work}/big.bin" tinio/mc-bucket/big.bin
+    And I run mc cp tinio/mc-bucket/big.bin "{work}/big-dl.bin"
+    Then the scratch file "big-dl.bin" equals the scratch file "big.bin"
+    When I run mc ls tinio/mc-bucket
+    Then the external client output contains "hello.txt"
+    When I run mc rm tinio/mc-bucket/hello.txt
+    And I run mc rb tinio/mc-bucket --force
+
+  @mc @confinement @read-only @FR-023 @FR-036
+  Scenario: The mc read-only refusals are the client's own shape
+    Given the served root contains a bucket "frozen" with 1 files "read-"
+    And the served root contains a bucket "empty-bucket" with 0 files "none-"
+    When I configure the mc alias
+    And I run mc ls tinio/frozen
+    Then the external client output contains "read-1.txt"
+    When I try mc mb tinio/refused-bucket
+    Then the external client error contains "Unable to make bucket `tinio/refused-bucket`. Access Denied"
+    Given I write "refused" to the scratch file "refused.txt"
+    When I try mc cp "{work}/refused.txt" tinio/frozen/new.txt
+    Then the external client error contains "Insufficient permissions to access this path"
+    When I try mc rm tinio/frozen/read-1.txt
+    Then the external client error contains "Failed to remove `tinio/frozen/read-1.txt`. Access Denied"
+    And I try mc rb tinio/empty-bucket
+    Then the external client error contains "Failed to remove `tinio/empty-bucket`. Access Denied"

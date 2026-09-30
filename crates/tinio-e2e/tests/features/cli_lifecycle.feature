@@ -1,20 +1,19 @@
 # The CLI's process surface (T055): every scenario here spawns the real `tinio`
 # binary. The readiness event, `--daemon`'s parent probe, the round trip, the
-# state-dir and mode rules `status`/`stop` are held to (decision 19), the `.env`
-# level of FR-016's chain, and the two sandbox channels — refused by name where nothing can
-# honour them, honoured where the target's backend is wired. Which of the two a scenario owes is
-# dispatched, never accepted either way (`steps/cli.rs`, `owed_arm`).
+# state-dir and mode rules `status`/`stop` are held to (decision 19), as is the
+# `.env` level of FR-016's chain.
 #
-# `@confinement` is the host gate on those two: they run a confinement, which no leg may assume —
-# a Windows launcher pays an ACL grant worth tens of seconds of variance, so the runner runs them
-# on macOS (where the launcher only binds and spawns) and takes them elsewhere only on
-# `TINIO_E2E_CONFINEMENT=1` (`tests/cucumber.rs`).
+# The two sandbox channels now belong to `confinement.feature`, which owns them,
+# their dispatch (`steps/cli.rs`'s `SandboxChannel`, over the probe
+# `Cli::knows_flag` reads) and the `@confinement` host gate they run under.
 #
 # These are the legs `crates/tinio/tests/lifecycle.rs` used to hold. That file
 # keeps only the console-handler leg, which no scenario can express: it needs
 # `GenerateConsoleCtrlEvent` under `#[cfg(windows)]` and one of the workspace's
-# five enumerated `#[allow(unsafe_code)]` sites. Its module doc says so, and
-# `docs/tests.md`'s "CLI (tinio)" section carries the leg-by-leg mapping.
+# two console-related `#[allow(unsafe_code)]` sites (the workspace enumerates
+# its exception sites one by one rather than counting them — design decision
+# 20). Its module doc says so, and `docs/tests.md`'s "CLI (tinio)" section
+# carries the leg-by-leg mapping.
 #
 # The harness (`tests/steps/cli.rs`) owns one scratch directory per scenario:
 # the served root, the state dir every child is handed in `TINIO_STATE_DIR`, the
@@ -165,20 +164,3 @@ Feature: CLI lifecycle
     When I run "tinio stop {root}"
     Then the run fails with exit code 1
     And the root holds no state directory
-
-  @cli @confinement @FR-036
-  Scenario: A `--sandbox` request is never silently ignored
-    Given a storage root
-    And the binary's "--sandbox" flag is probed
-    When I run "tinio server {root} --port 0 --sandbox"
-    Then the "--sandbox" request is answered, never ignored
-    And the root publishes a state file only when the run is serving
-
-  @cli @confinement @FR-036
-  Scenario: The `TINIO_SANDBOX` variable is never silently ignored
-    Given a storage root
-    And the binary's "--sandbox" flag is probed
-    And the child's environment holds "TINIO_SANDBOX" = "1"
-    When I run "tinio server {root} --port 0"
-    Then the "TINIO_SANDBOX" request is answered, never ignored
-    And the root publishes a state file only when the run is serving

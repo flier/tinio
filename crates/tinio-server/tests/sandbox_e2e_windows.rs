@@ -1,7 +1,13 @@
 //! Confined `tinio server --sandbox` on Windows: spawn the CLI, talk to it, and
-//! check what only a separate process can show — launcher death takes the
-//! child, a hard kill leaves residue, a clean run takes that residue over,
-//! and an escaping junction is refused inside the container.
+//! check what only a separate process can show — a hard kill leaves residue, a
+//! clean run takes that residue over, and a child that dies before reporting
+//! readiness becomes the parent's own `error` frame. **Two facts the file used to
+//! hold are `crates/tinio-e2e/tests/features/confinement.feature`'s now** (the
+//! plan's §5 migration): the launcher's death taking the child is P4, and an
+//! escaping bucket junction being refused as nonexistent inside the container is
+//! P5 — what stays here is the ACE half, which a step layer has no package-SID
+//! oracle for except the launcher's own log, and the parent's frame, whose
+//! induction is Windows' own.
 //!
 //! Preconditions this host cannot meet fail unless `TINIO_SANDBOX_ALLOW_SKIP`
 //! is set, and that decision happens before the first spawn. A request that
@@ -17,27 +23,26 @@ mod common;
 #[path = "support/windows_e2e_harness.rs"]
 mod harness;
 
-use std::{
-    fs,
-    net::TcpStream,
-    os::windows::process::ExitStatusExt as _,
-    process::{Command, ExitStatus},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fs, os::windows::process::ExitStatusExt as _, process::ExitStatus};
 
-use common::signed;
 use harness::{
-    Exit, Run, ace_count, answer, exit_timeout, grant_event, host_ready, icacls, junction,
-    seal_to_current_user, step_event, wait_for_exit, without_ansi,
+    Exit, Run, ace_count, answer, grant_event, host_ready, icacls, junction, seal_to_current_user,
+    step_event, wait_for_exit, without_ansi,
 };
-use tinio_sandbox::{
-    AccessMode, Event,
-    windows::acl::{self, Target},
-};
+use tinio_sandbox::Event;
 
+/// **The ACE this run holds, while it runs and after the launcher's death — the half no step can
+/// read.**
+///
+/// The serving half and the launcher's death *taking the child* are `confinement.feature`'s P4 now
+/// (the plan's §5 split): this leg's subject is the standing ACE on the served root (design
+/// decision 15's residue), read while the run serves and again after a hard kill leaves it — which
+/// is why the kill below is its induction rather than its subject, and why the request it makes
+/// first is a control rather than a claim. The SID the ACE is compared against comes from the
+/// launcher's own record, because a `PackageSid` built in *this* process would create — and on
+/// `Drop` delete — the very profile the launcher is using.
 #[test]
-fn a_confined_server_serves_and_the_launchers_death_takes_it_with_the_ace_left_behind() {
+fn a_confined_server_holds_one_ace_while_it_runs_and_after_the_launcher_is_killed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().join("root");
     if !host_ready() {
@@ -84,19 +89,10 @@ fn a_confined_server_serves_and_the_launchers_death_takes_it_with_the_ace_left_b
     assert!(without_ansi(&log).contains("CreateProcessW"), "{log}");
 
     // Kill the launcher, not the child: KILL_ON_JOB_CLOSE is the only thing that
-    // can end the confined server now (decision 20, first half).
+    // can end the confined server now (decision 20, first half) — and the wait is
+    // what makes the read below a residue rather than a race: the ACE is read from
+    // the root after the process whose job held the server is gone.
     run.launcher.kill().expect("kill the launcher");
-    // The bound here and the connect bound below are the harness's one knob
-    // (`harness::exit_timeout`), so a host whose ACL writes are slow raises both
-    // at once instead of moving one and leaving the leg on the other.
-    let deadline = Instant::now() + exit_timeout();
-    loop {
-        match TcpStream::connect_timeout(&run.address, exit_timeout()) {
-            Err(_) => break,
-            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
-            Ok(_) => panic!("the confined server outlived its launcher"),
-        }
-    }
     wait_for_exit(&mut run.launcher, &run.log, "the killed launcher");
 
     // **The residue is asserted as a residue, not as an absence.** `kill` is
@@ -215,164 +211,6 @@ fn a_restarted_launcher_takes_the_residue_over_and_a_clean_exit_keeps_it() {
     // field — so the wait is what is asserted: a third launcher that outlives the
     // stop is a relay failure, and [`Run::stop`] reports it with the log.
     let _ = third.stop("the stopped third launcher");
-}
-
-/// **The containment proof has to keep resolving reparse points *inside* the
-/// container, and this is the only place in the suite that asks.** Every other
-/// leg serves a tree with no link in it, so the proofs they exercise would pass
-/// whether they resolved anything or not.
-///
-/// The shape is the one the vendored `soft-canonicalize` patch was measured to
-/// accept: a junction **inside** the served root that lands **outside** it. The
-/// proof is `strict-path`'s `strict_join`, which canonicalizes the candidate and
-/// refuses it when the answer leaves the boundary — so an answer that never
-/// resolved the junction passes the proof, and the escaping directory is a
-/// bucket like any other. Outside the container the same tree is refused,
-/// because the platform canonicalizer is not refused there; inside, that
-/// refusal is the property the patch has to preserve.
-///
-/// **The request is a `GET` of an object under the escaping bucket, and the
-/// discriminator is the `NoSuchBucket` *code* — not the 404 status.**
-/// `ensure_bucket` asks `FsStorage::bucket_dir` first, which is the
-/// containment proof and nothing else. When the proof refuses, that error would
-/// surface on its own; what actually turns it into `NoSuchBucket` is
-/// `ensure_bucket`'s **reparse fallback** (`objects.rs`), which reads the
-/// bucket path with `symlink_metadata`, sees the reparse point, and rewrites
-/// *any* `bucket_dir` error into `NoSuchBucket` when `follow_symlinks` is
-/// off — for this bucket shape whatever the proof decided. The 404 is therefore
-/// `s3s`'s mapping of that code rather than the proof's own status, and a bare
-/// status assertion here would not discriminate: without the fallback the same
-/// leg would assert the other way round. When the proof does not refuse, the
-/// bucket is there, the read proceeds far enough to meet the **object-level
-/// lstat policy** — `check_symlinks`, which walks every existing component up
-/// to the root and refuses the link with `AccessDenied` — and 403 `AccessDenied`
-/// is the answer instead, because that path reaches the policy before any bucket
-/// resolution. So the two worlds differ in the code the data plane emits:
-/// `NoSuchBucket`, whose fallback is what makes a reparse-point bucket
-/// look absent, against `AccessDenied`. Measured both ways on this host; the
-/// leg asserts the first.
-///
-/// **A bucket listing is the wrong probe, and that is measured too.** `GET
-/// /<bucket>` answers `InternalError` in *both* worlds: `listing.rs`'s
-/// `walk_files_streaming` maps the bucket with the lexical join and, for a
-/// reparse-point bucket under `follow_symlinks: false`, calls the **platform**
-/// canonicalizer — which the container refuses for every path — so a junction
-/// bucket is an I/O error there whatever the proof decided. Nothing about this
-/// leg may be read as covering that site.
-///
-/// **The junction's target is granted to this run's package SID, and the grant
-/// is the premise rather than the subject.** The resolution adopts a link's
-/// target only when the target (or its parent) exists, and `exists()` swallows
-/// the refusal — so against an ungranted target the proof answers lexically in
-/// *both* worlds and the leg would assert nothing. The grant models the case the
-/// proof is for: a directory outside the root that the container can reach.
-/// (It is read off the launcher's own grant event and applied between the launch
-/// and the request, because the confined child resolves the path per request; the
-/// SID is never re-derived here, since a `PackageSid` built in this process
-/// would create the profile the launcher is using.)
-///
-/// **What it loses if the patch's prefix arms are reverted**: the proof accepts
-/// the bucket, the fallback never runs, and the object-level policy answers
-/// `AccessDenied` instead — so the code assertion fails where this leg requires
-/// `NoSuchBucket`. The control request below reads a plain directory and is
-/// unaffected, so the leg cannot pass by refusing everything, and cannot pass on
-/// a lexical proof either.
-#[tokio::test]
-async fn a_confined_server_refuses_an_escaping_bucket_junction_as_nonexistent() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path().join("root");
-    let outside = dir.path().join("outside");
-    if !host_ready() {
-        return;
-    }
-    // The launcher creates the served root itself on a normal run; the junction
-    // has to be inside it before the confined child resolves anything, so the
-    // tree is planted here and `create_dir_all` on an existing root is a no-op.
-    fs::create_dir_all(&root).expect("the served root");
-    // The control bucket: a plain directory with one object in it, which this
-    // leg reads to show the confined server does serve this tree.
-    fs::create_dir_all(root.join("plain")).expect("the control bucket");
-    fs::write(root.join("plain").join("plain.txt"), b"plain").expect("seed the control object");
-    fs::create_dir_all(&outside).expect("the out-of-root target");
-    fs::write(outside.join("outside.txt"), b"outside").expect("seed the out-of-root target");
-    junction(&root.join("leak"), &outside);
-
-    let mut run = Run::spawn(&root, 0);
-
-    // The spec is `acl::grant_spec`'s and not a mask spelled here: it is the
-    // launcher's own call with one string taken from the grant event instead of
-    // from a `PackageSid` value, and the leading `*` that stops `icacls` resolving
-    // it as an account name is the crate's rule rather than this test's.
-    let sid = run.package_sid();
-    let spec = acl::grant_spec(&sid, Target::Directory, AccessMode::ReadOnly);
-    let granted = Command::new(acl::icacls_binary())
-        .arg(&outside)
-        .args(["/grant:r", &spec, "/q"])
-        .output()
-        .expect("run icacls");
-    assert!(
-        granted.status.success(),
-        "grant the run's package SID read on {}: {}",
-        outside.display(),
-        String::from_utf8_lossy(&granted.stderr)
-    );
-
-    // **The control first.** A signed request is the only kind that reaches the
-    // storage — an unsigned one is refused `Signature is required` — and this
-    // one proves the confined server is serving *this* tree, so a refusal below
-    // cannot be a server that failed to start.
-    let control = signed(run.address, "GET", "/plain/plain.txt", b"").await;
-    assert_eq!(
-        control.status,
-        200,
-        "the confined server must serve a plain object of this tree: {} {}",
-        control.status,
-        control.text()
-    );
-
-    let answer = signed(run.address, "GET", "/leak/outside.txt", b"").await;
-    // **The code is the assertion and the status is its consequence.** The
-    // discriminator is `NoSuchBucket`: it is what `ensure_bucket`'s reparse
-    // fallback emits once the proof has refused the bucket, and the failing world
-    // emits `AccessDenied` from the object-level policy instead. The 404 below is
-    // the wire form `s3s` gives that code, asserted so the leg still pins the
-    // HTTP shape — this leg does not own the number, and the code is what tells
-    // the two worlds apart.
-    assert_eq!(
-        answer.code(),
-        "NoSuchBucket",
-        "a bucket whose directory is a junction out of the served root must be invisible to the \
-         data plane — the containment proof resolved the link, refused it, and `ensure_bucket`'s \
-         reparse fallback answered `NoSuchBucket` for the refused bucket. `{}` (status {}) is a \
-         different world: the object-level symlink policy (`check_symlinks`) catching a bucket \
-         the proof accepted, which is what a reverted prefix arm produces; 500 is the read \
-         reaching a directory the container cannot open:\n{}",
-        answer.code(),
-        answer.status,
-        answer.text()
-    );
-    assert_eq!(
-        answer.status,
-        404,
-        "`NoSuchBucket` is mapped to 404 on the wire; a different status for that code is a \
-         protocol change this leg should notice:\n{}",
-        answer.text()
-    );
-
-    // **Ended with a stop rather than a kill**, so the launcher's teardown runs
-    // and its AppContainer profile is deleted (decision 21) — but nothing is
-    // rolled back: every grant this crate makes is standing (design decision 15),
-    // so the executable's directory among the exposures and the served root both
-    // keep this run's package-SID ACE. The root's and the escaping bucket's
-    // targets go with this leg's temporary directory; the executable's
-    // directory's is this suite's residue on every run of this leg, exactly as
-    // the test above asserts a residue rather than an absence. A hard kill would
-    // leave the profile behind as well, for the next run on the same root to take
-    // over.
-    // This leg's subject is the answer above; the wait is asserted because a
-    // launcher that outlives its stop is a relay failure [`Run::stop`] reports.
-    // Its status is the child's and is not read here.
-    let _ = run.stop("the stopped launcher");
 }
 
 /// **A confined child that dies on the way up becomes the parent's own `error`

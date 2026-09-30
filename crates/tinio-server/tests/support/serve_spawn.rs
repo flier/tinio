@@ -232,11 +232,6 @@ impl Scratch {
     }
 }
 
-/// `TINIO_STATE_DIR` for a leg, as the `&str` the child's environment takes.
-pub fn state_var(state: &Path) -> (&'static str, &str) {
-    (STATE_DIR_VAR, state.to_str().expect("a UTF-8 scratch path"))
-}
-
 /// Whether `haystack` names `path` in either form a failure can print it:
 /// `Path::display` writes it plain, while a derived `Debug` (which is how
 /// `main`'s returned error reaches stderr) escapes the separators on

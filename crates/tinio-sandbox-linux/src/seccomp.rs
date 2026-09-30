@@ -15,6 +15,20 @@
 //! it can neither inspect an SQE nor an address family; refusing the ring calls
 //! is the only closure available at this layer.
 //!
+//! **The denial is the whole `sendto` *number*, so it reaches past the datagram it
+//! was written for.** `send(2)` on Linux *is* `sendto` (a null address is the
+//! whole difference), so a `libc::send` on a socket inside the confinement is
+//! refused exactly as a datagram to a peer is — and a library that wakes its own
+//! self-pipe that way fails **silently**, because the error is one its own `wake`
+//! drops on purpose rather than reports. Measured on an `AF_UNIX` `SOCK_STREAM`
+//! pair with this program installed (WSL2, 2026-09-30): `send` and `sendmsg`
+//! answered `EPERM` while `write(2)` delivered the byte, with the network cut this
+//! list exists for still in place (`connect(AF_INET, …)` refused). The case that
+//! found it is the CLI's signal wake (`crates/tinio-cli/src/signal.rs`), which is
+//! a `write(2)` for this reason: **inside a confinement, anything that wakes a
+//! self-pipe has to wake it with `write(2)`** — a wake that cannot be reported is
+//! a signal path that is quietly dead.
+//!
 //! **Every denial returns `EPERM` and the tail allows** (`SECCOMP_RET_ERRNO |
 //! EPERM`, `SECCOMP_RET_ALLOW`). `ENOSYS` was considered for the ring calls,
 //! because a library that probes `io_uring_setup` and falls back on an absent
@@ -95,6 +109,7 @@ use tracing::{Span, field, info, instrument, warn};
 use crate::{
     _core::{Error, Result},
     mechanism::fail,
+    metrics::record_seccomp,
 };
 
 /// Truncate a UAPI opcode (`u32` in `linux-raw-sys`) to `sock_filter.code`.
@@ -573,6 +588,13 @@ pub fn install() -> Result<Seccomp> {
             step = "seccomp",
             "this architecture has no syscall table, so outbound connections are NOT blocked"
         );
+        // **The `warn!` above has no subscriber on the arm that needs it most**, which is why
+        // this state is a metric rather than only a line: the process that confines in place
+        // builds its subscriber *after* the confinement (`tinio-cli`'s in-place arm, decision
+        // 26), so this event is discarded where it was emitted. The scraped `1` is the record
+        // that survives — and the caller reading the returned variant is the other half of one
+        // answer, not a second one.
+        record_seccomp(Seccomp::SkippedUnsupportedArch);
         return Ok(Seccomp::SkippedUnsupportedArch);
     };
     Span::current().record("arch", field::debug(arch));
@@ -607,6 +629,9 @@ pub fn install() -> Result<Seccomp> {
         return Err(fail("seccomp", io::Error::last_os_error()));
     }
     announce_installed(arch, program.len());
+    // The other answer of the same family, so the exposition carries a state rather than an
+    // absence a scraper has to interpret: `0` is the assertion that the network cut landed.
+    record_seccomp(Seccomp::Installed);
     Ok(Seccomp::Installed)
 }
 

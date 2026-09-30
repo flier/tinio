@@ -121,7 +121,7 @@ impl Mechanism {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for any
+    /// [`Error::Usage`] for any
     /// other value.
     ///
     /// # Examples
@@ -156,7 +156,7 @@ impl Mechanism {
                     value = wrong,
                     "unsupported confinement mechanism"
                 );
-                Error::Unsupported {
+                Error::Usage {
                     detail: MACOS_MECHANISM_USAGE,
                 }
             }),
@@ -231,7 +231,7 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for a value
+    /// [`Error::Usage`] for a value
     /// that is neither `sandbox-exec` nor `sandbox-init` — and for one that is not
     /// valid Unicode at all — so neither a typo nor an unreadable value can
     /// silently select the other mechanism.
@@ -314,7 +314,7 @@ fn read_mechanism(raw: result::Result<String, env::VarError>) -> Result<Mechanis
                 error = %error,
                 "unsupported confinement mechanism"
             );
-            Err(Error::Unsupported {
+            Err(Error::Usage {
                 detail: MACOS_MECHANISM_USAGE,
             })
         }

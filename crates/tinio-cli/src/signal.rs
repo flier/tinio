@@ -1,8 +1,21 @@
 //! Termination signals, turned into the one shutdown channel (design decision 20).
 //!
-//! `signal-hook` registers and owns the self-pipe on unix; nothing in the handler allocates
-//! or locks. On Windows `signal-hook`'s CRT-backed support cannot express the console-close
-//! event the contract requires, so the console handler is `windows-sys`'s.
+//! On unix `signal-hook` registers the handlers and **this module owns the wake they write**: a
+//! socketpair of our own, one `write(2)` per signal, and the thread that drains it — so nothing in
+//! a handler allocates, logs, locks **or waits**. That last word is load-bearing: the write end is
+//! **non-blocking**, so a wake the socket cannot hold is dropped rather than waited for, and the
+//! drain reads a burst in bulk so it is behind for as little of a flood as it can be. The residual
+//! is stated where the write happens; the short of it is that a dropped `SIGHUP` is harmless by
+//! contract while a termination byte is exposed only while a burst keeps the socket full.
+//! **Owning the wake is a fix rather than a style choice**: the
+//! library's own self-pipe is woken with `libc::send`, which on Linux *is* the `sendto` syscall,
+//! and the confinement's seccomp filter denies that syscall number wholesale while the library
+//! drops the failed wake on purpose — so inside a confined run no byte ever landed and `SIGTERM`,
+//! `SIGINT` and `SIGHUP` were all silently dead
+//! (`crates/tinio-sandbox-linux/src/seccomp.rs`'s module doc is that trap's home, and it is what
+//! the next reader inside a confinement has to know: wake with `write(2)`). On Windows
+//! `signal-hook`'s CRT-backed support cannot express the console-close event the contract
+//! requires, so the console handler is `windows-sys`'s.
 //!
 //! [`install`] is called by [`start::run`](crate::commands::start::run) **before** the
 //! process's runtime exists (§1 step j before step k), and the pair it answers is the shape
@@ -12,7 +25,7 @@
 
 use std::io;
 #[cfg(unix)]
-use std::{process, thread};
+use std::{io::Read as _, os::unix::net::UnixStream, process, sync::Arc, thread};
 #[cfg(windows)]
 use std::{
     sync::{
@@ -26,7 +39,7 @@ use std::{
 #[cfg(unix)]
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGTERM},
-    iterator::Signals,
+    low_level::register,
 };
 use tokio::sync::watch;
 #[cfg(windows)]
@@ -72,12 +85,14 @@ pub struct Handles {
 
 /// Installs the termination handlers and answers the shutdown channel.
 ///
-/// `SIGTERM`, `SIGINT` and `SIGHUP` are registered through `signal-hook`'s iterator, whose
-/// handler only writes a byte into the crate's self-pipe: the channel is flipped on the
-/// ordinary thread draining that pipe, never on the signal path, so no handler of ours
-/// allocates, logs or takes a lock. That thread counts the termination signals itself and
-/// answers the second with `second_signal_exits_immediately`; `SIGHUP` is logged and ignored,
-/// never a shutdown. On Windows the console handler is registered instead
+/// `SIGTERM`, `SIGINT` and `SIGHUP` are registered through `signal-hook`'s low-level registration,
+/// whose handler writes **one byte — the signal's own number — into a socketpair this module
+/// owns**, with a single **non-blocking** `write(2)`: the channel is flipped on the ordinary thread
+/// draining that socket, never on the signal path, so no handler of ours allocates, logs, takes a
+/// lock **or waits for space in a full socket**. That thread reads a burst in bulk and counts the
+/// termination signals itself, answering the second with
+/// `second_signal_exits_immediately`; `SIGHUP` is logged and ignored, never a shutdown. On Windows
+/// the console handler is registered instead
 /// (`install_console_handler`), because the console-close event the contract requires is not
 /// expressible through `signal-hook`'s CRT-backed support — and it counts its events the same
 /// way, so the second one exits the process without draining there too.
@@ -94,34 +109,73 @@ pub fn install() -> Result<Handles, Error> {
     #[cfg(unix)]
     {
         // **No `flag::register` here, and the reason is the counter below.** A
-        // `flag::register(SIGTERM, Arc<AtomicBool>)` sets its atomic *from the handler*, and
-        // the iterator only yields a signal after the handler for that signal has run — so a
-        // thread that asked the same atomic "is this the second one?" would read `true` on the
-        // **first** signal and exit before ever sending on the channel. The termination count
-        // is therefore this thread's own, and the atomic is not registered at all.
+        // `flag::register(SIGTERM, Arc<AtomicBool>)` sets its atomic *from the handler*, and that
+        // handler runs before the wake byte reaches the thread below — so a thread that asked the
+        // same atomic "is this the second one?" would read `true` on the **first** signal and exit
+        // before ever sending on the channel. The termination count is therefore this thread's
+        // own, and the atomic is not registered at all.
         //
         // `stopper` is cloned **before** the `move` closure: the thread takes the clone and the
         // `Handles` returned below keeps the original. Without this line the sender is moved
         // into the thread and the return is an E0382 — the Windows arm never hits it because it
         // hands its own `stopper.clone()` to the registration call.
         let stopper = stopper.clone();
-        let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP]).map_err(signal_error)?;
+        // **The wake is this module's own, and it is one `write(2)`.** `signal-hook`'s iterator
+        // wakes its selector thread with `libc::send`, and on Linux `send(2)` *is* `sendto` — the
+        // syscall number the confinement's seccomp filter refuses wholesale, with the error the
+        // library drops on purpose. That wake therefore never landed inside a confined run, the
+        // selector thread stayed blocked in `recvfrom`, and the signals were silently dead
+        // (measured, WSL2 2026-09-30: `sendto(5, "X", 1, MSG_DONTWAIT, NULL, 0) = -1 EPERM`
+        // confined against `= 1` unconfined, same binary;
+        // `crates/tinio-sandbox-linux/src/seccomp.rs`'s module doc carries the trap). A socketpair
+        // of our own, woken by `write(2)`, is permitted where `send` is refused.
+        let (mut reader, writer) = UnixStream::pair().map_err(signal_error)?;
+        // The write end is shared rather than cloned per signal (`try_clone` would spend three
+        // descriptors on one end), and **nothing is written to it here**: the wake happens in the
+        // handlers `register_wakes` installs — which is also where the non-blocking flag is set,
+        // because that flag *is* the handler's contract rather than this call's convenience.
+        register_wakes(&Arc::new(writer))?;
         thread::spawn(move || {
             let mut terminations = 0u32;
-            for signal in signals.forever() {
-                if signal == SIGHUP {
-                    // The contract: SIGHUP is ignored and logged, never a shutdown. The
-                    // iterator thread is where "logged" can happen — a handler cannot log.
-                    tracing::info!(signal, "SIGHUP ignored (no config reload in v1)");
-                    continue;
+            // **A burst is drained in as few reads as its bytes allow**, because a wake past the
+            // socketpair's capacity is *dropped*, not buffered: a reader that spends one syscall
+            // per byte (and one log line per `SIGHUP`) is a reader a tight `kill -HUP` loop
+            // outruns, and every byte dropped while it is behind is a wake the process never sees.
+            // **The residual, stated rather than implied**: a dropped `SIGHUP` is harmless by
+            // contract (it is ignored whether or not it is seen), and a dropped *termination* byte
+            // is the exposure — possible while a sustained burst keeps the socket full, answered by
+            // the next termination signal or by `SIGKILL`. That is no loss the wake it replaced did
+            // not also take: the library's write dropped its byte when its pipe was full, and its
+            // per-signal `AtomicBool` coalesced repeated deliveries of one signal into one, so it
+            // too was not signal-for-signal under a burst. What this loop guarantees instead is
+            // that every delivery it *sees* is counted — one byte per delivery, in the order the
+            // handlers wrote them, which is what `contracts/cli.md`'s fast exit asks for.
+            let mut wake = [0u8; 64];
+            loop {
+                let read = match reader.read(&mut wake) {
+                    // A closed socket is the end of the signals this process has left to select,
+                    // not a panic: nothing joins this thread.
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                for byte in &wake[..read] {
+                    let signal = i32::from(*byte);
+                    if signal == SIGHUP {
+                        // The contract: SIGHUP is ignored and logged, never a shutdown. The selector
+                        // thread is where "logged" can happen — a handler cannot log.
+                        tracing::info!(signal, "SIGHUP ignored (no config reload in v1)");
+                        continue;
+                    }
+                    terminations += 1;
+                    if terminations > 1 {
+                        second_signal_exits_immediately();
+                        continue;
+                    }
+                    tracing::info!(signal, "shutting down");
+                    let _ = stopper.send(true);
                 }
-                terminations += 1;
-                if terminations > 1 {
-                    second_signal_exits_immediately();
-                    continue;
-                }
-                tracing::info!(signal, "shutting down");
-                let _ = stopper.send(true);
             }
         });
     }
@@ -132,10 +186,65 @@ pub fn install() -> Result<Handles, Error> {
     Ok(Handles { shutdown, stopper })
 }
 
+/// Registers the three handlers over the caller's write end, each of which wakes the reader with
+/// **one byte holding the signal's own number** — and **marks that end non-blocking first**, which
+/// is the whole of the guarantee that a handler can never wait.
+///
+/// A blocking `write(2)` into a full socketpair waits for space, and the thread that has to make
+/// that space is the drain `install` spawns — itself one of the threads a signal is delivered to.
+/// A burst can therefore block the only reader *inside* a handler and wedge the process for good:
+/// measured on this host, an `AF_UNIX` `SOCK_STREAM` pair takes **278** one-byte sends before
+/// `EAGAIN` (a 1-byte skb costs ~768 bytes of truesize against `net.core.wmem_default = 212992`),
+/// one `kill -HUP` loop fills it, and the blocking draft of this file left every thread
+/// (`sock_alloc_send_pskb`) of a confined server wedged with `SIGTERM` ignored for good. `O_NONBLOCK`
+/// with the error dropped is exactly what the library's own wake did (`MSG_DONTWAIT`), and what
+/// this handler's contract needs. Only the *writer* end: the drain wants its blocking read.
+///
+/// **A function of its own because it is one of this crate's enumerated `#[allow(unsafe_code)]`
+/// sites**, and the shape every other site here takes: one item that holds the exception together
+/// with the argument making it sound, rather than an allow spread over the call site (the list's
+/// home is [`install_console_handler`]'s doc). It is unsafe at all because `signal-hook`'s
+/// registration *is*: the action it takes runs **inside a signal handler**. The flag is set
+/// *before* the first registration, so no handler ever runs against a blocking descriptor; taking
+/// the `Arc` by reference rather than by value is what lets a caller (the unit leg below) keep the
+/// write end and fill the socket without a handler in it.
+///
+/// # Safety
+///
+/// The action must be async-signal-safe, must touch no unsynchronized global and must not panic.
+/// The closure registered here is one `rustix::io::write` of one byte into a socketpair this
+/// process created before the registration: `write(2)` is in POSIX's async-signal-safe set, the
+/// writer end is a descriptor the process owns **and is non-blocking** — a full socket answers
+/// `EAGAIN`, which the dropped answer swallows, so the handler never waits — the `Arc` dereference
+/// reads a pointer nothing
+/// mutates (the registration clones it, once per signal, before any handler exists) and the byte
+/// is a copy of a `'static` constant. The answer is dropped rather than unwrapped, so a wake the
+/// confinement refused cannot unwind out of a handler — and the thread draining that socket is
+/// where everything else (the count, the logging, the channel) happens.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn register_wakes(writer: &Arc<UnixStream>) -> Result<(), Error> {
+    writer.set_nonblocking(true).map_err(signal_error)?;
+    for signal in [SIGTERM, SIGINT, SIGHUP] {
+        let writer = Arc::clone(writer);
+        // SAFETY: the action is one `write(2)` on a descriptor this process owns, captured before
+        // the registration — async-signal-safe, allocation-free, lock-free, panic-free and
+        // non-blocking (the writer end was set `O_NONBLOCK` above, before this call), as the doc
+        // argues in full.
+        unsafe {
+            register(signal, move || {
+                let _ = rustix::io::write(&*writer, &[signal as u8]);
+            })
+        }
+        .map_err(signal_error)?;
+    }
+    Ok(())
+}
+
 /// The fast-exit arm: a second termination signal exits immediately, without draining
 /// (`contracts/cli.md:43`).
 ///
-/// Called only from the iterator thread, on its second count, and unix-only like that caller:
+/// Called only from the selector thread, on its second count, and unix-only like that caller:
 /// Windows answers its second console event by **declining** it (`install_console_handler`
 /// returns `FALSE` there), so the process is terminated by the default handler instead of by
 /// an exit call of ours running on the system's thread.
@@ -187,12 +296,14 @@ const CLOSE_DRAIN: Duration = Duration::from_secs(3);
 
 /// Declares the Windows console handler and registers it.
 ///
-/// **One of this crate's three enumerated `#[allow(unsafe_code)]` sites** — the others are
-/// `daemon.rs`'s `set_launch_env` and `doctor.rs`'s `space` (the `GetDiskFreeSpaceExW` disk-space
-/// probe) — and it holds both halves of the exception — the
-/// `unsafe extern "system" fn` a console handler must be and the raw `windows-sys` registration
-/// call — in one item, which is why `crates/tinio-cli/Cargo.toml`'s `unsafe_code` is `deny`
-/// rather than `forbid` (design decision 20; the same shape `tinio-winsec`'s file DACLs and
+/// **One of this crate's four enumerated `#[allow(unsafe_code)]` sites** — the others are
+/// `daemon.rs`'s `set_launch_env`, `doctor.rs`'s `space` (the `GetDiskFreeSpaceExW` disk-space
+/// probe) and [`register_wakes`], the unix registration: `signal-hook`'s registration is `unsafe`
+/// because the action it takes runs inside a signal handler, and that function's doc is where the
+/// argument for the action registered there lives. This item holds both halves of its own
+/// exception — the `unsafe extern "system" fn` a console handler must be and the raw `windows-sys`
+/// registration call — in one item, which is why `crates/tinio-cli/Cargo.toml`'s `unsafe_code` is
+/// `deny` rather than `forbid` (design decision 20; the same shape `tinio-winsec`'s file DACLs and
 /// `tinio-api`'s `dacl` module take). The invariant inside it is Windows's rather than this
 /// design's: the handler runs on
 /// a thread the system creates, so it may not allocate, format or lock, and the whole of its
@@ -252,27 +363,93 @@ fn install_console_handler(stopper: watch::Sender<bool>) -> Result<(), Error> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use rustix::process::{Signal, getpid, kill_process};
     use tokio::time::timeout;
 
     use super::*;
 
+    /// **The channel flips** — the wiring leg, and the one the process-level legs are built on: the
+    /// confined `SIGTERM` scenario in `crates/tinio-e2e`'s `confinement.feature` drives this same
+    /// channel through the real binary under a seccomp filter, and the Windows console-handler case
+    /// lives in `crates/tinio/tests/lifecycle.rs`, where `CARGO_BIN_EXE_tinio` resolves, because no
+    /// scenario can raise a console control event. The test's own process is the only place a
+    /// handler can be installed, and registration is process-wide and permanent: **this is the
+    /// module's only test that may raise a termination signal**, because the fast-exit arm counts a
+    /// second one in *any* drain and would call `process::exit(0)`, truncating the run green.
     #[tokio::test]
     async fn a_signal_flips_the_shutdown_channel() {
         let handles = install().expect("install");
         let mut shutdown = handles.shutdown.clone();
-        // The test's own process is the only place a handler can be installed, so this test
-        // asserts the wiring; the process-level leg is the Windows console-handler case in
-        // `crates/tinio/tests/lifecycle.rs` (the `tinio` package's file, where
-        // `CARGO_BIN_EXE_tinio` resolves) — no scenario can raise a console control event.
         kill_process(getpid(), Signal::TERM).expect("raise");
         timeout(Duration::from_secs(5), shutdown.changed())
             .await
             .expect("the channel flips")
             .expect("sender alive");
         assert!(*shutdown.borrow());
+    }
+
+    /// **The wake answers a full socket instead of waiting** — the wedge's prevention, asserted on
+    /// the socket itself rather than on a race. A burst fills the write end (measured: 278 one-byte
+    /// sends before `EAGAIN`), and a handler that *waits* for space there can block the only thread
+    /// that would make space, so this flag is what keeps a burst from wedging the process.
+    ///
+    /// **The flood-shaped version of this leg was measured not to discriminate**, and the honest
+    /// record of that is here rather than an assertion that cannot fail: senders inside the target
+    /// process are themselves signal takers, the drain keeps up with them, the socket never fills,
+    /// and the blocking draft of this file passed a `SIGHUP` burst followed by `SIGTERM`. What
+    /// reproduces the wedge is a sender *outside* the process (the review's flood: one `kill -HUP`
+    /// loop against a confined server left all 42 threads in `sock_alloc_send_pskb` with `SIGTERM`
+    /// ignored), which is a product-level shape and lives in that evidence, not in a unit test.
+    ///
+    /// **Hermetic beside the wiring leg**: handlers registered through the product's own path, but
+    /// no drain and no signal raised — so this test neither counts a termination nor can reach
+    /// `process::exit`, and a handler that runs on its pair later (the `SIGTERM` the wiring leg
+    /// raises) finds a full socket and must answer `EAGAIN`, which is the point.
+    #[test]
+    fn the_wake_answers_a_full_socket_instead_of_waiting() {
+        let (mut reader, writer) = UnixStream::pair().expect("socketpair");
+        let writer = Arc::new(writer);
+        register_wakes(&writer).expect("register");
+
+        // Fill the socket the handlers write to, **through that same writer**. The loop is on a
+        // thread of its own because the failure this asserts *is* a write that waits — the thread
+        // is where the waiting would happen, and the bound below is how the test observes it
+        // instead of hanging on it.
+        let (sent, filled) = mpsc::channel();
+        let filler = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            let mut wrote = 0usize;
+            while rustix::io::write(&*filler, b"F").is_ok() {
+                wrote += 1;
+            }
+            let _ = sent.send(wrote);
+        });
+        let wrote = filled.recv_timeout(Duration::from_secs(2)).expect(
+            "the write end the handlers hold must be non-blocking: a full socket has to answer \
+             `EAGAIN`, and a blocking one leaves this thread waiting inside the write — the wedge",
+        );
+        assert!(wrote > 0, "the fill must have written at least one byte");
+
+        // And the bytes really are in that socket, so the fill was no no-op on a closed pair.
+        let mut sink = [0u8; 4096];
+        let mut got = 0usize;
+        while got < wrote {
+            match reader.read(&mut sink) {
+                Ok(0) => break,
+                Ok(read) => got += read,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            got >= wrote,
+            "the socket held {got} of the {wrote} bytes the fill wrote"
+        );
     }
 }
 

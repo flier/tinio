@@ -548,12 +548,14 @@ impl Pool {
     /// `body` against the instance in the slot, with the guard taken and given back around it —
     /// **the one spelling of the forwarded-poll shape**, so the four `AsyncWrite` methods and the
     /// read retry below cannot disagree about it.
-    fn with_instance<T>(&mut self, body: impl for<'a> FnOnce(Pin<&'a mut NamedPipeServer>) -> T) -> T {
+    fn with_instance<T>(
+        &mut self,
+        body: impl for<'a> FnOnce(Pin<&'a mut NamedPipeServer>) -> T,
+    ) -> T {
         let mut held = self.held();
-        body(Pin::new(
-            held.as_mut()
-                .expect("the instance is in the slot for the connection's life"),
-        ))
+        body(Pin::new(held.as_mut().expect(
+            "the instance is in the slot for the connection's life",
+        )))
     }
 }
 

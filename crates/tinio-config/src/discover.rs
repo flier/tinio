@@ -362,7 +362,7 @@ mod tests {
         };
         assert_eq!(
             text,
-            std::fs::read_to_string(&path).expect("read back"),
+            fs::read_to_string(&path).expect("read back"),
             "the text it hands back is the text it wrote"
         );
         assert!(path.exists());

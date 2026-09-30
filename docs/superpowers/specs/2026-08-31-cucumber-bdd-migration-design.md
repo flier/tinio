@@ -18,7 +18,7 @@ Migrate tinio's test cases to BDD-style cucumber so that:
 
 - **No migration of pure-mechanics unit tests** (≈600 of ~670): path encoding, checksum math, redb/DB layout, lockmap, schema validation, error formatting, scanner/cleanup internal state machines. Gherkin does not express these better than Rust.
 - **No migration of proptest files**: `tinio-core/tests/validation.rs`, `tinio-fs/tests/proptest_meta.rs`, `tinio-fs/tests/proptest_multipart.rs`. Property-based testing is a different paradigm; cucumber scenarios use representative fixed values instead.
-- **No direct-Storage cucumber steps.** Cucumber scenarios are black-box HTTP against the S3 API only. The `tinio-util` conformance harness (`assert_conformance`) stays as-is in Rust — it serves benches and `tinio doctor`, and its helpers become the step layer's assertion primitives.
+- **No direct-Storage cucumber steps.** Cucumber scenarios are black-box HTTP against the S3 API only, except for the behaviors the S3 API cannot observe, which drive the CLI/process surface or the product's own tracing/metrics instead (§Migration rule). The `tinio-util` conformance harness (`assert_conformance`) stays as-is in Rust — it serves benches and `tinio doctor`, and its helpers become the step layer's assertion primitives.
 - **No removal of `tinio-fs/tests/layout.rs`** — it inspects on-disk state-dir structure (`meta.redb`, `tmp/`, `multipart/`), an implementation detail requiring direct fs access.
 - **No changes to tinio-config / tinio-api / tinio-cli tests** (pure schema/error-formatting logic).
 - **No CI matrix reduction.** ubuntu/windows/macos stay; WSL2 is a local-dev convenience, not a CI substitute.
@@ -27,7 +27,7 @@ Migrate tinio's test cases to BDD-style cucumber so that:
 ## Decisions (locked in brainstorming, 2026-08-31)
 
 - **Dedicated e2e crate, single cucumber binary.** `crates/tinio-e2e` with one `[[test]] name = "cucumber"` target (`harness = false`). Rationale: cucumber-rs registers steps per-binary; a single binary is the only layout where step definitions, the `World`, and the conformance helpers share one registry. Per-crate targets would duplicate steps (each compiled per binary) and leave interop tests homeless.
-- **HTTP-surface-only level.** Scenarios express behavior through the S3 API (`PUT/GET/List/CompleteMultipartUpload…`). Backend selection is a tag (`@fs`/`@mem`), not a direct `Storage` call.
+- **HTTP-surface-only level.** Scenarios express behavior through the S3 API (`PUT/GET/List/CompleteMultipartUpload…`), except for the behaviors the S3 API cannot observe, which drive the CLI/process surface or the product's own tracing/metrics instead (§Migration rule). Backend selection is a tag (`@fs`/`@mem`), not a direct `Storage` call.
 - **Strong spec binding.** Features are derived from `contracts/s3-surface.md`; spec changes must update features in the same PR; a CI traceability check enforces it.
 - **Tag umbrella `@external`** = `@interop` ∪ `@boto3` ∪ `@mc`. CI quality job runs `~@external`; interop job runs `@interop`.
 - **Bash merge with deletion.** `e2e/interop/*.sh` + `lib.sh` are deleted once the cucumber `@interop` scenarios pass on 3 OS CI; the FR-025 tiering matrix folds into the tinio-e2e README; the `e2e/` directory retires.
@@ -107,7 +107,7 @@ pub struct World {
 
 ### Migration rule
 
-A test migrates iff it carries a SC/FR/T spec semantic **and** its behavior is observable through the S3 API (conjunction, sharpened at grilling 2026-08-31). API-observable unit tests without a spec ID stay in Rust — they are already covered by the conformance harness or by integration features, and cucumber scenarios do not repeat conformance assertions. Everything else (pure mechanics) stays in Rust.
+A test migrates iff it carries a SC/FR/T spec semantic **and** its behavior is observable through a product surface — the S3 API, the CLI/process surface, or the product's own tracing/metrics (conjunction, sharpened at grilling 2026-08-31). The surface is a set rather than one API because the sandbox's confinement has no S3-observable behavior. API-observable unit tests without a spec ID stay in Rust — they are already covered by the conformance harness or by integration features, and cucumber scenarios do not repeat conformance assertions. Everything else (pure mechanics) stays in Rust.
 
 ### Moves to cucumber (replaces the source)
 

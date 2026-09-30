@@ -406,44 +406,55 @@ jobs:
 
       # --- cucumber e2e suite (e2e and e2e-port) --------------------------
       # The `tinio` binary is a PREREQUISITE of the @cli scenarios, which
-      # spawn it (`cli_lifecycle.feature`): `assert_cmd::cargo::cargo_bin`
-      # falls back to the profile dir beside the test binary and does NOT
-      # build it, exactly as crates/tinio-server/tests/serve_read_only.rs
-      # needs (the run-test-leg action's own build step). --profile ci keeps
-      # the binary in the same profile dir this leg's test binary derives
-      # from its own location.
+      # spawn it (`cli_lifecycle.feature`, plus `confinement.feature`'s sandbox
+      # channels): `assert_cmd::cargo::cargo_bin` falls back to the profile dir
+      # beside the test binary and does NOT build it, exactly as
+      # crates/tinio-server/tests/serve_read_only.rs needs (the run-test-leg
+      # action's own build step). --profile ci keeps the binary in the same
+      # profile dir this leg's test binary derives from its own location.
       - &e2e-build
         name: build the tinio binary (a @cli scenario prerequisite)
         run: cargo build --profile ci -p tinio
 
       # In-process scenarios; the runner's built-in default filter excludes
-      # the feature-gated (@parquet), platform-bound (@unix/@windows),
-      # external-client (@interop/@boto3/@mc) and host-bound (@confinement
-      # off macOS) tags, so the fs pass needs no --tags. That is why the fs
-      # pass is the one macOS leg that runs the confinement scenarios at all,
-      # and there it takes the honour arm rather than a refusal: the backend
-      # is landed on every target, so steps/cli.rs's owed_arm has no macOS
-      # refusal branch. docs/tests.md's CLI section owns that coverage
-      # consequence and this comment does not restate it. The mem pass skips
-      # @fs-only scenarios (traversal, nested-root, out-of-band);
+      # the feature-gated (@parquet), platform-bound (@linux/@macos/@windows/
+      # @unix), external-client (@interop/@boto3/@mc) and host-bound
+      # (@confinement off macOS) tags, so the fs pass needs no --tags. Which
+      # confinement scenarios that leaves in this leg on macOS — and the arm
+      # they take there — is docs/tests.md's fact (its macOS section owns the
+      # selection, its CLI section the arm); this comment cites it rather than
+      # restating it. The mem
+      # pass skips @fs-only scenarios (traversal, nested-root, out-of-band);
       # backend-neutral scenarios run on mem via TINIO_E2E_BACKEND. --test
       # cucumber keeps the args from reaching the plain-harness traceability
       # target (its own step below), and an explicit --tags REPLACES the
-      # runner's default filter, so the
-      # mem pass must repeat the platform, external-tag and confinement
-      # exclusions itself.
+      # runner's default filter, so the mem pass must repeat the platform,
+      # external-tag and confinement exclusions itself — every platform tag,
+      # not one host's non-matching set: this one list is shared by the ubuntu,
+      # windows and macos runners (`e2e-port`), so what it may keep is what all
+      # three may run, and the runner's compound platform clause cannot be
+      # spelled once (tests/steps/tag_filter.rs).
       # --retry 2 on both passes: ConnectionAborted flakes on loaded legs
       # burned both retry-1 attempts in earlier runs (33764783657 fs,
       # 33750043137 mem).
+      #
+      # The guard keeps this step off e2e-port's macOS row, whose parallel pass
+      # is the forced-exclude variant below. It lives here, not at the alias use:
+      # GitHub expands aliases textually and supports no per-job override, and
+      # this anchor also serves the single-OS ubuntu e2e job (no matrix), so it
+      # names the runner rather than the matrix. The anchor itself stays free of
+      # `TINIO_E2E_CONFINEMENT` — ubuntu and windows must keep running with the
+      # variable unset (the platform default).
       - &e2e-fs
         name: e2e cucumber (fs backend)
+        if: runner.os != 'macOS'
         run: cargo test --profile ci -p tinio-e2e --test cucumber -- --retry 2
         env:
           TINIO_E2E_REPORT: cucumber-report-fs.json
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json
@@ -625,6 +636,28 @@ jobs:
       - *sccache
       - *e2e-build
       - *e2e-fs
+
+      # macOS parallel pass with the confinement family forced out, so the
+      # serial leg below is its only run on this row: same command as the shared
+      # anchor, which the guard at its definition skips on macOS, plus the `0`
+      # state (`1`/`true` would force the family in anywhere; any other value
+      # stops the run — tests/steps/tag_filter.rs owns the grammar).
+      - name: e2e cucumber (fs backend, confinement excluded)
+        if: matrix.os == 'macos-latest'
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --retry 2
+        env:
+          TINIO_E2E_CONFINEMENT: "0"
+          TINIO_E2E_REPORT: cucumber-report-fs.json
+
+      # macOS only: the default filter keeps `@confinement` on that host, and
+      # the family's measured spelling is serial (`--concurrency 1`,
+      # crates/tinio-e2e/README.md owns it). An explicit `--tags` replaces the
+      # runner's composed filter, so the platform and external axes are
+      # restated here (`tests/steps/tag_filter.rs` composes them).
+      - name: e2e cucumber (macOS confinement, serial)
+        if: matrix.os == 'macos-latest'
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@confinement and not @interop and not @boto3 and not @mc and not ((@linux or @macos or @windows or @unix) and not (@macos or @unix))' --retry 2 --concurrency 1
+
       - *e2e-mem
       - *e2e-trace
       - *upload-report
@@ -753,9 +786,16 @@ jobs:
       # @interop run replaces the deleted bash scripts (e2e/interop/*.sh).
       # --test cucumber keeps the tags from reaching the plain-harness
       # traceability target; --retry 1 mitigates external-client flakes.
+      # `and not @confinement` is load-bearing: an explicit --tags *replaces*
+      # the runner's composed filter, so the bare @interop would sweep the
+      # external clients' confined legs (interop/*.feature's `@confinement`
+      # scenarios) into this job — and no hosted runner can confine a server
+      # (ubuntu's AppArmor refuses the userns, macOS/Windows runners owe no
+      # grant budget): those legs are the platform gates' and the operator's,
+      # never CI's.
       - &interop-cucumber
         name: interop cucumber (@interop)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop' --retry 1
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop and not @confinement' --retry 1
         env:
           TINIO_E2E_REPORT: interop-report.json
 

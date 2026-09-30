@@ -73,8 +73,11 @@ pub(crate) mod testing;
 pub use self::launcher::{ProbeSteps, await_verdict, report_verdict};
 pub use self::{
     backend::{Backend, Confinement, PlatformFacts},
-    enforcement::{Attribution, Denial, Diagnostics, Enforcement, Refused},
-    error::{Error, MACOS_MECHANISM_USAGE, Result, fail, launch, refused, step},
+    enforcement::{Attribution, Diagnostics, Enforcement, Refused},
+    error::{
+        Error, LINUX_MODEL_USAGE, MACOS_MECHANISM_USAGE, Result, WINDOWS_CAPABILITY_USAGE, fail,
+        launch, refused, step,
+    },
     event::Event,
     launcher::{
         Adopted, CONTROL_FD_PREFIX, Child, ControlHandle, LISTENER_FD_PREFIX, LaunchPayload,

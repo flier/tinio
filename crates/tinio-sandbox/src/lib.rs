@@ -472,7 +472,6 @@ pub use crate::_core::PlatformFacts;
 /// ```
 /// let facts = tinio_sandbox::platform_facts();
 /// assert_eq!(facts.refuses_derived_state_dir, cfg!(target_os = "macos"));
-/// assert_eq!(facts.control_socket, cfg!(target_os = "macos"));
 /// ```
 pub const fn platform_facts() -> PlatformFacts {
     #[cfg(target_os = "linux")]
@@ -482,7 +481,7 @@ pub const fn platform_facts() -> PlatformFacts {
     #[cfg(target_os = "windows")]
     let facts = _windows::FACTS;
     // No backend is wired for this target, which is the same answer an in-place backend gives:
-    // nothing is launched, so the three facts a launch owns are unstated rather than false.
+    // nothing is launched, so the two facts a launch owns are unstated rather than false.
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let facts = PlatformFacts::NONE;
     facts
@@ -494,15 +493,12 @@ pub const fn platform_facts() -> PlatformFacts {
 /// The value is the target backend's own constant, so it is a sentence the crate that owns the
 /// mechanism wrote: `tinio_sandbox_macos::DIAGNOSTICS`, `tinio_sandbox_windows::DIAGNOSTICS`,
 /// `tinio_sandbox_linux::DIAGNOSTICS`. Which constant is the only `cfg` here, and a target this
-/// build wires no backend for answers [`Diagnostics::NOT_REPORTED`] — never
-/// [`Enforcement::Unimplemented`], which would be a claim about a mechanism that is not there
-/// to make it.
+/// build wires no backend for answers [`Diagnostics::NOT_REPORTED`] — not a claim that a
+/// mechanism which is not there applies nothing.
 ///
 /// **A caller that needs the strength reads this rather than assuming one**: the value a
 /// backend that has not answered returns is `NotReported`, and treating that as "nothing is
 /// applied" is the one reading this function exists to prevent.
-///
-/// [`Enforcement::Unimplemented`]: crate::Enforcement::Unimplemented
 ///
 /// # Examples
 ///
@@ -719,11 +715,12 @@ pub const fn backend_available() -> bool {
 // the comment on that test.
 pub use crate::_core::{
     AccessMode, Adopted, Attribution, Backend, CONTROL_FD_PREFIX, Child, Confinement,
-    ControlHandle, Denial, Diagnostics, Enforcement, Error, Event, Exposure, LISTENER_FD_PREFIX,
-    LaunchPayload, LaunchPlan, MACOS_MECHANISM_USAGE, Observer, Readiness, Refused, Result,
-    Sandbox, SandboxSpec, Terminal, adopt, control_fd_arg, control_fd_from_arg, describe_exposures,
-    fail, filter_argv, is_control_fd_arg, is_launcher_fd_arg, is_listener_fd_arg, launch,
-    listener_fd_arg, listener_fd_from_arg, refused, step, supervise,
+    ControlHandle, Diagnostics, Enforcement, Error, Event, Exposure, LINUX_MODEL_USAGE,
+    LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, MACOS_MECHANISM_USAGE, Observer, Readiness,
+    Refused, Result, Sandbox, SandboxSpec, Terminal, WINDOWS_CAPABILITY_USAGE, adopt,
+    control_fd_arg, control_fd_from_arg, describe_exposures, fail, filter_argv, is_control_fd_arg,
+    is_launcher_fd_arg, is_listener_fd_arg, launch, listener_fd_arg, listener_fd_from_arg, refused,
+    step, supervise,
 };
 // **The fork probe's names, published only where a probe can exist** — a `#[cfg]` the core's own
 // list carries for the same reason, and one this list has to repeat because the equality between
@@ -771,6 +768,75 @@ pub use crate::_linux as linux;
 /// ```
 #[cfg(target_os = "linux")]
 pub use crate::_linux::backend as platform;
+/// The Linux model `TINIO_SANDBOX_MODEL` asks for — **one read, on the rule that owns the
+/// variable**, so that a caller can carry the answer instead of spelling the variable again.
+///
+/// **[`serve::Spec::model`] is where the answer goes**, and the reason it is read here rather
+/// than there: the CLI has to state the request *after* the confinement has run (its in-place
+/// re-emit), where a second read of `TINIO_SANDBOX_MODEL` would be a second answer to what the
+/// confinement applied. The value therefore travels as a value, read once through the Linux
+/// backend's own parser (`tinio_sandbox_linux::Options::from_env` — the derivation the Linux arm
+/// of `Spec::apply` builds its options from).
+///
+/// **A refusal is the reader's own and is not swallowed**: a value that is neither `userns` nor
+/// `root` answers the backend's [`Error::Usage`] carrying [`LINUX_MODEL_USAGE`] — a caller maps it
+/// the way it maps `Spec::apply`'s, so a typo still ends the run as a usage error rather than being
+/// downgraded to the default.
+///
+/// # Errors
+///
+/// [`Error::Usage`] ([`LINUX_MODEL_USAGE`]) for a value outside the two model names.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(target_os = "linux")]
+/// # fn main() {
+/// use tinio_sandbox::{requested_model, serve};
+///
+/// // Both arms, so the example turns on the call rather than on how the test process happened
+/// // to be started: the model the environment spelled, or the refusal that names the variable.
+/// match requested_model() {
+///     Ok(model) => {
+///         let _ = serve::Spec::new().model(model);
+///     }
+///     Err(error) => assert!(error.to_string().contains("TINIO_SANDBOX_MODEL")),
+/// }
+/// # }
+/// # #[cfg(not(target_os = "linux"))]
+/// # fn main() {}
+/// ```
+#[cfg(target_os = "linux")]
+pub fn requested_model() -> Result<Mechanism> {
+    use crate::_linux::Options;
+
+    Ok(Options::from_env()?.model())
+}
+/// The Linux model vocabulary [`requested_model`] answers and [`serve::Spec::model`] carries —
+/// the platform's own type, published under a `#[cfg]`-selected facade name so that a caller
+/// that must name it in a signature of its own (the CLI's re-emit parameter) writes no `linux`
+/// module path for it.
+///
+/// **This is the module alias's rule in the one shape a path cannot serve**: the alias is for a
+/// caller spelling platform vocabulary at a call site, while this name exists because the shared
+/// signatures that carry a model — `Spec::model`, `requested_model` — must be nameable by a
+/// caller that never opens the platform module.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(target_os = "linux")]
+/// # fn main() {
+/// use tinio_sandbox::{Mechanism, serve};
+///
+/// let spec = serve::Spec::new().model(Mechanism::Auto);
+/// assert_eq!(spec.model_configured(), Some(Mechanism::Auto));
+/// # }
+/// # #[cfg(not(target_os = "linux"))]
+/// # fn main() {}
+/// ```
+#[cfg(target_os = "linux")]
+pub use crate::_linux::Mechanism;
 /// The macOS backend's own crate, for the settings the shared surface does not
 /// carry — its `Options`, which holds the mechanism (`Mechanism`), and the
 /// `apply` module the confined child reaches its own confinement through.

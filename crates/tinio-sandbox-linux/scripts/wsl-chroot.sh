@@ -108,11 +108,18 @@ echo "== the confined scenarios, end to end =="
 # selection and nothing the default excluded stays excluded; that is why it is
 # spelled out, and why the opt-in is the variable beside it rather than the tag.
 #
+# **The platform axis is re-stated in the runner's own spelling**: a scenario
+# carrying platform tags runs where at least one of them matches, so this Linux
+# host excludes the scenarios that carry platform tags and match neither
+# `@linux` nor `@unix` — a `@macos`/`@windows` scenario runs on the launcher
+# platforms, and its steps exist nowhere else, which `fail_on_skipped()` would
+# turn into a red gate rather than a skip.
+#
 # **`--concurrency 1` is measured, not tidiness**: two launchers at once write
 # DACLs on the same program directory and one blows the 30 s readiness bound,
 # which reads as a random red (six identical runs on the phase's Windows host:
 # 4.6 s, 8.7 s, 8.7 s, 18.1 s, 57.7 s, and one killed at >120 s).
-TINIO_E2E_CONFINEMENT=1 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036' --concurrency 1
+TINIO_E2E_CONFINEMENT=1 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036 and not ((@linux or @macos or @windows or @unix) and not (@linux or @unix))' --concurrency 1
 
 # **No server process outlives the legs, and the check is the gate rather than tidiness.** A
 # finished run once left 19 `tinio server <root> --port 0` processes alive after their parent had

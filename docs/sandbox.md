@@ -2,6 +2,8 @@
 
 `--sandbox` confines server to given paths — private mount namespace, `pivot_root`, seccomp deny eleven syscalls + whole x32 ABI. Notes below = Linux unless heading names other platform (Linux first; macOS + Windows landed since). Each item = confinement working as designed, not defect — all three read as bugs first time without warning.
 
+**A platform selector's value outside its accepted set is a usage error (exit 2) on every platform**, naming the variable and the values it takes rather than falling back to a default: `TINIO_SANDBOX_MODEL` (`userns` / `root`), `TINIO_SANDBOX_MACOS_MECHANISM` (`sandbox-exec` / `sandbox-init`), `TINIO_SANDBOX_CAPABILITIES` (the three AppContainer names). One operator mistake, one exit code, whichever selector it was typed into (`crates/tinio-sandbox-core/src/error.rs`'s `Error::Usage { detail }` variant is the class itself — `is_usage` deleted 2026-10-01, each platform's sentence now the variant's own `detail`, operator-visible refusal and exit code unchanged; each platform's own section below repeats the rule where its typo has a local consequence).
+
 ## Linux: the confinement's own log lines are not in a production run's log
 
 In-place arm installs the tracing subscriber **after** `confine` — a thread started before it would stay outside the namespaces, the dropped capabilities and the filter — so the jail's own events (`unshare`, mounts, cap drop, seccomp install) are emitted where no subscriber exists yet and are lost. Failure still reaches operator: returned error, non-zero exit, message on stderr. Trade accepted by operator; rule + reasoning = design decision 26.

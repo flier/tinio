@@ -49,6 +49,13 @@ pub mod options;
 pub mod plan;
 pub mod seccomp;
 
+/// The two families this crate records into the process-wide prometheus default registry — the
+/// read-only arm an exposure took and the seccomp skip — **internal to the crate**: nothing
+/// outside it reads or writes them, and the exposition they land in is the management plane's
+/// (`/metrics` gathers the same default registry this process registered into; the module's own
+/// doc carries that argument).
+pub(crate) mod metrics;
+
 /// The crate's test-side support, in one place: this platform's host
 /// precondition and the two shared recording devices.
 ///
@@ -73,7 +80,7 @@ pub use self::{
 /// What this mechanism does, for a caller that branches on the fact rather than the OS.
 ///
 /// **The in-place answer**: this backend confines the calling process (design decision 6), so it
-/// launches nothing and none of the three facts a *launch* owns are its to state.
+/// launches nothing and none of the two facts a *launch* owns are its to state.
 pub const FACTS: PlatformFacts = PlatformFacts::NONE;
 
 /// How much of its guarantee this backend's mechanism applies — **the strength the mechanism

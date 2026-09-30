@@ -161,3 +161,22 @@ if [[ -n "$refusals" ]]; then
   exit 1
 fi
 echo "no unexpected refusal for the server's own process"
+
+# **No server process outlives the legs, and the check is the gate rather than tidiness.** The other
+# two operator gates both end on this assertion (`crates/tinio-sandbox-linux/scripts/wsl-chroot.sh`,
+# `crates/tinio-sandbox-windows/scripts/verify-windows.ps1`), and each earned it the same way: a
+# finished run once left 19 `tinio server` processes alive on Windows, holding the binary open so
+# the next build failed at the uplift step, and on *this* platform every cucumber run left one
+# confined server orphaned — the launcher platforms keep no job object, so a killed launcher leaves
+# its child serving (design decision 20's accepted gap), which the harness sweeps by name.
+# **This script runs no cucumber and therefore walks none of that path today**; the assertion is
+# here because a gate whose leak exposure is "whatever a later leg adds" cannot say it is clean, and
+# because three gates that answer the same question should answer it the same way. `pgrep -x`
+# matches the binary's own name, which is the confined server's too — `sandbox-exec` execs in place,
+# so the process becomes `tinio`.
+if pgrep -x tinio > /dev/null 2>&1; then
+  echo "a tinio server process outlived the legs:" >&2
+  pgrep -lx tinio >&2 || true
+  exit 1
+fi
+echo "no tinio process outlived the legs"

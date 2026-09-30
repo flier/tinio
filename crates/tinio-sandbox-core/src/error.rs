@@ -31,6 +31,35 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    /// The operator's own input cannot be honoured — a value outside a platform
+    /// selector's accepted set, with the remedy in `detail`.
+    ///
+    /// **This is the structural usage class (exit 2)**: the platform that raised it
+    /// does not decide the exit code, so one operator mistake answers one code
+    /// whichever selector it was typed into, and a caller reads the class from the
+    /// variant rather than from the sentence. [`Self::Unsupported`] is the other half
+    /// of the split — a platform that cannot confine at all, which is not the
+    /// operator's to fix.
+    ///
+    /// The three sentences with a home in this crate are [`MACOS_MECHANISM_USAGE`],
+    /// [`LINUX_MODEL_USAGE`] and [`WINDOWS_CAPABILITY_USAGE`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::{Error, LINUX_MODEL_USAGE};
+    ///
+    /// let err = Error::Usage {
+    ///     detail: LINUX_MODEL_USAGE,
+    /// };
+    /// assert!(matches!(err, Error::Usage { .. }), "{err}");
+    /// assert!(err.to_string().contains("TINIO_SANDBOX_MODEL"), "{err}");
+    /// ```
+    #[error("sandbox unsupported here: {detail}")]
+    Usage {
+        /// Why, in operator-facing terms, with the remedy where one exists.
+        detail: &'static str,
+    },
     /// The platform cannot confine this process at all.
     ///
     /// Reserved for exactly that: no user namespaces and not root, a stub whose
@@ -38,11 +67,8 @@ pub enum Error {
     /// this process cannot satisfy is not this variant** — an exposure set with
     /// nothing in it is reported as [`Self::Step`] with the rejected step named,
     /// so that "unsupported here" keeps pointing at the platform rather than at
-    /// the operator's argument.
-    ///
-    /// **One value of `detail` is an operator typo rather than a missing
-    /// platform**, and [`Error::is_usage`] is how a caller tells them apart
-    /// without matching the sentence: [`MACOS_MECHANISM_USAGE`].
+    /// the operator's argument. **Nor is an operator typo**: a value outside a
+    /// selector's accepted set is [`Self::Usage`], the class that answers exit 2.
     #[error("sandbox unsupported here: {detail}")]
     Unsupported {
         /// Why, in operator-facing terms, with the remedy where one exists.
@@ -93,45 +119,65 @@ pub enum Error {
 /// The macOS mechanism selector's refusal when the operator typed neither
 /// accepted value.
 ///
-/// **This is the one [`Error::Unsupported`] a caller treats as usage** (exit 2).
-/// The sentence stays here so the platform that builds the error and
-/// [`Error::is_usage`] cannot drift.
+/// **This is the `detail` of an [`Error::Usage`]** (exit 2): the sentence the
+/// platform builds and the payload the class travels in are one definition, so the
+/// two cannot drift.
 ///
 /// # Examples
 ///
 /// ```
 /// use tinio_sandbox_core::{Error, MACOS_MECHANISM_USAGE};
 ///
-/// let err = Error::Unsupported {
+/// let err = Error::Usage {
 ///     detail: MACOS_MECHANISM_USAGE,
 /// };
-/// assert!(err.is_usage());
+/// assert!(err.to_string().contains(MACOS_MECHANISM_USAGE), "{err}");
 /// ```
 pub const MACOS_MECHANISM_USAGE: &str =
     "TINIO_SANDBOX_MACOS_MECHANISM must be `sandbox-exec` or `sandbox-init`";
 
-impl Error {
-    /// Whether this failure is an operator typo (exit 2) rather than a platform
-    /// that cannot confine (exit 1).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tinio_sandbox_core::{Error, MACOS_MECHANISM_USAGE};
-    ///
-    /// let typo = Error::Unsupported {
-    ///     detail: MACOS_MECHANISM_USAGE,
-    /// };
-    /// let missing = Error::Unsupported {
-    ///     detail: "no user namespaces",
-    /// };
-    /// assert!(typo.is_usage());
-    /// assert!(!missing.is_usage());
-    /// ```
-    pub fn is_usage(&self) -> bool {
-        matches!(self, Self::Unsupported { detail } if *detail == MACOS_MECHANISM_USAGE)
-    }
-}
+/// The Linux model selector's refusal when the operator typed neither accepted
+/// value.
+///
+/// **This is another [`Error::Usage`] `detail`** (exit 2), and it sits here for
+/// [`MACOS_MECHANISM_USAGE`]'s reason: the sentence the platform builds is one
+/// definition with the payload the class travels in. Typing a wrong value into any
+/// selector is one operator mistake, so they all answer one exit code rather than
+/// one per platform.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::{Error, LINUX_MODEL_USAGE};
+///
+/// let err = Error::Usage {
+///     detail: LINUX_MODEL_USAGE,
+/// };
+/// assert!(err.to_string().contains(LINUX_MODEL_USAGE), "{err}");
+/// ```
+pub const LINUX_MODEL_USAGE: &str = "TINIO_SANDBOX_MODEL must be `userns` or `root`";
+
+/// The Windows capability list's refusal when a name in it is not one the
+/// container can hold.
+///
+/// **This is the third [`Error::Usage`] sentence** (exit 2), beside
+/// [`MACOS_MECHANISM_USAGE`] and [`LINUX_MODEL_USAGE`], and it is here for their
+/// reason: the sentence the platform builds is one definition with the payload the
+/// class travels in. A name outside the accepted set is the same operator mistake as
+/// a selector outside its two values, so it answers the same code — the platform
+/// that typed it does not decide.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::{Error, WINDOWS_CAPABILITY_USAGE};
+///
+/// let err = Error::Usage {
+///     detail: WINDOWS_CAPABILITY_USAGE,
+/// };
+/// assert!(err.to_string().contains(WINDOWS_CAPABILITY_USAGE), "{err}");
+/// ```
+pub const WINDOWS_CAPABILITY_USAGE: &str = "unknown AppContainer capability (expected internetClient, internetClientServer or privateNetworkClientServer)";
 
 /// Convenience alias.
 ///

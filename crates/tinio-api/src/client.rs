@@ -585,6 +585,10 @@ mod tests {
     // Windows, so *their* imports are gated rather than the module: the TCP test at the bottom
     // is platform-neutral and runs on both hosts (it is the only leg of this module that
     // exercises `Control::Tcp`). The Windows pipe dialer and the DACL are Task 10's, gated there.
+    // The busy-pool leg's pool name is per-process, and `process` is named by that leg alone: the
+    // unix legs derive their own path from the temp dir they bind in.
+    #[cfg(windows)]
+    use std::process;
     #[cfg(any(unix, windows))]
     use std::sync::Arc;
     use std::{
@@ -599,20 +603,16 @@ mod tests {
     use tokio::sync::watch;
 
     use super::*;
-    use crate::state::State;
-    // The busy-pool leg's pool name is per-process, and `process` is named by that leg alone: the
-    // unix legs derive their own path from the temp dir they bind in.
-    #[cfg(windows)]
-    use std::process;
     #[cfg(windows)]
     use crate::bind::{INSTANCES, bind_pipe, pipe_name};
+    use crate::state::State;
+    #[cfg(unix)]
+    use crate::{bind::bind_unix, state::socket_path};
     #[cfg(any(unix, windows))]
     use crate::{
         router::{Auth, Context},
         transport::serve_local,
     };
-    #[cfg(unix)]
-    use crate::{bind::bind_unix, state::socket_path};
 
     #[cfg(unix)]
     #[tokio::test]

@@ -11,6 +11,11 @@ use secrecy::ExposeSecret;
 // an item no target imports.
 #[cfg(not(target_os = "linux"))]
 use crate::Error;
+// **The model vocabulary `Spec::model` carries is the facade's `Mechanism`** — the same name the
+// reader that answers it is published under (`crate::requested_model`), so the knob and the
+// environment's answer are one type with one home.
+#[cfg(target_os = "linux")]
+use crate::Mechanism;
 use crate::{
     _core::{Secret, SecretKey},
     AccessMode, Child, Confinement, ControlHandle, LaunchPlan, Result, Sandbox,
@@ -61,6 +66,14 @@ pub struct Spec {
     /// `Option` still shows whether a token was set.
     token: Option<Secret>,
     local_uid: bool,
+    /// The Linux confinement model a caller carried, when it carried one — the value
+    /// [`crate::requested_model`] answers for whoever must state the request after the
+    /// confinement has run. **`None` is `TINIO_SANDBOX_MODEL`'s own read, not the default**:
+    /// the Linux arm then builds its `Options` from `Options::from_env()` exactly as it always
+    /// has, which is what a caller with no model to carry — the `Spec::new().apply()` doctest,
+    /// any launcher that never had one — still gets.
+    #[cfg(target_os = "linux")]
+    model: Option<Mechanism>,
 }
 
 impl Spec {
@@ -280,6 +293,59 @@ impl Spec {
         self.local_uid
     }
 
+    /// Carry the Linux model the environment asked for, as a value — the second Linux knob,
+    /// beside [`Self::local_uid`], and the one the confinement's own options are built from.
+    ///
+    /// **Why the value is carried rather than spelled here.** [`crate::requested_model`] reads
+    /// `TINIO_SANDBOX_MODEL` once, on the backend's own parser, and a caller that also has to
+    /// state the request *after* the confinement has run (the CLI's in-place re-emit) hands the
+    /// answer back through this knob. The Linux arm then builds `Options` from that value
+    /// instead of reading the variable again, so the value the caller states and the value the
+    /// confinement applied cannot be two answers to one question.
+    ///
+    /// **A `Spec` that carries none reads the environment itself**, which is the mandatory
+    /// shape: `sandbox-child` and the crate's own `apply()` doctest never touch a `Spec`, and a
+    /// knob that had to be set would break both.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(target_os = "linux")]
+    /// # fn main() {
+    /// use tinio_sandbox::{Mechanism, serve};
+    ///
+    /// let spec = serve::Spec::new().model(Mechanism::UserNamespace);
+    /// assert_eq!(spec.model_configured(), Some(Mechanism::UserNamespace));
+    /// # }
+    /// # #[cfg(not(target_os = "linux"))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub fn model(mut self, model: Mechanism) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// The model [`Self::model`] carried, or `None` when the environment's own read is what the
+    /// Linux arm will build its options from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(target_os = "linux")]
+    /// # fn main() {
+    /// use tinio_sandbox::serve;
+    ///
+    /// assert_eq!(serve::Spec::new().model_configured(), None);
+    /// # }
+    /// # #[cfg(not(target_os = "linux"))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub fn model_configured(&self) -> Option<Mechanism> {
+        self.model
+    }
+
     /// The exposure set the spec will confine.
     ///
     /// # Examples
@@ -380,14 +446,24 @@ fn apply_platform(spec: Spec) -> Result<Option<Child>> {
     };
 
     let local_uid = spec.local_uid;
+    let model = spec.model;
     let (sandbox, plan) = spec.into_plan();
     // **The device nodes are this platform's own, not the caller's choice**: alongside
     // `local_uid`, they are what a Linux jail needs to be a jail, so they are asked for here
     // rather than carried on the business-agnostic builder — where the only caller that could
     // set them always did, and a caller that did not got a silent no-op.
-    let options = Options::from_env()?
-        .with_device_files(true)
-        .with_local_uid(local_uid);
+    //
+    // **The model is the caller's when it carried one, and the environment's read otherwise**:
+    // a carried value was read once, on the backend's own parser (`crate::requested_model`), so
+    // this arm does not read the variable a second time behind the caller's back; `None` keeps
+    // the read that a caller with no model to carry — the `apply()` doctest, a hand-built
+    // `Spec` — has always had.
+    let options = match model {
+        Some(model) => Options::default().with_model(model),
+        None => Options::from_env()?,
+    }
+    .with_device_files(true)
+    .with_local_uid(local_uid);
     let mut backend = LinuxBackend::with_options(options);
     let confinement = backend.confine(&sandbox, &plan)?;
     let child = map_confinement(confinement)?;
@@ -469,6 +545,16 @@ mod tests {
         assert_eq!(spec.sandbox().exposures().len(), 2);
         assert_eq!(spec.config(), Some("port = 9000"));
         assert!(spec.local_uid_configured());
+    }
+
+    /// The Linux model knob: **a carried value is the answer, and absence is `None` rather than
+    /// a default** — the arm's fallback to `Options::from_env()` is what the absence means.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_model_knob_records_what_the_environment_asked_for() {
+        assert_eq!(Spec::new().model_configured(), None);
+        let spec = Spec::new().model(crate::Mechanism::Root);
+        assert_eq!(spec.model_configured(), Some(crate::Mechanism::Root));
     }
 
     #[test]

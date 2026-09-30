@@ -14,12 +14,15 @@
 //! "CLI (tinio)" section.
 //!
 //! **Why this one stayed.** A console control event cannot be raised from a step definition:
-//! `GenerateConsoleCtrlEvent` is an `unsafe extern` call and the child has to be spawned
-//! `CREATE_NEW_PROCESS_GROUP` to be addressable by it at all — the second of the workspace's two
-//! console-related `#[allow(unsafe_code)]` sites, `tinio-cli`'s `signal.rs` handler being the
-//! other (the workspace has five in all: those two, `tinio-winsec`'s file DACLs, and the raw
-//! Windows modules `tinio-api`'s `dacl.rs` and `tinio-cli`'s `daemon.rs` own) — and a
-//! `#[cfg(windows)]` arm inside the cucumber suite's step table.
+//! `GenerateConsoleCtrlEvent` is an `unsafe extern` call, the child has to be spawned
+//! `CREATE_NEW_PROCESS_GROUP` to be addressable by it at all, and the leg is a `#[cfg(windows)]`
+//! arm inside the cucumber suite's step table. It is the second of the workspace's two
+//! **console-related** `#[allow(unsafe_code)]` sites — `tinio-cli`'s `signal.rs` console handler is
+//! the other — and the workspace's exception sites are **enumerated one by one rather than
+//! counted** (design decision 20): `tinio-cli`'s four — the console handler, the unix registration
+//! beside it (`register_wakes`), `daemon.rs`'s `set_launch_env` and `doctor`'s `space` — are named
+//! in `signal.rs`'s `install_console_handler` doc, the enumeration's home; each other crate keeps
+//! its list beside its own sites.
 //! What it proves is the handler's own half: that a console control event reaches the shutdown
 //! channel `tinio-cli`'s `signal.rs` installs, and that the run drains rather than dying where
 //! it stands.

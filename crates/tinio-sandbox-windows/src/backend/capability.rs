@@ -13,7 +13,7 @@
 //! unknown name are documented on the items below, exactly as they were before
 //! the backend became a directory module.
 
-use crate::_core::{Error, Result};
+use crate::_core::{Error, Result, WINDOWS_CAPABILITY_USAGE};
 
 /// A capability the container may hold.
 ///
@@ -103,7 +103,7 @@ impl Capability {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for an unknown name, so a typo cannot silently
+    /// [`Error::Usage`] for an unknown name, so a typo cannot silently
     /// leave the container with fewer capabilities than the operator asked for.
     ///
     /// # Examples
@@ -123,8 +123,8 @@ impl Capability {
             "internetClient" => Ok(Self::InternetClient),
             "internetClientServer" => Ok(Self::InternetClientServer),
             "privateNetworkClientServer" => Ok(Self::PrivateNetworkClientServer),
-            _ => Err(Error::Unsupported {
-                detail: "unknown AppContainer capability (expected internetClient, internetClientServer or privateNetworkClientServer)",
+            _ => Err(Error::Usage {
+                detail: WINDOWS_CAPABILITY_USAGE,
             }),
         }
     }
@@ -133,7 +133,7 @@ impl Capability {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for any unknown entry.
+    /// [`Error::Usage`] for any unknown entry.
     ///
     /// # Examples
     ///

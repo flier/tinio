@@ -188,14 +188,21 @@ Assert-Exit 'cargo test -p tinio-server --test sandbox_e2e_windows' $LASTEXITCOD
 # is spelled out for that reason, and `TINIO_E2E_CONFINEMENT=1` is what arms the
 # scenario rather than the tag alone.
 #
+# **The platform axis is re-stated in the runner's own spelling**: a scenario
+# carrying platform tags runs where at least one of them matches, so this
+# Windows host excludes the scenarios that carry platform tags and `@windows`
+# is not one of them — a `@linux`/`@macos`/`@unix` scenario runs on a host whose
+# steps this one does not have, which `fail_on_skipped()` would turn into a red
+# gate rather than a skip.
+#
 # **`--concurrency 1` is measured, not tidiness.** Two launchers running at once
 # write DACLs on the same program directory (`target\debug` here) and one of them
 # blows the 30 s readiness bound, which reads as a random red: six identical runs
 # of one command on this host measured 4.6 s, 8.7 s, 8.7 s, 18.1 s, 57.7 s and
 # one killed at >120 s.
 $env:TINIO_E2E_CONFINEMENT = '1'
-cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036' --concurrency 1
-Assert-Exit "cargo test -p tinio-e2e --test cucumber --tags '@cli and @FR-036' --concurrency 1" $LASTEXITCODE
+cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036 and not ((@linux or @macos or @windows or @unix) and not @windows)' --concurrency 1
+Assert-Exit "cargo test -p tinio-e2e --test cucumber --tags '@cli and @FR-036 and not ((@linux or @macos or @windows or @unix) and not @windows)' --concurrency 1" $LASTEXITCODE
 
 # **No server process outlives the legs, and the check is the gate rather than tidiness.** A
 # finished run once left 19 `tinio server <root> --port 0` processes alive after their parent had

@@ -1,18 +1,29 @@
 //! The confined server, driven the way the interop harness drives it: spawn
-//! `tinio server <root> --sandbox`, read the endpoint it reports, and talk to it.
+//! `tinio server <root> --sandbox --read-only`, read the endpoint it reports, and
+//! ask the confinement's own question of the served root.
 //!
-//! The server is confined **in place** on Linux (design decision 2), so these
-//! legs prove the end of the chain no unit test can: a process that built a
-//! jail around itself still binds a listener, still reports it, and still
-//! answers on it from outside. The second leg drives the same binary under
-//! `--read-only` and asks the confinement's own question — whether a write
-//! through the served root is refused — through the child's private mount
-//! namespace, which is the one place the answer exists.
+//! The server is confined **in place** on Linux (design decision 2), so this leg
+//! proves the end of the chain no unit test can: a process that built a jail
+//! around itself still binds a listener, still reports it, still serves — and the
+//! write it refuses under `--read-only` is refused by the **mount**, read through
+//! the child's private mount namespace, which is the one place that answer exists.
+//! **The listener's own half is the suite's now**: a signed S3 journey through the
+//! same binary is `crates/tinio-e2e/tests/features/confinement.feature`'s G8,
+//! strictly stronger than the bare connect this file used to send, and the plan's
+//! §5 retired the leg that sent it.
+//!
+//! **And the streams are the other subject this file can reach and no in-process
+//! test can**: fd 1 and fd 2 belong to a test harness from the inside, so the
+//! token A5's secret-leak rule is about is only readable on a spawned run —
+//! `a_confined_run_writes_its_control_token_to_neither_stream` below.
 
 #![cfg(target_os = "linux")]
 #![cfg(feature = "sandbox")]
 
 mod common;
+
+#[path = "support/serve_spawn.rs"]
+mod spawn;
 
 use std::{
     fs,
@@ -22,13 +33,20 @@ use std::{
 };
 
 use common::{answer, tinio_bin, wait_for_listening};
+use secrecy::ExposeSecret;
+use spawn::Serve;
+use tinio_api::state::State;
+use tinio_config::state::STATE_DIR_VAR;
 // **The precondition is `tinio-sandbox-linux`'s** — the same reader of
 // `TINIO_SANDBOX_MODEL` the confined child uses, and the same `unshare(1)` probes
 // the jail suite asks, so this leg and that suite cannot drift apart on what a
 // host must grant. What stays here is the part that is this file's own: which
 // failure each answer becomes.
 use tinio_sandbox::linux::testing::{host_can_confine, requested_model};
-use tinio_util::testing::{host_cannot, kill_and_reap};
+use tinio_util::{
+    job,
+    testing::{host_cannot, kill_and_reap},
+};
 
 /// Kill and reap the child, then fail with `message` and the stderr it left.
 ///
@@ -87,58 +105,6 @@ fn confined_view(pid: u32, path: &Path) -> PathBuf {
     PathBuf::from(format!("/proc/{pid}/root")).join(path.strip_prefix("/").unwrap_or(path))
 }
 
-#[test]
-fn a_confined_server_serves() {
-    if !confinement_available() {
-        return;
-    }
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path().join("root");
-    // **The CLI serves an existing `DIR` or refuses it**, where the retired example created the
-    // root it was handed — so a leg that wants a serving server makes the directory first.
-    fs::create_dir_all(&root).expect("the served root");
-
-    // **`job::spawn` rather than `Command::spawn`, and on this leg it is not a
-    // formality**: the child is a confined `tinio server` — the process shape and the
-    // platform arm the orphan incident was about — so the parent-death signal is what
-    // keeps a killed test runner from leaving a jailed server holding its listener and
-    // its state lock.
-    let mut command = Command::new(tinio_bin());
-    command
-        .args(["server", root.to_str().unwrap(), "--port", "0", "--sandbox"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = tinio_util::job::spawn(&mut command).expect("spawn tinio server");
-
-    // No precondition is left to blame here, so the wait's own failure is the
-    // failure — with the child killed and its stderr quoted, because an `Error`
-    // frame carries the confinement's rendering and the stderr behind it
-    // carries the backend's own `error!` line for whatever refused.
-    let addr = match wait_for_listening(&mut child) {
-        Ok(addr) => addr,
-        Err(message) => fail(&mut child, &message),
-    };
-
-    // A plain TCP connection proves the listener is reachable from outside the
-    // jail. Anything more would re-test S3, which the other suites cover.
-    // `addr` goes to `connect` as it is: the event's field is already a
-    // `SocketAddr`, `SocketAddr` implements `ToSocketAddrs`, and that is the
-    // point of the field being typed — there is no text in between that could
-    // disagree with what was bound. (There is no `SocketAddr::as_str`.)
-    // The probe itself is `common::answer`'s — the request bytes, the read and
-    // the bound in one place — and its refusal goes through `fail`, which kills
-    // the child before it reports, the rule the handshake above already follows.
-    let response = match answer(addr) {
-        Ok(response) => response,
-        Err(message) => fail(&mut child, &message),
-    };
-    assert!(response.starts_with("HTTP/1.1 "), "{response}");
-
-    child.kill().expect("kill");
-    child.wait().expect("wait");
-}
-
 /// The read-only seam, end to end: `tinio server <root> --sandbox --read-only`.
 ///
 /// **What this leg is for.** The phase's read-only assertions all ran against
@@ -191,7 +157,7 @@ fn a_confined_read_only_server_refuses_writes_through_the_served_root() {
         .env("TINIO_STATE_DIR", &state)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = tinio_util::job::spawn(&mut command).expect("spawn serve");
+    let mut child = job::spawn(&mut command).expect("spawn serve");
 
     // Still serving: the jail built with a read-only served root and a
     // writable state directory, the plane opened its database inside the
@@ -239,4 +205,92 @@ fn a_confined_read_only_server_refuses_writes_through_the_served_root() {
 
     child.kill().expect("kill");
     child.wait().expect("wait");
+}
+
+/// **A5's secret-leak rule, asked of the streams a real run writes**: the control token this
+/// process mints reaches neither the frame stream (stdout) nor the operational log (stderr).
+///
+/// **What the in-process leg cannot reach, which is why this one spawns.** The re-emit's own leg
+/// (`crates/tinio-cli/src/sandbox/tests.rs`'s
+/// `the_in_place_re_emit_names_its_facts_and_carries_no_token`) drives the emitter directly and
+/// reads a recording, because fd 1 and fd 2 belong to the test harness from inside the process —
+/// so the token it asserts against is one it invented, and nothing could falsify that. Spawning
+/// the binary is what makes the run's streams readable, and reading the token out of the `state`
+/// file the run itself published is what makes the needle the credential the process actually
+/// holds: `tinio-api`'s `generate_token` minted that value inside this process and nowhere else,
+/// so what a failure here would report is "the run printed its own token" and not "the run printed
+/// something that happens to be this test's string".
+///
+/// **Both carriers, because A5 names both.** stdout is the frame stream
+/// (`crates/tinio-cli/src/events.rs`: the readiness frame, and every refusal), and stderr is where
+/// this platform's subscriber writes the log — the in-place re-emit line
+/// (`crates/tinio-cli/src/sandbox/confine.rs`'s `announce_in_place`) among it, which is the line
+/// A5 added and the one the in-process leg can see only as a recording. Each stream is asserted
+/// **present** before the token is looked for: an absence assertion over an empty buffer would
+/// prove nothing. `NO_COLOR` is what makes the re-emit line greppable
+/// (`crates/tinio-server/src/log.rs` owns that rule, and the macOS leg beside this one sets it for
+/// the same reason).
+///
+/// **The two failures do not quote the stream they are about.** A run that leaked its token would
+/// otherwise put the value in the CI log on the way to reporting the leak — the shape STD-01 is
+/// the precedent for — so the offset is named instead of the bytes around it.
+#[tokio::test]
+async fn a_confined_run_writes_its_control_token_to_neither_stream() {
+    if !confinement_available() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    // The root first, because read-only mode refuses to create the directory it was told to serve,
+    // and the state directory outside it because that mode's state never lives under the root
+    // (FR-023) — the same fixture as the leg above.
+    fs::create_dir_all(&root).expect("the served root must already exist");
+    fs::create_dir_all(&state_dir).expect("the relocated state dir");
+
+    let mut server = Serve::spawn(
+        &root,
+        &["--port", "0", "--sandbox", "--read-only"],
+        &[
+            (STATE_DIR_VAR, state_dir.to_str().expect("utf-8 state dir")),
+            ("NO_COLOR", "1"),
+        ],
+    );
+    // **The readiness event is the wait, and `state` precedes it**: `serve`'s own sequence is
+    // `plane.publish(…)` and then `events::ready(…)` (`crates/tinio-cli/src/commands/start/serve.rs`),
+    // so a read taken after this returns cannot race a file still to be written — while the frame
+    // is the one thing this leg must not miss, the kill below being what ends the stream.
+    let _endpoint = server.ready().await;
+    let published = State::read(&state_dir)
+        .expect("the run's `state` is readable")
+        .expect("the run publishes `state` before it reports readiness");
+    let token = published.token.expose_secret().as_str().to_owned();
+    server.stop();
+
+    let stdout = server.stdout_lines().join("\n");
+    let stderr = server.stderr_text();
+    assert!(
+        stdout.contains("event: listening"),
+        "the frame stream must carry the readiness frame this leg reads it for:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("step=\"confined in place\""),
+        "the log must carry the in-place re-emit line, or the token check beside this one would be \
+         about a stream that never carried the line A5 is about:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(&token),
+        "the frame stream carries the run's own control token, at byte {} of {}: the stream is not \
+         quoted because the value is the credential this leg exists to keep out of a log",
+        stdout.find(&token).expect("the assertion above found it"),
+        stdout.len()
+    );
+    assert!(
+        !stderr.contains(&token),
+        "the operational log carries the run's own control token, at byte {} of {}: the log is not \
+         quoted, for the reason the frame stream's failure is not",
+        stderr.find(&token).expect("the assertion above found it"),
+        stderr.len()
+    );
 }

@@ -24,7 +24,7 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 ## Testing concepts
 
 - **Conformance harness** — the `tinio-util` `assert_conformance` suite, Rust-only; proves every `Storage` implementation meets the storage contract. Cucumber scenarios never repeat its assertions.
-- **Migration rule** — a test migrates iff it carries a spec semantic AND its behavior is observable through the S3 API.
+- **Migration rule** — a test migrates iff it carries a spec semantic AND its behavior is observable through a product surface (the S3 API, the CLI/process surface, or the product's own tracing/metrics).
 - **Interop** — scenarios that drive external clients (aws-cli, rclone, boto3, mc) against a spawned server; `@interop` is CI-gated, `@boto3`/`@mc` are manual.
 
 ## Storage & server

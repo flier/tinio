@@ -305,8 +305,8 @@ pub fn plan(
 /// The messages are a matched pair and are written to be told apart by a test: the build's names
 /// the build and never the platform, the platform's names `std::env::consts::OS` and never the
 /// build. A leg that accepted either would pass just as well if the two were swapped, which is
-/// why `cli_lifecycle.feature`'s variable scenario asserts each one's own words and the absence
-/// of the other's (`crates/tinio-e2e/tests/features/cli_lifecycle.feature`).
+/// why `confinement.feature`'s variable scenario asserts each one's own words and the absence
+/// of the other's (`crates/tinio-e2e/tests/features/confinement.feature`).
 fn refuse_unhonourable(channel: Channel) -> Result<(), Error> {
     // A channel this build has no feature for is a **usage** error: the request was well formed
     // and the answer is "not in this build" (design decision 5). This arm and the next are the

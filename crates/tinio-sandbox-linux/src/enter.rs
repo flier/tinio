@@ -29,6 +29,7 @@ use crate::{
     caps::{self, Cap},
     jail::{EXPOSE_STEP, jail_root, mirror_under},
     mechanism::{Resolved, fail, refused, step, unshare, userns_available},
+    metrics::{ReadOnlyArm, record_read_only_arm},
     options::Options,
     plan::{Mount, MountKind, OverlayDirs, plan},
     seccomp,
@@ -1090,6 +1091,15 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
         "",
     ) {
         Ok(()) => {
+            // **The arm, on the one surface a run can see it from.** Which of the two read-only
+            // implementations ran was measurable only from the test-only `sandbox-child` binary,
+            // and this is the production half of that fact: `/metrics` is read out of the process
+            // that confined itself, so the line survives both the window with no subscriber and
+            // the absence of a child (`metrics::ReadOnlyArm` carries the rest). Recorded with the
+            // `Ok` in hand and before the nested-mount check, so this site and the overlay's both
+            // record where the arm is decided — the check below refuses the run, not the arm, and
+            // a refused run serves nothing for a scrape to read.
+            record_read_only_arm(ReadOnlyArm::Remount);
             refuse_writable_nested_mounts(entry, &table)?;
             trace_mount(entry);
             Ok(())
@@ -1101,6 +1111,10 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
                 inherited = ?inherited,
                 "the remount was refused; falling back to the read-only overlay"
             );
+            // The same fact as the `debug!` above, on the carrier an operator can scrape: this
+            // branch is the *only* way into `MountKind::OverlayReadOnly`, so the substitution is
+            // the one site that knows the fallback was taken rather than planned.
+            record_read_only_arm(ReadOnlyArm::Overlay);
             let fallback = Mount {
                 kind: MountKind::OverlayReadOnly,
                 ..entry.clone()

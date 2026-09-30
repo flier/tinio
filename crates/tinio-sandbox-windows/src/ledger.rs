@@ -780,7 +780,11 @@ mod tests {
             .expect("the appending thread did not panic");
 
         let entries = lines(&file);
-        assert_eq!(entries.len(), 2, "the waiting run's lines landed: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the waiting run's lines landed: {entries:?}"
+        );
     }
 
     /// **A ledger that cannot be written warns once and does not fail the run.**

@@ -26,6 +26,7 @@ pub mod objects;
 pub mod reserved_paths;
 pub mod select;
 pub mod sigv4;
+pub mod tag_filter;
 
 use std::collections::HashMap;
 
@@ -171,7 +172,11 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
 /// server, check the client binaries, and spawn the real `tinio server`
 /// binary instead — configured from the same `config_from_tags` mapping
 /// the in-process hook uses (clients.rs translates `Capabilities` into the
-/// `--config` file and `FsKind` into the `TINIO_SCANNER` toggle).
+/// `--config` file and `FsKind` into the `TINIO_SCANNER` toggle). An
+/// `@external` scenario tagged `@confinement` takes this branch too, with
+/// the confinement added to the spawn ([`clients::Confinement`]) — its
+/// `@read-only` tag is read there and not by the branch below, which it
+/// therefore never reaches.
 ///
 /// The `@read-only` branch (FR-023) spawns a read-only fs plane with its
 /// state in a scratch home ([`Server::read_only`]) — every mutating
@@ -196,7 +201,14 @@ fn before_hook<'a>(
             .any(|t| has_tag(&scenario.tags, t));
         if external {
             clients::check_presence(&scenario.tags);
-            world.ext = Some(clients::External::start(&caps, fs_kind));
+            // The confinement the scenario asks for is a tag of its own (`@confinement`, and
+            // `@read-only` for FR-023's mode): the spawn happens here, before any step runs, so a
+            // step could not request one — see `clients::Confinement`.
+            world.ext = Some(clients::External::start(
+                &caps,
+                fs_kind,
+                clients::Confinement::from_tags(&scenario.tags),
+            ));
             return;
         }
         let server = if has_tag(&scenario.tags, "acl") {

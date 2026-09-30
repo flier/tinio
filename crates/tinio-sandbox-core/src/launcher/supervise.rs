@@ -654,8 +654,7 @@ impl Child {
     /// operator's, unmediated (decision 19), so a refusal after readiness and any
     /// other non-zero exit are one fact at this boundary — which is why a child that
     /// reported and then ended answers [`Attribution::Ran`], the arm that classifies
-    /// nothing, rather than a [`Attribution::Denied`] whose subject this process never
-    /// saw.
+    /// nothing, rather than a denial whose subject this process never saw.
     ///
     /// # Examples
     ///
@@ -689,12 +688,10 @@ impl Child {
             // launcher's own, and the classification adds a value to it rather than
             // rewriting it.
             return Attribution::Broken {
-                detail: format!(
-                    "the confined child exited ({status}) without reporting readiness"
-                ),
+                detail: format!("the confined child exited ({status}) without reporting readiness"),
             };
         }
-        // **The child announced a server and then ended, and that is the third case
+        // **The child announced a server and then ended, and that is the other case
         // rather than a refusal**: the mechanism got it as far as serving, so nothing
         // here is broken, and a refusal after readiness is one fact with any other
         // non-zero exit at this boundary — the child's stderr is the operator's
@@ -1095,6 +1092,43 @@ mod tests {
         assert_eq!(
             silent.wait_for_ready(Duration::from_millis(1)),
             Readiness::Elapsed
+        );
+    }
+
+    #[test]
+    fn an_expired_bound_reaches_the_abort() {
+        // **The half of the bound the three-answer test above cannot show, and the one the e2e suite
+        // cannot either (the plan's D8): a caller that reads `Elapsed` is holding a child that is
+        // still there and silent, and what it does next is end it.** That caller is `tinio-cli`'s
+        // `publish_state`, whose `Elapsed` arm returns the error `confine.rs` turns straight into
+        // `Child::abort`; a launcher that only reported the bound would leave a server serving with
+        // nothing naming it, which is exactly the state the `state` file exists to prevent.
+        //
+        // **The `lingering` fixture rather than the fakes above, because the abort has to be
+        // observable.** Its child is a real process with a real killer, so the reap below is the
+        // killed status and it arrives *now*; take the `abort` away and this test instead sits in
+        // `wait` for the minute that child was started for and then reads the clean exit it produced
+        // for itself.
+        let (_tx, rx) = mpsc::channel::<Terminal>();
+        let mut child = lingering().with_ready(rx);
+        assert_eq!(
+            child.wait_for_ready(Duration::from_millis(1)),
+            Readiness::Elapsed,
+            "the child is alive and silent: nothing announced and nothing disconnected, so the \
+             clock is what answered rather than the child"
+        );
+
+        child.abort();
+
+        let status = child.wait().expect("the reaped status is readable again");
+        assert!(
+            !status.success(),
+            "the child the bound gave up on was killed, not left to exit on its own: {status}"
+        );
+        assert_eq!(
+            child.terminal(),
+            None,
+            "the child was ended before it reported, so the relay recorded nothing"
         );
     }
 

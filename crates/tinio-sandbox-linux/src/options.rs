@@ -44,7 +44,7 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// [`tinio_sandbox_core::Error::Unsupported`] for a value that is neither
+    /// [`tinio_sandbox_core::Error::Usage`] for a value that is neither
     /// `userns` nor `root`, so a typo cannot silently pick a mechanism.
     ///
     /// # Examples
@@ -317,7 +317,7 @@ mod tests {
         match (Options::from_env(), expected) {
             (Ok(options), Ok(model)) => assert_eq!(options.model(), model),
             (Err(error), Err(_)) => assert!(
-                matches!(error, Error::Unsupported { .. })
+                matches!(error, Error::Usage { .. })
                     && error.to_string().contains("TINIO_SANDBOX_MODEL"),
                 "{error}"
             ),

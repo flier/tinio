@@ -12,6 +12,13 @@
 //! terminate the server synchronously (TerminateProcess on Windows), so the
 //! redb lock is released before a sibling server starts.
 //!
+//! **A scenario may ask that server for a confinement** ([`Confinement`],
+//! from its `@confinement`/`@read-only` tags): the same client journeys then
+//! run through the confined server, which is the arm G19–G22 exist for. The
+//! spawn site is unchanged — one `job::spawn` call takes every arm — and a
+//! host that cannot honour the ask is a failure rather than a skip: the run
+//! refuses at start and `spawn_child` reports the refusal it read.
+//!
 //! Config passthrough (grilling Q4): the spawned binary receives the same
 //! tag→config mapping as the in-process hook (`config_from_tags` in
 //! steps/mod.rs) — `Capabilities` overrides become the `--config <file>`
@@ -35,7 +42,11 @@ use cucumber::{given, then, when};
 use tinio_sandbox::Event;
 use tinio_util::testing::{job, kill_and_reap};
 
-use super::{FsKind, World, common::deterministic_bytes, has_tag};
+use super::{
+    FsKind, World,
+    common::{deterministic_bytes, frame_line},
+    has_tag,
+};
 use crate::_server::{
     _config::{Config, s3},
     Capabilities,
@@ -53,6 +64,19 @@ pub const SECRET_KEY: &str = "minioadmin";
 /// scenario fails rather than hanging on a pipe that will never carry it.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The same bound for a **confined** child — the sibling pair `cli.rs` carries
+/// (`RUN_TIMEOUT` 30 s against `CONFINED_RUN_TIMEOUT` 180 s), and the same number for the same
+/// reason.
+///
+/// **The grant is what a plain budget cannot hold.** On the launcher platforms the ACE grant
+/// precedes the child's bind, so it sits *inside* this wait: `cli.rs`'s doc records the measured
+/// 32.3–37.8 s per grant on NTFS against a 30 s readiness budget, with one host past 120 s. A
+/// 30 s bound would therefore read a slow grant as a child that never reported — and the panic
+/// below would send the reader after a stale binary instead. A third number would be a fourth
+/// home for a fact `docs/tests.md` ("confined timeout separate from normal") already owns, so the
+/// confined arms take the sibling's.
+const CONFINED_START_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// The workspace target dir (`CARGO_TARGET_DIR` override honored).
 fn target_dir() -> PathBuf {
     if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
@@ -61,6 +85,60 @@ fn target_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("../../target");
     p
+}
+
+/// The confinement an `@external` scenario asks its spawned server for — the CLI's own spelling of
+/// the two flags (`contracts/cli.md`), or no flag at all.
+///
+/// **The ask is a tag, not a step, because the spawn comes first.** The `#[before]` hook starts
+/// the server before any scenario step runs, so nothing a step says could change what was
+/// spawned. `@confinement` is the ask this suite already owns (`steps/tag_filter.rs` selects the
+/// host-bound scenarios off it, and the platform gates opt in), and `@read-only` is FR-023's mode
+/// tag — the one the in-process `read_only.feature` scenarios carry. The hook's own `@read-only`
+/// branch is never reached for an `@external` scenario (its external branch returns first), which
+/// is why that tag's meaning for this arm lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confinement {
+    /// No flag: the plain server every `@external` scenario without `@confinement` runs against.
+    Plain,
+    /// `--sandbox` (G19–G21).
+    Sandbox,
+    /// `--read-only --sandbox` (G22; `contracts/s3-surface.md` §Read-only mode).
+    ReadOnly,
+}
+
+impl Confinement {
+    /// The arm `tags` ask for: `@confinement` alone is `--sandbox`, `@confinement` with
+    /// `@read-only` is the read-only pair, and no `@confinement` is the plain server.
+    pub fn from_tags(tags: &[String]) -> Self {
+        if !has_tag(tags, "confinement") {
+            return Self::Plain;
+        }
+        if has_tag(tags, "read-only") {
+            Self::ReadOnly
+        } else {
+            Self::Sandbox
+        }
+    }
+
+    /// The flags this arm adds, in the CLI's own spelling — the pair `--read-only --sandbox` in the
+    /// order the plan's G22 row and `confinement.feature`'s G9 both write them.
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Plain => &[],
+            Self::Sandbox => &["--sandbox"],
+            Self::ReadOnly => &["--read-only", "--sandbox"],
+        }
+    }
+
+    /// How long this arm's child may take to report readiness — [`START_TIMEOUT`] for the plain
+    /// server, [`CONFINED_START_TIMEOUT`] once the spawn asks for a confinement.
+    fn readiness_budget(self) -> Duration {
+        match self {
+            Self::Plain => START_TIMEOUT,
+            Self::Sandbox | Self::ReadOnly => CONFINED_START_TIMEOUT,
+        }
+    }
 }
 
 /// @external scenarios only: a spawned `tinio server` + one client
@@ -84,23 +162,42 @@ pub struct External {
 }
 
 impl External {
-    /// Spawn the binary per `caps`/`fs_kind` — the tag→config
+    /// Spawn the binary per `caps`/`fs_kind`/`confinement` — the tag→config
     /// mapping from `config_from_tags` (steps/mod.rs), translated into the
     /// old harness's mechanisms: `Capabilities` overrides become a
     /// `--config <file>` (`[s3] checksum = true`, `[s3] max_buckets = 3`),
     /// the fs-scanner variant becomes `TINIO_SCANNER` (`@cold-listing` →
-    /// on, plain → off).
-    pub fn start(caps: &Capabilities, fs_kind: FsKind) -> Self {
+    /// on, plain → off), and `confinement` becomes the CLI's own flags.
+    ///
+    /// **The read-only arm relocates the state dir.** FR-023 refuses an in-root state dir in that
+    /// mode (it would write the tree the mode promises to leave alone), so the run resolves
+    /// `TINIO_STATE_DIR` instead — the directory [`SpawnedServer`]'s plain arm never needs, which
+    /// is why it is created here and handed to the child by [`spawn_child`]. The confinement's
+    /// exposure set carries it for the same reason the served root is carried
+    /// (`sandbox::product::exposures`), so the confined child can write where an unconfined one
+    /// would have written `<root>/.tinio`.
+    pub fn start(caps: &Capabilities, fs_kind: FsKind, confinement: Confinement) -> Self {
         let workdir = tempfile::tempdir().unwrap();
         let root = workdir.path().join("root");
         fs::create_dir_all(&root).unwrap();
+        let state = (confinement == Confinement::ReadOnly).then(|| {
+            let path = workdir.path().join("state");
+            fs::create_dir_all(&path).unwrap();
+            path
+        });
         let config = config_for(caps).map(|text| {
             let path = workdir.path().join("config.toml");
             fs::write(&path, text).unwrap();
             path
         });
         let scanner = Some(matches!(fs_kind, FsKind::ColdListing(_)));
-        let (child, endpoint) = spawn_child(&root, scanner, config.as_deref());
+        let (child, endpoint) = spawn_child(
+            &root,
+            scanner,
+            config.as_deref(),
+            confinement,
+            state.as_deref(),
+        );
         let base_url = format!("http://{endpoint}");
         Self {
             child,
@@ -143,7 +240,14 @@ pub struct SpawnedServer {
 /// Spawn `tinio server <root> --port 0` and wait for its readiness event;
 /// returns the child and the bound endpoint (`127.0.0.1:PORT`). `scanner`
 /// sets `TINIO_SCANNER` per Some (None leaves it unset), `config` is passed
-/// through `--config`.
+/// through `--config`, `confinement` adds the CLI's own flags, and
+/// `state_dir` sets `TINIO_STATE_DIR` (`Some` for the read-only arm alone —
+/// see [`External::start`]).
+///
+/// **The wait is the arm's own budget** ([`Confinement::readiness_budget`]):
+/// a confined child's readiness window has to hold the launcher's ACE grant
+/// as well as the bind, so the confined arms take the sibling constant
+/// ([`CONFINED_START_TIMEOUT`]) rather than the plain one.
 ///
 /// The child inherits this process's environment, so the three variables
 /// that would change what it serves are cleared first: a shell exporting
@@ -170,9 +274,16 @@ pub struct SpawnedServer {
 /// holding the redb lock and `target\<profile>\tinio.exe`. [`terminate`] and the two `Drop` impls
 /// stay what they were: the guard is the backstop for the path that runs no `Drop`, never the
 /// reaping.
-fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Child, SocketAddr) {
+fn spawn_child(
+    root: &Path,
+    scanner: Option<bool>,
+    config: Option<&Path>,
+    confinement: Confinement,
+    state_dir: Option<&Path>,
+) -> (Child, SocketAddr) {
     let mut cmd = Command::new(cargo_bin("tinio"));
     cmd.arg("server").arg(root).args(["--port", "0"]);
+    cmd.args(confinement.flags());
     if let Some(config) = config {
         cmd.arg("--config").arg(config);
     }
@@ -182,6 +293,9 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
         .env_remove("TINIO_SANDBOX")
         .env("TINIO_ACCESS_KEY", ACCESS_KEY)
         .env("TINIO_SECRET_KEY", SECRET_KEY);
+    if let Some(state) = state_dir {
+        cmd.env("TINIO_STATE_DIR", state);
+    }
     if let Some(s) = scanner {
         cmd.env("TINIO_SCANNER", if s { "1" } else { "0" });
     }
@@ -189,7 +303,8 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
     let mut child =
         job::spawn(&mut cmd).unwrap_or_else(|e| panic!("failed to spawn `tinio server`: {e}"));
     let stdout = child.stdout.take().expect("piped stdout");
-    let endpoint = match wait_for_ready(stdout) {
+    let budget = confinement.readiness_budget();
+    let endpoint = match wait_for_ready(stdout, budget) {
         // The address travels as the value the child bound: it comes out of the event's typed
         // field and goes to a URL as it stands, so nothing here can disagree with what
         // `local_addr` reported.
@@ -204,8 +319,8 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
         None => {
             terminate(&mut child);
             panic!(
-                "the server reported no `listening` event — is a stale `tinio.exe` holding this \
-                 root? ({} server --port 0)",
+                "the server reported no `listening` event within {budget:?} — is a stale \
+                 `tinio.exe` holding this root? ({} server --port 0)",
                 cargo_bin("tinio").display()
             );
         }
@@ -215,8 +330,14 @@ fn spawn_child(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> (Ch
 
 impl SpawnedServer {
     /// Serve `root` (caller keeps it) on `--port 0`; see [`spawn_child`].
+    ///
+    /// **Always plain, and that is a decision rather than an omission**: this server exists for
+    /// the ephemeral `--port 0` leg (`the client targets the {word} server`), whose subject is the
+    /// port a run reports — not one of the external-client legs (G19–G22), so no confined
+    /// scenario reaches it. A scenario that confined *both* servers would be a second ask, and
+    /// none exists.
     fn start(root: &Path, scanner: Option<bool>, config: Option<&Path>) -> Self {
-        let (child, endpoint) = spawn_child(root, scanner, config);
+        let (child, endpoint) = spawn_child(root, scanner, config, Confinement::Plain, None);
         Self { child, endpoint }
     }
 
@@ -236,33 +357,32 @@ impl Drop for SpawnedServer {
 /// Read the child's stdout until it reports its first event.
 ///
 /// The child speaks the sandbox's event stream (design decision 19): one SSE frame per event —
-/// an `event:` line, a `data:` line, closed by a blank line. **A frame is not a line**, so this
-/// accumulates until the blank line and decodes the block; decoding line by line would hand
-/// [`Event::decode`] half a frame. Text that is not a frame — a log a dependency wrote before
-/// the subscriber was installed — does not decode and is skipped rather than fatal, which is
-/// the property the framing buys. A reader thread keeps the pipe drained so the child never
-/// blocks on a full buffer; the thread exits when the child dies.
-fn wait_for_ready(stdout: impl Read + Send + 'static) -> Option<Event> {
+/// an `event:` line, a `data:` line, closed by a blank line. **A frame is not a line**, and the
+/// accumulation this reads with is [`frame_line`]'s — the one home in this crate for the rule
+/// (`steps/common.rs`), which `steps/cli.rs`'s whole-stream reader is written on too. Text that
+/// is not a frame — a log a dependency wrote before the subscriber was installed — does not
+/// decode and is skipped rather than fatal, which is the property the framing buys. A reader
+/// thread keeps the pipe drained so the child never blocks on a full buffer; the thread exits
+/// when the child dies.
+///
+/// `budget` is the arm's own ([`Confinement::readiness_budget`]): a confined child's window has to
+/// hold the launcher's ACE grant as well as the bind, which is the distinction `cli.rs`'s
+/// `RUN_TIMEOUT`/`CONFINED_RUN_TIMEOUT` pair owns and this one follows.
+fn wait_for_ready(stdout: impl Read + Send + 'static, budget: Duration) -> Option<Event> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         let mut frame = String::new();
         while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
-            if line.trim_end().is_empty() {
-                if let Some(event) = Event::decode(&frame) {
-                    let _ = tx.send(event);
-                    return;
-                }
-                frame.clear();
-            } else {
-                frame.push_str(line.trim_end());
-                frame.push('\n');
+            if let Some(event) = frame_line(&mut frame, &line) {
+                let _ = tx.send(event);
+                return;
             }
             line.clear();
         }
     });
-    rx.recv_timeout(START_TIMEOUT).ok()
+    rx.recv_timeout(budget).ok()
 }
 
 /// The `[s3]` config text for capability overrides (grilling Q4): the
@@ -610,6 +730,20 @@ async fn run_rclone(world: &mut World, command: String) {
     run_external(world, &mut cmd, true);
 }
 
+/// A failing `rclone` run — the read-only legs' shape, and the twin of `I try aws …`. Separate
+/// from `I run rclone …` rather than a flag on it: the exit status is the assertion (`assert.failure()`
+/// vs `assert.success()`), and a step that took an expectation as a parameter would let a scenario
+/// spell the wrong one.
+#[given(regex = r"I try rclone (.*)")]
+#[when(regex = r"I try rclone (.*)")]
+#[then(regex = r"I try rclone (.*)")]
+async fn try_rclone(world: &mut World, command: String) {
+    let ext = world.ext.as_ref().expect("external server running");
+    let mut cmd = Rclone::new(ext.workdir.path().join("rclone.conf"))
+        .cmd(&arg_refs(&tokenize(world, &command)));
+    run_external(world, &mut cmd, false);
+}
+
 #[given(expr = "I configure the rclone remote")]
 #[when(expr = "I configure the rclone remote")]
 #[then(expr = "I configure the rclone remote")]
@@ -628,6 +762,16 @@ async fn run_mc(world: &mut World, command: String) {
     run_external(world, &mut cmd, true);
 }
 
+/// A failing `mc` run — the twin of `I try rclone …` above.
+#[given(regex = r"I try mc (.*)")]
+#[when(regex = r"I try mc (.*)")]
+#[then(regex = r"I try mc (.*)")]
+async fn try_mc(world: &mut World, command: String) {
+    let ext = world.ext.as_ref().expect("external server running");
+    let mut cmd = Mc::new(ext.workdir.path().join("mc")).cmd(&arg_refs(&tokenize(world, &command)));
+    run_external(world, &mut cmd, false);
+}
+
 #[given(expr = "I configure the mc alias")]
 #[when(expr = "I configure the mc alias")]
 #[then(expr = "I configure the mc alias")]
@@ -637,15 +781,12 @@ async fn configure_mc(world: &mut World) {
     run_external(world, &mut cmd, true);
 }
 
-/// Run one of the checked-in boto3 scripts against the server (the venv
-/// python; the script asserts its own journey, the feature asserts the
-/// OK marker in the output).
-#[given(expr = "I run the boto3 script {string}")]
-#[when(expr = "I run the boto3 script {string}")]
-#[then(expr = "I run the boto3 script {string}")]
-async fn run_boto3(world: &mut World, name: String) {
+/// The venv-python command for a checked-in boto3 script, dialled at the scenario's server (the
+/// script takes the endpoint as its first argument) — the plumbing `I run the boto3 script …` and
+/// its read-only twin share, so the endpoint and the missing-script report have one home.
+fn boto3_cmd(world: &World, name: &str) -> AssertCmd {
     let ext = world.ext.as_ref().expect("external server running");
-    let script = boto3_script(&name);
+    let script = boto3_script(name);
     assert!(
         script.exists(),
         "boto3 script not found at {}",
@@ -655,7 +796,31 @@ async fn run_boto3(world: &mut World, name: String) {
         .base_url
         .strip_prefix("http://")
         .expect("base url has the http:// prefix");
-    let mut cmd = boto3(endpoint, &script);
+    boto3(endpoint, &script)
+}
+
+/// Run one of the checked-in boto3 scripts against the server (the venv
+/// python; the script asserts its own journey, the feature asserts the
+/// OK marker in the output).
+#[given(expr = "I run the boto3 script {string}")]
+#[when(expr = "I run the boto3 script {string}")]
+#[then(expr = "I run the boto3 script {string}")]
+async fn run_boto3(world: &mut World, name: String) {
+    let mut cmd = boto3_cmd(world, &name);
+    run_external(world, &mut cmd, true);
+}
+
+/// The read-only arm of a checked-in boto3 script: `--read-only` is the script's own second
+/// argument (G22), and the script then asserts the mode's refusals in the SDK's own shape
+/// (`botocore`'s `ClientError`) instead of running its journey body. A step of its own rather
+/// than a flag the harness derives from the scenario's tags: the feature text says which of the
+/// script's two contracts it is asserting, and the script's journey body stays untouched.
+#[given(expr = "I run the boto3 read-only script {string}")]
+#[when(expr = "I run the boto3 read-only script {string}")]
+#[then(expr = "I run the boto3 read-only script {string}")]
+async fn run_boto3_read_only(world: &mut World, name: String) {
+    let mut cmd = boto3_cmd(world, &name);
+    cmd.arg("--read-only");
     run_external(world, &mut cmd, true);
 }
 

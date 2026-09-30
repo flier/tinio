@@ -11,7 +11,7 @@ use handlebars::RenderError;
 use crate::_api;
 use crate::{
     _config, _core::storage, _fs::Error as FsError, _sandbox::Error as SandboxError,
-    _server::Error as ServerError, sandbox::denied_sentence_for,
+    _server::Error as ServerError,
 };
 
 /// A CLI failure carrying its exit code.
@@ -72,18 +72,13 @@ pub enum Error {
     },
     /// The confinement applied and refused an operation — exit code 1.
     ///
-    /// **`refused` is the subject, rendered**: a path in backticks, a channel by name, or `an
-    /// operation the platform did not name` where the platform named nothing (the rendering is
-    /// `crate::sandbox`'s, from the core's `Refused`, so the sentence and the value cannot
-    /// drift). Naming the subject is the point of the variant: `Permissions denied` alone
-    /// leaves a confined operator with nothing to expose.
-    ///
-    /// **The frame around that subject is `crate::sandbox`'s too**, so this file carries no
-    /// format string of its own: the attribute below hands the two fields to the module's own
-    /// renderer (`denied_sentence_for`, the type behind it), which is the definer
-    /// [`describe`](crate::sandbox::describe) builds a launcher's denial sentence on — a
-    /// rewording cannot reach one of the two renderings and not the other.
-    #[error("{}", denied_sentence_for(platform, refused))]
+    /// **The sentence is the operator-facing one** — `the confinement on <platform> refused
+    /// <subject>`, the `#[error]` format string below — and **`refused` is its subject, already
+    /// rendered by `crate::sandbox`'s `describe_refused`**: the core's `Refused` rendered rather
+    /// than re-derived, a path in backticks or a channel by name. Naming the subject is the
+    /// point of the variant: `Permissions denied` alone leaves a confined operator with nothing
+    /// to expose.
+    #[error("the confinement on `{platform}` refused {refused}")]
     SandboxDenied {
         /// The platform whose confinement refused.
         platform: &'static str,

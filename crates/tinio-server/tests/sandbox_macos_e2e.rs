@@ -1,9 +1,19 @@
 //! The confined server, driven the way the interop harness drives it: spawn the
-//! `tinio` server, read the endpoint the confined child reports, and talk to it.
+//! `tinio` server, read the endpoint the confined child reports, and check what the
+//! run's own records show — the launcher's published `state` and the control channel
+//! it names, the confined child's write through its profile, the relay, and the
+//! mechanism the launcher resolved.
 //!
 //! This is the CI macOS leg's acceptance (design §12). It fails rather than
 //! skips on macOS: a leg that quietly passes without confining anything is the
 //! failure mode the design refuses everywhere else.
+//!
+//! **Two halves of what this leg used to assert are the suite's now** (the plan's
+//! §5 split): that a confined run *serves* is `confinement.feature`'s G8 — a signed
+//! S3 journey through the same binary, strictly stronger than the bare HTTP probe
+//! this leg used to assert — and that the launcher *forwards its child's status* is
+//! its P2, written for both launcher platforms. What the probe below still exists
+//! for is the access log the request makes the confined child write.
 //!
 //! **The product entry point is the `tinio` binary, not an example.** The plan
 //! this file comes from drove a `serve` example; no such example exists in this
@@ -20,7 +30,7 @@
 mod common;
 
 use std::{
-    fs,
+    env, fs,
     io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -32,7 +42,10 @@ use std::{
 use common::{frame_line, stdout_lines, tinio_bin, wait_for_listening_in, wait_timeout};
 use tinio_api::state::State;
 use tinio_sandbox::Event;
-use tinio_util::testing::{kill_and_reap, poll_exit, wait_for_path};
+use tinio_util::{
+    job,
+    testing::{kill_and_reap, poll_exit, wait_for_path},
+};
 
 /// How often the leg looks for a file the product writes: the waits below are
 /// bounded by [`wait_timeout`], so the poll is their resolution and not a
@@ -40,7 +53,7 @@ use tinio_util::testing::{kill_and_reap, poll_exit, wait_for_path};
 const POLL: Duration = Duration::from_millis(50);
 
 #[test]
-fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
+fn a_confined_run_publishes_its_state_and_reports_the_mechanism_it_chose() {
     // **The served root is deliberately short, and that is a macOS fact rather
     // than tidiness.** `$TMPDIR` is `/private/var/folders/<xx>/<hash>/T/`, so a
     // root under it is already ~52 bytes and the child's unix control socket
@@ -85,7 +98,7 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = tinio_util::job::spawn(&mut command).expect("spawn tinio server");
+    let mut child = job::spawn(&mut command).expect("spawn tinio server");
 
     // The launcher's own record travels on stderr, which the confined child
     // inherits, and shared §7's checking rule is that the `info!` half is
@@ -127,21 +140,13 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
         }
     };
 
-    // Serving: any HTTP response proves the confined process reached `accept`
-    // and answered; an unsigned S3 request is refused with 403, which is still
-    // the plane answering. Both halves go through `fail` — a response that never
-    // arrives is the case where the server is least likely to exit on its own.
-    let response = match request(addr) {
-        Ok(response) => response,
-        Err(message) => fail(&mut child, logged, &root, &message),
-    };
-    if !response.starts_with("HTTP/1.1 ") {
-        fail(
-            &mut child,
-            logged,
-            &root,
-            &format!("the confined server's answer is not HTTP: {response}"),
-        );
+    // **The probe is an induction, not this leg's claim.** That a confined run serves is
+    // `confinement.feature`'s G8 (a signed S3 journey through the same binary); what the request
+    // below exists for is the access log it makes the confined child write. A request that gets no
+    // answer at all still goes through `fail` — the child is not serving, and that is the case
+    // where it is least likely to exit on its own.
+    if let Err(message) = request(addr) {
+        fail(&mut child, logged, &root, &message);
     }
 
     // A write through the profile: the access log lives in the state directory,
@@ -179,8 +184,8 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
     // still answered `stopped` — "it is stale" — because the child had never
     // received the token, which is why this leg asks a client command rather than
     // only reading the file. Every assertion above is true of both of those runs —
-    // the `listening` frame, the HTTP response and the access log — which is why
-    // this is a different leg rather than a stronger form of one of them.
+    // the `listening` frame and the access log — which is why this is a different leg
+    // rather than a stronger form of one of them.
     let state_file = root.join(".tinio/state");
     if !wait_for_path(&state_file, wait_timeout(), POLL) || !state_file.is_file() {
         fail(
@@ -322,31 +327,20 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
         );
     }
 
-    // Exit-status forwarding (design §3 step 8): the launcher outlived the
-    // signal and carried the **child's** status back, which in this flow is a
-    // clean exit — the child's own stop hook catches the forwarded `SIGTERM`, the
-    // plane drains, `serve` returns `Ok`, and the code is 0. `Some(143)` — the
-    // shell's 128 + `SIGTERM` for a signal death — can never appear here, because
-    // that rendering belongs to a shell and `ExitStatus::code()` refuses to
-    // invent one. A `None` would mean the child died of the default disposition
-    // instead, i.e. that the stop hook never registered: that is a defect in the
-    // serve wiring's confined arm, not an assertion to relax. A launcher that does
-    // not exit at all is [`fail`]'s: it is still running, and on this platform the
-    // confined grandchild outlives it.
-    let status = match wait_for_exit(&mut child) {
-        Some(status) => status,
-        None => fail(
+    // **What the launcher's own status *is* is `confinement.feature`'s P2 now** — that the launcher
+    // answers with the code its child left, on both launcher platforms — so this leg only waits for
+    // the launcher to end: the wait is what reaps it, and what the assertions above must not
+    // outlive. A launcher that does not exit at all is [`fail`]'s: it is still running, and on this
+    // platform the confined grandchild outlives it. (The child's own ending is still this file's:
+    // the `step="exit"` record asserted with the other launcher events below.)
+    if wait_for_exit(&mut child).is_none() {
+        fail(
             &mut child,
             logged,
             &root,
             "the launcher did not exit after its child was signalled",
-        ),
-    };
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "the launcher forwards the child's status; a clean stop is 0"
-    );
+        );
+    }
 
     // Shared §7's `info!` half, read off the stderr the child inherited: the
     // events that answer "was this process confined, and to what". A launch that
@@ -367,15 +361,40 @@ fn a_confined_server_serves_a_request_and_forwards_its_child_status() {
     // landed rather than that a particular one did — and the resolved mechanism is
     // what says which. Both legs are run by the crate's macOS suite (this file's
     // `MECHANISM`-driven e2e and the crate's own validator unit tests).
-    let mechanism = std::env::var("TINIO_SANDBOX_MACOS_MECHANISM").unwrap_or_default();
+    //
+    // **For the helper's mechanism that means a field and not the step's name**, and the
+    // distinction is the whole of plan §7's D2. `step="preflight"` is emitted three ways
+    // (`crates/tinio-sandbox-macos/src/launch.rs`): the skip, `verdict="skipped"`, which is what
+    // a **release build** (or a level below `debug`) writes and in which *no profile is compiled
+    // at all*; the acceptance, `rules=<n>`; and a refusal, `exit=… diagnostic=…`, which fails the
+    // launch before this point. Only the skip can satisfy a step-name assertion without a check
+    // having run — so a leg meant to show the pre-flight ran would pass on a build where it never
+    // did, in the direction that hides a defect. The string below is therefore the acceptance's
+    // **own field**: a skip carries no `rules=` and an acceptance carries no `verdict=`, so
+    // neither record can be read as the other.
+    //
+    // **What that leaves unexercised, stated rather than implied**: this leg runs under the
+    // profile cargo builds by default (a debug build, where `cfg!(debug_assertions)` makes the
+    // pre-flight unconditional), so the arm this assertion now excludes — the *skipped* verdict —
+    // is the release-profile run the plan records as a debt. Nothing here induces a skip.
+    let mechanism = env::var("TINIO_SANDBOX_MACOS_MECHANISM").unwrap_or_default();
     let (expected_check, expected_event) = if mechanism == "sandbox-init" {
         (
             "the in-process mechanism",
             "step=\"sandbox-init validator\"",
         )
     } else {
-        ("sandbox-exec", "step=\"preflight\"")
+        ("sandbox-exec", "step=\"preflight\" rules=")
     };
+    // The skip's own field, asserted **absent** beside the acceptance's — the other half of the
+    // discrimination above, and the arm the plan's debt names. It is vacuous under
+    // `sandbox-init`, which emits no `step="preflight"` record at all; under the helper it is what
+    // makes a release-profile run fail here rather than pass on a check that never ran.
+    assert!(
+        !logged.contains("step=\"preflight\" verdict="),
+        "the pre-flight was skipped, so no profile was compiled and this leg's subject never ran \
+         — a release build, or a log level below `debug`:\n{logged}"
+    );
     assert!(
         logged.contains(expected_event),
         "the launcher logged no `{expected_event}` event for {expected_check}:\n{logged}"
@@ -620,15 +639,20 @@ fn wait_for_exit(child: &mut Child) -> Option<ExitStatus> {
     poll_exit(child, wait_timeout())
 }
 
-/// The confined server's whole answer to one plain HTTP request.
+/// One plain HTTP request, made for its **side effect**: what the leg reads afterwards is the
+/// access log line the plane writes for it, and the serving claim itself is `G8`'s (see the
+/// module doc). The response is therefore discarded — a request that gets no answer is still a
+/// failure, because the assertion below it would then be waiting on a run that never served.
 ///
 /// `Err` rather than a panic for [`fail`]'s reason: every failure here happens
 /// while the confined child is alive, and a helper that panicked would leave it
 /// holding its listener and its state lock for the rest of the test process.
-fn request(addr: SocketAddr) -> Result<String, String> {
+fn request(addr: SocketAddr) -> Result<(), String> {
     // The probe and its read are `common::answer`'s — one spelling of the request bytes for every
     // leg in this crate; only the message is this leg's, because it names the confined server.
-    common::answer(addr).map_err(|err| format!("the confined server at {addr}: {err}"))
+    common::answer(addr)
+        .map(|_| ())
+        .map_err(|err| format!("the confined server at {addr}: {err}"))
 }
 
 #[cfg(test)]

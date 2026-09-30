@@ -64,8 +64,8 @@ fn the_vocabulary_is_re_exported() {
 /// selection rather than a list of platforms**: Linux's in-place jail, macOS's Seatbelt and
 /// Windows' AppContainer each apply the whole guarantee this build's contract claims for them,
 /// so the expected answer is the same on every target a backend exists for. A backend that
-/// stopped overriding the trait's default would answer `NotReported` here, and one that
-/// answered `Unimplemented` would be claiming a mechanism nobody disabled. The per-platform
+/// stopped answering would read `NotReported` here — the value that is no claim about a
+/// mechanism — and this test is where that would fail. The per-platform
 /// half — that *this* crate's constant is `Full` — is asserted in each crate's own doctest,
 /// which only its own platform compiles.
 #[test]
@@ -173,16 +173,11 @@ fn the_launcher_surface_is_re_exported() {
     // `fn`-pointer is what pins `diagnostics` to the core's own answer type.
     let _: core::Diagnostics = tinio_sandbox::Diagnostics::NOT_REPORTED;
     let _: core::Enforcement = tinio_sandbox::Enforcement::Full;
-    let _: core::Refused = tinio_sandbox::Refused::Unnamed;
-    let _: core::Denial = tinio_sandbox::Denial {
-        platform: "linux",
-        refused: tinio_sandbox::Refused::Channel("control"),
-        evidence: String::new(),
-    };
+    let _: core::Refused = tinio_sandbox::Refused::Path(PathBuf::from("/srv/data/.tinio"));
     let _: core::Attribution = tinio_sandbox::Attribution::Broken {
         detail: String::new(),
     };
-    // The same enum's third arm, bound as a value for the same reason: it is what the launcher
+    // The same enum's other arm, bound as a value for the same reason: it is what the launcher
     // answers for a child that reported and then ended, so a consumer matching on it reaches
     // this variant through the facade rather than only through the core.
     let _: core::Attribution = tinio_sandbox::Attribution::Ran;
@@ -382,12 +377,39 @@ fn the_adopted_names_answer_one_error_type() {
     let _: fn(fn()) -> tinio_sandbox::Result<()> = tinio_sandbox::on_stop;
     let _: fn(&tinio_sandbox::Adopted) -> tinio_sandbox::Result<ControlSocket> =
         tinio_sandbox::adopted_control;
+    // The three typo sentences, bound the same way and for the same reason: every
+    // selector's refusal is one class of operator mistake — the core's `Usage` variant —
+    // and the construction below is the whole classification check, because the class is
+    // the variant the caller builds rather than a sentence a caller matches. What the
+    // assertion adds is the other half: the operator's sentence renders unchanged through
+    // the facade.
     let _: &'static str = tinio_sandbox::MACOS_MECHANISM_USAGE;
+    let mechanism = tinio_sandbox::Error::Usage {
+        detail: tinio_sandbox::MACOS_MECHANISM_USAGE,
+    };
     assert!(
-        tinio_sandbox::Error::Unsupported {
-            detail: tinio_sandbox::MACOS_MECHANISM_USAGE,
-        }
-        .is_usage()
+        mechanism
+            .to_string()
+            .contains(tinio_sandbox::MACOS_MECHANISM_USAGE),
+        "{mechanism}"
+    );
+    let _: &'static str = tinio_sandbox::LINUX_MODEL_USAGE;
+    let model = tinio_sandbox::Error::Usage {
+        detail: tinio_sandbox::LINUX_MODEL_USAGE,
+    };
+    assert!(
+        model.to_string().contains(tinio_sandbox::LINUX_MODEL_USAGE),
+        "{model}"
+    );
+    let _: &'static str = tinio_sandbox::WINDOWS_CAPABILITY_USAGE;
+    let capability = tinio_sandbox::Error::Usage {
+        detail: tinio_sandbox::WINDOWS_CAPABILITY_USAGE,
+    };
+    assert!(
+        capability
+            .to_string()
+            .contains(tinio_sandbox::WINDOWS_CAPABILITY_USAGE),
+        "{capability}"
     );
 }
 

@@ -46,10 +46,6 @@
 
 #![allow(dead_code)]
 
-// The grandchild sweep's own tool, and macOS's alone: no other target compiles a
-// caller of it, since the helper is `cfg`'d for the same reason.
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Write},
@@ -585,5 +581,10 @@ pub fn answer(addr: SocketAddr) -> Result<String, String> {
 /// rather than copied.** The e2e crate's CLI harness needs the same sweep, and a
 /// `tests/` tree is not importable from another one — a crate both dev-depend on
 /// is, which is what removes the copy this module used to keep.
+// `unused_imports` is not right on this line: every target that declares `mod common;`
+// compiles this re-export, and only `sandbox_macos_e2e.rs` calls it — the same
+// "none of them uses everything" fact the module-wide `dead_code` allow above records,
+// which a lint reading one target at a time cannot see.
 #[cfg(target_os = "macos")]
+#[allow(unused_imports)]
 pub use tinio_util::testing::sweep_confined_grandchild;
