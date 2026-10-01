@@ -17,9 +17,9 @@ Migrate tinio's test cases to BDD-style cucumber so that:
 ## Non-goals
 
 - **No migration of pure-mechanics unit tests** (≈600 of ~670): path encoding, checksum math, redb/DB layout, lockmap, schema validation, error formatting, scanner/cleanup internal state machines. Gherkin does not express these better than Rust.
-- **No migration of proptest files**: `tinio-core/tests/validation.rs`, `tinio-fs/tests/proptest_meta.rs`, `tinio-fs/tests/proptest_multipart.rs`. Property-based testing is a different paradigm; cucumber scenarios use representative fixed values instead.
+- **No migration of proptest files**: `tinio-core/tests/validation.rs`, `tinio-fs/tests/proptest_meta.rs`, `tinio-fs/tests/proptest_multipart.rs`. Property-based testing is a different paradigm; cucumber scenarios use representative fixed values instead. (superseded 2026-10-01 for the two `tinio-fs` files: `docs/superpowers/plans/2026-10-01-test-placement-cleanup.md` — they moved to inline `mod tests` beside their subjects in `crates/tinio-fs/src/meta.rs` / `crates/tinio-fs/src/multipart.rs`, seeds renamed with them; `tinio-core/tests/validation.rs` is unchanged.)
 - **No direct-Storage cucumber steps.** Cucumber scenarios are black-box HTTP against the S3 API only, except for the behaviors the S3 API cannot observe, which drive the CLI/process surface or the product's own tracing/metrics instead (§Migration rule). The `tinio-util` conformance harness (`assert_conformance`) stays as-is in Rust — it serves benches and `tinio doctor`, and its helpers become the step layer's assertion primitives.
-- **No removal of `tinio-fs/tests/layout.rs`** — it inspects on-disk state-dir structure (`meta.redb`, `tmp/`, `multipart/`), an implementation detail requiring direct fs access.
+- **No removal of `tinio-fs/tests/layout.rs`** — it inspects on-disk state-dir structure (`meta.redb`, `tmp/`, `multipart/`), an implementation detail requiring direct fs access. (superseded 2026-10-01: `docs/superpowers/plans/2026-10-01-test-placement-cleanup.md` — the file's contents moved inline to `crates/tinio-fs/src/backend/tests.rs` / `crates/tinio-fs/src/database/open.rs`.)
 - **No changes to tinio-config / tinio-api / tinio-cli tests** (pure schema/error-formatting logic).
 - **No CI matrix reduction.** ubuntu/windows/macos stay; WSL2 is a local-dev convenience, not a CI substitute.
 - **No cucumber in library crates.** The cucumber binary lives only in `tinio-e2e`; library crates gain no cucumber dependency.
@@ -130,8 +130,8 @@ The exact per-file subset of unit tests is decided during implementation by the 
 
 | Existing test | Reason |
 |---|---|
-| `tinio-fs/tests/layout.rs` | on-disk state-dir structure — implementation detail |
-| `tinio-fs/tests/proptest_meta.rs`, `proptest_multipart.rs`, `tinio-core/tests/validation.rs` | proptest paradigm |
+| `tinio-fs/tests/layout.rs` | on-disk state-dir structure — implementation detail (superseded 2026-10-01: `docs/superpowers/plans/2026-10-01-test-placement-cleanup.md` — the file's contents moved inline to `crates/tinio-fs/src/backend/tests.rs` / `crates/tinio-fs/src/database/open.rs`) |
+| `tinio-fs/tests/proptest_meta.rs`, `proptest_multipart.rs`, `tinio-core/tests/validation.rs` | proptest paradigm (superseded 2026-10-01 for the two `tinio-fs` files: `docs/superpowers/plans/2026-10-01-test-placement-cleanup.md` — they moved to inline `mod tests` beside their subjects in `crates/tinio-fs/src/meta.rs` / `src/multipart.rs`, seeds renamed with them; `tinio-core/tests/validation.rs` still stays) |
 | `tinio/tests/smoke.rs` | one-line facade smoke |
 | ~600 pure-mechanics unit tests across all crates | internal detail; Gherkin would be worse |
 | `tinio-util/src/testing.rs` conformance harness | used by benches/doctor; helpers feed the step layer |

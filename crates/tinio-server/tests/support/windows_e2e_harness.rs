@@ -107,16 +107,18 @@ pub fn exit_timeout() -> Duration {
 /// it, and the legs that are about a *missing* root make their own absence.
 ///
 /// **The credential pair is injected here rather than left to the operator's
-/// environment.** Every request these legs make is signed by `common::signed`
-/// with `DEFAULT_ROOT_ACCESS_KEY` and [`SECRET_KEY`], while the CLI reads
-/// `[auth]` — and a first start *generates* a random pair into the config it
-/// creates, so a leg that did not pin the pair would be answered
-/// `AccessDenied`/`SignatureDoesNotMatch` for a request the harness itself
-/// signed. Both names are the same two constants the signing side uses (not a
-/// third copy of their values), the child inherits the launcher's environment,
-/// and `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are the chain
-/// `crates/tinio-server/tests/serve_read_only.rs`'s `Serve::spawn` uses for the
-/// same reason.
+/// environment.** **No leg in this harness signs a request any more**: the signed
+/// half of these legs is `crates/tinio-e2e`'s `@cli` scenarios since the
+/// 2026-10-01 cleanup retired `crates/tinio-server/tests/serve_read_only.rs`, and
+/// the request these legs send is `common::answer`'s unsigned probe. The pair is
+/// still pinned because the CLI reads `[auth]` and a first start *generates* a
+/// random pair into the config it creates, so the environment is what makes the
+/// pair a run resolves the one this harness names. Both names are the same two
+/// constants the signing side uses (not a third copy of their values), the child
+/// inherits the launcher's environment, and
+/// `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` are the chain `crates/tinio-e2e`'s step
+/// layer pins for its signed journeys (`steps/cli.rs`'s `harness_credentials`),
+/// which is where `Serve::spawn`'s copy of it went.
 fn launcher_command(root: &Path, port: u16) -> Command {
     fs::create_dir_all(root).expect("the served root");
     let mut command = Command::new(tinio_bin());

@@ -30,6 +30,9 @@ pub mod upload_checksum;
 #[cfg(test)]
 mod contract;
 
+#[cfg(test)]
+mod testutil;
+
 pub use self::{
     acl::{decode_acl_wire, decode_owner_wire},
     error::Error,

@@ -183,3 +183,204 @@ impl<'txn> table::Table<'txn, Def> {
         drain_pair(&mut self.0, (bucket, ""), |b, _| b == bucket)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::*;
+    use crate::{_core::object::Tags, testutil::handle};
+
+    #[test]
+    fn upload_rows_key_match_bucket_scan_and_for_each() {
+        let h = handle();
+        let key = object::key("big.bin").unwrap();
+        let tags = Tags::from_pairs([("k".into(), "v".into())]).unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            assert!(!t.has_bucket("data")?);
+            t.put(
+                "data",
+                "u1",
+                &key,
+                SystemTime::UNIX_EPOCH,
+                &tags.to_wire(),
+                "",
+                "",
+            )?;
+            t.put("data", "u2", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+            t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+            assert!(t.has_bucket("data")?);
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            // key_matches / get_matching bind the S3 identity (bucket,key,id).
+            assert!(t.key_matches("data", &key, "u1")?);
+            assert!(!t.key_matches("data", "wrong-key", "u1")?);
+            assert!(!t.key_matches("data", &key, "u5")?);
+            let (got_key, initiated, tags_wire, _, _) =
+                t.get_matching("data", &key, "u1")?.unwrap();
+            assert_eq!(got_key, &*key);
+            assert_eq!(initiated, 0);
+            assert_eq!(t.tags("data", &key, "u1")?.unwrap(), tags);
+            assert!(!tags_wire.is_empty());
+            assert!(t.get_matching("data", &key, "u5")?.is_none());
+            // The bucket scan visits only this bucket's uploads, in key order.
+            let mut ids = Vec::new();
+            t.for_bucket("data", |id, _| {
+                ids.push(id.to_string());
+                Ok(())
+            })?;
+            assert_eq!(ids, ["u1", "u2"]);
+            // The whole-table walk.
+            let mut all = Vec::new();
+            t.for_each(|b, id, _, _, _, _, _| {
+                all.push((b.to_string(), id.to_string()));
+                Ok(())
+            })?;
+            assert_eq!(
+                all,
+                vec![
+                    ("data".into(), "u1".into()),
+                    ("data".into(), "u2".into()),
+                    ("other".into(), "u9".into()),
+                ]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn upload_tags_accessors_round_trip_and_self_heal() {
+        let h = handle();
+        let key = object::key("big.bin").unwrap();
+        let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.put(
+                "data",
+                "u1",
+                &key,
+                SystemTime::UNIX_EPOCH,
+                &tags.to_wire(),
+                "",
+                "",
+            )?;
+            assert_eq!(t.tags("data", &key, "u1")?.unwrap(), tags);
+            t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+            assert!(t.tags("data", &key, "u1")?.unwrap().is_empty());
+            Ok(())
+        })
+        .unwrap();
+        // A garbage tags wire self-heals on the table accessor.
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?
+                .insert(("data", "u1"), ("big.bin", 0u64, "garbage", "", ""))
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            assert!(
+                t.tags("data", &key, "u1")?.unwrap().is_empty(),
+                "a corrupt upload tags wire is the empty set"
+            );
+            t.for_bucket("data", |_, (_, _, tags_wire, _, _)| {
+                assert!(
+                    object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX).is_empty(),
+                    "the bucket scan self-heals the same way"
+                );
+                Ok(())
+            })?;
+            t.for_each(|_, _, _, _, tags_wire, _, _| {
+                assert!(
+                    object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX).is_empty(),
+                    "the whole-table walk self-heals the same way"
+                );
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn upload_tags_accessor_answers_the_identity_check() {
+        let h = handle();
+        let key = object::key("big.bin").unwrap();
+        let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            // Missing row: None.
+            assert!(t.tags("data", &key, "u1")?.is_none());
+            t.put(
+                "data",
+                "u1",
+                &key,
+                SystemTime::UNIX_EPOCH,
+                &tags.to_wire(),
+                "",
+                "",
+            )?;
+            // S3 identity is (bucket, key, uploadId): a matching key answers
+            // the tags, a mismatched key or upload id answers None (the
+            // caller's NoSuchUpload arm).
+            assert_eq!(t.tags("data", &key, "u1")?, Some(tags.clone()));
+            assert!(
+                t.tags("data", &object::key("other.bin").unwrap(), "u1")?
+                    .is_none()
+            );
+            assert!(t.tags("data", &key, "u2")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+        // A corrupt tags wire still answers Some (the upload exists) with the
+        // self-healed empty set.
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?
+                .insert(("data", "u1"), ("big.bin", 0u64, "garbage", "", ""))
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert_eq!(
+                Table::open_readonly(txn)?.tags("data", &key, "u1")?,
+                Some(Tags::empty()),
+                "a corrupt upload tags wire is the empty set"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn upload_drain_bucket_removes_only_the_bucket() {
+        let h = handle();
+        let key = object::key("k").unwrap();
+        // Insert into a write txn, then drain in a separate one (drain and
+        // insert in the same txn trips a redb page-manager assertion).
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.put("data", "u1", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+            t.put("other", "u9", &key, SystemTime::UNIX_EPOCH, "", "", "")?;
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.drain_bucket("data")?;
+            assert!(!t.has_bucket("data")?);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !h.read(|txn| Table::open_readonly(txn)?.key_matches("data", &key, "u1"))
+                .unwrap()
+        );
+    }
+}

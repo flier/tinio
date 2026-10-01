@@ -108,14 +108,14 @@ pub(crate) fn sock(dir: &TempDir) -> PathBuf {
 }
 
 /// The caller's side of the metrics injection point, in miniature: the CLI's adapter has this
-/// shape, and so does the integration suite's. Both halves are side-effecting in a real adapter —
-/// `refresh` republishes the cheap families, `counts` runs the storage scan and sets the three
-/// gauges — so both are counted here, and the scan count is the number the reader's cadence
-/// exists to keep down.
+/// shape, and so do the plane's own legs in `transport.rs`. Both halves are side-effecting in a
+/// real adapter — `refresh` republishes the cheap families, `counts` runs the storage scan and
+/// sets the three gauges — so both are counted here, and the scan count is the number the
+/// reader's cadence exists to keep down.
 ///
-/// **The integration suite's double is the same thing written twice**, and its field and accessor
-/// names are the ones here: `#[cfg(test)]` cannot be reached from `tests/`, so there is no shared
-/// definition to have, and matching names are what keep the two readable as one.
+/// **This is the crate's one definition of the double.** The plane's legs run as inline tests,
+/// so the `#[cfg(test)]` boundary does not cut them off from it and no second copy exists
+/// (`plans/2026-10-01-test-placement-cleanup.md`).
 #[derive(Default)]
 pub(crate) struct Counting {
     refreshes: Arc<AtomicUsize>,

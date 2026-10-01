@@ -454,3 +454,39 @@ unsafe extern "system" fn console_handler(event: u32) -> i32 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The relay's round trip in one process, which is the half that needs no
+    //! console: `arm` then `disarm` against this binary's own id. The delivery
+    //! legs stay in `tests/signals.rs` — they raise and address a real console
+    //! control event, which is why CI drops `binary(signals)` from *run*.
+    //!
+    //! The 2026-10-01 placement cleanup moved this leg here from `tests/signals.rs`
+    //! (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
+
+    use std::process;
+
+    use super::*;
+
+    /// `arm` then `disarm`, in the process that runs the tests.
+    ///
+    /// The round trip is the whole of what this asserts, and it is worth asserting
+    /// because both calls report a refusal: an `arm` that cannot install the console
+    /// handler and a `disarm` that cannot remove it are the two failures a process
+    /// that outlives one launch would meet. What it cannot assert is the disposition
+    /// `disarm` restores — witnessing that takes an event, and the only process whose
+    /// death could witness it here is this one, which has to stay alive long enough to
+    /// report the result.
+    #[test]
+    fn the_relay_arms_and_disarms_in_this_process() {
+        // Armed for this process itself: a live id rather than a placeholder, so
+        // nothing in the call is invented. **It is not a group id** — this test
+        // process was started without `CREATE_NEW_PROCESS_GROUP`, so the forward the
+        // handler would make is refused by the system (`ERROR_INVALID_PARAMETER`)
+        // rather than signalled to anybody, and the handler is installed for the
+        // length of one call besides.
+        arm(process::id()).expect("arm the relay");
+        disarm().expect("disarm the relay");
+    }
+}

@@ -16,7 +16,7 @@ use std::time::Duration;
 /// restatements beside this one already: `crates/tinio-e2e/tests/steps/clients.rs`
 /// defines it as `START_TIMEOUT` — the receive timeout `wait_for_ready` reads the
 /// readiness frame under — and this crate's own suites restate it as
-/// `tests/common/mod.rs`'s `TIMEOUT`, in the same words about why.
+/// [`crate::testing::TIMEOUT`], in the same words about why.
 ///
 /// **It is a restatement and not a shared constant, which is the honest shape
 /// rather than a shortcut.** The budget belongs to the consumer: a backend is

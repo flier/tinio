@@ -12,15 +12,17 @@ use std::{
     io::{Error as IoError, ErrorKind},
     path::Path,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
+use proptest::{prelude::ProptestConfig, test_runner::FileFailurePersistence};
 use tokio::{
     fs as tokio_fs,
+    runtime::Runtime,
     sync::{Mutex, mpsc, watch},
     task, time,
 };
@@ -47,6 +49,27 @@ pub(crate) fn owner_id() -> acl::OwnerId {
 /// `tinio_util::testing::conform_other_owner` fixture.
 pub(crate) fn other_owner_id() -> acl::OwnerId {
     conform_other_owner()
+}
+
+/// One multi-thread runtime for the property suites that drive async store
+/// code (`meta.rs`, `multipart.rs`; moved inline from `tests/` 2026-10-01):
+/// built once per test binary, not once per case — `Runtime::new()` starts
+/// `num_cpus` workers, and each case used to pay that construction.
+pub(crate) fn runtime() -> &'static Runtime {
+    static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().unwrap());
+    &RUNTIME
+}
+
+/// The moved property suites' shared failure persistence: their regression
+/// seeds live beside each suite (`src/meta.proptest-regressions`,
+/// `src/multipart.proptest-regressions`), and proptest's `SourceParallel`
+/// default would resolve to `crates/tinio-fs/proptest-regressions/<file>.txt`
+/// once the tests sit in `src/` — `WithSource` keeps the file keyed to each
+/// test's own `file!()`, the layout the seeds had under `tests/`.
+pub(crate) fn proptest_config() -> ProptestConfig {
+    ProptestConfig::with_failure_persistence(FileFailurePersistence::WithSource(
+        "proptest-regressions",
+    ))
 }
 
 /// A group-read grant over the documented AllUsers URI — the standard

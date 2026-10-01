@@ -47,9 +47,10 @@ async fn bzip2_object_with_content(world: &mut super::World, key: String, step: 
 }
 
 /// A parquet object built from the committed fixture — the same bytes
-/// `tinio-select`'s integration test asserts and `tinio-server`'s parquet
+/// `tinio-select`'s inline tests assert and `tinio-server`'s parquet
 /// test selects (regenerate with the ignored generator in
-/// `crates/tinio-select/tests/parquet.rs`). No docstring: parquet is binary,
+/// `crates/tinio-select/src/parquet.rs`, where the retired
+/// `tests/parquet.rs` moved on 2026-10-01). No docstring: parquet is binary,
 /// and a `"""` block cannot carry it.
 ///
 /// The scenario is tagged `@parquet` because the reader lives behind

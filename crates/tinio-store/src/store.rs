@@ -76,3 +76,36 @@ impl Handle {
 }
 
 impl Store for Handle {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::*;
+    use crate::{bucket, testutil::handle};
+
+    #[test]
+    fn handle_write_commits_on_success_and_aborts_on_error() {
+        let h = handle();
+        // A failing write closure aborts the transaction — nothing is visible.
+        let err = h.write(|txn| -> Result<(), Error> {
+            bucket::Table::open(txn)?.put("rolled-back", SystemTime::UNIX_EPOCH)?;
+            Err(Error::Storage(redb::StorageError::Corrupted("boom".into())))
+        });
+        assert!(err.is_err());
+        assert!(
+            !h.read(|txn| bucket::Table::open_readonly(txn)?.exists("rolled-back"))
+                .unwrap()
+        );
+        // A succeeding write commits.
+        h.write(|txn| -> Result<(), Error> {
+            bucket::Table::open(txn)?.put("committed", SystemTime::UNIX_EPOCH)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            h.read(|txn| bucket::Table::open_readonly(txn)?.exists("committed"))
+                .unwrap()
+        );
+    }
+}

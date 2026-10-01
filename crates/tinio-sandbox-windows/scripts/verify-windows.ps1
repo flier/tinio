@@ -91,8 +91,8 @@ if ($AclCost) {
     # mechanism's per-object cost — which is what the caller's exposures still pay
     # and what this calibration exists for (design §6 and its Risks row,
     # `README.md`'s operator note). A measurement of the launcher's own directory
-    # is `tests/backend.rs`'s exposure set and `tests/acl.rs`'s batch test, not
-    # this mode.
+    # is `src/backend/tests.rs`'s exposure set and `src/acl.rs`'s sibling-batch
+    # test, not this mode.
     $sid = 'S-1-15-2-1-2-3'
     $deep = Join-Path (Join-Path $corpus "d$Dirs") "f$Files.bin"
 
@@ -133,7 +133,7 @@ if ($AclCost) {
     exit 0
 }
 
-# The gate's default, and it wins here over the harness's own fallback (the volume holding the system temp directory, `crates/tinio-sandbox-windows/tests/common/mod.rs`): this script is what covers an NTFS and an ReFS volume where the machine has both, which one volume cannot, and a bare `cargo test` against the crate gets the harness's fallback instead.
+# The gate's default, and it wins here over the harness's own fallback (the volume holding the system temp directory, `crates/tinio-sandbox-windows/src/testing.rs` — `tests/common/` was folded into that module by the 2026-10-01 placement cleanup): this script is what covers an NTFS and an ReFS volume where the machine has both, which one volume cannot, and a bare `cargo test` against the crate gets the harness's fallback instead.
 $requested = if ($env:TINIO_SANDBOX_TEST_VOLUMES) { $env:TINIO_SANDBOX_TEST_VOLUMES } else { 'C:\;E:\' }
 $present = @($requested -split ';' | Where-Object { $_ -and (Test-Path $_) })
 if ($present.Count -eq 0) { [Console]::Error.WriteLine("none of the volumes in '$requested' exist"); exit 1 }

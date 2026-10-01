@@ -2991,21 +2991,26 @@ fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
 ///
 /// **Why the std half is shared and the rest is not.** Two `tests/` trees cannot import from each
 /// other, and both spawn the real `tinio server` and read its pipes: the read-only suite
-/// (`tinio-server/tests/serve_read_only.rs`) and the sandbox-channel harness beside it
-/// (`tests/support/serve_spawn.rs`) held a byte-identical copy of this — the buffers, the drain,
-/// the exit wait and the kill — and the copies were equal only while an author remembered the
-/// other. What both of them add on top, and what stays in those trees, is the decoding of the
-/// readiness event, which is `tinio_sandbox::Event`'s: it would cost every `testing` build the
-/// whole sandbox stack to hold it here, for a type only those two binaries read.
+/// (`tinio-server/tests/serve_read_only.rs`) and the sandbox-channel suite beside it
+/// (`tinio-server/tests/serve_sandbox_channels.rs`, through `tests/support/serve_spawn.rs`) held a
+/// byte-identical copy of this — the buffers, the drain, the exit wait and the kill — and the
+/// copies were equal only while an author remembered the other. **Both suites retired on
+/// 2026-10-01** (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`; their legs are
+/// `crates/tinio-e2e`'s `@cli` scenarios), and `tests/support/serve_spawn.rs` is the merged copy
+/// they left, which `sandbox_e2e.rs` includes without calling. What it adds on top, and what stays
+/// in its tree, is the decoding of the readiness event, which is `tinio_sandbox::Event`'s: it
+/// would cost every `testing` build the whole sandbox stack to hold it here, for a type only that
+/// binary reads.
 ///
 /// The child inherits this process's environment; a harness that must remove or set a variable does
 /// it on the [`Command`] before [`spawn`](Self::spawn).
 ///
-/// **The spawn goes through the job guard** ([`crate::job::spawn`]), which is what makes the legs
-/// that hold one of these — `tinio-server`'s `serve_read_only` and the sandbox-channel harness
-/// beside it — take their servers with them when the test process dies without unwinding. The
-/// guard is the backstop for that path; the `Drop` below stays what reaps on every path that
-/// returns. What the guard covers, per target, is its module's doc.
+/// **The spawn goes through the job guard** ([`crate::job::spawn`]), which is what made the legs
+/// that held one of these — `tinio-server`'s `serve_read_only` and `serve_sandbox_channels`, both
+/// retired 2026-10-01 — take their servers with them when the test process died without unwinding;
+/// their merged harness `serve_spawn.rs` keeps the guard on the spawn path. The guard is the
+/// backstop for that path; the `Drop` below stays what reaps on every path that returns. What the
+/// guard covers, per target, is its module's doc.
 pub struct PipedChild {
     child: Child,
     stdout: Lines,

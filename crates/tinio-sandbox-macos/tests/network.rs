@@ -13,7 +13,6 @@ use std::{
 };
 
 use tinio_sandbox_core::{AccessMode, Sandbox};
-use tinio_sandbox_macos::profile::{network_operation, profile};
 
 /// Runs inside the confinement: accept on the inherited listener, and try to
 /// reach out.
@@ -93,24 +92,5 @@ fn the_confined_process_cannot_reach_out() {
         Some("refused(permission denied)"),
         "{}",
         report.text()
-    );
-}
-
-#[test]
-fn the_profile_grants_no_network_operation() {
-    // Design §7's macOS row is not "no outbound" — serving needs no network
-    // capability of any kind: a profile carrying zero network rules accepted a
-    // real connection from a listener the parent had handed in, and the kernel
-    // logged no `accept` violation. The property is asserted through
-    // `network_operation`, which owns the keyword table and the measurements
-    // behind it — `profile.rs`'s unit leg reads the same one, and the two used to
-    // carry the table twice.
-    let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadWrite);
-    let rendered = profile(&sandbox, tinio_sandbox_macos::Mechanism::SandboxExec).expect("profile");
-    assert_eq!(
-        network_operation(&rendered.text),
-        None,
-        "no rule in this profile may mention a network operation: {}",
-        rendered.text
     );
 }

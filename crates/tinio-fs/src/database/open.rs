@@ -91,12 +91,16 @@ pub fn open(state_dir: &Path) -> Result<Open, Error> {
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    use redb::TableHandle;
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn state_dir_and_meta_db_are_hardened() {
         let root = tempfile::tempdir().unwrap();
@@ -121,6 +125,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_hardens_pre_existing_state() {
         // Re-opening an existing state dir also enforces the modes
@@ -146,6 +151,38 @@ mod tests {
         assert_eq!(
             db_mode, META_DB_MODE,
             "meta.redb must be re-hardened to {META_DB_MODE:o}, got {db_mode:o}"
+        );
+    }
+
+    /// The on-disk byte-format contract: a freshly opened `meta.redb` contains
+    /// exactly the seven shared store tables plus the fs-local `state` table,
+    /// and nothing else (shared-store-table-layer 2026-09-03 Goal 4 / spec §4
+    /// byte-format guard — tinio-store's own `ensure_all` test pins the seven
+    /// shared names; this pins the full fs schema). Moved inline from
+    /// `tests/layout.rs`, 2026-10-01.
+    #[test]
+    fn open_creates_exactly_the_schema_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = open(dir.path()).unwrap();
+        let txn = opened.db.begin_write().unwrap();
+        let mut names: Vec<String> = txn
+            .list_tables()
+            .unwrap()
+            .map(|h| h.name().to_string())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "buckets",
+                "object_meta",
+                "object_parts",
+                "part_checksums",
+                "parts",
+                "state",
+                "upload_checksums",
+                "uploads",
+            ]
         );
     }
 }

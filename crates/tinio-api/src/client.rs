@@ -372,8 +372,8 @@ pub async fn stop(state_dir: &Path) -> Result<(), Error> {
     }
 }
 
-/// One request over an explicit unix socket path — the seam the transport tests and the
-/// integration suite use, and the dialer `request`'s unix arm delegates to.
+/// One request over an explicit unix socket path — the seam the transport tests use, and the
+/// dialer `request`'s unix arm delegates to.
 ///
 /// The whole request is the caller's [`Call`], method included, because this seam serves more
 /// than the CLI's `GET`s: `POST /stop` and any other method go through here too. A `None` token
@@ -508,9 +508,9 @@ async fn request(state: &State, call: Call<'_>) -> Result<RawResponse, Error> {
 /// One request over an already-dialed stream: the HTTP/1 client connection, the request, and
 /// the response read back as text. **The single `exchange` for the whole crate** — `request`
 /// (the three dialers, with `probe`/`status`/`stop` on top of them), [`get_local`], [`get_http`],
-/// the transport tests, `test_support::https_get` for the TLS leg and the integration suite are
-/// all its callers, so there is one definition and not two. `pub` for the callers that dial
-/// themselves: the TLS client and the tests' own transports.
+/// the transport tests and `test_support::https_get` for the TLS leg are all its callers, so
+/// there is one definition and not two. `pub` for the callers that dial themselves: the TLS
+/// client and the tests' own transports.
 ///
 /// # Examples
 ///
@@ -581,37 +581,36 @@ where
 
 #[cfg(test)]
 mod tests {
-    // The two socket tests below need `bind_unix` and `serve_local`, which do not exist on
-    // Windows, so *their* imports are gated rather than the module: the TCP test at the bottom
-    // is platform-neutral and runs on both hosts (it is the only leg of this module that
-    // exercises `Control::Tcp`). The Windows pipe dialer and the DACL are Task 10's, gated there.
-    // The busy-pool leg's pool name is per-process, and `process` is named by that leg alone: the
-    // unix legs derive their own path from the temp dir they bind in.
+    // The socket tests below need `bind_unix`, `socket_path` and `serve_local`, which do not
+    // exist on Windows, so *their* imports are gated rather than the module: the TCP tests at the
+    // bottom are platform-neutral and run on both hosts (they are the only legs of this module
+    // that exercise `Control::Tcp`). The Windows pipe dialer and the DACL are Task 10's, gated
+    // there. The busy-pool leg's pool name is per-process, and `process` is named by that leg
+    // alone: the unix legs derive their own path from the temp dir they bind in.
     #[cfg(windows)]
     use std::process;
-    #[cfg(any(unix, windows))]
-    use std::sync::Arc;
     use std::{
         io::{Read, Write},
         net::TcpListener,
         path::Path,
+        sync::Arc,
         thread,
     };
 
     use tempfile::TempDir;
-    #[cfg(any(unix, windows))]
     use tokio::sync::watch;
 
     use super::*;
     #[cfg(windows)]
     use crate::bind::{INSTANCES, bind_pipe, pipe_name};
-    use crate::state::State;
+    #[cfg(any(unix, windows))]
+    use crate::transport::serve_local;
     #[cfg(unix)]
     use crate::{bind::bind_unix, state::socket_path};
-    #[cfg(any(unix, windows))]
     use crate::{
         router::{Auth, Context},
-        transport::serve_local,
+        state::State,
+        transport::serve_tcp,
     };
 
     #[cfg(unix)]
@@ -705,10 +704,55 @@ mod tests {
         serving.abort();
     }
 
+    /// The wildcard bind's recorded name, and the client that makes it dialable. `state.control_name`
+    /// carries the **bound** address — `0.0.0.0:<port>`, which is truthful and load-bearing, because
+    /// it is what `Auth::for_bind` and `doctor` reason from — and dialling that verbatim never
+    /// connects: Windows answers `WSAEADDRNOTAVAIL` for it (measured on this host) while
+    /// `127.0.0.1:<port>` connects, and `status` maps every dial failure to `running: false`. So the
+    /// running report below is the assertion the missing loopback substitution fails: against the
+    /// pre-fix arm every dial is refused and a live server is reported stopped, which is the defect
+    /// this test exists to catch.
+    #[tokio::test]
+    async fn a_wildcard_bind_is_reported_running() {
+        let listener = TcpListener::bind("0.0.0.0:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+
+        let dir = TempDir::new().expect("temp dir");
+        let state =
+            State::new(addr.to_string(), Some(9000), Path::new("/srv/data")).expect("state");
+        state.write(dir.path()).expect("write");
+        let (tx, stop) = watch::channel(false);
+        let shared = Arc::new(Context::new(state, "0.0.0.0", Auth::for_bind(addr), tx));
+        // `Plane::publish` is what sets this in a real run: the client reads the port back
+        // through `/status`.
+        shared.port.set(9000).expect("the port is published once");
+        let serving = tokio::spawn(serve_tcp(listener, shared, stop));
+
+        let recorded: SocketAddr = State::read(dir.path())
+            .expect("read")
+            .expect("published")
+            .control_name
+            .parse()
+            .expect("a TCP control name is a socket address");
+        assert!(
+            recorded.ip().is_unspecified(),
+            "`state` records what was bound, the wildcard included: {recorded}"
+        );
+        let report = status(dir.path()).await.expect("status");
+        assert!(
+            report.running,
+            "the client dials loopback for an unspecified recorded address"
+        );
+        assert_eq!(report.status.expect("body").port, Some(9000));
+
+        serving.abort();
+    }
+
     /// R29, pinned: a `200` whose body is not this plane's contract is `false`, not an `Err`.
     /// The bare listener is the smallest server that can answer that way — no router, no plane,
-    /// just a status line and a body — and it is also this module's only test of `Control::Tcp`
-    /// and of `request`'s TCP dialer.
+    /// just a status line and a body — and it is also one of this module's two tests of
+    /// `Control::Tcp` and of `request`'s TCP dialer.
     ///
     /// The listener is `std` and answered on a blocking thread rather than tokio's: this crate's
     /// tokio graph carries no `io-util`, so `AsyncReadExt`/`AsyncWriteExt` do not exist here, and

@@ -19,6 +19,7 @@ pub mod cli;
 pub mod clients;
 pub mod common;
 pub mod conditions;
+pub mod doctor;
 pub mod errors;
 pub mod listing;
 pub mod multipart;
@@ -90,6 +91,12 @@ pub struct World {
     /// in-process server nor the wire client, which is why the `#[before]`
     /// hook leaves this world alone entirely.
     pub cli: Option<Cli>,
+    /// The served root a step restricted to owner read and traverse, with the
+    /// mode to give back on drop (common.rs: the `@unix` read-only scenario's
+    /// `chmod 0500` fixture). Unix only — the plant is a permission bit —
+    /// and `None` for every scenario that plants none.
+    #[cfg(unix)]
+    pub restricted: Option<common::RestrictedRoot>,
 }
 
 /// Whether `tags` contains exactly `tag` — the scenario-classification
@@ -262,6 +269,11 @@ fn after_hook<'a>(
             if let Some(mut cli) = world.cli.take() {
                 cli.teardown();
             }
+            // Before the server, whose tempdir may be the restricted root: a directory at
+            // mode 0500 refuses `remove_dir_all`, so the mode has to be back first
+            // (common.rs's `RestrictedRoot` owns the restore, and its `Drop` is this take).
+            #[cfg(unix)]
+            world.restricted.take();
             world.server.take();
         }
     })

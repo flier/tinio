@@ -254,3 +254,259 @@ pub fn command_args(listener: HANDLE, controls: &[HANDLE], args: &[OsString]) ->
     child.extend(args.iter().cloned());
     child
 }
+
+#[cfg(test)]
+mod tests {
+    //! The launch payload and the inherited listener: what [`adopt`] answers for
+    //! a process's arguments, the argv [`command_args`] builds, the socket
+    //! [`listener`] rebuilds from a descriptor, and the re-exec that puts a real
+    //! child on the other end of the frame.
+    //!
+    //! **Both halves live here since the 2026-10-01 placement cleanup**
+    //! (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`): the legs
+    //! that used to be `tests/payload.rs` moved beside their subjects, which is
+    //! what `docs/tests.md`'s placement rule asks. The child's half is a role of
+    //! *this* binary — a unit test's `env::current_exe()` is the libtest binary,
+    //! where libtest names every test by its module, hence
+    //! `launch::tests::child_role` — and the spawn still goes through
+    //! `tinio_util::job`, the guard every harness spawn site takes.
+    //!
+    //! The split is still the point: the legs that observe the payload from
+    //! *within* one process are here so a failure is unambiguous about which half
+    //! broke, and the re-exec leg is here so the frame and the argv element are
+    //! read by a process that really inherited them. The socket's own re-exec leg
+    //! is `crate::socket`'s, where the rebuild it exercises lives.
+
+    use std::{
+        env, fs,
+        ffi::{OsStr, OsString},
+        io::{self, ErrorKind, Write},
+        net::{TcpListener, TcpStream},
+        os::windows::io::IntoRawSocket,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use tinio_sandbox_core::LaunchPayload;
+    use tinio_util::job;
+
+    use crate::testing::{TIMEOUT, wait_for_exit};
+
+    // **The stdin stand-in is the shared one** (`tinio_util::testing`), which the core's own
+    // leg for this rule takes too: what the two measure is the same "was stdin read at all",
+    // and only a reader that fails on being read can tell that from a reader that returns
+    // nothing.
+    use tinio_util::testing::Untouchable;
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    use super::*;
+    use crate::_core::is_launcher_fd_arg;
+
+    /// The marker that makes [`child_role`] inert in this binary's own test run.
+    ///
+    /// The spawned child runs `child_role --exact` with this variable set; in the
+    /// launcher's run of the same binary the same function is an ordinary test that
+    /// must return rather than adopt — adopting from a console this process does
+    /// not own is a hang, not a failure. The payload cannot carry the marker:
+    /// adopting the payload is what the role is *for*.
+    const CHILD: &str = "TINIO_SANDBOX_TEST_PAYLOAD_CHILD";
+
+    /// The libtest name of the child's role **in this binary**, which the spawn in
+    /// [`a_child_reads_the_frame_the_parent_wrote`] passes as its `--exact` filter:
+    /// the lib test binary, where a test is named by its module path.
+    const CHILD_ROLE: &str = "launch::tests::child_role";
+
+    /// Where the child role records what it saw, for the parent to assert on.
+    const REPORT: &str = "TINIO_SANDBOX_TEST_REPORT";
+
+    #[test]
+    fn a_process_with_no_element_is_not_a_confined_child() {
+        // In the child role this process's argv carries the element *by
+        // construction* — that is what makes it the child — so the rule this test
+        // states is not the rule that process is under.
+        if env::var_os(CHILD).is_some() {
+            return;
+        }
+        // The discriminator: no element means no launcher expected this process to be
+        // confined, and stdin is never read — which is what keeps an ordinary
+        // launcher from blocking on its own console.
+        let adopted = adopt(env::args_os(), Untouchable).unwrap();
+        assert!(adopted.is_none());
+        // `OsString`s and not `String`s: the rule takes a process's own arguments,
+        // and a path that is not valid UTF-8 is a legal argument on Windows.
+        let adopted = adopt(
+            [OsString::from("serve"), OsString::from("/srv/data")],
+            Untouchable,
+        )
+        .unwrap();
+        assert!(adopted.is_none());
+    }
+
+    #[test]
+    fn the_element_carries_a_listener_descriptor() {
+        let element = listener_fd_arg(1040);
+        assert_eq!(element, "tinio-sandbox-fd=1040");
+        assert!(is_listener_fd_arg(&element));
+        assert_eq!(listener_fd_from_arg(&element), Some(1040));
+        assert!(!is_listener_fd_arg(OsStr::new("--port")));
+        // The launcher's own arguments survive untouched, minus the element the
+        // child consumes itself. `args` is what follows `argv[0]` — what
+        // `std::env::args_os().skip(1)` hands over — and the cast stands in for the
+        // listener's handle, whose value is the only thing the element carries.
+        let args = command_args(
+            1040usize as HANDLE,
+            &[],
+            &["/srv/data".into(), "--port".into(), "0".into()],
+        );
+        assert_eq!(args[0], element, "the element comes first");
+        let kept: Vec<String> = args
+            .iter()
+            .skip(1)
+            .filter(|arg| !is_listener_fd_arg(arg))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, ["/srv/data", "--port", "0"]);
+    }
+
+    #[test]
+    fn the_control_elements_ride_beside_the_listener_element() {
+        // The inherited descriptors, and the shape the launcher's own argv takes when
+        // its plan carries them: the listener element first (the child reads *it* to decide
+        // this process is a child), one control element per instance next, then the launcher's
+        // arguments untouched. All of them are the child's to consume, so all are filtered out
+        // here — what `tinio_sandbox_core::filter_argv` does for the real child.
+        let instances = [1044usize as HANDLE, 1048usize as HANDLE];
+        let args = command_args(
+            1040usize as HANDLE,
+            &instances,
+            &["/srv/data".into(), "--port".into(), "0".into()],
+        );
+        assert_eq!(args[0], "tinio-sandbox-fd=1040");
+        assert_eq!(args[1], "tinio-sandbox-control-fd=1044");
+        assert_eq!(args[2], "tinio-sandbox-control-fd=1048");
+        let kept: Vec<String> = args
+            .iter()
+            .filter(|arg| !is_launcher_fd_arg(arg))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            kept,
+            ["/srv/data", "--port", "0"],
+            "clap must never see any element"
+        );
+        // And with no control channel the argv is what it was before this seam existed.
+        let bare = command_args(1040usize as HANDLE, &[], &["/srv/data".into()]);
+        assert_eq!(bare, ["tinio-sandbox-fd=1040", "/srv/data"]);
+    }
+
+    #[test]
+    fn a_launch_that_named_no_listener_is_an_error_not_a_socket() {
+        // `adopt` only ever hands back a descriptor alongside the element that named
+        // it, so this is the hand-built `Adopted` a caller reaches through
+        // `Adopted::new`: what the rule does about it is report it, rather than rebuild
+        // a socket from a value no launch chose.
+        let adopted = Adopted::new(String::new(), None, Vec::new(), None, None);
+        let error = listener(&adopted).expect_err("no descriptor, no socket");
+        let rendered = error.to_string();
+        assert!(rendered.contains("rebuild the listener"), "{rendered}");
+        assert!(rendered.contains("argv"), "{rendered}");
+    }
+
+    /// The socket a child serves on must not block: a `std` listener is created blocking on Windows,
+    /// and an inherited one keeps that mode unless the rebuild clears it.
+    #[test]
+    fn the_rebuilt_listener_accepts_without_blocking() {
+        let bound = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = bound.local_addr().expect("address");
+        let raw = bound.into_raw_socket();
+        let adopted = Adopted::new(String::new(), Some(raw as i64), Vec::new(), None, None);
+        let listener = listener(&adopted).expect("rebuild the listener");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let kind = listener.accept().map(|_| ()).map_err(|err| err.kind());
+            let _ = tx.send(kind);
+        });
+        match rx.recv_timeout(Duration::from_millis(300)) {
+            Ok(Err(ErrorKind::WouldBlock)) => {}
+            Ok(other) => panic!("accept returned {other:?}, expected WouldBlock"),
+            Err(_) => {
+                // A blocking accept is stuck until a client arrives. Connect so the thread can
+                // finish, then fail: the harness must not hang on the bug this test exists to catch.
+                let _ = TcpStream::connect(address);
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                panic!("accept blocked: the rebuilt listener is still a blocking socket");
+            }
+        }
+    }
+
+    /// The child's half of the frame: adopt what the parent wrote, rebuild the
+    /// socket its element named, and record what the adoption answered.
+    #[test]
+    fn child_role() {
+        if env::var_os(CHILD).is_none() {
+            return;
+        }
+        let adopted = adopt(env::args_os(), io::stdin().lock())
+            .expect("adopt")
+            .expect("a payload arrived on stdin");
+        assert_eq!(adopted.config(), "version = 1\n");
+        // The element named the listener's handle and `adopt` handed back the
+        // descriptor; rebuilding the socket is this crate's half.
+        assert!(adopted.listener().is_some(), "the element named a listener");
+        let listener = listener(&adopted).expect("rebuild the listener");
+        assert!(listener.local_addr().expect("a bound socket").port() > 0);
+        let report = env::var(REPORT).expect("report path");
+        fs::write(report, "payload-ok\n").expect("write the report");
+    }
+
+    #[test]
+    fn a_child_reads_the_frame_the_parent_wrote() {
+        if env::var_os(CHILD).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = dir.path().join("report.txt");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        socket::mark_inheritable(&listener).expect("mark the listener inheritable");
+        let element = listener_fd_arg(socket::value(&listener) as i64);
+
+        // **The child role is spawned through the guard** (`tinio_util::job`), like every other spawn
+        // in this crate's tests: the frame is written after it is up, so a test binary that died
+        // without unwinding would leave this copy of itself holding the inherited handle and the
+        // target dir.
+        let mut command = Command::new(env::current_exe().expect("current exe"));
+        command
+            .args([CHILD_ROLE, "--exact", &element.to_string_lossy()])
+            .env(CHILD, "1")
+            .env(REPORT, &report)
+            .stdin(Stdio::piped());
+        let mut child = job::spawn(&mut command).expect("spawn the child");
+
+        // The frame comes from the core's one writer — the payload derives no
+        // `Serialize` — so this is the byte string a launch really writes, config
+        // text and all.
+        let frame = LaunchPayload::encode_frame("version = 1\n", None, None)
+            .expect("the frame is one JSON object");
+        child
+            .stdin
+            .take()
+            .expect("the child's stdin")
+            .write_all(&frame)
+            .expect("write the frame");
+        // Dropping the handle closes the pipe, which is what makes the child's read
+        // of stdin reach EOF (design §3 step 7).
+
+        // The wait is the harness's, and it is the shape the phase's rule asks for:
+        // the child here is a whole test binary, so "it exited" and "it is stuck
+        // reading a stdin nobody closed" are the two outcomes the wait has to tell
+        // apart — and a red one is killed and reaped before it panics.
+        let status = wait_for_exit(&mut child, TIMEOUT, "the payload child");
+        assert!(status.success(), "the child role failed: {status:?}");
+        assert_eq!(
+            fs::read_to_string(&report).expect("the child's report"),
+            "payload-ok\n"
+        );
+    }
+}

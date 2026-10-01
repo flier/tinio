@@ -27,8 +27,13 @@ runs:
       with:
         tool: nextest
 
-    # The `tinio` binary is a PREREQUISITE of tinio-server's serve_read_only
-    # integration test, which spawns it. `cargo test` (the local gate) leaves
+    # The `tinio` binary is a PREREQUISITE of the targets that spawn it —
+    # tinio-server's `sandbox_e2e*` integration tests and the `@cli` cucumber
+    # scenarios (the read-only family moved there 2026-10-01; its
+    # `serve_read_only.rs` is gone, and `serve_sandbox_channels.rs` retired
+    # with it — the `read_only` target drives the plane in process and spawns
+    # nothing).
+    # `cargo test` (the local gate) leaves
     # the built binary at `<profile>/tinio`, which is where
     # `assert_cmd::cargo::cargo_bin("tinio")` looks; nextest's target
     # selection is not something this leg can rely on to do the same, and the
@@ -39,7 +44,7 @@ runs:
     # DEFAULT-features server at that path and the no-default leg would then
     # spawn a binary with an `acl` stack its own test graph does not have —
     # the artifact under test must be the one the leg builds.
-    - name: build the tinio binary (a serve_read_only prerequisite)
+    - name: build the tinio binary (a spawning-target prerequisite)
       if: inputs.mode == 'default'
       shell: bash
       run: cargo build --profile ci -p tinio

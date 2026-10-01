@@ -121,33 +121,7 @@ proptest! {
     }
 }
 
-#[test]
-fn representative_valid_and_invalid_keys() {
-    for key in ["a", "dir/file.txt", "with space.txt", "ümlaut.txt", "dir/"] {
-        assert!(object::key(key).is_ok(), "{key:?}");
-    }
-    for key in [
-        "", "/abs", "C:\\evil", "a\x00b", "a/../b", "a/./b", "..", "a//b", r"a\\b", r"a/\b",
-    ] {
-        assert!(object::key(key).is_err(), "{key:?}");
-    }
-}
-
-/// Platform charset is NOT a universal rule: characters that are invalid
-/// file-name characters on Windows (but legal elsewhere) pass the checked
-/// constructor — the filesystem backend's path mapping rejects them on
-/// Windows only (fs-backend.md §1). This test pins the boundary.
-#[test]
-fn platform_charset_left_to_the_backend() {
-    for key in ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"] {
-        assert!(object::key(key).is_ok(), "{key:?} is a backend concern");
-    }
-}
-
-#[test]
-fn reserved_flag_vs_rejection() {
-    // Reserved keys are syntactically legal — the constructor accepts them
-    // and the backend refuses writes (FR-020).
-    assert!(object::key("a/.tinio/b").unwrap().is_reserved());
-    assert!(object::key(".tinio").unwrap().is_reserved());
-}
+// The plain key-classification cases (`representative_valid_and_invalid_keys`,
+// `platform_charset_left_to_the_backend`, `reserved_flag_vs_rejection`) moved
+// inline to `object.rs`'s own tests, beside the constructor they exercise; the
+// file keeps the proptest paradigm (`docs/tests.md`).

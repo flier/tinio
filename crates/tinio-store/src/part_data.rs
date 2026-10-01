@@ -76,3 +76,41 @@ impl<'txn> table::Table<'txn, Def> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::handle;
+
+    #[test]
+    fn part_data_rows_total_len_and_drain_upload() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut pd = Table::open(txn)?;
+            pd.put("data", "u1", 1, b"ab")?;
+            pd.put("data", "u1", 2, b"cdef")?;
+            pd.put("data", "u2", 1, b"zz")?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let pd = Table::open_readonly(txn)?;
+            assert_eq!(pd.total_len("data", "u1")?, 6);
+            assert_eq!(pd.total_len("data", "u2")?, 2);
+            // A sibling upload's rows do not leak into the scan.
+            assert_eq!(pd.total_len("data", "u3")?, 0);
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.drain_upload("data", "u1")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            h.read(|txn| Table::open_readonly(txn)?.total_len("data", "u1"))
+                .unwrap(),
+            0
+        );
+    }
+}

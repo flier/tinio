@@ -726,13 +726,18 @@ mod tests {
     #[tokio::test]
     async fn the_local_channel_does_not_guard_metrics() {
         // The route exists now, so the middleware's rule and the handler are asserted together:
-        // a guarded route answers 401 before its handler runs, an open one reaches it.
-        let (shared, _rx, _source) = gauged(Auth::Local);
+        // a guarded route answers 401 before its handler runs, an open one reaches it — and the
+        // scrape drove the cheap half, the counter the folded integration leg read back.
+        let (shared, _rx, source) = gauged(Auth::Local);
         let response = router(shared)
             .oneshot(get("/metrics", None))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            source.refreshes() >= 1,
+            "the scrape refreshed the cheap half"
+        );
     }
 
     #[tokio::test]
@@ -744,7 +749,7 @@ mod tests {
         // ever reaches it.
         for auth in [Auth::Local, Auth::Loopback] {
             let (shared, _rx, source) = gauged(auth);
-            let response = router(shared)
+            let response = router(shared.clone())
                 .oneshot(get("/metrics", None))
                 .await
                 .expect("response");
@@ -763,6 +768,24 @@ mod tests {
                 "one scrape refreshes the cheap half once: {auth:?}"
             );
             assert_eq!(source.scans(), 0, "and never scans: {auth:?}");
+
+            // **...and the flood does not move either number**: the burst the retired
+            // `management.rs` leg drove, folded in here — every one of the eight is the handler's
+            // cheap half, and the scan count stays where the reader task's cadence put it (none,
+            // for a source whose reader is deliberately not started).
+            for _ in 0..8 {
+                let response = router(shared.clone())
+                    .oneshot(get("/metrics", None))
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::OK, "{auth:?}");
+            }
+            assert_eq!(
+                source.refreshes(),
+                9,
+                "every scrape refreshes the cheap half: {auth:?}"
+            );
+            assert_eq!(source.scans(), 0, "no scrape scans the storage: {auth:?}");
         }
         // A reachable bind requires the token, and presenting it reaches the same handler —
         // the leg that makes the 401 a guard rather than a missing route.
@@ -794,6 +817,19 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{auth:?}");
+            // The body is what makes this the handler's answer rather than an unrouted path's
+            // (both are `404`): the absence keeps this crate's error shape.
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let text = String::from_utf8(body.to_vec()).expect("utf8");
+            assert!(
+                text.contains(r#""error""#) && text.contains("metrics are not attached"),
+                "the absence keeps this crate's error shape: {text}"
+            );
         }
         let (shared, _rx) = shared(Auth::Tcp);
         let token = shared.state.token.expose_secret().as_str().to_owned();
@@ -877,6 +913,16 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // The contract's `202` body, not just the status: the drain the CLI reports is this
+        // string.
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"draining\""), "{text}");
         rx.changed().await.expect("the channel flips");
         assert!(*rx.borrow());
     }
@@ -917,6 +963,18 @@ mod tests {
         assert!(
             text.contains("/openapi.json"),
             "the route answers the document: {text}"
+        );
+        // The middle rule: a loopback bind opens `/metrics` and nothing else, and the schema is
+        // not a scrape — it needs the token there, exactly as it does on a reachable bind.
+        let (loopback, _rx) = shared(Auth::Loopback);
+        let untokened = router(loopback)
+            .oneshot(get("/openapi.json", None))
+            .await
+            .expect("response");
+        assert_eq!(
+            untokened.status(),
+            StatusCode::UNAUTHORIZED,
+            "/openapi.json"
         );
         let (remote, _rx) = shared(Auth::Tcp);
         let token = remote.state.token.expose_secret().as_str().to_owned();

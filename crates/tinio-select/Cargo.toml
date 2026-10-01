@@ -37,10 +37,6 @@ criterion.workspace = true
 name = "select_scan"
 harness = false
 
-[[test]]
-name = "parquet"
-required-features = ["parquet"]
-
 [features]
 default = []
 parquet = ["dep:parquet", "dep:arrow", "dep:bytes", "dep:time"]

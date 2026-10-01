@@ -7,7 +7,12 @@
 
 #![cfg(target_os = "windows")]
 
-mod common;
+// **The harness is the library's now** (`tinio_sandbox_windows::testing`), and
+// this binary keeps its own top-level `child_role` and `launcher_role` shims —
+// the names the harness spawns here, because the lib linked into an integration
+// target is compiled without `cfg(test)`
+// (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
+use tinio_sandbox_windows::testing as common;
 
 use std::{
     env, fs,

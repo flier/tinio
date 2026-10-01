@@ -9,17 +9,53 @@
 //! `backend::exposures::tests::…`, and a rename is not a move. What the split
 //! had to widen, and why it stopped at `pub(in crate::backend)`, is stated once in `mod.rs`'s
 //! module doc.
+//!
+//! **The two suites that drive `Backend::confine` end to end moved in here on
+//! 2026-10-01** (`tests/network.rs`'s five legs and `tests/profile.rs`'s two;
+//! `docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`): the subject of
+//! each is this backend's composition — the ACLs it grants, the profile window it
+//! holds, the capability list it builds — and `docs/tests.md`'s placement rule
+//! puts a unit test beside the function it exercises. Their harness is
+//! [`crate::testing`]'s, which became lib code for the same reason, and the child
+//! they launch is this binary's `testing::tests::child_role`.
+//!
+//! **The profile window's legs are the measured answer to one interleaving.** A
+//! second `CreateAppContainerProfile` for one name answers
+//! `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` with a null SID out-parameter, so
+//! the second launcher takes the first's profile over rather than creating a
+//! second one — and the first launcher's exit deletes it, because nothing
+//! distinguishes "I created it" from "I took it over". What that costs is exactly
+//! one interleaving: a `CreateProcessW` that lands between a peer's delete and
+//! its own completion fails `err=2 ERROR_FILE_NOT_FOUND` for a program that
+//! exists, which is a misdiagnosis an operator chases as a missing binary (the
+//! delete's own half, `a_peer_delete_waits_for_the_window_a_launch_holds`, is
+//! inline in `tinio_sandbox_windows::sid`). The two legs below are the launch's
+//! half, and the first of them is the strongest assertion of the pair.
+//!
+//! **Why those legs scope their reads to this run.** The recording device is
+//! process-wide and this binary now holds several launching legs, so
+//! `step="grant the ACLs"` or `step="CreateProcessW"` alone is also what a
+//! *neighbouring* leg's launch writes: a wait satisfied by a foreign launch would
+//! release the peer's delete before this launcher is inside its window, and a
+//! search for the first `CreateProcessW` in the buffer could read a foreign
+//! process's. Both reads are therefore scoped — the phase marker by this root's
+//! SID, the launch by coming after that marker — which is stricter than the
+//! unscoped originals, never looser.
 
 use std::{
-    fs,
+    env, fs,
+    io::Read as _,
+    net::{IpAddr, SocketAddr, TcpStream, UdpSocket},
     os::windows::fs::symlink_file,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    process::Command,
+    sync::{Arc, mpsc},
+    thread,
+    time::{Duration, Instant},
 };
 
 use tempfile::tempdir;
-use tinio_sandbox_core::{AccessMode, Error, Exposure, Sandbox};
+use tinio_sandbox_core::{AccessMode, Confinement, Error, Exposure, Sandbox, supervise};
 use tinio_util::testing::{assert_recorded_at, assert_recorded_below, assert_step};
 
 // `CallerSet` is the one policy item `super::*` does not carry — the parent
@@ -33,11 +69,16 @@ use super::{
     *,
 };
 // **The recording device is `testing`'s rather than this module's**: `capture` and
-// `recorder` used to be a copy here and a second, wider one in `tests/profile.rs`,
-// and that module's own doc states what the union folded together.
+// `recorder` used to be a copy here and a second, wider one in the file the
+// profile legs arrived from (`tests/profile.rs`, retired 2026-10-01), and the
+// definer's own doc states what the union folded together.
 use crate::{
-    acl::Target,
-    testing::{self, capture, recorder},
+    acl::{self, Target},
+    sid::{PackageSid, ProfileLock, package_name},
+    testing::{
+        self, Capture, capture, launch_confined, one_volume, recorder, run_confined,
+        run_confined_with, sid_for, tree,
+    },
 };
 
 /// A junction at `dir/name` pointing at `target`, or a failed test.
@@ -59,6 +100,22 @@ fn recorded<T>(body: impl FnOnce() -> T) -> (T, String) {
     };
     let logged = capture.text();
     (value, logged)
+}
+
+/// Whether `path` names `leaf` directly under `dir`.
+///
+/// The directory is compared by equality and the leaf by name, because the two
+/// halves of the assertion come from different places: the directory is the one
+/// `exposures` produces, while the leaf is a spelling the rule adds.
+fn is_the_file(dir: &Path, leaf: &str, path: &Path) -> bool {
+    path.parent() == Some(dir) && path.file_name().and_then(|name| name.to_str()) == Some(leaf)
+}
+
+/// Whether `path`'s final component is `leaf` — the comparison the tests that
+/// never touch the disk use, because `exposures` does not resolve anything and
+/// their paths are spelled rather than resolved.
+fn ends_with(path: &Path, leaf: &str) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(leaf)
 }
 
 /// Shared §7's rule — `error!` where a returned [`Error`] is built, with the
@@ -221,8 +278,8 @@ fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
 #[test]
 // `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
 // is deliberately neither `Send` nor `Sync` — the same allow, for the same
-// reason, as `tests/acl.rs`'s: this is shared ownership inside one thread, which
-// is what the code under test is given.
+// reason, as `src/acl.rs`'s tests module: this is shared ownership inside one
+// thread, which is what the code under test is given.
 #[allow(clippy::arc_with_non_send_sync)]
 fn a_standing_grant_is_not_an_info_event() {
     let _recorder = recorder();
@@ -237,6 +294,14 @@ fn a_standing_grant_is_not_an_info_event() {
     assert_recorded_below(&logged, tracing::Level::INFO);
 }
 
+/// **Decision 22's rule, as Ruling 78 reshaped it**: the program's own directory
+/// read-only, **and** the `*.dll` files directly beside the program read-only —
+/// not the other files, and not a subdirectory.
+///
+/// The files that must *not* appear are the rule rather than an afterthought: a
+/// directory holding a text file, and a subdirectory holding a DLL, is exactly the
+/// exposure whole-directory inheritance used to grant and this rule deliberately
+/// does not (Ruling 78 refused option D).
 #[test]
 fn the_executables_directory_is_exposed_read_only() {
     // Measured 2026-09-21: the image itself is opened with the launcher's
@@ -250,8 +315,141 @@ fn the_executables_directory_is_exposed_read_only() {
         .find(|e| e.host == Path::new(r"E:\build"))
         .expect("the executable's directory is exposed");
     assert_eq!(exe_dir.access, AccessMode::ReadOnly);
+
+    // The same rule on a real tree, where what lies beside the program decides
+    // what the exposure set holds: the program's directory, the sibling DLL, and
+    // neither a non-DLL sibling nor a DLL one level down.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let program_dir = dir.path().join("bin");
+    let nested = program_dir.join("nested");
+    fs::create_dir_all(&nested).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    fs::write(program_dir.join("app-local.dll"), b"x").expect("write a sibling");
+    fs::write(program_dir.join("notes.txt"), b"x").expect("write a non-DLL sibling");
+    fs::write(nested.join("nested.dll"), b"x").expect("write a nested DLL");
+    let program = fs::canonicalize(program_dir.join("serve.exe")).expect("canonical program");
+    let canonical_dir = fs::canonicalize(&program_dir).expect("canonical directory");
+
+    let sandbox = Sandbox::new().expose(dir.path().join("root"), AccessMode::ReadWrite);
+    let all = exposures(&sandbox, &program);
+
+    let entry = all
+        .iter()
+        .find(|exposure| exposure.host == canonical_dir)
+        .expect("the program's directory is exposed");
+    assert_eq!(
+        entry.access,
+        AccessMode::ReadOnly,
+        "the program's directory is exposed read-only: {all:?}"
+    );
+
+    let dll = all
+        .iter()
+        .find(|exposure| is_the_file(&canonical_dir, "app-local.dll", &exposure.host))
+        .expect("the sibling DLL is exposed");
+    assert_eq!(
+        dll.access,
+        AccessMode::ReadOnly,
+        "the sibling DLL is exposed read-only: {all:?}"
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|exposure| is_the_file(&canonical_dir, "app-local.dll", &exposure.host))
+            .count(),
+        1,
+        "the sibling DLL is exposed once: {all:?}"
+    );
+
+    assert!(
+        !all.iter()
+            .any(|exposure| is_the_file(&canonical_dir, "notes.txt", &exposure.host)),
+        "a non-DLL sibling is not exposed: {all:?}"
+    );
+    assert!(
+        !all.iter()
+            .any(|exposure| is_the_file(&nested, "nested.dll", &exposure.host)),
+        "a DLL below the program's directory is not exposed: {all:?}"
+    );
 }
 
+/// The program's directory is exposed even when it holds no DLL at all — the
+/// product's own `target/debug/examples` is 539 files and 0 DLLs — and a program
+/// whose directory does not exist is not a failure of the exposure set: the
+/// directory entry is still produced and the resolution that follows reports the
+/// missing path, which is what `confine`'s failed-launch test relies on
+/// (a directory that did not exist would fail before a single ACE was granted, and
+/// that test needs the ACLs on).
+#[test]
+fn a_program_directory_with_no_dll_adds_no_file_entry() {
+    // **A tree this test owns, so the count below is a fact about the fixture
+    // rather than about `E:\build`.** The count is the assertion here ("the
+    // served root and the program's directory, and no DLL entry"), and the only
+    // way it can be one is for the program's directory to be one this test
+    // filled — a fixed path would make the test depend on what happens to be
+    // beside `E:\build\serve.exe` on the host running it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let program_dir = dir.path().join("build");
+    fs::create_dir_all(&program_dir).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    let sandbox = Sandbox::new().expose(dir.path().join("srv"), AccessMode::ReadOnly);
+    let all = exposures(&sandbox, &program_dir.join("serve.exe"));
+    assert_eq!(
+        all.len(),
+        2,
+        "the served root and the program's directory, and no DLL entry: {all:?}"
+    );
+    assert!(
+        all.iter()
+            .any(|exposure| ends_with(&exposure.host, "build")),
+        "the program's directory is exposed whatever it holds: {all:?}"
+    );
+
+    let missing = exposures(&sandbox, Path::new("E:/nowhere/serve.exe"));
+    assert!(
+        missing
+            .iter()
+            .any(|exposure| ends_with(&exposure.host, "nowhere")),
+        "a program directory that does not exist is still exposed: {missing:?}"
+    );
+}
+
+/// The exposure set keeps every entry it produced before the rule changed — the
+/// caller's exposures with their own access mode, and the program's directory —
+/// and adds nothing but the DLLs beside it.
+#[test]
+fn every_entry_the_callers_set_carried_is_still_there() {
+    let sandbox = Sandbox::new()
+        .expose("E:/srv/tinio", AccessMode::ReadWrite)
+        .expose("E:/state", AccessMode::ReadWrite);
+    let all = exposures(&sandbox, Path::new("E:/build/serve.exe"));
+    assert!(
+        all.iter().any(|exposure| ends_with(&exposure.host, "tinio")
+            && exposure.access == AccessMode::ReadWrite),
+        "{all:?}"
+    );
+    assert!(
+        all.iter()
+            .any(|exposure| ends_with(&exposure.host, "state")),
+        "{all:?}"
+    );
+    let program_dir = all
+        .iter()
+        .find(|exposure| ends_with(&exposure.host, "build"))
+        .expect("the program's directory is exposed");
+    assert_eq!(program_dir.access, AccessMode::ReadOnly);
+}
+
+/// The public half of the production combination: a caller exposes the launcher's
+/// own directory through a **raw** path, and `canonical_exposures` keeps the
+/// caller's entry and its access, so the merge cannot narrow a path the caller
+/// wrote.
+///
+/// **The shape decision that follows the merge is asked of the private surface
+/// elsewhere in this module** (`a_caller_who_exposed_the_launchers_own_directory_keeps_it_inherited`
+/// carries `canonical_whitelist` and `shape_for`); what this test keeps is what it
+/// can reach from the two public pure helpers (`exposures`, `canonical_exposures`)
+/// on a real tree and a raw spelling, which is the input that private test's
+/// production combination starts from.
 #[test]
 fn the_callers_access_survives_the_executable_exposure() {
     // The program directory's entry is read-only and must never widen a path
@@ -261,6 +459,43 @@ fn the_callers_access_survives_the_executable_exposure() {
     let all = exposures(&sandbox, Path::new(r"E:\build\serve.exe"));
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].access, AccessMode::ReadWrite);
+
+    // The same rule on a real tree, where the raw spelling is a path the volume
+    // resolves rather than one that names nothing.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let program_dir = dir.path().join("bin");
+    fs::create_dir_all(&program_dir).expect("create the program's directory");
+    fs::write(program_dir.join("serve.exe"), b"not really an image").expect("write the program");
+    // The raw path is what the caller writes; a canonical one would hide the
+    // spelling question this test exists to keep in view.
+    let caller_exposed = program_dir.clone();
+    assert!(
+        !caller_exposed
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with(r"\\?\"),
+        "the caller's spelling is raw: {caller_exposed:?}"
+    );
+    let sandbox = Sandbox::new().expose(&caller_exposed, AccessMode::ReadWrite);
+    let program = program_dir.join("serve.exe");
+
+    let canonical_dir = fs::canonicalize(&program_dir).expect("the program's directory resolves");
+    let all =
+        canonical_exposures(exposures(&sandbox, &program)).expect("the entries resolve");
+    assert_eq!(
+        all.len(),
+        1,
+        "the caller's directory and the launcher's entry are one path: {all:?}"
+    );
+    assert_eq!(
+        all[0].host, canonical_dir,
+        "the granted spelling is the volume's: {all:?}"
+    );
+    assert_eq!(
+        all[0].access,
+        AccessMode::ReadWrite,
+        "the caller's access survives the merge: {all:?}"
+    );
 }
 
 /// **The sibling DLLs are listed and counted, and they are not resolved**: the
@@ -283,8 +518,44 @@ fn the_sibling_dlls_are_listed_and_counted_without_being_resolved() {
     let served = dir.path().join("srv");
     fs::create_dir_all(&served).expect("create the served root");
 
-    let sandbox = Sandbox::new().expose(&served, AccessMode::ReadOnly);
+    // **The pattern's own contract, ahead of the whitelist that reads it**: a
+    // directory with no DLL has no pattern to grant, and the one that has a DLL
+    // spells the pattern in its own directory — never the parent's, whose same
+    // `*.dll` leaf and suffix would name a set the grant never covers.
+    let bare = dir.path().join("bare");
+    fs::create_dir_all(&bare).expect("create a directory with no DLL");
+    fs::write(bare.join("serve.exe"), b"not really an image").expect("write the program");
+    fs::write(bare.join("notes.txt"), b"x").expect("write a non-DLL");
+    assert_eq!(
+        SiblingScan::scan(&bare).pattern(),
+        None,
+        "a directory with no DLL has no pattern to grant"
+    );
+
     let scan = SiblingScan::scan(&program_dir);
+    let pattern = scan.pattern().expect("a sibling makes a pattern");
+    assert_eq!(
+        pattern.file_name().and_then(|name| name.to_str()),
+        Some("*.dll")
+    );
+    // **The base is the assertion that matters**, and it is the one the first
+    // draft of this test missed: a pattern built in the *parent* has the same
+    // `*.dll` leaf and the same suffix, so only the base distinguishes the rule
+    // that grants the program's own siblings from one that grants its parent's
+    // (and misses the program's).
+    assert_eq!(
+        pattern.parent(),
+        Some(program_dir.as_path()),
+        "the pattern is built in the program's directory, not its parent: {pattern:?}"
+    );
+    assert_eq!(pattern, program_dir.join("*.dll"), "{pattern:?}");
+    assert_eq!(
+        SiblingScan::scan(&program_dir.join("never-created")).pattern(),
+        None,
+        "a directory that cannot be read has no pattern either"
+    );
+
+    let sandbox = Sandbox::new().expose(&served, AccessMode::ReadOnly);
     let whitelist = canonical_whitelist(&sandbox, Some(&scan)).expect("the whitelist resolves");
 
     // The grant's own set: the caller's root and the program's directory, both in
@@ -326,6 +597,27 @@ fn the_sibling_dlls_are_listed_and_counted_without_being_resolved() {
     assert!(
         !listed.contains(&format!("{} (read-only)", resolved_dll.display())),
         "and not the resolved spelling, which is what resolving it would have produced: {listed}"
+    );
+
+    // The enumerate side the pattern must agree with: the exposure set names
+    // exactly the DLL directly inside the directory, and the pattern is that same
+    // directory's — one level up would name a set the grant never covers.
+    let all = exposures(&sandbox, &program_dir.join("serve.exe"));
+    let enumerated = all
+        .iter()
+        .filter(|exposure| exposure.host.is_file())
+        .count();
+    assert_eq!(enumerated, 1, "one sibling DLL is exposed: {all:?}");
+    let base = pattern.parent().expect("the pattern has a directory");
+    assert!(
+        all.iter()
+            .all(|exposure| !exposure.host.is_file() || exposure.host.parent() == Some(base)),
+        "every enumerated sibling lies in the pattern's directory: {all:?}"
+    );
+    assert_eq!(
+        SiblingScan::scan(base).pattern(),
+        Some(pattern),
+        "the pattern is derived from that same directory"
     );
 }
 
@@ -530,6 +822,70 @@ fn the_program_directory_is_the_one_directory_that_does_not_propagate() {
     assert_eq!(shape_for(&CallerSet::empty(), own, None), Target::Directory);
 }
 
+/// **The three spec strings, pinned where no DACL is needed** (Ruling 85's
+/// division of labour): the caller's exposed directories keep `(OI)(CI)` — the
+/// inherited form whose whole purpose is that a file already inside them stays
+/// reachable — while the program's own directory and every file take the plain
+/// form. A launcher that sent the plain form to the caller's directories is the
+/// regression this pins, and it is invisible to any check that only reads whether
+/// a grant reported success.
+#[test]
+fn the_three_shapes_are_the_ones_the_launcher_grants() {
+    let sid = "S-1-15-2-1-2-3";
+
+    // The caller's exposures: inherited, so a pre-existing descendant of the
+    // served root or the report directory is reachable by the child (design §6).
+    assert_eq!(
+        acl::grant_spec(sid, Target::Directory, AccessMode::ReadWrite),
+        "*S-1-15-2-1-2-3:(OI)(CI)M"
+    );
+    assert_eq!(
+        acl::grant_spec(sid, Target::Directory, AccessMode::ReadOnly),
+        "*S-1-15-2-1-2-3:(OI)(CI)RX"
+    );
+
+    // The program's own directory: a directory, and deliberately no propagation.
+    assert_eq!(
+        acl::grant_spec(sid, Target::ProgramDirectory, AccessMode::ReadOnly),
+        "*S-1-15-2-1-2-3:RX"
+    );
+
+    // A file: the plain form, because the inheritance flags are a no-op on one.
+    assert_eq!(
+        acl::grant_spec(sid, Target::File, AccessMode::ReadOnly),
+        "*S-1-15-2-1-2-3:RX"
+    );
+    assert_eq!(
+        acl::grant_spec(sid, Target::File, AccessMode::ReadWrite),
+        "*S-1-15-2-1-2-3:M"
+    );
+}
+
+/// **The ordinary spelling is the caller's, and this is the assertion that keeps
+/// it so.** The variant a call site reaches for when it has a directory in hand
+/// must be the inherited one; decision 22's entry is the only site in this crate
+/// that spells the exception, and it is named after the decision. This pins the
+/// direction rather than the mechanism: a future rename that made the plain form
+/// the obvious spelling would fail here before it could silently narrow a caller's
+/// exposure.
+#[test]
+fn the_obvious_directory_spelling_is_the_one_that_propagates() {
+    assert_eq!(
+        acl::grant_spec("S-1-15-2-1-2-3", Target::Directory, AccessMode::ReadOnly),
+        "*S-1-15-2-1-2-3:(OI)(CI)RX",
+        "a caller with a directory in hand means the inherited shape"
+    );
+    assert_eq!(
+        acl::grant_spec(
+            "S-1-15-2-1-2-3",
+            Target::ProgramDirectory,
+            AccessMode::ReadOnly
+        ),
+        "*S-1-15-2-1-2-3:RX",
+        "and the exception is spelled out"
+    );
+}
+
 /// **A caller's exposed file is refused at launch, and this is the site that
 /// refuses it** (P7, Ruling 95): the caller's set is the only one that knows
 /// which entries are the caller's, so the refusal lives with the type that
@@ -573,8 +929,29 @@ fn a_caller_exposed_file_is_refused_rather_than_silently_dropped() {
     let sandbox = Sandbox::new().expose(&served, AccessMode::ReadOnly);
     // The granted set carries the launcher's file entry, and the whole of the
     // public path resolves it — no refusal fires for the launcher's own file.
-    let granted = canonical_exposures(exposures(&sandbox, &program_dir.join("serve.exe")))
-        .expect("the launcher's own file entries resolve");
+    // **Every entry `exposures` adds for a sibling `*.dll` is a file, and it
+    // never enters the caller's set**: `confine` grants it through
+    // `acl::Grants::apply_siblings`' one `*.dll` invocation, not through the
+    // per-path loop the caller's entries take — so a refusal that read the
+    // *granted* set would refuse the launcher's own launch, and the assertions
+    // below are the half of P7's distinction that says so.
+    let all = exposures(&sandbox, &program_dir.join("serve.exe"));
+    let launcher_file = all
+        .iter()
+        .find(|exposure| ends_with(&exposure.host, "app-local.dll"))
+        .expect("the sibling DLL is exposed");
+    assert!(
+        launcher_file.host.is_file(),
+        "the launcher's sibling entry really is a file: {launcher_file:?}"
+    );
+    let canonical_dll = fs::canonicalize(&launcher_file.host).expect("the sibling DLL resolves");
+    let granted = canonical_exposures(all).expect("the launcher's own file entries resolve");
+    assert!(
+        granted
+            .iter()
+            .any(|exposure| exposure.host == canonical_dll),
+        "the launcher's file entry survives into the granted set: {granted:?}"
+    );
     assert!(
         granted.iter().any(|exposure| exposure.host.is_file()),
         "the granted set carries the launcher's own file entry: {granted:?}"
@@ -876,4 +1253,628 @@ fn two_spellings_of_one_directory_collapse_to_one_exposure() {
         "the widest access survives"
     );
     assert_eq!(all[0].host, fs::canonicalize(&real).expect("canonical"));
+}
+
+/// The capability SID `Capability::InternetClient` resolves to.
+///
+/// Spelled here rather than read from the enum so the ACL this suite writes is
+/// an independent statement of which SID it expects the container to carry: a
+/// test that asked `Capability::sid()` for the value to put in the `icacls`
+/// argument would agree with a wrong constant.
+const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
+
+/// The address the baseline and both confined attempts use.
+///
+/// `1.1.1.1:53` is the default, and it was chosen for what a refusal would mean:
+/// it is a public resolver, so a successful TCP handshake is a real round trip
+/// to the internet rather than an artefact of a closed port on a reachable host.
+/// `TINIO_SANDBOX_TEST_TARGET` points the suite at whatever address a given host
+/// actually reaches.
+fn target() -> SocketAddr {
+    env::var("TINIO_SANDBOX_TEST_TARGET")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(|| "1.1.1.1:53".parse().expect("a literal"))
+}
+
+/// Whether an **unconfined** process on this host reaches `address`.
+///
+/// The baseline, and the only thing this suite knows about the machine rather
+/// than about the container. Five seconds is the confined child's own budget for
+/// the same attempt (the harness's `child_role_body`), so the two halves are
+/// comparable rather than one being more patient than the other.
+fn baseline(address: SocketAddr) -> bool {
+    TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_ok()
+}
+
+/// **The host's precondition, probed before anything is spawned — and the only
+/// place this suite's opt-out is decided.** Returns `false` when this machine
+/// cannot do what the measurement needs *and* the operator has deliberately said
+/// so; the test then returns without asserting anything about the product.
+///
+/// One capability of the **machine** is asked about: whether an ordinary process
+/// here can reach [`target`] at all. A host that cannot reach it unconfined
+/// cannot be told apart from a container that refused it, so every leg of this
+/// suite would assert nothing — which is why this is a precondition and not a
+/// printed note.
+///
+/// **The control is not reachable from here.** Whether `internetClient` makes
+/// the container reach the target is not a property of this machine; it is the
+/// finding, and it lives in the test below where it can fail.
+///
+/// **The assert-before-print order, the variable's name and the remedy in the
+/// message are [`testing::host_cannot`]'s**, so this suite, `tinio-server`'s
+/// Windows harness and P1's jail test cannot drift apart on any of the three.
+fn host_ready(target: SocketAddr) -> bool {
+    if baseline(target) {
+        return true;
+    }
+    let reason = format!("an unconfined process on this host cannot reach {target}");
+    testing::host_cannot(
+        "the network suite",
+        &reason,
+        ", or set TINIO_SANDBOX_TEST_TARGET to an address this host reaches (design §7)",
+    );
+    false
+}
+
+/// What the confined child reports about reaching out.
+///
+/// The target travels in the probe file the child already reads, so nothing about
+/// this run goes through the environment — the rule every confined role in this
+/// crate follows (design decision 17), and the reason `Tree::target` exists.
+///
+/// **A launch that fails panics inside the harness with the backend's own
+/// error**, which is Task 9's rule: a test whose subject never started has
+/// nothing to report, and a value it could return `None` on would make "the
+/// backend refused to confine anything" look green.
+fn confined_outbound(volume: &Path, options: Options, target: SocketAddr) -> String {
+    let (_dir, mut tree) = tree(volume);
+    tree.target = Some(target);
+    // The harness's run, and it is the one whose body this function used to
+    // spell: the child probes and reports before it accepts, so the harness's
+    // `answer` both waits for it and proves inbound still works — with the
+    // connect and the read bounded by `crate::testing::TIMEOUT`, which a block
+    // spelling the same four lines without the timeout is the hazard Task 6 paid
+    // for. Its `supervise` joins the relay and reaps the child, so a caller's
+    // assertion that fails still leaves no process behind.
+    run_confined_with(&tree, AccessMode::ReadWrite, options).report
+}
+
+/// The outbound guarantee: an address this host reaches is refused inside.
+///
+/// **The baseline passed or this test did not run**, so the refusal read out of
+/// the child's own report is the container's policy rather than a missing route,
+/// and the loopback round trip the harness's `answer` performed proves the
+/// confinement left inbound alone — the other half of §7's rule, and the reason a
+/// refusal cannot be explained by a child that never started.
+///
+/// **A failure here is a design finding, not a broken test.** An AppContainer
+/// with an empty capability set that reaches an address this host reaches
+/// unconfined falsifies §7's Windows row, and the row is what would change.
+#[test]
+fn an_address_that_works_outside_is_refused_inside() {
+    let target = target();
+    if !host_ready(target) {
+        return;
+    }
+    let volume = one_volume();
+    let report = confined_outbound(&volume, Options::default(), target);
+    assert!(
+        report.contains("outbound: refused"),
+        "the container reached {target} with no capability, which §7's Windows row says it \
+         cannot: {report}"
+    );
+}
+
+/// The positive control: the same address, with `internetClient` granted.
+///
+/// **This asserts, and it is the assertion that found the capability defect.** It
+/// is the only measurement here that tells "the container's capability list was
+/// read from `Options` and honoured" from "it was silently emptied" — the two are
+/// indistinguishable from every other observable in the suite, because a
+/// container with no capabilities at all behaves exactly like one whose
+/// configured list was dropped. The pair of tests either side of it is what makes
+/// each of them mean something: same host, same address, same child, one
+/// capability between them.
+///
+/// **A failure here is a finding, never a flake.** It says the container did not
+/// reach an address this host reaches unconfined with `internetClient` granted.
+/// On 2026-09-22 it failed for exactly that reason and the cause was in this
+/// crate rather than on the host: the capability SIDs were handed to
+/// `CreateProcessW` with no attribute set, so the capability sat in the child's
+/// token and was honoured by nothing. If it fails again, the two candidates are
+/// that regression and a host whose own policy refuses the container's traffic —
+/// and [`a_granted_capability_is_enabled_in_the_container`] is what tells the two
+/// apart, because it does not touch the network.
+#[test]
+fn the_same_address_is_reached_with_internet_client() {
+    let target = target();
+    if !host_ready(target) {
+        return;
+    }
+    let volume = one_volume();
+    let options = Options {
+        capabilities: vec![Capability::InternetClient],
+        ..Default::default()
+    };
+    let report = confined_outbound(&volume, options, target);
+    eprintln!(
+        "measured: with internetClient the confined child reported `{}`",
+        report.lines().last().unwrap_or_default()
+    );
+    assert!(
+        report.contains("outbound: SUCCEEDED"),
+        "the container did not reach {target} with internetClient granted, while this host \
+         reaches it unconfined: {report}"
+    );
+}
+
+/// A capability that is not `internetClient` does not open the internet.
+///
+/// The third arm, and the one that makes the control's reading a *policy* rather
+/// than a coincidence: `privateNetworkClientServer` is the capability §7 says a
+/// non-loopback bind needs, so it is a non-empty list that must not reach a
+/// public resolver. Together with the test above it separates three outcomes a
+/// single capability would confound: a list that is read and honoured per
+/// capability, a list that is emptied, and a container that opens the network
+/// whenever any capability is present.
+#[test]
+fn a_capability_that_is_not_internet_does_not_open_the_network() {
+    let target = target();
+    if !host_ready(target) {
+        return;
+    }
+    let volume = one_volume();
+    let options = Options {
+        capabilities: vec![Capability::PrivateNetworkClientServer],
+        ..Default::default()
+    };
+    let report = confined_outbound(&volume, options, target);
+    assert!(
+        report.contains("outbound: refused"),
+        "the container reached {target} with privateNetworkClientServer and no internetClient, \
+         so a non-empty capability list is what granted it rather than the name of the \
+         capability: {report}"
+    );
+}
+
+/// The same question asked of an ACL instead of a socket.
+///
+/// **This is Task 9's carry, and the reason it is asked twice.** Its report
+/// records that `a_capability_from_the_options_reaches_the_container` — deleted
+/// by the 2026-10-01 cleanup, its capability arm now
+/// `tests/confine.rs`'s `the_whitelist_refuses_a_path_outside_the_exposures` —
+/// could not distinguish "the container's list was read from `Options`" from "it
+/// was silently emptied", that no observable in its own suite could, and that the
+/// network probe is the only measurement that can. That is true of the *network*
+/// arm above — and a network arm is exactly what a locked-down host takes away,
+/// since a host that refuses the container every destination reports the same
+/// refusal whatever its capabilities are.
+///
+/// A capability SID is also a token SID an access check consults, so granting one
+/// read on a directory and asking the child to read through it is the same
+/// question with no network in the way: the child reads the file if and only if
+/// the SID is in its token **and enabled**. Measured 2026-09-22, the second half
+/// of that is not free — with `Attributes: 0` the ACE granted nothing, and this
+/// leg is what makes a regression there fail on every host rather than only on
+/// the ones whose outbound happens to work.
+#[test]
+fn a_granted_capability_is_enabled_in_the_container() {
+    let volume = one_volume();
+    let granted = capability_is_visible(&volume, vec![Capability::InternetClient]);
+    let absent = capability_is_visible(&volume, Vec::new());
+    eprintln!(
+        "measured: the {INTERNET_CLIENT_SID} ACE was readable with internetClient={granted}, \
+         with no capability={absent}"
+    );
+    assert!(
+        granted,
+        "a directory whose ACL grants {INTERNET_CLIENT_SID} read was not readable by a container \
+         the operator granted internetClient, so either the list did not reach the container's \
+         token or it reached it disabled (a capability whose entry is not SE_GROUP_ENABLED is \
+         honoured by nothing)"
+    );
+    assert!(
+        !absent,
+        "a directory whose ACL grants {INTERNET_CLIENT_SID} read was readable by a container with \
+         no capability at all, so this ACE says nothing about the list"
+    );
+}
+
+/// Whether the confined child reads the `denied` file when `denied` carries an
+/// ACE for the `internetClient` capability SID.
+///
+/// The harness's own tree is reused rather than a new one added: `denied` is the
+/// directory the child already tries to read and reports on, it already carries
+/// `Users` (so a pass cannot be an inherited ACE nobody meant), and the grant is
+/// the suite's own `icacls` call — the launcher never writes a capability ACE,
+/// which is the same rule that keeps the confined child out of `icacls` (design
+/// decisions 15 and 17).
+fn capability_is_visible(volume: &Path, capabilities: Vec<Capability>) -> bool {
+    let (_dir, tree) = tree(volume);
+    let granted = Command::new(acl::icacls_binary())
+        .arg(&tree.denied)
+        .args(["/grant", &format!("*{INTERNET_CLIENT_SID}:(OI)(CI)R"), "/q"])
+        .output()
+        .expect("grant the capability SID");
+    assert!(
+        granted.status.success(),
+        "icacls could not grant {INTERNET_CLIENT_SID} on {}: {}",
+        tree.denied.display(),
+        String::from_utf8_lossy(&granted.stderr).trim()
+    );
+    run_confined_with(
+        &tree,
+        AccessMode::ReadWrite,
+        Options {
+            capabilities,
+            ..Default::default()
+        },
+    )
+    .report
+    .contains("denied-read: READ")
+}
+
+/// The address this host would use to reach the network, when nothing says
+/// otherwise.
+///
+/// **Discovered rather than configured, so the LAN leg below cannot pass by
+/// doing nothing.** A `UdpSocket` connected to the suite's own target performs a
+/// route lookup and nothing else — no packet is sent, no name is resolved — and
+/// the address it reports is this host's own source address on the interface that
+/// route selects. On a host with no route there is no answer, and the leg reports
+/// that rather than a pass.
+///
+/// `TINIO_SANDBOX_TEST_LAN_ADDR` overrides the **interface only**; the port comes
+/// from the listener the suite binds, so two runs cannot collide on a fixed one.
+fn lan_ip() -> Option<IpAddr> {
+    if let Ok(raw) = env::var("TINIO_SANDBOX_TEST_LAN_ADDR") {
+        if let Ok(address) = raw.parse::<SocketAddr>() {
+            return Some(address.ip());
+        }
+        if let Ok(ip) = raw.parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).ok()?;
+    socket.connect(target()).ok()?;
+    let local = socket.local_addr().ok()?;
+    let ip = local.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+/// The LAN question decision 16 leaves open, recorded and never asserted.
+///
+/// **What is measured is narrower than "the LAN", and saying so is the point.**
+/// The connection below is made by this same host to this host's own interface
+/// address; it travels the local stack rather than a cable. It establishes
+/// whether the container's policy gates a connection addressed to a non-loopback
+/// interface **at all** — and it established on 2026-09-22 that it does not: a
+/// container with no capability at all answered on `192.168.1.10`. What it
+/// cannot establish is whether a client on another machine gets through, because
+/// that is a different packet arriving on the same interface from off the host,
+/// and a second machine is what would settle it. Nothing in the design depends on
+/// the answer (decision 16, §7's Windows note), which is why this leg records
+/// rather than asserts.
+///
+/// **It is run for real rather than behind an unset variable.** A leg that
+/// returned early when nobody configured it would report nothing at all, which is
+/// the shape this suite exists to avoid; the interface is discovered when nothing
+/// overrides it, and a host with no route fails with that reason named.
+///
+/// The two arms differ only in `privateNetworkClientServer`, which §7 says a
+/// non-loopback bind needs: if the answer is ever "refused without it, answered
+/// with it", that sentence is confirmed rather than asserted.
+#[test]
+fn the_lan_answer_is_recorded() {
+    let Some(ip) = lan_ip() else {
+        let reason = "this host has no non-loopback route to the suite's target, so there is no \
+                      LAN interface to measure against";
+        testing::host_cannot(
+            "the LAN leg",
+            reason,
+            ", or set TINIO_SANDBOX_TEST_LAN_ADDR=<ip> to name the interface",
+        );
+        return;
+    };
+    let volume = one_volume();
+    for (label, capabilities) in [
+        ("no capability", Vec::new()),
+        (
+            "privateNetworkClientServer",
+            vec![Capability::PrivateNetworkClientServer],
+        ),
+    ] {
+        let (_dir, tree) = tree(&volume);
+        // The port is the wildcard bind's, so the address that reaches it is this
+        // host's own interface on the same port.
+        let bind = SocketAddr::from(([0, 0, 0, 0], 0));
+        let (confinement, bound, _slot) = launch_confined(
+            &tree,
+            AccessMode::ReadWrite,
+            Options {
+                capabilities,
+                ..Default::default()
+            },
+            Some(bind),
+        );
+        let Confinement::Supervise(child) = confinement else {
+            panic!("the Windows backend must launch a child");
+        };
+        let lan = SocketAddr::new(ip, bound.port());
+        let reached = match TcpStream::connect_timeout(&lan, Duration::from_secs(5)) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("bound the read");
+                let mut pong = [0u8; 4];
+                Some(stream.read_exact(&mut pong).is_ok() && &pong == b"pong")
+            }
+            Err(_) => None,
+        };
+        eprintln!(
+            "recorded: [{label}] the container bound {bound}; a same-host connection to {lan} {}",
+            match reached {
+                Some(true) => "was answered by the confined child",
+                Some(false) => "connected but the confined child said something else",
+                None => "was refused, so the container did not answer on that interface",
+            }
+        );
+        // **Every spawn is waited for or killed on every path** (Task 11's rule).
+        // A connection that was answered was also the child's `accept`, so it is
+        // on its way out and can be waited for; one that was not leaves it blocked
+        // in `accept` for a caller that is never coming, and dropping the
+        // supervision is what ends it — the `Child`'s closure drops with it,
+        // closing the job handle and taking the child with it (decision 20), and
+        // the `Grants` guard leaves the ACE standing on the same path (design
+        // decision 15 — the leg that asserted both halves, `tests/confine.rs`'s
+        // `a_dropped_supervision_leaves_the_grant_standing_and_takes_the_child`,
+        // was deleted by the 2026-10-01 cleanup: a standing grant after a failed
+        // launch is now `tests/confine.rs`'s
+        // `a_failed_launch_leaves_the_standing_grants_and_drops_the_profile`, and
+        // the child's fate on a launcher's death is `confinement.feature`'s "The
+        // launcher's death takes the confined child"). `_slot` is the harness's
+        // process-wide launch slot, held for as long as this iteration's child
+        // lives.
+        if reached == Some(true) {
+            let mut child = child;
+            supervise(&mut child, || ()).expect("supervise the confined child");
+        } else {
+            drop(child);
+        }
+    }
+}
+
+/// **The launch's half of the window, asserted for a delete aimed at the ACL
+/// phase** — the interval the window exists for, and the one the deferral leg
+/// (now inline in `tinio_sandbox_windows::sid`) cannot see because that test
+/// holds the lock by hand.
+///
+/// The property is the ordering such a delete is forced into: the launcher's
+/// `CreateProcessW` for the child is written **before** the peer's
+/// `DeleteAppContainerProfile`, because the delete waited for the window.
+///
+/// **What this covers, and what it does not, in this file's own words.**
+/// Covered: the window never taken (`window: None`) or acquired after the ACL
+/// phase — the delete aimed at the phase lands between the launcher's derive and
+/// its `CreateProcessW`, the launch fails `err=2 ERROR_FILE_NOT_FOUND` for a
+/// program that exists (the measurement this whole finding is about), and the
+/// harness's `expect("the Windows backend must confine the sandbox it was
+/// given")` panics on the launch before the ordering is ever read. **Not
+/// covered: the interval after the ACL phase ends and before `CreateProcessW`
+/// is called** — a window given up *there* leaves this test green, because
+/// nothing remains in the launcher's path but a handle list and an attribute
+/// buffer, which is faster than the peer's own delete round trip (measured on
+/// this host 2026-09-27: releasing the window at the top of
+/// `spawn_supervised_child` leaves both launch-side tests green,
+/// load-dependently). Closing that interval needs the lock's state observable
+/// from outside — a non-blocking probe, i.e. new public API for a test — or an
+/// event at the release, which is log noise on every launch; so it is stated
+/// here rather than implied by this test's name.
+///
+/// **Both reads are scoped to this run**, which the move into this binary made
+/// necessary and which is stricter than the unscoped original: the phase wait is
+/// the marker carrying *this* root's SID (a neighbouring leg's launch writes the
+/// same marker), and the launch is the first `CreateProcessW` *after* that
+/// marker. The harness's process-wide launch slot is what makes the second read
+/// sound — while this launcher is inside its window no other launch can be — and
+/// the first is what keeps a foreign window from releasing the peer early.
+///
+/// The served root carries [`SEEDED_FILES`] small files so the ACL phase — the
+/// window's width, and the only thing standing between the peer's signal and
+/// `CreateProcessW` — is wide enough for a delete that is *not* deferred to land
+/// inside it.
+#[test]
+fn a_confined_launch_holds_the_window_across_its_acl_phase() {
+    /// Enough objects under the served root that the grant takes tens of
+    /// milliseconds after the phase announces itself.
+    const SEEDED_FILES: usize = 500;
+
+    let _recorder = recorder();
+    let volume = one_volume();
+    let (_dir, tree) = tree(&volume);
+    let name = package_name(&tree.root);
+    for index in 0..SEEDED_FILES {
+        fs::write(tree.root.join(format!("seed-{index}.txt")), b"seed").expect("seed the root");
+    }
+
+    let capture = capture();
+    let _recording = capture.record_every_thread();
+    let (derived_tx, derived_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let peer_name = name.clone();
+    let peer = thread::spawn(move || {
+        // A second launcher's value for the same root, held until this root's
+        // launch is inside its window and then dropped: that drop is the exit
+        // whose delete the window exists to keep out of the launch.
+        //
+        // **Derived before the launcher starts, and that ordering is the
+        // test's, not the lock's.** `PackageSid::derive` is a bare
+        // `CreateAppContainerProfile`: two *concurrent* creations of one name
+        // race inside userenv, and a run of this test caught it —
+        // `CreateAppContainerProfile: hr=0x80070003` (`ERROR_PATH_NOT_FOUND`,
+        // the profile's `Packages` directory being made and unmade at once).
+        // Production cannot hit it, because every launcher's derive is inside
+        // the window and a peer's delete is too; this test's peer derives
+        // outside the window on purpose, so it waits for the value to exist
+        // before the launcher that shares the name takes it over.
+        let sid = PackageSid::derive(&peer_name).expect("the peer's value");
+        // **The rendered SID travels back, and it is the phase wait's scope**:
+        // the profile is a function of this root's name, so the SID every
+        // `grant the ACLs` line of *this* tree's launch carries is this one, and
+        // a neighbouring leg's launch carries another. The value itself stays
+        // held here — sending the text does not drop the profile.
+        derived_tx.send(sid.as_str().to_owned()).expect("the peer's value exists");
+        go_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the launcher's window opens");
+        drop(sid);
+        dropped_tx.send(()).expect("the peer reports its exit");
+    });
+    let sid_text = derived_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the peer derived its value");
+
+    // This run's own window, and not a neighbour's: see the test's doc. **The
+    // quotes belong to the rendering, not to this marker**: `grant_whitelist`
+    // records the SID from a `&str`, so the subscriber writes
+    // `sid="S-1-15-2-…"` — the measured rule `windows_e2e_harness::field`
+    // trims for (2026-09-24), and a marker without them matches no line at all.
+    let phase = format!("{PHASE_MARKER} sid=\"{sid_text}\"");
+    let run = thread::scope(|scope| {
+        let launcher = scope.spawn(|| run_confined(&tree, AccessMode::ReadWrite));
+        // The event the phase announces itself with is emitted *inside* the
+        // window — after the derive, before the first grant — so waiting for
+        // it is what turns the launcher's window into a signal rather than a
+        // guess.
+        wait_for(&capture, &phase, Duration::from_secs(60));
+        go_tx.send(()).expect("the peer may drop");
+        launcher.join().expect("the launcher thread")
+    });
+
+    assert_eq!(
+        run.status, 0,
+        "the confined child did not finish: {}",
+        run.report
+    );
+    dropped_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the peer's delete ran");
+    peer.join().expect("the peer thread");
+
+    let logged = capture.text();
+    // **Two deletes for this name and not one, which is what makes the ordering
+    // below about the peer's rather than the launcher's own.** `Grants` keeps the
+    // `Arc<PackageSid>` alive until `confine` returns — after the child — so this
+    // root's launcher deletes the same name once the run is over, and a search
+    // for *a* delete event would be satisfied by that one even if the peer's had
+    // never happened. The first of the two is the peer's (it drops right after
+    // the window opens; the launcher's comes after the child exits), and both
+    // must be present for the ordering to mean anything.
+    let deletes: Vec<usize> = logged
+        .match_indices(&format!("step=\"DeleteAppContainerProfile\" name={name}"))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        deletes.len(),
+        2,
+        "this root's two deletes — the peer's and the launcher's own, after the \
+         child — are both in the buffer, and a test with only one of them would \
+         assert an ordering the missing delete never entered: {deletes:?}\n{logged}"
+    );
+    // **The launch's own `CreateProcessW` and not the buffer's first one**: the
+    // recording is process-wide and this binary holds several launching legs, so
+    // an earlier line could belong to a neighbour. This run's launch is the first
+    // one after *this run's* phase, which the harness's launch slot keeps
+    // unambiguous — no other launch can be in flight while this one holds it.
+    let opened = logged
+        .find(&phase)
+        .expect("this run's grant phase is in the buffer it was waited on");
+    let launched = opened
+        + logged[opened..]
+            .find("step=\"CreateProcessW\"")
+            .expect("the launch was logged");
+    assert!(
+        launched < deletes[0],
+        "the peer's delete must wait for this root's launch, so the launcher's \
+         CreateProcessW precedes it: launched at {launched}, first delete at \
+         {}\n{logged}",
+        deletes[0]
+    );
+}
+
+/// **The window opens before the launch touches the tree**, which is the half a
+/// revert inside `prepare_launch` would lose: while a peer holds this root's
+/// lock, a `confine` may not have written a single ACE.
+///
+/// The observation is the served root's DACL, and that is what makes this
+/// deterministic where a timing test would not be: the ACL phase is the first
+/// thing `confine` does to the operator's tree after the derive, so "the ACE is
+/// still absent after the launcher has started" is exactly "the launcher is
+/// parked at the window" — a revert that takes the lock later, or not at all,
+/// writes that ACE within milliseconds of starting and fails the assertion. The
+/// window is then released and the run is asserted to finish, so a launcher that
+/// never acquires is a failure here rather than a hang.
+#[test]
+fn a_confine_waits_for_the_window_before_it_touches_the_tree() {
+    let volume = one_volume();
+    let (_dir, tree) = tree(&volume);
+    let sid = sid_for(&tree);
+    let window = ProfileLock::acquire(&package_name(&tree.root)).expect("the per-root lock");
+    let (started_tx, started_rx) = mpsc::channel();
+    let run = thread::scope(|scope| {
+        let launcher = scope.spawn(|| {
+            started_tx.send(()).expect("the launcher starts");
+            run_confined(&tree, AccessMode::ReadWrite)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the launcher started");
+        // Long enough for a launcher that is *not* parked at the window to have
+        // reached the ACL phase — milliseconds away once nothing is in its way.
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !acl::has_ace(&tree.root, &sid).expect("read the DACL"),
+            "the launcher granted the served root while a peer held this root's \
+             window: the lock is taken before the ACL phase, or it is not taken \
+             at all — and the window's whole purpose is that phase"
+        );
+        drop(window);
+        launcher.join().expect("the launcher thread")
+    });
+    assert_eq!(
+        run.status, 0,
+        "the confined child did not finish: {}",
+        run.report
+    );
+}
+
+/// The phase's own `info!`, which `grant_whitelist` emits once per launch
+/// *before* the first grant: the mark of the window being open, since the derive
+/// has happened by then and `CreateProcessW` has not.
+///
+/// **Matched together with this root's own `sid=`, never alone**: the recording
+/// is process-wide and this binary holds several launching legs, so the bare step
+/// is also what a neighbouring launch writes — see
+/// [`a_confined_launch_holds_the_window_across_its_acl_phase`].
+const PHASE_MARKER: &str = "step=\"grant the ACLs\"";
+
+/// Wait until the recording carries `marker`, so that an event emitted inside a
+/// window becomes something a test can act on.
+///
+/// Polled rather than channelled because the writer is part of the subscriber and
+/// has one job — copy what it is given — and the buffer is already the ordered
+/// record the assertions read afterwards.
+fn wait_for(capture: &Capture, marker: &str, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    while !capture.peek().contains(marker) {
+        assert!(
+            Instant::now() < deadline,
+            "the recording never carried {marker:?}:\n{}",
+            capture.peek()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }

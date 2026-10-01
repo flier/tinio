@@ -1,7 +1,12 @@
-//! Spawn harness shared by the read-only and sandbox-channel `serve` legs.
+//! Spawn harness of the retired read-only and sandbox-channel `serve` legs —
+//! `Serve`, `Scratch`, `observed_mode`, and the helpers beside them.
 //!
-//! Two integration binaries include this file. A helper only one of them calls
-//! is still part of the harness, so dead-code is allowed here and nowhere else.
+//! One integration binary includes this file now (`sandbox_e2e.rs`, through
+//! `#[path]`) and it deliberately calls nothing from it: the include is what keeps
+//! the harness compiled, so an API change in it is a compile error here rather
+//! than rot nothing builds (`sandbox_e2e.rs`'s own comment states the choice). A
+//! helper no caller reaches is still part of the harness, so dead-code is allowed
+//! here and nowhere else.
 
 #![allow(dead_code)]
 

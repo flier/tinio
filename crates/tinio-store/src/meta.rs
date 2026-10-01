@@ -235,3 +235,202 @@ impl<'txn> table::Table<'txn, Def> {
         drain_pair(&mut self.0, (bucket, ""), |b, _| b == bucket)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        _core::object::Tags,
+        testutil::{etag, handle},
+    };
+
+    #[test]
+    fn object_meta_walk_self_heals_a_corrupt_etag_row() {
+        let h = handle();
+        let valid = Stored {
+            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+            size: 1,
+            mtime: 0,
+            file_identity: 0,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        };
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.put("data", &object::key("ok.txt").unwrap(), &valid)?;
+            // A corrupt-etag row (written by a stale writer) self-heals on
+            // the walk rather than failing it — the gating load's discipline.
+            t.insert(
+                ("data", "bad-etag"),
+                ("not-an-etag", 1u64, 0u64, 0u64, "", "", "", ""),
+            )
+            .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            let mut saw_valid = false;
+            let mut saw_corrupt = false;
+            t.for_bucket_gated("data", |key, stored| {
+                if &*key == "ok.txt" {
+                    saw_valid = true;
+                    assert!(stored.is_some());
+                } else if &*key == "bad-etag" {
+                    saw_corrupt = true;
+                    assert!(stored.is_none(), "corrupt etag row self-heals");
+                }
+                Ok(())
+            })?;
+            assert!(saw_valid && saw_corrupt);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn object_meta_tag_accessors_rewrite_only_the_element() {
+        let h = handle();
+        let key = object::key("a.txt").unwrap();
+        let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        let stored = Stored {
+            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+            size: 3,
+            mtime: 1,
+            file_identity: 2,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        };
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            // Missing row: no presence outcome, nothing created.
+            assert!(t.put_tags("data", &key, &tags)?.is_none());
+            assert!(t.clear_tags("data", &key)?.is_none());
+            t.put("data", &key, &stored)?;
+            // Set rewrites the tags element, the row's other elements ride.
+            assert_eq!(t.put_tags("data", &key, &tags)?, Some(true));
+            let got = t.get("data", &key)?.unwrap();
+            assert_eq!(got.tags, tags);
+            assert_eq!(got.size, 3);
+            assert_eq!(got.etag, stored.etag);
+            // Identical set: no write.
+            assert_eq!(t.put_tags("data", &key, &tags)?, Some(false));
+            // Clear: true once, then the already-empty no-write.
+            assert_eq!(t.clear_tags("data", &key)?, Some(true));
+            assert_eq!(t.clear_tags("data", &key)?, Some(false));
+            assert!(t.get("data", &key)?.unwrap().tags.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        // A corrupt tags wire self-heals on the read AND the put heals the
+        // row back to a clean wire (the row's etag stays valid throughout).
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.insert(
+                ("data", "a.txt"),
+                (
+                    "d41d8cd98f00b204e9800998ecf8427e",
+                    3u64,
+                    1u64,
+                    2u64,
+                    "garbage",
+                    "",
+                    "",
+                    "",
+                ),
+            )
+            .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert!(
+                Table::open_readonly(txn)?
+                    .get("data", &key)?
+                    .unwrap()
+                    .tags
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            assert_eq!(Table::open(txn)?.put_tags("data", &key, &tags)?, Some(true));
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let got = Table::open_readonly(txn)?.get("data", &key)?.unwrap();
+            assert_eq!(got.tags, tags, "the rewrite normalized the corrupt wire");
+            assert_eq!(got.size, 3, "the other elements survived the heal");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn object_meta_missing_get_absent_remove_and_drain_bucket() {
+        let h = handle();
+        let key = object::key("dir/a.txt").unwrap();
+        let stored = Stored {
+            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+            size: 11,
+            mtime: 0,
+            file_identity: 7,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        };
+        // The missing-row contract: an absent bucket or key answers None,
+        // and removing a row that does not exist is a no-op.
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            assert!(t.get("nope", &key)?.is_none());
+            assert!(t.get("data", &object::key("nope.txt").unwrap())?.is_none());
+            t.remove("nope", &key)?;
+            t.remove("data", &object::key("nope.txt").unwrap())?;
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.put("data", &key, &stored)?;
+            Ok(())
+        })
+        .unwrap();
+        // Remove deletes the row, and re-removing it (now absent) still
+        // answers Ok — idempotent.
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.remove("data", &key)?;
+            assert!(t.get("data", &key)?.is_none());
+            t.remove("data", &key)?;
+            assert!(t.get("data", &key)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+        // Drain removes every row of the bucket (its own txn: drain and
+        // insert in one txn trips a redb page-manager assertion).
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.put("data", &key, &stored)?;
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.drain_bucket("data")?;
+            assert!(t.get("data", &key)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert!(Table::open_readonly(txn)?.get("data", &key)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+}

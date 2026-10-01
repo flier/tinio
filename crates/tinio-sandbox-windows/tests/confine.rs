@@ -1,184 +1,191 @@
-//! End-to-end confinement: the whitelist, the loopback round trip through the
-//! inherited listener, and the standing grants on every exit path — on every
-//! volume the harness is pointed at.
+//! End-to-end confinement: the mechanism half of the confined-launch flow legs,
+//! plus the child role the other suites spawn.
 //!
-//! **The failure paths are as much this suite's subject as the clean one.** A
-//! grant that fails, a launch that fails with the ACLs already on, a supervision
-//! that is dropped instead of waited on, and a child that never reports: each is
-//! asserted by what it left behind — the child's probe file, the relay's answer,
-//! the standing ACE on the operator's directory — never by the absence of an
-//! error.
+//! **The flow halves moved on 2026-10-01, and each carrier is named beside the
+//! leg it left** (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`):
+//! the whitelist's loopback round trip, the containment of an escape and the
+//! standing grants are `crates/tinio-e2e/tests/features/confinement.feature`'s
+//! now ("A confined server completes a real S3 journey", "An escaping junction
+//! inside the root is refused as nonexistent", and every `the run was confined`
+//! scenario's `icacls` cross-check), with the standing ACE read again after the
+//! launcher's death by `crates/tinio-server/tests/sandbox_e2e_windows.rs`'s
+//! documented Rust leg; the read-only journey is that file's "A confined
+//! read-only server refuses the write and still serves the read"; the launcher's
+//! death taking its child is its "The launcher's death takes the confined
+//! child"; the ACL ledger is its "The ACL ledger records the grants this run
+//! made"; the capability set is its "A valid capability name is honoured" /
+//! "An unknown capability name fails the run", with the deleted capability leg's
+//! out-of-root refusal folded into the whitelist leg below; and the two per-`Grants` duplicate
+//! legs are folded into `tinio-sandbox-windows/src/acl.rs`'s
+//! `the_grant_refuses_a_path_it_cannot_open` and
+//! `a_satisfied_grant_is_not_written_twice`.
+//!
+//! **What stays is what no product surface can ask for.** A confined child's own
+//! attempt to reach a path no exposure covers is refused by the OS — the product
+//! never touches an out-of-root path, so no step can induce it — and the failed
+//! launch and the silent child are seams only the launcher itself presents. Each
+//! is asserted by what it left behind — the child's probe file, the relay's
+//! answer, the standing ACE on the operator's directory — never by the absence of
+//! an error.
 //!
 //! **`Grants` no longer takes anything back** (design decision 22's cost
 //! follow-up: one descriptor write on a directory propagates over its whole
-//! subtree, measured 10–20 s for this workspace's `target\debug`), so the
-//! assertions that used to read "the ACE is gone" now read "the ACE is still
-//! there, and that is the contract". What the guard still owns is the profile's
-//! lifetime.
+//! subtree, measured 10–20 s for this workspace's `target\debug`), so what the
+//! failed launch below asserts is the ACE that stays after it. What the guard
+//! still owns is the profile's lifetime.
+//!
+//! **These legs fail on this host, and that is the API's answer rather than the
+//! code's**: `CreateAppContainerProfile` refuses here with
+//! `hr=0x80070005` (`E_ACCESSDENIED`, measured 2026-10-01), so every leg that
+//! launches a confined child is red on this machine. No leg here skips — there is
+//! no precondition helper to take, and a host that cannot create the profile owes
+//! a red leg rather than a green one that asserted nothing (`docs/tests.md`'s
+//! fail-not-skip rule).
 
 #![cfg(target_os = "windows")]
-// `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
-// is deliberately neither `Send` nor `Sync`, which is what clippy's
-// `arc_with_non_send_sync` is about; this one is shared ownership inside one test
-// rather than an `Arc` meant to cross a thread boundary, which is what the code
-// under test is given. The same allow, for the same reason, is in `tests/acl.rs`.
-#![allow(clippy::arc_with_non_send_sync)]
 
-mod common;
+// **The harness is the library's now.** `tests/common/` was folded into
+// `tinio_sandbox_windows::testing` by the 2026-10-01 placement cleanup
+// (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`), because the
+// confined-launch legs it serves moved inline beside their subjects and a
+// `tests/` module cannot cross that boundary. The alias keeps every `common::`
+// call site below reading as it did, and this binary keeps its own top-level
+// `child_role` shim — the name the harness spawns here, because the lib linked
+// into an integration target is compiled without `cfg(test)`
+// (`tinio_sandbox_windows::testing::CHILD_ROLE`).
+use tinio_sandbox_windows::testing as common;
 
-use std::{
-    fs,
-    net::{TcpListener, TcpStream},
-    path::Path,
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fs, net::TcpListener};
 
 use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, LaunchPlan, Sandbox};
 use tinio_sandbox_windows::{
     Backend, Capability, Options,
-    acl::{self, Target},
-    ledger,
-    sid::{ALL_APPLICATION_PACKAGES, PackageSid},
+    acl,
+    sid::ALL_APPLICATION_PACKAGES,
 };
 
 /// The confined child. The body lives in the harness because the network and
 /// signal suites launch the same role from their own test binaries.
+///
+/// **Kept, and it cannot move**: it is the test *name* the harness's payload
+/// invokes in this binary (`tinio_sandbox_windows::testing::CHILD_ROLE`), so it
+/// is the spawn target itself rather than an assertion — a cucumber step spawns
+/// the product's binary, never this test binary.
 #[test]
 fn child_role() {
     common::child_role();
 }
 
+/// **The whitelist's other half, and the one no product surface can ask for**: a
+/// confined child is refused a read and a write on a path **outside every
+/// exposure** — the probe is the harness's `denied` sibling, which carries
+/// `Users` and no package-SID ACE (the verified row
+/// `tinio-sandbox-windows/src/process.rs`'s leg reproduces at the mechanism
+/// layer).
+///
+/// **The flow halves of the leg this replaces are carried elsewhere and were
+/// deleted with it** (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`):
+/// the loopback round trip is `confinement.feature`'s "A confined server
+/// completes a real S3 journey" (a signed S3 journey, strictly stronger than the
+/// bare handshake), the containment of an out-of-root object is that file's "An
+/// escaping junction inside the root is refused as nonexistent", and the standing
+/// ACEs are every `the run was confined` scenario's `icacls` cross-check plus
+/// `crates/tinio-server/tests/sandbox_e2e_windows.rs` (the ACE read while a run
+/// serves and again after a hard kill). What stays is the fact none of those
+/// reaches: the child's own attempt is refused **by the OS**, for read and for
+/// write. The read half also survives in
+/// `tinio-sandbox-windows/src/process.rs`'s
+/// `a_rust_binary_runs_inside_the_container_and_the_whitelist_holds`; the write
+/// half has this leg as its only home.
+///
+/// **On every volume the harness is pointed at**, because the refusal is the
+/// filesystem's own access check and this is the suite's one leg that loops the
+/// volumes `common::volumes` selects (the gate script's C: and E:).
+///
+/// The in-root lines are the controls: the child reached its probes at all
+/// (`granted-read: OK` — without it, a report that never got written would make
+/// the refusals below assertions about nothing) and it wrote its own root
+/// (`root-write: ALLOWED` — the positive the two refusals are read against).
+///
+/// **The same case runs once more with a capability in the token** — the
+/// assertion the deleted `a_capability_from_the_options_reaches_the_container`
+/// carried: a non-default `Options::capabilities` list must not widen the
+/// container past the whitelist.
 #[test]
-fn the_whitelist_holds_the_loopback_round_trip_and_the_standing_grants() {
+fn the_whitelist_refuses_a_path_outside_the_exposures() {
     for volume in common::volumes() {
         let (_dir, tree) = common::tree(&volume);
         let sid = common::sid_for(&tree);
         let run = common::run_confined(&tree, AccessMode::ReadWrite);
         assert_eq!(run.status, 0, "on {}: {}", volume.display(), run.report);
-        // The pre-existing file this reads was seeded before the grant: the
-        // functional half of design §6's inheritance answer (Task 4).
         assert!(
             run.report.contains("granted-read: OK"),
-            "on {}: {}",
-            volume.display(),
-            run.report
-        );
-        assert!(
-            run.report.contains("denied-read: refused"),
-            "on {}: {}",
-            volume.display(),
-            run.report
-        );
-        assert!(
-            run.report.contains("denied-write: refused"),
-            "on {}: {}",
+            "on {}: the child never reached its probes, so the refusals below would be \
+             assertions about nothing: {}",
             volume.display(),
             run.report
         );
         assert!(
             run.report.contains("root-write: ALLOWED"),
-            "on {}: {}",
+            "on {}: the exposed root is writable, so the refusals below are about the \
+             whitelist rather than about a child that can reach nothing: {}",
             volume.display(),
             run.report
         );
-        // **The grants are standing, so the launcher's exit leaves them on the
-        // operator's directories** — that is the contract now (the launcher
-        // performs no `icacls` on the way out at all), and it is also what makes a
-        // second run on this root free: the SID is root-derived, so the ACE the
-        // first run wrote is the one the second finds and skips. **`has_ace`
-        // refusing a path whose DACL cannot be read is what makes these assertions
-        // mean anything** (Task 4): as an oracle it would otherwise have reported
-        // "no entry" for a path nothing had looked at.
         assert!(
-            acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-            "on {}: the served root's grant is standing",
-            volume.display()
+            run.report.contains("denied-read: refused"),
+            "on {}: a path no exposure covers was readable by the confined child: {}",
+            volume.display(),
+            run.report
         );
         assert!(
-            acl::has_ace(&tree.report, &sid).expect("read the DACL"),
-            "on {}: the report directory's grant is standing too",
-            volume.display()
+            run.report.contains("denied-write: refused"),
+            "on {}: a path no exposure covers was writable by the confined child: {}",
+            volume.display(),
+            run.report
         );
-        // Clean up the operator's temp tree by hand: the crate no longer does it,
+        // **The same refusal with a capability in the token**, on its own tree so
+        // the line below is this run's and not the case above's (the report file
+        // is append-only). This is the assertion
+        // `a_capability_from_the_options_reaches_the_container` carried until the
+        // 2026-10-01 cleanup deleted the leg: a non-default `Options::capabilities`
+        // list must not widen the container past the whitelist. The list reaching
+        // the container's token at all is `backend::tests`' capability-SID legs
+        // (the leg's own doc named them as the only measurement that can tell a
+        // read list from an emptied one), and the "still confines" half is
+        // `confinement.feature`'s "A valid capability name is honoured".
+        let (_cap_dir, cap_tree) = common::tree(&volume);
+        let capped = common::run_confined_with(
+            &cap_tree,
+            AccessMode::ReadWrite,
+            Options {
+                capabilities: vec![Capability::InternetClient],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            capped.status,
+            0,
+            "on {}: {}",
+            volume.display(),
+            capped.report
+        );
+        assert!(
+            capped.report.contains("denied-read: refused"),
+            "on {}: a granted capability opened a path no exposure covers: {}",
+            volume.display(),
+            capped.report
+        );
+        let cap_sid = common::sid_for(&cap_tree);
+        acl::revoke(&cap_tree.root, &cap_sid).expect("take the capability tree's root grant back");
+        acl::revoke(&cap_tree.report, &cap_sid)
+            .expect("take the capability tree's report grant back");
+
+        // Clean up the operator's temp tree by hand: the crate does not do it,
         // and a residue in this suite's own temp tree is this suite's to take back.
         acl::revoke(&tree.root, &sid).expect("take the root's grant back");
         acl::revoke(&tree.report, &sid).expect("take the report's grant back");
     }
-}
-
-/// **Every path a run granted reaches the ledger, not only its root** — the state
-/// directory's case, driven end to end: the harness exposes the tree's report
-/// directory beside the served root, which is the same shape as a `TINIO_STATE_DIR`
-/// outside the root (one more caller exposure, granted read-write, standing).
-///
-/// It would fail with a ledger hook that recorded the root alone (finding 3 of the
-/// 2026-09-28 review): the report directory's ACE names this run's package SID and
-/// stands after the run, and an audit that listed only the root would not name it.
-/// The oracle is the operator's own file — `ledger::path()`, the crate's own
-/// spelling of `%LOCALAPPDATA%\tinio\acl-ledger.jsonl`, so neither half of that
-/// path is re-spelled here and a rename arrives as a leg that read the wrong file
-/// rather than as one that found none — and what is searched for is *this* run's
-/// line: the tree is a fresh temporary directory, so its spelling and the SID
-/// derived from it are unique to this leg.
-///
-/// **Only lines that parse are looked at**: a peer leg appending under the same
-/// lock may be mid-write while this reads, and what this leg asserts is a match
-/// rather than the file's every line (the unit tests pin the line's shape).
-#[test]
-fn a_run_records_every_path_it_granted_and_not_only_its_root() {
-    let (_dir, tree) = common::tree(&common::one_volume());
-    let sid = common::sid_for(&tree);
-    let run = common::run_confined(&tree, AccessMode::ReadWrite);
-    assert_eq!(run.status, 0, "{}", run.report);
-
-    let ledger = ledger::path().expect("LOCALAPPDATA is set");
-    let text = fs::read_to_string(&ledger)
-        .unwrap_or_else(|error| panic!("read {}: {error}", ledger.display()));
-    let recorded: Vec<serde_json::Value> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    let root = tree.root.display().to_string();
-    let report = tree.report.display().to_string();
-    let line = |path: &String, kind: &str| {
-        recorded.iter().find(|entry| {
-            entry["root"] == *path && entry["kind"] == kind && entry["sid"] == sid.as_str()
-        })
-    };
-    assert!(
-        line(&root, "served-root").is_some(),
-        "this run's served root is not in the ledger ({root}):\n{text}"
-    );
-    assert!(
-        line(&report, "exposure").is_some(),
-        "this run's second exposure ({report}) never reached the ledger, so an \
-         operator's audit of the standing ACEs it left is incomplete:\n{text}"
-    );
-
-    acl::revoke(&tree.root, &sid).expect("take the root's grant back");
-    acl::revoke(&tree.report, &sid).expect("take the report's grant back");
-}
-
-#[test]
-fn a_read_only_root_refuses_writes_and_still_reads() {
-    let volume = common::one_volume();
-    let (_dir, tree) = common::tree(&volume);
-    let sid = common::sid_for(&tree);
-    let run = common::run_confined(&tree, AccessMode::ReadOnly);
-    assert_eq!(run.status, 0, "{}", run.report);
-    assert!(run.report.contains("granted-read: OK"), "{}", run.report);
-    assert!(run.report.contains("root-write: refused"), "{}", run.report);
-    assert!(
-        !tree.root.join("written.txt").exists(),
-        "the read-only root refused the write in the report but not on the disk"
-    );
-    assert!(
-        acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-        "the read-only grant is standing like every other one"
-    );
-    acl::revoke(&tree.root, &sid).expect("take the grant back");
 }
 
 #[test]
@@ -188,13 +195,15 @@ fn a_failed_launch_leaves_the_standing_grants_and_drops_the_profile() {
     // the **profile** — the value that held it drops with the guard, and a launch
     // that never ran has no user for it.
     //
-    // **The seam is `Options::program`, and it has to name a file that exists**
-    // (ruling 21): `exposures()` adds the program's directory to the whitelist, so
-    // a path under a directory that does not exist fails `canonical_exposures`
-    // *before* a single ACE is granted — and the state this test is about, a launch
-    // that fails *with the ACLs already on*, would never be reached. A file that
-    // canonicalises and is not a runnable image is what makes `CreateProcessW` the
-    // failing step instead.
+    // **Kept, and no step can induce it.** The seam is `Options::program`, and it
+    // has to name a file that exists (ruling 21): `exposures()` adds the program's
+    // directory to the whitelist, so a path under a directory that does not exist
+    // fails `canonical_exposures` *before* a single ACE is granted — and the state
+    // this test is about, a launch that fails *with the ACLs already on*, would
+    // never be reached. A file that canonicalises and is not a runnable image is
+    // what makes `CreateProcessW` the failing step instead. The product surface
+    // cannot present that seam: the CLI's program is always the `tinio` binary,
+    // which is a runnable image, so `confinement.feature` has nothing to drive.
     let volume = common::one_volume();
     let (dir, tree) = common::tree(&volume);
     let sid = common::sid_for(&tree);
@@ -235,47 +244,6 @@ fn a_failed_launch_leaves_the_standing_grants_and_drops_the_profile() {
 }
 
 #[test]
-fn a_dropped_supervision_leaves_the_grant_standing_and_takes_the_child() {
-    // The guard's path: the caller never waits. **The ACEs stay** — that is the
-    // standing contract — and what the drop must still do is take the child with
-    // it, which is the half of this test that is about the job rather than the ACL.
-    let volume = common::one_volume();
-    let (_dir, tree) = common::tree(&volume);
-    let sid = common::sid_for(&tree);
-    let (confinement, address) =
-        common::launch_confined(&tree, AccessMode::ReadWrite, Options::default(), None);
-    assert!(
-        acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-        "the grant is on while it runs"
-    );
-    drop(confinement);
-    assert!(
-        acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-        "dropping the supervision took nothing back, which is the standing contract"
-    );
-    // **The child went with it, which is the half a caller walks away from.** The
-    // wait closure owns the job, so the drop closes it and kill-on-close terminates
-    // whatever it still holds (decision 20). The observable is the socket: the
-    // child inherited the listener and is now its only owner — the parent's copy
-    // went when the plan did — so a connection that stops being accepted is the
-    // fact that the child is gone. Bounded, because the termination is not
-    // instantaneous and a socket that is still there forever is the failure this
-    // assertion is about.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
-            Err(_) => break,
-            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-            Ok(_) => panic!(
-                "the confined child outlived the dropped supervision: {address} still accepts \
-                 connections, so the job did not take it"
-            ),
-        }
-    }
-    acl::revoke(&tree.root, &sid).expect("take the grant back");
-}
-
-#[test]
 fn a_child_that_reports_no_frame_leaves_the_relays_answer_empty() {
     // Decision 19's other half, and the half only the launcher can assert: the
     // parent is the sole witness to a child that died without reporting, and the
@@ -284,6 +252,11 @@ fn a_child_that_reports_no_frame_leaves_the_relays_answer_empty() {
     // frame at all, so what this asserts is that the child really ran (its report
     // is on the disk), that the relay recorded nothing, and that the grant is
     // standing after the wait — the wait no longer writes anything at all.
+    //
+    // **Kept, and no step can induce it.** It needs a child that answers the
+    // handshake and then emits no frame at all, which no product run presents:
+    // the CLI's child either frames readiness or leaves an `error` frame (P3's
+    // scenario), and a step layer cannot replace the child of a spawned binary.
     let volume = common::one_volume();
     let (_dir, tree) = common::tree(&volume);
     let sid = common::sid_for(&tree);
@@ -305,158 +278,4 @@ fn a_child_that_reports_no_frame_leaves_the_relays_answer_empty() {
         "the wait wrote nothing on the way out: the grant is standing"
     );
     acl::revoke(&tree.root, &sid).expect("take the grant back");
-}
-
-#[test]
-fn a_capability_from_the_options_reaches_the_container() {
-    // The composition builds the container's capability list from
-    // `Options::capabilities` through `CapabilitySids::resolve`, and this is the
-    // observable a test has of it: a non-default list still confines, and the
-    // child it launched really ran. What it cannot distinguish — and nothing here
-    // can, short of a network-policy probe that Task 12 owns — is a list that was
-    // read from one that was silently replaced by an empty one; the reading is
-    // pinned by the one line that builds `Container` and by `backend`'s unit
-    // tests on the default.
-    let volume = common::one_volume();
-    let (_dir, tree) = common::tree(&volume);
-    let sid = common::sid_for(&tree);
-    let options = Options {
-        capabilities: vec![Capability::InternetClient],
-        ..Default::default()
-    };
-    let run = common::run_confined_with(&tree, AccessMode::ReadWrite, options);
-
-    assert_eq!(run.status, 0, "{}", run.report);
-    assert!(
-        run.report.contains("denied-read: refused"),
-        "the whitelist holds with a capability as well: {}",
-        run.report
-    );
-    assert!(
-        acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-        "the capability list does not change the standing grant"
-    );
-    acl::revoke(&tree.root, &sid).expect("take the grant back");
-}
-
-#[test]
-fn a_grant_that_fails_leaves_the_earlier_ones_standing() {
-    // **The failure a test can drive here, and the reason it is not driven through
-    // `confine`.** `confine` canonicalises every exposure before it grants anything,
-    // so what reaches its loop are paths that resolve — and a resolved path this
-    // process may read is one a grant opens and writes. What is left is the guard:
-    // the object `confine` holds, and what dropping it does. It deletes the profile
-    // and takes **nothing** back, so the grant that landed before the failure is
-    // still there — the state a subsequent run on the same root finds and skips.
-    let (_dir, tree) = common::tree(&common::one_volume());
-    let sid = Arc::new(common::sid_for(&tree));
-    let mut grants = acl::Grants::new(Arc::clone(&sid));
-
-    grants
-        .apply(&tree.root, Target::Directory, AccessMode::ReadWrite)
-        .expect("the first grant lands");
-    assert!(
-        acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-        "the first grant is on the disk before the second is attempted"
-    );
-
-    let vanished = tree.report.join("vanished");
-    let err = grants
-        .apply(&vanished, Target::Directory, AccessMode::ReadWrite)
-        .expect_err("a grant on a path that does not exist fails");
-    // The step is the open's now — the grant opens the object before it reads or
-    // writes anything, which is what pins the ACE to the object the check approved
-    // — and the failure still names the path it was about.
-    assert!(err.to_string().contains("open the granted path"), "{err}");
-    assert!(err.to_string().contains("vanished"), "{err}");
-
-    drop(grants);
-    assert!(
-        acl::has_ace(&tree.root, &sid).expect("read the DACL"),
-        "the grant that landed before the failure is still there: nothing is taken back"
-    );
-    acl::revoke(&tree.root, &sid).expect("take the grant back");
-}
-
-#[test]
-fn a_second_grant_replaces_the_ace_instead_of_adding_one() {
-    // **Decision 21's takeover property, and the skip that now carries it.** A run
-    // after a hard kill derives the same package name, so it reuses the SID and the
-    // ACEs a crashed run left behind; a run on the same root a second time finds
-    // the grant already satisfied and writes **nothing at all** — a read, then a
-    // skip (`acl::Grants::apply`'s doc), which is what keeps this free. Either way
-    // the observable is `icacls`'s own rendering: one line per ACE, and never two.
-    let (_dir, tree) = common::tree(&common::one_volume());
-    let sid = Arc::new(common::sid_for(&tree));
-    let mut grants = acl::Grants::new(Arc::clone(&sid));
-
-    grants
-        .apply(&tree.root, Target::Directory, AccessMode::ReadWrite)
-        .expect("the first grant lands");
-    let after_first = ace_count(&tree.root, &sid);
-    assert_eq!(after_first, 1, "one grant, one ACE");
-
-    grants
-        .apply(&tree.root, Target::Directory, AccessMode::ReadWrite)
-        .expect("a second grant on the same path succeeds");
-    assert_eq!(
-        ace_count(&tree.root, &sid),
-        after_first,
-        "a second grant on one path added a second ACE, so a run that took over a crashed run's \
-         residue would leave two"
-    );
-
-    // Standing: the second call wrote nothing and the drop takes nothing back.
-    drop(grants);
-    assert_eq!(
-        ace_count(&tree.root, &sid),
-        1,
-        "the one ACE is still there and still single"
-    );
-    acl::revoke(&tree.root, &sid).expect("take the grant back");
-}
-
-#[test]
-fn a_wider_request_is_not_satisfied_by_a_narrower_ace() {
-    // **The skip is mask-aware, and this is the case that proves it.** The first
-    // grant is read-only, so a later read-write request must *not* be treated as
-    // already satisfied — a skip there would leave a confined child unable to write
-    // the directory the operator asked it to write. The observable is the tool's
-    // rendering: `(RX)` becomes `M` once the wider request has been written.
-    let (_dir, tree) = common::tree(&common::one_volume());
-    let sid = Arc::new(common::sid_for(&tree));
-    let mut grants = acl::Grants::new(Arc::clone(&sid));
-
-    grants
-        .apply(&tree.root, Target::Directory, AccessMode::ReadOnly)
-        .expect("the read-only grant lands");
-    assert!(
-        common::icacls(&tree.root, &[]).contains("(RX)"),
-        "the narrow grant is rendered as RX:\n{}",
-        common::icacls(&tree.root, &[])
-    );
-
-    grants
-        .apply(&tree.root, Target::Directory, AccessMode::ReadWrite)
-        .expect("the wider grant lands");
-    assert!(
-        common::icacls(&tree.root, &[]).contains("(M)"),
-        "a read-write request was not skipped as satisfied by the read-only entry:\n{}",
-        common::icacls(&tree.root, &[])
-    );
-    acl::revoke(&tree.root, &sid).expect("take the grant back");
-}
-
-/// How many ACEs `icacls` renders for `path` with `sid` in them.
-///
-/// The oracle is the tool's own rendering, which is where the design's evidence
-/// table came from, and it is the harness's [`common::icacls`]: its exit status is
-/// checked, so a count read from a refused invocation cannot be `0` for a path the
-/// tool could not read at all — which would make the "did not grow" assertion
-/// above pass for that reason rather than this one.
-fn ace_count(path: &Path, sid: &PackageSid) -> usize {
-    common::icacls(path, &[])
-        .lines()
-        .filter(|line| line.contains(sid.as_str()))
-        .count()
 }

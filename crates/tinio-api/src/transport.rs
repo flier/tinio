@@ -280,8 +280,8 @@ async fn serve_pipe(
 /// **One task per instance is what preserves the drain.** A stop observed while this task is
 /// *waiting* ends it; a stop observed while it is *serving* cannot, because the connection is not
 /// a branch of the `select!` — so the client that got in before the shutdown is still answered
-/// (`management.rs`'s leg with a connection open at the stop is the assertion), which is the same
-/// property the previous single-instance loop got from its `JoinSet`.
+/// ([`the_pipe_pool_serves_back_to_back_dials_with_no_gap`]'s open-at-stop half is the assertion),
+/// which is the same property the previous single-instance loop got from its `JoinSet`.
 ///
 /// **An instance whose drain did not see a clean close carries the previous connection's runtime
 /// state, and that is what the loop carries forward.** [`serve_pipe_connection`] answers with it,
@@ -2167,6 +2167,13 @@ mod tests {
     // plain blocking one, and an explicit import shadows a glob.
     #[cfg(feature = "tls")]
     use std::net::TcpStream;
+    // The std listener the unix plane legs hand over, under its own name: `UnixListener` alone is
+    // the tokio type through the glob below, and the two are not interchangeable.
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    // The pipe names the management legs bind are distinct per test, so the counter is here.
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicU32, Ordering};
     #[cfg(unix)]
     use std::time::Duration;
     // The pipe tests' own imports: the raw dial, the silent connection the drain is asserted
@@ -2174,7 +2181,8 @@ mod tests {
     // them.
     #[cfg(windows)]
     use std::time::Duration;
-    #[cfg(feature = "tls")]
+    // The plane legs' ready-probe and drain bounds, and the TLS stall leg's own reading: one
+    // import for all three, because the default graph has all three.
     use std::time::Instant;
     // No `Arc` here: the module's own import carries it in through `super::*`, and only the unix
     // and TLS legs of this module name it.
@@ -2189,12 +2197,14 @@ mod tests {
     use hyper::{Request, client::conn::http1};
     use secrecy::ExposeSecret;
     use tempfile::TempDir;
-    use tokio::sync::watch;
     #[cfg(unix)]
     use tokio::time::sleep;
     // The pipe tests' own import: the raw dial. Nothing else in this module names it.
     #[cfg(windows)]
     use tokio::{net::windows::named_pipe::ClientOptions, time::sleep};
+    // The plane legs' own two: the shutdown channel the CLI owns, the bounded drain that awaits
+    // the serving task, and the task handle `Running` holds.
+    use tokio::{sync::watch, task::JoinHandle, time::timeout};
 
     use super::*;
     // The drain test's recording device, named here rather than at its two use sites: this crate
@@ -2202,15 +2212,19 @@ mod tests {
     // test module), and clippy's `absolute_paths` wants a `use` either way.
     #[cfg(windows)]
     use crate::_util::testing::{capture, recorder};
+    // The DACL read-back's other half, the state file's: the crate's one Windows security alias
+    // (`lib.rs`), named here rather than at its one use site.
+    #[cfg(windows)]
+    use crate::_winsec::acl_is_current_user_only;
     #[cfg(feature = "tls")]
     use crate::test_support::{fixture_pair, https_get};
     #[cfg(unix)]
     use crate::{bind::bind_unix, test_support::sock};
     use crate::{
-        client,
-        router::{Auth, Context},
-        state::State,
-        test_support::gauged,
+        client::{self, Call, RawResponse, Report},
+        router::{Auth, Context, StatusBody},
+        state::{self, State},
+        test_support::{Counting, gauged},
     };
 
     /// A `GET` call with the token when the leg has one: every request these tests make is one,
@@ -2692,6 +2706,14 @@ mod tests {
         // The instance whose `connect` this dial completed has been handed the connection by now.
         sleep(Duration::from_millis(100)).await;
         tx.send(true).expect("the instance loops are listening");
+        // **The drain is holding that connection**, and this is the assertion the retired
+        // `tests/management.rs` leg contributed here (`plans/2026-10-01-test-placement-cleanup.md`):
+        // `serve_local` cannot return while a connection it accepted is still in flight, so the
+        // stop has not taken the serving task down with the accept loop.
+        assert!(
+            !serving.is_finished(),
+            "the drain abandoned the connection the loop had accepted"
+        );
 
         let request = Request::builder()
             .method("GET")
@@ -2876,8 +2898,9 @@ mod tests {
         serving.abort();
     }
 
-    /// The same sequential dials through `Plane`: the path `management.rs` drives, kept here so a
-    /// regression in `Plane::serve`'s wiring is diagnosable without the integration suite.
+    /// The same sequential dials through `Plane`: the path the plane's own legs above drive, kept
+    /// here so a regression in `Plane::serve`'s wiring is diagnosable without the drained legs'
+    /// setup.
     #[cfg(windows)]
     #[tokio::test]
     async fn the_plane_serves_sequential_pipe_connections() {
@@ -2910,8 +2933,8 @@ mod tests {
             let (answer, _) = dial(&name, &token, nth).await;
             assert_eq!(answer.status, 200, "dial {nth}: {}", answer.body);
         }
-        // The crate's own client, twice: `management.rs`'s two steps, which is where the
-        // integration suite diverges from the raw dials above.
+        // The crate's own client, twice: the two steps the plane's drained legs take through the
+        // same client, which is where the raw dials above and the CLI's own path diverge.
         for nth in 1..=2 {
             let report = client::status(dir.path()).await.expect("status reads");
             assert!(report.running, "client status {nth} did not report running");
@@ -2948,6 +2971,512 @@ mod tests {
             yield_now().await;
         }
         unreachable!("the loop above returns or asserts")
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The plane's own legs, moved here from `tests/management.rs` (which is retired with them,
+    // `plans/2026-10-01-test-placement-cleanup.md`). Their subject is this module's own
+    // sequence — `Plane::bind(options)` → `publish(port)` → `serve(stop)` → the status/stop
+    // client → `shutdown()` — plus the OS state a live run has to be read back for: the socket
+    // file and the pipe's DACL, the single-instance refusal, and the local channel dialled the
+    // way the CLI dials it.
+    //
+    // The double the gauges' half uses is [`crate::test_support::Counting`], the crate's one
+    // definition of those counts, and its reader is driven through `Plane::serve` exactly as the
+    // CLI drives it.
+    // ---------------------------------------------------------------------------------------
+
+    /// How long the CLI gives a drain before it stops waiting (design decision 12's bound): the
+    /// tests use the same number, so a hang is reported rather than absorbed.
+    const DRAIN_BOUND: Duration = Duration::from_secs(10);
+
+    /// How long a leg waits for its plane to answer: `state` is published at `publish`, *before*
+    /// `serve` reaches its accept loop, and the local channel's backlog can be one connection deep.
+    const READY_BOUND: Duration = Duration::from_secs(5);
+
+    /// The CLI's selection for one resolved local channel: the caller resolved the form (the
+    /// config's `[api.unix]`/`[api.pipe]` section, or the derived default), and nothing downstream
+    /// re-derives a name from it.
+    fn local_selection(local: &LocalForm) -> Selection {
+        Selection {
+            local: Some(local.clone()),
+            ..Selection::default()
+        }
+    }
+
+    /// The two directories a leg serves from: the state dir the plane anchors on, and the served
+    /// root — canonical, because it is what the socket name hashes and what `state` records.
+    struct Dirs {
+        state_dir: TempDir,
+        /// Held for its lifetime alone: `root` is the canonical path *under* this directory, and
+        /// dropping the guard would delete it out from under the plane.
+        _root_dir: TempDir,
+        root: PathBuf,
+    }
+
+    impl Dirs {
+        fn new() -> Self {
+            let state_dir = TempDir::new().expect("state dir");
+            let root_dir = TempDir::new().expect("root");
+            let root = root_dir.path().canonicalize().expect("canonical root");
+            Self {
+                state_dir,
+                _root_dir: root_dir,
+                root,
+            }
+        }
+
+        fn dir(&self) -> &Path {
+            self.state_dir.path()
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// The local channel a run over these two directories binds when the config names
+        /// neither: the derived unix socket, whose name is a function of the root
+        /// (`state::socket_path`), or a pipe name distinct per test.
+        #[cfg(unix)]
+        fn local(&self) -> LocalForm {
+            LocalForm::Unix(state::socket_path(self.dir(), self.root()).expect("socket path"))
+        }
+
+        #[cfg(windows)]
+        fn local(&self) -> LocalForm {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            // The full `\\.\pipe\…` form, which is what a client dials and what `bind_pipe` records:
+            // the bare spelling is the config's, and the bind's own normalisation is what turns it into
+            // this — the leg hands it the already-normalised one so the name it later dials and reads
+            // its DACL back from is byte-for-byte the one the plane bound.
+            LocalForm::Pipe(format!(
+                r"\\.\pipe\tinio-test-{}-{}",
+                process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+
+        /// The bound control socket, unix only.
+        #[cfg(unix)]
+        fn socket(&self) -> PathBuf {
+            let LocalForm::Unix(path) = self.local() else {
+                unreachable!("the derived local form is a socket path");
+            };
+            path
+        }
+    }
+
+    /// A plane that is bound, published and serving, with the shutdown channel the CLI owns.
+    struct Running {
+        plane: Arc<Plane>,
+        serving: JoinHandle<Result<(), Error>>,
+        /// The channel's own end, for the leg that stops the plane without the client. Both are
+        /// the Windows channel's — [`Running::end`] is the field's only reader, and it is
+        /// `#[cfg(windows)]` with the DACL leg that drives it — so the field carries the same
+        /// gate rather than reading as dead code on the platforms that never stop this way.
+        #[cfg(windows)]
+        stop: watch::Sender<bool>,
+        rx: watch::Receiver<bool>,
+        report: Report,
+    }
+
+    impl Running {
+        /// The CLI's own startup, in order: bind (the single-instance lock) → publish (the
+        /// readiness point) → serve, then wait until the channel answers.
+        ///
+        /// **One body for both legs, because the two differ in the bind and in nothing else**, and
+        /// `bind` is that difference: `Plane::bind` for the CLI's own path, `Plane::adopt` for the
+        /// confined child's. The plane is built with `token: None` — this harness's plane owns its
+        /// `state` file, so it generates its own token, and the launcher-supplied case is the
+        /// confined child's.
+        async fn start_with(
+            dirs: &Dirs,
+            selection: Selection,
+            gauges: Option<Arc<Gauges>>,
+            bind: impl FnOnce(Options) -> Result<Plane, Error>,
+        ) -> Self {
+            let (stop, rx) = watch::channel(false);
+            let plane = Arc::new(
+                bind(Options {
+                    selection,
+                    state_dir: dirs.dir().to_path_buf(),
+                    root: dirs.root().to_path_buf(),
+                    host: "127.0.0.1".to_string(),
+                    stop: stop.clone(),
+                    gauges,
+                    token: None,
+                })
+                .expect("the plane is built"),
+            );
+            plane.publish(9000).expect("publish");
+            let serving = tokio::spawn({
+                let plane = Arc::clone(&plane);
+                let rx = rx.clone();
+                async move { plane.serve(rx).await }
+            });
+
+            await_ready(dirs.dir()).await;
+            // Read back through the client the CLI uses.
+            let report = client::status(dirs.dir()).await.expect("state reads");
+            assert!(report.state.is_some(), "`publish` wrote the state file");
+            Self {
+                plane,
+                serving,
+                #[cfg(windows)]
+                stop,
+                rx,
+                report,
+            }
+        }
+
+        /// [`Running::start_with`] on [`Plane::bind`]: the CLI's own single-instance path.
+        async fn start(dirs: &Dirs, selection: Selection, gauges: Option<Arc<Gauges>>) -> Self {
+            Self::start_with(dirs, selection, gauges, Plane::bind).await
+        }
+
+        /// [`Running::start_with`]'s **adopted** twin, and the shape a confined child runs: the
+        /// launcher already bound the control channel, and this plane serves on the socket it was
+        /// handed (`Plane::adopt`) instead of binding one of its own.
+        ///
+        /// The launcher-token half of the same path (`state` written by the launcher, the child
+        /// verifying against the value in it) is what the macOS end-to-end leg drives with a real
+        /// confining launcher.
+        #[cfg(unix)]
+        async fn start_adopted(
+            dirs: &Dirs,
+            selection: Selection,
+            inherited: StdUnixListener,
+        ) -> Self {
+            Self::start_with(dirs, selection, None, |options| {
+                Plane::adopt(options, inherited)
+            })
+            .await
+        }
+
+        fn token(&self) -> String {
+            self.report
+                .state
+                .as_ref()
+                .expect("the state file it read")
+                .token
+                .expose_secret()
+                .as_str()
+                .to_owned()
+        }
+
+        fn status(&self) -> &StatusBody {
+            self.report.status.as_ref().expect("the contract's body")
+        }
+
+        /// The CLI's stop path — `client::stop` returns `Ok` only for the contract's `202` — then
+        /// the drain and the plane's own deletions.
+        async fn stop(self, dirs: &Dirs) {
+            client::stop(dirs.dir()).await.expect("stop answers 202");
+            self.drain(dirs).await;
+        }
+
+        /// The same shutdown from the channel's own end, for the leg that drives the raw channel
+        /// rather than the client's: `/stop` sends on this very sender. Windows-only, with the
+        /// field and the DACL leg that is its one caller.
+        #[cfg(windows)]
+        async fn end(self, dirs: &Dirs) {
+            self.stop.send(true).expect("the plane is listening");
+            self.drain(dirs).await;
+        }
+
+        /// The bounded drain, the flipped channel, and `shutdown`'s deletion of the state file.
+        async fn drain(self, dirs: &Dirs) {
+            timeout(DRAIN_BOUND, self.serving)
+                .await
+                .expect("the drain is bounded")
+                .expect("the serve task does not panic")
+                .expect("serve returns Ok");
+            assert!(
+                *self.rx.borrow(),
+                "`/stop` flips the channel `serve` awaited"
+            );
+            self.plane.shutdown().await.expect("shutdown");
+            assert!(
+                State::read(dirs.dir()).expect("read").is_none(),
+                "`shutdown` removes the state file"
+            );
+        }
+    }
+
+    /// Whether the plane answers yet: `state` is published at `publish`, *before* `serve` reaches
+    /// its accept loop, so a probe that races it answers "stopped".
+    async fn answers(dir: &Path) -> bool {
+        client::status(dir).await.expect("state reads").running
+    }
+
+    /// Waits, bounded, for [`answers`]. The CLI's own path — read `state`, dial the channel it
+    /// names — which is what every leg in this section drives.
+    async fn await_ready(dir: &Path) {
+        let deadline = Instant::now() + READY_BOUND;
+        while Instant::now() < deadline {
+            if answers(dir).await {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the plane did not answer within {READY_BOUND:?}");
+    }
+
+    /// One request over the local channel, with or without the token — the crate's own client
+    /// covers the CLI's paths, this wrapper the rest: a tokenless `/metrics`, and `/status` with
+    /// the token absent or wrong. The dial and the exchange are both the crate's
+    /// ([`client::get_local`]), so there is one definition of each and not two.
+    #[cfg(unix)]
+    async fn local_request(
+        local: &LocalForm,
+        target: &str,
+        method: Method,
+        token: Option<&str>,
+    ) -> RawResponse {
+        let LocalForm::Unix(path) = local else {
+            unreachable!("the unix leg dials a socket path");
+        };
+        client::get_local(
+            path,
+            Call {
+                target,
+                method,
+                token,
+            },
+        )
+        .await
+        .expect("request")
+    }
+
+    /// The named-pipe form of [`local_request`]. No client helper dials a pipe — `get_local` is the
+    /// unix path and refuses on this platform — so the dial is here and the exchange is the crate's
+    /// one, [`client::exchange`].
+    #[cfg(windows)]
+    async fn local_request(
+        local: &LocalForm,
+        target: &str,
+        method: Method,
+        token: Option<&str>,
+    ) -> RawResponse {
+        let LocalForm::Pipe(name) = local else {
+            unreachable!("the Windows leg dials a pipe name");
+        };
+        let stream = ClientOptions::new()
+            .open(name)
+            .expect("dial the control pipe");
+        client::exchange(
+            TokioIo::new(stream),
+            Call {
+                target,
+                method,
+                token,
+            },
+        )
+        .await
+        .expect("request")
+    }
+
+    /// The plane's source: the crate's [`Counting`] double, at the ttl the leg needs.
+    fn gauges(source: &Arc<Counting>, ttl: Duration) -> Arc<Gauges> {
+        // The clone keeps the double's concrete type so a leg can read its counters back; the
+        // coercion to the trait object happens at the argument, which is where the seam is.
+        let source = Arc::clone(source);
+        Arc::new(Gauges::new(source, ttl))
+    }
+
+    #[tokio::test]
+    async fn the_cli_sequence_answers_status_and_leaves_nothing_behind() {
+        let dirs = Dirs::new();
+        let local = dirs.local();
+        let running = Running::start(&dirs, local_selection(&local), None).await;
+        assert!(running.report.running, "the plane answers for its own root");
+
+        let status = running.status();
+        assert_eq!(status.pid, process::id());
+        assert_eq!(status.port, Some(9000));
+        assert_eq!(status.host, "127.0.0.1");
+        assert_eq!(status.root, dirs.root().to_string_lossy());
+        let token = running.token();
+        assert_eq!(token.len(), 64, "the token is 32 CSPRNG bytes, hex-encoded");
+
+        // With the token, the contract's `200`; without one, and with a wrong one, `401` — `/status`
+        // is guarded on every transport, the local channel included.
+        let answer = local_request(&local, "/status", Method::GET, Some(&token)).await;
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
+        for absent in [None, Some("wrong")] {
+            let answer = local_request(&local, "/status", Method::GET, absent).await;
+            assert_eq!(answer.status, 401, "`/status` needs the token here too");
+        }
+
+        // The CLI's stop path, the drain it starts, and the plane's own deletions.
+        running.stop(&dirs).await;
+        #[cfg(unix)]
+        assert!(
+            !dirs.socket().exists(),
+            "`shutdown` removes the socket file: {}",
+            dirs.socket().display()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reader_starts_with_the_plane_and_stops_with_it() {
+        let dirs = Dirs::new();
+        let local = dirs.local();
+        let source = Arc::new(Counting::default());
+        let running = Running::start(
+            &dirs,
+            local_selection(&local),
+            Some(gauges(&source, Duration::from_millis(20))),
+        )
+        .await;
+
+        // Advanced while serving, and with no scrape at all: the reader scans once at start and then
+        // once per ttl.
+        sleep(Duration::from_millis(120)).await;
+        let scanned = source.scans();
+        assert!(
+            scanned >= 2,
+            "the reader scanned with the plane and kept its cadence: {scanned}"
+        );
+
+        running.stop(&dirs).await;
+
+        // Frozen after the plane stopped, which is what this leg can show. A grace window first,
+        // because the task stops on its own wake-up; *why* it stopped (the shared channel) is
+        // `metrics.rs`'s unit test's assertion, not this one's.
+        sleep(Duration::from_millis(60)).await;
+        let frozen = source.scans();
+        sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            source.scans(),
+            frozen,
+            "the reader stops with the plane rather than scanning on"
+        );
+    }
+
+    /// The unix stale-socket probe-then-reclaim, driven through the plane: a file left by a crashed
+    /// instance must not block a restart, and what the bind then records is the socket it bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_socket_file_is_reclaimed_by_the_bind() {
+        let dirs = Dirs::new();
+        let socket = dirs.socket();
+        // What a crashed instance leaves: the socket file with no listener behind it.
+        let stale = StdUnixListener::bind(&socket).expect("stale socket");
+        drop(stale);
+        assert!(socket.exists(), "the residue is there before the bind");
+
+        let local = LocalForm::Unix(socket.clone());
+        let running = Running::start(&dirs, local_selection(&local), None).await;
+        assert_eq!(
+            running.report.state.as_ref().expect("state").control_name,
+            socket.to_string_lossy(),
+            "`state` records the socket the bind created"
+        );
+
+        running.stop(&dirs).await;
+        assert!(!socket.exists(), "and `shutdown` removes it");
+    }
+
+    /// **The adopted half of that same channel**, and the property the macOS profile now depends on:
+    /// the launcher binds the control socket — it is the process that may — and the child serves on
+    /// the descriptor it inherited, so the confinement needs no `network-bind` grant. Nothing about
+    /// the single-instance claim moves: the launcher's bind is still what a second server meets, and
+    /// the plane records the path that bind created, so `state.control_name` names the socket the
+    /// child actually answers on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_socket_serves_on_the_channel_the_launcher_bound() {
+        let dirs = Dirs::new();
+        let socket = dirs.socket();
+        // The launcher's half: the bind that reclaims the path and makes the single-instance claim.
+        let channel = bind_unix(&socket).expect("the launcher binds the control channel");
+        // The child's half: a descriptor for the same socket. This is what crosses the exec in
+        // production — the launcher clears `FD_CLOEXEC` on `Channel::socket` and spells the number
+        // into argv, and the platform crate rebuilds the listener from it.
+        let inherited = StdUnixListener::from(
+            channel
+                .socket()
+                .try_clone_to_owned()
+                .expect("a descriptor for the inherited socket"),
+        );
+
+        let local = LocalForm::Unix(socket.clone());
+        let running = Running::start_adopted(&dirs, local_selection(&local), inherited).await;
+        assert_eq!(
+            running.report.state.as_ref().expect("state").control_name,
+            socket.to_string_lossy(),
+            "the adopted channel records the path the launcher bound"
+        );
+
+        // The claim is still the launcher's: its bind is what a second server meets, and the probe
+        // refuses rather than unlinking a live socket.
+        assert!(
+            bind_unix(&socket).is_err(),
+            "another server is already listening on the adopted channel"
+        );
+
+        let token = running.token();
+        let answer = local_request(&local, "/status", Method::GET, Some(&token)).await;
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(answer.body.contains("\"running\":true"), "{}", answer.body);
+
+        running.stop(&dirs).await;
+        // The plane removes the socket file it recorded, exactly as the binding half does, and the
+        // launcher's own copy is the last owner of the object this leg drops.
+        assert!(!socket.exists(), "`shutdown` removes the adopted socket");
+        drop(channel);
+    }
+
+    /// The Windows channel's two claims, checked rather than trusted: a second instance cannot bind
+    /// the same name, and both the pipe and the state file carry a DACL that names only this user.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only() {
+        let dirs = Dirs::new();
+        let local = dirs.local();
+        let running = Running::start(&dirs, local_selection(&local), None).await;
+        let LocalForm::Pipe(name) = &local else {
+            unreachable!("the Windows leg binds a pipe");
+        };
+
+        // The single-instance claim, as the CLI's second start meets it: the same name, refused.
+        let (stop, _rx) = watch::channel(false);
+        let refused = Plane::bind(Options {
+            selection: local_selection(&local),
+            state_dir: dirs.dir().to_path_buf(),
+            root: dirs.root().to_path_buf(),
+            host: "127.0.0.1".to_string(),
+            stop,
+            gauges: None,
+            token: None,
+        });
+        let err = refused.expect_err("a second instance is refused");
+        assert!(
+            format!("{err}").contains("already"),
+            "names the reason: {err}"
+        );
+
+        // The DACL that makes `Auth::Local`'s openness on this channel sound: read back from the pipe
+        // the plane is serving, and from the file the token is in.
+        assert!(
+            dacl::pipe_acl_is_current_user_only(name).expect("read the pipe's DACL back"),
+            "the control pipe grants the current user and nobody else"
+        );
+        assert!(
+            acl_is_current_user_only(&state::path(dirs.dir())).expect("read the file's DACL back"),
+            "the state file grants the current user and nobody else"
+        );
+
+        // Ended through the channel rather than by a second `client::stop` dial: this leg is about the
+        // DACL and the single-instance refusal, and the read-back above has already dialled the pipe
+        // once (a client connect, which is how `READ_CONTROL` reaches the object). The stop path over
+        // that channel is the story leg's and the `202` leg's, both of which reach it after a full
+        // round trip. With the instance pool the read-back costs the leg no listening instance — the
+        // pool's other instance still is one — so this is a choice about the leg's subject rather than
+        // the old limitation where the only instance was consumed by that dial.
+        running.end(&dirs).await;
     }
 
     /// A handoff with fewer instances than the channel needs is **refused, not served**: one

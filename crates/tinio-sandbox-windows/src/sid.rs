@@ -1438,8 +1438,12 @@ impl CapabilitySids {
     /// `S-1-15-3-N` form the conversion accepts, which
     /// `every_capability_the_enum_names_resolves_to_its_own_enabled_sid` pins by
     /// resolving all three, and which
-    /// `tests/confine.rs`'s `a_capability_from_the_options_reaches_the_container`
-    /// drives end to end. What is left is the FFI call failing for its own reason
+    /// `tests/confine.rs`'s `the_whitelist_refuses_a_path_outside_the_exposures`
+    /// drives end to end (its capability arm carries what the 2026-10-01 cleanup
+    /// deleted `a_capability_from_the_options_reaches_the_container` for, and the
+    /// list reaching the container's token is `backend`'s
+    /// `a_granted_capability_is_enabled_in_the_container`). What is left is the
+    /// FFI call failing for its own reason
     /// (its allocation refused), and that is still reported rather than
     /// unwrapped: the null check cannot be dropped, because a null `Sid` in the
     /// list is a failed `CreateProcessW` rather than a capability.
@@ -1568,8 +1572,9 @@ mod tests {
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
         process::Command,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, mpsc},
         thread,
+        time::Duration,
     };
 
     use tinio_util::testing::{assert_recorded_at, assert_step};
@@ -2144,8 +2149,10 @@ mod tests {
     /// is on [`CapabilitySids::resolve`]).
     ///
     /// **That an enabled SID is honoured is not assertable here**, because it
-    /// takes a container: `tests/network.rs` reads it out of the child's token
-    /// through an ACL and a socket, and that is where the measurement lives.
+    /// takes a container: `backend::tests`'s
+    /// `a_granted_capability_is_enabled_in_the_container` reads it out of the
+    /// child's token through an ACL and a socket, and that is where the
+    /// measurement lives.
     #[test]
     fn every_capability_the_enum_names_resolves_to_its_own_enabled_sid() {
         let all = [
@@ -2164,5 +2171,129 @@ mod tests {
             assert_eq!(entry.Attributes, SE_GROUP_ENABLED as u32, "{capability:?}");
             assert_eq!(render_sid(entry.Sid), capability.sid(), "{capability:?}");
         }
+    }
+
+    /// **The window's whole purpose**: a peer's delete waits for the launch that is
+    /// holding the lock, so it can never land between the derive and
+    /// `CreateProcessW`.
+    ///
+    /// The shape is a second holder's delete deferred while the first holds the
+    /// lock, which is deterministic — a raced pair of real launchers would not be,
+    /// because the window is a race by construction and a test that won it would
+    /// pass for the wrong reason. The negative assertion below is still a bound, so
+    /// what makes it mean anything is the **progress signal**: the peer says it is
+    /// at its drop before the wait starts, because a `derive` is a userenv profile
+    /// creation whose duration no bound controls and a peer that had not got there
+    /// yet would satisfy the same `is_err()`.
+    #[test]
+    fn a_peer_delete_waits_for_the_window_a_launch_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let name = package_name(dir.path());
+        // The launch's window, held by hand for as long as this test needs it: in
+        // the launcher it is `prepare_launch`'s derive through `CreateProcessW`.
+        let window = ProfileLock::acquire(&name).expect("the per-root lock");
+        let (derived_tx, derived_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            // A peer process's value for the same root: it takes the profile over,
+            // and dropping it is that peer's exit.
+            let sid = PackageSid::derive(&name).expect("the takeover");
+            derived_tx.send(()).expect("the peer reached its drop");
+            drop(sid);
+            done_tx.send(()).expect("the peer reports its exit");
+        });
+        derived_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the peer derived its value and is at its drop");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the peer's delete ran inside the launch window, so it could land \
+             between the derive and CreateProcessW and turn a launch of a program \
+             that exists into err=2 ERROR_FILE_NOT_FOUND"
+        );
+        drop(window);
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the delete lands once the window closes");
+        peer.join().expect("the peer thread");
+    }
+
+    /// **`S_OK` from `DeleteAppContainerProfile` is not "a deletion happened"**, and
+    /// the value whose profile a peer already deleted is the case that proves it:
+    /// measured on this host 2026-09-26, the call answers `S_OK` for a name that was
+    /// never created, for one deleted a moment ago and for a name never used at all
+    /// — so a `Drop` that logged a deletion on `hr == 0` logged one that did not
+    /// happen, and an operator reading the stream would believe the profile was taken
+    /// back when it may never have been there.
+    ///
+    /// The other half of the same defect is the warning: `hr != 0` is not "someone
+    /// else deleted it" (there is no such answer — see above), it is the delete
+    /// having failed, so what is left behind is a profile this run could not remove.
+    /// That branch has no test: the API refuses a delete for a name it will not
+    /// resolve, and this crate cannot build one of those without failing its own
+    /// derivation first.
+    #[test]
+    fn a_delete_that_found_no_profile_is_not_reported_as_a_deletion() {
+        let _recorder = recorder();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let name = package_name(dir.path());
+        // The takeover, then the creator's exit: `second` is a live `PackageSid`
+        // whose profile the delete above has already removed — the exact state the
+        // measured `S_OK` answers for.
+        let first = PackageSid::derive(&name).expect("create the profile");
+        let second = PackageSid::derive(&name).expect("take it over");
+        drop(first);
+
+        let capture = capture();
+        let logged = {
+            let _recording = capture.record();
+            drop(second);
+            capture.text()
+        };
+        assert!(
+            logged.contains(r#"step="DeleteAppContainerProfile""#),
+            "the event the profile's removal is read from: {logged}"
+        );
+        assert!(
+            logged.contains(&format!("name={name}")) && logged.contains("absent=true"),
+            "the event must report what the call leaves behind rather than a \
+             deletion it cannot claim: {logged}"
+        );
+        // The delete succeeded here, so the warning the refused-delete branch writes
+        // must not be what this recorded: a regression that took `hr != 0` for this
+        // case would say the profile may still be on the machine, and `absent=false`
+        // is the field that carries it.
+        assert!(
+            !logged.contains("absent=false") && !logged.contains("WARN"),
+            "this delete answered `S_OK`, so the event is the `INFO` one and not \
+             the warning a refused delete writes: {logged}"
+        );
+    }
+
+    /// The lock is **per served root**, which is the same key the profile is named
+    /// from: two roots are two profiles and must not wait for one another.
+    ///
+    /// The consequence of getting this wrong is a lock that serialises unrelated
+    /// roots — a launch blocked behind another root's ACL phase, which is minutes on
+    /// a large tree — so the assertion is that a second root's acquisition completes
+    /// while the first root's lock is held.
+    #[test]
+    fn a_different_root_is_a_different_lock() {
+        let held_dir = tempfile::tempdir().expect("temp dir");
+        let other_dir = tempfile::tempdir().expect("temp dir");
+        let held = ProfileLock::acquire(&package_name(held_dir.path())).expect("the per-root lock");
+        let other_name = package_name(other_dir.path());
+        assert_ne!(other_name, package_name(held_dir.path()));
+        let (done_tx, done_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let lock = ProfileLock::acquire(&other_name).expect("the other root's lock");
+            done_tx.send(()).expect("the peer reports the acquisition");
+            drop(lock);
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("another root's launch is not behind this root's window");
+        peer.join().expect("the peer thread");
+        drop(held);
     }
 }

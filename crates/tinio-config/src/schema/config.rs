@@ -324,6 +324,14 @@ mod tests {
     };
     use crate::Error;
 
+    /// A config file on disk, for the assertions that go through `Config::load`'s fs path
+    /// rather than the in-memory `Config::parse`.
+    fn write(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
     #[test]
     fn parse_minimal_config() {
         let config = Config::parse("version = 1").unwrap();
@@ -393,6 +401,7 @@ mod tests {
         otlp_endpoint = "http://127.0.0.1:4317"
     "#;
         let config = Config::parse(text).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 9001);
         assert_eq!(config.scanner.as_ref().unwrap().delay, 2.5);
         assert_eq!(config.auth.as_ref().unwrap().access_key, "ak");
@@ -402,6 +411,7 @@ mod tests {
             AccessFormat::Common
         );
         assert!(!config.s3.as_ref().unwrap().capabilities.multipart);
+        assert!(config.s3.as_ref().unwrap().capabilities.list_objects_v1);
         assert!(!config.storage.as_ref().unwrap().fs.follow_symlinks);
         assert_eq!(
             config
@@ -433,6 +443,12 @@ mod tests {
         // Round-trip through TOML preserves everything.
         let again = Config::parse(&config.to_toml().unwrap()).unwrap();
         assert_eq!(config, again);
+
+        // The same text through the fs path: `Config::load` reads the file and parses it into
+        // the same value the in-memory parse did.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "config.toml", text);
+        assert_eq!(Config::load(&path).unwrap(), config);
     }
 
     #[test]
@@ -440,6 +456,12 @@ mod tests {
         let err = Config::parse("version = 1\n[server]\nunknown = 1").unwrap_err();
         assert!(matches!(err, Error::UnknownKey(_)), "{err}");
         let err = Config::parse("version = 1\n[bogus]\nx = 1").unwrap_err();
+        assert!(matches!(err, Error::UnknownKey(_)), "{err}");
+        // The same refusal on the fs path: `Config::load` reads the file and hands the text to
+        // the parser above.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "bad.toml", "version = 1\n[bogus]\nx = 1");
+        let err = Config::load(&path).unwrap_err();
         assert!(matches!(err, Error::UnknownKey(_)), "{err}");
     }
 
@@ -450,6 +472,11 @@ mod tests {
         assert!(matches!(err, Error::Parse { .. }), "{err}");
         // Port must be a number in range.
         let err = Config::parse("version = 1\n[server]\nport = 70000").unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }), "{err}");
+        // The same refusal on the fs path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "bad.toml", "version = 1\n[server]\nport = 70000");
+        let err = Config::load(&path).unwrap_err();
         assert!(matches!(err, Error::Parse { .. }), "{err}");
     }
 
@@ -614,12 +641,26 @@ mod tests {
 
     #[test]
     fn presence_gated_sections_serialize_away() {
+        // The auto-generated first-start config omits every presence-gated section, so
+        // `to_toml` never emits `[pipeline.*]` (Q8) or a section a consumer could not
+        // round-trip.
         let config = Config::default();
         let toml = config.to_toml().unwrap();
-        assert!(!toml.contains("scanner"), "{toml}");
-        assert!(!toml.contains("api"), "{toml}");
-        // Q8: the auto-generated config never emits `[pipeline.*]` sections.
-        assert!(!toml.contains("pipeline"), "{toml}");
+        for section in [
+            "scanner",
+            "api",
+            "telemetry",
+            "pipeline",
+            "auth",
+            "log",
+            "s3",
+            "storage",
+        ] {
+            assert!(
+                !toml.contains(section),
+                "absent section {section:?} leaked into {toml}"
+            );
+        }
     }
 
     #[test]

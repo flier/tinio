@@ -627,6 +627,8 @@ fn described(status: &service_manager::ServiceStatus) -> (String, ExitCode) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::_util::testing::assert_send_sync;
 
@@ -643,7 +645,97 @@ mod tests {
     }
 
     #[test]
+    fn the_label_is_derived_from_the_root_and_overridable() {
+        // The derivation is over the **canonical** root, so the two spellings of one
+        // directory are one service: `label_for` is called with what `resolve::resolve_root`
+        // returned, never with the operator's spelling.
+        let dir = tempfile::TempDir::new().expect("temp");
+        let root = dir.path().join("data");
+        fs::create_dir_all(&root).expect("root");
+        let canonical = root.canonicalize().expect("canonical");
+        let derived = label_for(&canonical, None);
+        assert!(derived.starts_with("tinio-"), "{derived}");
+        assert_eq!(
+            derived.len(),
+            "tinio-".len() + 16,
+            "16 hex characters, as the control pipe's name is"
+        );
+        assert_eq!(
+            derived,
+            label_for(&canonical, None),
+            "the same root always derives the same label"
+        );
+        // `./data` and its canonical form are one service, and the reason is the **caller**:
+        // `label_for` digests the bytes it is handed, and `resolve_root` is what hands every
+        // caller the canonical ones. Asserted through that entry point rather than by feeding
+        // the raw join to `label_for`, because on Windows (a `\\?\` verbatim prefix) and on
+        // macOS (a symlinked `TMPDIR`) the two spellings are not byte-equal even though they
+        // are the same directory — a difference the label must not be made to paper over.
+        let resolved = resolve::resolve_root(Some(&root), &root).expect("the resolved root");
+        assert_eq!(resolved, canonical, "`resolve_root` canonicalises");
+        assert_eq!(
+            derived,
+            label_for(&resolved, None),
+            "`<dir>/data` and its canonical form agree"
+        );
+        assert_ne!(derived, label_for(&dir.path().join("other"), None));
+        assert_eq!(label_for(&canonical, Some("my-tinio")), "my-tinio");
+    }
+
+    #[test]
+    fn a_read_only_unit_records_the_resolved_state_dir() {
+        // The supervisor does not keep the installing environment. Read-only state is not a
+        // function of the root, so the argv the unit runs must name the path install resolved.
+        let argv = server_argv(Path::new("/srv/data"), true, Path::new("/var/lib/tinio"));
+        assert_eq!(
+            argv,
+            [
+                OsString::from("server"),
+                OsString::from("/srv/data"),
+                OsString::from("--read-only"),
+                OsString::from("--state-dir"),
+                OsString::from("/var/lib/tinio"),
+            ]
+        );
+        let read_write = server_argv(Path::new("/srv/data"), false, Path::new("/srv/data/.tinio"));
+        assert_eq!(
+            read_write,
+            [OsString::from("server"), OsString::from("/srv/data")]
+        );
+    }
+
+    #[test]
+    fn the_user_level_asks_for_no_elevation() {
+        // The level is the manager's, not the context's: `ServiceInstallCtx` has no `level` field
+        // (`service-manager 0.11.0/src/lib.rs:298-341`) — the crate carries it on the manager
+        // (`ServiceManager::set_level`) — so what `--user` maps to is asserted here, on the one
+        // pure function that maps it, rather than on a context field that does not exist.
+        assert_eq!(level_for(false), ServiceLevel::System);
+        assert_eq!(level_for(true), ServiceLevel::User);
+    }
+
+    #[test]
     fn only_systemd_is_handed_our_unit_text() {
+        // The context [`install_context`] builds is ours outright — the program, the argv the
+        // unit runs, and the **resolved** state dir as the working directory. The working
+        // directory is the state dir the run resolved, not the root: read-only mode relocates
+        // it (decision 6), and a unit that hard-codes `<root>/.tinio` would send a read-only
+        // deployment's relative paths into the tree the mode promises not to write.
+        let ours = context();
+        assert_eq!(ours.program, Path::new("/usr/local/bin/tinio"));
+        assert_eq!(
+            ours.args,
+            vec![OsString::from("server"), OsString::from("/srv/data")]
+        );
+        assert!(
+            ours.autostart,
+            "a service that does not come back after a reboot is not a service"
+        );
+        assert_eq!(
+            ours.working_directory.as_deref(),
+            Some(Path::new("/srv/data/.tinio"))
+        );
+
         // `contents` is *the service file*, and the service file is each backend's own format:
         // launchd writes it verbatim as `<label>.plist` and then `launchctl load`s it
         // (`launchd.rs:115-127`), OpenRC and rc.d as shell scripts. Our INI unit in a plist is
@@ -667,6 +759,7 @@ mod tests {
         {
             let unit = systemd.contents.expect("systemd's service file is ours");
             assert!(unit.contains("Type=notify"), "{unit}");
+            assert!(unit.contains("WorkingDirectory=/srv/data/.tinio"), "{unit}");
         }
         #[cfg(not(unix))]
         assert_eq!(
@@ -704,6 +797,27 @@ mod tests {
             !is_permission_denied(&missing),
             "a missing service keeps the backend's own message"
         );
+
+        // The other half of the same rule (decision 22's risk row): the recognised refusal is
+        // answered with the remedy, not with the errno three supervisors each spell
+        // differently, which tells the operator nothing.
+        let unix = permission_remedy(ServiceManagerKind::Systemd, ServiceLevel::System);
+        assert!(
+            unix.contains("--user"),
+            "the unix remedy is the user level: {unix}"
+        );
+        let windows = permission_remedy(ServiceManagerKind::Sc, ServiceLevel::System);
+        assert!(
+            windows.contains("Administrator"),
+            "the Windows remedy is elevation: {windows}"
+        );
+        // Already at the user level, the remedy is not "pass --user again".
+        let user = permission_remedy(ServiceManagerKind::Systemd, ServiceLevel::User);
+        assert!(
+            !user.contains("--user"),
+            "the flag is already in effect: {user}"
+        );
+        assert!(!user.contains("EACCES"), "never the raw error: {user}");
     }
 
     #[test]

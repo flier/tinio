@@ -104,3 +104,136 @@ impl<'txn> table::Table<'txn, Def> {
         drain_triple(&mut self.0, (bucket, "", 0), |b, _, _| b == bucket)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        _core::checksum::{Algorithm, Part, Value},
+        testutil::handle,
+    };
+
+    #[test]
+    fn part_checksum_rows_round_trip_self_heal_and_drain() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut pc = Table::open(txn)?;
+            assert!(!pc.has_upload("data", "u1")?);
+            pc.put(
+                "data",
+                "u1",
+                1,
+                &Part {
+                    algorithm: Algorithm::Crc32,
+                    value: Value("NhCmhg==".into()),
+                },
+            )?;
+            pc.put(
+                "data",
+                "u1",
+                2,
+                &Part {
+                    algorithm: Algorithm::Sha256,
+                    value: Value("BB==".into()),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let pc = Table::open_readonly(txn)?;
+            assert!(pc.has_upload("data", "u1")?);
+            assert!(!pc.has_upload("data", "u2")?);
+            assert_eq!(
+                pc.get("data", "u1", 1)?,
+                Some(Part {
+                    algorithm: Algorithm::Crc32,
+                    value: Value("NhCmhg==".into()),
+                })
+            );
+            assert!(pc.get("data", "u1", 3)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+        // A garbage part-checksum wire self-heals on the table accessor.
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?
+                .insert(("data", "u1", 1), ("BLAKE3", "AAAA"))
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let pc = Table::open_readonly(txn)?;
+            assert!(
+                pc.get("data", "u1", 1)?.is_none(),
+                "a corrupt part checksum wire is no checksum"
+            );
+            assert!(pc.has_upload("data", "u1")?, "the row itself remains");
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            let mut pc = Table::open(txn)?;
+            pc.remove("data", "u1", 1)?;
+            pc.drain_upload("data", "u1")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !h.read(|txn| Table::open_readonly(txn)?.has_upload("data", "u1"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn part_checksum_set_replaces_and_clears_the_slot() {
+        let h = handle();
+        let part = Part {
+            algorithm: Algorithm::Crc32,
+            value: Value("NhCmhg==".into()),
+        };
+        h.write(|txn| -> Result<(), Error> {
+            let mut pc = Table::open(txn)?;
+            // None on a missing row: a no-op (the part carried no checksum).
+            pc.set("data", "u1", 1, None)?;
+            // Some writes the digest.
+            pc.set("data", "u1", 1, Some(&part))?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert_eq!(
+                Table::open_readonly(txn)?.get("data", "u1", 1)?,
+                Some(part.clone())
+            );
+            Ok(())
+        })
+        .unwrap();
+        // The None arm clears the stale row from a previous upload of this
+        // part number (the digest-slot discipline, F-spec 2026-08-31).
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.set("data", "u1", 1, None)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let pc = Table::open_readonly(txn)?;
+            assert!(pc.get("data", "u1", 1)?.is_none());
+            assert!(!pc.has_upload("data", "u1")?);
+            Ok(())
+        })
+        .unwrap();
+        // And the Some arm re-writes after the clear.
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.set("data", "u1", 1, Some(&part))?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert_eq!(Table::open_readonly(txn)?.get("data", "u1", 1)?, Some(part));
+            Ok(())
+        })
+        .unwrap();
+    }
+}

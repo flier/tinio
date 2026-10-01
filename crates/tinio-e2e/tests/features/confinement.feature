@@ -51,6 +51,19 @@
 # by platform, while a feature-on host must reach readiness.
 Feature: Confinement
 
+  # The two channels that cannot be shrunk to a probe — the flag a parser without the feature does
+  # not know, and the variable that cannot be compiled away — and the pair is
+  # `crates/tinio-server/tests/serve_sandbox_channels.rs`'s cases 7 and 8 until the placement
+  # cleanup retired that file (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
+  # Case 7's subject — a build whose parser does not know the flag — cannot live here (cucumber
+  # drives one binary), so it stays Rust in `crates/tinio-server/tests/sandbox_feature_off.rs`.
+  # **The refusal's own shape moved with the scenarios**, into the dispatch step both `Then`s use
+  # (`steps/cli.rs`'s `refused_by_build`, over `refusal_frame_only`): a build's `--sandbox`
+  # refusal, which clap answers before any command is dispatched, writes no frame at all and
+  # creates nothing under the run's root; a channel the crate itself refuses is framed by the
+  # serving arm's error path — exactly the encoder's three stdout lines — and lands before the
+  # store, `<root>/.tinio/meta.redb`, the serving path's first write under the root. A build whose
+  # parser knows the flag owes the honour arm instead, and the probe is what dispatches.
   @cli @confinement @FR-036
   Scenario: A `--sandbox` request is never silently ignored
     Given a storage root
@@ -339,6 +352,13 @@ Feature: Confinement
   # through `/proc/<pid>/root` and stays) is the half only a client can give: a
   # signed reader is answered `200` with the bytes while the writer beside it is
   # refused, through a confinement that is asserted rather than assumed.
+  #
+  # **And the disk is read beside the client's status**: the refused write left
+  # no `data/b.txt` under the served root — the assertion
+  # `crates/tinio-sandbox-windows/tests/confine.rs`'s
+  # `a_read_only_root_refuses_writes_and_still_reads` carried until this cleanup
+  # moved the journey here, so a server that answered `AccessDenied` and wrote
+  # anyway fails rather than passing on the client's view alone.
   @cli @confinement @FR-036
   Scenario: A confined read-only server refuses the write and still serves the read
     Given a storage root
@@ -351,6 +371,7 @@ Feature: Confinement
     Then the response status is 403
     And the error code is "AccessDenied"
     And the response body contains "<Message>Access Denied</Message>"
+    And the served root holds no file "data/b.txt"
     When I send a "GET" request to "/data/a.txt" signed as "root"
     Then the response status is 200
     And the object body is "a confined payload"
@@ -563,7 +584,7 @@ Feature: Confinement
   # The sandbox's own clause is what lands on a root that already holds the file — a second
   # arrival, not this row.
   #
-  # **And every row here pins stdout, not only stderr** (`crates/tinio-cli/src/run.rs`'s serving arm frames the `Err` that `start::run` returns — decision 19's "a startup failure is an event rather than an absence"), so a refusal is one frame carrying the sentence and three lines and nothing else: the assertion `crates/tinio-server/tests/serve_sandbox_channels.rs`'s in-process helper kept and this layer's migration of case 11 dropped.
+  # **And every row here pins stdout, not only stderr** (`crates/tinio-cli/src/run.rs`'s serving arm frames the `Err` that `start::run` returns — decision 19's "a startup failure is an event rather than an absence"), so a refusal is one frame carrying the sentence and three lines and nothing else: the assertion the retired `crates/tinio-server/tests/serve_sandbox_channels.rs`'s in-process helper kept and this layer's migration of case 11 dropped — `steps/cli.rs`'s `refusal_frame_only` is that shape's one home now, shared with the channel dispatch.
   @cli @confinement @FR-036
   Scenario Outline: A state directory nested with the served root is refused
     Given a storage root
@@ -1154,3 +1175,33 @@ Feature: Confinement
     And the run was confined
     When I send the server SIGTERM
     Then the run stops on the signal
+
+  # A5's secret-leak rule, asked of the streams a real run writes: the control token the run
+  # publishes reaches neither the frame stream (stdout) nor the operational log (stderr) — the leg
+  # `crates/tinio-server/tests/sandbox_e2e.rs` carried until the placement cleanup moved it here
+  # (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`; that file's other leg stays,
+  # and its module doc says why the `EROFS` probe has no step).
+  #
+  # **The needle is the run's own published `state`, never a string this suite invented**:
+  # `neither stream carries the run's published control token` parses the file the run wrote
+  # (`steps/cli.rs`'s `published_state`, which reads it through `State` rather than grepping it, so
+  # the credential never reaches this log), and the value is the one `tinio-api`'s `generate_token`
+  # minted inside the run and nowhere else — so what a failure reports is "the run printed its own
+  # token" and not "the run printed something that happens to be this test's string".
+  #
+  # **The two steps before it are what keep the absence from being vacuous**: the readiness frame
+  # is the run's own record of having served, and the in-place re-emit line is the log A5 is about
+  # (`the run was confined` asserts it with its fields) — a stream that never carried them would
+  # make "the token is in neither" a statement about an empty buffer. `NO_COLOR`, which makes that
+  # line greppable, is the harness's own (`steps/cli.rs`'s `Cli::command`).
+  #
+  # **The caveat the move owes a reader**: on Linux the Rust leg ran in the default workspace leg
+  # (`cargo nextest --workspace --exclude tinio-e2e`), while a `@confinement` scenario is
+  # operator-opt-in off macOS — the coverage change `docs/tests.md`'s WSL2 section records.
+  @cli @confinement @FR-036 @linux
+  Scenario: A confined run writes its control token to neither stream
+    Given a storage root
+    When I run "tinio server {root} --port 0 --sandbox --read-only"
+    Then the readiness line reports a bound port
+    And the run was confined
+    And neither stream carries the run's published control token

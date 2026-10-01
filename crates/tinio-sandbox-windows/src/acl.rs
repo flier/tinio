@@ -18,7 +18,7 @@
 //! `SetEntriesInAclW` + `SetSecurityInfo` leaves is the one `icacls /grant:r`
 //! left — entry for entry, control word included (`0x8404`, auto-inherited and
 //! **not** protected), with the same propagation to a directory's pre-existing
-//! children, which is what `tests/acl.rs` asserts against the tool as an
+//! children, which this module's own tests assert against the tool as an
 //! independent oracle. [`Error::Launch`] carries the API's own status for a write
 //! or an open that failed, and a failed read carries it too.
 //!
@@ -372,8 +372,8 @@ const fn ace_bits(target: Target, access: AccessMode) -> (u32, u32) {
 /// operator, a fixture and [`revoke`] still use** — so what the function is for
 /// now is that one table describes both writers: `ace_bits` is what
 /// `SetSecurityInfo` is told and this is the same pair in the tool's own spelling,
-/// which is what `tests/acl.rs` and `tinio-server`'s Windows fixtures need to
-/// write an ACE the launcher's read will recognize.
+/// which is what this module's own tests and `tinio-server`'s Windows fixtures
+/// need to write an ACE the launcher's read will recognize.
 ///
 /// # Examples
 ///
@@ -1187,8 +1187,10 @@ fn grant_to(path: &Path, target: Target, access: AccessMode, sid: GrantSid<'_>) 
 /// `APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)`, so a text
 /// oracle that looks only for the literal never sees the ACE that is there.
 /// Measured on this host 2026-09-25: that is what made the sibling batch's skip
-/// never fire, and what `tests/acl.rs`'s post-condition could not see either —
-/// which is why the *read* no longer goes through text at all ([`has_ace`]).
+/// never fire, and what
+/// `the_sibling_batch_grants_every_dll_for_all_application_packages`'s
+/// post-condition could not see either — which is why the *read* no longer goes
+/// through text at all ([`has_ace`]).
 ///
 /// A package SID (`S-1-15-2-<8 groups>`) has no name to render, so it comes back
 /// literally and needs no second spelling.
@@ -1207,9 +1209,10 @@ fn sid_spellings(sid: &str) -> Vec<&str> {
 /// the skip ask the kernel's DACL through [`walk_dacl`], which compares trustees
 /// with `EqualSid`, so nothing this crate *decides* rides on how a SID is
 /// rendered; what still does is every suite that asserts against the tool's own
-/// output — `tests/acl.rs` pins [`ALL_APPLICATION_PACKAGES`] on the sibling batch
-/// through it, and `tests/confine.rs` asks whether the program directory carries
-/// the standing SID at all. Keeping one implementation of that question is what
+/// output — `the_sibling_batch_grants_every_dll_for_all_application_packages`
+/// pins [`ALL_APPLICATION_PACKAGES`] on the sibling batch through it, and
+/// `tests/confine.rs` asks whether the program directory carries the standing SID
+/// at all. Keeping one implementation of that question is what
 /// stops the oracle and the tool from drifting apart, and the rendering it handles
 /// is the reason the predicate exists: `S-1-15-2-1` is printed as
 /// `ALL APPLICATION PACKAGES`.
@@ -2008,6 +2011,14 @@ mod writes {
 
 #[cfg(test)]
 mod tests {
+    // `Grants::new` takes an `Arc<PackageSid>` — this module's interface, and the
+    // shape the launcher itself holds: one SID shared with the launch rather than a
+    // copy per user. `PackageSid` owns a raw `PSID`, so it is deliberately neither
+    // `Send` nor `Sync`, and clippy's lint about that is about an `Arc` meant to
+    // cross a thread boundary. The grants below are shared ownership inside one
+    // test, which is what the code under test is given.
+    #![allow(clippy::arc_with_non_send_sync)]
+
     use std::{
         ffi::c_void,
         fs,
@@ -2038,7 +2049,7 @@ mod tests {
         backend::SiblingScan,
         ledger::{self, PathKind},
         sid::{PackageSid, Salt, package_name, sid_text},
-        testing::{capture, recorder},
+        testing::{capture, icacls, junction, recorder},
     };
 
     #[test]
@@ -2048,7 +2059,7 @@ mod tests {
         // pre-existing descendant is reachable without a `/t` walk — while the
         // program's directory (decision 22) and every file take the plain form. An
         // inheritance-flagged grant on a file is a silent no-op (design §6's
-        // evidence row), which `tests/acl.rs` pins.
+        // evidence row), which `the_file_shaped_spec_is_what_lands_on_a_file` pins.
         assert_eq!(
             ace_spec(Target::Directory, AccessMode::ReadOnly),
             "(OI)(CI)RX"
@@ -2279,7 +2290,7 @@ mod tests {
     /// inheritable ACE to the descendants that were already there.
     ///
     /// The tool is the oracle rather than a written-down constant, which is the
-    /// same rule `tests/acl.rs` follows for the whole layer: what the crate has to
+    /// same rule the DACL tests below follow for the whole layer: what the crate has to
     /// keep is the behaviour `icacls` had, and only the tool can say what that was.
     #[test]
     fn the_descriptor_the_handle_route_writes_is_the_one_icacls_writes() {
@@ -2972,11 +2983,42 @@ an inherited entry is answering for the wrong reason: {:08X?}",
     /// the rule [`has_ace`]'s callers rest on, one layer earlier: the grant opens
     /// the object before it reads anything, so a path that does not exist fails
     /// there, with the step named and the path attached.
+    ///
+    /// **And the grant that landed before the failure is still there**, which is
+    /// the half `tests/confine.rs`'s `a_grant_that_fails_leaves_the_earlier_ones_standing`
+    /// carried until the 2026-10-01 placement cleanup folded it here
+    /// (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`): a failed
+    /// grant takes nothing back, so the state a later run on the same root finds is
+    /// the ACE the first grant wrote — the reason a second launch on a served root
+    /// is the cheap one (`grant_to`'s skip). The guard's own half of the same rule
+    /// (a dropped `Grants` removes nothing) is
+    /// `dropping_the_grants_leaves_them_standing`'s, which asks it with a derived
+    /// package SID.
+    ///
+    /// **The two grants are the standing `ALL_APPLICATION_PACKAGES` SID the rest of
+    /// this module's tests grant with**, deliberately: a derived `PackageSid` needs
+    /// `CreateAppContainerProfile`, which a host can refuse (`hr=0x80070005`,
+    /// measured), and this leg's subject — the failure names the path, and the ACE
+    /// that landed before it is not taken back — is about the DACL, not about the
+    /// profile.
     #[test]
     fn the_grant_refuses_a_path_it_cannot_open() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let missing = dir.path().join("never-created");
-        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, &missing).expect("a SID");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).expect("create the served root");
+        let sid = OwnedSid::parse(ALL_APPLICATION_PACKAGES, &root).expect("a SID");
+
+        assert!(
+            grant_to(
+                &root,
+                Target::Directory,
+                AccessMode::ReadWrite,
+                standing(&sid)
+            )
+            .expect("the first grant lands"),
+            "the first call writes"
+        );
+        let missing = root.join("never-created");
         let error = grant_to(
             &missing,
             Target::Directory,
@@ -2989,6 +3031,24 @@ an inherited entry is answering for the wrong reason: {:08X?}",
         assert!(
             text.contains("open the granted path"),
             "the failure names the step it happened at: {text}"
+        );
+        // The oracle is this module's own DACL read — the predicate `has_ace`
+        // wraps — asked of the object the first call wrote and the failure did not
+        // touch.
+        assert!(
+            acl_names(&root, sid.raw()).expect("read the DACL"),
+            "the grant that landed before the failure is still standing: nothing is taken back"
+        );
+
+        let taken_back = Command::new(icacls_binary())
+            .arg(&root)
+            .args(["/remove:g", "*S-1-15-2-1", "/q"])
+            .output()
+            .expect("run icacls");
+        assert!(
+            taken_back.status.success(),
+            "{}",
+            String::from_utf8_lossy(&taken_back.stderr)
         );
     }
 
@@ -3526,6 +3586,469 @@ an inherited entry is answering for the wrong reason: {:08X?}",
             logged.matches("wait for the ACL lock").count(),
             1,
             "one wait reports once, however many polls it took:\n{logged}"
+        );
+    }
+
+    // The DACL whitelist against a real filesystem, with `icacls` as the
+    // independent oracle for the grant, the standing skip and the inheritance
+    // answer design §6 settled on 2026-09-19.
+    //
+    // **Every test in this block writes real ACEs**, and only ever onto a
+    // temporary directory it created itself: the operator's tree is not this
+    // suite's to edit, and a failure must not be able to leave a residue outside
+    // the process's own temp tree.
+    //
+    // **Nothing the launcher does takes an ACE back any more.** Every grant is
+    // standing (`Grants`'s doc states why and what it gives up), so the tests that
+    // used to assert a rollback now assert the opposite — the ACE is still there
+    // after the guard drops — and `revoke` survives as the primitive an operator
+    // (or a test) removes one with.
+
+    /// The SID this run derives for `root` — the same question the launcher asks.
+    ///
+    /// **Called once per name, and the value held.** `PackageSid` owns the
+    /// AppContainer profile behind the SID and deletes it when the value drops
+    /// (decision 21), so a second value for one name would delete the profile the
+    /// first is still using — measured on 2026-09-21: `DeleteAppContainerProfile`
+    /// answers a profile that is already gone with `S_OK`, so the second delete is
+    /// silent, and what it leaves behind is a live `PackageSid` whose profile no
+    /// longer exists, which cannot launch (decision 21's measurement of 2026-09-19).
+    fn sid_for(root: &Path) -> PackageSid {
+        PackageSid::derive(&package_name(root)).expect("derive the package SID")
+    }
+
+    /// The ACE lines of `icacls`'s rendering of `path`.
+    ///
+    /// One entry per ACE, with the path `icacls` prefixes the first line with
+    /// removed and its own count line dropped. The name is distinct from the
+    /// `ace_lines` helper above, which keeps the path and answers a different
+    /// question.
+    ///
+    /// The point of extracting them is that **a comparison of these is independent of
+    /// how any ACE renders**. That matters for the foreign-ACE assertion below:
+    /// `icacls` prints a well-known SID by its account name (`BUILTIN\Users…`, and
+    /// the name is localised), so searching the text for `S-1-5-32-545` would fail on
+    /// every host.
+    fn ace_lines_without_path(rendered: &str, path: &Path) -> Vec<String> {
+        let prefix = path.to_string_lossy().to_string();
+        rendered
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(':'))
+            .map(|line| {
+                line.strip_prefix(prefix.as_str())
+                    .unwrap_or(line)
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The answer design §6 settled on 2026-09-19, pinned as a regression test.
+    ///
+    /// The question it settles was whether an inheritable ACE on a directory reaches
+    /// children that were already there when it was set: every probe behind the old
+    /// evidence table used `icacls … /t`, which applies the ACE to each child
+    /// explicitly, so inheritance alone was never isolated. Measured on NTFS (`C:`)
+    /// and ReFS (`E:`) alike, a directory-only `/grant:r` — **no `/t`** — does reach
+    /// them, as an inherited `(I)` entry. The grant list is therefore one ACE per
+    /// exposed directory, there is no `/t` walk, and this test is what fails if that
+    /// stops being true on the filesystem this crate is serving from.
+    ///
+    /// **What the tool counts and what the filesystem does are two different
+    /// counts.** `icacls` was handed one path and says so; the propagation is the
+    /// filesystem's, and it is also the cost — one descriptor write walks every
+    /// descendant the served tree holds, which is why the grants are standing and why
+    /// the launcher reads before it writes (`acl::grant_to`'s skip).
+    #[test]
+    fn the_directory_ace_alone_reaches_a_file_that_was_already_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("root");
+        let depth_one = root.join("direct.txt");
+        let nested = root.join("bucket").join("nested.txt");
+        fs::create_dir_all(nested.parent().expect("the bucket")).expect("create the tree");
+        fs::write(&depth_one, b"before the grant").expect("seed");
+        fs::write(&nested, b"before the grant").expect("seed");
+        // One value, alive for the whole test: it owns the profile the grants are for.
+        let sid = Arc::new(sid_for(&root));
+        let sid_text = sid.as_str().to_string();
+
+        assert!(
+            !has_ace(&depth_one, &sid).expect("read the DACL"),
+            "no package ACE yet"
+        );
+
+        {
+            let mut grants = Grants::new(Arc::clone(&sid));
+            grants
+                .apply(&root, Target::Directory, AccessMode::ReadWrite)
+                .expect("grant");
+        }
+
+        for file in [&depth_one, &nested] {
+            let after = icacls(file, &[]);
+            assert!(
+                after.contains(&sid_text),
+                "an inheritable ACE on the directory did not reach {}, which was there before the\n\
+                 grant — so the grant list would need the `/t` walk design §6 rules out. File DACL:\n{after}",
+                file.display()
+            );
+            assert!(
+                after.to_lowercase().contains("inherited") || after.contains("(I)"),
+                "the entry on the pre-existing file should be the *inherited* one, not a second \
+                 explicit ACE:\n{after}"
+            );
+        }
+
+        // A file created afterwards is the case the design's rows already covered; it
+        // must keep working either way.
+        let created_later = root.join("bucket").join("after.txt");
+        fs::write(&created_later, b"after the grant").expect("write");
+        assert!(has_ace(&created_later, &sid).expect("read the DACL"));
+
+        // **The guard is gone and the ACE is not**, which is the standing contract:
+        // `Grants` owns the profile's lifetime and nothing else. Read the DACL text
+        // itself rather than only asking our own predicate: an assertion that rests on
+        // `has_ace` alone would also pass for a path whose DACL could not be read, and
+        // the point is the operator's directory, not this crate's view of it.
+        for path in [&root, &depth_one, &nested, &created_later] {
+            assert!(
+                icacls(path, &[]).contains(&sid_text),
+                "the package ACE is still on the whole tree after the guard dropped: {}",
+                path.display()
+            );
+        }
+        // And the predicate agrees with the oracle, which is what lets the suites that
+        // have no oracle of their own rely on it.
+        assert!(has_ace(&root, &sid).expect("read the DACL"));
+
+        // `revoke` is still the primitive that takes one back, and the only one: an
+        // operator who wants the ACE gone runs it, not a rollback this crate no longer
+        // performs.
+        revoke(&root, &sid).expect("take the grant back by hand");
+        assert!(!has_ace(&root, &sid).expect("read the DACL"));
+    }
+
+    #[test]
+    fn a_grant_leaves_a_foreign_ace_alone_and_a_revoke_removes_exactly_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).expect("create the root");
+        let plain = ace_lines_without_path(&icacls(&root, &[]), &root);
+
+        // A foreign ACE the run must not touch, in the shape the verified row
+        // describes: `Users` granted on the directory. Named by SID so this does not
+        // depend on how the host spells that account's name.
+        let granted = Command::new(icacls_binary())
+            .arg(&root)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)R", "/q"])
+            .output()
+            .expect("grant Users");
+        assert!(
+            granted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&granted.stderr)
+        );
+
+        let before = ace_lines_without_path(&icacls(&root, &[]), &root);
+        assert_eq!(
+            before.len(),
+            plain.len() + 1,
+            "the foreign ACE was written, so the comparison below is about a real one: {before:?}"
+        );
+
+        let sid = Arc::new(sid_for(&root));
+        let sid_text = sid.as_str().to_string();
+        let mut grants = Grants::new(Arc::clone(&sid));
+        grants
+            .apply(&root, Target::Directory, AccessMode::ReadWrite)
+            .expect("grant");
+        assert!(
+            has_ace(&root, &sid).expect("read the DACL"),
+            "the grant landed"
+        );
+
+        let written = ace_lines_without_path(&icacls(&root, &[]), &root);
+        assert_eq!(
+            written.len(),
+            before.len() + 1,
+            "the grant added exactly one ACE and left every other ACE as it found it: {written:?}"
+        );
+
+        revoke(&root, &sid).expect("take the grant back by hand");
+
+        let after = ace_lines_without_path(&icacls(&root, &[]), &root);
+        assert!(
+            !after.iter().any(|line| line.contains(&sid_text)),
+            "the package ACE is gone: {after:?}"
+        );
+        // The half that does not depend on how a SID renders, which is the half the
+        // first draft of this test got wrong: `icacls` prints `S-1-5-32-545` as
+        // `BUILTIN\Users` (and the name is localised), so the property — removing this
+        // SID's entry leaves every other ACE as it found it — is asserted as an
+        // equality of the ACE lines rather than as a search for a string the tool never
+        // prints.
+        assert_eq!(
+            before, after,
+            "the revoke removed exactly one ACE and left every other ACE as it found it"
+        );
+    }
+
+    #[test]
+    fn revoking_an_absent_ace_succeeds() {
+        // Idempotence is what makes a crashed run's residue removable twice, and what
+        // lets a test clean up a directory whose grant it cannot be sure landed.
+        // Measured on this host 2026-09-21: `/remove:g` for a SID with no entry
+        // anywhere under the path exits 0 — "Successfully processed 1 files; Failed
+        // processing 0 files" — so this is the tool's behaviour rather than a kindness
+        // this crate adds.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sid = sid_for(dir.path());
+        revoke(dir.path(), &sid).expect("first revoke");
+        revoke(dir.path(), &sid).expect("second revoke");
+    }
+
+    #[test]
+    fn dropping_the_grants_leaves_them_standing() {
+        // **The inversion of what this test asserted before the grants became
+        // standing** (design decision 22's cost follow-up): `Grants` owns the profile's
+        // lifetime, so dropping it deletes the *profile* and nothing else — a guard
+        // that quietly took an ACE back would be the per-launch descriptor write the
+        // whole change exists to remove, and it would also mean a crash and a clean
+        // exit left different trees.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sid = Arc::new(sid_for(dir.path()));
+        {
+            let mut grants = Grants::new(Arc::clone(&sid));
+            grants
+                .apply(dir.path(), Target::Directory, AccessMode::ReadOnly)
+                .expect("grant");
+            assert!(has_ace(dir.path(), &sid).expect("read the DACL"));
+        }
+        // The oracle, not the predicate: this assertion is about the operator's
+        // directory, which is the thing the contract is about.
+        assert!(
+            icacls(dir.path(), &[]).contains(sid.as_str()),
+            "the grant is standing: dropping the guard removed nothing"
+        );
+    }
+
+    #[test]
+    fn the_predicate_refuses_a_path_it_cannot_read() {
+        // `has_ace` is the oracle the rest of this phase's suites consult, and an
+        // oracle that answered "no entry for this SID" for a path that could not be
+        // read would make every "the ACE is gone" assertion pass for the wrong reason.
+        // Measured on this host 2026-09-21: a path that does not exist fails the read
+        // with `ERROR_FILE_NOT_FOUND`. The read asks the DACL through
+        // `GetNamedSecurityInfoW` and no longer through `icacls`, so the step the
+        // failure names is the read's own.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("never-created");
+        let sid = sid_for(dir.path());
+
+        let err = has_ace(&missing, &sid).expect_err("a path the read cannot see is an error");
+        let text = err.to_string();
+        assert!(text.contains("read the DACL"), "{text}");
+        assert!(
+            text.contains("never-created"),
+            "the failure names the path it was about: {text}"
+        );
+    }
+
+    /// **The object the grant checks is the object it writes**, which is the defect
+    /// the handle route closed: a junction is planted at the path the whitelist
+    /// resolved — the window Fix 1 is about — and the grant refuses it rather than
+    /// following it to wherever it points.
+    ///
+    /// **What the refusal protects is measured rather than asserted** (this host,
+    /// 2026-09-27): `icacls /grant:r` through a junction **above** the last component
+    /// resolved it and wrote the ACE on the target, outside the exposed tree, and the
+    /// target's pre-existing children inherited it. The second half of this test is
+    /// that no ACE reached the target: the crate's own predicate *and* the tool's own
+    /// rendering both say so, because an assertion that rested on `has_ace` alone
+    /// would also pass for a DACL nothing had looked at.
+    #[test]
+    fn a_grant_refuses_a_junction_instead_of_following_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).expect("create the junction's target");
+        let link = dir.path().join("swapped");
+        junction(&link, &real);
+        let sid = Arc::new(sid_for(dir.path()));
+        let sid_text = sid.as_str().to_string();
+
+        let mut grants = Grants::new(Arc::clone(&sid));
+        let err = grants
+            .apply(&link, Target::Directory, AccessMode::ReadOnly)
+            .expect_err("a junction is refused, not followed");
+        assert!(err.to_string().contains("is a reparse point"), "{err}");
+
+        assert!(
+            !has_ace(&real, &sid).expect("read the DACL"),
+            "the ACE landed on the junction's target: {}",
+            icacls(&real, &[])
+        );
+        assert!(
+            !icacls(&real, &[]).contains(&sid_text),
+            "the target carries no package ACE: {}",
+            icacls(&real, &[])
+        );
+
+        // **The junction's own object is untouched too**, which is the half the old
+        // wildcard-style route could take: a grant that follows the link writes there
+        // instead of nowhere, and the confined child cannot use an ACE on a link
+        // object. A DACL read of the link's own object is what sees it.
+        let internal = has_ace(&link, &sid).expect("read the link's own DACL");
+        assert!(!internal, "nothing was written on the link's object either");
+    }
+
+    /// **The file-shaped spec is what actually lands on a file, and the inherited
+    /// form is the silent no-op the design's evidence row records** — decision 22's
+    /// rule is the first time this crate puts *files* into an exposure set, so the
+    /// two halves of this test are one measurement: what the grant has to be, and
+    /// what it must not be.
+    ///
+    /// The inherited form is run first and asserted to write **nothing**, because
+    /// that is the failure the counter-shape exists to prevent and it is silent:
+    /// `icacls` exits 0 and reports success, so a rule that shipped the directory
+    /// spec for the sibling DLLs would grant nothing and show up as a confined child
+    /// that dies `0xC0000135` with no diagnostic (design decision 22).
+    #[test]
+    fn the_file_shaped_spec_is_what_lands_on_a_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sibling = dir.path().join("sibling.dll");
+        fs::write(&sibling, b"not really a library").expect("write the sibling");
+        let sid = Arc::new(sid_for(dir.path()));
+
+        assert!(
+            !has_ace(&sibling, &sid).expect("read the DACL"),
+            "no package ACE yet"
+        );
+
+        // The directory shape, on a file. The invocation itself succeeds — the tool
+        // exits 0 and reports one file processed — and the ACE is nowhere: this is
+        // the no-op, not an error. A well-known SID is used rather than a derived
+        // package SID because this half is a fact about the tool and the filesystem
+        // rather than about this crate's SID, and it needs no AppContainer profile.
+        let written = dir.path().join("written.txt");
+        fs::write(&written, b"a plain file").expect("write the control");
+        let users = "S-1-5-32-545";
+        let inherited = Command::new(icacls_binary())
+            .arg(&written)
+            .args(["/grant:r", &format!("*{users}:(OI)(CI)M"), "/q"])
+            .output()
+            .expect("run icacls");
+        assert!(
+            inherited.status.success(),
+            "the inherited shape is accepted on a file: {}",
+            String::from_utf8_lossy(&inherited.stderr)
+        );
+        assert!(
+            !icacls(&written, &[]).contains(users),
+            "an inheritance-flagged grant on a file wrote an ACE after all, so the \
+             file-shaped spec below is not what makes a sibling grant land and this \
+             crate's reason for it needs re-measuring (design §6's evidence row): {}",
+            icacls(&written, &[])
+        );
+
+        // The file shape: no `(OI)`/`(CI)`, so the entry is explicit and stays. The
+        // path probe is the crate's own, so this half is the shape this crate
+        // actually writes for the sibling DLLs.
+        grant(&sibling, Target::File, AccessMode::ReadOnly, &sid)
+            .expect("the file shape is accepted on a file");
+        assert!(
+            has_ace(&sibling, &sid).expect("read the DACL"),
+            "the file-shaped grant is what puts an ACE on a file: {}",
+            icacls(&sibling, &[])
+        );
+
+        revoke(&sibling, &sid).expect("take the grant back");
+        assert!(!has_ace(&sibling, &sid).expect("read the DACL"));
+    }
+
+    /// **The sibling set goes on through one invocation, for the SID every container
+    /// already holds** (Ruling 78, decision 22, and the standing follow-up). The
+    /// directory's pattern is the grant the launcher actually makes, and every sibling
+    /// it covers is asserted through the oracle rather than through one path: a batch
+    /// that granted only the first match would leave a confined child that dies
+    /// `0xC0000135` with no diagnostic, which is the failure the counter-shape exists
+    /// to prevent.
+    ///
+    /// The SID is [`ALL_APPLICATION_PACKAGES`] rather than this root's, which is the
+    /// half that makes a new root cost nothing: the program directory does not change
+    /// between roots, so its grant cannot either. The ACE is never taken back, so the
+    /// assertion is that it is still there afterwards.
+    #[test]
+    fn the_sibling_batch_grants_every_dll_for_all_application_packages() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let siblings: Vec<PathBuf> = ["one.dll", "two.dll", "three.dll"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                fs::write(&path, b"not really a library").expect("write the sibling");
+                path
+            })
+            .collect();
+        let sid = Arc::new(sid_for(dir.path()));
+
+        // The precondition that makes the assertion below mean the batch ran: this
+        // temp tree does not already carry the standing SID, so its presence after the
+        // call is the call's doing. A host whose temp parent chain already inherits
+        // ALL APPLICATION PACKAGES fails here — which is the honest reading, because
+        // the grant would then have been skipped as already satisfied.
+        for sibling in &siblings {
+            assert!(
+                !mentions_sid(&icacls(sibling, &[]), ALL_APPLICATION_PACKAGES),
+                "the fixture already carries the standing SID on {}: {}",
+                sibling.display(),
+                icacls(sibling, &[])
+            );
+        }
+
+        let mut grants = Grants::new(Arc::clone(&sid));
+        assert!(
+            grants
+                .apply_siblings(&SiblingScan::scan(dir.path()), AccessMode::ReadOnly)
+                .expect("one batched grant"),
+            "the directory holds siblings, so the grant ran"
+        );
+        for sibling in &siblings {
+            assert!(
+                mentions_sid(&icacls(sibling, &[]), ALL_APPLICATION_PACKAGES),
+                "the batch granted {} for {ALL_APPLICATION_PACKAGES}: {}",
+                sibling.display(),
+                icacls(sibling, &[])
+            );
+        }
+
+        // Standing: dropping the guard takes nothing back.
+        drop(grants);
+        for sibling in &siblings {
+            assert!(
+                mentions_sid(&icacls(sibling, &[]), ALL_APPLICATION_PACKAGES),
+                "the batch grant is standing on {}: {}",
+                sibling.display(),
+                icacls(sibling, &[])
+            );
+        }
+    }
+
+    /// A directory with no sibling is a grant of nothing: no `icacls` invocation and
+    /// no pattern handed to the tool. **An unmatched pattern is an error rather than a
+    /// no-op** (measured 2026-09-21), so this is the negative that keeps a grant on a
+    /// DLL-less directory from reporting success.
+    #[test]
+    fn a_directory_with_no_sibling_grants_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("notes.txt"), b"not a library").expect("write a non-DLL");
+        let sid = Arc::new(sid_for(dir.path()));
+
+        let mut grants = Grants::new(Arc::clone(&sid));
+        assert!(
+            !grants
+                .apply_siblings(&SiblingScan::scan(dir.path()), AccessMode::ReadOnly)
+                .expect("nothing to grant"),
+            "no sibling means no grant"
         );
     }
 }

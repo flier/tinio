@@ -36,6 +36,23 @@
 //! child that went through `job::spawn` could not tell that apart from an assignment after the
 //! fact.
 //!
+//! **A second hole arrived by move rather than by design.** The two relay legs retired
+//! `crates/tinio-sandbox-macos/tests/relay.rs` into the inline tests beside the `on_stop` and
+//! `disarm` they exercise, so their two `/bin/sh` stand-ins left this scan's scope with them: the
+//! placement rule (a unit test lives beside its subject, 2026-10-01) put them in a `#[cfg(test)]`
+//! module in `src/`, which this scan does not read by construction. The allowlist entry that used
+//! to carry them went with the file, and there is no site left for it to count.
+//!
+//! **The Windows harness left the same way, and its sites are still guarded.** The placement
+//! cleanup promoted `crates/tinio-sandbox-windows/tests/common/` into
+//! `crates/tinio-sandbox-windows/src/testing.rs` behind the crate's `testing` feature, so the
+//! harness's two spawn sites — `spawn_launcher` and `spawn_unrelayed_child_in_own_group`, both
+//! `job::spawn` calls — now sit in `src/` and left this scan's scope with the move. They are
+//! **not** allowlist holes: each takes the guard, which is why no entry carries them, and a raw
+//! spawn that appears there would earn an entry a scanning gate could no longer see. What the
+//! move cost is this gate's sight of them, and this sentence is the record the placement rule
+//! asks for (the relay half is the paragraph above).
+//!
 //! **The allowlist is a list of holes with reasons, not a shelf of exceptions.** Every site that
 //! can take the guard takes it; a file is listed only where taking it is impossible or unmeasured,
 //! and the count in its entry is what keeps the permission from outliving its site.
@@ -76,14 +93,6 @@ const ALLOWED: &[(&str, usize, &str)] = &[
          (`#![cfg(target_os = \"macos\")]` makes every target here an empty crate off a Mac), so a \
          rewrite would be asserted rather than measured — the thing this workspace's rule about the \
          gated crates forbids. Converting it on a Mac is the follow-up this entry is waiting for.",
-    ),
-    (
-        "crates/tinio-sandbox-macos/tests/relay.rs",
-        2,
-        "the two `/bin/sh -c 'sleep 30'` stand-ins the relay legs signal in place of a launcher — \
-         the comment beside them says so, and the real one is exercised by the crate's \
-         end-to-end run. The same macOS-only entry as the harness above, for the same reason: no \
-         mechanism to take on this platform, no compiler for this crate on this host.",
     ),
 ];
 

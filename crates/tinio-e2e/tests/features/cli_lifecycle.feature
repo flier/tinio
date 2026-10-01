@@ -30,6 +30,16 @@ Feature: CLI lifecycle
     Then the run fails with exit code 2
     And its stderr is not empty
 
+  # The same class one level down: a bare `tinio` has no subcommand, and this one has an
+  # argument clap does not know. Both are `Error::Usage`, exit 2, and the text names the
+  # invocation (`serve_read_only.rs`'s unknown-argument leg used to hold this).
+  @cli
+  Scenario: An unknown argument is a usage error
+    Given a storage root
+    When I run "tinio server {root} --not-a-flag"
+    Then the run fails with exit code 2
+    And its stderr contains "Usage: tinio server"
+
   @cli @FR-016
   Scenario: The environment supplies a flag
     Given a storage root

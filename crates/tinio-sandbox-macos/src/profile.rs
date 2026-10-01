@@ -461,11 +461,13 @@ pub fn rule_count(text: &str) -> usize {
 /// on the network — **the one home of that property**, because it is one security
 /// property and it was asserted in two places.
 ///
-/// Two legs assert it: this module's `the_profile_grants_no_network_operation_at_all`
-/// and `tests/network.rs`'s `the_profile_grants_no_network_operation`. Their bodies
-/// were byte-identical — the same four spellings and the same check over the same
-/// render — so a keyword added to one left the other green, which is the drift this
-/// function removes: both legs read this table, and the table is the whole surface.
+/// One leg asserts it: this module's `the_profile_grants_no_network_operation_at_all`.
+/// A second, byte-identical leg in `tests/network.rs` — the same four spellings and
+/// the same check over the same render — is gone: a keyword added to one left the
+/// other green, which is the drift this function removes, and the 2026-10-01 placement
+/// cleanup deleted the copy the move had already made redundant
+/// (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`). The leg reads this
+/// table, and the table is the whole surface.
 ///
 /// **What is checked is each line's rule and not its provenance comment**, which is
 /// the half of this promise the first version did not keep. A rendered line is

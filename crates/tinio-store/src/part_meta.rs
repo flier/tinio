@@ -65,3 +65,28 @@ impl<'txn> table::Table<'txn, Def> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::handle;
+
+    #[test]
+    fn part_meta_rows_round_trip_size_and_mtime() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut pm = Table::open(txn)?;
+            pm.put("data", "u1", 1, 2, 100)?;
+            pm.put("data", "u1", 2, 4, 200)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let pm = Table::open_readonly(txn)?;
+            assert_eq!(pm.get("data", "u1", 1)?, Some((2, 100)));
+            assert!(pm.get("data", "u1", 9)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+}

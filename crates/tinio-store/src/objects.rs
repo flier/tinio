@@ -59,3 +59,33 @@ impl<'txn> table::Table<'txn, Def> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::handle;
+
+    #[test]
+    fn objects_put_get_remove_and_has_bucket() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            assert!(!t.has_bucket("data")?);
+            t.put("data", "a.txt", b"hello")?;
+            t.put("data", "b.txt", b"world")?;
+            assert!(t.has_bucket("data")?);
+            assert!(!t.has_bucket("other")?);
+            t.remove("data", "a.txt")?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            assert!(t.get("data", "a.txt")?.is_none());
+            let guard = t.get("data", "b.txt")?.expect("present");
+            assert_eq!(guard.value(), b"world");
+            Ok(())
+        })
+        .unwrap();
+    }
+}

@@ -747,11 +747,42 @@ pub fn launch(spec: &LaunchSpec<'_>, container: &Container) -> Result<LaunchedPr
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path};
+    //! The `CreateProcessW` entry in both halves: the command line it builds
+    //! (observed through the parser the child's own runtime uses), and the
+    //! container it launches into.
+    //!
+    //! **Four container legs moved here from `tests/launch.rs` on 2026-10-01**
+    //! (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`): their
+    //! subject is the `CreateProcessW` entry itself — the whitelist's effect on a
+    //! real child, the two causes `ERROR_FILE_NOT_FOUND` reports, a program path
+    //! that does not exist, and the empty capability set — so they belong beside
+    //! the function they drive by hand rather than through `Backend::confine`.
+    //!
+    //! **The child is this binary's `testing::tests::child_role`**
+    //! ([`crate::testing::CHILD_ROLE`]): a unit test's `env::current_exe()` is the
+    //! libtest binary, and the harness's role is the one that reads the probe and
+    //! writes the report these legs assert on. The role's own body is the
+    //! harness's; what is asserted here is the launch.
+
+    use std::{
+        env,
+        ffi::OsString,
+        net::TcpListener,
+        os::windows::ffi::OsStringExt,
+        path::Path,
+    };
 
     use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
 
+    use tinio_sandbox_core::{AccessMode, LaunchPayload};
+
     use super::*;
+    use crate::{
+        acl::{self, Target},
+        launch,
+        socket,
+        testing::{CHILD_ROLE, Tree, answer, one_volume, sid_for, tree},
+    };
 
     /// Parse `line` with the API the child's own runtime uses.
     fn parse(line: &[u16]) -> Vec<String> {
@@ -873,5 +904,303 @@ mod tests {
     fn the_command_line_is_nul_terminated() {
         let line = command_line(Path::new(r"C:\s.exe"), &[]);
         assert_eq!(line.last(), Some(&0));
+    }
+
+    #[test]
+    fn a_rust_binary_runs_inside_the_container_and_the_whitelist_holds() {
+        // The harness's tree, seeds and `Users` ACE, because they are the same ones
+        // this test used to spell out: `denied` carries `Users` and no package-SID
+        // ACE, which is the verified row this test reproduces.
+        let (_dir, tree) = tree(&one_volume());
+        let probe = tree.probe();
+
+        // **This is where the launch-succeeds assertion lives.** Two failures reach
+        // it with the same symptom — `CreateProcessW` refusing a program path that
+        // plainly exists — and this is the order to check them in: the ACE on the
+        // launcher's own directory first (the confined child's own reads are checked
+        // against its package SID, and the binary's siblings are what it may need to
+        // load), then the profile behind the SID, because a merely derived SID fails
+        // `err=2 ERROR_FILE_NOT_FOUND` on a machine where this profile never existed
+        // — which is every fresh machine — and it does so identically for this binary
+        // and for `cmd.exe`, with or without the ACEs already granted.
+        //
+        // **The first of those two is not what made this test fail, and the run that
+        // settled that is recorded here** (2026-09-21): with the launcher's directory
+        // ungranted — `acl::has_ace(dir)` and `acl::has_ace(exe)` both `false` — the
+        // confined child still launched and ran this test's assertions, because
+        // `CreateProcessW` opens the image with the *launcher's* access rather than
+        // the child's. What the grant buys is what the child opens for itself, which
+        // is why decision 22 keeps it; what it does not buy is the launch.
+        let sid = sid_for(&tree);
+        // The launcher's own directory, read-only: Task 3's `exposures()` adds
+        // exactly this path, first of all, and this test grants by hand because it
+        // drives `launch` itself rather than going through `Backend::confine`,
+        // which is what would have added that exposure for it.
+        let program = env::current_exe().expect("current exe");
+        let launcher_dir = program
+            .parent()
+            .expect("the launcher's directory")
+            .to_path_buf();
+        acl::grant(&tree.root, Target::Directory, AccessMode::ReadOnly, &sid)
+            .expect("grant the root");
+        acl::grant(&launcher_dir, Target::Directory, AccessMode::ReadOnly, &sid)
+            .expect("grant the launcher's own directory");
+        acl::grant(&tree.report, Target::Directory, AccessMode::ReadWrite, &sid)
+            .expect("grant the report dir");
+
+        // The child's stdin carries the payload and its stdout carries the event
+        // stream (decisions 17, 19); its listener is handed over by the argv element.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("the listener's address");
+        socket::mark_inheritable(&listener).expect("mark the listener inheritable");
+        let mut payload_pipe = handles::pipe().expect("the child's stdin");
+        let mut event_pipe = handles::pipe().expect("the event pipe");
+        // `command_args` puts the listener element first and the launcher's own
+        // arguments after it (Task 7 fixes the rule, and Task 9's `confine` states
+        // the same one from the launcher's end), so the child's argv is `<program>
+        // tinio-sandbox-fd=<handle> testing::tests::child_role --exact`. libtest
+        // meets the element exactly as a test runner meets any unrecognised argument
+        // — a second positional filter, which with `--exact` matches no test — and
+        // the role is the one test that runs (measured, by running this binary with
+        // the child's own argv).
+        let args = launch::command_args(
+            socket::handle(&listener),
+            &[],
+            &[OsString::from(CHILD_ROLE), OsString::from("--exact")],
+        );
+        // The frame is the core's `encode_frame`'s — the payload derives no
+        // `Serialize` — and the configuration it carries is the probe file's path,
+        // which is what the child role reads back out of the payload.
+        let frame = LaunchPayload::encode_frame(&probe.to_string_lossy(), None, None)
+            .expect("the frame is one JSON object");
+        handles::write_payload(&mut payload_pipe, &frame)
+            .expect("write the frame into the child's stdin");
+        let stderr = handles::inherited_stderr().expect("the launcher's stderr");
+
+        let mut launched = launch(
+            &LaunchSpec {
+                program: &program,
+                args: &args,
+                stdin: payload_pipe.read().expect("the payload pipe's read end"),
+                stdout: event_pipe.write().expect("the event pipe's write end"),
+                stderr,
+                inherited: &[socket::handle(&listener)],
+            },
+            &Container {
+                package_sid: sid.raw(),
+                capabilities: CapabilitySids::resolve(&[]).expect("no capabilities"),
+            },
+        )
+        .expect("launch inside the container");
+        // The child's own ends are `CreateProcessW`'s to duplicate into the child,
+        // and leaving this process's copies open is a hang rather than a leak: with
+        // the event pipe's write end still open here, the child's stdout never
+        // reaches end-of-stream (`handles::parent_end`'s rule, and what the launch
+        // site of Task 9 does at this same point).
+        payload_pipe.close_read();
+        event_pipe.close_write();
+        // **The child's last act is the `accept()` on the listener it inherited, so
+        // answering it is what lets this test wait for the child at all**: a test
+        // that only waited would be waiting for a process that is waiting for the
+        // test. The connect and the read are bounded, like every other wait in this
+        // suite (Task 6's rule), so a child that died before its handshake fails here
+        // with that reason rather than hanging the harness.
+        answer(address);
+        let status = launched.wait().expect("wait");
+
+        let report = tree.report_text();
+        acl::revoke(&tree.root, &sid).expect("take the grant back");
+        acl::revoke(&launcher_dir, &sid).expect("take the grant back");
+        acl::revoke(&tree.report, &sid).expect("take the grant back");
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the confined child exited non-zero: {report}"
+        );
+        assert!(report.contains("granted-read: OK"), "{report}");
+        // The harness renders the failure with `ErrorKind`'s `Display`, which is the
+        // lowercase description: a read that the package SID does not hold is a
+        // permission denial and nothing else.
+        assert!(
+            report.contains("denied-read: refused (permission denied)"),
+            "{report}"
+        );
+    }
+
+    /// **The misdiagnosis the measured window produced, as an assertion on the
+    /// error**: `ERROR_FILE_NOT_FOUND` has two causes here, and the raw code cannot
+    /// tell an operator which one they have.
+    ///
+    /// `CreateProcessW` answers it for a program that is *there* when the
+    /// AppContainer profile behind the launch's package SID is gone — measured on
+    /// this host 2026-09-21 for this crate's own binary and for `cmd.exe` alike, and
+    /// reproduced 2026-09-26 while a peer launcher's exit deleted a live
+    /// `PackageSid`'s profile — so an error that only repeated the code sent the
+    /// operator after a binary that was never missing. The two states are built here
+    /// the way the measurements built them: one value creates the profile, a second
+    /// takes it over, and the creator's exit deletes it, leaving the survivor holding
+    /// a SID whose profile is gone (the container half); and a path under a directory
+    /// that exists whose file does not (the file half).
+    #[test]
+    fn the_file_not_found_code_says_which_of_its_two_causes_it_had() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tree = Tree::at(dir.path());
+        let creator = sid_for(&tree);
+        let survivor = sid_for(&tree);
+        drop(creator);
+
+        let program = env::current_exe().expect("current exe");
+        assert!(
+            program.is_file(),
+            "this test's whole point is a program that is there: {}",
+            program.display()
+        );
+        let container = Container {
+            package_sid: survivor.raw(),
+            capabilities: CapabilitySids::resolve(&[]).expect("no capabilities"),
+        };
+        // Qualified to the parent module on purpose: the closure's own name is
+        // `launch`, and an unqualified call would be a call to itself.
+        let launch = |program: &Path| {
+            super::launch(
+                &LaunchSpec {
+                    program,
+                    args: &[],
+                    stdin: ptr::null_mut(),
+                    stdout: ptr::null_mut(),
+                    stderr: ptr::null_mut(),
+                    inherited: &[],
+                },
+                &container,
+            )
+            .expect_err("a SID whose profile is gone cannot launch")
+        };
+
+        // The container half: the file is there, the profile is not.
+        let rendered = launch(&program).to_string();
+        assert!(rendered.contains("CreateProcessW"), "{rendered}");
+        assert!(
+            rendered.contains("the program file is there"),
+            "the error must say the file was not what was missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("profile"),
+            "the error must name the container rather than leave the operator \
+             chasing a program that exists: {rendered}"
+        );
+
+        // The file half: the same code, a program that really is not there.
+        let missing = dir.path().join("no-such-program.exe");
+        assert!(!missing.exists(), "{}", missing.display());
+        let rendered = launch(&missing).to_string();
+        assert!(
+            rendered.contains("the program file was not found"),
+            "the error must say the file was what was not found: {rendered}"
+        );
+        assert!(
+            !rendered.contains("profile"),
+            "the file is missing, so nothing here is about the container: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_bad_program_path_is_an_error_naming_the_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The harness's derivation, over a directory that exists to make the package
+        // name this run's own and nothing else: `Tree::at` is lexical, so no tree is
+        // created under it.
+        let sid = sid_for(&Tree::at(dir.path()));
+        let err = launch(
+            &LaunchSpec {
+                program: Path::new(r"E:\does-not-exist\tinio-serve.exe"),
+                args: &[],
+                // The standard handles are never reached — `CreateProcessW` fails on
+                // the program path first — and a null handle is the honest value for
+                // a launch that never got that far.
+                stdin: ptr::null_mut(),
+                stdout: ptr::null_mut(),
+                stderr: ptr::null_mut(),
+                inherited: &[],
+            },
+            &Container {
+                package_sid: sid.raw(),
+                capabilities: CapabilitySids::resolve(&[]).expect("no capabilities"),
+            },
+        )
+        .expect_err("a missing program must fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("CreateProcessW"), "{rendered}");
+        assert!(rendered.contains("does-not-exist"), "{rendered}");
+        // **This path fails with `ERROR_PATH_NOT_FOUND` (3), not
+        // `ERROR_FILE_NOT_FOUND` (2)** — the *directory* is what is missing, and the
+        // kernel says so — so the crate passes the code through as it arrives and
+        // nothing here is about the container (`the_file_not_found_code_says_which_
+        // of_its_two_causes_it_had` is the test that pins the ambiguous code).
+        assert!(
+            !rendered.contains("profile"),
+            "the path is missing, so nothing here is about the container: {rendered}"
+        );
+    }
+
+    /// The default capability set — none at all — gets a test of its own, because it
+    /// is the configuration design §7's outbound guarantee rests on and because its
+    /// value in the attribute list is easy to get wrong in a way nothing else
+    /// catches: an empty `CapabilitySids` whose `as_ptr()` is passed as it stands is
+    /// a **dangling non-null** pointer, and `CreateProcessW` refuses the whole
+    /// launch with `err=87` (`ERROR_INVALID_PARAMETER`) rather than reporting
+    /// anything about capabilities (measured 2026-09-21; null is the value for no
+    /// capabilities). The child here is this test binary with a filter that matches
+    /// no test, so "the launch succeeded" is the entire assertion —
+    /// `a_rust_binary_runs_inside_the_container_and_the_whitelist_holds` uses the
+    /// empty set too, but its subject is the whitelist rather than the default.
+    #[test]
+    fn the_empty_capability_set_launches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // As above: a name source, through the harness's derivation.
+        let sid = sid_for(&Tree::at(dir.path()));
+        let program = env::current_exe().expect("current exe");
+        // The production exposure set's first entry, so this launches the way the
+        // launcher does (decision 22, Task 3's `exposures()`).
+        let launcher_dir = program
+            .parent()
+            .expect("the launcher's directory")
+            .to_path_buf();
+        acl::grant(&launcher_dir, Target::Directory, AccessMode::ReadOnly, &sid)
+            .expect("grant the launcher's directory");
+        let mut stdin = handles::pipe().expect("the child's stdin");
+        let mut stdout = handles::pipe().expect("the child's stdout");
+        let stderr = handles::inherited_stderr().expect("the launcher's stderr");
+
+        let mut launched = launch(
+            &LaunchSpec {
+                program: &program,
+                // No listener element, so `adopt` reads nothing in the child, and
+                // libtest's filter matches no test: it exits 0 having run none.
+                args: &[
+                    OsString::from("--exact"),
+                    OsString::from("no_such_test_runs_here"),
+                ],
+                stdin: stdin.read().expect("the payload pipe's read end"),
+                stdout: stdout.write().expect("the event pipe's write end"),
+                stderr,
+                inherited: &[],
+            },
+            &Container {
+                package_sid: sid.raw(),
+                capabilities: CapabilitySids::resolve(&[]).expect("the default: no capabilities"),
+            },
+        )
+        .expect("the default capability set launches");
+        stdin.close_read();
+        stdout.close_write();
+        let status = launched.wait().expect("wait");
+        acl::revoke(&launcher_dir, &sid).expect("take the grant back");
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the confined child did not exit cleanly with no capability"
+        );
     }
 }

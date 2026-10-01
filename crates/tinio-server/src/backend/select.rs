@@ -1145,9 +1145,9 @@ mod tests {
         assert_eq!(err.status_code().unwrap().as_u16(), 400, "{err:?}");
     }
 
-    /// The committed fixture `tinio-select`'s integration test reads and
-    /// asserts (`crates/tinio-select/tests/parquet.rs`; regenerate with its
-    /// ignored generator). Both layers embed the same file, so they cannot
+    /// The committed fixture `tinio-select`'s own unit tests read and
+    /// assert (`crates/tinio-select/src/parquet.rs`, inline `tests` module;
+    /// regenerate with its ignored generator). Both layers embed the same file, so they cannot
     /// drift onto different fixtures.
     #[cfg(feature = "select-parquet")]
     const PARQUET_FIXTURE: &[u8] =

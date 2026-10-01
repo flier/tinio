@@ -69,3 +69,99 @@ impl<'txn> table::Table<'txn, Def> {
         drain_pair(&mut self.0, (bucket, ""), |b, _| b == bucket)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        _core::checksum::{Algorithm, Type as ChecksumType, Upload},
+        testutil::handle,
+    };
+
+    #[test]
+    fn upload_checksum_rows_round_trip_and_replace_the_type() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut uc = Table::open(txn)?;
+            assert!(uc.get("data", "u1")?.is_none());
+            uc.put(
+                "data",
+                "u1",
+                &Upload {
+                    algorithm: Algorithm::Crc32,
+                    r#type: Some(ChecksumType::FullObject),
+                },
+            )?;
+            uc.put(
+                "data",
+                "u1",
+                &Upload {
+                    algorithm: Algorithm::Crc32,
+                    r#type: None,
+                },
+            )?; // upsert replaces the type
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let uc = Table::open_readonly(txn)?;
+            assert_eq!(
+                uc.get("data", "u1")?,
+                Some(Upload {
+                    algorithm: Algorithm::Crc32,
+                    r#type: None,
+                })
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn upload_checksum_accessors_round_trip_and_self_heal() {
+        let h = handle();
+        let spec = Upload {
+            algorithm: Algorithm::Sha256,
+            r#type: Some(ChecksumType::FullObject),
+        };
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            assert!(t.get("data", "u1")?.is_none());
+            t.put("data", "u1", &spec)?;
+            assert_eq!(t.get("data", "u1")?, Some(spec.clone()));
+            t.put(
+                "data",
+                "u1",
+                &Upload {
+                    algorithm: Algorithm::Sha256,
+                    r#type: None,
+                },
+            )?;
+            assert_eq!(
+                t.get("data", "u1")?,
+                Some(Upload {
+                    algorithm: Algorithm::Sha256,
+                    r#type: None,
+                })
+            );
+            Ok(())
+        })
+        .unwrap();
+        // A garbage spec wire self-heals on the table accessor.
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?
+                .insert(("data", "u1"), ("BLAKE3", ""))
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert!(
+                Table::open_readonly(txn)?.get("data", "u1")?.is_none(),
+                "a corrupt upload checksum wire is no spec"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+}

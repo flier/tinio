@@ -23,12 +23,17 @@
 
 #![cfg(target_os = "windows")]
 
-mod common;
+// **The harness is the library's now** (`tinio_sandbox_windows::testing`), and
+// this binary keeps its own top-level `child_role` and `launcher_role` shims —
+// the names the harness spawns here, because the lib linked into an integration
+// target is compiled without `cfg(test)`
+// (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
+use tinio_sandbox_windows::testing as common;
 
 use std::{
-    env, fs,
+    fs,
     path::Path,
-    process::{self, Child, Stdio},
+    process::{Child, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -59,18 +64,16 @@ fn launcher_role() {
 
 /// The child role: the stop hook, and a beat while it waits.
 ///
-/// Two ways in, one body. The confined child reads the probe file its launcher
-/// wrote (the payload, design decision 17); the unrelayed control case — a
-/// process this suite spawns directly, with nothing relaying to it — is handed
-/// the same file's path in the environment. A process with neither is the
-/// launcher, and plays no role at all.
+/// Two ways in, one body — the dispatch is [`common::child_role_entry`]'s, shared
+/// with the library's own entry point so the two cannot drift. The confined child
+/// reads the probe file its launcher wrote (the payload, design decision 17); the
+/// unrelayed control case — a process this suite spawns directly, with nothing
+/// relaying to it — is handed the same file's path in the environment. A process
+/// with neither is the launcher, and plays no role at all. The half installed
+/// here is the stop-hook variant, which is this suite's subject.
 #[test]
 fn child_role() {
-    if let Ok(probe) = env::var("TINIO_SANDBOX_TEST_PROBE") {
-        let probe = fs::read_to_string(&probe).expect("read the probe file");
-        common::unrelayed_child_role(&probe);
-    }
-    common::child_role_with_stop_hook();
+    common::child_role_entry(common::child_role_with_stop_hook);
 }
 
 /// A process this suite started, and owns.
@@ -273,25 +276,4 @@ fn the_stop_reaches_the_group_it_addresses_and_reaches_no_other() {
     );
     // Spawned by this suite, reaped by it (the beat never ends on its own).
     other.stop();
-}
-
-/// `arm` then `disarm`, in the process that runs the tests.
-///
-/// The round trip is the whole of what this asserts, and it is worth asserting
-/// because both calls report a refusal: an `arm` that cannot install the console
-/// handler and a `disarm` that cannot remove it are the two failures a process
-/// that outlives one launch would meet. What it cannot assert is the disposition
-/// `disarm` restores — witnessing that takes an event, and the only process whose
-/// death could witness it here is this one, which has to stay alive long enough to
-/// report the result.
-#[test]
-fn the_relay_arms_and_disarms_in_this_process() {
-    // Armed for this process itself: a live id rather than a placeholder, so
-    // nothing in the call is invented. **It is not a group id** — this test
-    // process was started without `CREATE_NEW_PROCESS_GROUP`, so the forward the
-    // handler would make is refused by the system (`ERROR_INVALID_PARAMETER`)
-    // rather than signalled to anybody, and the handler is installed for the
-    // length of one call besides.
-    control::arm(process::id()).expect("arm the relay");
-    control::disarm().expect("disarm the relay");
 }

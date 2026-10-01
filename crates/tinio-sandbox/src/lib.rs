@@ -906,3 +906,184 @@ pub use crate::_windows as windows;
 /// ```
 #[cfg(target_os = "windows")]
 pub use crate::_windows::backend as platform;
+
+#[cfg(test)]
+mod tests {
+    //! The facade's own logic, tested at the file that defines it: the backend this
+    //! build selects resolves to a value, the platform selection resolves to a real
+    //! backend, the target backend names its own enforcement, and the child-side
+    //! self-confinement step answers what the platform can and cannot apply.
+    //!
+    //! **The re-export list stays in `tests/facade.rs`**, and that is the boundary's
+    //! whole point: it binds the public `tinio_sandbox::` paths on purpose, so a name
+    //! that stopped being re-exported — or that was narrowed from `pub` to
+    //! crate-visibility — fails there, while a module inside this file could not
+    //! catch it.
+
+    /// The mechanism's own vocabulary through the facade's `macos` alias — the same
+    /// module `tinio_sandbox::macos::…` names from outside, bound here for the
+    /// default-mechanism leg below.
+    #[cfg(target_os = "macos")]
+    use crate::macos::{Mechanism, Options};
+
+    use super::*;
+
+    #[test]
+    fn the_facade_resolves_exactly_one_backend() {
+        let mut backend = platform();
+        // Confining an empty sandbox is allowed to fail for any platform-specific
+        // reason; what this asserts is that the call reaches a real backend rather
+        // than failing to compile or panicking on a missing selection.
+        let result = backend.confine(&Sandbox::new(), &LaunchPlan::new());
+        match result {
+            Ok(_) => {}
+            Err(err) => assert!(!err.to_string().is_empty()),
+        }
+    }
+
+    /// **Every backend names the strength of its own mechanism, and this is where the one this
+    /// build selected is pinned** — `diagnostics()` is the target backend's constant, reached the
+    /// way `platform_facts()` reaches the facts.
+    ///
+    /// **Why the value is `Full` on all three, and why the assertion is written against the
+    /// selection rather than a list of platforms**: Linux's in-place jail, macOS's Seatbelt and
+    /// Windows' AppContainer each apply the whole guarantee this build's contract claims for them,
+    /// so the expected answer is the same on every target a backend exists for. A backend that
+    /// stopped answering would read `NotReported` here — the value that is no claim about a
+    /// mechanism — and this test is where that would fail. The per-platform half — that *this*
+    /// crate's constant is `Full` — is asserted in each crate's own doctest, which only its own
+    /// platform compiles.
+    #[test]
+    fn the_target_backend_names_its_enforcement() {
+        let expected = if backend_available() {
+            Enforcement::Full
+        } else {
+            // A target this build wires no backend for has nothing to answer with, and
+            // `NotReported` is that answer rather than a claim about a mechanism.
+            Enforcement::NotReported
+        };
+        assert_eq!(
+            diagnostics().enforcement,
+            expected,
+            "the selected backend answers for its own mechanism"
+        );
+    }
+
+    /// **The Linux selection resolves to the in-process backend, and this leg is where that is
+    /// pinned** — `platform()` is the alias the crate root binds to `tinio_sandbox_linux`'s own
+    /// `backend` on this target alone.
+    ///
+    /// **Not executed on the host this move was made on (Windows)**: the `#[cfg]` below is the
+    /// whole reason — a `--target <platform> --tests` check type-checks it, and nothing here runs
+    /// it (`plans/2026-10-01-test-placement-cleanup.md`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_selects_the_in_process_backend() {
+        // An empty sandbox has nothing to confine to, so Linux refuses — which is
+        // itself the proof that the Linux backend is the one wired in.
+        let mut backend = platform();
+        let err = backend
+            .confine(&Sandbox::new(), &LaunchPlan::new())
+            .expect_err("an empty sandbox must be refused");
+        assert!(err.to_string().contains("nothing exposed"), "{err}");
+    }
+
+    /// **macOS alone, until P3's backend landed — and the assertion is now the opposite one.** The
+    /// Windows composition landed in P2's Task 9 and this test left that platform the moment its
+    /// backend stopped answering `Unsupported`; P3's macOS composition has now landed, so the same
+    /// thing is true here. What is asserted is the *composition* rather than a launch: a backend that
+    /// reaches `confine` at all has replaced the stub, and an exposure it cannot express is the one
+    /// refusal this call can produce without spawning `sandbox-exec` (a tree with no `sandbox-exec`
+    /// answers `Unsupported`, which would make the assertion below vacuous).
+    ///
+    /// **Not executed on the host this move was made on (Windows)**: the `#[cfg]` below is the
+    /// whole reason — a `--target <platform> --tests` check type-checks it, and nothing here runs
+    /// it (`plans/2026-10-01-test-placement-cleanup.md`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_selects_a_launcher_backend_rather_than_the_stub() {
+        let mut backend = platform();
+        let err = backend
+            .confine(
+                &Sandbox::new().expose("relative/path", AccessMode::ReadOnly),
+                &LaunchPlan::new(),
+            )
+            .expect_err("a relative exposure cannot be expressed in a profile");
+        assert!(
+            matches!(err, Error::BadPath { .. }),
+            "the macOS backend validates its exposures: {err}"
+        );
+        assert!(
+            !err.to_string().contains("not implemented"),
+            "the stub is gone: {err}"
+        );
+    }
+
+    /// **The backend this facade builds is the default one, and the default mechanism is
+    /// `sandbox-exec`** — the one every allowance was measured against and the one a run that
+    /// sets no variable gets. An `Options::default`, or a `Mechanism::from_env` whose absent
+    /// answer, that named the other mechanism fails here rather than in a launch.
+    ///
+    /// **The other half of the pair stays in `tests/facade.rs`**: reaching `Options`/`Mechanism`
+    /// through the published `tinio_sandbox::macos::…` path is that boundary's subject, while the
+    /// defaults asserted here are this module's. The alias is spelled `crate::macos` above, which
+    /// is the same re-export seen from inside.
+    ///
+    /// **Not executed on the host this move was made on (Windows)**: the `#[cfg]` below is the
+    /// whole reason — a `--target <platform> --tests` check type-checks it, and nothing here runs
+    /// it (`plans/2026-10-01-test-placement-cleanup.md`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publishes_the_mechanism_and_defaults_to_the_helper() {
+        assert_eq!(Options::default().mechanism(), Mechanism::SandboxExec);
+        assert_eq!(
+            Mechanism::from_env(None).expect("absent means the default"),
+            Mechanism::SandboxExec
+        );
+        assert_eq!(
+            Mechanism::from_env(Some("sandbox-init")).expect("the alternative"),
+            Mechanism::SandboxInit
+        );
+    }
+
+    /// **The self-confinement step answers one shape on every platform, and refuses what the platform
+    /// cannot apply** — the child-side rule the contract owns, pinned the way
+    /// `the_adopted_names_answer_one_error_type` (in `tests/facade.rs`) pins the adopted names: a
+    /// `fn`-pointer binding at the shared [`Result`], so a platform arm that went back to its own
+    /// error type stops compiling here rather than in a launch nobody runs on this host.
+    ///
+    /// **The frame is one macOS cannot have been handed, and that is deliberate.** `sandbox-exec`
+    /// confines the child's `exec`, so a launcher that resolved it never puts a profile on the frame:
+    /// the refusal is that disagreement between the two processes, and the apply is never reached. A
+    /// frame this build would really apply is not a case this test can hold — the apply is one-shot
+    /// and irreversible, so driving it here would confine the test binary and every leg after it.
+    ///
+    /// **The no-op half is the other side of the rule**, and it is what every ordinary run takes: a
+    /// frame carrying no confinement is nothing to apply on any platform.
+    #[test]
+    fn the_self_confinement_step_refuses_what_the_platform_cannot_apply() {
+        let _: fn(&Adopted) -> Result<Option<Applied>> = apply_self_confinement;
+
+        let plain = Adopted::new(String::new(), Some(7), Vec::new(), None, None);
+        assert_eq!(
+            apply_self_confinement(&plain).expect("no confinement to apply"),
+            None,
+            "a frame that carries none is a no-op everywhere"
+        );
+
+        let framed = Adopted::new(
+            String::new(),
+            Some(7),
+            Vec::new(),
+            None,
+            Some(SandboxSpec {
+                mechanism: String::from("sandbox-exec"),
+                profile: String::new(),
+                params: Vec::new(),
+            }),
+        );
+        let err = apply_self_confinement(&framed)
+            .expect_err("a frame this process cannot apply is refused, never served");
+        assert!(!err.to_string().is_empty(), "{err}");
+    }
+}

@@ -99,3 +99,117 @@ impl<'txn> table::Table<'txn, Def> {
         drain_triple(&mut self.0, (bucket, "", 0), |b, _, _| b == bucket)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        _core::checksum::{Algorithm, Part, Value},
+        testutil::handle,
+    };
+
+    #[test]
+    fn object_part_rows_list_in_order_and_remove_key() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            t.put(
+                "data",
+                "big.bin",
+                &Stored {
+                    part_number: 1,
+                    size: 100,
+                    checksum: Some(Part {
+                        algorithm: Algorithm::Crc32,
+                        value: Value("AA==".into()),
+                    }),
+                },
+            )?;
+            t.put(
+                "data",
+                "big.bin",
+                &Stored {
+                    part_number: 2,
+                    size: 200,
+                    checksum: None,
+                },
+            )?;
+            t.put(
+                "data",
+                "big.bin",
+                &Stored {
+                    part_number: 3,
+                    size: 50,
+                    checksum: Some(Part {
+                        algorithm: Algorithm::Sha256,
+                        value: Value("BB==".into()),
+                    }),
+                },
+            )?;
+            t.put(
+                "data",
+                "other.bin",
+                &Stored {
+                    part_number: 1,
+                    size: 1,
+                    checksum: None,
+                },
+            )?;
+            // A garbage checksum wire self-heals: the part is listed without
+            // a checksum (F07).
+            t.insert(("data", "big.bin", 4), (10u64, "BLAKE3", "AA=="))
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            let rows = t.list("data", "big.bin")?;
+            assert_eq!(
+                rows,
+                vec![
+                    Stored {
+                        part_number: 1,
+                        size: 100,
+                        checksum: Some(Part {
+                            algorithm: Algorithm::Crc32,
+                            value: Value("AA==".into()),
+                        }),
+                    },
+                    Stored {
+                        part_number: 2,
+                        size: 200,
+                        checksum: None,
+                    },
+                    Stored {
+                        part_number: 3,
+                        size: 50,
+                        checksum: Some(Part {
+                            algorithm: Algorithm::Sha256,
+                            value: Value("BB==".into()),
+                        }),
+                    },
+                    Stored {
+                        part_number: 4,
+                        size: 10,
+                        checksum: None,
+                    },
+                ]
+            );
+            // A different key's rows do not bleed in.
+            assert_eq!(t.list("data", "other.bin")?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.remove_key("data", "big.bin")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            h.read(|txn| Table::open_readonly(txn)?.list("data", "big.bin"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

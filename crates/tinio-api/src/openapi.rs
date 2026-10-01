@@ -70,3 +70,66 @@ impl Modify for TokenScheme {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::Arc};
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tokio::sync::watch;
+    use tower::ServiceExt;
+
+    use crate::{
+        router::{Auth, Context, router as management_router},
+        state::State,
+    };
+
+    /// The document as the **local channel** serves it: `document()`'s own doctest pins the
+    /// schema's content, and this the bytes a local caller receives — every registered path and
+    /// the token scheme, through the router rather than the builder.
+    #[tokio::test]
+    async fn the_document_is_served_on_the_local_channel() {
+        let state = State::new(
+            "tinio-0123456789abcdef.sock",
+            Some(9000),
+            Path::new("/srv/data"),
+        )
+        .expect("state");
+        let (tx, _rx) = watch::channel(false);
+        let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::Local, tx));
+
+        let response = management_router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the local channel serves the schema openly"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        for path in ["/status", "/stop", "/metrics", "/openapi.json"] {
+            assert!(text.contains(path), "{path} is missing from the document");
+        }
+        assert!(
+            text.contains("X-Tinio-Token"),
+            "the token scheme is documented"
+        );
+    }
+}

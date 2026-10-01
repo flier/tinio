@@ -1,9 +1,10 @@
 //! The synthetic-element shape the JSON DOCUMENT fixtures share. The bench
 //! (`benches/select_scan.rs`) and the large-input streaming test
-//! (`tests/stream_large.rs`) each `#[path]`-include this file and build their
-//! own document around it, because only the layout differs: the bench keeps
-//! its fixture under the 1 MB whole-document cap so the pre-refactor
-//! implementation can read it too, while the test pretty-prints and gzips.
+//! (`src/json/mod.rs`'s `tests` module) each `#[path]`-include this file and
+//! build their own document around it, because only the layout differs: the
+//! bench keeps its fixture under the 1 MB whole-document cap so the
+//! pre-refactor implementation can read it too, while the test pretty-prints
+//! and gzips.
 //!
 //! Each binary uses one of the two renderings, so the other is dead there.
 #![allow(dead_code)]

@@ -227,9 +227,9 @@ pub fn pipe_acl_is_current_user_only(name: &str) -> Result<bool, Error> {
 /// Opens `name` for `READ_CONTROL` — the one access right the pipe's read-back needs, and no
 /// more: the check asks for no **data** right, so it cannot act on what it inspects. It is a
 /// client connect like any other, and that is not a contradiction — the `CreateFileW` below
-/// consumes one of the server's listening instances, exactly as the Windows leg in
-/// `tests/management.rs` documents, and the descriptor it then reads is the one the create call
-/// installed.
+/// consumes one of the server's listening instances, exactly as
+/// `transport.rs::the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only`
+/// documents, and the descriptor it then reads is the one the create call installed.
 ///
 /// `READ_CONTROL` is `Win32::Storage::FileSystem`'s constant, which is where it belongs rather
 /// than in `Security`: a named pipe is a file object, and its access rights are the filesystem

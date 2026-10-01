@@ -1,21 +1,23 @@
 //! The raw-HTTP wire helpers the read-only integration targets share, and the
 //! spawn harness the targets that run the `tinio` binary share.
 //!
-//! `read_only.rs` drives the plane in process, `serve_read_only.rs` drives a
-//! spawned `tinio server`; both speak raw HTTP/1.1 to a loopback port and both
-//! read S3's XML answers. The response parser, the de-chunker, the
+//! `read_only.rs` drives the plane in process; the spawned-`tinio server`
+//! half of the read-only family is `crates/tinio-e2e`'s `@cli` scenarios
+//! since 2026-10-01 (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`,
+//! which retired `serve_read_only.rs`). What stays here speaks raw HTTP/1.1 to
+//! a loopback port and reads S3's XML answers. The response parser, the de-chunker, the
 //! connect-with-retry client and the on-disk fixture writer therefore live
 //! here once, instead of in two copies nothing forces together — a fix to a
 //! chunked-body edge case used to land in one and silently not the other.
 //!
-//! The targets that spawn the binary — `serve_read_only.rs`,
-//! `serve_sandbox_channels.rs` (through `support/serve_spawn.rs`),
-//! `sandbox_e2e.rs` and `sandbox_e2e_windows.rs` — share the spawn helpers for
+//! The targets that spawn the binary — `sandbox_e2e.rs`,
+//! `sandbox_e2e_windows.rs` (through `support/windows_e2e_harness.rs`) and
+//! `sandbox_macos_e2e.rs` — share the spawn helpers for
 //! the same reason: each carried its own copy of how the binary is resolved
 //! ([`tinio_bin`]), of how long a spawned child gets to report itself
 //! ([`wait_timeout`]) and of the framing rule a child's event stream is decoded
-//! with ([`frame_line`] — what `serve_read_only.rs`'s `listening` and
-//! `support/serve_spawn.rs`'s `stdout_event` walk their buffered lines with, and
+//! with ([`frame_line`] — what [`wait_for_listening_in`] and
+//! `sandbox_macos_e2e.rs`'s own walk read their buffered lines with, and
 //! what [`stdout_lines`] pumps a pipe into for the sandbox legs). **A fix to the
 //! resolution landing in one copy and silently not the others** is the failure
 //! those names exist to remove.
@@ -266,10 +268,12 @@ fn authorization(
 /// request is refused with `Signature is required` **before it reaches the
 /// layer under test**, so every leg whose subject is storage behaviour signs.
 ///
-/// **It lives here because two targets now need it.** It was written in
-/// `serve_read_only.rs`, where the module doc explains why the plane cannot be
-/// driven unsigned; the Windows confinement leg needs the same header for the
-/// same reason, and a second copy is the drift this module exists to prevent.
+/// **It lives here because one harness needs it, and that harness is kept compiled.** It was
+/// written in the retired `serve_read_only.rs`, where the module doc explained why the plane
+/// cannot be driven unsigned; its one caller now is `support/serve_spawn.rs`'s
+/// `observed_mode`, which `sandbox_e2e.rs` includes without calling — the read-only and
+/// sandbox-channel legs that needed the header are `crates/tinio-e2e`'s `@cli` scenarios
+/// since 2026-10-01, and a second copy is the drift this module exists to prevent.
 ///
 /// **No query string, and that is a limit rather than a rule**: the canonical
 /// request below signs an empty query, so a caller that needs `?list-type=2`

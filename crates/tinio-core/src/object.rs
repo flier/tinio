@@ -399,6 +399,29 @@ mod tests {
         assert!(!k.is_folder_marker());
         assert!(key("dir/").unwrap().is_folder_marker());
         assert!(key("").is_err());
+
+        // The representative spellings, both ways.
+        for case in ["a", "dir/file.txt", "with space.txt", "ümlaut.txt", "dir/"] {
+            assert!(key(case).is_ok(), "{case:?}");
+        }
+        for case in [
+            "", "/abs", "C:\\evil", "a\x00b", "a/../b", "a/./b", "..", "a//b", r"a\\b", r"a/\b",
+        ] {
+            assert!(key(case).is_err(), "{case:?}");
+        }
+
+        // Platform charset is NOT a universal rule: characters that are invalid
+        // file-name characters on Windows (but legal elsewhere) pass the checked
+        // constructor — the filesystem backend's path mapping rejects them on
+        // Windows only (fs-backend.md §1). This pins the boundary.
+        for case in ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"] {
+            assert!(key(case).is_ok(), "{case:?} is a backend concern");
+        }
+
+        // Reserved keys are syntactically legal — the constructor accepts them
+        // and the backend refuses writes (FR-020).
+        assert!(key("a/.tinio/b").unwrap().is_reserved());
+        assert!(key(".tinio").unwrap().is_reserved());
     }
 
     #[test]

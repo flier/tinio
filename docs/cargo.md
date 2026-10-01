@@ -20,6 +20,7 @@
 
 - No `features` in `[workspace.dependencies]`; exception: `tokio-rustls` / `utoipa` pin `default-features = false` at workspace so members cannot re-enable heavy native crypto into the graph; `clap` pins it so its default set (`color` included) is not inherited and each member lists what it actually uses (`tinio-cli`: `derive`/`env` plus the help and error renderer; `tinio-server`'s example: the refusal renderer only).
 - Enable on the crate that uses them (`serde = { workspace = true, features = ["derive"] }`) — and that is where a member's extra features belong, the exception above included: the workspace line names the pin and `default-features = false`, the member's own line names the set (`tokio-rustls` / `utoipa` moved there out of `[workspace.dependencies]` on 2026-09-28, deliberately, since only `tinio-api` asks for them).
+- **A facade's own feature list, never a dependency pin, decides the shipped binary.** `tinio`'s `default = ["full"]` (2026-10-01) names the set, and `tinio-cli` carries no feature pin: one that turned `sandbox` on unconditionally would make `--no-default-features` ship a confined binary anyway, and the feature-off legs key off the package's feature rather than the dependency's.
 
 ## Groups
 

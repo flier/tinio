@@ -177,7 +177,11 @@ pub struct Cli {
     root: PathBuf,
     /// The `TINIO_STATE_DIR` every child is handed: the relocated state dir a read-only run
     /// resolves *first*, and the candidate a read-write client probes second (decision 19).
-    state: PathBuf,
+    pub(super) state: PathBuf,
+    /// The path a missing-root scenario hands the run, and the one a run must never create —
+    /// a sibling of the served root, so nothing else in the scenario's fixtures is near it
+    /// ([`Cli::missing`]).
+    missing: PathBuf,
     /// The variables the scenario asks for, applied to every child it spawns.
     vars: Vec<(String, String)>,
     /// The entries the root held when the scenario claimed it: what "exactly as it found it" is
@@ -241,16 +245,27 @@ pub struct Cli {
     /// there is no protocol to speak — `sd-notify` cannot even link on Windows).
     #[cfg(unix)]
     notify: Option<Notify>,
+    /// The handles a fixture opened and must keep open for the rest of the scenario.
+    ///
+    /// **One call site, and the handle *is* the fixture**
+    /// ([`doctor_leftover_refuses_removal`]): the doctor's failed-repair induction holds the
+    /// stale temp file open with no sharing, and Windows refuses to unlink a file opened that
+    /// way. Dropping the handle early would put the repair's stage back on the success path and
+    /// the scenario would assert nothing — which is why it is parked here rather than left to a
+    /// local, and why [`Cli::teardown`] does not need to touch it (the drop at the end of the
+    /// scenario closes it).
+    #[cfg(windows)]
+    pub(super) held: Vec<fs::File>,
 }
 
 /// One run of the binary, as the operator would have seen it: the exit status (absent while it
 /// still serves), both streams, and the timings the scenarios assert.
 #[derive(Debug)]
-struct Run {
+pub(super) struct Run {
     /// `None` for a run that is still serving when the poll loop ends.
     status: Option<ExitStatus>,
     /// Everything the run wrote to stdout.
-    stdout: String,
+    pub(super) stdout: String,
     /// The file this run's stderr was redirected to ([`Cli::run_paths`]) — what [`Run::stderr`]
     /// re-reads at assertion time.
     stderr_path: PathBuf,
@@ -284,7 +299,7 @@ impl Run {
     /// its `state` publish, milliseconds after the frame, so an assertion made on the snapshot
     /// races that write. The snapshot remains the fallback for a file that cannot be read back,
     /// so a captured stream is never lost to a failed re-read.
-    fn stderr(&self) -> String {
+    pub(super) fn stderr(&self) -> String {
         fs::read_to_string(&self.stderr_path).unwrap_or_else(|_| self.stderr_snapshot.clone())
     }
 }
@@ -305,8 +320,12 @@ impl Cli {
         let entries = fs::read_dir(&root).expect("read the root").count();
         let state = dir.path().join("state");
         fs::create_dir_all(&state).expect("the relocated state directory");
+        // `{missing}` — a path beside the root, never created: the leg's subject is the root a
+        // run refuses to serve *and* refuses to create.
+        let missing = dir.path().join("missing");
         Self {
             state,
+            missing,
             dir,
             root,
             vars: Vec::new(),
@@ -325,17 +344,30 @@ impl Cli {
             unwritable: Vec::new(),
             #[cfg(unix)]
             notify: None,
+            #[cfg(windows)]
+            held: Vec::new(),
         }
     }
 
     /// The scratch directory: what a child's working directory and `HOME`/`USERPROFILE` are.
-    fn scratch(&self) -> &Path {
+    pub(super) fn scratch(&self) -> &Path {
         self.dir.path()
     }
 
     /// The served root.
-    fn root(&self) -> &Path {
+    pub(super) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The root a scenario hands a run **that must fail**, spelled `{missing}` on its command
+    /// line: a path beside the served root that nothing creates, so a run that made it would be
+    /// observable rather than harmless.
+    ///
+    /// **A sibling rather than a child of the root**: the root itself is created by [`Cli::new`],
+    /// and a path under it would be a fixture inside a served tree — a run that wrote it would
+    /// still be writing *inside* the root this leg is about leaving alone.
+    fn missing(&self) -> &Path {
+        &self.missing
     }
 
     /// The state directory a **read-write** run resolves: `<root>/.tinio`
@@ -348,7 +380,7 @@ impl Cli {
     /// a step that read `state` out of it would look for a file nothing writes. Every scenario
     /// these steps serve runs read-write; a **read-only** run's directory is
     /// [`Cli::state_dir_of`]'s answer, and the same rule is what makes [`state_file`] take a root.
-    fn state_dir(&self) -> PathBuf {
+    pub(super) fn state_dir(&self) -> PathBuf {
         self.root.join(".tinio")
     }
 
@@ -377,7 +409,7 @@ impl Cli {
     /// control channel's name and `state`'s own record are all derived from
     /// (`resolve::resolve_root`) — and on Windows the `\\?\` form `Path::canonicalize` answers,
     /// which is what every command prints.
-    fn canonical_root(&self) -> PathBuf {
+    pub(super) fn canonical_root(&self) -> PathBuf {
         self.root
             .canonicalize()
             .expect("the served root exists while its scenario runs")
@@ -385,7 +417,7 @@ impl Cli {
 
     /// The last run's outcome; every `Then` step here reads it, and none may run before a `When`
     /// step made one.
-    fn last(&self) -> &Run {
+    pub(super) fn last(&self) -> &Run {
         self.last
             .as_ref()
             .expect("a scenario's assertions follow the `I run` step that captures them")
@@ -453,15 +485,16 @@ impl Cli {
         }
     }
 
-    /// The operator's command line as argv: whitespace-separated words, with the `{root}` and
-    /// `{state}` placeholders expanded **per word** — so a scratch path with a space in it stays
-    /// one argument without the scenario needing to quote it.
+    /// The operator's command line as argv: whitespace-separated words, with the `{root}`,
+    /// `{state}` and `{missing}` placeholders expanded **per word** — so a scratch path with a
+    /// space in it stays one argument without the scenario needing to quote it.
     fn argv(&self, command: &str) -> Vec<String> {
         let words: Vec<String> = command
             .split_whitespace()
             .map(|word| {
                 word.replace("{root}", &self.root.display().to_string())
                     .replace("{state}", &self.state.display().to_string())
+                    .replace("{missing}", &self.missing.display().to_string())
             })
             .collect();
         assert_eq!(
@@ -867,8 +900,19 @@ impl Notify {
 
 /// The scenario's harness — the `Given a storage root` step claims it, and every step here needs
 /// it.
-fn cli(world: &mut World) -> &mut Cli {
+pub(super) fn cli(world: &mut World) -> &mut Cli {
     world.cli.as_mut().expect("the scenario has a storage root")
+}
+
+/// The same harness, **claiming one when the scenario has not claimed it yet** — the body of
+/// `Given a storage root`, shared with the fixtures whose own `Given` must also have a root (the
+/// doctor's, which plant their whole fixture in one step). One definition, so a second claim can
+/// only ever be the first one.
+pub(super) fn harness(world: &mut World) -> &mut Cli {
+    if world.cli.is_none() {
+        world.cli = Some(Cli::new());
+    }
+    cli(world)
 }
 
 /// The endpoint `text` reports as its readiness event, if it holds one.
@@ -1158,8 +1202,12 @@ fn published_state(cli: &Cli, run: &Run) -> State {
 /// because a fixture outside the served root has nowhere else to be: the harness's working
 /// directory is the scratch dir for every child, and a step that quietly wrote into the test
 /// runner's own cwd would be a fixture nothing cleans up.
-#[cfg(windows)]
-fn expand(cli: &Cli, text: &str) -> PathBuf {
+///
+/// **Not windows-only any more.** Its first caller was the Windows junction fixture, and the
+/// doctor's file assertions (`the file … holds/exists/does not exist`) reach the same placeholder
+/// expansion on every platform — the paths they name are the harness's own scratch tree, which no
+/// scenario can spell.
+pub(super) fn expand(cli: &Cli, text: &str) -> PathBuf {
     let expanded = PathBuf::from(
         text.replace("{root}", &cli.root().display().to_string())
             .replace("{state}", &cli.state.display().to_string())
@@ -1290,9 +1338,7 @@ async fn control_exchange(control: &str, call: Call<'_>) -> Result<RawResponse, 
 /// scenario is the same root, never a new one — a scenario serves one root.
 #[given("a storage root")]
 async fn a_storage_root(world: &mut World) {
-    if world.cli.is_none() {
-        world.cli = Some(Cli::new());
-    }
+    harness(world);
 }
 
 /// A server already serving the root — the precondition of every leg about what a *second*
@@ -1680,22 +1726,25 @@ async fn stdout_is_one_error_frame(world: &mut World, message: String) {
     }
 }
 
-/// **A refused run's stdout is the refusal frame and nothing else** — the shape
-/// `crates/tinio-server/tests/serve_sandbox_channels.rs`'s `refused_or_honoured` pins in-process
-/// (an `event:` line, a `data:` line and the blank line that closes them, and no fourth), restored
-/// here for the refusals the migration moved to this layer — case 11's frame assertion, which
-/// named the sentence the run refused with and counted the lines that carried it.
+/// A refusal's stdout shape, with no sentence asserted: **exactly one frame and it is the `error`
+/// frame, exactly three raw lines and no fourth** — an `event:` line, a `data:` line and the blank
+/// line that closes them (decision 19).
+///
+/// **The in-process home this shape came from is retired**:
+/// `crates/tinio-server/tests/serve_sandbox_channels.rs`'s `refused_or_honoured` pinned it against
+/// the spawned child, and the placement cleanup
+/// (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`) moved the shape here with the
+/// scenarios that owed it. The sentence a caller may want inside the frame is the return value.
 ///
 /// **Both halves, because neither implies the other.** [`stdout_is_one_error_frame`] asks for the
-/// *exact* sentence, which a wrapped one cannot satisfy: a `Config` refusal renders as
-/// `configuration error: …` and the macOS refusals interpolate the two paths they name, so the
-/// sentence here is matched by containment — the same relation the `stderr contains` step beside
-/// it uses, and the same one case 11 asserted on the frame. What that step cannot see is a line
-/// that never reached a frame: [`frames`] skips a block that does not decode, so a stray write
-/// beside the frame would leave the count at one. The raw line count is what closes that.
-#[then(expr = "its stdout is the refusal frame and nothing else, carrying {string}")]
-async fn stdout_is_the_refusal_frame_alone(world: &mut World, message: String) {
-    let run = cli(world).last();
+/// *exact* sentence, which a wrapped one cannot satisfy — a `Config` refusal renders as
+/// `configuration error: …` and the macOS refusals interpolate the two paths they name — so a
+/// caller asserting a sentence matches it by containment; what either form cannot see is a line
+/// that never reached a frame, because [`frames`] skips a block that does not decode, so a stray
+/// write beside the frame would leave the decoded count at one. The raw line count closes that, and
+/// the frame's own kind closes the mirror case: a run that came up wrote `listening`, whatever its
+/// status.
+fn refusal_frame_only(run: &Run) -> String {
     let events = frames(&run.stdout);
     assert_eq!(
         events.len(),
@@ -1705,16 +1754,67 @@ async fn stdout_is_the_refusal_frame_alone(world: &mut World, message: String) {
         run.stdout,
         run.stderr()
     );
-    match &events[0] {
-        Event::Error { message: framed } => assert!(
-            framed.contains(message.as_str()),
-            "the refusal frame carries the sentence the run refused with:\nstdout:\n{}\nstderr:\n{}",
-            run.stdout,
-            run.stderr()
-        ),
+    let framed = match &events[0] {
+        Event::Error { message } => message.clone(),
         Event::Listening { addr } => panic!(
             "the run framed `listening` ({addr}) instead of the refusal it exited with — a run \
              that came up served, whatever its status:\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr()
+        ),
+    };
+    let lines = run.stdout.lines().count();
+    assert_eq!(
+        lines, 3,
+        "stdout must carry the refusal frame and nothing else — an `event:` line, a `data:` line \
+         and the blank line that closes it; got {lines} lines:\nstdout:\n{}",
+        run.stdout
+    );
+    framed
+}
+
+/// **A refused run's stdout is the refusal frame and nothing else** — [`refusal_frame_only`]'s
+/// shape, with the sentence the scenario named asserted inside the frame by containment (the same
+/// relation the `stderr contains` step beside it uses).
+#[then(expr = "its stdout is the refusal frame and nothing else, carrying {string}")]
+async fn stdout_is_the_refusal_frame_alone(world: &mut World, message: String) {
+    let run = cli(world).last();
+    let framed = refusal_frame_only(run);
+    assert!(
+        framed.contains(message.as_str()),
+        "the refusal frame carries the sentence the run refused with:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr()
+    );
+}
+
+/// **A serving run's stdout is the readiness frame and nothing else** — the mirror of
+/// [`stdout_is_the_refusal_frame_alone`] for the run that came up, and the shape decision 19
+/// fixed for the stream: an `event:` line, a `data:` line and the blank line that closes them.
+///
+/// **Both halves, because neither implies the other.** A run that wrote a second frame (or a
+/// plain line that is not a frame) *is* ready — [`Cli::run`] ends its poll at the first
+/// `listening` frame — so `the readiness line reports a bound port` passes over it; and a decoded
+/// count of one says nothing about a stray un-decodable line beside the frame. The count of raw
+/// lines is what closes that, which is why the shape is asserted rather than inferred.
+#[then("its stdout is the readiness frame alone")]
+async fn stdout_is_the_readiness_frame_alone(world: &mut World) {
+    let run = cli(world).last();
+    let events = frames(&run.stdout);
+    assert_eq!(
+        events.len(),
+        1,
+        "a serving run frames its readiness once and this run wrote {} frames:\nstdout:\n{}\n\
+         stderr:\n{}",
+        events.len(),
+        run.stdout,
+        run.stderr()
+    );
+    match &events[0] {
+        Event::Listening { .. } => {}
+        Event::Error { message } => panic!(
+            "the run framed `error` ({message}) for a run that served — a refusal and a ready \
+             server are not the same run:\nstdout:\n{}\nstderr:\n{}",
             run.stdout,
             run.stderr()
         ),
@@ -1722,8 +1822,8 @@ async fn stdout_is_the_refusal_frame_alone(world: &mut World, message: String) {
     let lines = run.stdout.lines().count();
     assert_eq!(
         lines, 3,
-        "stdout must carry the refusal frame and nothing else — an `event:` line, a `data:` line \
-         and the blank line that closes it; got {lines} lines:\nstdout:\n{}",
+        "stdout must carry the readiness frame and nothing else — an `event:` line, a `data:` \
+         line and the blank line that closes it; got {lines} lines:\nstdout:\n{}",
         run.stdout
     );
 }
@@ -2046,6 +2146,11 @@ fn env_file_asks_for_the_confinement(cli: &Cli) {
 /// the spelling this replaces — "either refused with the channel named or applied" — can no
 /// longer pass on a run that failed for some other reason and merely mentioned `sandbox`, nor on
 /// an honour arm that never reached readiness.
+///
+/// **The refusal arm is also where the refusal's own shape lives now** ([`refused_by_build`]): the
+/// stdout it wrote and the residue it may not leave, per channel. That shape was
+/// `crates/tinio-server/tests/serve_sandbox_channels.rs`'s in-process subject until the placement
+/// cleanup retired the file, and it is asserted here because the arm is this step's dispatch.
 #[then(expr = "the {string} request is answered, never ignored")]
 async fn request_answered(world: &mut World, channel: String) {
     let channel = SandboxChannel::parse(&channel);
@@ -2057,7 +2162,7 @@ async fn request_answered(world: &mut World, channel: String) {
     {
         applied(run);
     } else {
-        refused_by_build(run, channel);
+        refused_by_build(cli, run, channel);
     }
 }
 
@@ -2101,7 +2206,26 @@ fn refused(run: &Run, channel: SandboxChannel) {
 /// and the configuration key) is refused by the crate itself: a usage error (2) naming the
 /// **build**, and never the platform, because no target this suite runs on owes that refusal any
 /// more.
-fn refused_by_build(run: &Run, channel: SandboxChannel) {
+///
+/// **And the refusal's own shape, which is the half a reader of the wording alone cannot see**
+/// (`design §12` bullet 4's wire contract; the subject
+/// `crates/tinio-server/tests/serve_sandbox_channels.rs`'s `refused_or_honoured` held in-process
+/// until the placement cleanup retired that file). The two arms' shapes differ because the layers
+/// that answer do, and each is asserted where it is measured:
+///
+/// - **The parse refusal wrote nothing at all.** clap answers a flag its parser does not know
+///   before any command is dispatched, so the serving path — stdout's only frame writer (decision
+///   19) — is never reached, and neither is the resolution that would have minted
+///   `<root>/.tinio/.tinio.toml`. What is asserted is both halves of that order: stdout empty, and
+///   the root's reserved directory absent, because a run that had created *anything* would not be
+///   a run the parser refused.
+/// - **The crate refusal is framed, and stops short of the store.** The channel cannot be compiled
+///   away, so the run dispatches and the serving arm renders the error it returns as one `error`
+///   frame — [`refusal_frame_only`]'s three stdout lines and no fourth. The resolution has already
+///   minted `.tinio.toml` on its way here (the document every first run creates), so the absence
+///   that says "nothing served" is the store, `<root>/.tinio/meta.redb`, which is the serving
+///   path's first write under the root.
+fn refused_by_build(cli: &Cli, run: &Run, channel: SandboxChannel) {
     refused(run, channel);
     assert_eq!(
         run.status.and_then(|status| status.code()),
@@ -2110,12 +2234,26 @@ fn refused_by_build(run: &Run, channel: SandboxChannel) {
         run.stderr()
     );
     match channel {
-        SandboxChannel::Flag => assert!(
-            run.stderr().contains("unexpected argument"),
-            "with no `sandbox` feature the flag is not in the parser, so clap is what refuses \
-             it:\n{}",
-            run.stderr()
-        ),
+        SandboxChannel::Flag => {
+            assert!(
+                run.stderr().contains("unexpected argument"),
+                "with no `sandbox` feature the flag is not in the parser, so clap is what refuses \
+                 it:\n{}",
+                run.stderr()
+            );
+            assert!(
+                run.stdout.is_empty(),
+                "stdout is the serving path's protocol and no command has been dispatched, so a \
+                 refusal answered by the parser writes no frame; got {:?}",
+                run.stdout
+            );
+            let state_dir = cli.state_dir();
+            assert!(
+                !state_dir.exists(),
+                "a parse refusal lands before the run creates anything it serves: {} exists",
+                state_dir.display()
+            );
+        }
         SandboxChannel::Env | SandboxChannel::DotEnv | SandboxChannel::Config => {
             assert!(
                 run.stderr().contains("no `sandbox` feature"),
@@ -2126,6 +2264,14 @@ fn refused_by_build(run: &Run, channel: SandboxChannel) {
                 !run.stderr().contains("platform"),
                 "and not the platform — this is the build's half of the pair:\n{}",
                 run.stderr()
+            );
+            refusal_frame_only(run);
+            let store = cli.state_dir().join("meta.redb");
+            assert!(
+                !store.exists(),
+                "a refusal lands before the run serves, and the store is what a serving run \
+                 opens: {} exists",
+                store.display()
             );
         }
     }
@@ -2683,6 +2829,72 @@ fn linux_has_no_descendants(pid: u32) {
     );
 }
 
+/// **A5's secret-leak rule, asked of the streams a real run writes**: the control token the run
+/// published reaches neither the frame stream (stdout) nor the operational log (stderr).
+///
+/// **The in-process leg this replaces could not ask it, which is why the scenario spawns.** The
+/// re-emit's own unit leg (`crates/tinio-cli/src/sandbox/tests.rs`) drives the emitter against a
+/// recording, because fd 1 and fd 2 belong to a test harness from the inside — so the token it
+/// asserts against is one it invented, and nothing could falsify that. Here the needle is the
+/// **run's own published `state`**, read through [`published_state`] (whose doc carries the
+/// redaction rule the parse exists for): `tinio-api`'s `generate_token` minted that value inside
+/// the run and nowhere else, so a failure reports "the run printed its own token" and not "the run
+/// printed something that happens to be this test's string".
+///
+/// **Both carriers, because A5 names both, and both are asserted present before the token is
+/// looked for.** stdout is the frame stream (the readiness frame, and every refusal) and stderr is
+/// where this platform's subscriber writes the log — the in-place re-emit line among it, the line
+/// A5 added, which is what makes the negative probe a statement about a stream that carried the
+/// line rather than about an empty buffer. The scenario asserts the same two facts with its own
+/// steps (`the readiness line reports a bound port`, `the run was confined`); they are repeated
+/// here because an absence assertion is only as good as the buffer it is made against, and a step
+/// stands on its own. `NO_COLOR`, which makes the re-emit line greppable, is the harness's own
+/// ([`Cli::command`]).
+///
+/// **The two failures do not quote the stream they are about.** A run that leaked its token would
+/// otherwise put the value in the CI log on the way to reporting the leak — the shape STD-01 is
+/// the precedent for — so the offset is named instead of the bytes around it.
+///
+/// `@linux` is the scenario's tag and this step's gate, the rule every platform-bound step in this
+/// module follows (`I send the server SIGTERM`): the in-place arm is the only one whose own
+/// process writes these streams — a launcher arm's log is the launcher's relay.
+#[cfg(target_os = "linux")]
+#[then("neither stream carries the run's published control token")]
+async fn neither_stream_carries_the_token(world: &mut World) {
+    let cli = cli(world);
+    let run = cli.last();
+    let token = published_state(cli, run)
+        .token
+        .expose_secret()
+        .as_str()
+        .to_owned();
+    let stdout = &run.stdout;
+    let stderr = run.stderr();
+    assert!(
+        stdout.contains("event: listening"),
+        "the frame stream must carry the readiness frame this step reads it for:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("step=\"confined in place\""),
+        "the log must carry the in-place re-emit line, or the token check beside this one would be \
+         about a stream that never carried the line A5 is about:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(&token),
+        "the frame stream carries the run's own control token, at byte {} of {}: the stream is not \
+         quoted because the value is the credential this step exists to keep out of a log",
+        stdout.find(&token).expect("the assertion above found it"),
+        stdout.len()
+    );
+    assert!(
+        !stderr.contains(&token),
+        "the operational log carries the run's own control token, at byte {} of {}: the log is not \
+         quoted, for the reason the frame stream's failure is not",
+        stderr.find(&token).expect("the assertion above found it"),
+        stderr.len()
+    );
+}
+
 /// One named `step="…"` line of the captured stderr, and the fields the caller requires of it.
 ///
 /// **The docstring is the contract for that event**, one requirement per line: `field` asserts the
@@ -2891,6 +3103,25 @@ async fn root_holds(world: &mut World, bucket: String, key: String, body: String
     fs::write(&path, body.as_bytes()).expect("the planted object");
 }
 
+/// **The disk half of a refusal**: the path the refused write named holds no file.
+///
+/// The status a client reads and the bytes the served root holds are two answers, and only the
+/// first is what a client sees — a server that answered `AccessDenied` and wrote anyway would pass
+/// on the status alone. The second is the assertion
+/// `crates/tinio-sandbox-windows/tests/confine.rs`'s
+/// `a_read_only_root_refuses_writes_and_still_reads` carried until the 2026-10-01 placement cleanup
+/// moved the journey here (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`); the
+/// path is the served root's own, because a `@cli` scenario's root belongs to [`Cli`].
+#[then(expr = "the served root holds no file {string}")]
+async fn root_holds_no_file(world: &mut World, rel: String) {
+    let path = cli(world).root().join(&rel);
+    assert!(
+        !path.exists(),
+        "the refused write left `{}` on the disk",
+        path.display()
+    );
+}
+
 // --- The exposure-set and state-dir refusals (G15/G16) -------------------
 
 /// A file inside the served root, for the row that **serves it as a root**.
@@ -3089,4 +3320,81 @@ async fn root_holds_an_escaping_junction(world: &mut World, name: String, target
     fs::create_dir_all(&target).expect("the out-of-root target");
     fs::write(target.join("outside.txt"), b"outside").expect("the out-of-root object");
     testing::junction(&link, &target);
+}
+
+// --- The read-only mode's process legs (FR-023) --------------------------
+
+/// The stderr summary says which mode the run serves in, and the address it names is the one
+/// its readiness event carried — the tail ` on <addr> (read-only; credentials ` that only the
+/// serving path prints (`crates/tinio-cli/src/commands/start/`).
+///
+/// **The needle is built from the run's own report rather than the scenario's spelling of a
+/// port**, because `--port 0` binds an ephemeral one: a literal in the feature could only name
+/// a port no run would have. What the assertion is about is not the text but the *agreement*
+/// between the two carriers of one fact — the frame the harness decoded readiness from and the
+/// line an operator reads — so the address half is what makes it discriminating, and the mode
+/// half is what makes it a claim about read-only mode.
+#[then("the run reports serving read-only on the endpoint it bound")]
+async fn stderr_reports_read_only(world: &mut World) {
+    let run = cli(world).last();
+    let endpoint = run
+        .readiness
+        .expect("the run reported its readiness event, which carries the address this asserts");
+    let diagnostic = format!(" on {endpoint} (read-only; credentials ");
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains(&diagnostic),
+        "stderr must carry `{diagnostic}`; got:\n{stderr}"
+    );
+}
+
+/// The other half of FR-023's relocation, and the one no wire response can carry: the run's own
+/// state database is in the **relocated** state dir the harness handed it
+/// ([`Cli::state`] — the first candidate `resolve::resolve_state_dir` reads in this mode), not in
+/// the served root.
+///
+/// **`meta.redb` and not "the directory is non-empty"**: the file is the state the mode must not
+/// write under the root, and the run that wrote it elsewhere is the claim — a directory holding
+/// an unrelated `.tinio.toml` would satisfy a weaker test. The assertion beside it is
+/// `the root holds no state directory`, and the pair is what makes the two homes disjoint.
+#[then("the relocated state dir holds the state database")]
+async fn relocated_state_dir_holds_state_database(world: &mut World) {
+    let path = cli(world).state.join("meta.redb");
+    assert!(
+        path.is_file(),
+        "read-only mode's state belongs in the relocated state dir: `{}` is not a file",
+        path.display()
+    );
+}
+
+/// The failure names the root it could not serve — the path `{missing}` expanded to, in either
+/// form a render can print it: `Path::display` writes it plain, while a `Debug` of the error
+/// escapes the separators on Windows, and both spellings are accepted because which one lands
+/// is a property of the error's own rendering and not of the failure.
+///
+/// **Named rather than spelled by the scenario**, because the path is the harness's scratch tree
+/// ([`Cli::missing`]) — a scenario names it `{missing}` on the command line and asserts it here.
+#[then("its stderr names the missing root")]
+async fn stderr_names_missing_root(world: &mut World) {
+    let cli = cli(world);
+    let missing = cli.missing().display().to_string();
+    let escaped = missing.replace('\\', "\\\\");
+    let stderr = cli.last().stderr();
+    assert!(
+        stderr.contains(&missing) || stderr.contains(&escaped),
+        "the failure must name the root it could not serve (`{missing}`); stderr:\n{stderr}"
+    );
+}
+
+/// A run that refused a missing root left it missing: the run ends during resolution, so nothing
+/// created the directory it was told to serve — and read-only mode in particular must never
+/// create the root rather than serve it (`contracts/cli.md`'s "an existing DIR").
+#[then("the missing root was not created")]
+async fn missing_root_not_created(world: &mut World) {
+    let missing = cli(world).missing().to_path_buf();
+    assert!(
+        !missing.exists(),
+        "the run created the root it could not serve: `{}`",
+        missing.display()
+    );
 }

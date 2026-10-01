@@ -12,6 +12,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 time = { workspace = true, features = ["formatting"] }
+tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "rt"] }
 tracing.workspace = true
 # **Optional, and on the `testing` feature, because what wants it is lib code**: the
@@ -43,13 +44,12 @@ tinio-util.workspace = true
 tinio-winsec.workspace = true
 
 [dev-dependencies]
-# The crate's own suites reach `tinio_sandbox_windows::testing` (`tests/common`),
+# The crate's own suites reach `tinio_sandbox_windows::testing` (`src/testing.rs`),
 # and that module is behind this crate's `testing` feature — hence the self
 # dev-dependency, which is what turns the feature on for a test build without
 # turning it on for anyone who merely depends on this crate. Cargo unifies the two
 # edges, so the lib under test and this edge are one build.
 tinio-sandbox-windows = { path = ".", features = ["testing"] }
-tempfile.workspace = true
 
 [features]
 # **Conformance support, and not part of a production build of this crate.** The
@@ -60,7 +60,7 @@ tempfile.workspace = true
 # never ride into a consumer's build, and the `[dependencies]` edges stay what
 # `docs/tests.md` asks for. `default` is empty for the same reason: the launcher
 # and the server never want it.
-testing = ["tinio-util/testing", "dep:tracing-subscriber"]
+testing = ["tinio-util/testing", "dep:tempfile", "dep:tracing-subscriber"]
 
 [lints.clippy]
 absolute_paths = "warn"

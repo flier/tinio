@@ -60,11 +60,12 @@ mod tag_filter;
 ///
 /// **IDs leave this list when scenarios land for them**, the way FR-023 did
 /// when the read-only scenarios arrived: FR-007 (the CLI's `server`/`status`/
-/// `stop` surface — `doctor`'s legs are not scenarios yet, T057), FR-036 (the
-/// two sandbox refusals) and SC-005/SC-007 (the readiness and round-trip
-/// bounds) left it on 2026-09-22, when the process-level CLI legs became
-/// `tests/features/cli_lifecycle.feature` — the same assertions, driven through
-/// the real binary from the cucumber suite. FR-016 stays: the two scenarios
+/// `stop` surface — and `doctor`'s flows, `tests/features/doctor.feature`,
+/// which landed after this entry was written: T057's legs are scenarios now),
+/// FR-036 (the two sandbox refusals) and SC-005/SC-007 (the readiness and
+/// round-trip bounds) left it on 2026-09-22, when the process-level CLI legs
+/// became `tests/features/cli_lifecycle.feature` — the same assertions, driven
+/// through the real binary from the cucumber suite. FR-016 stays: the two scenarios
 /// that prove the environment and `.env` levels reach the parser are
 /// `cli_lifecycle.feature`'s, the chain's flag and config-file levels are
 /// `confinement.feature`'s precedence rows, and `.env` loading itself is still

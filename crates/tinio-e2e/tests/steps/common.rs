@@ -29,6 +29,7 @@ use std::{
 use cucumber::{given, then};
 use md5::{Digest, Md5};
 use tempfile::TempDir;
+use tinio_sandbox::Event;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -48,7 +49,6 @@ use crate::{
         identity::IdentityFromConfig,
     },
 };
-use tinio_sandbox::Event;
 
 /// Repeatable body of length `n`: `(i * 31 + 7) % 256` at position `i`.
 /// The ONE byte generator the steps share (F14): the upload-vs-verify
@@ -560,6 +560,69 @@ pub(super) async fn plant_in_root(world: &super::World, rel: impl AsRef<Path>, b
 #[given(expr = "the served root holds bucket {string} with object {string} and body {string}")]
 async fn served_root_holds(world: &mut super::World, bucket: String, key: String, body: String) {
     plant_in_root(world, Path::new(&bucket).join(&key), &body).await;
+}
+
+/// A served root that **refuses new entries** for as long as this guard lives; the original mode
+/// comes back on drop. Unix only: the plant is a permission bit (`chmod 0500` — owner read and
+/// traverse, nobody may write), and a platform without mode bits has no equivalent (design §10).
+///
+/// **The guard is the step's, not the fixture's**, because the root is the harness's `TempDir`:
+/// a directory at 0500 refuses `remove_dir_all`, so the mode has to be given back **before** the
+/// server that owns it drops — which is why [`super::after_hook`] takes this field first.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct RestrictedRoot {
+    path: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl RestrictedRoot {
+    /// `chmod 0500` `path` and remember the mode to give back.
+    fn restrict(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(path)
+            .unwrap_or_else(|err| panic!("the served root `{}`: {err}", path.display()))
+            .permissions()
+            .mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+            .unwrap_or_else(|err| panic!("chmod 0500 `{}`: {err}", path.display()));
+        Self {
+            path: path.to_path_buf(),
+            mode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestrictedRoot {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+    }
+}
+
+/// The served-root half of a genuinely read-only root: the root is made unwritable **after** the
+/// scenario planted its objects, so every read the scenario drives is served off a tree that
+/// cannot be written at all.
+///
+/// **What the wire cannot show is the point**: a plane that wrote the root — a state directory,
+/// an object, anything — would fail on the request that drove it, where the portable half
+/// (`the root holds exactly what it held before`) only counts the entries. The scenario carrying
+/// this step is `@unix`, and the definition exists only there: an undefined step is a failure
+/// under `fail_on_skipped()`, so it must not be reachable on a host whose mode bits do not exist.
+#[cfg(unix)]
+#[given("the served root refuses new entries")]
+async fn served_root_refuses_new_entries(world: &mut super::World) {
+    let root = world
+        .server
+        .as_ref()
+        .and_then(|server| server.root())
+        .expect("a fixture step needs a running fs-backed server")
+        .to_path_buf();
+    world.restricted = Some(RestrictedRoot::restrict(&root));
 }
 
 /// Sweep the confined grandchild a killed launcher leaves behind, by the scratch

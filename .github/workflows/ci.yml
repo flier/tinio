@@ -235,8 +235,11 @@ jobs:
         with:
           tool: nextest
 
-      # The `tinio` binary is a PREREQUISITE of the `serve_read_only` legs
-      # `-p tinio-server` runs below: that test spawns the binary, and
+      # The `tinio` binary is a PREREQUISITE of the `-p tinio-server` targets
+      # that spawn it (`sandbox_e2e*`; the read-only CLI legs are `@cli`
+      # cucumber scenarios since 2026-10-01, and `serve_sandbox_channels.rs`
+      # retired with `serve_read_only.rs`).
+      # A spawned run needs the binary present, and
       # `assert_cmd::cargo::cargo_bin("tinio")` resolves it in the running
       # test binary's own profile dir — so the build profile here must match
       # the test profile (both use --profile ci), and nextest's target
@@ -244,7 +247,7 @@ jobs:
       # cache is registry-only (`cache-targets: "false"`), so nothing else
       # could: the build is the only thing that puts `target/ci/tinio` on
       # this runner, exactly as the shared action does for the default leg.
-      - name: build the tinio binary (a serve_read_only prerequisite)
+      - name: build the tinio binary (a spawning-target prerequisite)
         run: cargo build --profile ci -p tinio
 
       # Same cargo/runner profile flags as run-test-leg's default leg — the
@@ -406,10 +409,11 @@ jobs:
 
       # --- cucumber e2e suite (e2e and e2e-port) --------------------------
       # The `tinio` binary is a PREREQUISITE of the @cli scenarios, which
-      # spawn it (`cli_lifecycle.feature`, plus `confinement.feature`'s sandbox
-      # channels): `assert_cmd::cargo::cargo_bin` falls back to the profile dir
-      # beside the test binary and does NOT build it, exactly as
-      # crates/tinio-server/tests/serve_read_only.rs needs (the run-test-leg
+      # spawn it (`cli_lifecycle.feature`, `read_only.feature`, plus
+      # `confinement.feature`'s sandbox channels): `assert_cmd::cargo::cargo_bin`
+      # falls back to the profile dir
+      # beside the test binary and does NOT build it, exactly as the
+      # tinio-server targets that spawn it need (the run-test-leg
       # action's own build step). --profile ci keeps the binary in the same
       # profile dir this leg's test binary derives from its own location.
       - &e2e-build

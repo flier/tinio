@@ -81,7 +81,7 @@ trap 'for pid in ${LOG_PID:-} ${PRUNE_PID:-}; do kill "$pid" 2>/dev/null || true
 log stream --predicate 'sender == "Sandbox"' --style compact >"$LOG" 2>/dev/null &
 LOG_PID=$!
 
-echo "== the confinement tests (startup, exposures, network, relay, injection, handover) =="
+echo "== the confinement tests (startup, exposures, network, injection, handover; relay is inline in src/relay.rs) =="
 cargo test -p tinio-sandbox-macos -- --nocapture
 
 echo
