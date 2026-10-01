@@ -278,8 +278,9 @@ mod tests {
     //! is `crate::socket`'s, where the rebuild it exercises lives.
 
     use std::{
-        env, fs,
+        env,
         ffi::{OsStr, OsString},
+        fs,
         io::{self, ErrorKind, Write},
         net::{TcpListener, TcpStream},
         os::windows::io::IntoRawSocket,
@@ -291,9 +292,6 @@ mod tests {
 
     use tinio_sandbox_core::LaunchPayload;
     use tinio_util::job;
-
-    use crate::testing::{TIMEOUT, wait_for_exit};
-
     // **The stdin stand-in is the shared one** (`tinio_util::testing`), which the core's own
     // leg for this rule takes too: what the two measure is the same "was stdin read at all",
     // and only a reader that fails on being read can tell that from a reader that returns
@@ -302,7 +300,10 @@ mod tests {
     use windows_sys::Win32::Foundation::HANDLE;
 
     use super::*;
-    use crate::_core::is_launcher_fd_arg;
+    use crate::{
+        _core::is_launcher_fd_arg,
+        testing::{TIMEOUT, wait_for_exit},
+    };
 
     /// The marker that makes [`child_role`] inert in this binary's own test run.
     ///

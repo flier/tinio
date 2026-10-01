@@ -191,6 +191,12 @@ fn sandbox_err(err: _sandbox::Error) -> Error {
                 | _sandbox::STEP_ON_STOP,
             source,
         } => Error::Operational(source.to_string()),
+        // The host's own answer, kept as a value rather than flattened into the generic
+        // `Sandbox`: what a caller does about it is not what it does about a step failure.
+        // **The core error travels whole** — its own `#[error]` renders the sentence the
+        // operator reads — so this arm moves the value instead of taking it apart and rebuilding
+        // it, and the raw HRESULT rides along rather than being dropped here.
+        host @ _sandbox::Error::HostCannotConfine { .. } => Error::SandboxHostCannotConfine(host),
         other => Error::from(other),
     }
 }

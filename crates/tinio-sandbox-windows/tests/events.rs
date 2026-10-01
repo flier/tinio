@@ -12,8 +12,6 @@
 // the names the harness spawns here, because the lib linked into an integration
 // target is compiled without `cfg(test)`
 // (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
-use tinio_sandbox_windows::testing as common;
-
 use std::{
     env, fs,
     io::{self, Read},
@@ -26,7 +24,7 @@ use std::{
 };
 
 use tinio_sandbox_core::Event;
-use tinio_sandbox_windows::launch;
+use tinio_sandbox_windows::{launch, testing as common};
 use tinio_util::testing::kill_and_reap;
 
 /// The launcher's own role: run the production launch path and supervise it,

@@ -74,6 +74,26 @@ pub enum Error {
         /// Why, in operator-facing terms, with the remedy where one exists.
         detail: &'static str,
     },
+    /// This host's token cannot confine this process, though the platform can.
+    ///
+    /// **The split from [`Self::Unsupported`] is time, not severity.** `Unsupported` is a
+    /// compile-time fact about the platform — no mechanism is written for it. This is a
+    /// run-time fact about the token this process is running under, and it is the operator's
+    /// to fix: the platform is not at fault, and a later run in an ordinary session may not
+    /// see it at all.
+    ///
+    /// **The sentence is the platform's**, because it names an API this crate does not know:
+    /// `cause` and `remedy` are rendered where the refusal was measured. The join below is the
+    /// same one line `tinio-cli`'s own variant carries — see that variant's comment.
+    #[error("{cause} — {remedy}")]
+    HostCannotConfine {
+        /// The fact and its most likely cause, with the raw HRESULT kept verbatim.
+        cause: String,
+        /// The two actions the operator can take.
+        remedy: &'static str,
+        /// The platform's raw HRESULT, for support — the sentence carries it in prose.
+        hr: i32,
+    },
     /// A path handed to [`crate::Sandbox::expose`] cannot be expressed inside
     /// the confinement — it is not absolute, it does not exist, it is the
     /// confinement's own root, or it is not a directory on a platform whose
@@ -375,6 +395,20 @@ mod tests {
             detail: "no user namespaces",
         };
         assert!(err.to_string().contains("no user namespaces"));
+    }
+
+    #[test]
+    fn a_host_refusal_renders_both_halves_and_keeps_the_hresult() {
+        let err = Error::HostCannotConfine {
+            cause: "this token cannot create an AppContainer profile (hr=0x80070005)".to_string(),
+            remedy: "run in an ordinary user session",
+            hr: 0x8007_0005u32 as i32,
+        };
+        assert_eq!(
+            err.to_string(),
+            "this token cannot create an AppContainer profile (hr=0x80070005) — run in an ordinary user session"
+        );
+        assert!(matches!(err, Error::HostCannotConfine { hr, .. } if hr == 0x8007_0005u32 as i32));
     }
 
     #[test]

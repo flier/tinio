@@ -88,7 +88,7 @@ pub fn jail_root(tmpdir: &Path, served_root: &Path) -> PathBuf {
 /// which only a host of `/` produces, and which would make the first entry of
 /// the mount plan a self-bind of the jail tmpfs.
 ///
-/// **Each refusal is logged where it is built, with [`EXPOSE_STEP`] as its
+/// **Each refusal is logged where it is built, with `EXPOSE_STEP` as its
 /// `step`** (shared §7). This is a public function, so the caller may be
 /// outside the crate — and until 2026-09-26 the only event a refused exposure
 /// produced was emitted by `enter`, which a direct caller never runs: the

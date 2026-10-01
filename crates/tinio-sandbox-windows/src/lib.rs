@@ -1,10 +1,10 @@
 //! Windows confinement for tinio: an AppContainer whose package SID holds an
 //! ACE on exactly the exposed paths, launched by a supervising parent.
 //!
-//! [`Backend`] implements [`crate::_core::Backend`]. It can only confine a
+//! `Backend` implements `crate::_core::Backend`. It can only confine a
 //! process it creates — AppContainer membership is fixed at process creation —
 //! so it binds nothing itself, grants the ACLs, launches a confined child and
-//! supervises it through [`Confinement::Supervise`] (design decisions 2, 6).
+//! supervises it through `Confinement::Supervise` (design decisions 2, 6).
 //!
 //! The confinement is three mechanisms, not one: the DACL whitelist decides
 //! which paths exist for the confined process (design §6), the AppContainer's
@@ -32,7 +32,7 @@
 //! Windows implementation land across this phase's tasks**, so the list below
 //! grows one name per task: a module joins it in the task that creates it.
 //!
-//! **The NUL-terminated UTF-16 rule is [`tinio_winsec::to_wide`]'s, not this
+//! **The NUL-terminated UTF-16 rule is `tinio_winsec::to_wide`'s, not this
 //! crate's.** Every name this crate hands the kernel — `sid`'s profile names and
 //! capability strings, `process`'s image path, `acl`'s descriptor read — goes
 //! through that one function, which the workspace's other Windows crates share,
@@ -55,6 +55,7 @@ use crate::_core::{
 
 pub mod acl;
 pub mod backend;
+pub mod capability;
 pub mod control;
 pub mod handles;
 pub mod job;

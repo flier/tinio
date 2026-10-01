@@ -8,7 +8,7 @@ use std::{
     os::windows::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -17,7 +17,7 @@ use tinio_sandbox::{
     AccessMode,
     windows::{
         acl::{self, Target},
-        control, sid, testing,
+        control, testing,
     },
 };
 use tinio_util::testing::{job, kill_and_reap};
@@ -593,25 +593,80 @@ pub fn console_device() -> Result<(), String> {
 /// `CreateAppContainerProfile` in every launcher log this suite writes), and
 /// write the ACEs with `icacls`.
 ///
+/// **The token half is the production predicate's answer and not this harness's.**
+/// `testing::with_probe_profile` runs the predicate's own recipe
+/// (`capability::probe_window`, the window `can_confine` is built on) and answers a
+/// refusal with `cannot_confine`'s error — the one `tinio start` and `tinio doctor`
+/// render — so the sentence a skipped leg prints here is the sentence a refused run
+/// prints: one probe, one sentence, one place the answer is decided. A second
+/// opinion in this harness is exactly the thing the harness exists to avoid: it
+/// would derive a real profile of its own (the token answer's whole content is the
+/// cause and the one `capability::REMEDY` sentence, and `package_name` also touches
+/// the ACL salt), and a host where the two disagreed would skip a leg the product
+/// would have run, or run one it would have refused.
+/// **The signature stays `Result<(), String>`**: `host_missing` and `host_ready`
+/// consume the reason, and `host_ready` hands it to `host_cannot` at the call site
+/// below, so the sentence rendered here is the sentence a skipped leg prints.
+///
 /// A throwaway directory under `tempfile`, so a host that passes leaves nothing
 /// behind: **grants are standing** (this crate no longer rolls an ACE back), so
-/// the ACE dies with the directory `tempfile` deletes, and the profile is deleted
-/// by `PackageSid`'s own `Drop` when the value goes out of scope at the end of the
-/// call.
+/// the ACE dies with the directory `tempfile` deletes.
+///
+/// **The answer is memoized process-wide, because it cannot change under a
+/// running process and the suite asks it once per leg.** `host_ready` calls this
+/// through `host_missing` for each of the three legs, so an unmemoized answer
+/// would pay one scratch directory, one `whoami` (via [`current_user_sid`]) and
+/// one `icacls.exe` per leg. The `OnceLock` shape is `tinio-e2e`'s `tinio_vars` —
+/// a static inside the function — and the whole `Result` is cached, the failure
+/// included, so the reason string a skipped leg prints through
+/// [`testing::host_cannot`] is still exactly the one the first probe rendered.
 pub fn host_can_confine() -> Result<(), String> {
-    let scratch = tempfile::tempdir().map_err(|err| format!("make a scratch directory: {err}"))?;
-    let profile = sid::package_name(scratch.path());
-    let sid = sid::PackageSid::derive(&profile)
-        .map_err(|err| format!("create an AppContainer profile: {err}"))?;
-    #[allow(clippy::arc_with_non_send_sync)]
-    let mut grants = acl::Grants::new(Arc::new(sid));
-    grants
-        .apply(scratch.path(), Target::Directory, AccessMode::ReadWrite)
-        .map_err(|err| format!("grant an ACE with icacls: {err}"))?;
-    // No rollback: every grant this crate makes is standing, which is the contract
-    // `acl::Grants`'s own doc states. The scratch directory goes away with
-    // `tempfile`, and the ACE goes with it.
-    Ok(())
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            // **The token half is not a question this harness asks on its own.** It travels
+            // through `testing::with_probe_profile` below: that window clears and creates the
+            // predicate's own throwaway profile under a fixed name that cannot collide with a
+            // root's, takes the profile lock against a concurrent probe, and answers a refusal
+            // with the sentence the CLI prints — so the skip and the refusal say one thing, and
+            // an earlier shape that asked `can_confine()` and then opened the window was that
+            // one probe's answer asked twice.
+            //
+            // **The ACL half is the other capability, and it now names the principal the
+            // launcher really grants to.** The token half says nothing about writing a DACL, so
+            // this half is still probed here: a throwaway directory under `tempfile`, and a
+            // grant on it through the shared, exit-status-checked `icacls` (`testing::icacls`,
+            // the same call this file's own `icacls` and `seal_to_current_user` use).
+            //
+            // **The SID is the probe's own, lent by `testing::with_probe_profile`.** An earlier
+            // shape granted to the **calling user's** SID, because the writer it wanted,
+            // `acl::Grants`, is typed over `Arc<PackageSid>` and that type's only constructor is
+            // `derive` — a second profile creation, which is exactly the second opinion this
+            // harness exists not to hold. The window hands it a real AppContainer SID from the
+            // predicate's own probe instead, so this half certifies the principal the launcher
+            // grants to rather than an account that merely happens to be the runner's, and no
+            // second profile is derived. **What the window does not bring back is the
+            // `acl::Grants` writer**: the entry is still written by `icacls.exe`, as the
+            // calling-user shape already did.
+            let scratch =
+                tempfile::tempdir().map_err(|err| format!("make a scratch directory: {err}"))?;
+            // Checked, so a host that cannot write the entry fails here with the tool's own text
+            // rather than leaving a leg to discover it. **No rollback**: every grant this crate
+            // makes is standing (`acl::Grants`'s own contract), the scratch directory's ACE goes
+            // with the directory `tempfile` deletes, and nothing outside it is touched.
+            //
+            // **The closure must not block and must not rely on the log**: it runs under the
+            // probe's silenced dispatcher and its `ProfileLock` (`testing::with_probe_profile`'s
+            // own contract), and the `icacls` here is a short-lived child process rather than a
+            // waiter.
+            testing::with_probe_profile(|sid| {
+                let spec = acl::grant_spec(sid.as_str(), Target::Directory, AccessMode::ReadWrite);
+                testing::icacls(scratch.path(), &["/grant:r", &spec, "/q"]);
+            })
+            .map_err(|err| err.to_string())?;
+            Ok(())
+        })
+        .clone()
 }
 
 /// Kill and reap the launcher, then fail with `message` and the log it left.
@@ -738,4 +793,43 @@ pub fn without_ansi(text: &str) -> String {
 pub fn answer(address: SocketAddr) {
     let response = probe(address).unwrap_or_else(|message| panic!("{message}"));
     assert!(response.starts_with("HTTP/1.1 "), "{response}");
+}
+
+#[cfg(test)]
+mod tests {
+    use tinio_util::testing::function_body;
+
+    #[test]
+    fn the_harness_precondition_asks_the_production_predicate() {
+        // Structural: the harness must not carry a second opinion about the token, and the
+        // remedy it prints must be the one the operator reads.
+        //
+        // **The needle moved on 2026-10-02, and the subject did not.** It read
+        // `capability::can_confine()` while the precondition asked the predicate and then opened
+        // the probe's window a second time; the window *is* the ask now —
+        // `testing::with_probe_profile` runs the predicate's own recipe
+        // (`capability::probe_window`) and renders a refusal with `cannot_confine`, the error
+        // `can_confine` answers with — so the one call this body makes is the one that must be
+        // the predicate's, and the assertion names it rather than a call the function no longer
+        // makes. What the test guards is unchanged: the harness's precondition asks the
+        // production predicate rather than holding a second opinion.
+        let body = function_body(
+            include_str!("windows_e2e_harness.rs"),
+            "fn host_can_confine",
+        );
+        assert!(
+            body.contains("testing::with_probe_profile"),
+            "the token half borrows the predicate's own probe"
+        );
+        // **`body`, not the whole source, for the second half**: the source also contains this
+        // very assertion's literal, so a search over it can never fail. `body` ends at the
+        // function's own closing brace — the shared extractor's boundary — so the only thing that
+        // can satisfy the assertion is the delegation in the function itself, and the needle
+        // carries the newline and indentation that open that line, so a delegate someone
+        // commented out with `//` does not satisfy it.
+        assert!(
+            body.contains("\n            testing::with_probe_profile(|sid| {"),
+            "the reason the harness reports is the predicate's own error"
+        );
+    }
 }

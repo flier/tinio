@@ -53,6 +53,18 @@
 //! move cost is this gate's sight of them, and this sentence is the record the placement rule
 //! asks for (the relay half is the paragraph above).
 //!
+//! **The hole that sentence anticipated has since arrived, and it is not a `Command` at all.**
+//! `tinio-sandbox-windows`'s `testing::low_integrity::run_with` — the device that starts the e2e
+//! scenario's Low-integrity child — creates its process with `CreateProcessAsUserW`, because the
+//! restricted token and the integrity level it sets are arguments only that call takes. It is
+//! therefore neither a `job::spawn` site nor a `.spawn()` one, and this scan could not see it even
+//! if it lived under `tests/`. It sits in `src/`, behind that crate's non-default `testing`
+//! feature, which is where the placement rule puts a harness device a `tests/` target has to
+//! share. **One site**, and it is recorded here rather than in `ALLOWED` because an entry is a
+//! permission this gate can check — the count that keeps an entry honest has nothing to count
+//! here. What the device gives up by not going through `job::spawn` is the job object that call
+//! puts around the child; the `CHILD_DEADLINE_MS` bound it waits under is the device's own.
+//!
 //! **The allowlist is a list of holes with reasons, not a shelf of exceptions.** Every site that
 //! can take the guard takes it; a file is listed only where taking it is impossible or unmeasured,
 //! and the count in its entry is what keeps the permission from outliving its site.
@@ -81,11 +93,10 @@ use std::{
 /// doc: it is the one spelling a harness's spawn sites use. A site leaves this list when it takes
 /// the guard, and the check then fails until the entry goes with it — which is the point rather
 /// than a nuisance.
-const ALLOWED: &[(&str, usize, &str)] = &[
-    (
-        "crates/tinio-sandbox-macos/tests/harness/mod.rs",
-        1,
-        "the launcher copy `run_confined` re-execs this test binary under `LAUNCH_ENV` and reads \
+const ALLOWED: &[(&str, usize, &str)] = &[(
+    "crates/tinio-sandbox-macos/tests/harness/mod.rs",
+    1,
+    "the launcher copy `run_confined` re-execs this test binary under `LAUNCH_ENV` and reads \
          the report it writes; the confined child is a grandchild of *that* copy, so the spawn is \
          the crate's own re-exec chain rather than a child of this process. **The entry is \
          macOS-only, and the guard has nothing to take there**: `job::spawn`'s macOS arm is \
@@ -93,8 +104,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
          (`#![cfg(target_os = \"macos\")]` makes every target here an empty crate off a Mac), so a \
          rewrite would be asserted rather than measured — the thing this workspace's rule about the \
          gated crates forbids. Converting it on a Mac is the follow-up this entry is waiting for.",
-    ),
-];
+)];
 
 #[test]
 fn every_harness_spawn_goes_through_the_guard() {

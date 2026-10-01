@@ -53,15 +53,11 @@
 // `child_role` shim — the name the harness spawns here, because the lib linked
 // into an integration target is compiled without `cfg(test)`
 // (`tinio_sandbox_windows::testing::CHILD_ROLE`).
-use tinio_sandbox_windows::testing as common;
-
 use std::{fs, net::TcpListener};
 
 use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, LaunchPlan, Sandbox};
 use tinio_sandbox_windows::{
-    Backend, Capability, Options,
-    acl,
-    sid::ALL_APPLICATION_PACKAGES,
+    Backend, Capability, Options, acl, sid::ALL_APPLICATION_PACKAGES, testing as common,
 };
 
 /// The confined child. The body lives in the harness because the network and

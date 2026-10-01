@@ -436,3 +436,50 @@ Feature: Doctor diagnostics
     And the file "{state}/state" does not exist
     And the file "{state}/meta.redb" exists
     And the file "{root}/.tinio/meta.redb" does not exist
+
+  # **A host that cannot confine, which is the one host state a scenario has to create rather
+  # than ask about.** The runner's own token is Medium, so a plain `I run` makes `doctor` see a
+  # host that can, and the `warn` row this leg asserts on could never be witnessed here. The run
+  # is spawned under a Low integrity token (`tinio_sandbox_windows::testing::low_integrity`),
+  # which is the state a would-be confiner is refused in, so the capability probe reads the same
+  # `E_ACCESSDENIED` a real confined host reports and `writability` fails for the same reason —
+  # the second failure is why the exit code is 1 rather than only the row being `warn`. The leg
+  # is the text rendering on purpose: `--json` writes one field per line, so a finding's
+  # `severity` and `check` never share a line and `doctor_row` (`steps/doctor.rs`) could not read
+  # the row at all.
+  @cli @windows
+  Scenario: doctor reports a host that cannot confine
+    Given a storage root
+    When I run "tinio doctor {root}" under a low-integrity token
+    Then the run fails with exit code 1
+    And the report holds a warn finding carrying "host confinement"
+    And the report holds a warn finding carrying "hr=0x80070005"
+
+  # **The same refusal against the second state the predicate has to tell apart.** An earlier
+  # probe killed between its create and its delete leaves `tinio.sandbox.capability-probe`
+  # behind; the scenario above runs with the name absent, this one with it present, and both owe
+  # the same `When`/`Then`s. The residue is manufactured with `PackageSid::derive` +
+  # `mem::forget` (the seeding step), which is exactly what a hard kill leaves.
+  #
+  # **This is a state fixture with a regression role, not a reproduction of an observed
+  # defect.** On this host the residue cannot defeat the probe either way: measured by the
+  # wave-E review (and by Task 4 fix 3's own probe), `CreateAppContainerProfile`'s permission
+  # check precedes its existence check, so a Low token is refused `E_ACCESSDENIED`
+  # (`0x80070005`) with the residue present and never gets `ALREADY_EXISTS` (`0x800700B7`) —
+  # the takeover of a colliding name is never reached by a denied token here. It is kept
+  # because the clear-before-create must not regress on a host whose check order differs, and
+  # because the state is real on any host.
+  #
+  # **The HRESULT is deliberately not pinned here.** With residue present the refused call is
+  # the clear of the existing name rather than the create, and its HRESULT need not be the
+  # create's `0x80070005`; the code pin belongs to the scenario above, which has no residue.
+  # What this one pins is the row itself: severity `warn`, check `host confinement`, and the
+  # action the refusal tells the operator to take.
+  @cli @windows
+  Scenario: doctor reports a host that cannot confine with a leftover probe profile
+    Given a storage root
+    And an earlier probe left its profile behind
+    When I run "tinio doctor {root}" under a low-integrity token
+    Then the run fails with exit code 1
+    And the report holds a warn finding carrying "host confinement"
+    And the report holds a warn finding carrying "ordinary user session"

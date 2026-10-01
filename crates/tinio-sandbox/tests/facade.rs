@@ -34,6 +34,16 @@ use rustix::process::Pid;
 use tinio_sandbox::_core as core;
 use tinio_sandbox::{AccessMode, Backend, ControlSocket, Sandbox, serve};
 
+/// Binding the host predicate here is what makes a facade-native name that stops resolving a
+/// compile error rather than a discovery: `the_launcher_surface_is_re_exported` can see only the
+/// names its re-export list carries, and this one is not among them. `backend_available` is the
+/// neighbouring facade-native case, and it is bound nowhere: its only binding is the doctest in
+/// `lib.rs` that asserts the answer this target gives, which pins no name against drift.
+#[test]
+fn the_host_predicate_is_published() {
+    let _: fn() -> Result<(), tinio_sandbox::Error> = tinio_sandbox::can_confine;
+}
+
 #[test]
 fn the_vocabulary_is_re_exported() {
     let sandbox = Sandbox::new().expose("/srv/data", AccessMode::ReadOnly);
@@ -378,4 +388,3 @@ fn the_adopted_names_answer_one_error_type() {
         "{capability}"
     );
 }
-

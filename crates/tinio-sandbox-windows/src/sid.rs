@@ -50,6 +50,7 @@ use windows_sys::Win32::{
 use crate::{
     _core::{Result, launch},
     backend::Capability,
+    capability,
     handles::last_error,
 };
 
@@ -1158,9 +1159,15 @@ impl PackageSid {
     ///
     /// # Errors
     ///
+    /// [`Error::HostCannotConfine`](tinio_sandbox_core::Error::HostCannotConfine)
+    /// when the token is denied the profile itself (`E_ACCESSDENIED`): the
+    /// platform can confine and this token may not, and the variant names the
+    /// cause and the two actions.
+    ///
     /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when the profile
-    /// cannot be created or the SID cannot be rendered — a name that is too long
-    /// or malformed surfaces here, before anything has been granted.
+    /// cannot be created for any other reason or the SID cannot be rendered —
+    /// a name that is too long or malformed surfaces here, before anything has
+    /// been granted.
     ///
     /// # Examples
     ///
@@ -1206,15 +1213,29 @@ impl PackageSid {
             // as the API documents.
             let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut raw) };
             if hr != 0 {
-                return Err(launch(
-                    "DeriveAppContainerSidFromAppContainerName",
-                    name,
-                    io::Error::other(format!(
-                        "DeriveAppContainerSidFromAppContainerName: hr=0x{hr:08X}"
-                    )),
-                ));
+                return Err(capability::classify(hr).unwrap_or_else(|| {
+                    launch(
+                        "DeriveAppContainerSidFromAppContainerName",
+                        name,
+                        io::Error::other(format!(
+                            "DeriveAppContainerSidFromAppContainerName: hr=0x{hr:08X}"
+                        )),
+                    )
+                }));
             }
         } else if hr != 0 {
+            // **The floor.** Whatever a preflight said, the call that actually fails classifies
+            // its own HRESULT, so an operator on a host no preflight anticipated still reads a
+            // cause and two actions rather than a bare code.
+            if let Some(err) = capability::classify(hr) {
+                tracing::warn!(
+                    step = "host cannot confine",
+                    name = name,
+                    hr = hr,
+                    "the token cannot create an AppContainer profile; the refusal names the cause and the remedy"
+                );
+                return Err(err);
+            }
             return Err(launch(
                 "CreateAppContainerProfile",
                 name,
@@ -1318,6 +1339,95 @@ impl PackageSid {
     }
 }
 
+/// What one `DeleteAppContainerProfile` call found — **the two states the API can
+/// distinguish, and there is deliberately no third.**
+///
+/// `DeleteAppContainerProfile` answers `S_OK` for a name that was never created
+/// exactly as it does for one it removed (measured on this host 2026-09-26, and
+/// recorded beside each presentation below), so "deleted one" and "there was none"
+/// are one answer: neither this type nor a caller of it may claim to tell them
+/// apart. [`Self::Gone`] is "no profile with this name is left" — the only thing
+/// the call knows — and [`Self::Refused`] is the call being refused, which is the
+/// only state in which a profile with that name may still be on the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deleted {
+    /// No profile with this name is left. **Whether this call removed one is not
+    /// knowable and is deliberately not claimed**: a run whose profile a peer had
+    /// already taken is exactly the case that cannot be told from a deletion.
+    Gone,
+    /// This call was refused with this HRESULT, so a profile with this name may
+    /// still be on the machine. What that leaves behind is each presentation's to
+    /// say: [`PackageSid`]'s `Drop` warns and keeps the name, [`clear_profile`]
+    /// answers the classified refusal, and `crate::sweep` warns and goes on.
+    Refused(i32),
+}
+
+/// Delete the AppContainer profile `name` — **the crate's one `to_wide` + `unsafe` +
+/// `SAFETY` note for this API, which all three presentations render from.**
+///
+/// **It is a primitive rather than a policy, because the three presentations do not
+/// share one.** [`PackageSid`]'s `Drop` takes [`ProfileLock`] around the call and
+/// emits the `step = "DeleteAppContainerProfile"` event with its `absent` field;
+/// [`clear_profile`] renders the refusal [`capability::classify`] recognises and
+/// emits nothing, because it runs under a no-op dispatcher; and `crate::sweep`'s
+/// private `delete_profile` warns at its own step and answers `bool`, because a
+/// sweep continues past a name it could not take. **Locking and eventing are those
+/// sites' business and deliberately not this function's.** The profile-name rules
+/// are this module's ([`package_name`], [`normalised_root`]), which is why the call
+/// lives beside them.
+pub(crate) fn delete_appcontainer_profile(name: &str) -> Deleted {
+    let wide = to_wide(name);
+    // SAFETY: `wide` is NUL-terminated and alive for the call, and `name` is the
+    // profile this caller means to clear.
+    let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+    if hr == 0 {
+        Deleted::Gone
+    } else {
+        Deleted::Refused(hr)
+    }
+}
+
+/// Clear the profile `name`, answering the probe's one refusal — **the capability
+/// probe's clear, and quietly so.**
+///
+/// **`Err` is the refusal [`capability::classify`] recognises, and that is the whole
+/// contract.** A token the API refuses is refused the clear too: a clear of an absent
+/// name under the Low token answers `0x80070005` on this host (measured by Task 4 fix
+/// 3, and 3000/3000 under churn by the wave-E review), so the caller may answer "cannot
+/// confine" from this call without asking the create. **`Ok` is not "the name is
+/// gone"**: `DeleteAppContainerProfile` answers `S_OK` for an absent name for a token
+/// the API admits (measured 2026-09-26, the same call [`PackageSid`]'s `Drop` records),
+/// but an *unrecognised* non-zero HRESULT is `Ok` here too and leaves the name possibly
+/// still present — the caller's create handles that, and an unrecognised code is
+/// deliberately not a verdict (the wave-E review's finding 2).
+///
+/// **The probe clears the name before it creates it**, which is why this call exists:
+/// for a token the API admits the clear is the cleanup that makes the caller's create a
+/// real creation rather than a takeover of a crashed probe's residue.
+///
+/// **One kernel call, three presentations, and each presentation carries its own
+/// obligation.** All three go through [`delete_appcontainer_profile`], the crate's one
+/// call of this API and the one [`Deleted`] it answers; what differs is what each site
+/// owes its readers. [`PackageSid`]'s `Drop` carries the
+/// `step = "DeleteAppContainerProfile"` event with its `absent` field, which an operator
+/// reads a run's log for and the e2e suite asserts on. This presentation carries the
+/// refusal alone and emits nothing, which is the shape the probe needs — it runs under
+/// a no-op dispatcher, so an event here would be discarded anyway. **`sweep`'s private
+/// `delete_profile` is the third presentation**, and it carries the reaper's
+/// continuation: warned at its own step and answering `bool`, because a sweep continues
+/// past a name it could not take.
+pub(crate) fn clear_profile(name: &str) -> Result<()> {
+    match delete_appcontainer_profile(name) {
+        // **An unrecognised refusal is still `Ok`**, for the reason the doc above
+        // gives: only the code `classify` knows is a verdict.
+        Deleted::Refused(hr) => match capability::classify(hr) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        },
+        Deleted::Gone => Ok(()),
+    }
+}
+
 impl Drop for PackageSid {
     fn drop(&mut self) {
         // SAFETY: `raw` is this value's own allocation, produced by the profile
@@ -1331,49 +1441,48 @@ impl Drop for PackageSid {
         // A running child is unharmed either way, which is why the lock is taken
         // around the delete rather than held for the child's life.
         let _lock = ProfileLock::acquire(&self.name);
-        let wide = to_wide(&self.name);
-        // SAFETY: `wide` is NUL-terminated and alive for the call, and the name
-        // is the one this value created the profile under.
-        let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
-        if hr != 0 {
-            // **The delete failed, and that is all this branch means.** It is
-            // *not* "someone else deleted it": the API does not report that as a
-            // failure at all — it answers `S_OK` for a name that is not there
-            // (measured 2026-09-26) — so a non-zero `hr` is this call being
-            // refused, and what is left behind is a profile this run could not
-            // take back. A residue rather than a failure, and `Drop` has no
-            // caller to report one to: the next run derives the same name and
-            // takes this profile over (decision 21). Warned, because shared §7's
-            // "a documented degradation is logged" is what makes an undeleted
-            // profile visible in a log rather than inferable from a package
-            // listing.
-            tracing::warn!(
-                step = "DeleteAppContainerProfile",
-                name = %self.name,
-                hr = hr,
-                absent = false,
-                "the profile could not be deleted and may still be on this \
-                 machine; the next run on this root takes it over (decision 21)"
-            );
-        } else {
-            // The other half of the pair the creation emits, so a log answers
-            // "was this process confined, and to what" from both ends of the
-            // profile's life (shared §7).
-            //
-            // **`hr == 0` is "no profile with this name is left", which is not
-            // the same statement as "this call deleted one"**, and the field
-            // says the first because that is what the call knows: measured on
-            // this host 2026-09-26, `DeleteAppContainerProfile` answers `S_OK`
-            // for a name that was never created just as it does for one it
-            // removed, so an event that claimed the removal would be reporting
-            // an action this value cannot observe — and a run whose profile a
-            // peer had already taken is exactly that case.
-            tracing::info!(
-                step = "DeleteAppContainerProfile",
-                name = %self.name,
-                sid = %self.text,
-                absent = true
-            );
+        match delete_appcontainer_profile(&self.name) {
+            Deleted::Refused(hr) => {
+                // **The refusal is all this branch means.** It is
+                // *not* "someone else deleted it": the API does not report that as a
+                // failure at all — it answers `S_OK` for a name that is not there
+                // (measured 2026-09-26) — so this branch is this call being
+                // refused, and what is left behind is a profile this run could not
+                // take back. A residue rather than a failure, and `Drop` has no
+                // caller to report one to: the next run derives the same name and
+                // takes this profile over (decision 21). Warned, because shared §7's
+                // "a documented degradation is logged" is what makes an undeleted
+                // profile visible in a log rather than inferable from a package
+                // listing.
+                tracing::warn!(
+                    step = "DeleteAppContainerProfile",
+                    name = %self.name,
+                    hr = hr,
+                    absent = false,
+                    "the profile could not be deleted and may still be on this \
+                     machine; the next run on this root takes it over (decision 21)"
+                );
+            }
+            Deleted::Gone => {
+                // The other half of the pair the creation emits, so a log answers
+                // "was this process confined, and to what" from both ends of the
+                // profile's life (shared §7).
+                //
+                // **[`Deleted::Gone`] is "no profile with this name is left", which is
+                // not the same statement as "this call deleted one"**, and the field
+                // says the first because that is what the call knows: measured on
+                // this host 2026-09-26, `DeleteAppContainerProfile` answers `S_OK`
+                // for a name that was never created just as it does for one it
+                // removed, so an event that claimed the removal would be reporting
+                // an action this value cannot observe — and a run whose profile a
+                // peer had already taken is exactly that case.
+                tracing::info!(
+                    step = "DeleteAppContainerProfile",
+                    name = %self.name,
+                    sid = %self.text,
+                    absent = true
+                );
+            }
         }
     }
 }
@@ -1577,10 +1686,11 @@ mod tests {
         time::Duration,
     };
 
-    use tinio_util::testing::{assert_recorded_at, assert_step};
+    use tinio_util::testing::{assert_recorded_at, assert_step, function_body};
 
     use super::*;
     use crate::{
+        _core::Error,
         acl::{grant_everyone_read, icacls_binary},
         testing::{capture, recorder},
     };
@@ -2132,6 +2242,39 @@ mod tests {
             taken_over.as_str(),
             sid.as_str(),
             "the takeover keeps the SID"
+        );
+    }
+
+    #[test]
+    fn a_denied_profile_creation_classifies_rather_than_reports_a_bare_hr() {
+        // `capability::`, not `crate::capability::`: this crate's `[lints.clippy]` sets
+        // `absolute_paths`, and `-D warnings` turns the longer spelling into a build failure.
+        let err =
+            capability::classify(capability::E_ACCESSDENIED).expect("E_ACCESSDENIED classifies");
+        assert!(matches!(err, Error::HostCannotConfine { .. }), "{err}");
+        // And the code that must NOT classify keeps the old path.
+        assert!(capability::classify(0x8007_0003u32 as i32).is_none());
+        // **The call site itself is pinned by reading it, because nothing else can.** No test
+        // forces `userenv` to answer `E_ACCESSDENIED` on a host that works, so the properties
+        // this name claims — a denied creation classifies rather than reporting a bare HRESULT,
+        // and the refusal says so in the log — are properties of the source.
+        let derive = function_body(include_str!("sid.rs"), "fn derive(name: &str)");
+        // The region is pinned before it is used, so a slice that came back as the wrong region
+        // fails here rather than counting it.
+        assert!(
+            derive.contains("let taken_over = hr == HRESULT_ALREADY_EXISTS;"),
+            "the extraction found derive's body"
+        );
+        assert_eq!(
+            derive.matches("capability::classify(hr)").count(),
+            2,
+            "both of derive's `hr != 0` arms classify"
+        );
+        // **The log half is pinned too.** Without this the whole `warn!` block can be deleted
+        // with the suite green, and the step line is the surface the suites read.
+        assert!(
+            derive.contains("step = \"host cannot confine\""),
+            "the refusal emits the step event"
         );
     }
 

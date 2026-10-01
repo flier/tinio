@@ -79,6 +79,10 @@
 //! fails a test which reads it. None of them names a domain type or a platform,
 //! which is what lets them live in the shared module at all.
 //!
+//! One more is the structural reader: [`function_body`], the one boundary rule four tests used to
+//! hand-roll their own delimiters for — a function's slice ends at the line that closes it at the
+//! declaration's own indentation, so no site's slice can run past the function it names.
+//!
 //! Four fixtures are the same idea one step down: [`conform_owner`],
 //! [`conform_other_owner`], [`conform_group_read_grant`] and [`checksum_tee`]
 //! are the ACL and checksum-slot literals the conformance blocks build on, and
@@ -2632,6 +2636,47 @@ mod tests {
         let hex = "d41d8cd98f00b204e9800998ecf8427e";
         assert_eq!(etag(hex).as_str(), hex);
     }
+
+    /// The boundary rule on the two shapes its callers have: a free function at column zero whose
+    /// body holds a block closing deeper, and an `impl` method at four spaces — plus the comment
+    /// skip, so the doc mention above `outer` is not mistaken for its declaration.
+    #[test]
+    fn a_function_slice_ends_at_the_declarations_own_closing_brace() {
+        let source = "\
+// fn outer is mentioned here
+fn outer() {
+    if x {
+        inner();
+    }
+}
+
+    fn method() {
+        if y {
+            deeper();
+        }
+    }
+";
+        let outer = function_body(source, "fn outer");
+        assert!(outer.starts_with("fn outer()"), "{outer}");
+        assert!(outer.contains("inner();"), "{outer}");
+        assert_eq!(outer.lines().last(), Some("}"), "{outer}");
+        let method = function_body(source, "fn method");
+        assert!(method.contains("deeper();"), "{method}");
+        assert!(!method.contains("fn outer"), "{method}");
+        assert_eq!(method.lines().last(), Some("    }"), "{method}");
+    }
+
+    #[test]
+    #[should_panic(expected = "no line of this source declares")]
+    fn a_missing_declaration_line_is_the_shared_guard() {
+        function_body("fn other() {}\n", "fn missing");
+    }
+
+    #[test]
+    #[should_panic(expected = "never closed")]
+    fn a_declaration_that_never_closes_at_its_indentation_is_the_shared_guard() {
+        function_body("    fn method() {\n}\n", "fn method");
+    }
 }
 
 /// The wait timeout in seconds — `TINIO_TEST_WAIT_TIMEOUT_SECS` overrides the
@@ -2817,6 +2862,62 @@ pub fn assert_step(logged: &str, step: &str) {
         logged.contains(&format!("step=\"{step}\"")),
         "no `step=\"{step}\"` in:\n{logged}"
     );
+}
+
+/// The text of the function whose declaration line carries `signature` — **one boundary rule for
+/// every structural test that slices a function out of `include_str!`.**
+///
+/// **The rule is the declaration's own indentation.** The slice runs from the declaration's line
+/// to the first later line whose leading whitespace equals the declaration's and whose first
+/// non-whitespace character is `}` — so a free function at column zero ends at column zero and an
+/// `impl` method at four spaces ends at four, and no site spells a delimiter of its own. The
+/// delimiters this replaced were each right for the file it was written in and wrong for its
+/// sibling: a `"\n    fn "` split finds no sibling when the method is its `impl`'s last, and a
+/// bare `"\n}"` finds the whole `impl`'s close rather than the method's.
+///
+/// **A comment line carrying the signature is skipped**, so a doc mention above the declaration
+/// is never mistaken for it.
+///
+/// **The guard is this function's two panics**: a source with no line carrying the signature, or
+/// a declaration whose indentation never repeats before the source ends, fails here rather than
+/// handing the caller a slice of the wrong region. Callers keep asserting on what the slice
+/// contains; this is the boundary check they no longer spell one by one.
+///
+/// # Panics
+///
+/// When `signature` is on no non-comment line, or the declaration's line is never closed by a
+/// `}` line at its own indentation.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_util::testing::function_body;
+///
+/// let source = "fn a() {\n    if x {\n        b();\n    }\n}\n\nfn c() {}\n";
+/// let a = function_body(source, "fn a");
+/// assert!(a.contains("b();") && !a.contains("fn c"));
+/// ```
+pub fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let mut offset = 0;
+    let (start, declaration) = source
+        .split_inclusive('\n')
+        .find_map(|line| {
+            let start = offset;
+            offset += line.len();
+            let is_comment = line.trim_start().starts_with("//");
+            (!is_comment && line.contains(signature)).then_some((start, line))
+        })
+        .unwrap_or_else(|| panic!("no line of this source declares `{signature}`"));
+    let indent = declaration.len() - declaration.trim_start().len();
+    let mut line_start = start + declaration.len();
+    for line in source[line_start..].split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() == indent && trimmed.starts_with('}') {
+            return &source[start..line_start + line.len()];
+        }
+        line_start += line.len();
+    }
+    panic!("the declaration of `{signature}` is never closed by a `}}` at its own indentation");
 }
 
 /// The recorded line carrying `needle` is logged at `level`: **the level check a recording can no

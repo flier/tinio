@@ -61,9 +61,9 @@
 //! else — or a confined child started by a launcher whose image is not `tinio` —
 //! is invisible to the gate. A machine that never launches this launcher again
 //! keeps its residue. And this module never removes a filesystem path itself: it
-//! names the profile to [`DeleteAppContainerProfile`] and the key to the registry,
-//! and what those do with a directory that has been replaced by a reparse point
-//! is their own behaviour.
+//! names the profile through [`delete_appcontainer_profile`] and the key to the
+//! registry, and what those do with a directory that has been replaced by a reparse
+//! point is their own behaviour.
 //!
 //! This module is one of the crate's enumerated `unsafe` sites (design decision
 //! 14): the Toolhelp process walk, the `Storage` key listing and the registry
@@ -86,7 +86,6 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, GetLastError,
         INVALID_HANDLE_VALUE,
     },
-    Security::Isolation::DeleteAppContainerProfile,
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -100,7 +99,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::sid::{PACKAGE_PREFIX, ProfileLock};
+use crate::sid::{Deleted, PACKAGE_PREFIX, ProfileLock, delete_appcontainer_profile};
 
 /// The `step` every event this module emits carries.
 ///
@@ -158,7 +157,7 @@ const LAUNCHER_IMAGE: &[u8] = b"tinio";
 /// A struct rather than two reads inside the sweep, and that is what keeps a test
 /// off the operator's machine: a sweep handed a scratch `packages` directory and a
 /// scratch `storage` path can only find the names a leg put there, while the
-/// directory removal [`DeleteAppContainerProfile`] performs stays the product call
+/// directory removal [`delete_appcontainer_profile`] performs stays the product call
 /// it is (the name it is given is the fixture's own, derived from a temporary
 /// root).
 struct Places {
@@ -519,31 +518,30 @@ fn reap(places: &Places, name: &str) -> bool {
     profile && key
 }
 
-/// `DeleteAppContainerProfile(name)` — the half that takes
-/// `%LOCALAPPDATA%\Packages\<name>` with it.
+/// The profile half of a reap — [`delete_appcontainer_profile`] for `name`, the
+/// call that takes `%LOCALAPPDATA%\Packages\<name>` with it.
 ///
-/// **`hr == 0` is "no profile with this name is left"**, not "this call removed
-/// one": the API answers `S_OK` for a name that was never created (measured
-/// 2026-09-26; [`crate::sid::PackageSid`]'s own `Drop` records the reading for the
-/// same call), so the half that is there is the half that goes and the absent one
-/// is free rather than a failure.
+/// **`true` is "no profile with this name is left"**, not "this call removed one":
+/// [`Deleted::Gone`] is what the API answers for a name that was never created
+/// (measured 2026-09-26; [`crate::sid::PackageSid`]'s own `Drop` records the reading
+/// for the same call), so the half that is there is the half that goes and the
+/// absent one is free rather than a failure. **The refusal is this presentation's
+/// obligation**: warned at the sweep's own step and answered `false`, so the sweep
+/// continues past a name it could not take (rule 5).
 fn delete_profile(name: &str) -> bool {
-    let wide = to_wide(name);
-    // SAFETY: `wide` is NUL-terminated and alive for the call, and the name is the
-    // candidate's — a name under `Packages` that starts with `PACKAGE_PREFIX`, or a
-    // key of the same shape, never anything else in either place.
-    let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
-    if hr != 0 {
-        tracing::warn!(
-            step = SWEEP_STEP,
-            name = %name,
-            hr = hr,
-            "a stale profile could not be deleted and may still be on this machine; \
-             the launch continues and the next sweep tries again (design decision 21)"
-        );
-        return false;
+    match delete_appcontainer_profile(name) {
+        Deleted::Gone => true,
+        Deleted::Refused(hr) => {
+            tracing::warn!(
+                step = SWEEP_STEP,
+                name = %name,
+                hr = hr,
+                "a stale profile could not be deleted and may still be on this machine; \
+                 the launch continues and the next sweep tries again (design decision 21)"
+            );
+            false
+        }
     }
-    true
 }
 
 /// The `HKCU\…\Storage\<name>` key and everything under it — **the half a reap

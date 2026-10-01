@@ -175,9 +175,8 @@ mod tests {
 
     use tinio_util::job;
 
-    use crate::testing::{TIMEOUT, wait_for_exit};
-
     use super::*;
+    use crate::testing::{TIMEOUT, wait_for_exit};
 
     /// The libtest name of the child's role **in this binary**, which the spawn
     /// below passes as its `--exact` filter: the lib test binary, where a test

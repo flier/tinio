@@ -85,6 +85,24 @@ pub enum Error {
         /// What it refused, as the core's `Refused` renders it.
         refused: String,
     },
+    /// This host's token cannot confine this process, though the platform can — exit code 1.
+    ///
+    /// **The sentence is the core error's, rendered rather than re-spelled.** The variant holds
+    /// the `tinio-sandbox-core` error the platform built, so `{cause} — {remedy}` is the join
+    /// that error's own `#[error]` carries: the text the operator reads, the text a skipped
+    /// suite prints and the text the platform measured have one author **and one spelling**. An
+    /// earlier shape carried the two halves here and re-typed the join, held equal to the core's
+    /// only by a test whose whole job was comparing the two strings; that test is gone with the
+    /// second spelling, and the raw HRESULT now rides along instead of being dropped on the way
+    /// through (the sentence still carries it in prose).
+    ///
+    /// **It does not join [`Self::SandboxBroken`] or [`Self::SandboxDenied`]**: `Broken` says
+    /// the mechanism never applied and `Denied` says it applied and refused an operation,
+    /// while this says the mechanism **could not be applied on this host** — the operator's to
+    /// fix rather than the request's. That distinction is why the variant exists at all, and why
+    /// a host refusal is not simply carried by [`Self::Sandbox`].
+    #[error("{0}")]
+    SandboxHostCannotConfine(_sandbox::Error),
     /// A logging-subscriber failure — exit code 1. The subscriber's own error is a boxed
     /// `dyn Error` the crate's `Error` cannot convert (`tinio_server::log::build_subscriber`'s
     /// return), so it is carried as its message rather than wrapped.
@@ -169,6 +187,22 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(err.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn a_host_that_cannot_confine_is_operational_and_renders_the_cores_sentence() {
+        // **The pair this crate owns, and only that**: the exit code, beside the rendering the
+        // core's own `#[error]` produces. There is no second spelling left to compare.
+        let err = Error::SandboxHostCannotConfine(_sandbox::Error::HostCannotConfine {
+            cause: "this token cannot create an AppContainer profile (hr=0x80070005)".to_string(),
+            remedy: "run in an ordinary user session",
+            hr: 0x8007_0005u32 as i32,
+        });
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(
+            err.to_string(),
+            "this token cannot create an AppContainer profile (hr=0x80070005) — run in an ordinary user session"
+        );
     }
 
     #[test]

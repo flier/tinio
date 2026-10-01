@@ -764,23 +764,15 @@ mod tests {
     //! writes the report these legs assert on. The role's own body is the
     //! harness's; what is asserted here is the launch.
 
-    use std::{
-        env,
-        ffi::OsString,
-        net::TcpListener,
-        os::windows::ffi::OsStringExt,
-        path::Path,
-    };
-
-    use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
+    use std::{env, ffi::OsString, net::TcpListener, os::windows::ffi::OsStringExt, path::Path};
 
     use tinio_sandbox_core::{AccessMode, LaunchPayload};
+    use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
 
     use super::*;
     use crate::{
         acl::{self, Target},
-        launch,
-        socket,
+        launch, socket,
         testing::{CHILD_ROLE, Tree, answer, one_volume, sid_for, tree},
     };
 

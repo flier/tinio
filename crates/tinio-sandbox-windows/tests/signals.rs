@@ -28,8 +28,6 @@
 // the names the harness spawns here, because the lib linked into an integration
 // target is compiled without `cfg(test)`
 // (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
-use tinio_sandbox_windows::testing as common;
-
 use std::{
     fs,
     path::Path,
@@ -38,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tinio_sandbox_windows::control;
+use tinio_sandbox_windows::{control, testing as common};
 use tinio_util::testing::{kill_and_reap, wait_for_path};
 
 /// How often this suite looks at a file: the resolution of every window below.

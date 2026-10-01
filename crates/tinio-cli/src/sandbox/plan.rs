@@ -100,8 +100,8 @@ impl StateDirSource {
 /// module's `lost_export`** — a configured `[telemetry] otlp_endpoint` and a confinement cannot
 /// both be honoured, and the warning that names both is emitted by
 /// [`crate::commands::start::run`], which is where the log is live. [`plan`] answers a disabled
-/// one when no channel asked, and an enabled one only after `refuse_unhonourable` has cleared both
-/// the feature and the target — so an enabled `Request` is one this build is committed to applying,
+/// one when no channel asked, and an enabled one only after `refuse_unhonourable` has cleared the
+/// feature, the target and the host — so an enabled `Request` is one this build is committed to applying,
 /// and the exposure set is rebuilt in the platform arm rather than carried here.
 ///
 /// # Examples
@@ -172,7 +172,7 @@ pub fn resolve_flag(source: ValueSource, requested: bool, file: bool) -> bool {
 /// every refusal reaches the operator's shell.
 ///
 /// No channel set answers "disabled" with an empty exposure set, and a channel that **is** set
-/// is resolved in one place and then measured against the two facts this build cannot change:
+/// is resolved in one place and then measured against the three facts this build cannot change:
 ///
 /// - **the feature.** With `sandbox` off, `--sandbox` is not in the parser at all — so the
 ///   answer can only have come from `TINIO_SANDBOX` or `[server] sandbox`, and either is a
@@ -187,8 +187,14 @@ pub fn resolve_flag(source: ValueSource, requested: bool, file: bool) -> bool {
 ///   one [`tinio_sandbox::serve::Spec`] and does not ask the question again. The determination
 ///   runs before the fork, on every target, which is what makes it reachable and observable in
 ///   every build.
+/// - **the host's own answer.** With the feature on and the target backed, the token may still be
+///   refused a profile: [`tinio_sandbox::can_confine`] is the run-time half of the same question
+///   [`tinio_sandbox::backend_available`] answers at build time, and while it answers `Err`, the
+///   answer is a **startup** error (exit 1). It is asked before this build writes anything, so the
+///   operator reads a cause and two actions instead of a `PermissionDenied` on a temp directory.
 ///
-/// Only a build that has both is allowed to answer an **enabled** [`Request`]; the exposure set at
+/// Only a build, target and host that clear all three facts are allowed to answer an **enabled**
+/// [`Request`]; the exposure set at
 /// the mode's access, plus the platform's own extras, is built where [`crate::sandbox::confine`]
 /// applies the spec rather than carried here. **The channel rides on the request**
 /// ([`Request::channel`]) and the exposure set does not: the channel is what FR-036's warning names
@@ -207,7 +213,8 @@ pub fn resolve_flag(source: ValueSource, requested: bool, file: bool) -> bool {
 /// # Errors
 ///
 /// A usage error (2) for a channel this build cannot honour, a startup error (1) for a platform
-/// whose backend is still a stub, and whatever reading the platform's own extras needs.
+/// whose backend is still a stub or a host that cannot confine, and whatever reading the
+/// platform's own extras needs.
 ///
 /// # Examples
 ///
@@ -262,8 +269,9 @@ pub fn plan(
     };
     // A request this build cannot honour is refused here, before any exposure set exists and
     // before the fork, so the operator's shell sees it. **What is left after the refusal is a
-    // request this target can honour**: the feature is on and
-    // [`tinio_sandbox::backend_available`] answers `true`, and [`crate::sandbox::confine`] applies
+    // request this build, this target and this host can honour**: the feature is on,
+    // [`tinio_sandbox::backend_available`] answers `true`, [`_sandbox::can_confine`] answers `Ok`,
+    // and [`crate::sandbox::confine`] applies
     // it — a request that reached `confine` with nothing to do would serve unconfined.
     refuse_unhonourable(channel)?;
     // A request this target **can** honour is still refused where the confinement it would build
@@ -298,7 +306,7 @@ pub fn plan(
     })
 }
 
-/// The two facts this build cannot change, refused in one place so neither can be answered by
+/// The three facts this build cannot change, refused in one place so none can be answered by
 /// accident — the fail-closed half of [`plan`], and the only reader of
 /// [`tinio_sandbox::backend_available`].
 ///
@@ -334,11 +342,16 @@ fn refuse_unhonourable(channel: Channel) -> Result<(), Error> {
                 OS
             )))
         } else {
-            // **The backend for this target is wired, so the request is honourable** and
-            // [`crate::sandbox::confine`] is the arm that acts on it — the answer above is a property of this
-            // build's target, and the arm below is what has to act on the request it lets through.
-            // Refusing here as well would make the confinement unreachable on every target that
-            // has one.
+            // **The third fact, and the last this build can answer before it writes anything.**
+            // The target has a backend; the token may still be refused one, and on a host where
+            // it is, every later step — the state directory, the served root, the listener, the
+            // stale-profile sweep, the ACL salt file and the profile itself — is work done for a
+            // run that cannot serve. Asking here is what makes the operator read a cause and two
+            // actions instead of a `PermissionDenied` on a temp directory.
+            //
+            // **The ask is the facade's, exactly as `backend_available` is**: the platform that
+            // can answer it is the one that owns the probe.
+            _sandbox::can_confine().map_err(super::sandbox_err)?;
             Ok(())
         }
     }

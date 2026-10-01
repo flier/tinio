@@ -20,6 +20,10 @@
 //! without a reader thread: the poll ends at the child's exit, and the file holds whatever it
 //! said on the way out.
 
+// The Windows-only import, for the low-integrity step below: `OsStr` is the type
+// `Command::get_envs` answers in.
+#[cfg(target_os = "windows")]
+use std::ffi::OsStr;
 // The Linux arms' own import: [`outside_probe`] answers with `io::Result`, and the module's other
 // `io` name is the `ErrorKind` the shared import below brings in on every platform.
 #[cfg(target_os = "linux")]
@@ -59,6 +63,8 @@ use tinio_sandbox::windows::testing;
 use tinio_util::testing::{job, kill_and_reap, poll_exit, wait_for_path};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
+#[cfg(windows)]
+use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 
 #[cfg(target_os = "macos")]
@@ -518,6 +524,19 @@ impl Cli {
         flagged || variable || self.fixture_asked
     }
 
+    /// Whether this run asks for read-only mode — the flag on the command line or the variable a
+    /// scenario put on the child ([`Cli::vars`]). **One spelling for the two sites that need it**:
+    /// `run` records the answer into the [`Run`] the `Then` steps read, and the low-integrity step
+    /// must record the same one, because a run may be read-only through `TINIO_READ_ONLY` with no
+    /// flag at all and a step that read argv alone would disagree with every other run about the
+    /// mode it served.
+    fn read_only(&self, argv: &[String]) -> bool {
+        argv.iter().any(|arg| arg == "--read-only")
+            || self.vars.iter().any(|(name, value)| {
+                name == READ_ONLY_VAR && !matches!(value.as_str(), "0" | "false")
+            })
+    }
+
     /// Runs the operator's command line — `tinio` and all — the way the scenario's environment
     /// asks, and captures what it did.
     ///
@@ -546,10 +565,7 @@ impl Cli {
         } else {
             RUN_TIMEOUT
         };
-        let read_only = argv.iter().any(|arg| arg == "--read-only")
-            || self.vars.iter().any(|(name, value)| {
-                name == READ_ONLY_VAR && !matches!(value.as_str(), "0" | "false")
-            });
+        let read_only = self.read_only(&argv);
         self.confined_spawned |= confined;
         let (out_path, err_path) = self.run_paths();
         let mut cmd = self.command();
@@ -600,11 +616,6 @@ impl Cli {
             sleep(POLL).await;
         }
         let took = started.elapsed();
-        let (stdout, stderr) = (read(&out_path), read(&err_path));
-        let address = readiness(&stdout);
-        if let Some(endpoint) = address {
-            self.endpoint = Some(endpoint.to_string());
-        }
         // A successful `--daemon` run leaves a process nothing here holds a handle to: the
         // `state` file it published is the record, and it is what the teardown stops the daemon
         // through.
@@ -614,6 +625,43 @@ impl Cli {
         }
         if status.is_none() {
             self.children.push(child);
+        }
+        self.record(
+            (out_path, err_path),
+            status,
+            ready_in,
+            took,
+            spawned,
+            read_only,
+        );
+    }
+
+    /// Records a finished run: read back the two stream files [`Cli::run_paths`] handed out and
+    /// build the [`Run`] every `Then` step reads.
+    ///
+    /// **Both spawn paths end here** — this harness's own `Command::spawn` and the low-integrity
+    /// device's `CreateProcessAsUserW` — so the stream → file → snapshot rule has one
+    /// implementation. That relation is load-bearing: [`Run::stderr`] re-reads the file, and the
+    /// snapshot beside it is only the unreadable-file fallback, which two hand-written literals
+    /// would have to keep in step by hand.
+    ///
+    /// **Readiness is derived here rather than passed in**, as the poll loop derived it: the
+    /// frame is a property of the run's stdout, so a caller that computed it would have to read
+    /// the file this function is about to read.
+    fn record(
+        &mut self,
+        (out_path, err_path): (PathBuf, PathBuf),
+        status: Option<ExitStatus>,
+        ready_in: Option<Duration>,
+        took: Duration,
+        spawned: u32,
+        read_only: bool,
+    ) {
+        let stdout = read(&out_path);
+        let stderr = read(&err_path);
+        let address = readiness(&stdout);
+        if let Some(endpoint) = address {
+            self.endpoint = Some(endpoint.to_string());
         }
         self.last = Some(Run {
             status,
@@ -1021,6 +1069,46 @@ fn tinio_vars() -> &'static [OsString] {
             .filter(|key| key.to_string_lossy().starts_with("TINIO_"))
             .collect()
     })
+}
+
+/// The environment a child of [`Cli::command`] is given, as the `name=value` block a spawn that
+/// is not a `std::process::Command` needs.
+///
+/// **The rule is [`Cli::command`]'s, read back rather than restated.** `Command::get_envs`
+/// answers exactly the modifications that method made — a key with no value is an `env_remove`,
+/// a key with one is an `env` — so this starts from this process's own environment, drops the
+/// removals and overlays the sets. [`tinio_vars`] therefore has one reader, and a child spawned
+/// through `CreateProcessAsUserW` is scrubbed by the same definition as every other child.
+///
+/// **Windows-gated because its one caller is.** `CreateProcessAsUserW` is the only spawn in this
+/// harness that cannot take a `std::process::Command`, so the step below is the only caller and
+/// it exists on Windows alone; ungated, this function is dead code on every other target and the
+/// ubuntu and macOS `-D warnings` gates reject it. The gate is the caller's own `cfg`, so the
+/// two cannot drift apart silently.
+#[cfg(target_os = "windows")]
+fn child_environment(cli: &Cli) -> Vec<(OsString, OsString)> {
+    let command = cli.command();
+    let overrides: Vec<(&OsStr, Option<&OsStr>)> = command.get_envs().collect();
+    let mut environment: Vec<(OsString, OsString)> = env::vars_os()
+        .filter(|(key, _)| {
+            !overrides
+                .iter()
+                .any(|(name, value)| value.is_none() && name.eq_ignore_ascii_case(key))
+        })
+        .collect();
+    for (name, value) in overrides {
+        if let Some(value) = value {
+            if let Some(entry) = environment
+                .iter_mut()
+                .find(|entry| entry.0.eq_ignore_ascii_case(name))
+            {
+                entry.1 = value.to_os_string();
+            } else {
+                environment.push((name.to_os_string(), value.to_os_string()));
+            }
+        }
+    }
+    environment
 }
 
 /// A step's docstring (`"""`-delimited in the feature), trimmed of the newline the block adds.
@@ -1463,6 +1551,48 @@ async fn flag_is_probed(world: &mut World, flag: String) {
     cli(world).sandbox_flag = Some(built_in);
 }
 
+/// **The second state the predicate has to tell apart — the profile left behind, where the
+/// scenario above has an absent name — as a state fixture with a regression role, not the
+/// reproduction of an observed defect.** Measured, the residue cannot defeat the predicate on
+/// this host: `CreateAppContainerProfile`'s permission check precedes its existence check, so a
+/// refused token answers `E_ACCESSDENIED` (`0x80070005`) with the name present and never
+/// reaches the colliding-name takeover (`ALREADY_EXISTS`, `0x800700B7`) that the
+/// clear-before-create guards against on a host whose check order differs.
+///
+/// **The residue is manufactured by the crate that owns the name.**
+/// [`testing::leave_probe_residue`] creates the probe's own profile and forgets the value:
+/// `PackageSid`'s lifetime *is* create-then-delete, so forgetting it is exactly the state a
+/// hard kill leaves — a profile that exists and that no value will remove. The fixture lives
+/// there rather than here because the name is `capability::PROBE_NAME`, which is `pub(crate)`:
+/// a step spelling the literal for itself would be a second definition of the name the
+/// predicate probes, which is what the fixture's move retires.
+///
+/// **Measured, the residue is this run's rather than the next run's.** The seed's own
+/// `CreateAppContainerProfile` line reports `taken_over=false` in every run measured (the
+/// wave-E review's three and this round's), so the name is absent each time this step runs and the
+/// sibling scenario above still starts from an absent name. Nothing in the fixture removes the
+/// profile — the `forget` is its point — and nothing waits for it: the launch-path sweep
+/// (`tinio_sandbox_windows::sweep`, design decision 21) reaps this class of orphaned profile,
+/// and the suite's measured runs show the name gone by the next seed rather than carried to it.
+///
+/// **The seed retries, because the profile name is the predicate's fixed one and the scenario
+/// beside this one is probing it at the same time.** `userenv` answers
+/// `0x80070020` (`ERROR_SHARING_VIOLATION`) or `0x80070003` (`ERROR_PATH_NOT_FOUND`) to a
+/// create that overlaps another process's create-then-delete of the same name — the transient
+/// window `capability.rs` records — and a scenario that failed on one would be reporting its
+/// own scheduling rather than the predicate. Only a definitive answer is taken: a refusal of
+/// the `E_ACCESSDENIED` kind cannot arrive here, because this process's token is the ordinary
+/// Medium one the runner has, so any other failure is a real host problem and panics. The retry
+/// loop is the fixture's own ([`testing::leave_probe_residue`]); this step only gives it a
+/// thread that is not the one driving every scenario in this binary.
+#[cfg(target_os = "windows")]
+#[given("an earlier probe left its profile behind")]
+async fn an_earlier_probe_left_its_profile_behind(_world: &mut World) {
+    spawn_blocking(testing::leave_probe_residue)
+        .await
+        .unwrap_or_else(|join| panic!("the residue fixture panicked: {join}"));
+}
+
 // --- When ---------------------------------------------------------------
 
 /// The operator's command line, run to whatever end it reaches: an exit, or a server that keeps
@@ -1470,6 +1600,67 @@ async fn flag_is_probed(world: &mut World, flag: String) {
 #[when(expr = "I run {string}")]
 async fn run_command(world: &mut World, command: String) {
     cli(world).run(&command).await;
+}
+
+/// **The one host state a scenario has to create rather than ask about.** The runner's own token
+/// is Medium, so a plain [`run_command`] makes `doctor` see a host that can confine and the `warn`
+/// row this leg asserts on could never be witnessed. The child is spawned under a Low integrity
+/// token (`tinio_sandbox_windows::testing::low_integrity`), which is the state a would-be
+/// confiner is refused in, and it is recorded into [`Cli::last`] exactly as [`Cli::run`] records
+/// an ordinary one: both streams into this run's own pair of files ([`Cli::run_paths`]), which
+/// the device is handed as the child's destinations, so the `Then` steps read what they read for
+/// every other run.
+///
+/// **The environment is [`Cli::command`]'s, and [`child_environment`] is what keeps it so.**
+/// `CreateProcessAsUserW` cannot be handed a `std::process::Command`, so the block is built from
+/// the modifications that method made and this process's environment — the `TINIO_*` scrub has
+/// one definition rather than a second one here.
+///
+/// **The launch runs on the runtime's blocking pool.** The device is synchronous by design — it
+/// waits with `WaitForSingleObject` under its own `CHILD_DEADLINE_MS` — and the whole suite is
+/// polled from one thread (the runtime's `block_on`, `tests/cucumber.rs`'s runner), so calling
+/// it inline would hold every scenario in this binary for the child's whole life, where each
+/// sibling run here polls with `sleep(POLL).await`. The hop is the step's, which is what keeps
+/// the device's sync entry — the one its own `#[test]` leg calls — and its deadline unchanged.
+///
+/// **A refused launch fails the scenario rather than skipping.** `low_integrity` panics when the
+/// token or the process creation is refused; the blocking task surfaces that panic as its join's
+/// error, which this step re-panics. A host that cannot make the state this leg asserts on has
+/// not produced the state, and must be red rather than quietly fall back to the runner's own
+/// Medium token.
+#[cfg(target_os = "windows")]
+#[when(expr = "I run {string} under a low-integrity token")]
+async fn run_under_low_integrity(world: &mut World, command: String) {
+    let cli = cli(world);
+    let argv = cli.argv(&command);
+    // **`Cli::read_only`'s answer, and not the flag alone**: this step records it into the same
+    // [`Run`] the `Then` steps read, so the two sites must agree that a run may be read-only
+    // through `TINIO_READ_ONLY` with no flag at all — reading argv only would make a scenario
+    // that set the variable silently disagree with every other run about the mode it served.
+    let read_only = cli.read_only(&argv);
+    let environment = child_environment(cli);
+    let program = cargo_bin("tinio");
+    let args: Vec<String> = argv[1..].to_vec();
+    let scratch = cli.scratch().to_path_buf();
+    let (out_path, err_path) = cli.run_paths();
+    let started = Instant::now();
+    let out = out_path.clone();
+    let err = err_path.clone();
+    let finished = spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        testing::low_integrity::run_with(&program, &args, &scratch, Some(&environment), &out, &err)
+    })
+    .await
+    .unwrap_or_else(|join| panic!("the Low-integrity launch task panicked: {join}"));
+    let took = started.elapsed();
+    cli.record(
+        (out_path, err_path),
+        Some(finished.status),
+        None,
+        took,
+        finished.pid,
+        read_only,
+    );
 }
 
 /// Ends the server without letting it drain — the only way to leave a `state` file behind that

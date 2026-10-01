@@ -26,6 +26,9 @@ use crate::_api::{
     state::socket_path,
     transport::{LocalForm, resolve_socket_path},
 };
+// The crate-wide facade alias, imported rather than spelled `crate::_sandbox::...`: a
+// three-segment expression path is what this crate's `absolute_paths` lint refuses.
+use crate::_sandbox;
 #[cfg(all(feature = "api", unix))]
 use crate::commands::start;
 use crate::{
@@ -344,6 +347,60 @@ fn free_space_finding(root: &Path, free: u64, total: u64) -> Finding {
     )
 }
 
+/// The name of the host-confinement row, owned here for the check that emits it: a rename
+/// reaching only one site would still pass on a host that confines, and silently misreport on one
+/// that does not.
+///
+/// **The readers across the crate boundary spell it themselves, and that is the boundary's cost
+/// rather than a copy someone forgot to share.** The cucumber legs drive the `tinio` binary and
+/// hold no dependency on this crate, so a rename here has to reach `tinio-e2e`'s `steps/doctor.rs`
+/// (the `check != "host confinement"` filter that excludes the row) and the two
+/// `carrying "host confinement"` steps in `doctor.feature` by hand. What those legs read the name
+/// from is the contract — `contracts/cli.md`'s `doctor` check list — rather than a constant this
+/// crate could hand them.
+pub(crate) const HOST_CONFINEMENT: &str = "host confinement";
+
+/// The row's `ok` detail on Windows. **`Ok(())` establishes only that this token was not
+/// refused**, so the sentence may not promise a profile: the predicate answers `Ok` both when
+/// its probe created and deleted the throwaway profile and when the probe could not answer at
+/// all — an unrecognised HRESULT is logged at `warn`, answered `Ok` and cached nowhere
+/// (`capability.rs`'s `get_or_probe`). A real refusal still reaches the operator through the
+/// other arm, and the real profile creation keeps classifying its own HRESULT.
+#[cfg(windows)]
+pub(crate) const HOST_CONFINEMENT_OK: &str =
+    "this host's token was not refused an AppContainer profile";
+
+/// The row's `ok` detail on every other target: the facade's non-Windows arm answers `Ok(())`
+/// without probing anything, because the platform's confinement has no host-level precondition
+/// to fail — the Linux jail applies in place and macOS's Seatbelt profile applies to this
+/// process.
+#[cfg(not(windows))]
+pub(crate) const HOST_CONFINEMENT_OK: &str =
+    "this host has no host-level confinement precondition to fail";
+
+/// Whether this host can confine a process, as a finding.
+///
+/// **The `ok` detail is the platform's own truth, and the two arms differ because the
+/// mechanisms do**: on Windows, `Ok(())` means only that this token was not refused — the
+/// profile may have been created, or the probe may have been unable to answer — so the row
+/// claims the non-refusal and never the creation. Every non-Windows target's confinement has
+/// no host-level precondition to fail, so its arm probes nothing and says exactly that. The
+/// refusal arm renders the predicate's error, and neither `ok` sentence is that error's
+/// negation — which is what keeps the row honest on every target it is compiled for.
+///
+/// **A second self-cleaning write is allowed here, and it is the design's ruling rather than
+/// an oversight**: the profile this asks about is created and deleted by the predicate, and
+/// no storage root is touched — `writability`'s note names both probes.
+pub(crate) fn host_confinement_finding(answer: Result<(), _sandbox::Error>) -> Finding {
+    let (severity, detail) = match answer {
+        Ok(()) => (Severity::Ok, HOST_CONFINEMENT_OK.to_string()),
+        Err(err) => (Severity::Warn, err.to_string()),
+    };
+    // **`Finding::check`, not a struct literal**: `Finding.check` is a String
+    // (`report.rs:39-47`), and the constructor is the shape `free_space_finding` uses beside it.
+    Finding::check(HOST_CONFINEMENT, severity, detail)
+}
+
 /// A byte count in GiB, to one decimal — the resolution the floor is discussed at.
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -458,6 +515,10 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
 
     report.extend(walk_findings(&resolution.root, follow_symlinks).await);
     report.push(free_space(&resolution.root));
+    // The push sits exactly after `free_space`'s because the predicate is the host's own
+    // answer, not the root's, and the row is the last thing about the machine the checks
+    // speak for. It is not free: the profile is created and deleted inside this call.
+    report.push(host_confinement_finding(_sandbox::can_confine()));
     #[cfg(feature = "api")]
     report.push(state_findings(run));
     #[cfg(all(feature = "api", unix))]
@@ -559,10 +620,16 @@ fn readability(root: &Path) -> Finding {
 /// The writability probe: one probe file, created and removed, so the answer is the
 /// filesystem's rather than the mode bits' (an ACL can deny a write the mode permits).
 ///
-/// **This is the diagnosis's one temporary write.** `--dry-run` withholds *repairs*, never a
-/// check, so the probe runs in every mode; what the flag changes is that no repair stage
-/// writes. The name walk has no special case for the probe: a file really left behind is
-/// honestly reported there.
+/// **This is the diagnosis's first of two temporary writes, and each undoes itself on the
+/// ordinary path**: the root is left exactly as the run found it (`contracts/cli.md`: the
+/// commands that launch nothing "must leave that root exactly as it found it"). The second
+/// is the confinement predicate's, which creates and deletes an AppContainer profile inside
+/// the [`host_confinement_finding`] row — a probe of the machine, not of the root. Neither is
+/// an absolute promise: a probe file whose removal fails is a finding here and the name walk
+/// reports it like any other, and the design's Risks record the orphaned
+/// `tinio.sandbox.capability-probe` a run killed between create and delete leaves for a later
+/// sweep to reap. `--dry-run` withholds *repairs*, never a check, so both probes run in every
+/// mode; what the flag changes is that no repair stage writes.
 fn writability(root: &Path) -> Finding {
     // A fresh name per probe: a bare pid collides when two doctor processes diagnose one root,
     // and `create_new` refuses a name a third party pre-created — so the probe removes only the

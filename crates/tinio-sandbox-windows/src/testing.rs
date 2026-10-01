@@ -72,6 +72,7 @@ use std::{
     ffi::OsString,
     fs, io,
     io::{Read as _, Write},
+    mem::forget,
     net::{SocketAddr, TcpListener, TcpStream},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
@@ -85,9 +86,6 @@ use tinio_sandbox_core::{
     AccessMode, Backend as BackendTrait, Confinement, LaunchPlan, Sandbox, supervise,
 };
 use tinio_util::job;
-
-use crate::{Backend, Options, acl, launch, sid};
-
 /// Wait for `child` to exit, or kill it and fail the test rather than block on
 /// it.
 ///
@@ -117,6 +115,13 @@ pub use tinio_util::testing::wait_for_exit;
 /// at the definer.
 #[doc(inline)]
 pub use tinio_util::testing::{ALLOW_SKIP, host_cannot, skip_allowed};
+
+use crate::{
+    _core::Error,
+    Backend, Options, acl,
+    capability::{PROBE_NAME, Window, cannot_confine, probe_window},
+    launch, sid,
+};
 
 /// `icacls` on `path`, with `args` appended, and its exit status checked.
 ///
@@ -632,6 +637,91 @@ pub fn sid_for(tree: &Tree) -> sid::PackageSid {
     sid::PackageSid::derive(&sid::package_name(&tree.root)).expect("derive the package SID")
 }
 
+/// Run `f` while the **capability probe's own throwaway profile** is alive, handing it the
+/// package SID that probe created.
+///
+/// **The recipe is [`probe_window`]'s — the predicate's, and not a second one.** The fixed name,
+/// the clear-before-create order and the `ProfileLock` are the window `can_confine` runs, so a
+/// caller that needs a real AppContainer SID takes it from the predicate's own probe rather than
+/// deriving a profile of its own, and the refusal that can end the window is `cannot_confine`'s
+/// own — the same error `can_confine` answers with, from the same probe. The Windows e2e
+/// harness's ACL precondition is the one caller, and it is why this exists: it grants to *this*
+/// SID with the `acl::grant_spec` + `icacls` pair it already used, so what it certifies is the
+/// principal the launcher actually grants to rather than an account that merely happens to be
+/// the runner's.
+///
+/// **The device lives here rather than on `capability`** because `docs/tests.md` puts a device a
+/// `tests/` target must share in this crate's non-default `testing` module, and because the
+/// predicate's module is designed around the one public entry point it keeps.
+///
+/// **A caller owes two things**: its work runs under the silenced dispatcher `probe_window`
+/// opens, so it must not depend on being logged, and it runs under the probe's `ProfileLock`,
+/// so it must not block.
+///
+/// # Errors
+///
+/// `Error::HostCannotConfine` when the token is refused the profile — the same refusal
+/// [`can_confine`](crate::capability::can_confine) answers with, so a skipped leg that reports it
+/// still prints one sentence.
+pub fn with_probe_profile<T>(f: impl FnOnce(&sid::PackageSid) -> T) -> Result<T, Error> {
+    probe_window(f).and_then(|window| match window {
+        Window::Used(used) => Ok(used),
+        Window::Cannot(hr) => Err(cannot_confine(hr)),
+    })
+}
+
+/// Leave the capability probe's profile behind, as a probe killed between its create and its
+/// delete does — the state the e2e suite's residue scenario starts from.
+///
+/// **The name is `capability::PROBE_NAME`, the probe's own, and that is why this device lives
+/// here.** The e2e step that planted this state used to spell the literal
+/// `tinio.sandbox.capability-probe` for itself, because `PROBE_NAME` is `pub(crate)` and a
+/// `tests/` target cannot see it — so the fixture and the name it had to use lived in two
+/// crates, pinned to each other only by a test in the owner. Here the constant is the only
+/// spelling.
+///
+/// **`PackageSid`'s lifetime *is* create-then-delete, so forgetting the value is exactly the
+/// state a hard kill leaves** — a profile that exists and that nothing here will remove.
+/// Nothing waits for it afterwards: the launch-path sweep (`crate::sweep`, design decision 21)
+/// reaps this class of orphaned profile, and the suite's measured runs show the name gone by the
+/// next seed rather than carried to it.
+///
+/// **The retries are deliberate: the name is fixed, so a sibling e2e scenario is probing it
+/// while this device runs.** `userenv` answers `0x80070020` (`ERROR_SHARING_VIOLATION`) or
+/// `0x80070003` (`ERROR_PATH_NOT_FOUND`) to a create that overlaps another process's
+/// create-then-delete of the same name — the transient window `capability` records — and a
+/// caller that failed on one would be reporting its own scheduling rather than the state it
+/// plants. Only a definitive answer is taken: this process's token is the ordinary Medium one a
+/// test runner has, so a refusal of the `E_ACCESSDENIED` kind cannot arrive here, and any other
+/// failure is a real host problem and panics.
+pub fn leave_probe_residue() {
+    let mut attempt = 0u32;
+    let leftover = loop {
+        match sid::PackageSid::derive(PROBE_NAME) {
+            Ok(sid) => break sid,
+            Err(_) if attempt < PROBE_RESIDUE_ATTEMPTS => {
+                attempt += 1;
+                thread::sleep(PROBE_RESIDUE_RETRY);
+            }
+            Err(err) => panic!(
+                "leaving the probe profile {PROBE_NAME:?} behind: creating it was refused \
+                 {PROBE_RESIDUE_ATTEMPTS} times in a row with {err}"
+            ),
+        }
+    };
+    forget(leftover);
+}
+
+/// How many times [`leave_probe_residue`] retries a refused create before it fails the caller.
+///
+/// A second of retries in [`PROBE_RESIDUE_RETRY`] steps: the collision window is the sibling
+/// e2e scenario's create-then-delete of the same fixed name, which is milliseconds.
+const PROBE_RESIDUE_ATTEMPTS: u32 = 20;
+
+/// How long [`leave_probe_residue`] waits between two attempts — see
+/// [`PROBE_RESIDUE_ATTEMPTS`].
+const PROBE_RESIDUE_RETRY: Duration = Duration::from_millis(50);
+
 /// Append one line to the report the parent reads.
 pub fn append_to_report(report: &Path, line: &str) {
     let mut file = fs::OpenOptions::new()
@@ -1011,6 +1101,429 @@ pub fn answer(address: SocketAddr) {
     assert_eq!(&pong, b"pong", "the confined child answered something else");
 }
 
+/// Run a program under a **Low** integrity token, so a suite can reach a host state this
+/// machine will not otherwise produce.
+///
+/// **The recipe, measured on 2026-10-01 and written down because it is not the obvious one:**
+/// `icacls <path> /setintegritylevel Low` answers "Access denied" without
+/// `SeSecurityPrivilege`, and a Low-labelled *image file* lowers the resulting process's
+/// integrity. What works unelevated is
+/// `CreateRestrictedToken` + `SetTokenInformation(TokenIntegrityLevel, Low)` +
+/// `CreateProcessAsUserW`: the child's writes to an object labelled Medium are refused by
+/// no-write-up, which is exactly the state `tinio doctor` must survive.
+///
+/// **The child's streams are files and not pipes**, which is the e2e harness's own rule for its
+/// own reason: a piped capture can wait forever on EOF when a descendant holds the write end.
+/// The two destinations are the caller's (`run_with`): each file is created at the path the
+/// caller named, its handle marked inheritable and handed to `CreateProcessAsUserW` as the
+/// child's standard output or standard error, so a run's streams land in the very files the
+/// caller reads afterwards. `run` — the measured recipe's simple form — keeps the
+/// `std::process::Command::output` shape by naming two files under a `tempfile` directory of its
+/// own and reading them back.
+///
+/// **Those writes reach the files even though the child is Low**, and the distinction is the one
+/// the mandatory-label mechanism is built on: no-write-up is an access check at *open*, and these
+/// handles were opened under this process's own token and are inherited, so the child performs no
+/// open of its own. What the recipe refuses is the child opening a Medium object *itself*, which
+/// is exactly what `mod tests`' leg measures through `cmd`'s own redirection.
+///
+/// **The child's stdin is null.** Neither program this device runs reads one, and a console this
+/// process does not own is not something to hand a Low child.
+///
+/// **Every refusal here panics**, because the entry's signature has no error channel: this is a
+/// test device behind the non-default `testing` feature and not a library entry point, and
+/// the crate's no-panic rule is about the code an operator runs.
+///
+/// **This module is one of the crate's enumerated `unsafe` sites** (design decision 14):
+/// the low-integrity token and the `CreateProcessAsUserW` launch it is handed to are the
+/// crate's only restricted-token FFI, and the module-level `#![allow(unsafe_code)]` below
+/// is the same form `sid` and `control` carry. It sits behind the non-default `testing`
+/// feature, so no production build compiles it.
+pub mod low_integrity {
+    #![allow(unsafe_code)]
+
+    use std::{
+        ffi::OsString,
+        fs::{self, File},
+        mem::size_of,
+        os::windows::{ffi::OsStrExt, io::AsRawHandle, process::ExitStatusExt},
+        path::Path,
+        process::{ExitStatus, Output},
+        ptr,
+    };
+
+    use tinio_winsec::to_wide;
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, WAIT_OBJECT_0},
+        Security::{
+            CreateRestrictedToken, CreateWellKnownSid, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+            SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, WinLowLabelSid,
+        },
+        System::{
+            SystemServices::SE_GROUP_INTEGRITY,
+            Threading::{
+                CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
+                GetExitCodeProcess, INFINITE, OpenProcessToken, PROCESS_INFORMATION,
+                STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            },
+        },
+    };
+
+    use crate::{
+        handles::{self, last_error, mark_inheritable},
+        process::command_line,
+    };
+
+    /// How long a Low-integrity child may run before this device gives up on it.
+    ///
+    /// **A finite bound, and the point is what a hung child does here**: `tinio doctor` on
+    /// this host answers in under a second, and this leg's own child is `cmd`, so every
+    /// real run finishes in milliseconds — a child still alive after a minute is a broken
+    /// one, and an unbounded `WaitForSingleObject` would wedge the whole suite instead of
+    /// failing the test that names it.
+    const CHILD_DEADLINE_MS: u32 = 60_000;
+
+    /// What a Low-integrity run did.
+    ///
+    /// **The status and the pid are the two facts a caller cannot read back for itself**: the
+    /// streams are in the destination files the caller named ([`run_with`] does not copy them),
+    /// and `std::process::Output` — the shape [`run`] still answers — has three fields and none
+    /// of them is a pid. The e2e harness's `Run` records the process it spawned, which is what
+    /// the pid is for.
+    pub struct Finished {
+        /// The child's exit status, from `GetExitCodeProcess`.
+        pub status: ExitStatus,
+        /// The child's process id, from `CreateProcessAsUserW`'s `PROCESS_INFORMATION`.
+        pub pid: u32,
+    }
+
+    /// Run `program` with `args` from `cwd` under a Low integrity token,
+    /// inheriting this process's environment.
+    ///
+    /// **The capture is this entry's own, because the caller named no destination.** It hands
+    /// [`run_with`] two files under a `tempfile` directory it owns, reads them back once the
+    /// child has exited, and answers the `std::process::Command::output` shape the measured
+    /// recipe (this module's own `mod tests` leg) reads.
+    ///
+    /// # Panics
+    ///
+    /// Any refused Win32 call, and a child that cannot be waited for — see the module doc.
+    pub fn run(program: &Path, args: &[&str], cwd: &Path) -> Output {
+        let scratch = tempfile::tempdir().expect("a Low-integrity scratch directory");
+        let stdout_path = scratch.path().join("stdout");
+        let stderr_path = scratch.path().join("stderr");
+        let finished = run_with(program, args, cwd, None, &stdout_path, &stderr_path);
+        Output {
+            status: finished.status,
+            stdout: fs::read(&stdout_path).expect("read the child's stdout"),
+            stderr: fs::read(&stderr_path).expect("read the child's stderr"),
+        }
+    }
+
+    /// `run` with the environment block the child is given and the two files its streams are
+    /// written to.
+    ///
+    /// **`env` is the reason this second entry exists.** The e2e scenarios' harness builds
+    /// every child's environment rather than letting it inherit one (`steps/cli.rs`'s
+    /// `Cli::command`): a `TINIO_*` variable the runner's shell exported would change
+    /// what a scenario serves, and the `*mut c_void` block
+    /// `CreateProcessAsUserW` takes cannot be a `std::process::Command` whose
+    /// `env_remove` calls the spawn would have applied. So the pairs the caller means are
+    /// turned into a NUL-terminated, name-sorted block here, and `None` keeps the
+    /// inheritance the measured recipe used.
+    ///
+    /// **The two destinations are the caller's, so a run's capture is written once.** The e2e
+    /// harness names the very files its `Then` steps read; an earlier spelling captured into a
+    /// scratch directory this device owned and the caller copied both streams into its own files
+    /// afterwards, which was a second create, a second read and a second owned copy per run.
+    /// Each file is created (truncating) here and nothing else, so the caller's path must sit in
+    /// a directory that already exists.
+    ///
+    /// # Panics
+    ///
+    /// `run`'s.
+    pub fn run_with(
+        program: &Path,
+        args: &[&str],
+        cwd: &Path,
+        env: Option<&[(OsString, OsString)]>,
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) -> Finished {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut line = command_line(program, &args);
+        let application = to_wide(program);
+        let directory = to_wide(cwd);
+        let environment = env.map(environment_block);
+        let environment_ptr = environment
+            .as_ref()
+            .map_or(ptr::null(), |block| block.as_ptr().cast());
+
+        // The two capture files, at the destinations the caller named. Their handles are
+        // marked inheritable because `CreateProcessAsUserW` only duplicates inheritable
+        // handles into a child.
+        let stdout_file = File::create(stdout_path).expect("the child's stdout file");
+        let stderr_file = File::create(stderr_path).expect("the child's stderr file");
+        let stdout = stdout_file.as_raw_handle();
+        let stderr = stderr_file.as_raw_handle();
+        mark_inheritable(stdout).expect("mark the child's stdout inheritable");
+        mark_inheritable(stderr).expect("mark the child's stderr inheritable");
+
+        let token = low_token();
+        let startup = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: ptr::null_mut(),
+            hStdOutput: stdout,
+            hStdError: stderr,
+            ..STARTUPINFOW::default()
+        };
+        let mut info = PROCESS_INFORMATION::default();
+        // SAFETY: every pointer below is valid for the call. `application` and
+        // `directory` are NUL-terminated UTF-16 buffers this frame owns, `line` is
+        // the mutable command line the call may rewrite in place, `environment_ptr`
+        // is either null (inherit) or a NUL-terminated block this frame owns,
+        // `startup` is a zeroed `STARTUPINFOW` with its `cb` set and two live
+        // inheritable handles, `info` is writable, and `token.0` is a live primary
+        // token this frame owns for the whole call. `bInheritHandles` is 1 so the
+        // two capture handles reach the child, which is the only reason either of
+        // them is marked inheritable.
+        let created = unsafe {
+            CreateProcessAsUserW(
+                token.0,
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+                CREATE_UNICODE_ENVIRONMENT,
+                environment_ptr,
+                directory.as_ptr(),
+                &startup,
+                &mut info,
+            )
+        };
+        if created == 0 {
+            panic!("CreateProcessAsUserW: {}", last_error());
+        }
+        // The child holds its own copies by now, so this process is done with the two
+        // handles it marked inheritable. **Dropping them is hygiene rather than a
+        // requirement on the read-back**: the caller reopens both files by path after
+        // this returns, and a second open of a file this process still holds would
+        // succeed anyway (Rust's own share mode is read/write/delete). What it buys is
+        // that a capture file's lifetime is not tied to this frame's handles once the
+        // child owns its own copies.
+        drop(stdout_file);
+        drop(stderr_file);
+        // **Both handles are owned from here, so neither an assert nor a panic below
+        // can leak them.** `info` is not read again: the pid is taken first, because
+        // moving the pair into the guard would make a later field access a partial move.
+        let pid = info.dwProcessId;
+        let process = Process(info);
+        // SAFETY: `process.0.hProcess` is the live process handle the guard owns, and
+        // `CHILD_DEADLINE_MS` is a real millisecond budget rather than a sentinel.
+        let waited = unsafe { WaitForSingleObject(process.0.hProcess, CHILD_DEADLINE_MS) };
+        if waited != WAIT_OBJECT_0 {
+            // **A child still alive at the deadline is broken, and it does not outlive this
+            // test.** Every other launch in this harness kills and reaps a child it gives up
+            // on, and an unreaped one here would survive the panic and could poison the
+            // `sweep` liveness leg, which counts live `tinio` processes (the wave-E review's
+            // Minor 6).
+            // SAFETY: `process.0.hProcess` is the live process handle the guard owns, and
+            // `TerminateProcess` takes an exit code and dereferences nothing.
+            let killed = unsafe { TerminateProcess(process.0.hProcess, 1) };
+            if killed != 0 {
+                // SAFETY: as above; a terminated process is signalled, so this reap returns
+                // without blocking, and the guard's `Drop` closes the handle afterwards.
+                unsafe { WaitForSingleObject(process.0.hProcess, INFINITE) };
+            }
+            panic!(
+                "the Low-integrity child was still running {} ms after it was created, so this \
+                 run gave up on it rather than waiting forever: WaitForSingleObject answered \
+                 0x{waited:08X}, terminate answered {killed}, with stdout {:?} and stderr {:?} \
+                 so far",
+                CHILD_DEADLINE_MS,
+                fs::read(stdout_path).unwrap_or_default(),
+                fs::read(stderr_path).unwrap_or_default()
+            );
+        }
+        let mut code = 0u32;
+        // SAFETY: as above, and `code` is a valid out-parameter.
+        let queried = unsafe { GetExitCodeProcess(process.0.hProcess, &mut code) };
+        if queried == 0 {
+            panic!("GetExitCodeProcess: {}", last_error());
+        }
+        Finished {
+            status: ExitStatus::from_raw(code),
+            pid,
+        }
+    }
+
+    /// A restricted copy of this process's own primary token, at Low integrity.
+    ///
+    /// **The copy is what lets the launch be unelevated.** `CreateProcessAsUserW` requires
+    /// `SeAssignPrimaryTokenPrivilege` for a token that is *not* a restricted version of
+    /// the caller's own, and the measurement behind this module is that the restricted form needs
+    /// no privilege at all. `CreateRestrictedToken` is given no disabled SIDs, no deleted
+    /// privileges and no restricting SIDs: the one thing this token changes is its integrity
+    /// level, which `set_low_integrity` writes onto the returned primary token.
+    ///
+    /// **`TOKEN_ASSIGN_PRIMARY` is on the source handle, and it is load-bearing** (measured on
+    /// this host, 2026-10-01): `CreateRestrictedToken`'s new handle carries the access its source
+    /// handle was opened with, so a source opened without that right yields a token whose handle
+    /// `CreateProcessAsUserW` refuses with `ERROR_ACCESS_DENIED` (5). The refusal is the handle's
+    /// access, not the privilege the paragraph above is about — the same call with the same token
+    /// succeeds once the right is asked for.
+    fn low_token() -> Token {
+        let mut existing: HANDLE = ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle that is always valid, and
+        // `existing` is a writable out-parameter for the token handle. The rights are
+        // the ones this module's own calls need: `TOKEN_DUPLICATE` for
+        // `CreateRestrictedToken`, `TOKEN_ADJUST_DEFAULT` for the integrity write, and
+        // `TOKEN_ASSIGN_PRIMARY` because the restricted handle must carry it into
+        // `CreateProcessAsUserW` (see the doc above). `TOKEN_QUERY` is
+        // `CreateProcessAsUserW`'s: it reads back the token it is handed, so the
+        // restricted handle must carry that right for the same reason it carries
+        // `TOKEN_ASSIGN_PRIMARY`. It is not the child's own access — a child opens its
+        // own token separately.
+        let opened = unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                &mut existing,
+            )
+        };
+        if opened == 0 {
+            panic!("OpenProcessToken: {}", last_error());
+        }
+        // The handle is owned from here, so a failure below cannot leak it.
+        let existing = Token(existing);
+        let mut restricted: HANDLE = ptr::null_mut();
+        // SAFETY: `existing.0` is a live token handle with `TOKEN_DUPLICATE`, the
+        // three null pointer/count pairs are the documented "nothing to disable,
+        // delete or restrict" arguments, and `restricted` is writable.
+        let made = unsafe {
+            CreateRestrictedToken(
+                existing.0,
+                0,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                &mut restricted,
+            )
+        };
+        if made == 0 {
+            panic!("CreateRestrictedToken: {}", last_error());
+        }
+        let restricted = Token(restricted);
+        set_low_integrity(restricted.0);
+        restricted
+    }
+
+    /// Lower `token`'s integrity to Low (`S-1-16-4096`), which is what no-write-up
+    /// reads.
+    ///
+    /// `CreateWellKnownSid(WinLowLabelSid)` builds the SID rather than this module parsing
+    /// `S-1-16-4096`: the well-known type is the platform's own spelling, and a string SID
+    /// would be a second parser for a value the kernel already names.
+    fn set_low_integrity(token: HANDLE) {
+        // A `u32` element array of `SECURITY_MAX_SID_SIZE` bytes gives the SID its
+        // documented DWORD alignment; the call reports the length it wrote.
+        let mut sid = [0u32; SECURITY_MAX_SID_SIZE as usize / 4];
+        let mut size = SECURITY_MAX_SID_SIZE;
+        // SAFETY: `sid` is `SECURITY_MAX_SID_SIZE` bytes, which the call documents as
+        // the maximum a well-known SID needs, `size` starts at that length, and a
+        // null domain SID is the documented form for a well-known SID.
+        let built = unsafe {
+            CreateWellKnownSid(
+                WinLowLabelSid,
+                ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if built == 0 {
+            panic!("CreateWellKnownSid(WinLowLabelSid): {}", last_error());
+        }
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                // The pointer borrows `sid`, which outlives the call below.
+                Sid: sid.as_mut_ptr().cast(),
+                Attributes: SE_GROUP_INTEGRITY as u32,
+            },
+        };
+        // SAFETY: `token` is a live primary token this process owns with
+        // `TOKEN_ADJUST_DEFAULT`, `label.Label.Sid` points into `sid` (alive here),
+        // and the length is exactly the structure's size.
+        let set = unsafe {
+            SetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+                size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+            )
+        };
+        if set == 0 {
+            panic!("SetTokenInformation(TokenIntegrityLevel): {}", last_error());
+        }
+    }
+
+    /// The environment block `CreateProcessAsUserW` takes: `name=value` strings, each
+    /// NUL-terminated, the whole block closed by a second NUL.
+    ///
+    /// **Sorted by name**, which the call documents, case-insensitively — a Windows environment
+    /// is case-insensitive in the name while `std::env::vars_os` keeps the case it was
+    /// given.
+    fn environment_block(pairs: &[(OsString, OsString)]) -> Vec<u16> {
+        let mut sorted: Vec<&(OsString, OsString)> = pairs.iter().collect();
+        // **`sort_by_cached_key`, not `sort_by_key`**: std's `sort_by_key` calls the key closure
+        // once per comparison, and each call here allocates two `String`s — over a process
+        // environment of ~100 variables that is ~1000 allocations per child. The cached form
+        // computes each key once and is stable, so the order is the same.
+        sorted.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
+        let mut block = Vec::new();
+        for (name, value) in sorted {
+            block.extend(name.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    /// A handle this module owns, closed when it drops.
+    ///
+    /// **A guard rather than a set of closes on every path**: `low_token` has failure
+    /// returns after the process token exists, and a raw handle would leak on each of them.
+    struct Token(HANDLE);
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            handles::close(self.0);
+        }
+    }
+
+    /// The process/thread pair `CreateProcessAsUserW` filled in, closed when it drops.
+    ///
+    /// **The same reason [`Token`] is a guard, on the path where the leak was real**: the
+    /// pair is closed after the wait's assert and after `GetExitCodeProcess`, so either
+    /// panic — the very failure a test is supposed to take — returned with both handles
+    /// still open. Taking ownership here is what makes the closes unconditional.
+    struct Process(PROCESS_INFORMATION);
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            handles::close(self.0.hThread);
+            handles::close(self.0.hProcess);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The role entry points the harness spawns, and the two properties of the
@@ -1030,6 +1543,9 @@ mod tests {
     };
 
     use super::*;
+    // Two segments, so `absolute_paths` is not provoked by the Low-integrity leg's path to
+    // the system directory; the module's own `use` above does not carry it.
+    use crate::handles;
 
     /// The confined child's role, as this binary's libtest entry point.
     ///
@@ -1122,5 +1638,46 @@ mod tests {
             .recv_timeout(TIMEOUT)
             .expect("the launch never got the slot the test released");
         waiting.join().expect("the launching thread");
+    }
+
+    /// **A Low writer is refused by a Medium directory, which is the host state
+    /// this phase's last leg needs and this machine does not otherwise produce.**
+    ///
+    /// **The leg measures an access decision, by difference.** The child opens the
+    /// same file this process's own token then writes, from the same directory, so
+    /// the two writers are one variable apart and that variable is the token's
+    /// integrity level. The refusal is cmd's own open under its redirection (its
+    /// \"Access is denied.\" on stderr, its exit code 1), and the **same-named** file
+    /// is then written by this process — which is what separates \"the token is Low\"
+    /// from \"the target was never usable\". Without the second writer the leg would
+    /// stay green on a cmd that failed for any other reason at all, which is what
+    /// the earlier spelling of this test did.
+    ///
+    /// **Nothing here parses an absolute path and nothing quotes one.** The target
+    /// is the bare name `probe.txt` relative to the child's working directory, so
+    /// cmd's redirection cannot be split by a space in the path — and the system
+    /// directory is asked for through `handles::system_directory` (the kernel's own
+    /// answer) with a backslash join, because cmd rejects its own command line at
+    /// the *exit 1* the first assertion reads when that path is spelled with a
+    /// forward slash.
+    #[test]
+    fn a_low_integrity_child_cannot_write_a_medium_directory() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let program = handles::system_directory().join("cmd.exe");
+        let out = low_integrity::run(&program, &["/C", "echo x > probe.txt"], dir.path());
+        assert!(
+            out.status.code().unwrap_or(-1) != 0,
+            "a Low writer must be refused; cmd answered {:?} with stdout {:?} and stderr {:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !dir.path().join("probe.txt").exists(),
+            "the Medium directory refuses a Low writer"
+        );
+        // The control: this process's own Medium token writes the same name in the
+        // same directory, so the refusal above is the token's and not the path's.
+        fs::write(dir.path().join("probe.txt"), b"x").expect("the parent's own write");
     }
 }

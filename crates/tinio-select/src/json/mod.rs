@@ -184,6 +184,20 @@ impl<R: Read> RecordReader for Reader<R> {
     }
 }
 
+/// The synthetic-element shape this module's tests and the bench share.
+///
+/// **Declared at file scope rather than inside `mod tests`, and that is the whole point.**
+/// `benches/select_scan.rs` `#[path]`-includes this very file, so the two cannot drift onto
+/// different element layouts. A `#[path]` resolves against the directory of the file declaring
+/// it **plus the name of any enclosing inline module** — inside `mod tests` that base is
+/// `src/json/tests/`, which does not exist, and while Windows folds the `..` away lexically,
+/// Linux resolves a path component by component and refuses to open it: the lib-test target did
+/// not compile there at all. At file scope the base is `src/json/`, which is real, and so is
+/// every component below it on both platforms.
+#[cfg(test)]
+#[path = "../../tests/support/json_fixture.rs"]
+mod json_fixture;
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -195,7 +209,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Params, Reader, Type,
+        Params, Reader, Type, json_fixture,
         testing::{raw, run, run_err, s},
     };
     use crate::{
@@ -536,15 +550,6 @@ mod tests {
     // decompressed (~11 MB); the read path is the production one
     // (`decompressed(Gzip)`).
     // ------------------------------------------------------------------
-
-    /// The synthetic-element shape the fixture generator shares with the
-    /// bench: `benches/select_scan.rs` `#[path]`-includes this very file, so
-    /// the two cannot drift onto different element layouts. The `#[path]`
-    /// climbs three levels because a path inside an inline module is
-    /// resolved against that module's own directory, i.e.
-    /// `src/json/tests/` — not against `src/json/`.
-    #[path = "../../../tests/support/json_fixture.rs"]
-    mod json_fixture;
 
     /// Fixture size, shared with `generate_large_fixture` below.
     const ELEMENTS: u64 = 100_000;

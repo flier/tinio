@@ -47,6 +47,11 @@ use crate::_sandbox;
 use crate::_sandbox::{Enforcement, backend_available};
 #[cfg(all(feature = "sandbox", unix))]
 use crate::_util::path::path_contains;
+// The shared structural reader — the boundary rule the one structural test below slices `plan.rs`'s
+// function with. **Unconditional, unlike its neighbour below, and deliberately so**: that test runs
+// in every build's test graph, so a `cfg` beside this import would leave it uncompiled where the
+// test is.
+use crate::_util::testing::function_body;
 // The shared recording device (`tinio_util::testing`), which this crate's dev edge turns on.
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 use crate::_util::testing::{assert_recorded_at, assert_step, record_events};
@@ -903,6 +908,48 @@ fn a_selector_typo_is_the_usage_class_whichever_platform_raised_it() {
         platform.exit_code(),
         1,
         "exit 1 for the platform's own refusal"
+    );
+}
+
+#[test]
+fn a_host_refusal_keeps_its_classification_rather_than_flattening() {
+    // The `Unsupported` leg beside this one pins the opposite outcome on purpose: a
+    // platform fact flattens into `Sandbox`, a host fact does not, because the remedy is
+    // the operator's and the caller may want to know which it was.
+    let mapped = sandbox_err(_sandbox::Error::HostCannotConfine {
+        cause: "this token cannot create an AppContainer profile (hr=0x80070005)".to_string(),
+        remedy: "run in an ordinary user session",
+        hr: 0x8007_0005u32 as i32,
+    });
+    assert!(
+        matches!(mapped, Error::SandboxHostCannotConfine(_)),
+        "{mapped}"
+    );
+    assert_eq!(mapped.exit_code(), 1);
+}
+
+#[test]
+fn the_hosts_own_answer_is_a_third_refusal_and_not_a_fourth_path() {
+    // **Layer one, and it is the whole of this seam's proof** (the plan-grilling ruling).
+    // The workspace's own precedent for a structural test is
+    // `crates/tinio-server/src/backend/ops.rs:287-310`.
+    //
+    // The guarantee is that the three facts are asked in ONE function, so a request that
+    // reaches `confine` is one this build, this target and this host all committed to
+    // applying. **No seam exists to force the facade's answer** — `backend_available` is a
+    // `pub const fn` over `cfg!`, and `tinio-cli` has no dev-dependency on the Windows crate
+    // — so the predicate's behaviour is proven where it is real (Task 11's Low-integrity
+    // doctor scenario) and this test binds the call site. A text search is not a behaviour,
+    // and the plan says so rather than implying otherwise.
+    let body = function_body(include_str!("plan.rs"), "fn refuse_unhonourable");
+    assert_eq!(
+        body.matches("can_confine()").count(),
+        1,
+        "the host fact is asked once, beside the build and target facts"
+    );
+    assert!(
+        body.contains("backend_available()"),
+        "and the target fact stays"
     );
 }
 

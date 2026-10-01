@@ -698,6 +698,57 @@ pub const fn backend_available() -> bool {
     ))
 }
 
+/// Whether **this host** can confine a process, as the platform answers it.
+///
+/// **The run-time half of the question [`backend_available`] answers at build time.** That one
+/// is a `const fn` over the target list and says the backend has landed; this one asks the
+/// token this process is actually running under, and on Windows that means creating a
+/// throwaway AppContainer profile and deleting it.
+///
+/// **It cannot be `const`**, unlike its two siblings (`platform_facts`, `diagnostics`): the
+/// answer is the machine's, not the build's. **The non-Windows arm is `Ok(())` rather than an
+/// absence**: macOS's Seatbelt is an SBPL profile applied to this process and Linux's jail
+/// applies in place, so neither has a host-level precondition to fail. The name exists on
+/// every target so a consumer compiles and answers one question rather than two.
+///
+/// # Errors
+///
+/// `Error::HostCannotConfine` on Windows when this token is refused. The fact's owner is
+/// `docs/superpowers/specs/2026-10-01-host-confinement-capability-design.md`.
+///
+/// # Examples
+///
+/// ```rust
+/// // The answer is this host's, and the profile the probe creates is deleted again before it
+/// // returns: a refusal is a value to read here, never a panic.
+/// match tinio_sandbox::can_confine() {
+///     Ok(()) => {}
+///     Err(err) => eprintln!("{err}"),
+/// }
+/// ```
+#[cfg(target_os = "windows")]
+pub fn can_confine() -> Result<()> {
+    use crate::_windows::capability::can_confine as windows_can_confine;
+
+    windows_can_confine()
+}
+
+/// Whether **this host** can confine a process — see the Windows arm's doc.
+///
+/// # Examples
+///
+/// ```rust
+/// // A non-Windows host has no host-level precondition to fail: macOS's profile applies to
+/// // this process and Linux's jail applies in place, so this arm answers `Ok` on every
+/// // target it is compiled for — including one this build wires no backend for, whose
+/// // refusal is [`backend_available`]'s to make.
+/// assert!(tinio_sandbox::can_confine().is_ok());
+/// ```
+#[cfg(not(target_os = "windows"))]
+pub fn can_confine() -> Result<()> {
+    Ok(())
+}
+
 // **Exactly the core's public surface, name for name, and that equality is the
 // rule rather than an accident.** The consumers are `crates/tinio-cli` (the
 // serving process, which reaches this crate through the `sandbox` feature its
@@ -911,8 +962,9 @@ pub use crate::_windows::backend as platform;
 mod tests {
     //! The facade's own logic, tested at the file that defines it: the backend this
     //! build selects resolves to a value, the platform selection resolves to a real
-    //! backend, the target backend names its own enforcement, and the child-side
-    //! self-confinement step answers what the platform can and cannot apply.
+    //! backend, the target backend names its own enforcement, the child-side
+    //! self-confinement step answers what the platform can and cannot apply, and the
+    //! host predicate answers on every target.
     //!
     //! **The re-export list stays in `tests/facade.rs`**, and that is the boundary's
     //! whole point: it binds the public `tinio_sandbox::` paths on purpose, so a name
@@ -920,13 +972,12 @@ mod tests {
     //! crate-visibility — fails there, while a module inside this file could not
     //! catch it.
 
+    use super::*;
     /// The mechanism's own vocabulary through the facade's `macos` alias — the same
     /// module `tinio_sandbox::macos::…` names from outside, bound here for the
     /// default-mechanism leg below.
     #[cfg(target_os = "macos")]
     use crate::macos::{Mechanism, Options};
-
-    use super::*;
 
     #[test]
     fn the_facade_resolves_exactly_one_backend() {
@@ -1085,5 +1136,19 @@ mod tests {
         let err = apply_self_confinement(&framed)
             .expect_err("a frame this process cannot apply is refused, never served");
         assert!(!err.to_string().is_empty(), "{err}");
+    }
+
+    #[test]
+    fn the_host_predicate_answers_on_every_target() {
+        // The facade's surface has to exist where no AppContainer does: a consumer that
+        // compiles only on Windows is not a facade.
+        let answer = crate::can_confine();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            answer.is_ok(),
+            "unix platforms confine in place or by profile of their own"
+        );
+        #[cfg(target_os = "windows")]
+        let _ = answer;
     }
 }

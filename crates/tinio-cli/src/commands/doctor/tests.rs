@@ -7,8 +7,12 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+// Reached directly rather than through the module's `pub use`: the row is `pub(crate)` and
+// re-exporting it would put a foreign `_sandbox::Error` in this crate's public API.
+use super::checks::{HOST_CONFINEMENT, HOST_CONFINEMENT_OK, host_confinement_finding};
 use super::*;
 use crate::{
+    _sandbox,
     _util::testing::assert_send_sync,
     commands::DirArgs,
     report::{Finding, Severity},
@@ -32,19 +36,32 @@ fn the_public_surface_is_send_and_sync() {
     assert_send_sync::<Args>();
 }
 
-/// The findings that are not `ok`, **excluding `free space`** — the unit legs' answer to "was
-/// this root reported clean?".
+/// The findings that are not `ok`, **excluding `free space` and `host confinement`** — the unit
+/// legs' answer to "was this root reported clean?".
 ///
 /// `free space` reads the **host's** volume, so a machine below doctor's own floor
 /// (`max(1 GiB, 5%)`) answers `warn` on a root with nothing wrong with it, and a leg asserting the
 /// whole report `Ok` would be a function of the CI disk's free space. The floor's two arms are
 /// pinned with explicit numbers instead — `the_floor_is_the_larger_of_one_gib_and_five_percent`
 /// drives `below_floor` itself — so nothing is lost by leaving the host out here.
+///
+/// `host confinement` is the second row that reads the **host** rather than the root: it asks
+/// whether this machine can confine a process, so a Low-integrity session, a service account or
+/// an AppContainer-hostile runner answers `warn` on a root that has nothing wrong with it, and a
+/// leg asserting the whole report `Ok` would be a function of the machine. Its two arms are
+/// pinned by `a_host_that_cannot_confine_is_reported_as_a_warning` and
+/// `a_host_that_can_confine_says_so`, and the assembly's wiring by
+/// `the_report_wires_the_host_confinement_row_to_the_predicate`, so like the floor's, nothing is
+/// lost by leaving the host out here.
 fn problems(report: &Report) -> Vec<String> {
     report
         .findings()
         .iter()
-        .filter(|finding| finding.severity != Severity::Ok && finding.check != "free space")
+        .filter(|finding| {
+            finding.severity != Severity::Ok
+                && finding.check != "free space"
+                && finding.check != HOST_CONFINEMENT
+        })
         .map(|finding| format!("{}: {}", finding.check, finding.detail))
         .collect()
 }
@@ -361,6 +378,65 @@ fn free_space_reports_the_amount_and_its_percentage() {
         matches!(finding.severity, Severity::Ok | Severity::Warn),
         "the floor's two arms are the only answers this row has: {}",
         finding.detail
+    );
+}
+
+#[test]
+fn a_host_that_cannot_confine_is_reported_as_a_warning() {
+    // The landed shape of the refusal (Task 3/4): `HostCannotConfine` carries cause, remedy and
+    // the raw HRESULT, and it is **not** constructible from a `String` — so the fixture builds
+    // the value the predicate really hands over and lets `Display` render the one sentence.
+    let finding = host_confinement_finding(Err(_sandbox::Error::HostCannotConfine {
+        cause: "this token cannot create an AppContainer profile (hr=0x80070005)".to_string(),
+        remedy: "run in an ordinary user session",
+        hr: 0x8007_0005u32 as i32,
+    }));
+    assert_eq!(finding.check, HOST_CONFINEMENT);
+    assert_eq!(finding.severity, Severity::Warn);
+    assert!(
+        finding.detail.contains("hr=0x80070005"),
+        "{}",
+        finding.detail
+    );
+}
+
+#[test]
+fn a_host_that_can_confine_says_so() {
+    // The name's other half: the row must **say** the platform can confine, not merely be
+    // `ok`. The expectation is the platform's own sentence (`HOST_CONFINEMENT_OK`), so the
+    // assertion is honest on a target whose truth is not Windows's; swapping in the refusal
+    // sentence turns it red.
+    let finding = host_confinement_finding(Ok(()));
+    assert_eq!(finding.check, HOST_CONFINEMENT);
+    assert_eq!(finding.severity, Severity::Ok);
+    assert_eq!(
+        finding.detail, HOST_CONFINEMENT_OK,
+        "the row says the platform's own truth, not the refusal's sentence"
+    );
+}
+
+/// M-3: the arm tests above drive `host_confinement_finding` directly, so a constant severity at
+/// the push in `checks()` would leave them green. This leg runs the **real assembly**
+/// (`crate::test_support::run_checks`) and reads the row it emits: exactly one
+/// `host confinement` row, at the severity the predicate answers in this same test. The
+/// expectation is computed from `_sandbox::can_confine()` rather than hardcoded, so the leg is
+/// honest on a host that cannot confine too.
+#[tokio::test]
+async fn the_report_wires_the_host_confinement_row_to_the_predicate() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    crate::test_support::seed_config(dir.path());
+    let report = crate::test_support::run_checks(dir.path(), false, Proposals::Informational).await;
+    let rows: Vec<&Finding> = report
+        .findings()
+        .iter()
+        .filter(|finding| finding.check == HOST_CONFINEMENT)
+        .collect();
+    assert_eq!(rows.len(), 1, "one row: {:?}", report.findings());
+    assert_eq!(
+        rows[0].severity,
+        host_confinement_finding(_sandbox::can_confine()).severity,
+        "the assembly emits the predicate's answer, not a constant: {:?}",
+        report.findings()
     );
 }
 

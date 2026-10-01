@@ -56,6 +56,7 @@ use crate::{
         Observer, Result, Sandbox, Terminal, launch,
     },
     acl::{Grants, Target},
+    capability::{Admission, admit},
     control, handles,
     job::Job,
     launch::command_args,
@@ -226,7 +227,18 @@ impl BackendTrait for Backend {
     /// # }
     /// ```
     fn confine(&mut self, sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement> {
-        let inputs = prepare_launch(&self.options, sandbox, plan)?;
+        // **The host's own gate, and it sits above everything this crate does.** The CLI asks the
+        // same question before it writes its state directory; this one protects every other
+        // embedder of this crate, and keeps the stale-profile sweep, the ACL salt file, the
+        // profile mutex and the profile itself from happening for a run that cannot be confined.
+        //
+        // **The order is `prepare_launch`'s parameter now, not this comment's subject.** The
+        // witness below is the only value that function accepts and `admit` is the crate's only
+        // constructor of it, so a later edit that moved the crate's first side effect above this
+        // line would not compile. The source-reading test that used to pin the order is gone
+        // with it.
+        let admitted = admit()?;
+        let inputs = prepare_launch(admitted, &self.options, sandbox, plan)?;
         let grants = grant_whitelist(&inputs)?;
         // **A failed spawn returns with the grants still held here**, which drops
         // the last `Arc<PackageSid>` and deletes the profile with it — the launch
@@ -341,7 +353,12 @@ fn other_exposed_paths(sandbox: &Sandbox, served_root: &Path) -> Vec<PathBuf> {
 /// later run of the same directory takes the residue over (decision 21).
 /// `..` is not resolved there. A missing listener is a named launch step:
 /// `Unsupported` is reserved for a mechanism this host does not have.
+///
+/// **`Admission` is the ordering proof and nothing else**: the body never reads it, and it is
+/// taken by value so a caller must have asked the host first. It is what replaced the
+/// source-reading test that pinned the gate above this call.
 fn prepare_launch<'a>(
+    _admitted: Admission,
     options: &Options,
     sandbox: &Sandbox,
     plan: &'a LaunchPlan,

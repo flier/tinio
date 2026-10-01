@@ -530,7 +530,7 @@ pub enum Seccomp {
 /// where that argument is written out in full.
 ///
 /// `ret` is the Info event for the install (shared §7), emitted by
-/// [`announce_installed`]; the skip is still a `warn!`.
+/// `announce_installed`; the skip is still a `warn!`.
 ///
 /// # Errors
 ///

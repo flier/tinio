@@ -331,8 +331,8 @@ async fn doctor_remove_state_file(world: &mut World) {
     fs::remove_file(&path).unwrap_or_else(|err| panic!("removing `{}`: {err}", path.display()));
 }
 
-/// The report's rows that are not `ok`, **excluding `free space`** — the scenarios' answer to
-/// "was this root reported clean?".
+/// The report's rows that are not `ok`, **excluding `free space` and `host confinement`** — the
+/// scenarios' answer to "was this root reported clean?".
 ///
 /// `free space` reads the **host's** volume, so a machine below doctor's own floor
 /// (`max(1 GiB, 5%)` of the filesystem) answers `warn` on a root that has nothing wrong with it.
@@ -340,14 +340,22 @@ async fn doctor_remove_state_file(world: &mut World) {
 /// disk's free space — which is exactly what happened on a 1.9 TB volume down to its last 3%.
 /// The floor's two arms are pinned with explicit numbers in the unit tests
 /// (`crates/tinio-cli/src/commands/doctor/tests.rs`), and this step is about the root.
+///
+/// `host confinement` is the second row that reads the **host** rather than the root: it asks
+/// whether this machine's token can create an AppContainer profile, so a Low-integrity session,
+/// a service account or an AppContainer-hostile runner answers `warn` on a root that has nothing
+/// wrong with it, and asserting the whole report clean would make every "clean root" scenario a
+/// function of the machine. Its two arms are pinned in the same unit file, by
+/// `host_confinement_finding`'s own tests, so nothing about the root is hidden here either.
 #[then("the report holds no problem other than the host's disk")]
 async fn report_holds_no_problem(world: &mut World) {
     let stdout = &cli(world).last().stdout;
     let problems: Vec<&str> = stdout
         .lines()
         .filter(|line| {
-            doctor_row(line)
-                .is_some_and(|(severity, check)| severity != "ok" && check != "free space")
+            doctor_row(line).is_some_and(|(severity, check)| {
+                severity != "ok" && check != "free space" && check != "host confinement"
+            })
         })
         .collect();
     assert!(
@@ -518,7 +526,14 @@ async fn json_report_severity_is(world: &mut World, severity: String) {
 /// Some rendered row carries `text` at `severity` — the relation a report's failure has to the
 /// stage that raised it, which plain containment cannot state: the sentence being somewhere is
 /// not the sentence being an error finding.
-#[then(expr = "the report holds an {word} finding carrying {string}")]
+///
+/// **One expression covers both English articles**, because the article is a function of the
+/// severity word a scenario spells: `an error finding` and `a warn finding` are both English, and
+/// a cucumber expression matches its literal text around a placeholder. `a(n)` is
+/// cucumber-expressions' optional text (its grammar's `I have {int} cucumber(s)`), which expands
+/// to `a(?:n)?`; the two registrations the two spellings used to need — one delegating to the
+/// other — are one step again.
+#[then(expr = "the report holds a(n) {word} finding carrying {string}")]
 async fn report_holds_finding(world: &mut World, severity: String, text: String) {
     let stdout = &cli(world).last().stdout;
     let found = stdout.lines().any(|line| {

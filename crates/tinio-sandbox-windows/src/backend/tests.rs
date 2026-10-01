@@ -480,8 +480,7 @@ fn the_callers_access_survives_the_executable_exposure() {
     let program = program_dir.join("serve.exe");
 
     let canonical_dir = fs::canonicalize(&program_dir).expect("the program's directory resolves");
-    let all =
-        canonical_exposures(exposures(&sandbox, &program)).expect("the entries resolve");
+    let all = canonical_exposures(exposures(&sandbox, &program)).expect("the entries resolve");
     assert_eq!(
         all.len(),
         1,
@@ -1726,7 +1725,9 @@ fn a_confined_launch_holds_the_window_across_its_acl_phase() {
         // `grant the ACLs` line of *this* tree's launch carries is this one, and
         // a neighbouring leg's launch carries another. The value itself stays
         // held here — sending the text does not drop the profile.
-        derived_tx.send(sid.as_str().to_owned()).expect("the peer's value exists");
+        derived_tx
+            .send(sid.as_str().to_owned())
+            .expect("the peer's value exists");
         go_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the launcher's window opens");
@@ -1878,3 +1879,9 @@ fn wait_for(capture: &Capture, marker: &str, bound: Duration) {
         thread::sleep(Duration::from_millis(1));
     }
 }
+
+// **The host gate's order has no test here any more, and the reason is that it stopped being a
+// text property.** `prepare_launch` takes a `capability::Admission` that only `capability::admit`
+// can construct, so a run whose gate moved below the crate's first side effect would not compile
+// — a stronger check than this file's source-reading assertion was, and one that cannot drift
+// from the code it is about.
