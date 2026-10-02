@@ -1015,8 +1015,8 @@ mod tests {
     };
 
     use super::{
-        Ace, CurrentUser, acl_is_current_user_only, create_restricted, current_user, to_wide,
-        walk_dacl, win32_error,
+        Ace, CurrentUser, acl_is_current_user_only, create_restricted, current_user,
+        restrict_to_current_user, to_wide, walk_dacl, win32_error,
     };
 
     /// **The create-time descriptor keeps an inheriting parent's ACEs out on its own**, which is
@@ -1149,6 +1149,22 @@ mod tests {
         };
         let seen = dacl_with_an_extra_ace(denied, &dir, &user);
         let verdict = acl_is_current_user_only(&dir.join("state.tmp")).expect("read the DACL back");
+        // **The deny this test installs is what keeps the fixture on disk.** `state.tmp` carries
+        // the current user's `FILE_ALL_ACCESS` as a `DENY` ahead of its allow, so deleting it
+        // needs `FILE_DELETE_CHILD` on the scratch directory instead — and a scratch directory
+        // that grants only `Modify` does not carry that right, because `FILE_GENERIC_WRITE` is
+        // `FILE_ADD_FILE` and `FILE_ADD_SUBDIRECTORY` and deliberately not delete-child.
+        // Measured 2026-10-02 on this host: this test with `TEMP` on the Dev Drive leaves
+        // `tinio-winsec-deny-<pid>\state.tmp` behind, and the same test with `TEMP` under
+        // `%LOCALAPPDATA%`, where the user's own SID holds full control, leaves nothing.
+        // `remove_dir_all` reports that failure and the `let _ =` swallows it, so the residue
+        // outlives every repeat — the next run's own `remove_dir_all` at the top of this test
+        // cannot clear it either. Writing the DACL back to the current user's alone, the shape
+        // every other writer in this crate installs, is what puts the deny out of the delete's
+        // way; the owner's implicit `WRITE_DAC` is why this call gets through a descriptor that
+        // denies that same user everything.
+        restrict_to_current_user(&dir.join("state.tmp"))
+            .expect("the fixture's DACL back to the current user's alone");
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
