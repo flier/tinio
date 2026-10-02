@@ -6,7 +6,7 @@
 //! `Record` frames one record per input format. Numbers parse lazily:
 //! `parse_number` runs only when a numeric operator consumes a value.
 
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use rust_decimal::Decimal;
 
@@ -50,28 +50,103 @@ impl NameStyle {
     }
 }
 
+/// One header lookup's outcome; `Ambiguous` is a value, not an error, so the
+/// caller keeps its existing per-style rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameHit {
+    One(usize),
+    Ambiguous,
+    None,
+}
+
+/// Header names resolved once per stream: one pass at build time, O(1) per
+/// reference afterwards.
+#[derive(Debug, Default, PartialEq)]
+pub struct NameIndex {
+    exact: HashMap<String, NameHit>,
+    folded: HashMap<String, NameHit>,
+}
+
+impl NameIndex {
+    pub fn build(names: &[String]) -> Self {
+        let mut exact = HashMap::new();
+        let mut folded = HashMap::new();
+        for (i, n) in names.iter().enumerate() {
+            insert(&mut exact, n.clone(), i);
+            insert(&mut folded, n.to_ascii_lowercase(), i);
+        }
+        Self { exact, folded }
+    }
+
+    /// The name's outcome under the reference's spelling: quoted is
+    /// exact-case, bare is the ASCII case folding `eq_ignore_ascii_case`
+    /// applied (the one comparison the scan used before this index).
+    ///
+    /// **Both arms look the reference up without allocating**, which is what
+    /// this index is for (P3: one lookup per reference per record). The exact
+    /// map borrows the `&str` (`String: Borrow<str>`), and the folded map is
+    /// asked for the name verbatim first — it answers whenever the reference
+    /// is already ASCII-lowercase, which is the shape the fold would leave
+    /// unchanged — so only a reference the fold would actually rewrite pays
+    /// for a lowered copy.
+    pub fn get(&self, name: &str, style: NameStyle) -> NameHit {
+        if style.exact() {
+            return self.exact.get(name).copied().unwrap_or(NameHit::None);
+        }
+        if let Some(hit) = self.folded.get(name) {
+            return *hit;
+        }
+        self.folded
+            .get(&name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(NameHit::None)
+    }
+}
+
+/// Insert one name's position; a second occupant of the key is the ambiguity
+/// verdict (a third changes nothing).
+fn insert(map: &mut HashMap<String, NameHit>, key: String, i: usize) {
+    match map.get(&key) {
+        Some(NameHit::One(_)) => {
+            map.insert(key, NameHit::Ambiguous);
+        }
+        Some(_) => {}
+        None => {
+            map.insert(key, NameHit::One(i));
+        }
+    }
+}
+
 /// One record's fields and its name set — the payload shared by the CSV
 /// and parquet arms (review 2026-09-06 S7: the two `(Vec<Field>,
 /// Vec<String>)` payloads were a data clump). `names` is `Rc`-shared per
 /// reader stream: header/schema names are identical across every record,
-/// so per-record cloning was pure waste (X8).
+/// so per-record cloning was pure waste (X8) — and their `index` is built
+/// in the same step, so a named reference is one map lookup instead of a
+/// scan of the whole header per record (P3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Columns {
     pub fields: Vec<Field>,
     pub names: Rc<Vec<String>>,
+    pub index: Rc<NameIndex>,
 }
 
 impl Columns {
-    /// Fields plus the reader's shared name set (the `Rc` flows straight
-    /// into the record — no per-record clone).
-    pub fn new(fields: Vec<Field>, names: Rc<Vec<String>>) -> Self {
-        Self { fields, names }
+    /// Fields plus the reader's shared name set and its index (both `Rc`s
+    /// flow straight into the record — no per-record clone).
+    pub fn new(fields: Vec<Field>, names: Rc<Vec<String>>, index: Rc<NameIndex>) -> Self {
+        Self {
+            fields,
+            names,
+            index,
+        }
     }
 
-    /// Owned-name helper (tests and one-off construction): the Vec is
-    /// boxed once.
+    /// Owned-name helper (tests and one-off construction): the Vec is boxed
+    /// once and its index built once.
     pub fn from_names(fields: Vec<Field>, names: Vec<String>) -> Self {
-        Self::new(fields, Rc::new(names))
+        let index = Rc::new(NameIndex::build(&names));
+        Self::new(fields, Rc::new(names), index)
     }
 }
 
@@ -145,16 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn the_index_distinguishes_a_hit_a_duplicate_and_a_miss() {
+        let names = vec!["a".to_string(), "A".to_string(), "b".to_string()];
+        let ix = NameIndex::build(&names);
+        assert!(matches!(ix.get("a", NameStyle::Bare), NameHit::Ambiguous));
+        assert_eq!(ix.get("a", NameStyle::Quoted), NameHit::One(0));
+        assert_eq!(ix.get("b", NameStyle::Bare), NameHit::One(2));
+        assert_eq!(ix.get("c", NameStyle::Bare), NameHit::None);
+    }
+
+    #[test]
     fn columns_new_shares_name_rc() {
-        // `new` takes an Rc and stores it verbatim (the reader stream shares
-        // one name set across every record — no per-record clone);
-        // `from_names` boxes the Vec once at construction.
+        // `new` takes the Rcs and stores them verbatim (the reader stream
+        // shares one name set across every record — no per-record clone);
+        // `from_names` boxes the Vec and builds its index once at
+        // construction.
         let names = Rc::new(vec!["a".into(), "b".into()]);
-        let c = Columns::new(vec![Field::Missing, Field::Missing], Rc::clone(&names));
+        let index = Rc::new(NameIndex::build(&names));
+        let c = Columns::new(
+            vec![Field::Missing, Field::Missing],
+            Rc::clone(&names),
+            Rc::clone(&index),
+        );
         assert_eq!(*c.names, vec!["a", "b"]);
         assert!(Rc::ptr_eq(&c.names, &names));
+        assert!(Rc::ptr_eq(&c.index, &index));
         let c2 = Columns::from_names(Vec::new(), vec!["x".into()]);
         assert_eq!(*c2.names, vec!["x"]);
+        assert_eq!(c2.index.get("x", NameStyle::Bare), NameHit::One(0));
     }
 
     #[test]
@@ -221,7 +314,7 @@ mod tests {
             ],
             vec!["_1".into(), "_2".into(), "_3".into()],
         ));
-        let Record::Csv(Columns { fields, names }) = record else {
+        let Record::Csv(Columns { fields, names, .. }) = record else {
             unreachable!()
         };
         assert_eq!(*names, vec!["_1", "_2", "_3"]);

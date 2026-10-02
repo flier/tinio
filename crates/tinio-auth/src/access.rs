@@ -26,6 +26,7 @@ use crate::{
     error::{AccessDecision, classify},
     identity::Identity,
     matrix::{OpRule, Requirement, rule_for},
+    source,
 };
 
 /// The s3s `S3Access` authorization pipeline over a [`Storage`] backend
@@ -209,7 +210,7 @@ impl<S: Storage> AclAccess<S> {
         }
         if rule.reads_source {
             // UploadPartCopy: copy parity on the source (source READ).
-            let (src_bucket, src_key) = match request.copy_source.and_then(parse_source) {
+            let (src_bucket, src_key) = match request.copy_source.and_then(source::copy_source) {
                 Some(pair) => pair,
                 None => return Err(denied()),
             };
@@ -225,18 +226,20 @@ impl<S: Storage> AclAccess<S> {
     }
 
     /// CopyObject / RenameObject: the base requirement evaluates against
-    /// the SOURCE (parsed from `x-amz-copy-source` /
-    /// `x-amz-rename-source`, both `/bucket/key`, URL-encoded per the
-    /// s3s dto), plus the destination-bucket WRITE overlay and the B1
-    /// destination head.
+    /// the SOURCE, parsed by the one authority in [`crate::source`], plus
+    /// the destination-bucket WRITE overlay and the B1 destination head.
+    /// A RenameObject source is the key of the request's own bucket
+    /// (never a bucket split); a CopyObject source is `/bucket/key`.
     async fn source_gate(&self, request: &Request<'_>, rule: OpRule) -> S3Result<()> {
         let (dst_bucket, dst_key) = object_resource(request)?;
-        let source = if request.op == "RenameObject" {
-            request.rename_source
+        let (src_bucket, src_key) = match if request.op == "RenameObject" {
+            request
+                .rename_source
+                .and_then(source::rename_source)
+                .map(|key| (dst_bucket.clone(), key))
         } else {
-            request.copy_source
-        };
-        let (src_bucket, src_key) = match source.and_then(parse_source) {
+            request.copy_source.and_then(source::copy_source)
+        } {
             Some(pair) => pair,
             // A missing/malformed source header fails closed — the check
             // runs before s3s deserializes the input.
@@ -636,17 +639,6 @@ fn form_decode(raw: &str) -> String {
     percent::decode(&raw.replace('+', "%20"))
 }
 
-/// Parse a copy/rename source header — `/bucket/key`, both segments
-/// URL-encoded (the s3s dto marks the header value URL-encoded).
-fn parse_source(raw: &str) -> Option<(bucket::Name, object::Key)> {
-    let raw = raw.strip_prefix('/').unwrap_or(raw);
-    let (b, k) = raw.split_once('/')?;
-    Some((
-        bucket::name(percent::decode(b)).ok()?,
-        object::key(percent::decode(k)).ok()?,
-    ))
-}
-
 /// Grantee membership: canonical IDs compare to P; AllUsers covers any P
 /// (anonymous included); AuthenticatedUsers any signed P; LogDelivery
 /// (and any unknown URI) is never satisfiable — fail closed.
@@ -1005,11 +997,11 @@ mod tests {
         let access = AclAccess::new(storage, identity());
         let dst = S3Path::object("data", "dst.txt");
         let mut r = req(anon(), false, "RenameObject", &dst);
-        r.rename_source = Some("/data/src.txt");
+        r.rename_source = Some("/src.txt");
         assert_denied(&access, &r).await;
         let dst2 = S3Path::object("data", "dst2.txt");
         let mut r = req(anon(), false, "RenameObject", &dst2);
-        r.rename_source = Some("/data/src.txt");
+        r.rename_source = Some("/src.txt");
         assert_allowed(&access, &r).await;
     }
 

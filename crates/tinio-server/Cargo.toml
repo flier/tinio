@@ -145,7 +145,7 @@ default = ["multipart", "copy", "list-v1", "list-v2", "cors", "select", "acl", "
 # there.
 sandbox = []
 multipart = []
-copy = []
+copy = ["dep:tinio-auth"]
 list-v1 = []
 list-v2 = []
 cors = []

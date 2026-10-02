@@ -4,9 +4,9 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    env, fs,
+    env, fs, mem,
     net::{SocketAddr, TcpListener},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -28,6 +28,10 @@ use tinio_util::testing::host_cannot;
 /// directly and the opt-in leg below hands it to a wrapper's `exec` — so the
 /// environment is set beside the chain rather than inside it, and a leg cannot
 /// quietly probe a different `HOME` than its sibling.
+///
+/// **`extra` is the leg's own additions**, and it exists for the one hook that
+/// is not a fact about the host: the forced `/proc/self/fd` fallback, which the
+/// child reads from its environment *after* it has confined itself.
 fn child_environment(
     command: &mut Command,
     root: &Path,
@@ -35,6 +39,7 @@ fn child_environment(
     home: &Path,
     access: &str,
     probe: SocketAddr,
+    extra: &[(&str, &str)],
 ) {
     command
         .env("TINIO_SANDBOX_TEST_ROOT", root)
@@ -43,6 +48,9 @@ fn child_environment(
         .env("HOME", home);
     if let Some(state) = state {
         command.env("TINIO_SANDBOX_TEST_STATE", state);
+    }
+    for (key, value) in extra {
+        command.env(key, value);
     }
 }
 
@@ -62,6 +70,20 @@ fn run_child(
     access: &str,
     probe: SocketAddr,
 ) -> Option<String> {
+    run_child_with_env(root, state, home, access, probe, &[])
+}
+
+/// [`run_child`] with a leg's own environment added, for the leg whose subject
+/// is a hook the child reads rather than a fact about the host. One body, so the
+/// two entry points cannot drift into confining differently.
+fn run_child_with_env(
+    root: &Path,
+    state: Option<&Path>,
+    home: &Path,
+    access: &str,
+    probe: SocketAddr,
+    extra: &[(&str, &str)],
+) -> Option<String> {
     let model = requested_model();
     if let Err(tried) = host_can_confine(model) {
         host_cannot(
@@ -72,7 +94,7 @@ fn run_child(
         return None;
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_sandbox-child"));
-    child_environment(&mut command, root, state, home, access, probe);
+    child_environment(&mut command, root, state, home, access, probe, extra);
     let output = command.output().expect("spawn confined child");
     let log = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
@@ -109,18 +131,35 @@ fn probe_listener() -> (TcpListener, SocketAddr) {
     (listener, addr)
 }
 
-#[test]
-fn the_jail_confines_the_process() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path().join("root");
-    let home = tmp.path().join("home");
+/// The read-write legs' fixture: the served root with one object, a state
+/// directory beside it, a scratch `HOME` the child probes, and the parent's
+/// probe listener.
+///
+/// **The listener is leaked rather than returned**, because it has to outlive
+/// the child ([`probe_listener`] carries the reason) and this tuple has no room
+/// for it: `mem::forget` keeps the descriptor — and its bound port — for the
+/// rest of the test process, which is deliberate in a test binary and never
+/// released.
+fn jail_fixture(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, SocketAddr, Option<PathBuf>) {
+    let root = dir.path().join("root");
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
     fs::create_dir_all(root.join("bucket")).expect("create root");
+    fs::create_dir_all(&state).expect("create state");
     fs::create_dir_all(&home).expect("create the home the child probes");
     fs::write(root.join("bucket/obj.txt"), "hello from the served root\n").expect("seed");
 
-    let (_listener, probe) = probe_listener();
+    let (listener, probe) = probe_listener();
+    mem::forget(listener);
+    (root, home, probe, Some(state))
+}
 
-    let Some(log) = run_child(&root, None, &home, "read-write", probe) else {
+#[test]
+fn the_jail_confines_the_process() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, home, probe, state) = jail_fixture(&tmp);
+
+    let Some(log) = run_child(&root, state.as_deref(), &home, "read-write", probe) else {
         return;
     };
 
@@ -134,6 +173,42 @@ fn the_jail_confines_the_process() {
     // listener this process holds, so `ECONNREFUSED` would mean the listener was
     // gone and `SUCCEEDED` would mean the filter was never installed. Only
     // `PermissionDenied` is the network cut.
+    assert!(
+        log.contains("outbound-connect: refused (PermissionDenied"),
+        "{log}"
+    );
+}
+
+/// The `/proc/self/fd` fallback forced, and the same invariants as the leg
+/// above.
+///
+/// **The hook is the child's environment, not this process's**: the fallback is
+/// chosen where the bind is made, which is after the confinement, so the
+/// variable is handed to the spawned child through `child_environment`'s
+/// `extra`. **This is the only leg that reaches the fallback branch** — measured
+/// by making that branch answer `Unsupported`, which reddens this leg alone —
+/// so what it proves is that the fallback confines identically, and that the
+/// `open_tree` path the other legs take is not the only one that works.
+#[test]
+fn the_forced_proc_fallback_confines_identically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, home, probe, state) = jail_fixture(&dir);
+
+    let Some(log) = run_child_with_env(
+        &root,
+        state.as_deref(),
+        &home,
+        "read-write",
+        probe,
+        &[("TINIO_SANDBOX_FORCE_PROC_FALLBACK", "1")],
+    ) else {
+        return;
+    };
+
+    assert!(log.contains("read-ok: hello from the served root"), "{log}");
+    assert!(log.contains("host-etc-visible: false"), "{log}");
+    assert!(log.contains("old-root-visible: false"), "{log}");
+    assert!(log.contains("host-home-visible: false"), "{log}");
     assert!(
         log.contains("outbound-connect: refused (PermissionDenied"),
         "{log}"
@@ -320,7 +395,7 @@ fn run_child_under_a_nested_user_namespace(root: &Path, home: &Path, probe: Sock
             env!("CARGO_BIN_EXE_sandbox-child"),
         )
         .env("TINIO_SANDBOX_MODEL", "userns");
-    child_environment(&mut command, root, None, home, "read-only", probe);
+    child_environment(&mut command, root, None, home, "read-only", probe, &[]);
     let output = command.output().expect("spawn the wrapper");
     let log = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);

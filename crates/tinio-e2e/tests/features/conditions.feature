@@ -517,3 +517,133 @@ Feature: Request conditions
       | x-amz-rename-source | a.txt |
     Then the response status is 501
     And the error code is "NotImplemented"
+
+  # Task 1 (one source-key authority): the ACL source parse and the
+  # handler's dto parse must not diverge. A rename source is the request
+  # bucket's KEY, never a bucket split — contracts/s3-surface.md
+  # §RenameObject ("a bucket-prefixed source is not a legal key here").
+  # The copy leg below is its COPY-object twin.
+  #
+  # The rename denial is decoy-shaped on purpose: the naive form (source
+  # `/data/secret.txt` against the request bucket `data`) answers 403
+  # under BOTH parses — pre-fix the source lands on the real private
+  # object a bucket-WRITE principal cannot remove, post-fix on the
+  # missing key `data/secret.txt` — so it pins nothing about the fix.
+  # Here `inner` is a real bucket the grantee OWNS and `inner/secret.txt`
+  # an object the grantee owns, so the pre-fix parse's `(inner,
+  # secret.txt)` is a delete-parity ALLOW, and the handler then moves the
+  # root-owned `data/inner/secret.txt`: a 200 for a cross-owner rename.
+  # False-pass vector closed: a source the gate authorizes as one object
+  # while the handler moves another.
+  @acl @FR-031
+  Scenario: A bucket-WRITE principal cannot rename another owner's key through a bucket-prefixed source
+    # The decoy: the grantee's own bucket and the object its first
+    # segment names, so the pre-fix parse has a source it may touch.
+    When I send a "PUT" request to "/inner" signed as "user-b"
+    Then the response status is 200
+    When I send a "PUT" request to "/inner/secret.txt" signed as "user-b" with headers and body "DECOY-BYTES"
+      | x-amz-acl | private |
+    Then the response status is 200
+    # The request bucket (grantee holds WRITE, not ownership) and the
+    # private object the fixed parse names: the key `inner/secret.txt`
+    # of the request bucket, which the grantee may not remove.
+    When I send a "PUT" request to "/data" signed as "root" with headers
+      | x-amz-grant-write | id="8b3873bb48d62959c9316b8bc5a1c11dcb3e14dce9426cc76ce9c67e00523b6c" |
+    Then the response status is 200
+    When I send a "PUT" request to "/data/inner/secret.txt" signed as "root" with headers and body "top-secret"
+      | x-amz-acl | private |
+    Then the response status is 200
+    When I send a "PUT" request to "/data/stolen.txt?renameObject" signed as "user-b" with headers
+      | x-amz-rename-source | /inner/secret.txt |
+    Then the response status is 403
+    And the error code is "AccessDenied"
+    # Nothing moved: the private source still answers under its own key…
+    When I send a "GET" request to "/data/inner/secret.txt" signed as "root"
+    Then the response status is 200
+    And the object body is "top-secret"
+    # …and no destination was created (read as the bucket owner, so the
+    # missing key answers NoSuchKey rather than the grantee's 403).
+    When I send a "GET" request to "/data/stolen.txt" signed as "root"
+    Then the response status is 404
+    And the error code is "NoSuchKey"
+
+  # The CopyObject twin: `@FR-015` is CopyObject's own ID and this file
+  # one of its two homes (contracts/s3-surface.md, Automated coverage,
+  # the `CopyObject` row) — NOT RenameObject's `@FR-031`. The `@acl`
+  # marker is the ACL-gate plane the denial runs in.
+  @acl @FR-015
+  Scenario: A bucket-READ grantee cannot copy a private object with a versionId suffix
+    When I send a "PUT" request to "/data" signed as "root" with headers
+      | x-amz-acl | public-read |
+    Then the response status is 200
+    When I send a "PUT" request to "/data/secret.txt" signed as "root" with headers and body "top-secret"
+      | x-amz-acl | private |
+    Then the response status is 200
+    When I send a "PUT" request to "/out" signed as "user-b"
+    Then the response status is 200
+    When I send a "PUT" request to "/out/leak.txt" signed as "user-b" with headers and body ""
+      | x-amz-copy-source | /data/secret.txt?versionId=x |
+    Then the response status is 403
+    And the error code is "AccessDenied"
+
+  # Positive controls for the two denials above: nothing in the suite
+  # otherwise pins that the legitimate forms still succeed, so an
+  # over-denial (refuse every copy/rename) would pass those scenarios.
+  # Each leg names what would make it pass falsely. The copy control is
+  # CopyObject's `@FR-015` (see above); the rename control RenameObject's
+  # `@FR-031`.
+  @acl @FR-015
+  Scenario: A bucket-READ grantee copies a public-read object
+    # The versionId denial's positive counterpart: a bare source key on
+    # a public-read object authorizes the same grantee's copy. Fails
+    # (403 here) if the fix narrows the source gate to deny every copy
+    # that carries no versionId — i.e. over-denies instead of fixing
+    # the parse. It can only pass falsely if the 200 is not backed by a
+    # real copy: the PUBLIC-BYTES body read back at the destination is
+    # what pins that the bytes moved.
+    When I send a "PUT" request to "/data" signed as "root" with headers
+      | x-amz-acl | public-read |
+    Then the response status is 200
+    When I send a "PUT" request to "/data/public.txt" signed as "root" with headers and body "PUBLIC-BYTES"
+      | x-amz-acl | public-read |
+    Then the response status is 200
+    When I send a "PUT" request to "/out" signed as "user-b"
+    Then the response status is 200
+    When I send a "PUT" request to "/out/copy.txt" signed as "user-b" with headers and body ""
+      | x-amz-copy-source | /data/public.txt |
+    Then the response status is 200
+    # The copy really carried the source bytes to the grantee.
+    When I send a "GET" request to "/out/copy.txt" signed as "user-b"
+    Then the response status is 200
+    And the object body is "PUBLIC-BYTES"
+
+  @acl @FR-031
+  Scenario: A bucket-WRITE principal renames with a bare key
+    # The bucket-prefixed denial's positive counterpart: the key-only
+    # wire form (no bucket segment) is the one the handler accepts and
+    # the gate must admit. Fails (403 here) if the gate denies the
+    # key-only form instead of parsing it. The rename's source gate is
+    # delete-parity — ownership, which no grant satisfies — so the
+    # grantee renames an object its own WRITE grant admitted it to
+    # upload; a grantee renaming another owner's object is denied by
+    # that same rule regardless of the wire form. It can only pass
+    # falsely if the 200 is not backed by a move: the new-key body and
+    # the old-key 404 NoSuchKey pin that the key changed.
+    When I send a "PUT" request to "/data" signed as "root" with headers
+      | x-amz-grant-write | id="8b3873bb48d62959c9316b8bc5a1c11dcb3e14dce9426cc76ce9c67e00523b6c" |
+    Then the response status is 200
+    When I send a "PUT" request to "/data/source.txt" signed as "user-b" with headers and body "hello"
+      | x-amz-acl | private |
+    Then the response status is 200
+    When I send a "PUT" request to "/data/renamed.txt?renameObject" signed as "user-b" with headers
+      | x-amz-rename-source | source.txt |
+    Then the response status is 200
+    # The move preserved the object: it answers at the new key…
+    When I send a "GET" request to "/data/renamed.txt" signed as "user-b"
+    Then the response status is 200
+    And the object body is "hello"
+    # …and the old key is gone (read as the bucket owner, so a missing
+    # key answers NoSuchKey rather than the grantee's 403).
+    When I send a "GET" request to "/data/source.txt" signed as "root"
+    Then the response status is 404
+    And the error code is "NoSuchKey"

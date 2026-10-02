@@ -14,7 +14,7 @@ use smart_default::SmartDefault;
 use crate::{
     error::Error,
     record::{CAP_ALLOWANCE, CAP_MESSAGE, MAX_RECORD, RecordReader, cap_io_error},
-    row::{Columns, Field, Record, Value},
+    row::{Columns, Field, NameIndex, Record, Value},
 };
 
 /// CSV input options (S3 Select `InputSerialization.CSV`).
@@ -117,11 +117,14 @@ pub struct Reader<R: Read> {
     buf: StringRecord,
     mode: Option<Header>,
     /// USE header names (row 0), original case — `Rc`-shared into every
-    /// record (review S7) instead of cloned per record (X8).
+    /// record (review S7) instead of cloned per record (X8) — plus the index
+    /// built once here, beside them (P3: a named reference is a lookup, not a
+    /// scan of the whole header per record).
     names_header: Rc<Vec<String>>,
+    index_header: Rc<NameIndex>,
     /// The last record's positional name set, cached by width (ragged rows
-    /// rebuild; a constant width reuses one `Rc`).
-    positional: (usize, Rc<Vec<String>>),
+    /// rebuild; a constant width reuses one `Rc`) and its index with it.
+    positional: (usize, Rc<Vec<String>>, Rc<NameIndex>),
     /// USE/IGNORE: the header line has been consumed.
     header_done: bool,
     last_record_start: u64,
@@ -146,7 +149,8 @@ impl<R: Read> Reader<R> {
             buf: StringRecord::new(),
             mode: params.header,
             names_header: Rc::new(Vec::new()),
-            positional: (0, Rc::new(Vec::new())),
+            index_header: Rc::new(NameIndex::default()),
+            positional: (0, Rc::new(Vec::new()), Rc::new(NameIndex::default())),
             header_done: false,
             last_record_start: 0,
         }
@@ -217,8 +221,9 @@ impl<R: Read> RecordReader for Reader<R> {
                         return Ok(None);
                     }
                     if self.mode == Some(Header::Use) {
-                        self.names_header =
-                            Rc::new(self.buf.iter().map(|f| f.to_string()).collect());
+                        let names: Vec<String> = self.buf.iter().map(|f| f.to_string()).collect();
+                        self.index_header = Rc::new(NameIndex::build(&names));
+                        self.names_header = Rc::new(names);
                     }
                 }
                 None => {}
@@ -228,14 +233,16 @@ impl<R: Read> RecordReader for Reader<R> {
             return Ok(None);
         }
         self.last_record_start = record_start(&self.buf);
-        let names = match self.mode {
-            Some(Header::Use) => self.names_header.clone(),
+        let (names, index) = match self.mode {
+            Some(Header::Use) => (self.names_header.clone(), self.index_header.clone()),
             _ => {
                 let width = self.buf.len();
                 if width != self.positional.0 {
-                    self.positional = (width, Rc::new(positional_names(width)));
+                    let names = Rc::new(positional_names(width));
+                    let index = Rc::new(NameIndex::build(&names));
+                    self.positional = (width, names, index);
                 }
-                self.positional.1.clone()
+                (self.positional.1.clone(), self.positional.2.clone())
             }
         };
         let fields = self
@@ -243,7 +250,7 @@ impl<R: Read> RecordReader for Reader<R> {
             .iter()
             .map(|f| Field::Present(Value::String(f.to_string())))
             .collect();
-        Ok(Some(Record::Csv(Columns::new(fields, names))))
+        Ok(Some(Record::Csv(Columns::new(fields, names, index))))
     }
 
     fn last_record_start(&self) -> u64 {

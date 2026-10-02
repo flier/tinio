@@ -29,6 +29,8 @@ Start the server over a directory (the fs backend; the config is auto-created un
 cargo run -p tinio -- server ./root --port 9000
 ```
 
+A config that carries no `[auth]` section serves the built-in `minioadmin`/`minioadmin` pair instead, which is a **loopback-only** development credential: a non-loopback bind refuses to start without an `[auth]` pair (or `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY`).
+
 Then point any S3 client at it, reading the generated pair out of `<root>/.tinio/.tinio.toml`:
 
 ```sh

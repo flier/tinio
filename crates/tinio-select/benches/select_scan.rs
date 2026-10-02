@@ -49,6 +49,16 @@
 //! per-record construction + framing. The residual is the transport layer
 //! difference (`BufReader` in, `BudgetedRead` out) plus the per-record
 //! struson warm-up (the first `fill_buffer`).
+//!
+//! `select_wide_header` and `select_budget` are the P3 pair: named CSV
+//! references used to be resolved by rescanning the record's whole name
+//! vector per reference per record. The first group prices that scan against
+//! the per-stream index (same fixture, 4 vs 16 repeated references — the
+//! times must stay flat as the reference count grows, because an indexed
+//! lookup is O(1) and uncharged); the second drives a `%`-heavy `LIKE`, whose
+//! DP cells the index cannot help with, so the request budget must end the
+//! stream with its error item (the `S3QueryError` shape) instead of evaluating
+//! every wildcard pair of every record.
 
 use std::{
     hint::black_box,
@@ -59,6 +69,7 @@ use std::{
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use struson::reader::{JsonStreamReader, ReaderSettings};
 use tinio_select::{
+    Error, csv,
     events::{InputFormat, SelectConfig, SelectEvent, select_iter},
     json,
     sql::{QueryPlan, parse},
@@ -379,6 +390,155 @@ fn json_lines_framing_only(c: &mut Criterion) {
     group.finish();
 }
 
+// ----------------------------------------------------------------------
+// P3: bounded named-reference evaluation.
+// ----------------------------------------------------------------------
+
+/// The audit's wide header: 8 000 distinct USE names and 300 one-field rows.
+/// The pre-fix engine rescanned all 8 000 names once per reference per row.
+const WIDE_COLS: usize = 8_000;
+const WIDE_ROWS: usize = 300;
+
+/// `WIDE_COLS` distinct names, then `WIDE_ROWS` one-field rows.
+fn generate_wide_csv() -> Vec<u8> {
+    let mut csv = String::with_capacity(WIDE_COLS * 6 + WIDE_ROWS * 2);
+    for i in 0..WIDE_COLS {
+        if i > 0 {
+            csv.push(',');
+        }
+        csv.push_str(&format!("c{i}"));
+    }
+    for _ in 0..WIDE_ROWS {
+        csv.push_str("\nx");
+    }
+    csv.push('\n');
+    csv.into_bytes()
+}
+
+/// The one-column fixture the budget group streams: a USE header plus
+/// [`ROWS`] one-row records.
+fn generate_budget_csv() -> Vec<u8> {
+    let mut csv = String::with_capacity(ROWS * 2 + 3);
+    csv.push_str("c0");
+    for _ in 0..ROWS {
+        csv.push_str("\nx");
+    }
+    csv.push('\n');
+    csv.into_bytes()
+}
+
+/// CSV input with `FileHeaderInfo=USE`: the record's names are the header's,
+/// which is the case the name index serves.
+fn use_header_config() -> SelectConfig {
+    SelectConfig {
+        input_format: InputFormat::Csv(csv::Params {
+            header: Some(csv::Header::Use),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// `SELECT` the same named reference `refs` times — the audit's shape.
+fn repeated_reference_sql(name: &str, refs: usize) -> String {
+    format!(
+        "SELECT {} FROM S3Object s",
+        vec![format!("s.{name}"); refs].join(", ")
+    )
+}
+
+/// The audit's first shape (P3): repeated named references over a wide
+/// header. Both functions scan the same fixture and differ only in the
+/// reference count, so the pair prices the count: with the per-stream index a
+/// reference is one table lookup, and the two times must stay flat (the
+/// audit measured 4/8/16 references against a 4 000-column header growing
+/// ~2× per doubling).
+fn wide_header_refs(c: &mut Criterion) {
+    let fixture = generate_wide_csv();
+    let config = use_header_config();
+    let name = format!("c{}", WIDE_COLS - 1);
+    let mut group = c.benchmark_group("select_wide_header");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_secs(WARM_UP));
+    group.measurement_time(Duration::from_secs(MEASURE));
+    group.throughput(Throughput::Bytes(fixture.len() as u64));
+    for refs in [4, 16] {
+        let sql = repeated_reference_sql(&name, refs);
+        let plan = parse(&sql).unwrap_or_else(|e| panic!("refs={refs}: {e}"));
+        group.bench_function(format!("refs_{refs}"), |b| {
+            b.iter_batched(
+                || Box::new(Cursor::new(fixture.clone())) as Box<dyn Read + Send>,
+                |input| drain(plan.clone(), config.clone(), input),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Wildcard-DP tokens per probe: `tokens × (text + 1)` cells are charged per
+/// evaluated pair (the crate's `EVAL_CELL_CAP`), so a `%`-heavy pattern on the
+/// one-char budget fixture spends `tokens × 2` per record and passes 10⁷ partway
+/// through [`ROWS`] records.
+const BUDGET_LIKE_TOKENS: usize = 60;
+
+/// One scan that must end on the budget's error item — the crate-level
+/// `Error::Value` the server maps to the in-stream `S3QueryError` — and
+/// returns the number of events that preceded it. Panics (failing the bench)
+/// if the stream completes or stops on anything else: the budget is the
+/// subject, so a silent pass would certify nothing.
+fn drain_until_budget(plan: QueryPlan, config: SelectConfig, input: Box<dyn Read + Send>) -> u64 {
+    let mut events = 0u64;
+    for ev in select_iter(plan, config, input) {
+        match ev {
+            Ok(_) => events += 1,
+            Err(Error::Value(m)) => {
+                assert_eq!(m, "SELECT expression too expensive");
+                return events;
+            }
+            Err(e) => panic!("expected the budget error, got {e:?}"),
+        }
+    }
+    panic!("the budget did not trip");
+}
+
+/// `SELECT` one named reference under a wildcard-heavy `LIKE` — the wildcard
+/// DP the per-stream index cannot help with.
+fn wildcard_dp_sql(name: &str, tokens: usize) -> String {
+    format!(
+        "SELECT s.{name} FROM S3Object s WHERE s.{name} LIKE '{}'",
+        "%a".repeat(tokens) + "%"
+    )
+}
+
+/// The audit's second shape (P3): one-row records whose priced work is the
+/// wildcard DP the per-stream index cannot help with. The request budget ends
+/// the stream with its error instead of evaluating every wildcard pair of
+/// every record — the negative result is gone (no unbounded work) and the
+/// error is the documented one.
+///
+/// One iteration spends the budget's own 10⁷ cells before it stops (~3 s in
+/// this unoptimized profile), so the sample count is halved against the
+/// default: the point is that the scan *ends*, not how fast it ends.
+fn budget_trips(c: &mut Criterion) {
+    let fixture = generate_budget_csv();
+    let plan = parse(&wildcard_dp_sql("c0", BUDGET_LIKE_TOKENS)).expect("budget plan");
+    let config = use_header_config();
+    let mut group = c.benchmark_group("select_budget");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(WARM_UP));
+    group.measurement_time(Duration::from_secs(MEASURE));
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("over_cap", |b| {
+        b.iter_batched(
+            || Box::new(Cursor::new(fixture.clone())) as Box<dyn Read + Send>,
+            |input| drain_until_budget(plan.clone(), config.clone(), input),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     full_scan,
@@ -386,6 +546,8 @@ criterion_group!(
     json_document_scan,
     json_lines_scan,
     json_lines_construct,
-    json_lines_framing_only
+    json_lines_framing_only,
+    wide_header_refs,
+    budget_trips
 );
 criterion_main!(benches);

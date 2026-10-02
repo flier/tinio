@@ -27,7 +27,7 @@ These hold under every abnormal condition in this document:
 | Root unreadable, or unwritable without `--read-only` | startup check | Clear startup error, exit 1 |
 | Invalid config (unknown keys, bad format variables, port rules, missing https cert/key, http/https same port) | fail-fast validation (T017) | Startup error, exit 1 |
 | `api` feature compiled, no transport enabled after resolution | config check | Startup error, exit 1 |
-| Non-loopback bind | bind address check | Warning on stderr; escalated prominent warning with anonymous mode (layered trust) |
+| Non-loopback bind | bind address check | Warning on stderr; escalated prominent warning with anonymous mode (layered trust). Refused instead when no `[auth]` pair is configured: the built-in `minioadmin` fallback is loopback-only, so a non-loopback bind is a startup config error naming `auth` |
 
 ### B. Request-phase protocol/input errors (standard S3 error codes, FR-005)
 

@@ -42,6 +42,29 @@ pub fn root_auth_pair(config: &Config) -> (String, String) {
     }
 }
 
+/// True when the resolved pair is the built-in fallback — no `[auth]` section is configured.
+///
+/// **The fallback is a development credential, and where that becomes a policy is the CLI**: a
+/// start that would serve it to another host refuses to start, while one on loopback serves it
+/// with a warning (`tinio-cli`'s `commands::start::serve`). The server stays agnostic —
+/// [`root_auth_pair`] answers the pair either way, and the data plane has no notion of which host
+/// can reach it.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_server::{_config::Config, identity::uses_builtin_fallback};
+///
+/// assert!(uses_builtin_fallback(&Config::default()));
+/// let text = "version = 1\n[auth]\naccess_key = \"ak\"\nsecret_key = \"sk\"\n";
+/// assert!(!uses_builtin_fallback(
+///     &Config::parse(text).expect("config")
+/// ));
+/// ```
+pub fn uses_builtin_fallback(config: &Config) -> bool {
+    config.auth.is_none()
+}
+
 /// The fs store's owner→uid map (unix chown on write): config-supplied
 /// only, never request-derived (no injection vector). Windows configs
 /// cannot carry a mapping (parse rejects any `local_uid`), so the map is

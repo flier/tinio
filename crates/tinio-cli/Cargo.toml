@@ -54,7 +54,7 @@ tinio-util = { workspace = true, features = ["testing"] }
 daemonize.workspace = true
 rustix = { workspace = true, features = ["process", "fs"] }
 sd-notify.workspace = true
-signal-hook = { workspace = true, features = ["iterator"] }
+signal-hook = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true

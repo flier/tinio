@@ -34,6 +34,8 @@ use s3s::{
     s3_error,
 };
 
+#[cfg(feature = "copy")]
+use crate::_auth::source::rename_source;
 #[cfg(feature = "acl")]
 use crate::_core::acl::Acl;
 #[cfg(feature = "copy")]
@@ -1165,7 +1167,9 @@ impl<S: Storage> S3Backend<S> {
     /// (the AWS directory-bucket op; tinio honors it on the
     /// general-purpose model) with source and destination conditionals.
     /// The s3s model: the URL `key` is the DESTINATION and
-    /// `rename_source` (`x-amz-rename-source`) the source; the source
+    /// `rename_source` (`x-amz-rename-source`) the source — the source
+    /// KEY of the request's own bucket, parsed by the one authority in
+    /// [`crate::_auth::source`]; the source
     /// conditions are String-typed (`source_if_*`, parsed with ETag
     /// semantics here) and the destination conditions the plain `If-*`
     /// newtypes — on the wire the plain `If-Match`/`If-None-Match`/
@@ -1189,7 +1193,8 @@ impl<S: Storage> S3Backend<S> {
         use http::header::ETAG;
         let bucket = self.bucket(req.input.bucket)?;
         let dst = self.key(req.input.key)?;
-        let src = self.key(rename_source_key(&req.input.rename_source).to_string())?;
+        let src = rename_source(&req.input.rename_source)
+            .ok_or_else(|| s3_error!(InvalidArgument, "invalid object key"))?;
         // The source conditions parse FIRST — a pure parse, no I/O —
         // so a malformed value (400, the `parse_etag_condition_header`
         // rule) is rejected before the degenerate-key check, the
@@ -1292,17 +1297,6 @@ impl<S: Storage> S3Backend<S> {
         );
         Ok(resp)
     }
-}
-
-/// The RenameObject source key from the `x-amz-rename-source` header:
-/// the s3s model keeps the header as a raw String (never parsed), and
-/// the value is the source object key of the request's own bucket —
-/// optionally with the leading slash of the AWS-documented form
-/// (`/src.txt`); a bucket prefix is never part of the value. The key
-/// validation below rejects what remains invalid.
-#[cfg(feature = "copy")]
-fn rename_source_key(raw: &str) -> &str {
-    raw.strip_prefix('/').unwrap_or(raw)
 }
 
 #[cfg(test)]

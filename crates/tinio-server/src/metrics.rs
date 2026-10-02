@@ -322,10 +322,27 @@ fn record(
         .observe(duration.as_secs_f64());
 }
 
-/// Record a completed HTTP request (management plane).
+/// The six verbs the data plane serves; any other HTTP token collapses to
+/// one label so a client cannot grow the metric families.
+fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "PUT" => "PUT",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+/// Record a completed HTTP request (management plane). The method is
+/// collapsed by `method_label` before it becomes a label, so an
+/// arbitrary request token books `OTHER` rather than a new family.
 pub fn record_http_request(method: &str, status: u16, duration: Duration) {
     #[cfg(test)]
     let _g = test_lock::writer();
+    let method = method_label(method);
     record(
         &HTTP_REQUESTS,
         &[method, &status.to_string()],
@@ -530,7 +547,7 @@ mod tests {
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         // gather() only emits families with samples — record one of each
         // label-bearing family first.
-        record_http_request("FAM", 200, Duration::from_millis(1));
+        record_http_request("GET", 200, Duration::from_millis(1));
         record_s3_operation("FamGetObject", 200, Duration::from_millis(1));
         HTTP_IN_FLIGHT.set(0);
         STORAGE_BUCKETS.set(0);
@@ -676,6 +693,14 @@ mod tests {
     }
 
     #[test]
+    fn unknown_methods_share_one_label() {
+        assert_eq!(method_label("FAM"), "OTHER");
+        assert_eq!(method_label("PATCH"), "OTHER");
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("OPTIONS"), "OPTIONS");
+    }
+
+    #[test]
     fn recording_increments_counters() {
         let _window = test_lock::window();
         record_http_request("INC", 200, Duration::from_millis(2));
@@ -690,8 +715,10 @@ mod tests {
         // Label-bearing counters are asserted with unique labels so parallel
         // tests cannot clobber each other (the shared default registry);
         // label-less gauges are covered by registers_all_families instead.
+        // The fabricated `INC` is not a served verb, so it proves the
+        // collapse: it books under `OTHER`, this test's label alone.
         assert!(
-            text.contains(r#"tinio_http_requests_total{method="INC",status="200"} 2"#),
+            text.contains(r#"tinio_http_requests_total{method="OTHER",status="200"} 2"#),
             "{text}"
         );
         assert!(

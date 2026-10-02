@@ -331,6 +331,37 @@ async fn a_missing_config_is_a_warning_and_never_created() {
     );
 }
 
+/// The no-`[auth]` row's text, pinned. The case is a configuration that **exists** without an
+/// `[auth]` section, which the credential remediation (2026-10-02) made the built-in loopback
+/// pair's and not the generated-credentials case: `discover::load_or_create` generates only when
+/// the file is *absent* (`a_missing_config_is_a_warning_and_never_created` above), so a start here
+/// serves the built-in `minioadmin` pair on loopback and refuses a non-loopback bind. The retired
+/// sentence ("a start would generate session credentials") was also a warn on this same row, so a
+/// severity-or-name-only assertion would have passed it; the detail is asserted whole for that
+/// reason.
+#[tokio::test]
+async fn a_config_without_auth_names_the_loopback_fallback() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    std::fs::create_dir_all(dir.path().join(".tinio")).expect("reserved dir");
+    std::fs::write(
+        dir.path().join(".tinio/.tinio.toml"),
+        "version = 1\n[server]\nhost = \"127.0.0.1\"\nport = 9000\n",
+    )
+    .expect("seed");
+    let report = crate::test_support::run_checks(dir.path(), false, Proposals::Informational).await;
+    let row = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "configuration")
+        .expect("the configuration row is reported");
+    assert_eq!(row.severity, Severity::Warn, "{:?}", report.findings());
+    assert_eq!(
+        row.detail,
+        "no [auth] pair: a start would serve the built-in minioadmin development pair on \
+         loopback, and would refuse a non-loopback bind instead"
+    );
+}
+
 #[test]
 fn the_floor_is_the_larger_of_one_gib_and_five_percent() {
     // The floor is arithmetic over the probed totals, so it is pinned with explicit

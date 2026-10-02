@@ -18,6 +18,12 @@ fn validate_auth_secret_key(value: &Secret, _context: &()) -> garde::Result {
 /// There is deliberately no `anonymous` key — anonymous mode is flag/env
 /// only (the key is rejected as unknown).
 ///
+/// **An absent section is the loopback-only development pair.** With no
+/// `[auth]`, the served credentials are the built-in `minioadmin`/
+/// `minioadmin` pair — not a credential at all, so the CLI refuses to start
+/// on a non-loopback bind without this section (or `TINIO_ACCESS_KEY`/
+/// `TINIO_SECRET_KEY`), and warns on the loopback one it does serve.
+///
 /// # Examples
 ///
 /// ```rust

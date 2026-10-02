@@ -38,6 +38,11 @@ pub const DEVICE_FILES: [&str; 4] = ["/dev/null", "/dev/zero", "/dev/random", "/
 /// let mounts: Vec<Mount> = plan(&sandbox, Path::new("/tmp/j"), Mechanism::Root, &opts).unwrap();
 /// assert_eq!(mounts[1].source, Path::new("/srv/data"));
 /// assert_eq!(mounts[1].target, Path::new("/tmp/j/srv/data"));
+/// assert_eq!(
+///     mounts[1].exposure,
+///     Some(0),
+///     "the exposure's own descriptor index"
+/// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -52,6 +57,13 @@ pub struct Mount {
     pub access: AccessMode,
     /// How to perform it.
     pub kind: MountKind,
+    /// Which of `open_exposures`' descriptors this mount binds, when it is
+    /// an exposure's own bind — **the link between the two parallel orders**,
+    /// since `plan` appends the exposures between the jail tmpfs and the device
+    /// files and an index into either list alone would name the wrong mount.
+    /// [`MountKind::JailTmpfs`] and the device files carry `None`: they bind by
+    /// path.
+    pub exposure: Option<usize>,
 }
 
 /// How a [`Mount`] is performed.
@@ -184,6 +196,7 @@ pub fn plan(
         target: jail.to_path_buf(),
         access: AccessMode::ReadWrite,
         kind: MountKind::JailTmpfs,
+        exposure: None,
     }];
 
     if model == Mechanism::UserNamespace
@@ -211,7 +224,7 @@ pub fn plan(
         ));
     }
 
-    for exposure in sandbox.exposures() {
+    for (index, exposure) in sandbox.exposures().iter().enumerate() {
         let target = mirror_under(jail, &exposure.host)?;
         // **Every exposure is a plain bind, read-only ones included.** Which
         // mechanism makes a read-only bind read-only — a remount, or the
@@ -225,6 +238,9 @@ pub fn plan(
             target,
             access: exposure.access,
             kind: MountKind::Bind,
+            // `open_exposures` returns its descriptors in this same order,
+            // and this index is what says so.
+            exposure: Some(index),
         });
     }
 
@@ -235,6 +251,7 @@ pub fn plan(
                 target: mirror_under(jail, Path::new(device))?,
                 access: AccessMode::ReadWrite,
                 kind: MountKind::Bind,
+                exposure: None,
             });
         }
     }
@@ -363,5 +380,37 @@ mod tests {
         // The same two exposures are fine under root, where the remount is not
         // refused and the pair is therefore never reached.
         assert!(plan(&sandbox, Path::new(JAIL), Mechanism::Root, &opts).is_ok());
+    }
+
+    #[test]
+    fn every_exposure_bind_is_linked_and_nothing_else_is() {
+        // `Mount::exposure` is the link between the two parallel orders: the
+        // exposure list `open_exposures` opens and the mount list `apply_bind`
+        // walks. A `Some` on the jail tmpfs or on a device file would make
+        // `apply_bind` land `descriptors[0]` on `/dev/null`.
+        let sandbox = Sandbox::new()
+            .expose("/srv/data", AccessMode::ReadWrite)
+            .expose("/srv/other", AccessMode::ReadWrite);
+        let mounts = plan(
+            &sandbox,
+            Path::new(JAIL),
+            Mechanism::Root,
+            &Options::default(),
+        )
+        .unwrap();
+        let linked: Vec<usize> = mounts.iter().filter_map(|mount| mount.exposure).collect();
+        assert_eq!(linked, vec![0, 1], "exposure order, one per exposure");
+        for mount in &mounts {
+            if mount.exposure.is_some() {
+                assert_eq!(mount.kind, MountKind::Bind, "{mount:?}");
+                continue;
+            }
+            let is_jail_or_device = mount.kind == MountKind::JailTmpfs
+                || DEVICE_FILES.iter().any(|d| Path::new(d) == mount.source);
+            assert!(
+                is_jail_or_device,
+                "an unlinked mount is the jail tmpfs or a device file: {mount:?}"
+            );
+        }
     }
 }

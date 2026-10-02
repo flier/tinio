@@ -18,6 +18,7 @@
 
 - One-off scripts: any language.
 - Unit / e2e tests: Rust only — no shell/python standing in as a test.
+- Verification scratch lives outside the repo (`/tmp`; the guest's `/var/tmp` for a WSL leg) and is deleted when the round ends — one dir per round when several run. A repo-local or `target/` scratch is a commit hazard; a multi-GB tree copy left behind is the bill. A run reaps the processes it spawns (product binary, client): a leaked `tinio.exe` holds the binary open and the next `cargo` fails on it (os error 5).
 
 ## Standard acceptance (pre-push gate)
 
@@ -58,6 +59,7 @@ Layout / tags / env: `crates/tinio-e2e/README.md`. Features ↔ `specs/001-s3-lo
 - Process legs = cucumber `@cli` (build `tinio` first). Windows console drain stays Rust (`lifecycle.rs`).
 - `@cli @confinement`: feature-off refuses by build, never by platform; feature-on must reach readiness. Automatic honour arm = macOS `e2e-port` only; Linux/Windows = operator opt-in ([WSL2](#platform-gated-verification-wsl2) / [Windows](#platform-gated-verification-windows)).
 - Doctor (T057): two halves. The flows are `doctor.feature` (`@cli`; `@unix` for the socket residue, `@windows` for the held-handle failed repair) — each repairable defect the reclamation matrix names, driven plain → `--dry-run` → `--dry-run --json` → `--fix` against one fixture, so the modes' contrast is asserted rather than assumed. The residue is `crates/tinio/tests/doctor.rs` (`cargo test -p tinio --test doctor`), the `--json` **key set** against `contracts/doctor-report.schema.json` — the schema's `additionalProperties: false` at both levels, which no scenario asserts: the step layer has no JSON reader (`steps/cli.rs`'s `report_severity` reads the one severity field by text and says why). Coverage change with the move: the migrated legs' `#[cfg(not(feature = "api"))]` arms went with them, the cucumber child being a default-feature binary — an `api`-off plain run is no longer process-asserted, and never was a gate (the `no-default-features` keeper is `cargo hack check`, compile-only; the checks themselves are `crates/tinio-cli/src/commands/doctor/tests.rs`).
+- Residue: `crates/tinio/tests/credential_policy.rs` (`cargo test -p tinio --test credential_policy`) — the loopback-only built-in `minioadmin` fallback: a refused non-loopback start (non-zero exit, an `auth`-naming stderr that also names `TINIO_ACCESS_KEY` and `TINIO_SECRET_KEY`), the warning line on a loopback start, and the `event: listening` readiness frame on each of the three starts that must not refuse (a configured `[auth]`, the environment pair, the loopback fallback). **Kept in Rust by ruling, not by a limit of the step layer**: the `@cli` steps could express each leg — `the run fails with exit code …` plus `its stderr contains …` on a refused start, the readiness frame on one that must serve — so this is a deliberate placement, recorded here rather than presented as unrepresentable.
 
 ## Read-only mode (FR-023)
 

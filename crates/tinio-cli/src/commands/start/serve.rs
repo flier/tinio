@@ -19,6 +19,7 @@ use super::Ready;
 #[cfg(unix)]
 use crate::notify;
 use crate::{
+    _config,
     _core::{
         cleanup::{Cleanup, CleanupOptions, RepairKind},
         mode::AccessMode,
@@ -129,6 +130,23 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
         })?;
     }
     let bind = resolution.address()?;
+    // **The built-in pair is a loopback-only development credential** (audit run-2, P2): a config
+    // with no `[auth]` section serves `identity::root_auth_pair`'s documented fallback, which is
+    // not a credential at all — so a bind another host can reach refuses to start rather than
+    // publishing it. On loopback the fallback still serves, and the warning is the whole of what
+    // changes for a run that has always used it. A configured pair is unaffected: the pair the
+    // operator chose is theirs to expose, and `warn_if_non_loopback` below is that bind's report.
+    if identity::uses_builtin_fallback(&resolution.config) {
+        if bind.ip().is_loopback() {
+            warn("serving the built-in minioadmin pair on loopback");
+        } else {
+            return Err(Error::Config(_config::Error::invalid_value(
+                "auth",
+                "no [auth] pair: a non-loopback bind needs explicit credentials \
+                 ([auth], TINIO_ACCESS_KEY/TINIO_SECRET_KEY)",
+            )));
+        }
+    }
     // **Borrowed, not taken**: the arm below asks whether this process is a launched child, which
     // is what decides who publishes `state`. A `match adopted` binding its inner value would move
     // it here and leave that question unanswerable at the publish site.
@@ -201,7 +219,7 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
         } else {
             "read-write"
         },
-        origin = credential_origin(&args.env),
+        origin = credential_origin(&args.env, &resolution.config),
     );
     if let Some(on_ready) = on_ready {
         on_ready();
@@ -329,15 +347,22 @@ async fn stopping(stop: &mut watch::Receiver<bool>) {
     }
 }
 
+/// The one spelling of a start's stderr warning: the stream and the `tinio: warning:` prefix are
+/// the contract's (`contracts/cli.md`), and every warning arm of this file writes through here so
+/// a reword cannot reach one and miss another.
+fn warn(message: &str) {
+    eprintln!("tinio: warning: {message}");
+}
+
 /// `contracts/cli.md`: non-loopback bind warns on stderr. Anonymous escalation is US3 (T087)
 /// and is not wired until that flag exists.
 fn warn_if_non_loopback(address: SocketAddr) {
     if address.ip().is_loopback() {
         return;
     }
-    eprintln!(
-        "tinio: warning: binding a non-loopback address ({address}); the data plane is reachable from other hosts"
-    );
+    warn(&format!(
+        "binding a non-loopback address ({address}); the data plane is reachable from other hosts"
+    ));
 }
 
 /// One serving arm's outcome, as this process's.
@@ -485,9 +510,18 @@ fn credentials_of(resolution: &Resolution) -> (String, String) {
 /// the config, so `env.access_key` being set *is* "the variables won", and there is no second
 /// read of the environment to drift from the fold's. They are set together or not at all;
 /// half a pair never reaches this line, because the fold refuses it.
-fn credential_origin(env: &EnvArgs) -> &'static str {
+///
+/// **The absent `[auth]` section is an answer of its own**, and it is the one this line got
+/// wrong: the pair a resolution without a section carries is [`identity::root_auth_pair`]'s
+/// built-in development pair, which no config file holds — so "from the config file" put the
+/// summary at odds with the loopback warning printed just above it. The predicate is
+/// [`identity::uses_builtin_fallback`], the same one that warning and the non-loopback refusal
+/// read.
+fn credential_origin(env: &EnvArgs, config: &_config::Config) -> &'static str {
     if env.access_key.is_some() {
         "from TINIO_ACCESS_KEY/TINIO_SECRET_KEY"
+    } else if identity::uses_builtin_fallback(config) {
+        "the built-in development pair (no [auth] configured)"
     } else {
         "from the config file"
     }

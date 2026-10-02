@@ -29,6 +29,7 @@ use crate::_api::{
 // The crate-wide facade alias, imported rather than spelled `crate::_sandbox::...`: a
 // three-segment expression path is what this crate's `absolute_paths` lint refuses.
 use crate::_sandbox;
+use crate::_server::identity;
 #[cfg(all(feature = "api", unix))]
 use crate::commands::start;
 use crate::{
@@ -681,6 +682,13 @@ fn writability(root: &Path) -> Finding {
 /// The configuration's row: the load outcome the resolution carries, the absent file's warn,
 /// and the credential rule.
 ///
+/// The absent-`[auth]` row is a `warn` rather than an `error` because a start still comes up;
+/// what its text says is the **loopback** story, and that is the fact the credential remediation
+/// changed here. A config that exists without the section is not the generated-credentials case
+/// — [`discover::load_or_create`](crate::_config::discover::load_or_create) only generates when
+/// the file is *absent* — so a start serves `identity::root_auth_pair`'s built-in `minioadmin`
+/// development pair on loopback and refuses a non-loopback bind instead.
+///
 /// A root whose configuration does not parse is the case `doctor` exists for, so the failure
 /// is a finding rather than a `?` that would abort the run. Nothing is read here: the
 /// resolution already loaded the file and recorded the outcome beside the parsed config, and a
@@ -699,11 +707,15 @@ fn config_finding(resolution: &Resolution) -> Finding {
             ),
         );
     }
-    if resolution.config.auth.is_none() {
+    // The predicate, not a second spelling of it: the row describes the very
+    // policy `serve`'s refusal and warning enforce (P2), so the two must not
+    // be able to disagree.
+    if identity::uses_builtin_fallback(&resolution.config) {
         return Finding::check(
             "configuration",
             Severity::Warn,
-            "no credentials at all: a start would generate session credentials (printed once)",
+            "no [auth] pair: a start would serve the built-in minioadmin development pair on \
+             loopback, and would refuse a non-loopback bind instead",
         );
     }
     Finding::check(

@@ -5,15 +5,17 @@ use std::{
     ffi::CString,
     fs,
     io::{self, Write as _},
-    os::unix::ffi::OsStrExt,
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
 };
 
 use rustix::{
+    fd::OwnedFd,
+    fs::{CWD, Mode, OFlags, ResolveFlags, open, openat2},
     io::Errno,
     mount::{
-        MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind_recursive, mount_change,
-        mount_remount, unmount,
+        MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount,
+        mount_bind_recursive, mount_change, mount_remount, move_mount, open_tree, unmount,
     },
     process::{getegid, pivot_root},
     thread::{
@@ -102,12 +104,22 @@ impl crate::Backend {
         create_jail_root(&prepared.jail)?;
         let map_fds = enter_user_namespace(prepared.resolved, opts)?;
         enter_mount_namespace()?;
-        apply_planned_mounts(sandbox, &prepared.mounts, &prepared.overlay)?;
-        // 7. The maps have been read by every mount that needed them; the
-        //    descriptors are closed explicitly because nothing here ever
-        //    `exec`s, so `CLOEXEC` never gets a chance to close them and they
-        //    would otherwise be inherited by the whole server lifetime.
+        // **The exposure descriptors are opened here, not in the plan**: a mount
+        //    is bindable only from the namespace that owns it, so a descriptor
+        //    opened before `enter_mount_namespace` belongs to the namespace this
+        //    process left and both binds refuse it with `EINVAL` (measured).
+        //    `open_exposures` carries the argument; the path policy that has to
+        //    hold before anything irreversible — the ancestor symlink, the
+        //    existence and the mirror of every exposure — already did.
+        let descriptors = open_exposures(sandbox)?;
+        apply_planned_mounts(sandbox, &prepared.mounts, &prepared.overlay, &descriptors)?;
+        // 7. The maps have been read by every mount that needed them, and the
+        //    exposure descriptors have been bound; both are closed explicitly
+        //    because nothing here ever `exec`s, so `CLOEXEC` never gets a chance
+        //    to close them and they would otherwise be inherited by the whole
+        //    server lifetime.
         drop(map_fds);
+        drop(descriptors);
         pivot_into_jail(&prepared.jail)?;
         // 9. Drop everything the jail no longer needs, then cut the network.
         //    The filter's outcome is recorded on the backend rather than
@@ -312,6 +324,110 @@ fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
     Ok(())
 }
 
+/// Open every validated exposure as the object the bind will use, **in exposure
+/// order** — the order [`Mount::exposure`] indexes.
+///
+/// **The open happens after the mount namespace is unshared, and that is the
+/// kernel's requirement rather than a preference**: a mount is bindable only
+/// from the namespace that owns it, so a descriptor opened before the `unshare`
+/// belongs to the namespace this process left and both `open_tree` and the
+/// `/proc/self/fd` bind refuse it with `EINVAL` (measured on the project's
+/// kernel). What is validated *before* the namespace change is the path policy
+/// — [`validate_exposures`], which is what a mistyped exposure has to be refused
+/// by without a jail directory left behind; what is opened here is the object,
+/// and [`open_exposure`] re-applies the same policy atomically where the kernel
+/// can (`openat2`).
+fn open_exposures(sandbox: &Sandbox) -> Result<Vec<ExposureFd>> {
+    sandbox
+        .exposures()
+        .iter()
+        .map(|exposure| open_exposure(&exposure.host))
+        .collect()
+}
+
+/// The validated exposure: the descriptor is the object, the path was only the
+/// way to it.
+///
+/// **Which syscall refuses a linked component is [`open_exposure`]'s to state**:
+/// one `openat2` resolution on the primary arm, a re-check after the open on
+/// the fallback. `O_CLOEXEC` is what the explicit close in
+/// [`crate::Backend::enter`] stands in for: nothing here ever `exec`s.
+#[derive(Debug)]
+struct ExposureFd(OwnedFd);
+
+/// Open `path` as the object the bind will use, refusing a symlink in any
+/// component.
+///
+/// **`openat2` with `RESOLVE_NO_SYMLINKS` is the whole ancestor policy in one
+/// syscall** — it refuses a link in any component, the leaf included, and it
+/// resolves the path *inside* that refusal, so nothing can be swapped in between
+/// the policy check and this open. The refusal is the same [`SYMLINK_EXPOSURE`]
+/// the ancestor walk gives (`ELOOP` here), so an operator reads one reason for
+/// one mistake whichever component was the link.
+///
+/// **A kernel without `openat2` (5.2–5.5, or one that refuses the resolve flag)
+/// falls back to `open` with `O_PATH | O_NOFOLLOW`, and then every refusal is the
+/// re-check's rather than the syscall's.** That open refuses nothing: `O_PATH`
+/// does not answer `ELOOP` for a symlink leaf — it returns a descriptor for the
+/// *link itself* (measured: `O_PATH|O_NOFOLLOW` opens the link, while
+/// `O_RDONLY|O_NOFOLLOW` answers `ELOOP`) — and the components above it are
+/// walked by the kernel at that moment, after [`validate_exposures`] walked them
+/// earlier. So [`refuse_symlink_exposure`] runs again immediately after the open
+/// and is what refuses both the leaf and any linked component above it, the
+/// descriptor it would otherwise be bound from being dropped by the `?`.
+///
+/// **And that arm's window is real rather than merely narrower: an ancestor link
+/// is followed.** A link swapped into a component before the open and restored
+/// before the re-check is resolved by the open and invisible to the walk
+/// afterwards, so what lands can be the linked directory. The window is those two
+/// syscalls, and it is reached wherever `openat2` is absent (5.5 and below, with or
+/// without `open_tree`) — or where the resolve flag is refused, which is what the
+/// `EINVAL` arm is for. That residual is the arm's own and is bounded by the
+/// kernel it runs on: `openat2`'s arm has no such window, and what the fallback
+/// cannot reach is `RESOLVE_NO_SYMLINKS`, not a second check.
+fn open_exposure(path: &Path) -> Result<ExposureFd> {
+    let refuse = |err: Errno| {
+        let reason = if err == Errno::LOOP {
+            SYMLINK_EXPOSURE
+        } else {
+            "cannot open"
+        };
+        refused(
+            EXPOSE_STEP,
+            Error::BadPath {
+                path: path.to_path_buf(),
+                reason,
+            },
+        )
+    };
+    match openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(descriptor) => Ok(ExposureFd(descriptor)),
+        // No `openat2`, or a kernel that refuses the resolve flag: the weaker
+        // open below, whose window the doc above states.
+        Err(err) if err == Errno::NOSYS || err == Errno::INVAL => {
+            let descriptor = open(
+                path,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(refuse)?;
+            // The policy again, now that the path has been opened: the leaf,
+            // which `O_PATH | O_NOFOLLOW` accepted as a descriptor for the link
+            // itself, and the components this open had to walk. The `?` drops
+            // the descriptor it would otherwise be bound from.
+            refuse_symlink_exposure(path)?;
+            Ok(ExposureFd(descriptor))
+        }
+        Err(err) => Err(refuse(err)),
+    }
+}
+
 /// A bind follows a symlink, so an exposure through one would mount the target.
 const SYMLINK_EXPOSURE: &str =
     "is a symlink, and a bind of it would mount the target rather than the path that was exposed";
@@ -321,7 +437,7 @@ const SYMLINK_EXPOSURE: &str =
 /// The whole chain, not the last component: a directory reached through a
 /// linked parent is the target's directory. `symlink_metadata` reports the
 /// link itself. A component that cannot be read is not this check's to refuse
-/// — the existence check that follows reports a path that is not there.
+/// — the existence check reports a path that is not there.
 fn refuse_symlink_exposure(path: &Path) -> Result<()> {
     for component in path.ancestors() {
         let Ok(metadata) = fs::symlink_metadata(component) else {
@@ -585,13 +701,18 @@ fn enter_mount_namespace() -> Result<()> {
     ret,
     fields(mounts = mounts.len(), exposures = ?sandbox.exposures())
 )]
-fn apply_planned_mounts(sandbox: &Sandbox, mounts: &[Mount], overlay: &OverlayDirs) -> Result<()> {
+fn apply_planned_mounts(
+    sandbox: &Sandbox,
+    mounts: &[Mount],
+    overlay: &OverlayDirs,
+    descriptors: &[ExposureFd],
+) -> Result<()> {
     // 6. The mounts, in plan order. **No inherited flags**: a planned mount is
     //    not a remount of anything — `plan` emits no `OverlayReadOnly` — and the
     //    one caller that has them is the read-only arm's fallback, which
     //    re-enters `apply_mount` with them so the trace stays one event per mount.
     for entry in mounts {
-        apply_mount(entry, overlay, MountFlags::empty())?;
+        apply_mount(entry, overlay, MountFlags::empty(), descriptors)?;
     }
     announce_exposures(sandbox.exposures(), mounts.len());
     Ok(())
@@ -877,13 +998,22 @@ fn source_mount_flags_in(table: &str, source: &Path) -> MountFlags {
 /// [`enforce_bind_read_only`], the only caller that builds that kind; a planned
 /// mount passes [`MountFlags::empty()`], there being no source it was bound
 /// from.
-fn apply_mount(entry: &Mount, overlay: &OverlayDirs, inherited: MountFlags) -> Result<()> {
+fn apply_mount(
+    entry: &Mount,
+    overlay: &OverlayDirs,
+    inherited: MountFlags,
+    descriptors: &[ExposureFd],
+) -> Result<()> {
     match entry.kind {
         MountKind::JailTmpfs => apply_jail_tmpfs(entry)?,
         // `return`: the overlay fallback re-enters this function, and that
         // recursive call is the one that traces — falling through would emit a
         // second `mount applied` with the bind's kind (design decision 8).
-        MountKind::Bind => return apply_bind(entry, overlay),
+        //
+        // **The exposure's own descriptor when this mount is one**: `plan`
+        // links every exposure and no other mount, so the device files and the
+        // jail tmpfs keep the path-based bind below.
+        MountKind::Bind => return apply_bind(entry, overlay, descriptors),
         MountKind::OverlayReadOnly => apply_overlay_read_only(entry, overlay, inherited)?,
     }
     trace_mount(entry);
@@ -933,7 +1063,7 @@ fn apply_jail_tmpfs(entry: &Mount) -> Result<()> {
     .map_err(step("mount tmpfs"))
 }
 
-fn apply_bind(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+fn apply_bind(entry: &Mount, overlay: &OverlayDirs, descriptors: &[ExposureFd]) -> Result<()> {
     // **"Is the source a directory?", not "is it a file?"** The four
     // device files are character devices, so `is_file()` is false for
     // every one of them: that spelling runs the *directory* branch for
@@ -950,21 +1080,92 @@ fn apply_bind(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
         }
         fs::File::create(&entry.target).map_err(step("create device node"))?;
     }
-    // Recursive, not plain: a bare `MS_BIND` of a mount-point source is
-    // refused with EINVAL inside a user namespace (measured), and for a
-    // source with no submounts the two forms are identical — so the
-    // recursive call is the one to write everywhere.
-    mount_bind_recursive(&entry.source, &entry.target).map_err(step("mount --bind"))?;
+    // **An exposure binds the descriptor's own object, never the path again**:
+    // `open_exposures` resolved the path once, and a rename or a link swap
+    // since then would otherwise decide what lands in the jail.
+    match entry.exposure {
+        Some(index) => {
+            // **Checked, not `descriptors[index]`.** `plan` links every
+            // exposure and no other mount, so the index is in range for every
+            // mount the plan built — but a wrong one read as an index would
+            // panic inside confinement rather than refuse, and design §11 wants
+            // the refusal. Both numbers are named so the mismatch is
+            // diagnosable rather than a bare panic.
+            let descriptor = descriptors.get(index).ok_or_else(|| {
+                fail(
+                    "bind exposure",
+                    io::Error::other(format!(
+                        "mount {} names exposure {index}, but only {} descriptor(s) were opened",
+                        entry.source.display(),
+                        descriptors.len(),
+                    )),
+                )
+            })?;
+            bind_exposure(&descriptor.0, &entry.target)?;
+        }
+        // Recursive, not plain: a bare `MS_BIND` of a mount-point source is
+        // refused with EINVAL inside a user namespace (measured), and for a
+        // source with no submounts the two forms are identical — so the
+        // recursive call is the one to write everywhere.
+        None => mount_bind_recursive(&entry.source, &entry.target).map_err(step("mount --bind"))?,
+    }
     if entry.access.is_read_only() {
-        return enforce_bind_read_only(entry, overlay);
+        return enforce_bind_read_only(entry, overlay, descriptors);
     }
     trace_mount(entry);
     Ok(())
 }
 
+/// Bind the validated object: a recursive clone of the descriptor's mount moved
+/// onto the target, or the descriptor's `/proc` link where `open_tree` is
+/// unavailable.
+///
+/// **`move_mount` takes a *mount* descriptor, which is why the clone and not the
+/// bare `O_PATH` descriptor is what it receives.** The `/proc/self/fd` arm is for
+/// the kernels below 5.2 that answer `ENOSYS`, and it requires `/proc`; it is also
+/// what `TINIO_SANDBOX_FORCE_PROC_FALLBACK` selects, so the two arms can be
+/// exercised on one host. Both resolve the same held descriptor, so neither can
+/// be steered by a path that changed after validation — **and the descriptor was
+/// opened in *this* mount namespace** (`open_exposures` runs after
+/// `enter_mount_namespace`), which is what makes it bindable at all: a mount
+/// belongs to the namespace that owns it, and one opened earlier belongs to the
+/// namespace this process left.
+fn bind_exposure(descriptor: &OwnedFd, target: &Path) -> Result<()> {
+    if env::var_os("TINIO_SANDBOX_FORCE_PROC_FALLBACK").is_none() {
+        let flags = OpenTreeFlags::OPEN_TREE_CLONE
+            | OpenTreeFlags::AT_EMPTY_PATH
+            | OpenTreeFlags::AT_RECURSIVE;
+        match open_tree(descriptor, "", flags) {
+            Ok(tree) => {
+                return move_mount(
+                    &tree,
+                    "",
+                    CWD,
+                    target,
+                    MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+                )
+                .map_err(step("move_mount"));
+            }
+            // No `open_tree` at all: the `/proc` arm is the only bind left.
+            Err(Errno::NOSYS) => {}
+            Err(err) => return Err(step("open_tree")(err)),
+        }
+    }
+    let link = format!("/proc/self/fd/{}", descriptor.as_raw_fd());
+    mount_bind_recursive(Path::new(&link), target).map_err(step("mount --bind"))
+}
+
 /// Remount the bind read-only, or fall back to the overlay when locked flags
 /// refuse the remount (design decision 8).
-fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
+///
+/// `descriptors` is passed through because the fallback re-enters
+/// [`apply_mount`], which takes them for every bind it may still have to make;
+/// the overlay mounts a filesystem of its own rather than binding one.
+fn enforce_bind_read_only(
+    entry: &Mount,
+    overlay: &OverlayDirs,
+    descriptors: &[ExposureFd],
+) -> Result<()> {
     // **`mount_remount`, not `mount_change`, and this is the primary
     // enforcement of `AccessMode::ReadOnly`** (design decision 8).
     // `mount_change` takes `MountPropagationFlags` — `MountFlags`
@@ -1117,9 +1318,17 @@ fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs) -> Result<()> {
             record_read_only_arm(ReadOnlyArm::Overlay);
             let fallback = Mount {
                 kind: MountKind::OverlayReadOnly,
+                // **No exposure link here.** `exposure` means "this mount is an
+                // exposure's own bind" (`plan`'s field doc), and `apply_bind`
+                // is its only reader — the overlay arm binds no descriptor, so
+                // a `Some` left over from the clone would be a state no reader
+                // acts on and would contradict the invariant
+                // `every_exposure_bind_is_linked_and_nothing_else_is` pins
+                // (`exposure.is_some() ⇒ kind == Bind`).
+                exposure: None,
                 ..entry.clone()
             };
-            apply_mount(&fallback, overlay, inherited)
+            apply_mount(&fallback, overlay, inherited, descriptors)
         }
         Err(source) => Err(fail("remount ro", source)),
     }
@@ -1505,7 +1714,10 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
-        os::unix::{ffi::OsStrExt, fs::symlink},
+        os::{
+            fd::AsRawFd,
+            unix::{ffi::OsStrExt, fs::symlink},
+        },
         path::{Path, PathBuf},
         sync::mpsc,
         thread,
@@ -1515,12 +1727,13 @@ mod tests {
 
     use super::{
         OVERLAY_OPTION_META, SYMLINK_EXPOSURE, TASK_DIR, THREAD_STEP, announce_capset,
-        announce_exposures, announce_no_new_privs, announce_retained, create_jail_root,
-        decode_mountinfo, enforce_bind_read_only, enter_user_namespace, open_map,
-        overlay_mount_options, overlay_read_only_flags, read_mountinfo, refuse_symlink_exposure,
-        refuse_when_threaded, refuse_writable_nested_mounts, refused_remount_needs_the_overlay,
-        require_single_thread, resolve_model, source_mount_flags_in, task_count, validate_and_plan,
-        validate_exposures, writable_nested_mounts_in, write_map,
+        announce_exposures, announce_no_new_privs, announce_retained, apply_bind, create_jail_root,
+        decode_mountinfo, enforce_bind_read_only, enter_user_namespace, open_exposure,
+        open_exposures, open_map, overlay_mount_options, overlay_read_only_flags, read_mountinfo,
+        refuse_symlink_exposure, refuse_when_threaded, refuse_writable_nested_mounts,
+        refused_remount_needs_the_overlay, require_single_thread, resolve_model,
+        source_mount_flags_in, task_count, validate_and_plan, validate_exposures,
+        writable_nested_mounts_in, write_map,
     };
     use crate::{
         _core::{AccessMode, Backend as BackendTrait, Error, Exposure, LaunchPlan, Sandbox},
@@ -2102,6 +2315,109 @@ mod tests {
     }
 
     #[test]
+    fn the_opened_descriptors_are_in_exposure_order() {
+        // **The order is the link `Mount::exposure` indexes**, so an opener that
+        // returned them in another order — or dropped one — would bind the
+        // wrong object for every exposure after the first. The `/proc/self/fd`
+        // link is the oracle: it is the descriptor's own path, which is exactly
+        // what `apply_bind` binds.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir(&first).expect("first");
+        fs::create_dir(&second).expect("second");
+        let sandbox = Sandbox::new()
+            .expose(&first, AccessMode::ReadOnly)
+            .expose(&second, AccessMode::ReadWrite);
+
+        let Ok(descriptors) = open_exposures(&sandbox) else {
+            // A temp root whose ancestor is a symlink is the policy
+            // `a_directory_that_is_not_a_symlink_can_be_exposed` owns, and it
+            // refuses at the open; this test is about the order.
+            return;
+        };
+        assert_eq!(descriptors.len(), 2, "one descriptor per exposure");
+        let opened: Vec<PathBuf> = descriptors
+            .iter()
+            .map(|exposure| {
+                fs::read_link(format!("/proc/self/fd/{}", exposure.0.as_raw_fd()))
+                    .expect("the descriptor names its own path")
+            })
+            .collect();
+        assert_eq!(opened, [first, second], "exposure order");
+    }
+
+    #[test]
+    fn a_mount_naming_a_missing_descriptor_refuses_rather_than_panicking() {
+        // **`Mount::exposure` is in range for every mount `plan` builds, and
+        // this pins the refusal for the one that is not.** The link is an
+        // index, and reading a wrong one with `descriptors[index]` would panic
+        // inside confinement rather than refuse — the outcome design §11
+        // forbids. `plan`'s own output never carries a wrong index, so a
+        // hand-built mount is the only way to reach the guard.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("served");
+        fs::create_dir(&source).expect("source");
+        let Ok(descriptors) = open_exposures(&Sandbox::new().expose(&source, AccessMode::ReadOnly))
+        else {
+            // A temp root whose ancestor is a symlink is the open's own policy
+            // (`a_directory_that_is_not_a_symlink_can_be_exposed`); this test
+            // is about the index.
+            return;
+        };
+        assert_eq!(descriptors.len(), 1, "one descriptor per exposure");
+        let entry = Mount {
+            source,
+            target: dir.path().join("jail/served"),
+            access: AccessMode::ReadOnly,
+            kind: MountKind::Bind,
+            exposure: Some(2),
+        };
+        let overlay = OverlayDirs {
+            upper: dir.path().join("upper"),
+            work: dir.path().join("work"),
+        };
+        let err = apply_bind(&entry, &overlay, &descriptors)
+            .expect_err("only one descriptor was opened, so index 2 is missing");
+        assert!(
+            matches!(err, Error::Step { step, .. } if step == "bind exposure"),
+            "{err:?}"
+        );
+        // Both numbers are in the message, so the operator reads the mismatch
+        // rather than only that a bind was refused.
+        let refusal = err.to_string();
+        assert!(refusal.contains("2") && refusal.contains("1"), "{refusal}");
+    }
+
+    #[test]
+    fn a_symlinked_component_is_refused_by_the_open() {
+        // **The open is the policy now, not only the walk before it**: with
+        // `openat2` the kernel refuses a link in any component inside one
+        // resolution, and the fallback re-runs the walk after its open — so both
+        // arms must answer a linked ancestor with the same named refusal rather
+        // than following it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("target");
+        fs::create_dir(real.join("child")).expect("child");
+        let link = dir.path().join("link");
+        symlink(&real, &link).expect("symlink");
+
+        // The link *target* is a real directory with the component that is
+        // asked for below, so the `O_NOFOLLOW` arm's open resolves through the
+        // link successfully — which is what makes the re-check, and not the
+        // open's own failure, the thing that refuses it there. One policy, one
+        // reason, whichever arm this kernel can run.
+        for exposed in [link.clone(), link.join("child")] {
+            let err = open_exposure(&exposed).expect_err("the link is followed nowhere");
+            assert!(
+                matches!(err, Error::BadPath { reason, .. } if reason == SYMLINK_EXPOSURE),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn overlay_options_refuse_separator_bytes() {
         let upper = Path::new("/tmp/jail/upper");
         let work = Path::new("/tmp/jail/work");
@@ -2228,6 +2544,7 @@ mod tests {
             target: target.clone(),
             access: AccessMode::ReadOnly,
             kind: MountKind::Bind,
+            exposure: None,
         };
         // The table is the caller's one read, so a test can hand it the shape it
         // needs — and what it hands is a real `/proc/self/mountinfo` line. Its
@@ -2294,8 +2611,9 @@ mod tests {
             target: tmp.path().join("jail/gone"),
             access: AccessMode::ReadOnly,
             kind: MountKind::Bind,
+            exposure: None,
         };
-        let err = enforce_bind_read_only(&entry, &overlay)
+        let err = enforce_bind_read_only(&entry, &overlay, &[])
             .expect_err("a source that is not there cannot be resolved");
         assert!(
             matches!(

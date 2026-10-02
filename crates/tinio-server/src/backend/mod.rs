@@ -153,8 +153,6 @@ use futures::{TryStreamExt, stream};
 use mime_guess;
 #[cfg(feature = "select")]
 use rayon::ThreadPool;
-#[cfg(feature = "copy")]
-use s3s::dto::CopySource;
 use s3s::{
     S3Error, S3Result,
     dto::{self, ETag as WireETag, LastModified, Range, StreamingBlob},
@@ -169,6 +167,8 @@ use self::acls::object_write_acl;
 use crate::_auth::canned::GrantHeaders;
 #[cfg(feature = "acl")]
 use crate::_auth::identity::Identity;
+#[cfg(feature = "copy")]
+use crate::_auth::source::copy_source_of;
 pub use crate::_config::s3::Capabilities;
 #[cfg(feature = "acl")]
 use crate::_core::acl;
@@ -350,6 +350,21 @@ impl<S: Storage> S3Backend<S> {
         object::key(raw).map_err(|_| s3_error!(InvalidArgument, "invalid object key"))
     }
 
+    /// The source of a `CopyObject`/`UploadPartCopy` request into a
+    /// (bucket, key) pair — the framework has already parsed the header into
+    /// [`dto::CopySource`], and the pair is validated by the auth crate's one
+    /// parse authority (P1/P6), so the ACL and the handler cannot disagree
+    /// about which key is being acted on. Anything that is not a
+    /// `<bucket>/<key>` pair the ACL would authorize (an ARN, a malformed
+    /// value) is the server's 400.
+    #[cfg(feature = "copy")]
+    pub(crate) fn copy_source(
+        &self,
+        source: &dto::CopySource,
+    ) -> Result<(bucket::Name, object::Key), S3Error> {
+        copy_source_of(source).ok_or_else(|| s3_error!(InvalidArgument, "unsupported copy source"))
+    }
+
     /// A `StreamingBlob` request body into the contract's [`BodyStream`].
     pub(crate) fn stream_in(body: Option<dto::StreamingBlob>) -> BodyStream {
         match body {
@@ -441,22 +456,6 @@ impl<S: Storage> S3Backend<S> {
     /// The response `LastModified` timestamp of a [`SystemTime`].
     pub(crate) fn last_modified(t: SystemTime) -> dto::LastModified {
         LastModified::from(t)
-    }
-
-    /// The source of a `CopyObject`/`UploadPartCopy` request into a
-    /// (bucket, key) pair (the framework parses the header into
-    /// [`dto::CopySource`]).
-    #[cfg(feature = "copy")]
-    pub(crate) fn copy_source(
-        &self,
-        source: &dto::CopySource,
-    ) -> Result<(bucket::Name, object::Key), S3Error> {
-        match source {
-            CopySource::Bucket { bucket, key, .. } => {
-                Ok((self.bucket(bucket.to_string())?, self.key(key.to_string())?))
-            }
-            _ => Err(s3_error!(InvalidArgument, "unsupported copy source")),
-        }
     }
 
     /// The inferred Content-Type of a key (mime_guess; fallback

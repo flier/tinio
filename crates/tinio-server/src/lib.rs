@@ -11,7 +11,7 @@
 #[cfg(feature = "api")]
 #[doc(hidden)]
 pub extern crate tinio_api as _api;
-#[cfg(feature = "acl")]
+#[cfg(any(feature = "acl", feature = "copy"))]
 #[doc(hidden)]
 pub extern crate tinio_auth as _auth;
 #[doc(hidden)]
