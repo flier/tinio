@@ -17,7 +17,6 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::ExitCode,
-    str::FromStr,
 };
 
 use clap::{ArgAction, ValueEnum};
@@ -167,26 +166,42 @@ pub struct Args {
 /// caller passes what it returned — so `tinio service install ./data` and
 /// `tinio service install /abs/data` name one service rather than two. The digest is
 /// `sha2::Sha256` over the canonical path's bytes, hex-encoded and truncated to 16
-/// characters, the same shape the control channel's own name uses.
+/// characters, the same shape the control channel's own name uses. The result is a
+/// `ServiceLabel` with only `application` set — the derived form and `--name` have no
+/// qualifier or organization to carry.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use std::path::Path;
 ///
+/// use service_manager::ServiceLabel;
 /// use tinio_cli::service::label_for;
 ///
 /// let label = label_for(Path::new("/srv/data"), None);
-/// assert!(label.starts_with("tinio-"));
-/// assert_eq!(label.len(), "tinio-".len() + 16);
-/// assert_eq!(label_for(Path::new("/srv/data"), Some("mine")), "mine");
+/// assert!(label.to_string().starts_with("tinio-"));
+/// assert_eq!(label.to_string().len(), "tinio-".len() + 16);
+/// assert_eq!(
+///     label_for(Path::new("/srv/data"), Some("mine")),
+///     ServiceLabel {
+///         qualifier: None,
+///         organization: None,
+///         application: "mine".into(),
+///     }
+/// );
 /// ```
-pub fn label_for(root: &Path, name: Option<&str>) -> String {
-    if let Some(name) = name {
-        return name.to_string();
+pub fn label_for(root: &Path, name: Option<&str>) -> ServiceLabel {
+    let application = if let Some(name) = name {
+        name.to_string()
+    } else {
+        let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        format!("tinio-{}", hex::encode(&digest[..8]))
+    };
+    ServiceLabel {
+        qualifier: None,
+        organization: None,
+        application,
     }
-    let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
-    format!("tinio-{}", hex::encode(&digest[..8]))
 }
 
 /// The level `--user` selects, in one place — the manager carries it, not the context.
@@ -258,23 +273,26 @@ pub fn server_argv(root: &Path, read_only: bool, state_dir: &Path) -> Vec<OsStri
 /// **A struct literal, not `ServiceInstallCtx::new`**: the crate has no such constructor
 /// (`service-manager 0.11.0/src/lib.rs:343-353` carries only `cmd_iter`/`args_iter`) and no
 /// `Default` to spread, so all nine fields are named, `restart_policy` included (`RestartPolicy`
-/// does implement `Default` — `OnFailure`, `:189-193`). The label arrives as a `&str` because
-/// that is what the operator types and what `--name` carries, and `ServiceLabel` parses it
-/// through `FromStr` (`:262`), which is fallible in type terms and therefore a `Result` here
-/// rather than an `expect` in library code (Global Constraints).
+/// does implement `Default` — `OnFailure`, `:189-193`). The label is already a
+/// [`ServiceLabel`] — [`label_for`] builds it — so this only packs the install context.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use std::path::Path;
 ///
+/// use service_manager::ServiceLabel;
 /// use tinio_cli::service::install_context;
 ///
 /// let context = install_context(
 ///     Path::new("/srv/data/.tinio"),
 ///     Path::new("/usr/local/bin/tinio"),
 ///     vec!["server".into(), "/srv/data".into()],
-///     "tinio-abc",
+///     ServiceLabel {
+///         qualifier: None,
+///         organization: None,
+///         application: "tinio-abc".into(),
+///     },
 /// )?;
 /// # #[cfg(unix)]
 /// assert!(context.contents.expect("our unit").contains("Type=notify"));
@@ -284,14 +302,14 @@ pub fn install_context(
     state_dir: &Path,
     program: &Path,
     args: Vec<OsString>,
-    label: &str,
+    label: ServiceLabel,
 ) -> Result<ServiceInstallCtx, Error> {
     #[cfg(unix)]
     let contents = Some(notify::unit_text(program, &args, state_dir)?);
     #[cfg(not(unix))]
     let contents = None;
     Ok(ServiceInstallCtx {
-        label: parse_label(label)?,
+        label,
         program: program.to_path_buf(),
         args,
         contents,
@@ -356,9 +374,8 @@ pub fn permission_remedy(kind: ServiceManagerKind, level: ServiceLevel) -> &'sta
 /// # Errors
 ///
 /// A root that is not usable, no native supervisor on this platform, a supervisor that would
-/// be WinSW (refused below), a label the crate cannot take, and every backend failure —
-/// permission denials mapped to [`permission_remedy`]'s text, everything else carrying the
-/// backend's own message.
+/// be WinSW (refused below), and every backend failure — permission denials mapped to
+/// [`permission_remedy`]'s text, everything else carrying the backend's own message.
 ///
 /// # Examples
 ///
@@ -431,7 +448,7 @@ pub fn run(args: Args) -> Result<ExitCode, Error> {
             // keep `TINIO_STATE_DIR` or the installing user's home, and the server re-derives
             // its state dir from those — not from `WorkingDirectory=`.
             let service_argv = server_argv(&root, read_only, &state_dir);
-            let context = install_context(&state_dir, &program, service_argv, &label)?;
+            let context = install_context(&state_dir, &program, service_argv, label.clone())?;
             manager
                 .install(for_backend(kind, context))
                 .map_err(|err| failure(kind, level, verb, err))?;
@@ -439,28 +456,28 @@ pub fn run(args: Args) -> Result<ExitCode, Error> {
         Verb::Uninstall => {
             manager
                 .uninstall(ServiceUninstallCtx {
-                    label: parse_label(&label)?,
+                    label: label.clone(),
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
         Verb::Start => {
             manager
                 .start(ServiceStartCtx {
-                    label: parse_label(&label)?,
+                    label: label.clone(),
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
         Verb::Stop => {
             manager
                 .stop(ServiceStopCtx {
-                    label: parse_label(&label)?,
+                    label: label.clone(),
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
         }
         Verb::Query => {
             let status = manager
                 .status(ServiceStatusCtx {
-                    label: parse_label(&label)?,
+                    label: label.clone(),
                 })
                 .map_err(|err| failure(kind, level, verb, err))?;
             let (state, code) = described(&status);
@@ -494,17 +511,6 @@ fn for_backend(kind: ServiceManagerKind, mut context: ServiceInstallCtx) -> Serv
         context.contents = None;
     }
     context
-}
-
-/// The label as `service-manager` needs it.
-///
-/// `ServiceLabel`'s only constructor from a name is `FromStr`
-/// (`service-manager-0.11.0/src/lib.rs:262`), so every verb goes through here once and a name
-/// the crate cannot take is one refusal rather than five.
-fn parse_label(label: &str) -> Result<ServiceLabel, Error> {
-    ServiceLabel::from_str(label).map_err(|err| {
-        Error::Operational(format!("the service label `{label}` is not usable: {err}"))
-    })
 }
 
 /// Which backend was chosen, so a failure's remedy names the platform it came from.
@@ -639,7 +645,11 @@ mod tests {
             Path::new("/srv/data/.tinio"),
             Path::new("/usr/local/bin/tinio"),
             vec![OsString::from("server"), OsString::from("/srv/data")],
-            "tinio-abc",
+            ServiceLabel {
+                qualifier: None,
+                organization: None,
+                application: "tinio-abc".into(),
+            },
         )
         .expect("the install context")
     }
@@ -654,9 +664,9 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let canonical = root.canonicalize().expect("canonical");
         let derived = label_for(&canonical, None);
-        assert!(derived.starts_with("tinio-"), "{derived}");
+        assert!(derived.to_string().starts_with("tinio-"), "{derived}");
         assert_eq!(
-            derived.len(),
+            derived.to_string().len(),
             "tinio-".len() + 16,
             "16 hex characters, as the control pipe's name is"
         );
@@ -679,7 +689,14 @@ mod tests {
             "`<dir>/data` and its canonical form agree"
         );
         assert_ne!(derived, label_for(&dir.path().join("other"), None));
-        assert_eq!(label_for(&canonical, Some("my-tinio")), "my-tinio");
+        assert_eq!(
+            label_for(&canonical, Some("my-tinio")),
+            ServiceLabel {
+                qualifier: None,
+                organization: None,
+                application: "my-tinio".into(),
+            }
+        );
     }
 
     #[test]
