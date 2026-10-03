@@ -53,6 +53,7 @@ use parquet::{
         arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder},
     },
     basic::{ConvertedType, LogicalType},
+    errors::ParquetError,
     schema::types::SchemaDescriptor,
 };
 use rust_decimal::Decimal;
@@ -570,13 +571,13 @@ fn downcast<A: Array + 'static>(array: &dyn Array) -> &A {
         .expect("typed downcast follows data_type")
 }
 
-fn from_parquet(e: parquet::errors::ParquetError) -> Error {
+fn from_parquet(e: ParquetError) -> Error {
     Error::Format(format!("parquet input: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, path::Path, sync::Arc};
+    use std::{fs, io::Cursor, path::Path, sync::Arc, thread::Builder};
 
     use arrow::{
         array::{
@@ -1073,7 +1074,7 @@ mod tests {
         };
         assert_eq!(carrier, &text);
         assert!(
-            crate::row::parse_number(carrier).is_err(),
+            parse_number(carrier).is_err(),
             "the carrier stays lazy — parsing it is the consumer's fault"
         );
     }
@@ -1256,7 +1257,7 @@ mod tests {
         // The recursion runs on an enlarged-stack thread exactly like the
         // engine's: 513 live frames times a large arrow match arm exceeds a
         // default 8 MiB test-process stack even at the cap depth.
-        let got = std::thread::Builder::new()
+        let got = Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(move || arrow_json(array.as_ref(), 0, 0))
             .unwrap()

@@ -28,7 +28,7 @@ use std::fs::{File as StdFile, OpenOptions, remove_file};
 use std::io::Seek;
 use std::{
     fs::Metadata,
-    io::{self, ErrorKind},
+    io,
     path::{Path, PathBuf},
     pin::pin,
 };
@@ -43,80 +43,15 @@ use tokio::{
 };
 use uuid::Uuid;
 
+// One definer for the bounded-chunk constant (the ranged body stream serves in
+// the same bound): the value's rationale lives in `tinio_util::fsutil`.
+pub(crate) use crate::_util::fsutil::CHUNK_SIZE;
 use crate::{
-    _core::{BodyStream, ETag, checksum, object::RESERVED_SEGMENT},
+    _core::{BodyStream, ETag, checksum},
     Error, fsutil,
     fsutil::DirOwnerUid,
     path::TMP_DIR_NAME,
 };
-
-/// Bounded chunk size for the streaming copy/hash loops (constitution V:
-/// no per-object buffering; hyper chunks are typically ≤ 64 KiB anyway).
-pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
-
-/// Sync `parent` so a rename inside it is durable (D1 — the standard
-/// durable-write pattern: content fsynced before the rename, the
-/// directory fsynced after). On unix the parent directory is opened
-/// (read-only) and fsynced. On Windows std cannot open a directory
-/// handle and no heavyweight dependency is added for a directory flush —
-/// the directory entry is not fsynced there (a documented limitation,
-/// pipeline-spec.md §7 D1). Tokio's `sync_all` runs the blocking fsync
-/// on the blocking pool — the request path never blocks.
-async fn sync_parent_dir(parent: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(parent).await?.sync_all().await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
-        Ok(())
-    }
-}
-
-/// Copy `temp` onto `target` via a unique staging file inside the target
-/// directory's `.tinio/` reserved segment, then rename it (same volume —
-/// atomic). The EXDEV fallback of [`AtomicWriter::commit`].
-///
-/// Staging inside the reserved segment keeps a crash residual **invisible
-/// to the data plane** (FR-020: `.tinio` segments are never served or
-/// listed at any depth); the staging file is removed best-effort on
-/// failure, and the staging directory is removed when empty.
-async fn copy_across_volumes(temp: &Path, target: &Path) -> Result<(), Error> {
-    let staging_dir = target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(RESERVED_SEGMENT);
-    // Private residue, server-user-owned: the mode hardening only
-    // (spec 2026-09-05 §5a — no chown; `.tinio` dirs stay the server
-    // user's).
-    fsutil::ensure_dir(&staging_dir, DirOwnerUid::new(None)).await?;
-    let staging = staging_dir.join(Uuid::new_v4().to_string());
-    let copied = async {
-        fs::copy(temp, &staging).await?;
-        // D1 — the staging copy is what the rename makes visible; `copy`
-        // does not sync. Sync its content before the name (the same
-        // content-durability promise as [`AtomicWriter::stage`]).
-        // Write access: Windows `FlushFileBuffers` refuses read-only
-        // handles (the staging file is private to this rename).
-        File::options()
-            .write(true)
-            .open(&staging)
-            .await?
-            .sync_all()
-            .await?;
-        fs::rename(&staging, target).await?;
-        Ok::<_, Error>(())
-    }
-    .await;
-    if copied.is_err() {
-        let _ = fs::remove_file(&staging).await;
-    }
-    // Remove the staging directory when empty (a concurrent EXDEV write
-    // may still be staging in it — the removal then fails harmlessly).
-    let _ = fs::remove_dir(&staging_dir).await;
-    copied
-}
 
 /// The streaming content MD5 of the file at `path` plus the metadata of
 /// the opened file (bounded buffers; the metadata is the caller's file
@@ -186,118 +121,38 @@ impl AtomicWriter {
     /// the temp is removed best-effort on failure. Callers that serialize
     /// bucket mutations hold their lock across this call.
     ///
-    /// `sync_root` bounds the D1 ancestor sync (F03): the first commit
-    /// into a NEW prefix created the whole ancestor chain with
-    /// `create_dir_all`, and only the chain's directory entries — up to
-    /// and including the bucket root — make the rename's path durable.
-    /// The production callers pass the bucket directory; standalone users
-    /// (`AtomicWriter::write`) pass `None` and get the leaf-only sync.
-    /// `dir_owner_uid` is the unix dir-hardening context of the parent
-    /// creation (spec 2026-09-05 §5a): the production callers pass the
-    /// bucket owner's mapped uid; private/standalone commits pass the
-    /// default (mode `0700` only, server-user-owned).
-    ///
-    /// A cross-volume state dir (FR-023 relocation) makes `rename` fail
-    /// with `CrossesDevices` — the fallback copies the temp through a
-    /// unique staging file **on the target volume**, then renames (atomic
-    /// there; readers still see the old object or the new one, never a
-    /// torn mix). The staging file lives in the target directory's
-    /// `.tinio/` reserved segment — a crash between copy and rename
-    /// leaves invisible residue (never served or listed, FR-020), not a
-    /// stray object.
+    /// The protocol itself — parent creation, the rename, the EXDEV
+    /// fallback and the D1/F03 directory syncs — is
+    /// [`tinio_util::fsutil::commit`](crate::_util::fsutil::commit)'s; this
+    /// method keeps the write path's own spelling of it (the `Error`
+    /// mapping included). `sync_root` bounds the ancestor sync: the
+    /// production callers pass the bucket directory, standalone users
+    /// (`AtomicWriter::write`) pass `None`. `dir_owner_uid` is the unix
+    /// dir-hardening context of the parent creation (spec 2026-09-05 §5a).
     pub(crate) async fn commit(
         temp: &Path,
         target: &Path,
         sync_root: Option<&Path>,
         dir_owner_uid: DirOwnerUid,
     ) -> Result<(), Error> {
-        // Every commit target is `bucket_dir.join(key)` — a parent always
-        // exists (item 8: a `None` here would silently skip the dir
-        // creation AND the durability sync — unreachable in practice,
-        // pinned for debug builds).
-        debug_assert!(
-            target.parent().is_some(),
-            "commit target without a parent: {target:?}"
-        );
-        let mut fallback = false;
-        let mut created_parent = false;
-        let result = async {
-            if let Some(parent) = target.parent() {
-                // One probe instead of `create_dir_all`'s per-component
-                // walk (item 7d): the parent exists in steady state; the
-                // create still runs when the parent is missing (the
-                // first PUT into a new prefix), and the created flag
-                // drives the ancestor-chain sync (F03).
-                created_parent = fsutil::ensure_dir(parent, dir_owner_uid).await?;
-            }
-            match fs::rename(temp, target).await {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == ErrorKind::CrossesDevices => {
-                    fallback = true;
-                    copy_across_volumes(temp, target).await
-                }
-                Err(err) => Err(err.into()),
-            }
-        }
-        .await;
-        // Remove the source temp only where it survives (item 7c): on
-        // the rename success path the temp is already gone — the old
-        // unconditional remove was a per-PUT NotFound probe; on failure
-        // it is partial residue, and on the EXDEV fallback success the
-        // copy did not consume it.
-        if fallback || result.is_err() {
-            let _ = fs::remove_file(temp).await;
-        }
-        // D1 — the rename is not durable until the directory entries are
-        // synced (the content was synced before the rename). The rename
-        // is the COMMIT POINT (F06): a post-rename sync failure no longer
-        // fails the write — the object is visible and correct, and the
-        // failure is warned. Both crash directions self-heal (a durable
-        // meta row for a file lost on power loss is reclaimed as an
-        // orphan; a lost rename's row is recomputed from the content,
-        // FR-022), while failing the request would leave the object
-        // visible WITHOUT a success (or a row) — strictly worse.
-        if let Ok(()) = result
-            && let Some(parent) = target.parent()
-        {
-            if created_parent {
-                // F03: the first PUT into a new prefix — the whole
-                // ancestor chain is new, and only the chain's directory
-                // entries make the rename's path durable. Sync every
-                // ancestor up to (and including) `sync_root`; the leaf
-                // alone would leave the parent-chain entries unsynced and
-                // invert the durability promise.
-                Self::sync_ancestor_chain(parent, sync_root).await;
-            } else {
-                Self::sync_dir_warned(parent).await;
-            }
-        }
-        result
+        fsutil::commit(temp, target, sync_root, dir_owner_uid)
+            .await
+            .map_err(Error::from)
     }
 
-    /// Sync `dir` (D1); a failure is warned, never fatal (F06 — see
-    /// [`Self::commit`]).
+    /// Sync `dir` (D1); a failure is warned, never fatal (F06). The
+    /// discipline ([`crate::_util::fsutil::sync_dir_warned`]) is shared with
+    /// every backend now; this method is the write path's own spelling.
     pub(crate) async fn sync_dir_warned(dir: &Path) {
-        if let Err(err) = sync_parent_dir(dir).await {
-            tracing::warn!(path = %dir.display(), error = %err, "directory sync failed after a committed rename");
-        }
+        fsutil::sync_dir_warned(dir).await
     }
 
-    /// Sync every ancestor of `leaf` up to and including `sync_root`
-    /// (F03 — the first commit into a new prefix created the chain). Each
-    /// sync failure is warned and the chain walk continues (the closest
-    /// surviving entry is the strongest durability the filesystem allows
-    /// at that point; F06). Shared with `rename_object`'s file move (the
-    /// same first-into-a-new-prefix durability).
+    /// Sync every ancestor of `leaf` up to and including `sync_root` (F03).
+    /// The chain walk ([`crate::_util::fsutil::sync_ancestor_chain`]) is
+    /// shared with every backend now; this method is the write path's own
+    /// spelling.
     pub(crate) async fn sync_ancestor_chain(leaf: &Path, sync_root: Option<&Path>) {
-        let mut dir = Some(leaf);
-        while let Some(d) = dir {
-            Self::sync_dir_warned(d).await;
-            if Some(d) == sync_root {
-                break;
-            }
-            dir = d.parent();
-        }
+        fsutil::sync_ancestor_chain(leaf, sync_root).await
     }
 
     /// The tmp dir exists in steady state — one probe instead of the
@@ -450,8 +305,6 @@ impl AtomicWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::read_dir;
-
     use bytes::Bytes;
     use futures::stream;
     use io::Error as IoError;
@@ -542,15 +395,6 @@ mod tests {
         );
     }
 
-    /// The parent-dir fsync of a real directory succeeds (D1 — the
-    /// durability step behind every committed object).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sync_parent_dir_syncs_a_real_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        sync_parent_dir(dir.path()).await.unwrap();
-    }
-
     /// The dir fsync is not silently dropped: when the parent directory
     /// cannot be opened for the sync (no read permission — a rename needs
     /// only write+execute), the write SUCCEEDS (the rename is the commit
@@ -618,31 +462,5 @@ mod tests {
         // ancestor was warned, not fatal.
         assert_eq!(fs::read(&target).await.unwrap(), b"x");
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn copy_across_volumes_lands_content_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let temp = dir.path().join("staged.bin");
-        fs::write(&temp, b"cross-volume payload").await.unwrap();
-        let target = dir.path().join("sub").join("obj.bin");
-        fs::create_dir_all(target.parent().unwrap()).await.unwrap();
-        copy_across_volumes(&temp, &target).await.unwrap();
-        assert_eq!(fs::read(&target).await.unwrap(), b"cross-volume payload");
-        // No staging file left behind on success.
-        let entries: Vec<_> = read_dir(dir.path().join("sub"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(entries, ["obj.bin"], "{entries:?}");
-        // A failed copy cleans up the staging file and directory
-        // (no `.tinio` residue).
-        let target2 = dir.path().join("sub2").join("obj.bin");
-        fs::create_dir_all(target2.parent().unwrap()).await.unwrap();
-        let err = copy_across_volumes(&dir.path().join("missing"), &target2)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err:?}");
-        assert!(!target2.parent().unwrap().join(".tinio").exists());
     }
 }

@@ -4271,6 +4271,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinio-blob"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "sha2",
+ "smart-default",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tinio-blob",
+ "tinio-core",
+ "tinio-util",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tinio-cli"
 version = "0.1.0"
 dependencies = [
@@ -4618,10 +4637,12 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "tinio-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

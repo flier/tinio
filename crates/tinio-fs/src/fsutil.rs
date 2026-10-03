@@ -7,7 +7,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     fs::{File, Metadata, OpenOptions},
     io::{self, Error as IoError, ErrorKind},
-    path::{Path, PathBuf},
+    path::Path,
     time::SystemTime,
 };
 
@@ -20,7 +20,19 @@ use tokio::{fs, fs::File as TokioFile, io::AsyncRead, task::spawn_blocking};
 #[cfg(windows)]
 use winapi_util::file;
 
-use crate::error::Error;
+// **The shared half of this module lives in `tinio-util`** (`crate::_util::fsutil`,
+// 2026-10-03): the helper trio, the mode-hardening constants that go with
+// `ensure_dir`, and the hardening context type. The block store open-coded
+// copies of the three helpers, so the definitions moved down to the shared
+// crate and this module re-exports them — every call site in the crate keeps
+// its `crate::fsutil::…` spelling while there is exactly one definition. The
+// re-export exists for the helpers' readers, not as a second copy.
+#[cfg(unix)]
+pub(crate) use crate::_util::fsutil::{DIR_MODE_PRIVATE, FILE_MODE_PRIVATE};
+pub(crate) use crate::_util::fsutil::{
+    DirOwnerUid, commit, ensure_dir, entries_of, ok_if_missing, sync_ancestor_chain,
+    sync_dir_warned,
+};
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -524,16 +536,6 @@ pub(crate) async fn md5_stream_async<R: AsyncRead + Unpin>(
     Ok(hasher.finalize().into())
 }
 
-/// A removal is idempotent: a missing target is success, any other
-/// failure propagates.
-pub(crate) fn ok_if_missing(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
 /// Remove a directory tree — or a file if `path` is not a directory —
 /// treating a missing target as success. The async home of the rule
 /// (the IO runs on the tokio blocking pool via `tokio::fs`); shared by
@@ -550,163 +552,6 @@ pub(crate) async fn remove_tree(path: &Path) -> io::Result<()> {
     }
 }
 
-/// The unix mode of object files and private directories the backend
-/// creates (spec 2026-09-05 §5a): files land `0600`, dirs `0700`,
-/// regardless of the process umask — the create-then-chmod shape of the
-/// `STATE_DIR_MODE` precedent in `database::open`. Pre-existing
-/// files/dirs are never touched (no retroactive chmod pass); on Windows
-/// the created files inherit the creating user's ACLs (std has no ACL
-/// API).
-#[cfg(unix)]
-pub(crate) const FILE_MODE_PRIVATE: u32 = 0o600;
-#[cfg(unix)]
-pub(crate) const DIR_MODE_PRIVATE: u32 = 0o700;
-
-/// The dir-hardening context of a directory creation (spec 2026-09-05
-/// §5a): the uid every newly created component chowns to (`None` =
-/// leave server-user-owned, still `0700` — the private-state dirs and
-/// unmapped owners). Unix-only in effect; off-unix the value is inert
-/// (the creating user's platform ACLs isolate) but the type keeps the
-/// call sites uniform.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DirOwnerUid(pub(crate) Option<u32>);
-
-#[cfg(not(unix))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DirOwnerUid;
-
-impl DirOwnerUid {
-    /// The dir-hardening context: the uid every newly created component
-    /// chowns to (`None` = server-user-owned, still `0700` — the
-    /// private-state dirs and unmapped owners). Inert off-unix.
-    pub(crate) fn new(owner_uid: Option<u32>) -> Self {
-        #[cfg(unix)]
-        {
-            Self(owner_uid)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = owner_uid;
-            Self
-        }
-    }
-}
-
-/// Ensure `dir` exists — one probe instead of the per-component walk of
-/// `create_dir_all` (the fs-backed directory idiom: the dir exists in
-/// steady state — the write tmp dir, a PUT's parent chain, the
-/// tombstone staging dir). Returns whether it was created (the commit
-/// path's ancestor-chain sync decision, F03).
-///
-/// Unix hardening (spec 2026-09-05 §5a): every created component lands
-/// `0700` and — when `owner_uid` carries a mapped uid — chowned to it
-/// (an implicitly created bucket/prefix dir takes the bucket owner's
-/// uid; private-state dirs pass `None` and stay server-user-owned). A
-/// pre-existing component is never chmodded or chowned. FAIL-CLOSED
-/// (review round 1): a failure hardening a NEW component — the create,
-/// the mode set, the chown, or the chown task itself — removes the
-/// components THIS call created (deepest first, so each removal finds
-/// an empty dir) and errors the request. A wrongly-owned `0700` prefix
-/// dir must not be left behind with the write reporting success: it
-/// would permanently strand the mapped owner's own `0600` objects (no
-/// retroactive chmod, no self-heal). An unmapped owner performs no
-/// chown, so no failure path fires; EPERM-at-startup is Task 14's
-/// concern, not a runtime carve-out.
-pub(crate) async fn ensure_dir(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<bool> {
-    match fs::try_exists(dir).await {
-        Ok(true) => Ok(false),
-        Ok(false) => {
-            #[cfg(unix)]
-            ensure_dir_unix(dir, owner_uid).await?;
-            #[cfg(not(unix))]
-            {
-                let _ = owner_uid;
-                fs::create_dir_all(dir).await?;
-            }
-            Ok(true)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// The unix creation tail of [`ensure_dir`]: create each missing
-/// component (deepest ancestor first) at `0700`, then chown it to the
-/// mapped uid when one was passed. Fail-closed — see [`ensure_dir`].
-#[cfg(unix)]
-async fn ensure_dir_unix(dir: &Path, owner_uid: DirOwnerUid) -> io::Result<()> {
-    use std::{
-        fs::Permissions,
-        os::unix::fs::{PermissionsExt, chown},
-    };
-
-    // The missing chain, deepest ancestor first — the caller proved
-    // `dir` absent; every component up to the first existing ancestor
-    // lands private and chowned.
-    let mut missing: Vec<PathBuf> = vec![dir.to_path_buf()];
-    let mut current = dir;
-    while let Some(parent) = current.parent() {
-        if parent.as_os_str().is_empty() || fs::try_exists(parent).await? {
-            break;
-        }
-        missing.push(parent.to_path_buf());
-        current = parent;
-    }
-    // The components THIS call created, in creation order — the
-    // fail-closed cleanup removes them deepest-first on any hardening
-    // failure. Pre-existing components and a concurrent creator's dir
-    // (`AlreadyExists`) are never touched.
-    let mut created: Vec<PathBuf> = Vec::with_capacity(missing.len());
-    let mut outcome: io::Result<()> = Ok(());
-    for component in missing.iter().rev() {
-        match fs::create_dir(component).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                // A concurrent creator won the race — its dir counts as
-                // pre-existing: untouched.
-                continue;
-            }
-            Err(err) => {
-                outcome = Err(err);
-                break;
-            }
-        }
-        created.push(component.clone());
-        if let Err(err) =
-            fs::set_permissions(component, Permissions::from_mode(DIR_MODE_PRIVATE)).await
-        {
-            outcome = Err(err);
-            break;
-        }
-        if let Some(uid) = owner_uid.0 {
-            let path = component.clone();
-            let chowned = spawn_blocking(move || chown(&path, Some(uid), None)).await;
-            match chowned {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    outcome = Err(err);
-                    break;
-                }
-                Err(join) => {
-                    outcome = Err(IoError::other(format!("chown task join failed: {join}")));
-                    break;
-                }
-            }
-        }
-    }
-    if let Err(err) = outcome {
-        // Deepest first — each created dir is still empty, so the plain
-        // rmdir removes the chain. A concurrent interference (a racing
-        // creator's entry) makes the removal fail harmlessly; the
-        // original error is what the caller reports.
-        for component in created.iter().rev() {
-            let _ = fs::remove_dir(component).await;
-        }
-        return Err(err);
-    }
-    Ok(())
-}
-
 /// Chown `path` to `uid` — the object-file hardening tail (spec
 /// 2026-09-05 §5a, unix): the sync syscall runs on the blocking pool
 /// (item 7a — never inline on a request thread). The caller fails
@@ -721,28 +566,8 @@ pub(crate) async fn chown_file(path: &Path, uid: u32) -> io::Result<()> {
         .map_err(|join| IoError::other(format!("chown task join failed: {join}")))?
 }
 
-/// The entries of `dir` (a missing directory is empty), as `(path, name)`
-/// pairs. Shared by the startup repair, the sweep, and the tombstone
-/// leftover enumeration.
-pub(crate) async fn entries_of(dir: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
-    let mut out = Vec::new();
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(out),
-        Err(err) => return Err(err.into()),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        out.push((
-            entry.path(),
-            entry.file_name().to_string_lossy().into_owned(),
-        ));
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs::{create_dir, write};
     #[cfg(unix)]
     use std::io::Cursor;
     #[cfg(windows)]
@@ -750,6 +575,10 @@ mod tests {
         fs::{File, metadata, rename},
         io::ErrorKind,
         time::{Duration, SystemTime},
+    };
+    use std::{
+        fs::{create_dir, write},
+        path::PathBuf,
     };
 
     use super::*;

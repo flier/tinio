@@ -14,13 +14,15 @@ papaya.workspace = true
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["sync", "time"] }
-tracing = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["v4"] }
 
-tinio-core = { workspace = true, optional = true }
+tinio-core.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = [
     "macros",
     "rt",
@@ -46,10 +48,8 @@ windows-sys = { workspace = true, features = [
 [features]
 render = ["dep:handlebars"]
 testing = [
-    "dep:tinio-core",
     "dep:rustix",
     "dep:serde_json",
-    "dep:tracing",
     "dep:tracing-subscriber",
 ]
 

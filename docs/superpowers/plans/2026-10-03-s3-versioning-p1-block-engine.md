@@ -9,6 +9,19 @@
 **Tech Stack:** Rust (edition 2024), `tokio` (`fs`, `io-util`), `async-trait`, `thiserror`, `sha2`, `bytes`, `futures`, `derive_more`, `hex`, `uuid` (temp names), `tempfile` (dev).
 
 **Spec:** `docs/superpowers/specs/2026-10-03-s3-versioning-design.md` — the plan argues from the spec; read them together. This plan implements the spec's **The block store: one contract, one engine, one implementation** section and nothing else: no version tables, no S3 surface, no config keys (plans 2 and 3 own those).
+> **Execution note (2026-10-03).** The operator ruled that this run accumulates uncommitted work, so every task's final **Commit** step is deliberately left unticked and unperformed; all other steps are ticked as they land. Task 1 is complete (review clean; 3 lib + 45 doc tests green).
+>
+> **Consolidated ruling note — the changes landed after this plan's final review (2026-10-03).** The notes under the task headings below record the decisions made *during* execution; this block is the consolidated record of what changed *after* its whole-branch review, so a re-run of this plan lands the same tree (plan 2's dependency note carries the same list). Each entry is part of plan 1 as shipped:
+> - `BlockStore` gained a **required** `walk(after) -> Result<EntryStream<Self::Error>, Self::Error>`, with the `tinio_core::blob::EntryStream<E>` alias: paging the sweep through `list` restarted the traversal from the root on every page, which made one sweep Θ(N²) (at 10⁶ blocks, ~7.6 name-parses per block). `list` stays — this plan's Interfaces and the conformance suite's paging assertions pin it — and is now built on the walk, so the two cannot disagree.
+> - The local walk lists only **canonical entries**: a regular file whose name is the lowercase hex address of its own fan-out directory. An entry that is not exactly where `block_path` puts it (an uppercase spelling, a canonical name filed under the wrong directory, a directory) is skipped, so it can never be listed as a block that `remove` cannot find — a phantom a sweep would report removed on every pass, forever.
+> - `publish` **fsyncs the fan-out directory** after the rename, so the committed name is durable rather than only the content (unix only: on Windows std cannot open a directory handle, and no dependency is added for it).
+> - `BlobRef`'s block list is the inline `Blocks` enum (`One`/`Many`) rather than a `Box<[BlockRef]>`: v1 stores one block per blob, and the boxed slice was an allocation for every blob stored.
+> - `BlobRef::new` **rejects a zero-length block in a multi-block list** (a zero-length block is legal only as the blob's sole block), which is what makes the read path's prefix-sum arithmetic total without a guard on every read.
+> - `Error::Missing`, `Error::Store` and `Error::store` were **deleted**: every backend error now projects through the contract variant because `BlockStore::Error` is already bound `Into<storage::Error>`, and boxing a `NotFound` lost the error kind the S3 layer classifies on. The variant was renamed `Contract` → `Error::Storage` in the wave-3 cleanup, the name `docs/style.md` §Error prescribes.
+> - `tinio-blob`'s `versioning` feature and crate-root `#![cfg]` were **removed** by operator ruling: the feature had exactly one referent, the attribute, and its off-state compiled an empty crate; `testing` stands alone.
+>
+> **Wave 3 (2026-10-03) added two more, also part of this plan's tree:** the conformance target is no longer gated by `required-features = ["testing"]` — the crate's own `[dev-dependencies]` edge turns the feature on (`tinio-blob = { path = ".", features = ["testing"] }`, the shape `tinio-sandbox-linux` and `tinio-sandbox-windows` use), so `cargo test -p tinio-blob` with no flags runs it; and `Store::open` counts the bytes each block part yields and ends the stream with an `UnexpectedEof` error when a part comes up short, which makes `BlockStore::open`'s "never a clamp" contract true for every backend instead of a plan-2 promise.
+
 
 ## Global Constraints
 
@@ -45,7 +58,7 @@ The failure modes below are the ones the spec implies and no task's happy-path t
 - Consumes: `crate::storage::range::ByteRange` (already exists: `crates/tinio-core/src/storage/range.rs:22-30`), `sha2::{Digest, Sha256}` (the workspace's usage pattern: `crates/tinio-core/src/acl.rs:21,79`), `derive_more::{AsRef, Deref, Display}`, `hex`.
 - Produces (later tasks and plans 2–3 depend on these exact names): `tinio_core::blob::{BlockHash, ParseError, BlockRef, BlobRef, Entry}` with `BlockHash::from_digest([u8; 32]) -> Self`, `BlockHash::as_bytes(&self) -> &[u8; 32]`, `BlockHash::to_hex(&self) -> String`, `BlockHash::new(&str) -> Result<Self, ParseError>`, `BlockHash::of(bytes: &[u8]) -> Self`; `BlockRef { pub hash: BlockHash, pub len: u64 }`; `BlobRef::single(BlockHash, u64) -> Self`, `BlobRef::new(BlockHash, u64, impl Into<Box<[BlockRef]>>) -> Result<Self, ParseError>`, accessors `hash()`, `len()`, `is_empty()`, `blocks()`; `Entry { pub hash: BlockHash, pub len: u64, pub published: SystemTime }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/tinio-core/src/blob.rs` with only the module doc and this test module, so the file compiles and the test fails on the missing types:
 
@@ -102,12 +115,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-core --lib blob`
 Expected: FAIL — `cannot find type BlockHash in this scope`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add above the test module in `crates/tinio-core/src/blob.rs`:
 
@@ -271,12 +284,12 @@ pub struct Entry {
 
 The types above are Task 1's whole surface, on top of the file's three imports (`std::{str::FromStr, time::SystemTime}`, `derive_more::{AsRef, Deref}`, `sha2::{Digest, Sha256}`); the traits follow in Task 2, whose Step 3 lists the four imports they add to that same block.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-core --lib blob`
 Expected: PASS — three tests green.
 
-- [ ] **Step 5: Wire the module into the crate**
+- [x] **Step 5: Wire the module into the crate**
 
 In `crates/tinio-core/src/lib.rs`, add `pub mod blob;` alphabetically before `pub mod bucket;`, and add `blob::BlockHash` to the `pub use self::{…}` block. Add the doc example run to the gate: `cargo test -p tinio-core --doc` — expected PASS.
 
@@ -300,7 +313,7 @@ git commit -m "feat(core): add the block-store address and blob-reference types"
 - Consumes: Task 1's types; `crate::storage::{BodyStream, error::{self as storage}}`; `async_trait::async_trait`.
 - Produces: `pub trait StagedBlock { async fn write(&mut self, chunk: Bytes) -> io::Result<()>; }`; `pub enum Published { Stored, Existing }`; `pub trait BlockStore { type Error; type Staged; async fn stage(&self) -> Result<Self::Staged, Self::Error>; async fn publish(&self, staged: Self::Staged, hash: &BlockHash) -> Result<Published, Self::Error>; async fn contains(&self, hash: &BlockHash) -> Result<bool, Self::Error>; async fn open(&self, hash: &BlockHash, range: Option<ByteRange>) -> Result<BodyStream, Self::Error>; async fn remove(&self, hash: &BlockHash) -> Result<(), Self::Error>; async fn list(&self, after: Option<&BlockHash>, limit: usize) -> Result<Vec<Entry>, Self::Error>; }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `tests` module in `crates/tinio-core/src/blob.rs` — a fake in-memory store that exercises every trait method, so the signatures are pinned by a compiling implementation rather than by prose:
 
@@ -408,12 +421,12 @@ Add a `fn not_found(hash: &BlockHash) -> storage::Error` helper in the test modu
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-core --lib blob`
 Expected: FAIL — `cannot find trait BlockStore in this scope`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append the traits to `crates/tinio-core/src/blob.rs` above the test module:
 
@@ -506,7 +519,7 @@ pub trait BlockStore: Send + Sync + 'static {
 
 Task 2 adds four imports to the file, on top of Task 1's three: `use bytes::Bytes;` (the `StagedBlock::write` parameter), `use std::error::Error as StdError;` (the `type Error` bound), `use std::io;` (the staged sink's result type and, in the test module, `io::ErrorKind`), and — in the test module — `use crate::{storage::{self, BodyStream}, ByteRange};`. The test module's `Bytes` and `io::ErrorKind` arrive through its `use super::*;`, so they need no lines of their own. The attribute stays fully qualified (`#[async_trait::async_trait]`) and the stream construction stays fully qualified (`futures::stream::once`), so `futures` and `async_trait` need no top-level `use`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-core --lib blob && cargo test -p tinio-core --doc`
 Expected: PASS — four lib tests and the doc examples.
@@ -534,7 +547,7 @@ git commit -m "feat(core): add the BlockStore contract"
 - Consumes: `tinio_core::storage` (the contract error and its helpers).
 - Produces: `tinio_blob::Error` (`error::Error`, re-exported) with `impl From<Error> for tinio_core::storage::Error`; `tinio_blob::Result<T>` alias; the crate's `_core` re-export so in-crate paths read `crate::_core::…`.
 
-- [ ] **Step 1: Create the manifest and the crate skeleton**
+- [x] **Step 1: Create the manifest and the crate skeleton**
 
 `crates/tinio-blob/Cargo.toml` (no comments — `docs/cargo.md`):
 
@@ -608,9 +621,11 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 The crate root is gated, decided with the operator on 2026-10-03: `tinio-blob` is the versioning engine, and the design promises a build that does not need versioning **does not carry it** — a gate on the consumers alone would leave this code compiled into the binary as dead weight. The shape is the one `tinio-sandbox-windows` already uses (a root `#![cfg]` makes it the empty library on a host it is not built for); `default = ["versioning"]` keeps `cargo test -p tinio-blob` meaningful while `--no-default-features` strips the crate to nothing, and `testing` implies `versioning` because the conformance suite asserts the contract the feature gates.
 
+> **Ruling at wave 2 (2026-10-03): the root gate is removed.** The `versioning` feature had exactly one referent — the crate-root attribute — and its off-state compiled an empty crate, so it bought nothing: attribute, feature and the `testing` implication are gone, the crate is built unconditionally, and `testing` stands alone. The ruling concerns `tinio-blob` only; the `versioning` features of the later crates are the later plans' to decide.
+
 `crates/tinio-blob/src/engine.rs`, `local.rs`, `sweep.rs` are created empty in this task (module docs + nothing else) so the tree compiles; Tasks 4–8 fill them, and each entry above joins the `pub use` block in the task that defines its type (Task 4 `local::LocalBlocks`, Task 6 `engine::Store`, Task 8 `sweep::{LiveSet, SweepReport}` — `LiveSet` never lives in `engine`). `use crate::_core::blob::…` is the in-crate path form (`docs/style.md`).
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 `crates/tinio-blob/src/error.rs`:
 
@@ -638,12 +653,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [x] **Step 3: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --lib`
 Expected: FAIL — `cannot find type Error` / the crate does not compile.
 
-- [ ] **Step 4: Write minimal implementation**
+- [x] **Step 4: Write minimal implementation**
 
 Prepend to `crates/tinio-blob/src/error.rs`:
 
@@ -685,12 +700,12 @@ impl From<Error> for storage::Error {
 
 The `Store(Box<dyn …>)` arm exists because the engine is generic over a `BlockStore` whose error type is only known at the call site; the engine boxes it (its own error cannot be generic without infecting every signature). Task 5 adds `Error::store(e)` — a constructor that boxes an `impl StdError + Send + Sync + 'static` — and the trait bound `<S as BlockStore>::Error: Into<storage::Error>` is what makes the projection total.
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --lib`
 Expected: PASS — two tests green.
 
-- [ ] **Step 6: Prove the crate joins the gates**
+- [x] **Step 6: Prove the crate joins the gates**
 
 Run: `cargo hack check --package tinio-blob --each-feature` — expected: the default graph and the `testing` graph both compile (with `testing` empty for now).
 Run: `RUSTDOCFLAGS="-D warnings" cargo doc -p tinio-blob --no-deps` — expected: clean.
@@ -708,6 +723,8 @@ git commit -m "feat(blob): add the tinio-blob crate and its error"
 
 ### Task 4: `LocalBlocks` — staging and publishing
 
+> **Ruling at execution (2026-10-03):** Step 4's "Expected: PASS — three tests green" is impossible as written. `BlockStore` declares six required methods, this task supplies three and Task 5 supplies the rest, so the file cannot compile until Task 5 lands. GREEN was proved with a temporary `todo!()` scaffold for the three Task-5 methods, since removed. Task 5's own GREEN run is the authoritative proof for the completed impl block; see the run ledger.
+
 **Files:**
 - Create: `crates/tinio-blob/src/local.rs`
 - Modify: `crates/tinio-blob/src/lib.rs` (only if the re-export list needs the staged type)
@@ -716,7 +733,7 @@ git commit -m "feat(blob): add the tinio-blob crate and its error"
 - Consumes: `_core::blob::{BlockHash, BlockStore, StagedBlock}`, tokio's `fs::File` + `io::AsyncWriteExt`.
 - Produces: `LocalBlocks::new(root: impl Into<PathBuf>) -> Self`; `LocalBlocks::block_path(&self, hash: &BlockHash) -> PathBuf` (also used by Task 5's tests); the associated `Staged` type. Layout (documented in the module): blocks at `<root>/<first two hex chars>/<hex>`, staged temps at `<root>/tmp/<uuid>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-blob/src/local.rs`:
 
@@ -789,12 +806,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --lib local`
 Expected: FAIL — `cannot find type LocalBlocks`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Prepend to `crates/tinio-blob/src/local.rs`:
 
@@ -949,7 +966,7 @@ impl StagedBlock for Staged {
 
 `Staged` is not re-exported from `lib.rs` (it appears only as the associated type); if the private-in-public lint objects, re-export it as `pub use self::local::Staged;`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --lib local`
 Expected: PASS — three tests green.
@@ -967,6 +984,12 @@ git commit -m "feat(blob): stage and publish blocks on the local filesystem"
 
 ### Task 5: `LocalBlocks` — reading, removing, listing
 
+> **Rulings at execution (2026-10-03), two of them against this task's text:**
+> 1. `open` returns `Error::Io(NotFound)`, not `Error::Missing` — the task's own code block and test contradict each other, and the test wins because the trait's documented contract ("an error whose source is an `io::ErrorKind::NotFound` I/O error") is satisfied that way. `Error::Missing` remains a public variant with a contract-correct projection; only its producers are gone.
+> 2. **A short read must be an error, not a normal end of stream.** The brief's `read == 0 => Ok(None)` would serve a truncated block silently; since the loop already returns `Ok(None)` when `remaining == 0`, a zero read with bytes still owed is always anomalous. It is now `io::ErrorKind::UnexpectedEof`.
+> 3. **`meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)` is not acceptable.** A 1970 timestamp is the one default direction that loses data — the sweep's grace window reads `Entry.published`, so an unreadable mtime would classify a live block as maximally old and hand it to the deleter. It propagates with `?` instead: a sweep that aborts retries, a sweep that deletes referenced blocks does not.
+> 4. `list` gained a per-directory sort because `read_dir` order is unspecified — without it a fan-out directory holding more than one block emits addresses out of order and the cursor walk then **skips blocks between pages**, which is the path the sweep deletes along.
+
 **Files:**
 - Modify: `crates/tinio-blob/src/local.rs`
 
@@ -974,7 +997,7 @@ git commit -m "feat(blob): stage and publish blocks on the local filesystem"
 - Consumes: Task 4's type; `_core::blob::Entry`; `_core::storage::BodyStream`; `_core::ByteRange`.
 - Produces: the remaining `BlockStore` methods. `open` serves the whole block or a resolved range; `list` walks `<root>/<aa>/` directories in ascending address order and pages.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `tests` module in `crates/tinio-blob/src/local.rs`:
 
@@ -1051,12 +1074,12 @@ Append to the `tests` module in `crates/tinio-blob/src/local.rs`:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --lib local`
 Expected: FAIL — `no method named open` (and the same for `list`, `remove`).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add to the `impl BlockStore for LocalBlocks` block in `crates/tinio-blob/src/local.rs`:
 
@@ -1156,7 +1179,7 @@ Add `impl From<storage::Error> for Error` with a pass-through arm (`Error::Contr
 
 with the projection arm `Error::Contract(e) => e` placed first in `impl From<Error> for storage::Error`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --lib local`
 Expected: PASS — seven tests green.
@@ -1182,7 +1205,7 @@ git commit -m "feat(blob): read, remove and page blocks on the local filesystem"
 - Consumes: `_core::blob::{BlockStore, BlobRef, StagedBlock}`, `_core::storage::BodyStream`, `futures::StreamExt`, `sha2::{Digest, Sha256}`.
 - Produces: `Store::new(blocks: S) -> Self`, `Store::blocks(&self) -> &S`, `Store::put(&self, body: BodyStream) -> Result<BlobRef, Error>`; `Error::store(impl StdError + Send + Sync + 'static) -> Error`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-blob/src/engine.rs`:
 
@@ -1261,12 +1284,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --lib engine`
 Expected: FAIL — `cannot find type Store`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Prepend to `crates/tinio-blob/src/engine.rs`:
 
@@ -1377,7 +1400,7 @@ The `Contract` variant added in Task 5 is what the local implementation maps `ra
 
 One consequence of content addressing is worth stating where the dedup is written: a repeat `put` still **writes** its bytes to a stage before it can learn the address (the hash is only known once the content has been read), so the dedup saves the publish, the disk space and the second copy — not the write. That is inherent to storing by content hash, and it is why `put` is one streaming pass rather than a `contains` probe followed by a write.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --lib engine`
 Expected: PASS — four tests green.
@@ -1402,7 +1425,7 @@ git commit -m "feat(blob): store blobs by content hash with a dedup lookup"
 - Consumes: Tasks 1–6.
 - Produces: `Store::open(&self, blob: &BlobRef, range: Option<ByteRange>) -> Result<BodyStream, Error>` — the range is resolved by prefix-summing the block list and stitching the intersecting blocks' sub-ranges (one block in v1, so the loop runs once), the shape the prior art uses (Garage's `body_from_blocks_range`, `docs/superpowers/versioning-storage-prior-art-research.md` is the survey; this plan's own ranged-read study is recorded in the operator's 2026-10-03 ruling).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `tests` module in `crates/tinio-blob/src/engine.rs`:
 
@@ -1473,12 +1496,12 @@ Append to the `tests` module in `crates/tinio-blob/src/engine.rs`:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --lib engine`
 Expected: FAIL — `no method named open`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add to `impl<S: BlockStore> Store<S>` in `crates/tinio-blob/src/engine.rs`:
 
@@ -1540,9 +1563,9 @@ Add to `impl<S: BlockStore> Store<S>` in `crates/tinio-blob/src/engine.rs`:
 
 The intersecting blocks are opened eagerly (one `open` per block, before the first byte streams); with one block per blob that is one open, and a later chunking policy that makes the count large is the point at which pacing them (Garage streams through a channel) becomes worth doing — recorded here so the choice is visible rather than implicit.
 
-`Error::Missing` is produced by the store's `open` (the local implementation maps `NotFound` to it) — the engine passes it through.
+**Superseded at execution (2026-10-03).** `Error::Missing` is no longer produced: Task 5's `LocalBlocks::open` returns `Error::Io(io)` with `io.kind() == NotFound` directly (its brief's own code block and test contradicted each other, and the test — matching the trait's documented contract — won). So the engine must **not** pass a store error through by boxing it: `Error::store` would project a `NotFound` to an `io::Error` of kind `Other` and lose it. Instead map each block-store error through the contract projection — `.map_err(|err| Error::Contract(err.into()))?` — and assert the `NotFound` kind through that projection in the test. `Error::store` stays for `put` and `sweep`: a missing block is a contract condition, not a backend failure.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --lib engine`
 Expected: PASS — eight tests green.
@@ -1568,7 +1591,7 @@ git commit -m "feat(blob): open blobs and ranges from the engine"
 - Consumes: `_core::blob::{BlockHash, BlockStore}`, `std::time::{Duration, SystemTime}`, `futures`.
 - Produces: `LiveSet::from_hashes(impl IntoIterator<Item = BlockHash>) -> Self`, `LiveSet::contains(&self, hash: &BlockHash) -> bool`, `LiveSet::len(&self) -> usize`; `SweepReport { scanned: u64, kept_live: u64, kept_young: u64, removed: u64, bytes: u64 }` (all `pub`, `Default`); `Store::sweep(&self, live: &LiveSet, min_age: Duration, now: SystemTime) -> Result<SweepReport, Error>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-blob/src/sweep.rs`:
 
@@ -1645,12 +1668,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --lib sweep`
 Expected: FAIL — `cannot find type LiveSet`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `crates/tinio-blob/src/sweep.rs`:
 
@@ -1801,7 +1824,7 @@ impl<S: BlockStore> super::Store<S> {
 
 The `futures::StreamExt` import is unused here — drop it. `LiveSet` and `SweepReport` both live in `sweep.rs`: there is no `live` module anywhere in the crate, and Task 6's `engine.rs` sketch carries no `LiveSet` line of its own, so `lib.rs`'s `pub use` block gains `sweep::{LiveSet, SweepReport}` here — on top of Task 3's `engine::Store`, `error::Error` and `local::LocalBlocks` — which is exactly the state the Files bullet above records.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --lib`
 Expected: PASS — the whole crate's lib tests, sweep included.
@@ -1829,7 +1852,7 @@ git commit -m "feat(blob): sweep blocks outside the live set, with a grace"
 - Consumes: every type above.
 - Produces: `tinio_blob::testing::assert_block_store(store: &impl BlockStore)` — the suite a future WebDAV/FTP implementation runs to prove it meets the contract, and the reason the contract exists at all (spec: "equivalent capability").
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-blob/tests/conformance.rs`:
 
@@ -1859,7 +1882,7 @@ The second test is what makes the `tinio-util` dev-dependency (Task 3's manifest
 
 `tempfile` is in `[dev-dependencies]`; `tokio` needs `macros` + `rt` in the dev edge (already listed in Task 3's manifest).
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-blob --test conformance`
 Expected: FAIL — `unresolved import tinio_blob::testing` (the feature is off by default; the target must be run with it on, or the module must exist).
@@ -1874,7 +1897,7 @@ required-features = ["testing"]
 
 and run `cargo test -p tinio-blob --features testing --test conformance` — expected FAIL until Step 3.
 
-- [ ] **Step 3: Write the suite**
+- [x] **Step 3: Write the suite**
 
 `crates/tinio-blob/src/testing.rs`:
 
@@ -1950,16 +1973,16 @@ pub async fn assert_block_store<S: BlockStore>(store: &S) {
 pub mod testing;
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p tinio-blob --features testing --test conformance`
 Expected: PASS — one test green; and `cargo test -p tinio-blob` (feature off) still compiles the target out entirely.
 
-- [ ] **Step 5: Sweep the crate for public items without an example**
+- [x] **Step 5: Sweep the crate for public items without an example**
 
 Every public item this crate defines carries a doc comment **and** a runnable `# Examples` block (Global Constraints; the constitution's exempt list is closed and contains no accessor). The earlier tasks wrote examples for the substantial items; this step is the sweep for the rest — read `local.rs`, `engine.rs`, `sweep.rs` and `error.rs` for public items with none (`LocalBlocks::{new, block_path, temp_dir}`, `Store::{new, blocks}`, `LiveSet::{from_hashes, contains, len, is_empty}`, and the trait/type declarations themselves) and add a two-to-four-line example to each, in the shape the earlier ones use. `cargo test -p tinio-blob --doc` proves they compile; a *missing* example is what this step catches, because the doc gate can only see the examples that exist.
 
-- [ ] **Step 6: Run the crate's full gates**
+- [x] **Step 6: Run the crate's full gates**
 
 Run each, expecting success:
 - `cargo fmt --all -- --check`
@@ -1968,7 +1991,7 @@ Run each, expecting success:
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 - `cargo hack check --package tinio-blob --each-feature`
 
-- [ ] **Step 7: Append the issue-tracker row**
+- [x] **Step 7: Append the issue-tracker row**
 
 Append to `specs/001-s3-local-server/tasks.md`, in the shape its existing addenda use:
 

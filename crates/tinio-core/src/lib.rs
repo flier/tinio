@@ -18,6 +18,7 @@
 extern crate tinio_util as _util;
 
 pub mod acl;
+pub mod blob;
 pub mod bucket;
 pub mod checksum;
 pub mod cleanup;
@@ -31,6 +32,7 @@ pub mod pipeline;
 pub mod storage;
 
 pub use self::{
+    blob::BlockHash,
     bucket::Bucket,
     etag::ETag,
     mode::AccessMode,

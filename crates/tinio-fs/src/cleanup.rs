@@ -169,7 +169,7 @@ impl FsCleanup {
         let entries = match entries_of(&self.state_dir.join(TMP_DIR_NAME)).await {
             Ok(entries) => entries,
             Err(err) => {
-                actions.push(Err(err));
+                actions.push(Err(err.into()));
                 return;
             }
         };

@@ -1,6 +1,21 @@
 //! Shared runtime utilities for tinio: small backend-agnostic helpers
 //! built on by both the storage backends and the server.
 //!
+//! - [`fsutil`] — the filesystem primitives the storage backends are written
+//!   on, lifted here so there is one copy of each: the atomic commit protocol
+//!   ([`commit`](fsutil::commit) — parent creation, rename, the EXDEV
+//!   fallback, the D1 post-rename directory sync and the F03 ancestor chain),
+//!   the staged-temp `Drop` discipline
+//!   ([`remove_staged_temp`](fsutil::remove_staged_temp)), the bounded-chunk
+//!   ranged body stream ([`file_stream`](fsutil::file_stream)), and the
+//!   helper trio [`ensure_dir`](fsutil::ensure_dir) /
+//!   [`ok_if_missing`](fsutil::ok_if_missing) /
+//!   [`entries_of`](fsutil::entries_of). **The copies it replaced had already
+//!   drifted** — the block store's publish had the parent-directory fsync but
+//!   not the cross-volume fallback, its staged-temp `Drop` unlinked on the
+//!   runtime worker, and its read loop allocated a fresh buffer per chunk.
+//!   Nothing here names a backend: the module may use `tinio-core`, `tokio`,
+//!   `std` and this crate, never `tinio-fs`.
 //! - `job` — the guard that makes a test-spawned process die with the test
 //!   process, and `job::spawn`, the one spelling a harness's spawn sites
 //!   use for it. A job object on Windows (`GuardJob`, `guard`), the
@@ -40,10 +55,10 @@
 //! - `testing` — the conformance test harness (behind the `testing`
 //!   feature: requires `tinio-core` types).
 
-#[cfg(feature = "testing")]
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 
+pub mod fsutil;
 pub mod lockmap;
 pub mod pacing;
 pub mod path;
@@ -67,7 +82,8 @@ pub mod job;
 // per-launch job inside the launcher's own build (design decision 20), so the call sequence the
 // guard and the launcher used to spell twice is gated on the target alone. The guard stays out of
 // those builds, and so does everything behind `testing` — nothing here needs a feature, a
-// `tinio-core` type or `tracing`.
+// `tinio-core` type or `tracing` (both are plain dependencies now — the `fsutil`
+// primitives need them — and neither guard reaches for either).
 #[cfg(windows)]
 pub mod job_object;
 

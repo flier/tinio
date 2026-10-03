@@ -1177,12 +1177,12 @@ impl PackageSid {
     ///
     /// # Errors
     ///
-    /// [`Error::HostCannotConfine`](tinio_sandbox_core::Error::HostCannotConfine)
+    /// [`Error::HostCannotConfine`]
     /// when the token is denied the profile itself (`E_ACCESSDENIED`): the
     /// platform can confine and this token may not, and the variant names the
     /// cause and the two actions.
     ///
-    /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when the profile
+    /// [`Error::Launch`] when the profile
     /// cannot be created for any other reason or the SID cannot be rendered —
     /// a name that is too long or malformed surfaces here, before anything has
     /// been granted.
@@ -1548,7 +1548,7 @@ impl CapabilitySids {
     ///
     /// # Errors
     ///
-    /// [`Error::Launch`](tinio_sandbox_core::Error::Launch) when
+    /// [`Error::Launch`] when
     /// `ConvertStringSidToSidW` refuses to resolve a SID. **The refusal the
     /// string-taking signature used to document — "not a SID" — is unreachable
     /// through this one**: the three inputs are compile-time constants of the

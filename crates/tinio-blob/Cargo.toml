@@ -1,0 +1,37 @@
+[package]
+name = "tinio-blob"
+version.workspace = true
+edition.workspace = true
+description = "Content-addressed block engine for tinio: blobs stored by SHA-256, deduplicated, swept by live set"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+sha2.workspace = true
+smart-default.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+tinio-core.workspace = true
+tinio-util.workspace = true
+
+[features]
+default = []
+testing = []
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+tinio-blob = { path = ".", features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

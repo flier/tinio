@@ -50,7 +50,7 @@ pub(crate) async fn prepare(root: &Path) -> Result<PathBuf, Error> {
 ///
 /// A missing directory is empty. Any other read error is returned.
 pub(crate) async fn leftovers(root: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
-    entries_of(&dir(root)).await
+    Ok(entries_of(&dir(root)).await?)
 }
 
 /// Enqueue one [`RemoveTask`] on the removal pipeline — the shared
