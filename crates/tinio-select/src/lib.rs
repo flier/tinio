@@ -10,6 +10,7 @@
 
 extern crate csv as _csv;
 
+mod budget;
 pub mod csv;
 mod dialect;
 pub mod engine;

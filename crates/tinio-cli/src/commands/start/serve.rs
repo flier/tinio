@@ -132,20 +132,15 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     let bind = resolution.address()?;
     // **The built-in pair is a loopback-only development credential** (audit run-2, P2): a config
     // with no `[auth]` section serves `identity::root_auth_pair`'s documented fallback, which is
-    // not a credential at all — so a bind another host can reach refuses to start rather than
-    // publishing it. On loopback the fallback still serves, and the warning is the whole of what
-    // changes for a run that has always used it. A configured pair is unaffected: the pair the
-    // operator chose is theirs to expose, and `warn_if_non_loopback` below is that bind's report.
-    if identity::uses_builtin_fallback(&resolution.config) {
-        if bind.ip().is_loopback() {
-            warn("serving the built-in minioadmin pair on loopback");
-        } else {
-            return Err(Error::Config(_config::Error::invalid_value(
-                "auth",
-                "no [auth] pair: a non-loopback bind needs explicit credentials \
-                 ([auth], TINIO_ACCESS_KEY/TINIO_SECRET_KEY)",
-            )));
-        }
+    // not a credential at all. **The refusal for a bind another host can reach is `run`'s static
+    // half now** — raised before the fork and before the directories, so a refused start has not
+    // repaired the root or jailed itself — which leaves the loopback warning as the whole of what
+    // this line is: the same policy rule renders both sentences
+    // (`Resolution::credential_policy`), and a configured pair is unaffected (the pair the
+    // operator chose is theirs to expose, and `warn_if_non_loopback` below is that bind's
+    // report).
+    if let Some(message) = resolution.credential_policy()?.warning() {
+        warn(&message);
     }
     // **Borrowed, not taken**: the arm below asks whether this process is a launched child, which
     // is what decides who publishes `state`. A `match adopted` binding its inner value would move

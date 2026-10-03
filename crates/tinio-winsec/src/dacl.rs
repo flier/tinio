@@ -987,11 +987,11 @@ pub fn to_wide(name: impl AsRef<OsStr>) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use std::{
-        env, fs,
+        env, fs, io,
         ops::ControlFlow,
-        path::Path,
+        path::{Path, PathBuf},
         process::{self, Command},
-        ptr,
+        ptr, thread,
     };
 
     use windows_sys::{
@@ -1019,6 +1019,101 @@ mod tests {
         restrict_to_current_user, to_wide, walk_dacl, win32_error,
     };
 
+    /// A scratch directory that owns its teardown.
+    ///
+    /// **The residue knowledge lives here, once.** A test that installs an ACE can leave a tree
+    /// the process's own delete cannot remove — a deny for the current user being the case that
+    /// forced this guard: `state.tmp` carrying the current user's `FILE_ALL_ACCESS` as a `DENY`
+    /// ahead of its allow needs `FILE_DELETE_CHILD` on the scratch directory instead, and a
+    /// scratch directory that grants only `Modify` does not carry that right, because
+    /// `FILE_GENERIC_WRITE` is `FILE_ADD_FILE` and `FILE_ADD_SUBDIRECTORY` and deliberately not
+    /// delete-child. Measured 2026-10-02 on this host: the deny test with `TEMP` on the Dev Drive
+    /// left `tinio-winsec-deny-<pid>\state.tmp` behind, and the same test with `TEMP` under
+    /// `%LOCALAPPDATA%`, where the user's own SID holds full control, left nothing.
+    /// `remove_dir_all` reports that failure and a `let _ =` swallows it, so the residue outlives
+    /// every repeat — the next run's own cleanup cannot clear it either, because the deny is
+    /// still on the file.
+    ///
+    /// Writing the DACL back to the current user's alone — [`restrict_to_current_user`], the
+    /// shape every writer in this crate installs — is what puts a deny out of the delete's way;
+    /// the owner's implicit `WRITE_DAC` is why the call gets through a descriptor that denies
+    /// that same user everything. A test that installed one records its path with
+    /// [`ScratchDir::restore_dacl`], and `Drop` puts those back first and removes the tree
+    /// second. The teardown **reports a failure rather than swallowing it**: a dropped guard is
+    /// the last chance to say the residue is there, and a `let _ =` is how it stayed invisible
+    /// in the first place. On a thread that is already unwinding it prints instead of panicking,
+    /// because a panicking `Drop` would abort the process the test's own red is trying to
+    /// report.
+    struct ScratchDir {
+        /// The scratch directory.
+        dir: PathBuf,
+        /// The paths whose DACL a test installed, put back before the tree is removed.
+        restore: Vec<PathBuf>,
+    }
+
+    impl ScratchDir {
+        /// The process's own scratch directory for `tag`, with the residue of an earlier run
+        /// cleared first — a run that was killed rather than unwound leaves the tree behind, and
+        /// the tests assert on what a tree holds.
+        fn new(tag: &str) -> Self {
+            let dir = env::temp_dir().join(format!("tinio-winsec-{tag}-{}", process::id()));
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                // Nothing there is the ordinary case. Anything else is a residue this run cannot
+                // clear, and asserting on a tree that still holds the last run's files would be
+                // asserting about the wrong fixture.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => panic!(
+                    "the residue of an earlier run at `{}` cannot be removed: {err}",
+                    dir.display()
+                ),
+            }
+            fs::create_dir_all(&dir).expect("scratch directory");
+            Self {
+                dir,
+                restore: Vec::new(),
+            }
+        }
+
+        /// The scratch directory.
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        /// Records `path` as carrying a DACL a test installed: `Drop` puts the current user's
+        /// alone back before the tree goes, because the entry can be one that refuses the delete.
+        fn restore_dacl(&mut self, path: PathBuf) {
+            self.restore.push(path);
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let mut failures: Vec<String> = Vec::new();
+            for path in &self.restore {
+                if let Err(err) = restrict_to_current_user(path) {
+                    failures.push(format!("{}: {err}", path.display()));
+                }
+            }
+            if let Err(err) = fs::remove_dir_all(&self.dir) {
+                failures.push(format!("{}: {err}", self.dir.display()));
+            }
+            if failures.is_empty() {
+                return;
+            }
+            let report = format!(
+                "the scratch teardown failed, so this run leaves the residue the next one has to \
+                 live with: {}",
+                failures.join("; ")
+            );
+            if thread::panicking() {
+                eprintln!("{report}");
+            } else {
+                panic!("{report}");
+            }
+        }
+    }
+
     /// **The create-time descriptor keeps an inheriting parent's ACEs out on its own**, which is
     /// the property a confined `state` write depends on.
     ///
@@ -1036,11 +1131,10 @@ mod tests {
     /// machine's display language.
     #[test]
     fn a_created_file_keeps_an_inheriting_parents_aces_out() {
-        let dir = env::temp_dir().join(format!("tinio-winsec-inherit-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch directory");
+        let scratch = ScratchDir::new("inherit");
+        let dir = scratch.path();
         let granted = Command::new("icacls")
-            .arg(&dir)
+            .arg(dir)
             .args(["/grant", "*S-1-5-32-545:(OI)(CI)M", "/q"])
             .status()
             .expect("icacls runs");
@@ -1054,7 +1148,6 @@ mod tests {
         // Read back **without** `restrict_to_current_user`: what is asserted is what the create
         // call installed, not what a later repair could impose.
         let verdict = acl_is_current_user_only(&path).expect("read the DACL back");
-        let _ = fs::remove_dir_all(&dir);
 
         assert!(
             verdict,
@@ -1074,9 +1167,8 @@ mod tests {
     /// display language.
     #[test]
     fn an_ace_for_another_trustee_is_not_the_current_users_dacl() {
-        let dir = env::temp_dir().join(format!("tinio-winsec-foreign-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch directory");
+        let scratch = ScratchDir::new("foreign");
+        let dir = scratch.path();
 
         let path = dir.join("state.tmp");
         drop(create_restricted(&path).expect("a restricted file"));
@@ -1092,7 +1184,6 @@ mod tests {
             .expect("icacls runs");
         assert!(granted.success(), "the scratch file takes the ACE");
         let verdict = acl_is_current_user_only(&path).expect("read the DACL back");
-        let _ = fs::remove_dir_all(&dir);
 
         assert!(
             !verdict,
@@ -1130,9 +1221,8 @@ mod tests {
     /// order (deny entries come first).
     #[test]
     fn a_deny_entry_for_the_current_user_is_not_the_current_users_dacl() {
-        let dir = env::temp_dir().join(format!("tinio-winsec-deny-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch directory");
+        let mut scratch = ScratchDir::new("deny");
+        let dir = scratch.path();
         let user = current_user().expect("the process token");
         let denied = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_ALL_ACCESS,
@@ -1147,25 +1237,14 @@ mod tests {
                 ..Default::default()
             },
         };
-        let seen = dacl_with_an_extra_ace(denied, &dir, &user);
-        let verdict = acl_is_current_user_only(&dir.join("state.tmp")).expect("read the DACL back");
-        // **The deny this test installs is what keeps the fixture on disk.** `state.tmp` carries
-        // the current user's `FILE_ALL_ACCESS` as a `DENY` ahead of its allow, so deleting it
-        // needs `FILE_DELETE_CHILD` on the scratch directory instead — and a scratch directory
-        // that grants only `Modify` does not carry that right, because `FILE_GENERIC_WRITE` is
-        // `FILE_ADD_FILE` and `FILE_ADD_SUBDIRECTORY` and deliberately not delete-child.
-        // Measured 2026-10-02 on this host: this test with `TEMP` on the Dev Drive leaves
-        // `tinio-winsec-deny-<pid>\state.tmp` behind, and the same test with `TEMP` under
-        // `%LOCALAPPDATA%`, where the user's own SID holds full control, leaves nothing.
-        // `remove_dir_all` reports that failure and the `let _ =` swallows it, so the residue
-        // outlives every repeat — the next run's own `remove_dir_all` at the top of this test
-        // cannot clear it either. Writing the DACL back to the current user's alone, the shape
-        // every other writer in this crate installs, is what puts the deny out of the delete's
-        // way; the owner's implicit `WRITE_DAC` is why this call gets through a descriptor that
-        // denies that same user everything.
-        restrict_to_current_user(&dir.join("state.tmp"))
-            .expect("the fixture's DACL back to the current user's alone");
-        let _ = fs::remove_dir_all(&dir);
+        let seen = dacl_with_an_extra_ace(denied, dir, &user);
+        let state = dir.join("state.tmp");
+        let verdict = acl_is_current_user_only(&state).expect("read the DACL back");
+        // **The deny this test installs is what needs the guard's restore**: it refuses the
+        // current user the delete, so the tree cannot go until the DACL is back to that user's
+        // alone — [`ScratchDir`]'s `Drop` is where that happens, and its doc carries the
+        // measurement and the delete-child rule that make it necessary.
+        scratch.restore_dacl(state);
 
         assert_eq!(
             seen,
@@ -1199,9 +1278,8 @@ mod tests {
     /// with an audit-typed entry on it.
     #[test]
     fn an_audit_entry_is_not_the_current_users_dacl() {
-        let dir = env::temp_dir().join(format!("tinio-winsec-audit-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch directory");
+        let scratch = ScratchDir::new("audit");
+        let dir = scratch.path();
         let user = current_user().expect("the process token");
         let audited = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_ALL_ACCESS,
@@ -1216,9 +1294,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let seen = dacl_with_an_extra_ace(audited, &dir, &user);
+        let seen = dacl_with_an_extra_ace(audited, dir, &user);
         let verdict = acl_is_current_user_only(&dir.join("state.tmp")).expect("read the DACL back");
-        let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
             seen,
@@ -1249,9 +1326,8 @@ mod tests {
     /// has to be is an object-typed ACE naming the current user.
     #[test]
     fn an_object_typed_ace_is_not_the_current_users_dacl() {
-        let dir = env::temp_dir().join(format!("tinio-winsec-object-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch directory");
+        let scratch = ScratchDir::new("object");
+        let dir = scratch.path();
         let user = current_user().expect("the process token");
         let mut objects = OBJECTS_AND_SID {
             ObjectsPresent: ACE_OBJECT_TYPE_PRESENT,
@@ -1270,9 +1346,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let seen = dacl_with_an_extra_ace(extra, &dir, &user);
+        let seen = dacl_with_an_extra_ace(extra, dir, &user);
         let verdict = acl_is_current_user_only(&dir.join("state.tmp")).expect("read the DACL back");
-        let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
             seen,

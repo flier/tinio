@@ -10,7 +10,7 @@ use std::{collections::HashMap, rc::Rc};
 
 use rust_decimal::Decimal;
 
-use crate::error::Error;
+use crate::{budget::Budget, error::Error};
 
 /// One projected/loaded record value.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +68,11 @@ pub struct NameIndex {
 }
 
 impl NameIndex {
-    pub fn build(names: &[String]) -> Self {
+    /// The one builder: [`NameSet::new`] calls it with the very names the set
+    /// carries, so an index can never be built for a different list. Kept
+    /// `pub(crate)` — nothing outside the crate pairs a name list with an
+    /// index itself (review F6).
+    pub(crate) fn build(names: &[String]) -> Self {
         let mut exact = HashMap::new();
         let mut folded = HashMap::new();
         for (i, n) in names.iter().enumerate() {
@@ -117,36 +121,79 @@ fn insert(map: &mut HashMap<String, NameHit>, key: String, i: usize) {
     }
 }
 
-/// One record's fields and its name set — the payload shared by the CSV
-/// and parquet arms (review 2026-09-06 S7: the two `(Vec<Field>,
-/// Vec<String>)` payloads were a data clump). `names` is `Rc`-shared per
-/// reader stream: header/schema names are identical across every record,
-/// so per-record cloning was pure waste (X8) — and their `index` is built
-/// in the same step, so a named reference is one map lookup instead of a
-/// scan of the whole header per record (P3).
+/// One stream's names and the index built from them — one value, so the two
+/// can never disagree (review C4): when they travelled as separate fields,
+/// four construction sites paired them by hand and `Columns::new` accepted
+/// any pairing, resolving names against the wrong header. The fields are
+/// private and [`NameSet::new`] the only constructor, so the invariant is the
+/// type's rather than its callers' (review F6).
+///
+/// # Examples
+///
+/// ```
+/// use tinio_select::row::{NameHit, NameSet, NameStyle};
+///
+/// let names = NameSet::new(vec!["Id".to_string(), "Name".to_string()]);
+///
+/// assert_eq!(names.names()[1], "Name");
+/// // A lookup resolves against exactly those names: bare references fold
+/// // ASCII case, quoted ones are exact.
+/// assert_eq!(names.index().get("id", NameStyle::Bare), NameHit::One(0));
+/// assert_eq!(names.index().get("id", NameStyle::Quoted), NameHit::None);
+/// assert_eq!(names.index().get("Name", NameStyle::Bare), NameHit::One(1));
+/// ```
+#[derive(Debug, PartialEq)]
+pub struct NameSet {
+    names: Vec<String>,
+    index: NameIndex,
+}
+
+impl NameSet {
+    /// The one constructor: the index is built from these very names, so
+    /// `NameIndex::build` stays the only builder and a mismatch cannot be
+    /// constructed.
+    pub fn new(names: Vec<String>) -> Self {
+        let index = NameIndex::build(&names);
+        Self { names, index }
+    }
+
+    /// The stream's names, in header order — the names [`NameSet::index`]
+    /// was built over, handed out together so callers never pair the two by
+    /// hand.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The index over those same names: the O(1) side of a named reference.
+    pub fn index(&self) -> &NameIndex {
+        &self.index
+    }
+}
+
+/// One record's fields and its header name set — the payload shared by the
+/// CSV and parquet arms (review 2026-09-06 S7: the two `(Vec<Field>,
+/// Vec<String>)` payloads were a data clump). `header` is `Rc`-shared per
+/// reader stream: header/schema names are identical across every record, so
+/// per-record cloning was pure waste (X8) — and the index travels inside the
+/// same value, so a named reference is one map lookup instead of a scan of
+/// the whole header per record (P3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Columns {
     pub fields: Vec<Field>,
-    pub names: Rc<Vec<String>>,
-    pub index: Rc<NameIndex>,
+    pub header: Rc<NameSet>,
 }
 
 impl Columns {
-    /// Fields plus the reader's shared name set and its index (both `Rc`s
-    /// flow straight into the record — no per-record clone).
-    pub fn new(fields: Vec<Field>, names: Rc<Vec<String>>, index: Rc<NameIndex>) -> Self {
-        Self {
-            fields,
-            names,
-            index,
-        }
+    /// Fields plus the reader's shared header name set (the `Rc` flows
+    /// straight into the record — no per-record clone).
+    pub fn new(fields: Vec<Field>, header: Rc<NameSet>) -> Self {
+        Self { fields, header }
     }
 
     /// Owned-name helper (tests and one-off construction): the Vec is boxed
     /// once and its index built once.
     pub fn from_names(fields: Vec<Field>, names: Vec<String>) -> Self {
-        let index = Rc::new(NameIndex::build(&names));
-        Self::new(fields, Rc::new(names), index)
+        Self::new(fields, Rc::new(NameSet::new(names)))
     }
 }
 
@@ -159,6 +206,51 @@ pub enum Record {
     Csv(Columns),
     Json(Option<serde_json::Value>),
     Parquet(Columns),
+}
+
+/// What an expression in flight sees: the record under test plus the FROM
+/// alias (the JSON path/access arms need the alias; flat lookups do not),
+/// plus this request's MISSING sentinel name (the per-request uuid name —
+/// the dialect hook produced the sentinel call under it; derived once in
+/// `Engine::new`, never per row) and the request's budget.
+///
+/// It lives beside [`Record`] rather than in `engine` because the JSON
+/// lookup chain takes it too: the dependency points from the leaf utilities
+/// (which already reach into `row`) down to the row/budget pair, never up
+/// into the engine.
+pub(crate) struct RowCtx<'a> {
+    pub(crate) record: &'a Record,
+    pub(crate) alias: &'a Option<String>,
+    pub(crate) missing_name: &'a str,
+    pub(crate) budget: &'a Budget,
+}
+
+impl<'a> RowCtx<'a> {
+    /// The one constructor: `next` and `aggregate_next` both build their
+    /// context here, so the two literals cannot drift (review C2).
+    pub(crate) fn new(
+        record: &'a Record,
+        alias: &'a Option<String>,
+        missing_name: &'a str,
+        budget: &'a Budget,
+    ) -> Self {
+        Self {
+            record,
+            alias,
+            missing_name,
+            budget,
+        }
+    }
+
+    /// The record's JSON payload, `None` for anything else — what the JSON
+    /// lookup arms resolve against (`None` is a JSON MISSING row: a wildcard
+    /// or path step that matched nothing).
+    pub(crate) fn json_value(&self) -> Option<&serde_json::Value> {
+        match self.record {
+            Record::Json(v) => v.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Lazily parse a value text into `Decimal` (the 28-digit numeric spine).
@@ -231,23 +323,17 @@ mod tests {
 
     #[test]
     fn columns_new_shares_name_rc() {
-        // `new` takes the Rcs and stores them verbatim (the reader stream
+        // `new` takes the `Rc` and stores it verbatim (the reader stream
         // shares one name set across every record — no per-record clone);
         // `from_names` boxes the Vec and builds its index once at
-        // construction.
-        let names = Rc::new(vec!["a".into(), "b".into()]);
-        let index = Rc::new(NameIndex::build(&names));
-        let c = Columns::new(
-            vec![Field::Missing, Field::Missing],
-            Rc::clone(&names),
-            Rc::clone(&index),
-        );
-        assert_eq!(*c.names, vec!["a", "b"]);
-        assert!(Rc::ptr_eq(&c.names, &names));
-        assert!(Rc::ptr_eq(&c.index, &index));
+        // construction, inside the `NameSet` that carries both.
+        let names = Rc::new(NameSet::new(vec!["a".into(), "b".into()]));
+        let c = Columns::new(vec![Field::Missing, Field::Missing], Rc::clone(&names));
+        assert_eq!(c.header.names(), ["a", "b"]);
+        assert!(Rc::ptr_eq(&c.header, &names));
         let c2 = Columns::from_names(Vec::new(), vec!["x".into()]);
-        assert_eq!(*c2.names, vec!["x"]);
-        assert_eq!(c2.index.get("x", NameStyle::Bare), NameHit::One(0));
+        assert_eq!(c2.header.names(), ["x"]);
+        assert_eq!(c2.header.index().get("x", NameStyle::Bare), NameHit::One(0));
     }
 
     #[test]
@@ -314,10 +400,10 @@ mod tests {
             ],
             vec!["_1".into(), "_2".into(), "_3".into()],
         ));
-        let Record::Csv(Columns { fields, names, .. }) = record else {
+        let Record::Csv(Columns { fields, header, .. }) = record else {
             unreachable!()
         };
-        assert_eq!(*names, vec!["_1", "_2", "_3"]);
+        assert_eq!(header.names(), ["_1", "_2", "_3"]);
         assert_eq!(fields.len(), 3);
         assert!(matches!(fields[1], Field::Missing));
         let Field::Present(third) = &fields[2] else {

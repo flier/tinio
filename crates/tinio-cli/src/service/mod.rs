@@ -162,13 +162,27 @@ pub struct Args {
 
 /// The service's label: derived from the root so several roots can be several services.
 ///
-/// The input is the **canonical** root — `resolve::resolve_root` canonicalises, and every
-/// caller passes what it returned — so `tinio service install ./data` and
-/// `tinio service install /abs/data` name one service rather than two. The digest is
+/// **The root is canonicalised here, in the digest's own derivation, the way
+/// `tinio_api::state::channel_stem` canonicalises for the channel name** — the sibling of
+/// this digest, and the reason the rule is inside the function rather than a caller
+/// convention. `tinio service install ./data` and `tinio service install /abs/data` name one
+/// service because the digest is over the canonical path's bytes, whichever spelling the
+/// caller hands in; a label derived from the raw bytes would install a *second* service for
+/// the same directory, silently, with no compile-time signal. `resolve::resolve_root` already
+/// answers a canonical path, so for the production caller the second canonicalisation is a
+/// no-op — it is here so the invariant does not rest on that sentence. The digest is
 /// `sha2::Sha256` over the canonical path's bytes, hex-encoded and truncated to 16
 /// characters, the same shape the control channel's own name uses. The result is a
 /// `ServiceLabel` with only `application` set — the derived form and `--name` have no
 /// qualifier or organization to carry.
+///
+/// # Errors
+///
+/// A root that cannot be canonicalised (it does not exist, or is unreadable). The refusal is
+/// [`resolve_root`](crate::resolve::resolve_root)'s own — a root nobody can serve is not one
+/// to derive a service name for — and it can only be reached by a caller that skipped the
+/// resolution, since `resolve_root` already refuses the same input. A `--name` needs no root
+/// at all, so nothing is canonicalised on that arm.
 ///
 /// # Examples
 ///
@@ -178,11 +192,11 @@ pub struct Args {
 /// use service_manager::ServiceLabel;
 /// use tinio_cli::service::label_for;
 ///
-/// let label = label_for(Path::new("/srv/data"), None);
+/// let label = label_for(Path::new("."), None).expect("the current directory canonicalises");
 /// assert!(label.to_string().starts_with("tinio-"));
 /// assert_eq!(label.to_string().len(), "tinio-".len() + 16);
 /// assert_eq!(
-///     label_for(Path::new("/srv/data"), Some("mine")),
+///     label_for(Path::new("."), Some("mine")).expect("a named label needs no digest"),
 ///     ServiceLabel {
 ///         qualifier: None,
 ///         organization: None,
@@ -190,18 +204,25 @@ pub struct Args {
 ///     }
 /// );
 /// ```
-pub fn label_for(root: &Path, name: Option<&str>) -> ServiceLabel {
-    let application = if let Some(name) = name {
-        name.to_string()
-    } else {
-        let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
-        format!("tinio-{}", hex::encode(&digest[..8]))
+pub fn label_for(root: &Path, name: Option<&str>) -> Result<ServiceLabel, Error> {
+    let application = match name {
+        Some(name) => name.to_string(),
+        None => {
+            let canonical = root.canonicalize().map_err(|err| {
+                Error::Usage(format!(
+                    "the storage root `{}` is not usable: {err} — pass an existing DIR",
+                    root.display()
+                ))
+            })?;
+            let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+            format!("tinio-{}", hex::encode(&digest[..8]))
+        }
     };
-    ServiceLabel {
+    Ok(ServiceLabel {
         qualifier: None,
         organization: None,
         application,
-    }
+    })
 }
 
 /// The level `--user` selects, in one place — the manager carries it, not the context.
@@ -362,8 +383,9 @@ pub fn permission_remedy(kind: ServiceManagerKind, level: ServiceLevel) -> &'sta
 
 /// Runs the requested verb against the service for the root `args` names.
 ///
-/// The root is resolved **canonicalised** (the label's input, and `resolve_root`'s contract),
-/// the mode from the environment, and the state dir by the same
+/// The root is resolved **canonicalised** ([`resolve_root`](resolve::resolve_root)'s contract,
+/// and the label's own derivation canonicalises too), the mode from the environment, and the
+/// state dir by the same
 /// [`resolve::resolve_state_dir`] the server uses. Read-only argv records that path as
 /// `--state-dir` ([`server_argv`]); `WorkingDirectory=` is the same path so relative paths
 /// land there, and it is not what the server reads its state dir from. The level travels on the **manager** (`ServiceManager::set_level`), never on the
@@ -410,7 +432,7 @@ pub fn run(args: Args) -> Result<ExitCode, Error> {
     // is loaded, which is what keeps the mode the unit records the mode the server resolves.
     let read_only = args.read_only;
     let state_dir = resolve::resolve_state_dir(&root, read_only, args.env.state_dir.as_deref())?;
-    let label = label_for(&root, args.name.as_deref());
+    let label = label_for(&root, args.name.as_deref())?;
     let level = level_for(args.user);
 
     let mut manager = TypedServiceManager::native().map_err(|err| {
@@ -657,13 +679,16 @@ mod tests {
     #[test]
     fn the_label_is_derived_from_the_root_and_overridable() {
         // The derivation is over the **canonical** root, so the two spellings of one
-        // directory are one service: `label_for` is called with what `resolve::resolve_root`
-        // returned, never with the operator's spelling.
+        // directory are one service — and that is `label_for`'s own canonicalisation now, not
+        // a caller convention: the raw join and what `resolve_root` returns must agree even
+        // though on Windows (a `\\?\` verbatim prefix) and on macOS (a symlinked `TMPDIR`) the
+        // two spellings are not byte-equal, which is exactly the difference the derivation has
+        // to absorb rather than paper over.
         let dir = tempfile::TempDir::new().expect("temp");
         let root = dir.path().join("data");
         fs::create_dir_all(&root).expect("root");
         let canonical = root.canonicalize().expect("canonical");
-        let derived = label_for(&canonical, None);
+        let derived = label_for(&canonical, None).expect("a canonical root derives a label");
         assert!(derived.to_string().starts_with("tinio-"), "{derived}");
         assert_eq!(
             derived.to_string().len(),
@@ -672,30 +697,44 @@ mod tests {
         );
         assert_eq!(
             derived,
-            label_for(&canonical, None),
+            label_for(&canonical, None).expect("the same root always derives the same label"),
             "the same root always derives the same label"
         );
-        // `./data` and its canonical form are one service, and the reason is the **caller**:
-        // `label_for` digests the bytes it is handed, and `resolve_root` is what hands every
-        // caller the canonical ones. Asserted through that entry point rather than by feeding
-        // the raw join to `label_for`, because on Windows (a `\\?\` verbatim prefix) and on
-        // macOS (a symlinked `TMPDIR`) the two spellings are not byte-equal even though they
-        // are the same directory — a difference the label must not be made to paper over.
+        // The operator's spelling and the resolution's answer are one service, and both are
+        // carried by `label_for` itself: the raw join is what a second caller would hand in,
+        // and `resolve_root` is what production hands in.
         let resolved = resolve::resolve_root(Some(&root), &root).expect("the resolved root");
         assert_eq!(resolved, canonical, "`resolve_root` canonicalises");
         assert_eq!(
             derived,
-            label_for(&resolved, None),
+            label_for(&root, None).expect("the raw join is canonicalised inside"),
             "`<dir>/data` and its canonical form agree"
         );
-        assert_ne!(derived, label_for(&dir.path().join("other"), None));
         assert_eq!(
-            label_for(&canonical, Some("my-tinio")),
+            derived,
+            label_for(&resolved, None).expect("the resolved root derives the same label"),
+            "`<dir>/data` and its canonical form agree"
+        );
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).expect("the other root");
+        assert_ne!(
+            derived,
+            label_for(&other, None).expect("the other root derives its own label"),
+            "two roots are two services"
+        );
+        assert_eq!(
+            label_for(&canonical, Some("my-tinio")).expect("a named label needs no digest"),
             ServiceLabel {
                 qualifier: None,
                 organization: None,
                 application: "my-tinio".into(),
             }
+        );
+        // A root nobody can serve is a refusal, not a label derived from raw bytes — the
+        // second spelling of one directory is what the digest would otherwise be open to.
+        assert!(
+            label_for(&dir.path().join("never-created"), None).is_err(),
+            "a root that cannot be canonicalised is refused"
         );
     }
 

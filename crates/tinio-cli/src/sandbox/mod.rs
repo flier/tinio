@@ -15,8 +15,10 @@
 //!
 //! **Confinement mechanics are [`tinio_sandbox::serve::Spec`]** — this module owns enablement,
 //! product refusals, launcher API handoff/`state` publish, and FR-036's OTLP trade
-//! (`lost_export`, whose event `crate::commands::start::run` emits); it does not name platform
-//! `Backend` / `Options` types.
+//! (`lost_export`, whose event `crate::commands::start::run` emits); it names no platform
+//! `Backend` / `Options` type. The one platform value it reads is the network filter's outcome
+//! `serve::Confined` carries, matched in the in-place re-emit — the confinement's own report,
+//! not a second spelling of it.
 //!
 //! **Two of this module's names are how a caller reads a confinement's own report**, and they
 //! are the entry points an operator-facing classification travels through: [`classify_io`] is

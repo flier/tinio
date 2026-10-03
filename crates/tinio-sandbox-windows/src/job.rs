@@ -205,13 +205,12 @@ mod tests {
     use std::{
         os::windows::io::AsRawHandle,
         process::{Child, Command, Stdio},
-        thread::sleep,
-        time::{Duration, Instant},
     };
 
     use tinio_util::job;
 
     use super::*;
+    use crate::testing::{TIMEOUT, wait_for_exit};
 
     /// The raw process handle behind a `std::process::Child`.
     fn raw_handle(child: &Child) -> HANDLE {
@@ -249,15 +248,17 @@ mod tests {
     }
 
     /// Wait for `child` to be gone, or fail loudly.
+    ///
+    /// **The wait is [`crate::testing::wait_for_exit`]'s and not a second spelling of it** —
+    /// the deadline/poll/kill-before-panic rule is the workspace's, documented at
+    /// [`tinio_util::testing::wait_for_exit`], and this leg used to carry its own copy of it
+    /// (a fifteen-second deadline and a `panic!` that left the child running). The bound is
+    /// the harness's [`TIMEOUT`] rather than a number of this module's: one bound for every
+    /// wait in the suite, and a child the job is about to kill answers long inside either.
     fn expect_death(child: &mut Child, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match child.try_wait().expect("poll the child") {
-                Some(_) => return,
-                None if Instant::now() < deadline => sleep(Duration::from_millis(50)),
-                None => panic!("the child outlived {what}"),
-            }
-        }
+        // The status is the shared wait's byproduct; the subject here is that the wait
+        // *ended*, and a child that outlived `what` never reaches this binding.
+        let _status = wait_for_exit(child, TIMEOUT, what);
     }
 
     #[test]

@@ -134,6 +134,29 @@ pub struct Backend {
     /// here after confining, which the `&mut self` receiver makes ordinary
     /// rather than something to work around with a `Cell`.
     seccomp: Option<Seccomp>,
+    /// The mechanism the last `confine` resolved, written the moment the
+    /// resolution answers and read the same way [`Backend::seccomp`] is —
+    /// through the `&mut self` receiver, after the call.
+    ///
+    /// **`Auto` is why this is stored rather than re-derived**: the resolution
+    /// probes the kernel inside `confine`, so a caller that asked the table
+    /// again afterwards would take a second confinement-time decision outside
+    /// the confinement. `tinio-sandbox`'s `serve::Spec::apply` carries it back
+    /// as part of the confinement's own answer (the §7 record a caller re-emits
+    /// where its subscriber is installed after the confinement), and
+    /// `Resolved::Unavailable` never reaches this field — the resolution is
+    /// refused before it would be recorded.
+    resolved: Option<Mechanism>,
+    /// How many mounts the last `confine` applied, written where they landed and
+    /// read the same way the two fields above are.
+    ///
+    /// **The plan's own length, recorded rather than re-derived.** The table is
+    /// built inside the confinement ([`crate::plan`]) and applying it is what
+    /// makes the jail; a caller that wanted the count afterwards — the facade's
+    /// `Confined::mounts`, which the CLI's in-place re-emit states beside the
+    /// exposure set's size — would otherwise have to re-plan the jail, a second
+    /// answer to what was mounted. It is the number `announce_exposures` logs.
+    mounts: usize,
 }
 
 impl Backend {
@@ -151,6 +174,8 @@ impl Backend {
         Self {
             options,
             seccomp: None,
+            resolved: None,
+            mounts: 0,
         }
     }
 
@@ -178,6 +203,60 @@ impl Backend {
     /// ```
     pub fn seccomp(&self) -> Option<Seccomp> {
         self.seccomp
+    }
+
+    /// The mechanism the last [`Backend::confine`] resolved and applied, or
+    /// `None` if it has not been called — the [`Backend::seccomp`] shape for
+    /// the model the resolution chose.
+    ///
+    /// **The resolved answer, never a second derivation of it.** `Auto` becomes
+    /// one of the two mechanisms against a live probe of this kernel (and, for
+    /// a forced model, may be refused outright); asking the table again after
+    /// the call would be a second confinement-time decision taken outside the
+    /// confinement, on a host state that may have moved. The value is written
+    /// when the resolution answers, so a caller reads the model the run really
+    /// applied.
+    ///
+    /// **What it carries: the serve-spec seam's §7 record**
+    /// (`docs/superpowers/specs/2026-09-27-sandbox-servespec-seam-design.md`) —
+    /// the *resolved* mechanism `tinio-sandbox`'s `serve::Spec::apply` hands back
+    /// on `Confined::model`, so the caller that re-emits the confinement's own
+    /// record after the subscriber exists states the model that ran.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_linux::Backend;
+    ///
+    /// assert!(
+    ///     Backend::default().resolved().is_none(),
+    ///     "nothing confined yet"
+    /// );
+    /// ```
+    pub fn resolved(&self) -> Option<Mechanism> {
+        self.resolved
+    }
+
+    /// How many mounts the last [`Backend::confine`] applied, or `0` if it has
+    /// not been called — the mount plan's own length, recorded where the mounts
+    /// landed.
+    ///
+    /// **What it carries: the serve-spec seam's §7 record**
+    /// (`docs/superpowers/specs/2026-09-27-sandbox-servespec-seam-design.md`) —
+    /// the `mounts` field of the exposure event that record re-emits, which
+    /// `tinio-sandbox`'s `serve::Spec::apply` hands back on `Confined::mounts`.
+    /// A caller that re-planned the jail for the number would be answering what
+    /// was mounted a second time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_linux::Backend;
+    ///
+    /// assert_eq!(Backend::default().mounts(), 0, "nothing confined yet");
+    /// ```
+    pub fn mounts(&self) -> usize {
+        self.mounts
     }
 }
 

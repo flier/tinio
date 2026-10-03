@@ -3,12 +3,13 @@
 //! to another host refuses instead.
 //!
 //! **What the four legs hold, and why they are process-level.** The policy is the CLI's —
-//! `tinio_server::identity::uses_builtin_fallback` is the predicate and `serve`'s refusal beside
-//! the bind is the enforcement — so no in-process assertion can tell whether a *start* refused or
-//! served: the child's exit status and the lines it wrote are the whole evidence. This target
-//! therefore lives in the `tinio` package, the one that owns the `tinio` bin
-//! (`env!("CARGO_BIN_EXE_tinio")` is defined for a package's own binaries and for nothing else),
-//! and follows `lifecycle.rs`'s harness shape.
+//! `tinio_server::identity::uses_builtin_fallback` is the predicate, `Resolution::credential_policy`
+//! is the one decision, and `run`'s static refusal (before the fork and the directories) is the
+//! enforcement — so no in-process assertion can tell whether a *start* refused or served: the
+//! child's exit status and the lines it wrote are the whole evidence. This target therefore lives
+//! in the `tinio` package, the one that owns the `tinio` bin (`env!("CARGO_BIN_EXE_tinio")` is
+//! defined for a package's own binaries and for nothing else), and follows `lifecycle.rs`'s
+//! harness shape.
 //!
 //! **Both of the child's streams go to files rather than pipes**, the shape `lifecycle.rs` records
 //! the reasons for: a pipe this test holds is a handle any descendant of the server could keep

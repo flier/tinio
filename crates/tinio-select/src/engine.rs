@@ -13,12 +13,7 @@
 //! cousins, so a MISSING operand answers `true` there (pinned, review
 //! 2026-09-06b R12).
 
-use std::{
-    borrow::Cow,
-    cell::{Cell, RefCell},
-    cmp::Ordering,
-    mem,
-};
+use std::{borrow::Cow, cell::RefCell, cmp::Ordering, mem};
 
 use parse_display::Display;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -32,9 +27,10 @@ use sqlparser::{
 };
 
 use crate::{
+    budget::Budget,
     error::Error,
     json::{json_lookup, to_value},
-    row::{Field, NameHit, NameIndex, NameStyle, Record, Value, display, parse_number},
+    row::{Field, NameHit, NameSet, NameStyle, Record, RowCtx, Value, display, parse_number},
     sql::{Projection, QueryPlan, contains_aggregate, is_aggregate_name},
 };
 
@@ -68,9 +64,8 @@ pub struct Engine {
     /// per row on every Function eval was the waste; review 2026-09-09).
     missing_name: String,
     /// This request's evaluation budget, charged by the work each step does
-    /// (P3). `Cell`, not `Mut`, because every evaluation path reads the
-    /// record through a shared `&RowCtx`.
-    spent: Cell<u64>,
+    /// (P3) — shared into every evaluation path through `&RowCtx`.
+    budget: Budget,
 }
 
 /// One projection item's aggregate form.
@@ -113,49 +108,6 @@ enum ExtremaMode {
     String,
 }
 
-/// What an expression in flight sees: the record under test plus the FROM
-/// alias (the JSON path/access arms need the alias; flat lookups do not),
-/// plus this request's MISSING sentinel name (the per-request uuid name —
-/// the dialect hook produced the sentinel call under it; derived once in
-/// `Engine::new`, never per row) and the request's spent counter.
-struct RowCtx<'a> {
-    record: &'a Record,
-    alias: &'a Option<String>,
-    missing_name: &'a str,
-    spent: &'a Cell<u64>,
-}
-
-/// The per-request evaluation budget (P3), mirroring the LIKE matcher's own
-/// `LIKE_CELL_CAP` product. That cap bounds one pattern pair; this one bounds
-/// the whole request, because the attacker picks the record count and the LIKE
-/// pairs alike — neither is a per-call quantity. Only the possibly-superlinear
-/// work is priced (see `charge`); a per-record constant is not, so an ordinary
-/// wide `SELECT` streams instead of aborting. 10⁷ cells is high-end
-/// single-digit milliseconds per the LIKE precedent.
-pub(crate) const EVAL_CELL_CAP: u64 = 10_000_000;
-
-/// Charge `cells` to the request and refuse once the running total is past
-/// `EVAL_CELL_CAP`. Every step that walks something attacker-sized charges the
-/// work it does — one per JSON entry scanned, one per headerless name-set walk,
-/// the LIKE cell product — so the spend tracks the actual cost rather than a
-/// static shape. An indexed reference lookup is O(1) in the header width and is
-/// deliberately not charged: the budget prices DP-shaped work, not a wide but
-/// legitimate projection.
-pub(crate) fn charge(spent: &Cell<u64>, cells: u64) -> Result<(), Error> {
-    let total = spent.get() + cells;
-    spent.set(total);
-    if total > EVAL_CELL_CAP {
-        return Err(too_expensive());
-    }
-    Ok(())
-}
-
-/// The budget's one message — the value error the server maps to an in-stream
-/// `S3QueryError`, same channel as the LIKE cap.
-fn too_expensive() -> Error {
-    Error::Value("SELECT expression too expensive".into())
-}
-
 impl Engine {
     pub fn new(plan: QueryPlan) -> Self {
         let missing_name = plan.missing.is_missing();
@@ -180,7 +132,7 @@ impl Engine {
             agg_kinds: None,
             item_keys,
             missing_name,
-            spent: Cell::new(0),
+            budget: Budget::new(),
         }
     }
 
@@ -194,12 +146,12 @@ impl Engine {
         if self.emitted >= self.plan.limit.unwrap_or(usize::MAX) {
             return Ok(None);
         }
-        let ctx = RowCtx {
-            record: &rec,
-            alias: &self.plan.from.alias,
-            missing_name: &self.missing_name,
-            spent: &self.spent,
-        };
+        let ctx = RowCtx::new(
+            &rec,
+            &self.plan.from.alias,
+            &self.missing_name,
+            &self.budget,
+        );
         if !self.passes(&ctx)? {
             return Ok(None);
         }
@@ -240,12 +192,12 @@ impl Engine {
     /// (never a positive bound) and is not consulted here.
     fn aggregate_next(&mut self, rec: Record) -> Result<Option<OutRow>, Error> {
         self.classified()?;
-        let ctx = RowCtx {
-            record: &rec,
-            alias: &self.plan.from.alias,
-            missing_name: &self.missing_name,
-            spent: &self.spent,
-        };
+        let ctx = RowCtx::new(
+            &rec,
+            &self.plan.from.alias,
+            &self.missing_name,
+            &self.budget,
+        );
         if self.passes(&ctx)? {
             let kinds = self.agg_kinds.as_deref().expect("classified above");
             let state = self.agg_state.as_mut().expect("aggregate mode");
@@ -290,23 +242,13 @@ impl Engine {
     /// `{}` (AWS: MISSING → empty record) rather than a present NULL; CSV
     /// keeps the eval-level collapse.
     fn project(&self, ctx: &RowCtx) -> Result<OutRow, Error> {
-        // Charging nothing: the budget prices the possibly-superlinear steps,
-        // and each of those charges at the point it walks (`json_lookup`'s
-        // entries, `like_match`'s DP cells, the headerless name-set walk). A
-        // projection item is O(1) through the per-stream index, so charging it
-        // here refused an ordinary wide SELECT. This is a defensive re-check of
-        // the running total, not a priced step: in a live stream a spend past
-        // the cap is only reachable through a charge that has already returned
-        // its error, and the aggregate path does not call this function at all
-        // (P3).
-        charge(ctx.spent, 0)?;
         let mut keys = Vec::new();
         let mut vals = Vec::new();
         for (i, item) in self.plan.projections.iter().enumerate() {
             match item {
                 Projection::Wild => match ctx.record {
                     Record::Csv(cols) | Record::Parquet(cols) => {
-                        keys.extend(cols.names.iter().cloned());
+                        keys.extend(cols.header.names().iter().cloned());
                         vals.extend(cols.fields.iter().cloned());
                     }
                     // JSON: the top-level keys in encounter order (objects);
@@ -589,27 +531,19 @@ fn access_key(root: &Expr, chain: &[AccessExpr]) -> String {
 /// `MissingHeader`, headerless modes fall through to MISSING. JSON: the
 /// attribute rules below. Parquet: the CSV spine minus MissingHeader (a
 /// name matching no projected column is MISSING — see `parquet_field`).
-/// `spent` is the request budget the indexed (CSV/parquet) and scanned
-/// (JSON) lookups charge (P3).
-fn column_value(
-    rec: &Record,
-    name: &str,
-    style: NameStyle,
-    spent: &Cell<u64>,
-) -> Result<Option<Field>, Error> {
-    match rec {
+/// `ctx` also carries the request budget the indexed (CSV/parquet) and
+/// scanned (JSON) lookups charge (P3).
+fn column_value(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Option<Field>, Error> {
+    match ctx.record {
         Record::Csv(cols) => Ok(csv_field(
             &cols.fields,
-            &cols.names,
-            &cols.index,
+            &cols.header,
             name,
             style,
-            spent,
+            ctx.budget,
         )?),
-        Record::Json(v) => Ok(Some(json_column(v.as_ref(), name, style, spent)?)),
-        Record::Parquet(cols) => {
-            parquet_field(&cols.fields, &cols.names, &cols.index, name, style, spent)
-        }
+        Record::Json(_) => Ok(Some(json_column(ctx, name, style)?)),
+        Record::Parquet(cols) => parquet_field(&cols.fields, &cols.header, name, style, ctx.budget),
     }
 }
 
@@ -618,17 +552,12 @@ fn column_value(
 /// case-insensitively (`quoted` → exact; folded duplicates → `Ambiguous`);
 /// `_1` is the row itself unless the object carries a matching `_1` key
 /// (field wins); absent → MISSING.
-fn json_column(
-    value: Option<&serde_json::Value>,
-    name: &str,
-    style: NameStyle,
-    spent: &Cell<u64>,
-) -> Result<Field, Error> {
-    let Some(v) = value else {
+fn json_column(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Field, Error> {
+    let Some(v) = ctx.json_value() else {
         return Ok(Field::Missing);
     };
     match v {
-        serde_json::Value::Object(map) => match json_lookup(map, name, style, spent)? {
+        serde_json::Value::Object(map) => match json_lookup(map, name, style, ctx)? {
             None if name == "_1" => Ok(Field::Present(to_value(v))),
             Some(field) => Ok(Field::Present(to_value(field))),
             None => Ok(Field::Missing),
@@ -640,34 +569,25 @@ fn json_column(
 /// A JSON compound identifier path (`_1.dir_name`, `s.a.b`): the first part
 /// resolves on the record (`_1`/the FROM alias → the row; any other name →
 /// a field), the remaining parts walk object fields.
-fn json_path(
-    record: Option<&serde_json::Value>,
-    parts: &[Ident],
-    alias: &Option<String>,
-    spent: &Cell<u64>,
-) -> Result<Field, Error> {
+fn json_path(ctx: &RowCtx, parts: &[Ident]) -> Result<Field, Error> {
     let (first, rest) = parts
         .split_first()
         .expect("compound identifier is non-empty");
-    let mut field = json_root_field(record, &first.value, ident_style(first), alias, spent)?;
+    let mut field = json_root_field(ctx, &first.value, ident_style(first))?;
     for part in rest {
-        field = json_dot_step(field, &part.value, ident_style(part), spent)?;
+        field = json_dot_step(field, &part.value, ident_style(part), ctx)?;
     }
     Ok(field)
 }
 
 /// The row itself under `_1` — the whole record value unless the object
 /// carries a key matching `_1` (field wins).
-fn json_row_ref(
-    record: Option<&serde_json::Value>,
-    style: NameStyle,
-    spent: &Cell<u64>,
-) -> Result<Field, Error> {
-    let Some(v) = record else {
+fn json_row_ref(ctx: &RowCtx, style: NameStyle) -> Result<Field, Error> {
+    let Some(v) = ctx.json_value() else {
         return Ok(Field::Missing);
     };
     if let serde_json::Value::Object(map) = v
-        && let Some(field) = json_lookup(map, "_1", style, spent)?
+        && let Some(field) = json_lookup(map, "_1", style, ctx)?
     {
         return Ok(Field::Present(to_value(field)));
     }
@@ -686,31 +606,20 @@ fn json_row_value(record: Option<&serde_json::Value>) -> Field {
 /// `CompoundIdentifier` (`json_path`) and `CompoundFieldAccess`
 /// (`json_access`): `_1` → the row (a matching field wins), the FROM alias →
 /// the whole record value, any other name → a field.
-fn json_root_field(
-    record: Option<&serde_json::Value>,
-    name: &str,
-    style: NameStyle,
-    alias: &Option<String>,
-    spent: &Cell<u64>,
-) -> Result<Field, Error> {
+fn json_root_field(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Field, Error> {
     match name {
-        "_1" => json_row_ref(record, style, spent),
-        name if alias.as_deref() == Some(name) => Ok(json_row_value(record)),
-        name => json_column(record, name, style, spent),
+        "_1" => json_row_ref(ctx, style),
+        name if ctx.alias.as_deref() == Some(name) => Ok(json_row_value(ctx.json_value())),
+        name => json_column(ctx, name, style),
     }
 }
 
 /// One dot step: an object key lookup (CI/exact per the part's quote);
 /// anything else is MISSING.
-fn json_dot_step(
-    field: Field,
-    name: &str,
-    style: NameStyle,
-    spent: &Cell<u64>,
-) -> Result<Field, Error> {
+fn json_dot_step(field: Field, name: &str, style: NameStyle, ctx: &RowCtx) -> Result<Field, Error> {
     match field {
         Field::Missing => Ok(Field::Missing),
-        Field::Present(Value::Json(j)) => json_dot(j, name, style, spent),
+        Field::Present(Value::Json(j)) => json_dot(j, name, style, ctx),
         Field::Present(_) => Ok(Field::Missing),
     }
 }
@@ -720,12 +629,12 @@ fn json_dot(
     j: Box<serde_json::Value>,
     name: &str,
     style: NameStyle,
-    spent: &Cell<u64>,
+    ctx: &RowCtx,
 ) -> Result<Field, Error> {
     let serde_json::Value::Object(map) = j.as_ref() else {
         return Ok(Field::Missing);
     };
-    match json_lookup(map, name, style, spent)? {
+    match json_lookup(map, name, style, ctx)? {
         Some(v) => Ok(Field::Present(to_value(v))),
         None => Ok(Field::Missing),
     }
@@ -735,30 +644,24 @@ fn json_dot(
 /// resolves on the record (`_1`/the FROM alias → the row; any other name →
 /// a field), then each step is a dot or a bracket subscript; a MISSING
 /// base stays MISSING and a non-match step is MISSING.
-fn json_access(
-    record: Option<&serde_json::Value>,
-    root: &Expr,
-    chain: &[AccessExpr],
-    alias: &Option<String>,
-    spent: &Cell<u64>,
-) -> Result<Field, Error> {
+fn json_access(ctx: &RowCtx, root: &Expr, chain: &[AccessExpr]) -> Result<Field, Error> {
     let mut field = match root {
-        Expr::Identifier(id) => json_root_field(record, &id.value, ident_style(id), alias, spent)?,
+        Expr::Identifier(id) => json_root_field(ctx, &id.value, ident_style(id))?,
         // A non-identifier root has no path into the record.
         _ => Field::Missing,
     };
     for step in chain {
-        field = json_step(field, step, spent)?;
+        field = json_step(field, step, ctx)?;
     }
     Ok(field)
 }
 
 /// One access-chain step.
-fn json_step(field: Field, step: &AccessExpr, spent: &Cell<u64>) -> Result<Field, Error> {
+fn json_step(field: Field, step: &AccessExpr, ctx: &RowCtx) -> Result<Field, Error> {
     match (field, step) {
         (Field::Missing, _) => Ok(Field::Missing),
         (Field::Present(Value::Json(j)), AccessExpr::Dot(Expr::Identifier(id))) => {
-            json_dot(j, &id.value, ident_style(id), spent)
+            json_dot(j, &id.value, ident_style(id), ctx)
         }
         (Field::Present(Value::Json(_)), AccessExpr::Dot(_)) => Ok(Field::Missing),
         (Field::Present(Value::Json(j)), AccessExpr::Subscript(s)) => json_subscript(j, s),
@@ -816,16 +719,16 @@ enum SubKey {
     Key(String),
 }
 
-/// CSV column resolution, per the interface above. `index` is the record's
-/// per-stream name index and `spent` the request budget: the indexed lookup
-/// is O(1) and uncharged, the headerless fallback walk is not (P3).
+/// CSV column resolution, per the interface above. `names` is the record's
+/// per-stream name set (the names and their index together) and `budget` the
+/// request budget: the indexed lookup is O(1) and uncharged, the headerless
+/// fallback walk is not (P3).
 fn csv_field(
     fields: &[Field],
-    names: &[String],
-    index: &NameIndex,
+    names: &NameSet,
     name: &str,
     style: NameStyle,
-    spent: &Cell<u64>,
+    budget: &Budget,
 ) -> Result<Option<Field>, Error> {
     // `_N` positional notation wins over headers.
     if let Some(i) = positional(name) {
@@ -834,7 +737,7 @@ fn csv_field(
     // Header lookup: exact-case when quoted, case-insensitive otherwise.
     // A duplicate (case-folded for unquoted, literal for quoted) is
     // ambiguous — the index holds that verdict, built once per stream.
-    match index.get(name, style) {
+    match names.index().get(name, style) {
         NameHit::One(i) => Ok(Some(fields.get(i).cloned().unwrap_or(Field::Missing))),
         NameHit::Ambiguous => Err(Error::Ambiguous(name.into())),
         NameHit::None => {
@@ -842,12 +745,12 @@ fn csv_field(
             // both directions (names × references), so it is charged before
             // it runs — the whole set, its bound, since the walk may stop
             // early and pricing it exactly would mean walking it to find out.
-            charge(spent, names.len() as u64)?;
+            budget.charge(names.names().len() as u64)?;
             // USE-mode headers are the record's names; a named ref matching
             // none of them is a missing-header error. Headerless modes
             // (names are the positional `_1..` alias set) fall through to
             // MISSING.
-            if is_positional_names(names) {
+            if is_positional_names(names.names()) {
                 Ok(Some(Field::Missing))
             } else {
                 Err(Error::MissingHeader(name.into()))
@@ -863,13 +766,12 @@ fn csv_field(
 /// schema column must look MISSING rather than error the stream).
 fn parquet_field(
     fields: &[Field],
-    names: &[String],
-    index: &NameIndex,
+    names: &NameSet,
     name: &str,
     style: NameStyle,
-    spent: &Cell<u64>,
+    budget: &Budget,
 ) -> Result<Option<Field>, Error> {
-    match csv_field(fields, names, index, name, style, spent) {
+    match csv_field(fields, names, name, style, budget) {
         Ok(field) => Ok(field),
         Err(Error::MissingHeader(_)) => Ok(Some(Field::Missing)),
         Err(e) => Err(e),
@@ -919,7 +821,7 @@ fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, Error> {
     match expr {
         Expr::Identifier(id) => column_field(ctx, &id.value, ident_style(id)),
         Expr::CompoundIdentifier(parts) => match ctx.record {
-            Record::Json(v) => json_path(v.as_ref(), parts, ctx.alias, ctx.spent),
+            Record::Json(_) => json_path(ctx, parts),
             _ => {
                 let last = parts.last().expect("compound identifier is non-empty");
                 column_field(ctx, &last.value, ident_style(last))
@@ -928,7 +830,7 @@ fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, Error> {
         // Path access on flat CSV is not meaningful — the full text never
         // matches a header → MISSING; JSON resolves the real access chain.
         Expr::CompoundFieldAccess { root, access_chain } => match ctx.record {
-            Record::Json(v) => json_access(v.as_ref(), root, access_chain, ctx.alias, ctx.spent),
+            Record::Json(_) => json_access(ctx, root, access_chain),
             _ => column_field(ctx, &expr.to_string(), NameStyle::Bare),
         },
         Expr::JsonAccess { .. } => column_field(ctx, &expr.to_string(), NameStyle::Bare),
@@ -940,7 +842,7 @@ fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, Error> {
 }
 
 fn column_field(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Field, Error> {
-    Ok(column_value(ctx.record, name, style, ctx.spent)?.unwrap_or(Field::Missing))
+    Ok(column_value(ctx, name, style)?.unwrap_or(Field::Missing))
 }
 
 /// The single expression argument the `IS [NOT] MISSING` hook emits.
@@ -1469,7 +1371,7 @@ fn eval_like(
             &display(&subject),
             &display(&pattern),
             escape,
-            ctx.spent,
+            ctx.budget,
         )?),
         _ => None,
     };
@@ -1579,7 +1481,7 @@ fn like_match(
     text: &str,
     pattern: &str,
     escape: Option<char>,
-    spent: &Cell<u64>,
+    budget: &Budget,
 ) -> Result<bool, Error> {
     let text: Vec<char> = text.chars().collect();
     LIKE_MEMO.with(|slot| {
@@ -1597,7 +1499,7 @@ fn like_match(
         if cells > LIKE_CELL_CAP {
             return Err(Error::Value("LIKE pattern too large".into()));
         }
-        charge(spent, cells)?;
+        budget.charge(cells)?;
         let LikeMemo {
             tokens, prev, cur, ..
         } = &mut *memo;
@@ -1808,6 +1710,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        budget::EVAL_CELL_CAP,
         row::{Columns, Value},
         sql::{FromClause, SentinelNames, parse},
     };
@@ -1862,7 +1765,7 @@ mod tests {
         let mut engine = Engine::new(
             parse("SELECT s.a FROM S3Object s WHERE s.a LIKE '%a%a%a%a%a%a%'").expect("plan"),
         );
-        engine.spent.set(EVAL_CELL_CAP - 4);
+        engine.budget.set_spent(EVAL_CELL_CAP - 4);
         let err = engine.next(csv(&["aaaaaaa"], &["a"])).unwrap_err();
         assert!(matches!(err, Error::Value(_)), "{err:?}");
     }
@@ -1876,7 +1779,7 @@ mod tests {
         // the 2 000-missing-references × 50 000-names scan, which needs no
         // seconds-long run to pin.
         let mut engine = Engine::new(parse("SELECT s.a FROM S3Object s").expect("plan"));
-        engine.spent.set(EVAL_CELL_CAP - 4);
+        engine.budget.set_spent(EVAL_CELL_CAP - 4);
         let names: Vec<String> = (1..=64).map(|i| format!("_{i}")).collect();
         let rec = Record::Csv(Columns::from_names(vec![Field::Missing; 64], names));
         let err = engine.next(rec).unwrap_err();
@@ -1886,9 +1789,9 @@ mod tests {
         // constant charge (say 5) would satisfy the assertion above while
         // leaving a 50 000-name walk effectively free.
         assert!(
-            engine.spent.get() >= EVAL_CELL_CAP - 4 + 64,
+            engine.budget.spent() >= EVAL_CELL_CAP - 4 + 64,
             "the walk charged names.len(): spent = {}",
-            engine.spent.get()
+            engine.budget.spent()
         );
     }
 
@@ -1900,7 +1803,7 @@ mod tests {
         // the CSV index's O(1) lookup is the deliberate exception, not the
         // rule.
         let mut engine = Engine::new(parse("SELECT s.a FROM S3Object s").expect("plan"));
-        engine.spent.set(EVAL_CELL_CAP);
+        engine.budget.set_spent(EVAL_CELL_CAP);
         let value: serde_json::Value = serde_json::from_str(r#"{"a": 1, "b": 2}"#).expect("json");
         let err = engine.next(Record::Json(Some(value))).unwrap_err();
         assert!(matches!(err, Error::Value(_)), "{err:?}");
@@ -1923,7 +1826,7 @@ mod tests {
                 .join(", ")
         );
         let mut engine = Engine::new(parse(&sql).expect("plan"));
-        engine.spent.set(EVAL_CELL_CAP);
+        engine.budget.set_spent(EVAL_CELL_CAP);
         let fields: Vec<&str> = vec!["x"; 64];
         let names: Vec<&str> = cols.iter().map(String::as_str).collect();
         let row = engine.next(csv(&fields, &names)).expect("row");
@@ -1931,28 +1834,12 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_re_check_refuses_a_spend_past_the_cap() {
-        // `project()` charges nothing (a projection item is O(1)) but re-checks
-        // the running total — the defensive arm the task-3 review noted no test
-        // reached, because a live stream only crosses the cap through a charge
-        // that has already returned its error. Seeding the spend *above* the
-        // cap reaches it directly: the next record must refuse rather than
-        // project. If `charge(ctx.spent, 0)?` in `project()` were dropped, this
-        // leg would get `Ok(Some(row))` and panic on `unwrap_err`, so the
-        // assertion fails exactly when the re-check goes away.
-        let mut engine = Engine::new(parse("SELECT s.a FROM S3Object s").expect("plan"));
-        engine.spent.set(EVAL_CELL_CAP + 1);
-        let err = engine.next(csv(&["x"], &["a"])).unwrap_err();
-        assert!(matches!(err, Error::Value(_)), "{err:?}");
-    }
-
-    #[test]
     fn a_wide_aggregate_projection_is_unpriced_and_returns_its_row() {
         // Aggregate evaluation (`accumulate`) is linear-per-request and
         // deliberately uncharged: the budget prices DP-shaped work only, and
         // the task-3 ruling accepts this as a known gap. Aggregate plans never
-        // reach `project()`, so not even the running-total re-check runs here —
-        // a wide `count(s.cN)` projection over a handful of records still
+        // reach `project()`, so the projection walk is uncharged there too — a
+        // wide `count(s.cN)` projection over a handful of records still
         // yields its aggregate row rather than refusing. The leg therefore
         // builds the `Engine` itself instead of going through `run_agg`, which
         // hides it: the row alone cannot see a spend, but `spent` stays exactly
@@ -1985,7 +1872,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{sql}: expected an aggregate row"));
         assert_eq!(row.vals.len(), 8);
         assert_eq!(
-            engine.spent.get(),
+            engine.budget.spent(),
             0,
             "aggregate evaluation must stay unpriced"
         );
@@ -2583,7 +2470,7 @@ mod tests {
                 &format!("{}{}", "b".repeat(300), "a".repeat(300)),
                 &pattern,
                 None,
-                &Cell::new(0)
+                &Budget::new()
             )
             .unwrap()
         );
@@ -2594,7 +2481,7 @@ mod tests {
                 &format!("{}{}", "a".repeat(300), "b".repeat(300)),
                 &pattern,
                 None,
-                &Cell::new(0)
+                &Budget::new()
             )
             .unwrap()
         );
@@ -2606,7 +2493,7 @@ mod tests {
         // (2×10⁷ cells) is refused with a value error instead of pinning a
         // spawn_blocking worker for seconds-to-minutes.
         let pattern = "%a".repeat(50_000);
-        match like_match(&"a".repeat(200), &pattern, None, &Cell::new(0)) {
+        match like_match(&"a".repeat(200), &pattern, None, &Budget::new()) {
             Err(Error::Value(m)) => assert_eq!(m, "LIKE pattern too large"),
             other => panic!("expected cell-cap error, got {other:?}"),
         }
@@ -3537,6 +3424,15 @@ mod tests {
         ))
     }
 
+    /// `column_value` over `rec` through a fresh context — these flat-lookup
+    /// tests have no alias, sentinel or spend of their own.
+    fn lookup(rec: &Record, name: &str, style: NameStyle) -> Result<Option<Field>, Error> {
+        let budget = Budget::new();
+        let alias = None;
+        let ctx = RowCtx::new(rec, &alias, "missing", &budget);
+        column_value(&ctx, name, style)
+    }
+
     #[test]
     fn parquet_lookup_finds_projected_columns() {
         let rec = parquet(
@@ -3549,16 +3445,16 @@ mod tests {
         );
         // Unquoted names are case-insensitive per the identifier rules.
         assert_eq!(
-            column_value(&rec, "ID", NameStyle::Bare, &Cell::new(0)).unwrap(),
+            lookup(&rec, "ID", NameStyle::Bare).unwrap(),
             Some(Field::Present(Value::Int(1)))
         );
         assert_eq!(
-            column_value(&rec, "price", NameStyle::Bare, &Cell::new(0)).unwrap(),
+            lookup(&rec, "price", NameStyle::Bare).unwrap(),
             Some(Field::Present(Value::Decimal(Decimal::new(1234, 2))))
         );
         // `_N` positional spine works like CSV.
         assert_eq!(
-            column_value(&rec, "_2", NameStyle::Bare, &Cell::new(0)).unwrap(),
+            lookup(&rec, "_2", NameStyle::Bare).unwrap(),
             Some(Field::Present(Value::Decimal(Decimal::new(1234, 2))))
         );
     }
@@ -3570,11 +3466,11 @@ mod tests {
         // never existed, both resolve MISSING — never MissingHeader (that
         // code is CSV-header-specific; pruning must not error the stream).
         assert_eq!(
-            column_value(&rec, "score", NameStyle::Bare, &Cell::new(0)).unwrap(),
+            lookup(&rec, "score", NameStyle::Bare).unwrap(),
             Some(Field::Missing)
         );
         assert_eq!(
-            column_value(&rec, "nope", NameStyle::Bare, &Cell::new(0)).unwrap(),
+            lookup(&rec, "nope", NameStyle::Bare).unwrap(),
             Some(Field::Missing)
         );
     }
@@ -3585,13 +3481,13 @@ mod tests {
             vec![Field::Present(Value::Int(1)), Field::Present(Value::Int(2))],
             &["a", "A"],
         );
-        match column_value(&rec, "a", NameStyle::Bare, &Cell::new(0)) {
+        match lookup(&rec, "a", NameStyle::Bare) {
             Err(Error::Ambiguous(n)) => assert_eq!(n, "a"),
             other => panic!("expected ambiguous, got {other:?}"),
         }
         // Quoted: exact case, no ambiguity.
         assert_eq!(
-            column_value(&rec, "A", NameStyle::Quoted, &Cell::new(0)).unwrap(),
+            lookup(&rec, "A", NameStyle::Quoted).unwrap(),
             Some(Field::Present(Value::Int(2)))
         );
     }

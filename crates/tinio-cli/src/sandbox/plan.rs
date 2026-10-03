@@ -187,11 +187,16 @@ pub fn resolve_flag(source: ValueSource, requested: bool, file: bool) -> bool {
 ///   one [`tinio_sandbox::serve::Spec`] and does not ask the question again. The determination
 ///   runs before the fork, on every target, which is what makes it reachable and observable in
 ///   every build.
-/// - **the host's own answer.** With the feature on and the target backed, the token may still be
-///   refused a profile: [`tinio_sandbox::can_confine`] is the run-time half of the same question
-///   [`tinio_sandbox::backend_available`] answers at build time, and while it answers `Err`, the
-///   answer is a **startup** error (exit 1). It is asked before this build writes anything, so the
-///   operator reads a cause and two actions instead of a `PermissionDenied` on a temp directory.
+/// - **the host's own answer.** With the feature on and the target backed, this host may still
+///   refuse: [`tinio_sandbox::can_confine`] is the run-time half of the same question
+///   [`tinio_sandbox::backend_available`] answers at build time — the token may be denied an
+///   AppContainer profile (Windows) or the requested model may resolve to neither an
+///   unprivileged user namespace nor root (Linux) — and while it answers `Err`, the run is
+///   refused. A host refusal is a **startup** error (exit 1); the Linux arm's
+///   `TINIO_SANDBOX_MODEL` typo keeps the variable's own **usage** class (exit 2). It is asked
+///   before this build writes anything, so the operator reads a cause and the remedy instead of
+///   a `PermissionDenied` on a temp directory or a late `Unsupported` from inside the
+///   confinement.
 ///
 /// Only a build, target and host that clear all three facts are allowed to answer an **enabled**
 /// [`Request`]; the exposure set at
@@ -343,14 +348,19 @@ fn refuse_unhonourable(channel: Channel) -> Result<(), Error> {
             )))
         } else {
             // **The third fact, and the last this build can answer before it writes anything.**
-            // The target has a backend; the token may still be refused one, and on a host where
-            // it is, every later step — the state directory, the served root, the listener, the
-            // stale-profile sweep, the ACL salt file and the profile itself — is work done for a
-            // run that cannot serve. Asking here is what makes the operator read a cause and two
-            // actions instead of a `PermissionDenied` on a temp directory.
+            // The target has a backend; this host may still refuse — Windows' token can be denied
+            // an AppContainer profile, and Linux can resolve neither an unprivileged user
+            // namespace nor root — and on a host where it does, every later step — the state
+            // directory, the served root, the listener, the stale-profile sweep, the ACL salt
+            // file and the profile itself — is work done for a run that cannot serve. Asking here
+            // is what makes the operator read a cause and two actions instead of a
+            // `PermissionDenied` on a temp directory (Windows) or a late `Unsupported` from
+            // inside the confinement (Linux).
             //
             // **The ask is the facade's, exactly as `backend_available` is**: the platform that
-            // can answer it is the one that owns the probe.
+            // can answer it is the one that owns the probe, and Linux's arm answers from the same
+            // model resolution the confinement itself applies — so the gate cannot clear a
+            // request the later `apply` would refuse.
             _sandbox::can_confine().map_err(super::sandbox_err)?;
             Ok(())
         }

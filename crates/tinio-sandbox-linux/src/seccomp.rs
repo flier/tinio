@@ -107,7 +107,7 @@ use linux_raw_sys::{
 use tracing::{Span, field, info, instrument, warn};
 
 use crate::{
-    _core::{Error, Result},
+    _core::{Error, Result, SECCOMP_SKIP_WARNING},
     mechanism::fail,
     metrics::record_seccomp,
 };
@@ -583,11 +583,11 @@ pub fn install() -> Result<Seccomp> {
         // The one documented degradation (design §11) and this crate's only
         // `warn!`: the directory boundary still holds, the network guarantee
         // does not, and that is a sentence an operator has to be given rather
-        // than left to infer from a filter that was never installed.
-        warn!(
-            step = "seccomp",
-            "this architecture has no syscall table, so outbound connections are NOT blocked"
-        );
+        // than left to infer from a filter that was never installed. **The text
+        // has one home** (`SECCOMP_SKIP_WARNING`): the CLI's in-place re-emit
+        // renders the same sentence from the same definition, so the two log
+        // lines an operator greps for cannot drift apart.
+        warn!(step = "seccomp", "{SECCOMP_SKIP_WARNING}");
         // **The `warn!` above has no subscriber on the arm that needs it most**, which is why
         // this state is a metric rather than only a line: the process that confines in place
         // builds its subscriber *after* the confinement (`tinio-cli`'s in-place arm, decision

@@ -40,6 +40,29 @@ pub enum Enforcement {
     NotReported,
 }
 
+/// Linux's one degradation, as the sentence both of its emitters spell — **the text is defined
+/// once because two crates render it**.
+///
+/// `tinio-sandbox-linux`'s `seccomp::install` emits it where the skip is decided, and
+/// `tinio-cli`'s in-place re-emit emits it again because that first event is written before the
+/// arm's subscriber exists (the confinement runs first, sandbox design decision 26) — and the
+/// re-emit appends its own clause (`; the directory confinement still holds`), which is that
+/// arm's statement about what still stands rather than a second spelling of this sentence.
+///
+/// **It is a `warn!` message and not an `Error` payload**, which is why it lives beside
+/// [`Enforcement`] rather than beside the `*_USAGE` sentences `error.rs` owns: the value that
+/// answers how much of a mechanism's guarantee applied is where its one shortfall is stated.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_sandbox_core::SECCOMP_SKIP_WARNING;
+///
+/// assert!(SECCOMP_SKIP_WARNING.contains("outbound connections are NOT blocked"));
+/// ```
+pub const SECCOMP_SKIP_WARNING: &str =
+    "this architecture has no syscall table, so outbound connections are NOT blocked";
+
 /// What a refusal was *about*, as precisely as the platform could name it.
 ///
 /// **One variant per shape a refusal can name, and not one per surface it can arrive on.** A

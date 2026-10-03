@@ -1225,16 +1225,21 @@ fn field_of(line: &str, name: &str) -> Option<String> {
 /// `crate::sandbox::confine` dispatches on, and the reason these three tables are the *only* place
 /// in this file that names a platform's events rather than a platform's mechanism.
 #[cfg(target_os = "linux")]
-const CONFINED_STEPS: &[(&str, &[&str])] = &[(
-    // The re-emit `crate::sandbox::confine`'s `announce_in_place` writes after the confinement,
-    // with the facts the CLI can re-resolve once the subscriber exists. The field names are the
-    // shared §7 vocabulary and not this table's choice: `requested` is the model the environment
-    // *asked for* (the sibling `model` field is the one a run *resolved*), `count` is the
-    // exposure set's size (the sibling `exposures` field renders the path list), and `local_uid`
-    // is FR-033's mapping knob.
-    "confined in place",
-    &["requested", "count", "local_uid"],
-)];
+const CONFINED_STEPS: &[(&str, &[&str])] = &[
+    // The §7 events `crate::sandbox::confine`'s `announce_in_place` writes after the in-place
+    // confinement, every value taken from the answer the confinement itself returned
+    // (`serve::Confined`): the *resolved* model (`model`), the exposure event's whole field set —
+    // the set's size (`count`), the mounts the jail applied (`mounts`) and the rendered path list
+    // (`exposures`) — and the network filter's outcome (`installed` — `true` on an architecture
+    // with a syscall table, `false` where the filter was skipped and the network guarantee is not
+    // delivered). The step and field names are the shared §7 vocabulary and not this table's
+    // choice: the re-emit replaces the backend's own events, which the in-place ordering drops
+    // (the subscriber is installed after the confinement, design decision 26), rather than
+    // inventing a vocabulary of its own.
+    ("model", &["model"]),
+    ("exposures", &["count", "mounts", "exposures"]),
+    ("seccomp", &["installed"]),
+];
 #[cfg(target_os = "macos")]
 const CONFINED_STEPS: &[(&str, &[&str])] = &[
     // The mechanism the environment resolved, before anything acts on it (`serve::apply`).
@@ -3066,9 +3071,9 @@ async fn neither_stream_carries_the_token(world: &mut World) {
         "the frame stream must carry the readiness frame this step reads it for:\n{stdout}"
     );
     assert!(
-        stderr.contains("step=\"confined in place\""),
-        "the log must carry the in-place re-emit line, or the token check beside this one would be \
-         about a stream that never carried the line A5 is about:\n{stderr}"
+        stderr.contains("step=\"model\""),
+        "the log must carry the in-place re-emit's §7 events, or the token check beside this one \
+         would be about a stream that never carried the record A5 is about:\n{stderr}"
     );
     assert!(
         !stdout.contains(&token),

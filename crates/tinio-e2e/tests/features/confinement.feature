@@ -208,8 +208,9 @@ Feature: Confinement
   # G6: each platform's own variable is read from the process environment
   # *after* `apply_env_file`, so a value the file supplies reaches the backend
   # exactly as an exported one does — and the run's own record is what says so:
-  # the Linux in-place arm re-emits the model the environment asked for, and the
-  # macOS launcher logs the mechanism it resolved before anything acts on it.
+  # the Linux in-place arm re-emits the model it resolved (a forced `userns`
+  # either resolves to the user namespace or refuses the run), and the macOS
+  # launcher logs the mechanism it resolved before anything acts on it.
   @cli @confinement @FR-036 @linux
   Scenario: `.env` reaches the model variable
     Given a storage root
@@ -220,9 +221,9 @@ Feature: Confinement
       """
     When I run "tinio server {root} --port 0"
     Then the run was confined
-    And its stderr carries a "confined in place" step line naming
+    And its stderr carries a "model" step line naming
       """
-      requested=UserNamespace
+      model=UserNamespace
       """
 
   @cli @confinement @FR-036 @macos
@@ -1122,9 +1123,9 @@ Feature: Confinement
   # the crate's to assert.
   #
   # **The witness says the exposition came from a confined run**, the pair every other confined
-  # scenario here uses (`steps/cli.rs`'s `linux_witness`): the `step="confined in place"` re-emit
-  # plus the `/proc/<pid>/root` probes. A server that answered the scrape with no jail in place
-  # fails there rather than passing on a route the unconfined scenarios share.
+  # scenario here uses (`steps/cli.rs`'s `linux_witness`): the `step="model"` re-emit plus the
+  # `/proc/<pid>/root` probes. A server that answered the scrape with no jail in place fails
+  # there rather than passing on a route the unconfined scenarios share.
   @cli @confinement @FR-036 @linux
   Scenario: A confined read-only run exposes the read-only arm family
     Given a storage root

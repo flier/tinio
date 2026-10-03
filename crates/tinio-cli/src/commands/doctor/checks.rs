@@ -29,7 +29,6 @@ use crate::_api::{
 // The crate-wide facade alias, imported rather than spelled `crate::_sandbox::...`: a
 // three-segment expression path is what this crate's `absolute_paths` lint refuses.
 use crate::_sandbox;
-use crate::_server::identity;
 #[cfg(all(feature = "api", unix))]
 use crate::commands::start;
 use crate::{
@@ -38,6 +37,7 @@ use crate::{
         Error as FsError, FsCleanup, FsOptions, FsStorage,
         database::{self, Integrity, Stats, check_integrity, needs_compact, open},
     },
+    _server::identity,
     Error,
     report::{Finding, PRIVATE_STATE, Report, Severity},
     resolve::{self, Resolution},
@@ -371,23 +371,31 @@ pub(crate) const HOST_CONFINEMENT: &str = "host confinement";
 pub(crate) const HOST_CONFINEMENT_OK: &str =
     "this host's token was not refused an AppContainer profile";
 
-/// The row's `ok` detail on every other target: the facade's non-Windows arm answers `Ok(())`
+/// The row's `ok` detail on Linux: **the answer is a real probe of this host now** — the facade's
+/// arm resolves the requested model against the kernel (its user-namespace probe and the effective
+/// uid, `Options::resolve`), so `Ok` means the model resolution found a mechanism this host can
+/// apply rather than that no question was asked.
+#[cfg(target_os = "linux")]
+pub(crate) const HOST_CONFINEMENT_OK: &str =
+    "this host resolves the requested model to a confinement mechanism it can apply";
+
+/// The row's `ok` detail on every other non-Windows target: the facade's arm answers `Ok(())`
 /// without probing anything, because the platform's confinement has no host-level precondition
-/// to fail — the Linux jail applies in place and macOS's Seatbelt profile applies to this
-/// process.
-#[cfg(not(windows))]
+/// to fail — macOS's Seatbelt profile applies to this process.
+#[cfg(not(any(windows, target_os = "linux")))]
 pub(crate) const HOST_CONFINEMENT_OK: &str =
     "this host has no host-level confinement precondition to fail";
 
 /// Whether this host can confine a process, as a finding.
 ///
-/// **The `ok` detail is the platform's own truth, and the two arms differ because the
-/// mechanisms do**: on Windows, `Ok(())` means only that this token was not refused — the
-/// profile may have been created, or the probe may have been unable to answer — so the row
-/// claims the non-refusal and never the creation. Every non-Windows target's confinement has
-/// no host-level precondition to fail, so its arm probes nothing and says exactly that. The
-/// refusal arm renders the predicate's error, and neither `ok` sentence is that error's
-/// negation — which is what keeps the row honest on every target it is compiled for.
+/// **The `ok` detail is the platform's own truth, and the arms differ because the mechanisms
+/// do**: on Windows, `Ok(())` means only that this token was not refused — the profile may have
+/// been created, or the probe may have been unable to answer — so the row claims the non-refusal
+/// and never the creation. Linux's arm is this kernel's answer to the model resolution, so its
+/// `ok` sentence claims exactly that and no more; the remaining targets' confinement has no
+/// host-level precondition to fail, so their arm probes nothing and says exactly that. The
+/// refusal arm renders the predicate's error, and no `ok` sentence is that error's negation —
+/// which is what keeps the row honest on every target it is compiled for.
 ///
 /// **A second self-cleaning write is allowed here, and it is the design's ruling rather than
 /// an oversight**: the profile this asks about is created and deleted by the predicate, and
@@ -518,7 +526,9 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
     report.push(free_space(&resolution.root));
     // The push sits exactly after `free_space`'s because the predicate is the host's own
     // answer, not the root's, and the row is the last thing about the machine the checks
-    // speak for. It is not free: the profile is created and deleted inside this call.
+    // speak for. It is not free: Windows' probe creates and deletes an AppContainer profile
+    // inside this call, and Linux's arm runs the model resolution's own user-namespace probe
+    // (a forked child) here.
     report.push(host_confinement_finding(_sandbox::can_confine()));
     #[cfg(feature = "api")]
     report.push(state_findings(run));
@@ -708,8 +718,9 @@ fn config_finding(resolution: &Resolution) -> Finding {
         );
     }
     // The predicate, not a second spelling of it: the row describes the very
-    // policy `serve`'s refusal and warning enforce (P2), so the two must not
-    // be able to disagree.
+    // policy the start's refusal and warning enforce (`commands::start::run`'s
+    // static half, `commands::start::serve`'s loopback warning; P2), so the two
+    // must not be able to disagree.
     if identity::uses_builtin_fallback(&resolution.config) {
         return Finding::check(
             "configuration",

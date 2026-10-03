@@ -46,6 +46,8 @@ pub mod serve;
 use std::os::{fd::BorrowedFd, unix::net::UnixListener};
 use std::{io, net::TcpListener};
 
+#[cfg(target_os = "linux")]
+use crate::_linux::{Options as LinuxOptions, Resolved};
 #[cfg(target_os = "macos")]
 use crate::_macos::apply::self_confinement as macos_apply;
 #[cfg(target_os = "macos")]
@@ -706,14 +708,19 @@ pub const fn backend_available() -> bool {
 /// throwaway AppContainer profile and deleting it.
 ///
 /// **It cannot be `const`**, unlike its two siblings (`platform_facts`, `diagnostics`): the
-/// answer is the machine's, not the build's. **The non-Windows arm is `Ok(())` rather than an
-/// absence**: macOS's Seatbelt is an SBPL profile applied to this process and Linux's jail
-/// applies in place, so neither has a host-level precondition to fail. The name exists on
-/// every target so a consumer compiles and answers one question rather than two.
+/// answer is the machine's, not the build's. **Two of the three arms really ask the host**:
+/// Windows probes the token, and Linux resolves the requested model against this kernel
+/// (its own user-namespace probe plus the effective uid — see the Linux arm below). macOS has no
+/// host-level precondition to fail: its Seatbelt profile applies to this process, so that arm
+/// answers `Ok` without probing. The name exists on every target so a consumer compiles and
+/// answers one question rather than two.
 ///
 /// # Errors
 ///
-/// `Error::HostCannotConfine` on Windows when this token is refused. The fact's owner is
+/// `Error::HostCannotConfine` on Windows when this token is refused, and — on Linux — the model
+/// resolution's own refusal (`Error::Usage` for a `TINIO_SANDBOX_MODEL` that names no model, the
+/// probe's `Error::Step`, or `Error::Unsupported` carrying `Resolved::Unavailable`'s
+/// cause-and-actions sentence). The fact's owner is
 /// `docs/superpowers/specs/2026-10-01-host-confinement-capability-design.md`.
 ///
 /// # Examples
@@ -733,18 +740,55 @@ pub fn can_confine() -> Result<()> {
     windows_can_confine()
 }
 
+/// Whether **this host** can confine a process — the Linux arm, answered from the platform's own
+/// model resolution.
+///
+/// **A host that can neither use an unprivileged user namespace nor fall back to real root cannot
+/// confine anything here**, and this is where that host is refused — with the resolution table's
+/// own cause-and-actions sentence. The alternative is the defect this arm closes: a gate that
+/// answered `Ok` unconditionally let the run reach `Backend::confine`, which resolved the same
+/// question a moment later and answered `Error::Unsupported`, *after* the state directory and the
+/// served root had been created.
+///
+/// **The answer is derived from the same resolution the eventual `apply` uses** —
+/// `Options::from_env` (the variable's one reader) feeding `Options::resolve`, the very call
+/// `enter::resolve_model` makes — so the gate cannot disagree with the outcome: an `Ok` here is a
+/// model this host can apply, and the concurrency between the two asks is the host's own state
+/// rather than a second rule.
+///
+/// # Errors
+///
+/// [`Error::Usage`] for a `TINIO_SANDBOX_MODEL` that names no model, the probe's own
+/// [`Error::Step`], and [`Error::Unsupported`] carrying `Resolved::Unavailable`'s sentence.
+///
+/// # Examples
+///
+/// ```rust
+/// // Both answers are this host's, so neither is a failure of the call.
+/// match tinio_sandbox::can_confine() {
+///     Ok(()) => {}
+///     Err(err) => eprintln!("{err}"),
+/// }
+/// ```
+#[cfg(target_os = "linux")]
+pub fn can_confine() -> Result<()> {
+    match LinuxOptions::from_env()?.resolve()? {
+        Resolved::Unavailable(detail) => Err(Error::Unsupported { detail }),
+        Resolved::UserNamespace | Resolved::Root => Ok(()),
+    }
+}
+
 /// Whether **this host** can confine a process — see the Windows arm's doc.
 ///
 /// # Examples
 ///
 /// ```rust
-/// // A non-Windows host has no host-level precondition to fail: macOS's profile applies to
-/// // this process and Linux's jail applies in place, so this arm answers `Ok` on every
-/// // target it is compiled for — including one this build wires no backend for, whose
-/// // refusal is [`backend_available`]'s to make.
+/// // This target's confinement has no host-level precondition to fail: macOS's profile applies
+/// // to this process, so this arm answers `Ok` on every target it is compiled for — including
+/// // one this build wires no backend for, whose refusal is [`backend_available`]'s to make.
 /// assert!(tinio_sandbox::can_confine().is_ok());
 /// ```
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn can_confine() -> Result<()> {
     Ok(())
 }
@@ -768,10 +812,10 @@ pub use crate::_core::{
     AccessMode, Adopted, Attribution, Backend, CONTROL_FD_PREFIX, Child, Confinement,
     ControlHandle, Diagnostics, Enforcement, Error, Event, Exposure, LINUX_MODEL_USAGE,
     LISTENER_FD_PREFIX, LaunchPayload, LaunchPlan, MACOS_MECHANISM_USAGE, Observer, Readiness,
-    Refused, Result, Sandbox, SandboxSpec, Terminal, WINDOWS_CAPABILITY_USAGE, adopt,
-    control_fd_arg, control_fd_from_arg, describe_exposures, fail, filter_argv, is_control_fd_arg,
-    is_launcher_fd_arg, is_listener_fd_arg, launch, listener_fd_arg, listener_fd_from_arg, refused,
-    step, supervise,
+    Refused, Result, SECCOMP_SKIP_WARNING, Sandbox, SandboxSpec, Terminal,
+    WINDOWS_CAPABILITY_USAGE, adopt, control_fd_arg, control_fd_from_arg, describe_exposures, fail,
+    filter_argv, is_control_fd_arg, is_launcher_fd_arg, is_listener_fd_arg, launch,
+    listener_fd_arg, listener_fd_from_arg, refused, step, supervise,
 };
 // **The fork probe's names, published only where a probe can exist** — a `#[cfg]` the core's own
 // list carries for the same reason, and one this list has to repeat because the equality between
@@ -819,75 +863,6 @@ pub use crate::_linux as linux;
 /// ```
 #[cfg(target_os = "linux")]
 pub use crate::_linux::backend as platform;
-/// The Linux model `TINIO_SANDBOX_MODEL` asks for — **one read, on the rule that owns the
-/// variable**, so that a caller can carry the answer instead of spelling the variable again.
-///
-/// **[`serve::Spec::model`] is where the answer goes**, and the reason it is read here rather
-/// than there: the CLI has to state the request *after* the confinement has run (its in-place
-/// re-emit), where a second read of `TINIO_SANDBOX_MODEL` would be a second answer to what the
-/// confinement applied. The value therefore travels as a value, read once through the Linux
-/// backend's own parser (`tinio_sandbox_linux::Options::from_env` — the derivation the Linux arm
-/// of `Spec::apply` builds its options from).
-///
-/// **A refusal is the reader's own and is not swallowed**: a value that is neither `userns` nor
-/// `root` answers the backend's [`Error::Usage`] carrying [`LINUX_MODEL_USAGE`] — a caller maps it
-/// the way it maps `Spec::apply`'s, so a typo still ends the run as a usage error rather than being
-/// downgraded to the default.
-///
-/// # Errors
-///
-/// [`Error::Usage`] ([`LINUX_MODEL_USAGE`]) for a value outside the two model names.
-///
-/// # Examples
-///
-/// ```
-/// # #[cfg(target_os = "linux")]
-/// # fn main() {
-/// use tinio_sandbox::{requested_model, serve};
-///
-/// // Both arms, so the example turns on the call rather than on how the test process happened
-/// // to be started: the model the environment spelled, or the refusal that names the variable.
-/// match requested_model() {
-///     Ok(model) => {
-///         let _ = serve::Spec::new().model(model);
-///     }
-///     Err(error) => assert!(error.to_string().contains("TINIO_SANDBOX_MODEL")),
-/// }
-/// # }
-/// # #[cfg(not(target_os = "linux"))]
-/// # fn main() {}
-/// ```
-#[cfg(target_os = "linux")]
-pub fn requested_model() -> Result<Mechanism> {
-    use crate::_linux::Options;
-
-    Ok(Options::from_env()?.model())
-}
-/// The Linux model vocabulary [`requested_model`] answers and [`serve::Spec::model`] carries —
-/// the platform's own type, published under a `#[cfg]`-selected facade name so that a caller
-/// that must name it in a signature of its own (the CLI's re-emit parameter) writes no `linux`
-/// module path for it.
-///
-/// **This is the module alias's rule in the one shape a path cannot serve**: the alias is for a
-/// caller spelling platform vocabulary at a call site, while this name exists because the shared
-/// signatures that carry a model — `Spec::model`, `requested_model` — must be nameable by a
-/// caller that never opens the platform module.
-///
-/// # Examples
-///
-/// ```
-/// # #[cfg(target_os = "linux")]
-/// # fn main() {
-/// use tinio_sandbox::{Mechanism, serve};
-///
-/// let spec = serve::Spec::new().model(Mechanism::Auto);
-/// assert_eq!(spec.model_configured(), Some(Mechanism::Auto));
-/// # }
-/// # #[cfg(not(target_os = "linux"))]
-/// # fn main() {}
-/// ```
-#[cfg(target_os = "linux")]
-pub use crate::_linux::Mechanism;
 /// The macOS backend's own crate, for the settings the shared surface does not
 /// carry — its `Options`, which holds the mechanism (`Mechanism`), and the
 /// `apply` module the confined child reaches its own confinement through.
@@ -1138,17 +1113,25 @@ mod tests {
         assert!(!err.to_string().is_empty(), "{err}");
     }
 
+    /// **The host predicate answers on every target, and the answer is the host's own** — the
+    /// facade's surface has to exist where no AppContainer does (a consumer that compiles only on
+    /// Windows is not a facade), and a target whose answer is unconditional must still name the
+    /// question.
+    ///
+    /// **Only the macOS arm may assert `Ok`**: it has no host-level precondition to fail. Linux's
+    /// answer is this kernel's — the model resolution's own table, which can refuse on a host
+    /// that grants neither an unprivileged user namespace nor root — so either value is legal
+    /// here and the assertion is that the call answers rather than what it says. The Windows arm
+    /// is the capability probe, pinned by its own crate.
     #[test]
     fn the_host_predicate_answers_on_every_target() {
-        // The facade's surface has to exist where no AppContainer does: a consumer that
-        // compiles only on Windows is not a facade.
         let answer = crate::can_confine();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         assert!(
             answer.is_ok(),
-            "unix platforms confine in place or by profile of their own"
+            "macOS has no host-level precondition to fail"
         );
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_os = "macos"))]
         let _ = answer;
     }
 }

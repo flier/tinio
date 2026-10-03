@@ -73,7 +73,7 @@ pub(crate) mod testing;
 pub use self::launcher::{ProbeSteps, await_verdict, report_verdict};
 pub use self::{
     backend::{Backend, Confinement, PlatformFacts},
-    enforcement::{Attribution, Diagnostics, Enforcement, Refused},
+    enforcement::{Attribution, Diagnostics, Enforcement, Refused, SECCOMP_SKIP_WARNING},
     error::{
         Error, LINUX_MODEL_USAGE, MACOS_MECHANISM_USAGE, Result, WINDOWS_CAPABILITY_USAGE, fail,
         launch, refused, step,

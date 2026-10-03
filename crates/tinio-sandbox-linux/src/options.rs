@@ -9,7 +9,7 @@ use std::{env, path::PathBuf};
 
 use rustix::process::geteuid;
 
-use crate::{_core::Result, Mechanism};
+use crate::{_core::Result, Mechanism, Resolved, mechanism::userns_available};
 
 /// How to confine, and the facts the backend needs that the sandbox does not
 /// own.
@@ -173,6 +173,54 @@ impl Options {
     /// ```
     pub fn model(&self) -> Mechanism {
         self.model
+    }
+
+    /// The model this request resolves to on **this host**: [`Mechanism::resolved`]'s pure table,
+    /// fed the two facts only this type holds — the effective uid and the kernel's answer to the
+    /// unprivileged user-namespace probe.
+    ///
+    /// **One implementation for the two askers, so the gate cannot disagree with the outcome.**
+    /// `enter::resolve_model` applies what this answers (the confinement's three tiers), and
+    /// `tinio-sandbox`'s `can_confine` — the CLI's run-time gate, asked before a start writes
+    /// anything — refuses on the same answer rather than on a second derivation of it.
+    ///
+    /// **What it carries: the host-confinement gate**
+    /// (`docs/superpowers/specs/2026-10-01-host-confinement-capability-design.md`) — a host that
+    /// can neither use an unprivileged user namespace nor fall back to real root is refused by
+    /// `can_confine` with this resolution's own sentence, before the run touches a directory.
+    ///
+    /// **The probe runs only when the request depends on it** (`Auto`, or a forced `userns`), as
+    /// the resolution always has: a forced `root` model is decided from the euid alone.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Step`](tinio_sandbox_core::Error::Step) — the probe's own refusal, named by its
+    /// `userns probe …` step — when the kernel cannot be asked at all.
+    /// [`Resolved::Unavailable`] is not an error here: it is the table's answer, and the caller
+    /// that must refuse the run maps it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_linux::{Mechanism, Options};
+    ///
+    /// // Both arms, so the example turns on the call rather than on what this host grants: the
+    /// // table's answer, or the probe's own refusal naming the step.
+    /// match Options::default().with_model(Mechanism::Root).resolve() {
+    ///     Ok(resolved) => println!("{resolved:?}"),
+    ///     Err(error) => assert!(!error.to_string().is_empty()),
+    /// }
+    /// ```
+    pub fn resolve(&self) -> Result<Resolved> {
+        let needs_probe = matches!(self.model, Mechanism::UserNamespace | Mechanism::Auto);
+        Ok(self.model.resolved(
+            self.euid(),
+            if needs_probe {
+                userns_available()?
+            } else {
+                false
+            },
+        ))
     }
 
     /// The jail directory's parent, when one was set.

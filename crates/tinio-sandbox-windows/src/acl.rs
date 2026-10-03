@@ -2049,7 +2049,7 @@ mod tests {
         backend::SiblingScan,
         ledger::{self, PathKind},
         sid::{PackageSid, Salt, package_name, sid_text},
-        testing::{capture, icacls, junction, recorder},
+        testing::{capture, icacls, junction, recorder, sid_for},
     };
 
     #[test]
@@ -3603,19 +3603,13 @@ an inherited entry is answering for the wrong reason: {:08X?}",
     // used to assert a rollback now assert the opposite — the ACE is still there
     // after the guard drops — and `revoke` survives as the primitive an operator
     // (or a test) removes one with.
-
-    /// The SID this run derives for `root` — the same question the launcher asks.
-    ///
-    /// **Called once per name, and the value held.** `PackageSid` owns the
-    /// AppContainer profile behind the SID and deletes it when the value drops
-    /// (decision 21), so a second value for one name would delete the profile the
-    /// first is still using — measured on 2026-09-21: `DeleteAppContainerProfile`
-    /// answers a profile that is already gone with `S_OK`, so the second delete is
-    /// silent, and what it leaves behind is a live `PackageSid` whose profile no
-    /// longer exists, which cannot launch (decision 21's measurement of 2026-09-19).
-    fn sid_for(root: &Path) -> PackageSid {
-        PackageSid::derive(&package_name(root)).expect("derive the package SID")
-    }
+    //
+    // **The SID these tests grant to is [`crate::testing::sid_for`]'s** — imported
+    // above, and the same derivation the launcher asks — and each test derives it
+    // **once and holds the value**: `PackageSid` owns the profile behind the SID and
+    // deletes it when the value drops, so two live values for one name would have the
+    // second delete take the profile the first is still using (the measurements are
+    // at the definer's doc).
 
     /// The ACE lines of `icacls`'s rendering of `path`.
     ///

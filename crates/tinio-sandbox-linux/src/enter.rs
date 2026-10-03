@@ -30,7 +30,7 @@ use crate::{
     Mechanism,
     caps::{self, Cap},
     jail::{EXPOSE_STEP, jail_root, mirror_under},
-    mechanism::{Resolved, fail, refused, step, unshare, userns_available},
+    mechanism::{Resolved, fail, refused, step, unshare},
     metrics::{ReadOnlyArm, record_read_only_arm},
     options::Options,
     plan::{Mount, MountKind, OverlayDirs, plan},
@@ -92,7 +92,29 @@ impl crate::Backend {
     /// own.
     #[instrument(skip_all, fields(model = ?opts.model(), euid = opts.euid()))]
     pub(crate) fn enter(&mut self, sandbox: &Sandbox, opts: &Options) -> Result<Confinement> {
+        // **The forced `/proc/self/fd` fallback, resolved once for the run
+        // instead of once per bind.** [`bind_exposure`] used to read
+        // `TINIO_SANDBOX_FORCE_PROC_FALLBACK` for every exposure it bound — the
+        // same answer asked again per mount. The variable is deliberate and
+        // stays: it selects between the two descriptor-bound bind paths —
+        // `open_tree` + `move_mount`, or `mount --bind` of the descriptor's own
+        // `/proc/self/fd` link — so it grants no authority, and it is read in
+        // release builds too (`docs/sandbox.md`). **Not in `Options::from_env`
+        // beside the model**: `Options` is a value the caller builds — the
+        // launcher builds it from the model it already carries rather than
+        // through the environment — so a read there would drop this hook for
+        // exactly the callers that confine in production. Every caller crosses
+        // this boundary, and the answer travels down as a plain value.
+        let proc_fallback = env::var_os("TINIO_SANDBOX_FORCE_PROC_FALLBACK").is_some();
         let prepared = validate_and_plan(sandbox, opts)?;
+        // **The resolution is recorded the moment it answers**, through the same `&mut self`
+        // receiver `seccomp` is written through: `Auto` became one of the two mechanisms here, and
+        // a caller that must state *what confined it* — the facade's `serve::Spec::apply` carries
+        // the answer back in the confinement's own §7 record — reads this value rather than asking
+        // the probe a second time after the confinement (a second confinement-time decision, taken
+        // outside the confinement). `validate_and_plan` has already refused `Unavailable`, so the
+        // field never holds a "no model" answer.
+        self.resolved = Some(prepared.resolved);
         // **The precondition every step below shares, checked before the first
         // of them** (design §8, §10). It sits after validation so an operator's
         // own mistake is still reported as itself, and before
@@ -112,7 +134,19 @@ impl crate::Backend {
         //    hold before anything irreversible — the ancestor symlink, the
         //    existence and the mirror of every exposure — already did.
         let descriptors = open_exposures(sandbox)?;
-        apply_planned_mounts(sandbox, &prepared.mounts, &prepared.overlay, &descriptors)?;
+        apply_planned_mounts(
+            sandbox,
+            &prepared.mounts,
+            &prepared.overlay,
+            &descriptors,
+            proc_fallback,
+        )?;
+        // **The count is recorded where the mounts landed, and it is the plan's own length**:
+        // `apply_planned_mounts` either applies every entry or fails the run, so the number the
+        // backend answers afterwards is the table that was applied rather than a second planning
+        // of it — the same value its own exposure event states (`announce_exposures`). The
+        // facade's `Confined::mounts` and the CLI's in-place re-emit read it from here.
+        self.mounts = prepared.mounts.len();
         // 7. The maps have been read by every mount that needed them, and the
         //    exposure descriptors have been bound; both are closed explicitly
         //    because nothing here ever `exec`s, so `CLOEXEC` never gets a chance
@@ -220,20 +254,15 @@ fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
 /// mechanism that runs. `ret` is the Info event for which model ran (shared §7).
 #[instrument(skip_all, ret, fields(requested = ?opts.model(), euid = opts.euid()))]
 fn resolve_model(opts: &Options) -> Result<Mechanism> {
-    // Design decision 7's three tiers, decided by asking the kernel rather
-    // than guessing: `userns_available` forks a child, so a refusal costs
-    // nothing here. `Auto` needs the answer only when the user namespace
-    // might be the choice; the forced models that do not depend on it skip
-    // the fork.
-    let needs_probe = matches!(opts.model(), Mechanism::UserNamespace | Mechanism::Auto);
-    let resolved = opts.model().resolved(
-        opts.euid(),
-        if needs_probe {
-            userns_available()?
-        } else {
-            false
-        },
-    );
+    // **The probe and the table moved to `Options::resolve`, and the move is the point**: the
+    // facade's run-time gate (`tinio_sandbox::can_confine`, asked by the CLI before a start
+    // writes anything) refuses on the very answer this line applies, so a host that cannot
+    // confine is refused with a cause before the run touches a directory instead of meeting a
+    // late `Unsupported` from inside the confinement. Design decision 7's three tiers live there:
+    // the user namespace when the kernel's probe grants it — `userns_available` forks a child, so
+    // a refusal costs nothing — real root's `CAP_SYS_ADMIN` as the fallback, and
+    // `Resolved::Unavailable` when neither is available.
+    let resolved = opts.resolve()?;
 
     let resolved = match resolved {
         // **The refusal *is* the mapping, and the shape this function used to
@@ -325,7 +354,7 @@ fn validate_exposures(sandbox: &Sandbox) -> Result<()> {
 }
 
 /// Open every validated exposure as the object the bind will use, **in exposure
-/// order** — the order [`Mount::exposure`] indexes.
+/// order** — the order [`MountKind::ExposureBind`] indexes.
 ///
 /// **The open happens after the mount namespace is unshared, and that is the
 /// kernel's requirement rather than a preference**: a mount is bindable only
@@ -706,13 +735,20 @@ fn apply_planned_mounts(
     mounts: &[Mount],
     overlay: &OverlayDirs,
     descriptors: &[ExposureFd],
+    proc_fallback: bool,
 ) -> Result<()> {
     // 6. The mounts, in plan order. **No inherited flags**: a planned mount is
     //    not a remount of anything — `plan` emits no `OverlayReadOnly` — and the
     //    one caller that has them is the read-only arm's fallback, which
     //    re-enters `apply_mount` with them so the trace stays one event per mount.
     for entry in mounts {
-        apply_mount(entry, overlay, MountFlags::empty(), descriptors)?;
+        apply_mount(
+            entry,
+            overlay,
+            MountFlags::empty(),
+            descriptors,
+            proc_fallback,
+        )?;
     }
     announce_exposures(sandbox.exposures(), mounts.len());
     Ok(())
@@ -1003,6 +1039,7 @@ fn apply_mount(
     overlay: &OverlayDirs,
     inherited: MountFlags,
     descriptors: &[ExposureFd],
+    proc_fallback: bool,
 ) -> Result<()> {
     match entry.kind {
         MountKind::JailTmpfs => apply_jail_tmpfs(entry)?,
@@ -1010,10 +1047,14 @@ fn apply_mount(
         // recursive call is the one that traces — falling through would emit a
         // second `mount applied` with the bind's kind (design decision 8).
         //
-        // **The exposure's own descriptor when this mount is one**: `plan`
-        // links every exposure and no other mount, so the device files and the
-        // jail tmpfs keep the path-based bind below.
-        MountKind::Bind => return apply_bind(entry, overlay, descriptors),
+        // **The two binding kinds go to one function, and the kind picks the
+        // form there**: `plan` marks an exposure's own bind
+        // [`MountKind::ExposureBind`], so it binds the descriptor
+        // `open_exposures` opened, while the device files — plain
+        // [`MountKind::Bind`] — keep the path-based bind.
+        MountKind::Bind | MountKind::ExposureBind(_) => {
+            return apply_bind(entry, overlay, descriptors, proc_fallback);
+        }
         MountKind::OverlayReadOnly => apply_overlay_read_only(entry, overlay, inherited)?,
     }
     trace_mount(entry);
@@ -1063,7 +1104,12 @@ fn apply_jail_tmpfs(entry: &Mount) -> Result<()> {
     .map_err(step("mount tmpfs"))
 }
 
-fn apply_bind(entry: &Mount, overlay: &OverlayDirs, descriptors: &[ExposureFd]) -> Result<()> {
+fn apply_bind(
+    entry: &Mount,
+    overlay: &OverlayDirs,
+    descriptors: &[ExposureFd],
+    proc_fallback: bool,
+) -> Result<()> {
     // **"Is the source a directory?", not "is it a file?"** The four
     // device files are character devices, so `is_file()` is false for
     // every one of them: that spelling runs the *directory* branch for
@@ -1082,15 +1128,18 @@ fn apply_bind(entry: &Mount, overlay: &OverlayDirs, descriptors: &[ExposureFd]) 
     }
     // **An exposure binds the descriptor's own object, never the path again**:
     // `open_exposures` resolved the path once, and a rename or a link swap
-    // since then would otherwise decide what lands in the jail.
-    match entry.exposure {
-        Some(index) => {
-            // **Checked, not `descriptors[index]`.** `plan` links every
-            // exposure and no other mount, so the index is in range for every
-            // mount the plan built — but a wrong one read as an index would
-            // panic inside confinement rather than refuse, and design §11 wants
-            // the refusal. Both numbers are named so the mismatch is
-            // diagnosable rather than a bare panic.
+    // since then would otherwise decide what lands in the jail. **The index is
+    // in range for every mount the plan builds** — only `plan` emits
+    // [`MountKind::ExposureBind`], from the same `enumerate()` over
+    // `sandbox.exposures()` that `open_exposures` walks — **but it is still a
+    // `usize`, so an out-of-range one is still representable**: a stale or
+    // hand-built index read as `descriptors[index]` would panic inside
+    // confinement rather than refuse, which is the outcome design §11 forbids.
+    // The lookup is therefore checked, and a miss becomes the crate's ordinary
+    // `bind exposure` refusal naming the mount and both numbers (Task 5's "M2
+    // correction", `docs/superpowers/plans/2026-10-02-known-issues-remediation.md`).
+    match entry.kind {
+        MountKind::ExposureBind(index) => {
             let descriptor = descriptors.get(index).ok_or_else(|| {
                 fail(
                     "bind exposure",
@@ -1101,16 +1150,34 @@ fn apply_bind(entry: &Mount, overlay: &OverlayDirs, descriptors: &[ExposureFd]) 
                     )),
                 )
             })?;
-            bind_exposure(&descriptor.0, &entry.target)?;
+            bind_exposure(&descriptor.0, &entry.target, proc_fallback)?;
         }
         // Recursive, not plain: a bare `MS_BIND` of a mount-point source is
         // refused with EINVAL inside a user namespace (measured), and for a
         // source with no submounts the two forms are identical — so the
         // recursive call is the one to write everywhere.
-        None => mount_bind_recursive(&entry.source, &entry.target).map_err(step("mount --bind"))?,
+        MountKind::Bind => {
+            mount_bind_recursive(&entry.source, &entry.target).map_err(step("mount --bind"))?;
+        }
+        // **The two kinds `apply_mount` routes to their own arms, named rather
+        // than left to a `_` so a fifth `MountKind` cannot silently inherit the
+        // path bind this match used to end in.** Neither is reachable from
+        // confinement; one arriving anyway means that routing and this match
+        // disagree, and it is refused by sentence rather than with
+        // `unreachable!()` — library code does not panic, and the message is
+        // what makes the disagreement diagnosable.
+        MountKind::JailTmpfs | MountKind::OverlayReadOnly => {
+            return Err(fail(
+                "bind exposure",
+                io::Error::other(format!(
+                    "apply_bind was handed a {:?} mount, which apply_mount applies in its own arm",
+                    entry.kind
+                )),
+            ));
+        }
     }
     if entry.access.is_read_only() {
-        return enforce_bind_read_only(entry, overlay, descriptors);
+        return enforce_bind_read_only(entry, overlay, proc_fallback);
     }
     trace_mount(entry);
     Ok(())
@@ -1130,8 +1197,14 @@ fn apply_bind(entry: &Mount, overlay: &OverlayDirs, descriptors: &[ExposureFd]) 
 /// `enter_mount_namespace`), which is what makes it bindable at all: a mount
 /// belongs to the namespace that owns it, and one opened earlier belongs to the
 /// namespace this process left.
-fn bind_exposure(descriptor: &OwnedFd, target: &Path) -> Result<()> {
-    if env::var_os("TINIO_SANDBOX_FORCE_PROC_FALLBACK").is_none() {
+///
+/// **`proc_fallback` is the run's one resolved answer, not a second read of the
+/// variable here**: the confinement boundary reads it once and carries the
+/// decision down, and both arms bind the same held descriptor — the variable
+/// picks *which* of two descriptor-bound paths performs the bind, so it grants no
+/// authority either way.
+fn bind_exposure(descriptor: &OwnedFd, target: &Path, proc_fallback: bool) -> Result<()> {
+    if !proc_fallback {
         let flags = OpenTreeFlags::OPEN_TREE_CLONE
             | OpenTreeFlags::AT_EMPTY_PATH
             | OpenTreeFlags::AT_RECURSIVE;
@@ -1158,14 +1231,11 @@ fn bind_exposure(descriptor: &OwnedFd, target: &Path) -> Result<()> {
 /// Remount the bind read-only, or fall back to the overlay when locked flags
 /// refuse the remount (design decision 8).
 ///
-/// `descriptors` is passed through because the fallback re-enters
-/// [`apply_mount`], which takes them for every bind it may still have to make;
-/// the overlay mounts a filesystem of its own rather than binding one.
-fn enforce_bind_read_only(
-    entry: &Mount,
-    overlay: &OverlayDirs,
-    descriptors: &[ExposureFd],
-) -> Result<()> {
+/// `proc_fallback` is the run's resolved `/proc` decision, passed through
+/// because the fallback re-enters [`apply_mount`] — whose signature carries it
+/// for the bind kinds — even though the substituted `OverlayReadOnly` binds
+/// nothing.
+fn enforce_bind_read_only(entry: &Mount, overlay: &OverlayDirs, proc_fallback: bool) -> Result<()> {
     // **`mount_remount`, not `mount_change`, and this is the primary
     // enforcement of `AccessMode::ReadOnly`** (design decision 8).
     // `mount_change` takes `MountPropagationFlags` — `MountFlags`
@@ -1318,17 +1388,13 @@ fn enforce_bind_read_only(
             record_read_only_arm(ReadOnlyArm::Overlay);
             let fallback = Mount {
                 kind: MountKind::OverlayReadOnly,
-                // **No exposure link here.** `exposure` means "this mount is an
-                // exposure's own bind" (`plan`'s field doc), and `apply_bind`
-                // is its only reader — the overlay arm binds no descriptor, so
-                // a `Some` left over from the clone would be a state no reader
-                // acts on and would contradict the invariant
-                // `every_exposure_bind_is_linked_and_nothing_else_is` pins
-                // (`exposure.is_some() ⇒ kind == Bind`).
-                exposure: None,
                 ..entry.clone()
             };
-            apply_mount(&fallback, overlay, inherited, descriptors)
+            // No descriptors: the substitution is the one way into
+            // [`MountKind::OverlayReadOnly`], which mounts a filesystem of its
+            // own rather than binding one, so the re-entry never reads the
+            // slice. `apply_mount` still takes it because the bind kinds do.
+            apply_mount(&fallback, overlay, inherited, &[], proc_fallback)
         }
         Err(source) => Err(fail("remount ro", source)),
     }
@@ -2316,9 +2382,9 @@ mod tests {
 
     #[test]
     fn the_opened_descriptors_are_in_exposure_order() {
-        // **The order is the link `Mount::exposure` indexes**, so an opener that
-        // returned them in another order — or dropped one — would bind the
-        // wrong object for every exposure after the first. The `/proc/self/fd`
+        // **The order is the link `MountKind::ExposureBind` indexes**, so an
+        // opener that returned them in another order — or dropped one — would
+        // bind the wrong object for every exposure after the first. The `/proc/self/fd`
         // link is the oracle: it is the descriptor's own path, which is exactly
         // what `apply_bind` binds.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2349,12 +2415,16 @@ mod tests {
 
     #[test]
     fn a_mount_naming_a_missing_descriptor_refuses_rather_than_panicking() {
-        // **`Mount::exposure` is in range for every mount `plan` builds, and
-        // this pins the refusal for the one that is not.** The link is an
-        // index, and reading a wrong one with `descriptors[index]` would panic
-        // inside confinement rather than refuse — the outcome design §11
-        // forbids. `plan`'s own output never carries a wrong index, so a
-        // hand-built mount is the only way to reach the guard.
+        // **`MountKind::ExposureBind`'s index is in range for every mount
+        // `plan` builds, and this pins the refusal for the one that is not.**
+        // The kind makes an index on a non-bind mount unrepresentable, but any
+        // `usize` is still representable: reading a wrong one with
+        // `descriptors[index]` would panic inside confinement rather than
+        // refuse — the outcome design §11 forbids — so the lookup is checked
+        // and a miss is the crate's ordinary `bind exposure` refusal (Task 5's
+        // "M2 correction", `docs/superpowers/plans/2026-10-02-known-issues-remediation.md`).
+        // `plan`'s own output never carries a wrong index, so a hand-built
+        // mount is the only way to reach the guard.
         let dir = tempfile::tempdir().expect("temp dir");
         let source = dir.path().join("served");
         fs::create_dir(&source).expect("source");
@@ -2370,14 +2440,13 @@ mod tests {
             source,
             target: dir.path().join("jail/served"),
             access: AccessMode::ReadOnly,
-            kind: MountKind::Bind,
-            exposure: Some(2),
+            kind: MountKind::ExposureBind(2),
         };
         let overlay = OverlayDirs {
             upper: dir.path().join("upper"),
             work: dir.path().join("work"),
         };
-        let err = apply_bind(&entry, &overlay, &descriptors)
+        let err = apply_bind(&entry, &overlay, &descriptors, false)
             .expect_err("only one descriptor was opened, so index 2 is missing");
         assert!(
             matches!(err, Error::Step { step, .. } if step == "bind exposure"),
@@ -2544,7 +2613,6 @@ mod tests {
             target: target.clone(),
             access: AccessMode::ReadOnly,
             kind: MountKind::Bind,
-            exposure: None,
         };
         // The table is the caller's one read, so a test can hand it the shape it
         // needs — and what it hands is a real `/proc/self/mountinfo` line. Its
@@ -2611,9 +2679,8 @@ mod tests {
             target: tmp.path().join("jail/gone"),
             access: AccessMode::ReadOnly,
             kind: MountKind::Bind,
-            exposure: None,
         };
-        let err = enforce_bind_read_only(&entry, &overlay, &[])
+        let err = enforce_bind_read_only(&entry, &overlay, false)
             .expect_err("a source that is not there cannot be resolved");
         assert!(
             matches!(
@@ -2664,7 +2731,9 @@ mod tests {
         assert_eq!(prepared.mounts.len(), 2, "the tmpfs and the one exposure");
         assert_eq!(
             prepared.mounts.last().map(|mount| mount.kind),
-            Some(MountKind::Bind)
+            Some(MountKind::ExposureBind(0)),
+            "an exposure is bound by its descriptor, and the index rides in the kind — an index \
+             on a non-exposure mount is unrepresentable"
         );
         // **Planning is not creating**: the jail root is the first thing the
         // confinement does to the host, and a refusal from `plan` has to leave

@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    env, fs, mem,
+    env, fs,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::Command,
@@ -31,7 +31,7 @@ use tinio_util::testing::host_cannot;
 ///
 /// **`extra` is the leg's own additions**, and it exists for the one hook that
 /// is not a fact about the host: the forced `/proc/self/fd` fallback, which the
-/// child reads from its environment *after* it has confined itself.
+/// child resolves from its environment as it confines itself.
 fn child_environment(
     command: &mut Command,
     root: &Path,
@@ -135,12 +135,12 @@ fn probe_listener() -> (TcpListener, SocketAddr) {
 /// directory beside it, a scratch `HOME` the child probes, and the parent's
 /// probe listener.
 ///
-/// **The listener is leaked rather than returned**, because it has to outlive
-/// the child ([`probe_listener`] carries the reason) and this tuple has no room
-/// for it: `mem::forget` keeps the descriptor — and its bound port — for the
-/// rest of the test process, which is deliberate in a test binary and never
-/// released.
-fn jail_fixture(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, SocketAddr, Option<PathBuf>) {
+/// **The listener is returned rather than leaked**, and the caller binds it to
+/// a name so it outlives the child ([`probe_listener`] carries the reason):
+/// dropping it first would leave the child's `connect` nothing to reach, and
+/// the assertion it feeds is the one that separates the filter's
+/// `PermissionDenied` from `ConnectionRefused`.
+fn jail_fixture(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, SocketAddr, PathBuf, TcpListener) {
     let root = dir.path().join("root");
     let state = dir.path().join("state");
     let home = dir.path().join("home");
@@ -150,16 +150,15 @@ fn jail_fixture(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, SocketAddr, Optio
     fs::write(root.join("bucket/obj.txt"), "hello from the served root\n").expect("seed");
 
     let (listener, probe) = probe_listener();
-    mem::forget(listener);
-    (root, home, probe, Some(state))
+    (root, home, probe, state, listener)
 }
 
 #[test]
 fn the_jail_confines_the_process() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (root, home, probe, state) = jail_fixture(&tmp);
+    let (root, home, probe, state, _listener) = jail_fixture(&tmp);
 
-    let Some(log) = run_child(&root, state.as_deref(), &home, "read-write", probe) else {
+    let Some(log) = run_child(&root, Some(&state), &home, "read-write", probe) else {
         return;
     };
 
@@ -182,21 +181,21 @@ fn the_jail_confines_the_process() {
 /// The `/proc/self/fd` fallback forced, and the same invariants as the leg
 /// above.
 ///
-/// **The hook is the child's environment, not this process's**: the fallback is
-/// chosen where the bind is made, which is after the confinement, so the
-/// variable is handed to the spawned child through `child_environment`'s
-/// `extra`. **This is the only leg that reaches the fallback branch** — measured
+/// **The hook is the child's environment, not this process's**: the choice is
+/// the confining process's own, so the variable is handed to the spawned child
+/// through `child_environment`'s `extra`. **This is the only leg that reaches
+/// the fallback branch** — measured
 /// by making that branch answer `Unsupported`, which reddens this leg alone —
 /// so what it proves is that the fallback confines identically, and that the
 /// `open_tree` path the other legs take is not the only one that works.
 #[test]
 fn the_forced_proc_fallback_confines_identically() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (root, home, probe, state) = jail_fixture(&dir);
+    let (root, home, probe, state, _listener) = jail_fixture(&dir);
 
     let Some(log) = run_child_with_env(
         &root,
-        state.as_deref(),
+        Some(&state),
         &home,
         "read-write",
         probe,

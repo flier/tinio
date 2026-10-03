@@ -4,28 +4,31 @@ use std::{net::TcpListener, path::PathBuf};
 
 use secrecy::ExposeSecret;
 
-// **`Error` is named only by the arms that build a refusal**, and every one of them is
-// non-Linux: `apply_platform`'s other-target arm and `map_confinement`'s launcher-platform arm.
-// A Linux build reaches its failures through `?` and never spells the type, so the import
-// carries their cfg — and `Spec::apply`'s doc links the variant by full path, the way it names
-// an item no target imports.
-#[cfg(not(target_os = "linux"))]
-use crate::Error;
-// **The model vocabulary `Spec::model` carries is the facade's `Mechanism`** — the same name the
-// reader that answers it is published under (`crate::requested_model`), so the knob and the
-// environment's answer are one type with one home.
+// **The platform vocabulary `Confined` carries on Linux** — the resolved mechanism and the
+// network filter's outcome, the two facts the in-place re-emit states after the confinement.
 #[cfg(target_os = "linux")]
-use crate::Mechanism;
+use crate::_linux::{Mechanism, Seccomp};
+// **Every arm of this module can build a refusal** — the launcher platforms' `InPlace` arm, the
+// no-backend arm, and the Linux arm's unresolved-mechanism guard — so the error type is imported
+// on every target rather than under a `cfg` no arm can be trusted to keep true.
+use crate::Error;
 use crate::{
     _core::{Secret, SecretKey},
-    AccessMode, Child, Confinement, ControlHandle, LaunchPlan, Result, Sandbox,
+    AccessMode, Child, Confinement, ControlHandle, LaunchPlan, Result, Sandbox, describe_exposures,
 };
 
-/// How a caller asks this process (or a child) to be confined — builder in, [`Option<Child>`] out.
+/// How a caller asks this process (or a child) to be confined — builder in, [`Confined`] out.
 ///
 /// **Inputs are sandbox vocabulary only**: exposures, config text, an already-bound listener,
-/// control handles, a token string, and Linux knobs. No clap, config keys, or management-plane
-/// types (design `2026-09-27-sandbox-servespec-seam-design.md`).
+/// control handles, a token string, and the Linux `local_uid` knob. No clap, config keys, or
+/// management-plane types (design `2026-09-27-sandbox-servespec-seam-design.md`).
+///
+/// **What the spec does not carry is the Linux model.** It used to (a `model` field fed by the
+/// caller), because the CLI had to state the *request* after a confinement that consumed the
+/// spec — and the value rode a facade re-export so the CLI could name its type. The resolved
+/// model now travels back in [`Confined`] instead, read from the backend that applied it, so the
+/// request is stated by the one reader that owns it (`Options::from_env`) and the answer is the
+/// confinement's own.
 ///
 /// **The token is a [`Secret`]** — the shared `SecretBox` layer; redacted from `Debug` by
 /// construction. A `Spec` is the value a caller holds while a launch is assembled, so a failing
@@ -66,14 +69,6 @@ pub struct Spec {
     /// `Option` still shows whether a token was set.
     token: Option<Secret>,
     local_uid: bool,
-    /// The Linux confinement model a caller carried, when it carried one — the value
-    /// [`crate::requested_model`] answers for whoever must state the request after the
-    /// confinement has run. **`None` is `TINIO_SANDBOX_MODEL`'s own read, not the default**:
-    /// the Linux arm then builds its `Options` from `Options::from_env()` exactly as it always
-    /// has, which is what a caller with no model to carry — the `Spec::new().apply()` doctest,
-    /// any launcher that never had one — still gets.
-    #[cfg(target_os = "linux")]
-    model: Option<Mechanism>,
 }
 
 impl Spec {
@@ -293,59 +288,6 @@ impl Spec {
         self.local_uid
     }
 
-    /// Carry the Linux model the environment asked for, as a value — the second Linux knob,
-    /// beside [`Self::local_uid`], and the one the confinement's own options are built from.
-    ///
-    /// **Why the value is carried rather than spelled here.** [`crate::requested_model`] reads
-    /// `TINIO_SANDBOX_MODEL` once, on the backend's own parser, and a caller that also has to
-    /// state the request *after* the confinement has run (the CLI's in-place re-emit) hands the
-    /// answer back through this knob. The Linux arm then builds `Options` from that value
-    /// instead of reading the variable again, so the value the caller states and the value the
-    /// confinement applied cannot be two answers to one question.
-    ///
-    /// **A `Spec` that carries none reads the environment itself**, which is the mandatory
-    /// shape: `sandbox-child` and the crate's own `apply()` doctest never touch a `Spec`, and a
-    /// knob that had to be set would break both.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # #[cfg(target_os = "linux")]
-    /// # fn main() {
-    /// use tinio_sandbox::{Mechanism, serve};
-    ///
-    /// let spec = serve::Spec::new().model(Mechanism::UserNamespace);
-    /// assert_eq!(spec.model_configured(), Some(Mechanism::UserNamespace));
-    /// # }
-    /// # #[cfg(not(target_os = "linux"))]
-    /// # fn main() {}
-    /// ```
-    #[cfg(target_os = "linux")]
-    pub fn model(mut self, model: Mechanism) -> Self {
-        self.model = Some(model);
-        self
-    }
-
-    /// The model [`Self::model`] carried, or `None` when the environment's own read is what the
-    /// Linux arm will build its options from.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # #[cfg(target_os = "linux")]
-    /// # fn main() {
-    /// use tinio_sandbox::serve;
-    ///
-    /// assert_eq!(serve::Spec::new().model_configured(), None);
-    /// # }
-    /// # #[cfg(not(target_os = "linux"))]
-    /// # fn main() {}
-    /// ```
-    #[cfg(target_os = "linux")]
-    pub fn model_configured(&self) -> Option<Mechanism> {
-        self.model
-    }
-
     /// The exposure set the spec will confine.
     ///
     /// # Examples
@@ -360,10 +302,12 @@ impl Spec {
         &self.sandbox
     }
 
-    /// Build platform Options from the environment, confine, and map the shape.
+    /// Build platform Options from the environment, confine, and answer with **what the
+    /// confinement applied** ([`Confined`]).
     ///
-    /// - **Linux** `InPlace` → `Ok(None)`; prints a stderr warning when seccomp was skipped.
-    /// - **macOS / Windows** `Supervise` → `Ok(Some(child))`; `InPlace` → refuse.
+    /// - **Linux** `InPlace` → a [`Confined`] with no child, carrying the resolved model, the
+    ///   exposure count and the network filter's outcome.
+    /// - **macOS / Windows** `Supervise` → a [`Confined`] carrying the child; `InPlace` → refuse.
     /// - **Other targets** → [`Error::Unsupported`].
     ///
     /// # Errors
@@ -382,7 +326,7 @@ impl Spec {
     ///     .expose("/srv/data", AccessMode::ReadWrite)
     ///     .apply();
     /// ```
-    pub fn apply(self) -> Result<Option<Child>> {
+    pub fn apply(self) -> Result<Confined> {
         apply_platform(self)
     }
 
@@ -403,6 +347,87 @@ impl Spec {
         }
         (self.sandbox, plan)
     }
+}
+
+/// What a [`Spec::apply`] confined — **the facts the confinement itself answered with**, so a
+/// caller that must state them after the call (the CLI's in-place re-emit, whose subscriber is
+/// installed *after* the confinement) reads them off this value rather than re-deriving them.
+///
+/// **Every fact here has one owner, and it is not the caller**: `child` is the launch, `model`
+/// and `seccomp` are the backend's post-apply state (`LinuxBackend::resolved`/`seccomp` — the
+/// same accessors `enter` writes), `mounts` is the mount plan that backend applied, and
+/// `exposures`/`rendered_exposures` are the exposure set the confinement was handed and its one
+/// rendering ([`describe_exposures`], composed while the set was in hand). The alternative shape
+/// — a caller carrying a *request* in and re-stating it afterwards — is what made the CLI resolve
+/// `TINIO_SANDBOX_MODEL` twice and name a platform type of its own.
+///
+/// **No field can carry a secret, and the one string is why that is argued rather than
+/// asserted.** `rendered_exposures` is the exposure set's own rendering — host paths and their
+/// access, composed by the core's renderer from the same value the confinement applied — so the
+/// `Spec`'s token has no route into it: the string is not the spec's, and no other field is a
+/// string at all.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(target_os = "linux")]
+/// # fn main() {
+/// use tinio_sandbox::{linux::Mechanism, serve::Confined};
+///
+/// // What an in-place confinement answers with: this process is the confined one.
+/// let confined = Confined {
+///     child: None,
+///     exposures: 2,
+///     mounts: 6,
+///     rendered_exposures: String::from("/srv/data (read-write), /srv/state (read-write)"),
+///     model: Mechanism::Root,
+///     seccomp: None,
+/// };
+/// assert_eq!(confined.mounts, 6);
+/// assert!(confined.rendered_exposures.contains("/srv/data"));
+/// # }
+/// # #[cfg(not(target_os = "linux"))]
+/// # fn main() {
+/// use tinio_sandbox::serve::Confined;
+///
+/// // A launcher arm answers with the child it spawned; its confinement applies the exposure set
+/// // as grants rather than mounts, so the mount count is the jail's own zero.
+/// let confined = Confined {
+///     child: None,
+///     exposures: 2,
+///     mounts: 0,
+///     rendered_exposures: String::from("/srv/data (read-write), /srv/state (read-write)"),
+/// };
+/// assert_eq!(confined.exposures, 2);
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct Confined {
+    /// The confined child, where this target launches one. `None` is the in-place arm: the
+    /// calling process is the one that was confined, so there is no child to drive.
+    pub child: Option<Child>,
+    /// How many exposures the confinement applied — the [`Sandbox`]'s own set size, read where
+    /// the confinement ran because `apply` consumed the spec that held it.
+    pub exposures: usize,
+    /// How many mounts the jail applied — the exposure binds plus the jail's own entries (its
+    /// root, and the four device files on Linux), recorded by the backend that performed them
+    /// (`LinuxBackend::mounts`) rather than re-planned here. **Zero on a launcher platform**,
+    /// which applies its set as profile or ACL grants and mounts nothing.
+    pub mounts: usize,
+    /// The exposure set, rendered by the core's [`describe_exposures`] (`host (access)`,
+    /// comma-joined) — §7's exposure event carries it under this name, and the in-place re-emit
+    /// states it from here because that event is emitted before the arm's subscriber exists.
+    /// Read off the same set the confinement was handed rather than re-derived afterwards.
+    pub rendered_exposures: String,
+    /// The mechanism the confinement resolved and applied — **`Auto` resolved against this
+    /// kernel, never the request** (`LinuxBackend::resolved`'s answer, which the run-time gate
+    /// asked the same question of).
+    #[cfg(target_os = "linux")]
+    pub model: Mechanism,
+    /// What the network filter did (`LinuxBackend::seccomp`'s answer), or `None` where this
+    /// target installs none.
+    #[cfg(target_os = "linux")]
+    pub seccomp: Option<Seccomp>,
 }
 
 /// Map a backend's [`Confinement`] into the facade's `Option<Child>` answer.
@@ -439,47 +464,60 @@ const LAUNCHER_IN_PLACE: &str = "this platform's backend must supervise its chil
                                  confine in place: nothing was confined, so the run is refused";
 
 #[cfg(target_os = "linux")]
-fn apply_platform(spec: Spec) -> Result<Option<Child>> {
+fn apply_platform(spec: Spec) -> Result<Confined> {
     use crate::{
-        _linux::{Backend as LinuxBackend, Options, Seccomp},
+        _linux::{Backend as LinuxBackend, Options},
         Backend,
     };
 
     let local_uid = spec.local_uid;
-    let model = spec.model;
     let (sandbox, plan) = spec.into_plan();
     // **The device nodes are this platform's own, not the caller's choice**: alongside
     // `local_uid`, they are what a Linux jail needs to be a jail, so they are asked for here
     // rather than carried on the business-agnostic builder — where the only caller that could
     // set them always did, and a caller that did not got a silent no-op.
     //
-    // **The model is the caller's when it carried one, and the environment's read otherwise**:
-    // a carried value was read once, on the backend's own parser (`crate::requested_model`), so
-    // this arm does not read the variable a second time behind the caller's back; `None` keeps
-    // the read that a caller with no model to carry — the `apply()` doctest, a hand-built
-    // `Spec` — has always had.
-    let options = match model {
-        Some(model) => Options::default().with_model(model),
-        None => Options::from_env()?,
-    }
-    .with_device_files(true)
-    .with_local_uid(local_uid);
+    // **The model is the environment's own read, and the only one.** `Options::from_env` is the
+    // variable's one reader (`TINIO_SANDBOX_MODEL`); the spec carries no model and no caller
+    // states a request, because the *resolved* mechanism travels back on the answer instead
+    // (`Confined::model`, read off the backend below).
+    let options = Options::from_env()?
+        .with_device_files(true)
+        .with_local_uid(local_uid);
     let mut backend = LinuxBackend::with_options(options);
     let confinement = backend.confine(&sandbox, &plan)?;
     let child = map_confinement(confinement)?;
-    if child.is_none() && backend.seccomp() == Some(Seccomp::SkippedUnsupportedArch) {
-        // The backend also emitted a `warn!` through the subscriber; this line is for whoever
-        // watches a startup rather than a log (stdout is the event channel).
-        eprintln!(
-            "warning: this architecture has no seccomp table, so outbound \
-             connections are NOT blocked; the directory confinement still holds"
-        );
-    }
-    Ok(child)
+    // **The facts are the backend's, read after the confinement — never re-derived here.** The
+    // resolved mechanism is `Some` by construction after a successful confine (`enter` records it
+    // the moment the resolution answers, and an unavailable one is refused before that), so a
+    // `None` is an answer this facade cannot carry and is refused rather than assumed. The
+    // seccomp skip that this arm used to `eprintln!` now travels on the answer: the caller that
+    // installs a subscriber *after* this call is the one that reports §7's record, and it reports
+    // the degradation once, from this outcome.
+    //
+    // **The exposure facts travel the same way, and the set is the one this call acted on**: the
+    // mount count is the plan the backend applied (`LinuxBackend::mounts`), and the rendered list
+    // is [`describe_exposures`] over `sandbox.exposures()` — the very value handed to `confine`
+    // above, so the re-emit states the paths that were mounted rather than a second answer
+    // derived after the spec is gone.
+    let Some(model) = backend.resolved() else {
+        return Err(Error::Unsupported {
+            detail: "the confinement answered without resolving a mechanism: nothing was \
+                     confined, so the run is refused",
+        });
+    };
+    Ok(Confined {
+        child,
+        exposures: sandbox.exposures().len(),
+        mounts: backend.mounts(),
+        rendered_exposures: describe_exposures(sandbox.exposures()),
+        model,
+        seccomp: backend.seccomp(),
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn apply_platform(spec: Spec) -> Result<Option<Child>> {
+fn apply_platform(spec: Spec) -> Result<Confined> {
     use crate::{
         _macos::{Backend as MacosBackend, Options},
         Backend,
@@ -497,11 +535,19 @@ fn apply_platform(spec: Spec) -> Result<Option<Child>> {
     );
     let mut backend = MacosBackend::with_options(options);
     let confinement = backend.confine(&sandbox, &plan)?;
-    map_confinement(confinement)
+    Ok(Confined {
+        child: map_confinement(confinement)?,
+        exposures: sandbox.exposures().len(),
+        // **No mounts on this arm**: the profile grants the set rather than binding it, so the
+        // count is the jail's own zero while the rendered list is the value the confinement was
+        // handed — the set the launch granted, in the one rendering `describe_exposures` owns.
+        mounts: 0,
+        rendered_exposures: describe_exposures(sandbox.exposures()),
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn apply_platform(spec: Spec) -> Result<Option<Child>> {
+fn apply_platform(spec: Spec) -> Result<Confined> {
     use std::env;
 
     use crate::{
@@ -518,13 +564,20 @@ fn apply_platform(spec: Spec) -> Result<Option<Child>> {
     };
     let mut backend = WindowsBackend::with_options(options);
     let confinement = backend.confine(&sandbox, &plan)?;
-    map_confinement(confinement)
+    Ok(Confined {
+        child: map_confinement(confinement)?,
+        exposures: sandbox.exposures().len(),
+        // The same two facts as the macOS arm's, for the same reason: the capability set's ACL
+        // grants are not mounts, and the rendered list is the set this launch was handed.
+        mounts: 0,
+        rendered_exposures: describe_exposures(sandbox.exposures()),
+    })
 }
 
 /// No backend at all: a target this crate was built for without one is a refusal, not a
 /// silently unconfined run.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn apply_platform(spec: Spec) -> Result<Option<Child>> {
+fn apply_platform(spec: Spec) -> Result<Confined> {
     let _ = spec;
     Err(Error::Unsupported {
         detail: "no confinement backend is wired for this target",
@@ -547,14 +600,32 @@ mod tests {
         assert!(spec.local_uid_configured());
     }
 
-    /// The Linux model knob: **a carried value is the answer, and absence is `None` rather than
-    /// a default** — the arm's fallback to `Options::from_env()` is what the absence means.
+    /// **The apply answer carries the platform's own facts, and this leg is where the deleted
+    /// model knob's contract moved.** The old leg asserted that a *carried request* answered back
+    /// out; nothing carries a request any more — [`Confined`] is the confinement's own answer —
+    /// so what this pins is that the Linux answer is the whole of what a caller states the run
+    /// with: the exposure count and its rendering, the mount count, the resolved mechanism and
+    /// the filter's outcome, none of them a value the caller fed in.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_model_knob_records_what_the_environment_asked_for() {
-        assert_eq!(Spec::new().model_configured(), None);
-        let spec = Spec::new().model(crate::Mechanism::Root);
-        assert_eq!(spec.model_configured(), Some(crate::Mechanism::Root));
+    fn the_apply_answer_carries_the_platforms_own_facts() {
+        let confined = Confined {
+            child: None,
+            exposures: 2,
+            mounts: 6,
+            rendered_exposures: String::from("/srv/data (read-write), /srv/state (read-write)"),
+            model: Mechanism::UserNamespace,
+            seccomp: Some(Seccomp::Installed),
+        };
+        assert_eq!(confined.exposures, 2);
+        assert_eq!(confined.mounts, 6);
+        assert!(
+            confined
+                .rendered_exposures
+                .contains("/srv/data (read-write)")
+        );
+        assert_eq!(confined.model, Mechanism::UserNamespace);
+        assert_eq!(confined.seccomp, Some(Seccomp::Installed));
     }
 
     #[test]

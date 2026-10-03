@@ -110,8 +110,32 @@ pub(crate) fn seed_config(root: &Path) {
 /// one `FsOptions` mapping: while following is enabled the link entries are served, so the row is
 /// `ok` there and `warn` only while following is disabled (the doctor section's symlink-check bullet).
 pub(crate) fn seed_config_with(root: &Path, follow_symlinks: bool) {
+    seed_config_file(root, follow_symlinks, true);
+}
+
+/// [`seed_config`]'s file **without the `[auth]` pair**: a configuration that exists and has no
+/// credential section, which is the case the no-`[auth]` row is about (the generated-credentials
+/// case is a *missing* file, which neither fixture produces). The reserved directory, the file
+/// name and the format stay spelled in [`seed_config_file`] alone — the row is asserted on the
+/// detail, so a test that spelled its own TOML could drift from what a real root holds.
+pub(crate) fn seed_config_without_auth(root: &Path) {
+    seed_config_file(root, false, false);
+}
+
+/// The one place the reserved directory, the file name and the TOML are written.
+fn seed_config_file(root: &Path, follow_symlinks: bool, with_auth: bool) {
     let dir = root.join(".tinio");
     fs::create_dir_all(&dir).expect("reserved dir");
+    // The complete fixture's pair, absent only for the variant whose whole subject is that
+    // absence ([`seed_config`]'s doc carries why the pair is load-bearing), so it is a flag
+    // here rather than a second TOML literal in the test that needs it.
+    let auth = if with_auth {
+        "[auth]\n\
+         access_key = \"minioadmin\"\n\
+         secret_key = \"minioadmin-secret\"\n"
+    } else {
+        ""
+    };
     fs::write(
         dir.join(".tinio.toml"),
         format!(
@@ -120,10 +144,7 @@ pub(crate) fn seed_config_with(root: &Path, follow_symlinks: bool) {
              host = \"127.0.0.1\"\n\
              port = 9000\n\
              [storage.fs]\n\
-             follow_symlinks = {follow_symlinks}\n\
-             [auth]\n\
-             access_key = \"minioadmin\"\n\
-             secret_key = \"minioadmin-secret\"\n"
+             follow_symlinks = {follow_symlinks}\n{auth}"
         ),
     )
     .expect("seed the configuration");

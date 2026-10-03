@@ -118,10 +118,11 @@ fn the_launcher_surface_is_re_exported() {
     };
 
     // serve::Spec is the facade's own confine entry (not a core re-export): bind the constructor
-    // and apply so a rename or drop fails here rather than only at a CLI call site.
+    // and apply so a rename or drop fails here rather than only at a CLI call site. The answer is
+    // the facade's `Confined` — the facts the confinement applied, alongside the child a launcher
+    // arm hands back — so the binding pins that shape too.
     let _: fn() -> serve::Spec = serve::Spec::new;
-    let _: fn(serve::Spec) -> tinio_sandbox::Result<Option<tinio_sandbox::Child>> =
-        serve::Spec::apply;
+    let _: fn(serve::Spec) -> tinio_sandbox::Result<serve::Confined> = serve::Spec::apply;
 
     // The vocabulary — Task 1's half of the surface.
     let _: fn() -> core::Sandbox = tinio_sandbox::Sandbox::new;
@@ -225,6 +226,10 @@ fn the_launcher_surface_is_re_exported() {
     let _: fn(&OsStr) -> bool = tinio_sandbox::is_control_fd_arg;
     let _: fn(&OsStr) -> Option<i64> = tinio_sandbox::control_fd_from_arg;
     let _: &str = tinio_sandbox::CONTROL_FD_PREFIX;
+    // **Linux's one degradation, bound as the sentence it is**: the backend emits it where the
+    // filter is skipped and the CLI re-emits it after the in-place confinement, so one home for
+    // the text is what keeps the two log lines from drifting apart.
+    let _: &str = tinio_sandbox::SECCOMP_SKIP_WARNING;
     // **The confinement a launcher hands a child that confines itself**, and the reason
     // this guard had to be widened: it is the public field type of
     // `LaunchPayload::confinement` and the answer `Adopted::confinement` gives, so a

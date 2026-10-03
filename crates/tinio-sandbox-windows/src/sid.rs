@@ -48,7 +48,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    _core::{Result, launch},
+    _core::{Error, Result, launch},
     backend::Capability,
     capability,
     handles::last_error,
@@ -1108,6 +1108,24 @@ impl Drop for ProfileLock {
     }
 }
 
+/// A profile call's HRESULT, as the error it belongs to: the classified refusal, or
+/// [`Error::Launch`](tinio_sandbox_core::Error::Launch) naming the step and the code.
+///
+/// **One rule, one place.** Both of [`PackageSid::derive`]'s `hr != 0` arms state it — a
+/// capability answer becomes the refusal, anything else keeps the old path — and they used to
+/// spell it in two shapes, one with a silent `unwrap_or_else` and one with a bare `format!` of
+/// the same sentence. The classification itself stays [`capability::classify`]'s; what lives
+/// here is only the fallback and the `hr=0x{:08X}` rendering, so the arms cannot drift apart.
+fn classified(step: &'static str, name: &str, hr: i32) -> Error {
+    capability::classify(hr).unwrap_or_else(|| {
+        launch(
+            step,
+            name,
+            io::Error::other(format!("{step}: hr=0x{hr:08X}")),
+        )
+    })
+}
+
 /// A created package SID **and the profile behind it**, alive for as long as
 /// anything needs them.
 ///
@@ -1213,34 +1231,24 @@ impl PackageSid {
             // as the API documents.
             let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut raw) };
             if hr != 0 {
-                return Err(capability::classify(hr).unwrap_or_else(|| {
-                    launch(
-                        "DeriveAppContainerSidFromAppContainerName",
-                        name,
-                        io::Error::other(format!(
-                            "DeriveAppContainerSidFromAppContainerName: hr=0x{hr:08X}"
-                        )),
-                    )
-                }));
+                return Err(classified(
+                    "DeriveAppContainerSidFromAppContainerName",
+                    name,
+                    hr,
+                ));
             }
         } else if hr != 0 {
             // **The floor.** Whatever a preflight said, the call that actually fails classifies
             // its own HRESULT, so an operator on a host no preflight anticipated still reads a
             // cause and two actions rather than a bare code.
-            if let Some(err) = capability::classify(hr) {
-                tracing::warn!(
-                    step = "host cannot confine",
-                    name = name,
-                    hr = hr,
-                    "the token cannot create an AppContainer profile; the refusal names the cause and the remedy"
-                );
-                return Err(err);
+            //
+            // **The refusal's event belongs to this arm** — the create, the call whose profile
+            // an operator is asking about — and `capability::refuse` is its one producer; the
+            // takeover arm above classifies without announcing.
+            if capability::classify(hr).is_some() {
+                return Err(capability::refuse(hr, name));
             }
-            return Err(launch(
-                "CreateAppContainerProfile",
-                name,
-                io::Error::other(format!("CreateAppContainerProfile: hr=0x{hr:08X}")),
-            ));
+            return Err(classified("CreateAppContainerProfile", name, hr));
         }
         if raw.is_null() {
             // Neither call leaves the out-parameter null on the success it
@@ -2265,16 +2273,33 @@ mod tests {
             derive.contains("let taken_over = hr == HRESULT_ALREADY_EXISTS;"),
             "the extraction found derive's body"
         );
+        // **The property is the delegation, not the classifier's own text.** Both `hr != 0`
+        // arms hand their HRESULT to `classified`, which is the one place the classify-or-
+        // launch rule lives, so a third spelling of it cannot appear without this failing.
         assert_eq!(
-            derive.matches("capability::classify(hr)").count(),
+            derive.matches("classified(").count(),
             2,
-            "both of derive's `hr != 0` arms classify"
+            "both of derive's `hr != 0` arms classify through the one helper"
         );
-        // **The log half is pinned too.** Without this the whole `warn!` block can be deleted
-        // with the suite green, and the step line is the surface the suites read.
+        // And the helper is where the classification itself lives, so the arms' delegation
+        // cannot keep passing while the rule it delegates to stops classifying.
+        let classified = function_body(include_str!("sid.rs"), "fn classified(step: &'static str");
         assert!(
-            derive.contains("step = \"host cannot confine\""),
-            "the refusal emits the step event"
+            classified.contains("capability::classify(hr)"),
+            "the helper is the one place derive's HRESULTs are classified"
+        );
+        // **The log half is pinned by the delegation.** The `warn!` moved into its one
+        // producer, `capability::refuse` — whose own test records the event — so what this
+        // region still has to show is that the create arm, and not the takeover arm above,
+        // routes its refusal through that producer.
+        assert_eq!(
+            derive.matches("capability::refuse(").count(),
+            1,
+            "the create arm emits the refusal through its one producer"
+        );
+        assert!(
+            derive.contains("capability::refuse(hr, name)"),
+            "and it refuses the profile this call named"
         );
     }
 

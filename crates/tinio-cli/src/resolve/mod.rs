@@ -184,6 +184,152 @@ impl Resolution {
             self.config.server.port,
         )
     }
+
+    /// The credential policy this resolution's bind falls under (audit run-2, P2).
+    ///
+    /// **The built-in pair is a development credential, and this is where that becomes a
+    /// policy**: a config with no `[auth]` section serves [`identity::root_auth_pair`]'s
+    /// documented fallback, which is not a credential at all — so a bind another host can reach
+    /// refuses to start rather than publishing it, while a loopback bind serves it with a
+    /// warning. A configured pair is unaffected: the pair the operator chose is theirs to
+    /// expose.
+    ///
+    /// **The predicate is [`identity::uses_builtin_fallback`]** (never `config.auth.is_none()`,
+    /// which would be a second definer of one rule), and both sentences are the policy's own
+    /// ([`CredentialPolicy`]), so the refusal and the warning render one source.
+    ///
+    /// **The change it carries is audit run-2 P2's loopback-only development credential**, and it
+    /// stays `pub` although no crate outside `tinio-cli` reads it: its own runnable example (and
+    /// [`CredentialPolicy`]'s) names it from outside the crate, which a `pub(crate)` item cannot
+    /// be named by.
+    ///
+    /// # Errors
+    ///
+    /// The address parse [`Resolution::address`] reports: a `[server] host` that is not a bind
+    /// address is refused here as it is there.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::path::PathBuf;
+    ///
+    /// use tinio_cli::resolve::{CredentialPolicy, Resolution};
+    /// use tinio_config::Config;
+    ///
+    /// let resolution = Resolution {
+    ///     root: PathBuf::from("/srv/data"),
+    ///     config: Config::parse("version = 1\n[server]\nhost = \"0.0.0.0\"\n").expect("config"),
+    ///     config_text: String::new(),
+    ///     config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
+    ///     read_only: false,
+    ///     state_dir: PathBuf::from("/srv/data/.tinio"),
+    ///     state_dir_override: None,
+    ///     config_error: None,
+    /// };
+    /// assert_eq!(
+    ///     resolution
+    ///         .credential_policy()
+    ///         .expect("the bind address parses"),
+    ///     CredentialPolicy::BuiltinExposed
+    /// );
+    /// ```
+    pub fn credential_policy(&self) -> Result<CredentialPolicy, Error> {
+        if !identity::uses_builtin_fallback(&self.config) {
+            return Ok(CredentialPolicy::Configured);
+        }
+        Ok(if self.address()?.ip().is_loopback() {
+            CredentialPolicy::BuiltinLoopback
+        } else {
+            CredentialPolicy::BuiltinExposed
+        })
+    }
+}
+
+/// Which credential policy a start's bind falls under (audit run-2, P2).
+///
+/// **One decision about the built-in fallback pair**, taken where the resolution and the bind are
+/// both in hand ([`Resolution::credential_policy`]): the refusal is `commands::start::run`'s
+/// static half — raised before the fork and before the directories below it, so a refused start
+/// has not repaired the root or jailed itself — and the loopback warning is the serving half's,
+/// rendered by the same rule.
+///
+/// **The change it carries is audit run-2 P2's loopback-only development credential**, and it
+/// stays `pub` although no crate outside `tinio-cli` reads it: the runnable examples on this enum
+/// and on [`Self::refusal`]/[`Self::warning`] are compiled as external crates, which a
+/// `pub(crate)` item cannot be named by.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_cli::resolve::CredentialPolicy;
+///
+/// assert!(CredentialPolicy::Configured.refusal().is_none());
+/// assert!(CredentialPolicy::BuiltinLoopback.refusal().is_none());
+/// assert!(CredentialPolicy::BuiltinExposed.refusal().is_some());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialPolicy {
+    /// The operator configured a pair (`[auth]`, or the environment folded onto it): nothing to
+    /// refuse and nothing to warn about.
+    Configured,
+    /// The built-in pair on a loopback bind: serve it, and warn.
+    BuiltinLoopback,
+    /// The built-in pair on a bind another host can reach: refuse.
+    BuiltinExposed,
+}
+
+impl CredentialPolicy {
+    /// The refusal's detail, when this policy refuses — **naming both escapes**, because an
+    /// operator who hit this has to be told the environment variables are the other one
+    /// (design §2).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_cli::resolve::CredentialPolicy;
+    ///
+    /// let refusal = CredentialPolicy::BuiltinExposed
+    ///     .refusal()
+    ///     .expect("a non-loopback bind refuses");
+    /// assert!(refusal.contains("minioadmin"), "{refusal}");
+    /// assert!(refusal.contains("TINIO_ACCESS_KEY"), "{refusal}");
+    /// assert!(refusal.contains("TINIO_SECRET_KEY"), "{refusal}");
+    /// assert!(CredentialPolicy::Configured.refusal().is_none());
+    /// ```
+    pub fn refusal(self) -> Option<String> {
+        matches!(self, Self::BuiltinExposed).then(|| {
+            format!(
+                "a non-loopback bind cannot serve {}: no [auth] pair is configured, so this bind \
+                 needs explicit credentials ([auth], TINIO_ACCESS_KEY/TINIO_SECRET_KEY)",
+                builtin_pair()
+            )
+        })
+    }
+
+    /// The warning's message, when this policy owes one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_cli::resolve::CredentialPolicy;
+    ///
+    /// let warning = CredentialPolicy::BuiltinLoopback
+    ///     .warning()
+    ///     .expect("a loopback bind warns");
+    /// assert_eq!(warning, "serving the built-in minioadmin pair on loopback");
+    /// assert!(CredentialPolicy::Configured.warning().is_none());
+    /// ```
+    pub fn warning(self) -> Option<String> {
+        matches!(self, Self::BuiltinLoopback)
+            .then(|| format!("serving {} on loopback", builtin_pair()))
+    }
+}
+
+/// The built-in pair as both of [`CredentialPolicy`]'s sentences name it — **one rendering of
+/// [`identity::DEFAULT_ROOT_ACCESS_KEY`]**, so the refusal and the warning cannot spell the
+/// credential differently.
+fn builtin_pair() -> String {
+    format!("the built-in {} pair", identity::DEFAULT_ROOT_ACCESS_KEY)
 }
 
 /// A bind address from a host and a port: `[server] host`/`port` and the `[api.http]` pair.

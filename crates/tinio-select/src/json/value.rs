@@ -3,14 +3,11 @@
 //! it applies the same case-folding and ambiguity rule directly to the
 //! `MapAccess` stream.
 
-use std::cell::Cell;
-
 use serde_json::Value;
 
 use crate::{
-    engine::charge,
     error::Error,
-    row::{NameStyle, Value as RowValue},
+    row::{NameStyle, RowCtx, Value as RowValue},
 };
 
 /// The JSON element of a row in the row model: numbers keep their verbatim
@@ -45,19 +42,19 @@ pub(crate) fn key_matches(key: &str, name: &str, style: NameStyle) -> bool {
 ///
 /// JSON keys are per-row and per-nesting-level (`serde_json::Map`), so there
 /// is no index to build the way CSV/parquet do; this is the one lookup whose
-/// cost stays linear in the map, and `spent` is what bounds it (P3) — one
-/// charge per entry scanned, before the case rules run.
+/// cost stays linear in the map, and the request budget `ctx` carries is what
+/// bounds it (P3) — one charge per entry scanned, before the case rules run.
 pub(crate) fn json_lookup<'a>(
     map: &'a serde_json::Map<String, Value>,
     name: &str,
     style: NameStyle,
-    spent: &Cell<u64>,
+    ctx: &RowCtx,
 ) -> Result<Option<&'a Value>, Error> {
     // Early-exit count (X8): two matches is the ambiguity verdict — a
     // Vec-collect per lookup was pure allocation on the hot path.
     let mut found: Option<&Value> = None;
     for (key, value) in map {
-        charge(spent, 1)?;
+        ctx.budget.charge(1)?;
         if key_matches(key, name, style) {
             if found.is_some() {
                 return Err(Error::Ambiguous(name.into()));

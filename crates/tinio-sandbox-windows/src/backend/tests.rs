@@ -1822,7 +1822,7 @@ fn a_confined_launch_holds_the_window_across_its_acl_phase() {
 fn a_confine_waits_for_the_window_before_it_touches_the_tree() {
     let volume = one_volume();
     let (_dir, tree) = tree(&volume);
-    let sid = sid_for(&tree);
+    let sid = sid_for(&tree.root);
     let window = ProfileLock::acquire(&package_name(&tree.root)).expect("the per-root lock");
     let (started_tx, started_rx) = mpsc::channel();
     let run = thread::scope(|scope| {

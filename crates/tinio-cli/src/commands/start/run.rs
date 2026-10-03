@@ -27,7 +27,7 @@ use crate::_api::{
 use crate::daemon;
 use crate::{
     _config::{
-        Config,
+        self, Config,
         log::{AccessFormat, Format, Verbosity},
         state::prepare_home_derived,
     },
@@ -47,14 +47,15 @@ use crate::{
 /// single-instance gate, so it happens before the startup repair — nothing repairs the state a
 /// live server is using — which is why the storage and the bound plane are built here and the
 /// repair is the first thing [`serve()`](crate::commands::start::serve) does. The full order
-/// is: the sandbox's static half (step f) → create the state dir and, read-write, the root
-/// (step h, because the bind sources and the storage both need the paths to exist) →
-/// daemonize (step g) → confine (step i), which installs the subscriber at the position its own
-/// doc states — around the launch or after the in-place confinement, and **not** a position this
-/// function picks → FR-036's OTLP warning → the signal handlers (step j) → pipelines and
-/// storage → single-instance bind → (in [`serve()`](crate::commands::start::serve)) startup
-/// repair → data plane bound → api plane bound → `state` published → readiness line →
-/// `READY=1`.
+/// is: the sandbox's static half (step f) → the credential policy's static refusal (audit
+/// run-2, P2 — a non-loopback bind that would serve the built-in pair) → create the state dir
+/// and, read-write, the root (step h, because the bind sources and the storage both need the
+/// paths to exist) → daemonize (step g) → confine (step i), which installs the subscriber at
+/// the position its own doc states — around the launch or after the in-place confinement, and
+/// **not** a position this function picks → FR-036's OTLP warning → the signal handlers
+/// (step j) → pipelines and storage → single-instance bind → (in
+/// [`serve()`](crate::commands::start::serve)) startup repair → data plane bound → api plane
+/// bound → `state` published → readiness line → `READY=1`.
 ///
 /// `sandbox::plan` precedes the directories rather than follows them — §1's own order. It is a
 /// decision on the **channels** alone (`[server] sandbox`, `TINIO_SANDBOX`, `--sandbox`) and
@@ -153,6 +154,18 @@ pub fn run(
         // is named. Nothing is threaded through this call site for it.
         sandbox::plan(&resolution, &args, provenance)?
     };
+
+    // **The built-in credential pair's refusal is a static one too** (audit run-2, P2): the
+    // predicate is `tinio_server::identity::uses_builtin_fallback` and the sentence is
+    // `Resolution::credential_policy`'s, so the refusal and the loopback warning the serving half
+    // still owes render one source. It used to be raised by `serve` — after the repair, the
+    // daemon fork and the confinement — which left a refused start with the root repaired and
+    // this process jailed; here it sits with the sandbox's own static refusals, before the fork
+    // and before the directories below, and `serve` is left with the warning alone (the only arm
+    // this refusal does not end).
+    if let Some(detail) = resolution.credential_policy()?.refusal() {
+        return Err(Error::Config(_config::Error::invalid_value("auth", detail)));
+    }
 
     // h: the bind sources must exist before anything binds — the data plane and the plane's
     // control channel both bind below — and the storage opens under the root, so a missing state

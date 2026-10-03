@@ -111,7 +111,7 @@ fn child_role() {
 fn the_whitelist_refuses_a_path_outside_the_exposures() {
     for volume in common::volumes() {
         let (_dir, tree) = common::tree(&volume);
-        let sid = common::sid_for(&tree);
+        let sid = common::sid_for(&tree.root);
         let run = common::run_confined(&tree, AccessMode::ReadWrite);
         assert_eq!(run.status, 0, "on {}: {}", volume.display(), run.report);
         assert!(
@@ -172,7 +172,7 @@ fn the_whitelist_refuses_a_path_outside_the_exposures() {
             volume.display(),
             capped.report
         );
-        let cap_sid = common::sid_for(&cap_tree);
+        let cap_sid = common::sid_for(&cap_tree.root);
         acl::revoke(&cap_tree.root, &cap_sid).expect("take the capability tree's root grant back");
         acl::revoke(&cap_tree.report, &cap_sid)
             .expect("take the capability tree's report grant back");
@@ -202,7 +202,7 @@ fn a_failed_launch_leaves_the_standing_grants_and_drops_the_profile() {
     // which is a runnable image, so `confinement.feature` has nothing to drive.
     let volume = common::one_volume();
     let (dir, tree) = common::tree(&volume);
-    let sid = common::sid_for(&tree);
+    let sid = common::sid_for(&tree.root);
 
     let program_dir = dir.path().join("not-an-image");
     fs::create_dir_all(&program_dir).expect("create the program's directory");
@@ -255,7 +255,7 @@ fn a_child_that_reports_no_frame_leaves_the_relays_answer_empty() {
     // scenario), and a step layer cannot replace the child of a spawned binary.
     let volume = common::one_volume();
     let (_dir, tree) = common::tree(&volume);
-    let sid = common::sid_for(&tree);
+    let sid = common::sid_for(&tree.root);
     let run = common::run_confined_with(&tree, AccessMode::ReadWrite, Options::default());
 
     assert_eq!(run.status, 0, "{}", run.report);

@@ -342,12 +342,9 @@ async fn a_missing_config_is_a_warning_and_never_created() {
 #[tokio::test]
 async fn a_config_without_auth_names_the_loopback_fallback() {
     let dir = tempfile::TempDir::new().expect("temp");
-    std::fs::create_dir_all(dir.path().join(".tinio")).expect("reserved dir");
-    std::fs::write(
-        dir.path().join(".tinio/.tinio.toml"),
-        "version = 1\n[server]\nhost = \"127.0.0.1\"\nport = 9000\n",
-    )
-    .expect("seed");
+    // The fixture family, not a second spelling of the reserved directory and the file name:
+    // this is the one fixture that has no `[auth]` pair, which is the row's whole subject.
+    crate::test_support::seed_config_without_auth(dir.path());
     let report = crate::test_support::run_checks(dir.path(), false, Proposals::Informational).await;
     let row = report
         .findings()

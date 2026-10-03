@@ -22,10 +22,27 @@ use secrecy::ExposeSecret;
 
 #[cfg(feature = "acl")]
 use crate::_auth::{Identity, User};
-use crate::{
-    _config::Config,
-    _core::acl::{DEFAULT_ROOT_ACCESS_KEY, OwnerId},
-};
+/// The root access-key fallback (`"minioadmin"`), **published here because the policy that names
+/// it is this module's**: [`uses_builtin_fallback`] is the predicate a caller asks, and a caller
+/// rendering a sentence about the fallback — `tinio-cli`'s start refusal and its loopback warning
+/// — names the key through this path rather than spelling the value a second time.
+///
+/// The constant's one definer stays `tinio_core::acl::DEFAULT_ROOT_ACCESS_KEY` (the value the
+/// config uniqueness validation reserves); this is a re-export of it, not a second home.
+///
+/// **The change it carries is audit run-2 P2's loopback-only development credential**: the CLI's
+/// policy refuses a non-loopback bind that would serve this pair, and it reads the key from here
+/// because the predicate beside it is what decides whether the pair is the fallback at all.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_server::identity::DEFAULT_ROOT_ACCESS_KEY;
+///
+/// assert_eq!(DEFAULT_ROOT_ACCESS_KEY, "minioadmin");
+/// ```
+pub use crate::_core::acl::DEFAULT_ROOT_ACCESS_KEY;
+use crate::{_config::Config, _core::acl::OwnerId};
 
 /// The root credential pair: the configured `[auth]` keys, or the US1
 /// interop convention pair (`minioadmin`/`minioadmin`) when no `[auth]`

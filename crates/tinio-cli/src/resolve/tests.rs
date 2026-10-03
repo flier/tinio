@@ -549,3 +549,77 @@ fn api_options_resolves_the_local_channel() {
     // The `http`/`https` arms come from `--api`-shaped inputs in the second selection;
     // exclusivity is `select`'s and is asserted in plan A, not here.
 }
+
+/// **The credential policy is one decision with three answers, and both sentences render the
+/// fallback from its one definer** (audit run-2, P2): the pair's source is
+/// `tinio_server::identity::uses_builtin_fallback` and the bind is `Resolution::address`'s, so the
+/// only inputs are the config and `[server] host` — which is what this leg varies, while the
+/// static half (`commands::start::run`) and the serving half (`commands::start::serve`) read the
+/// same value.
+#[test]
+fn the_credential_policy_reads_the_bind_and_the_pair() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    let root = dir.path().join("root");
+    let state = dir.path().join("state");
+
+    // The schema's default host is loopback, so no `[auth]` is the warning arm.
+    let loopback = resolution_with(&root, &state, "");
+    assert_eq!(
+        loopback
+            .credential_policy()
+            .expect("the default bind parses"),
+        CredentialPolicy::BuiltinLoopback
+    );
+    let warning = loopback
+        .credential_policy()
+        .expect("the default bind parses")
+        .warning()
+        .expect("the loopback arm warns");
+    assert!(
+        warning.contains(identity::DEFAULT_ROOT_ACCESS_KEY),
+        "the warning names the fallback through its one definer: {warning}"
+    );
+    assert_eq!(
+        loopback
+            .credential_policy()
+            .expect("the default bind parses")
+            .refusal(),
+        None
+    );
+
+    // A bind another host can reach is the refusal arm, and its sentence names both escapes.
+    let exposed = resolution_with(&root, &state, "[server]\nhost = \"0.0.0.0\"\n");
+    let refusal = exposed
+        .credential_policy()
+        .expect("the bind parses")
+        .refusal()
+        .expect("the exposed arm refuses");
+    assert!(
+        refusal.contains("[auth]")
+            && refusal.contains("TINIO_ACCESS_KEY")
+            && refusal.contains("TINIO_SECRET_KEY"),
+        "the refusal names the section and the variables: {refusal}"
+    );
+    assert!(
+        refusal.contains(identity::DEFAULT_ROOT_ACCESS_KEY),
+        "and it names the fallback through its one definer: {refusal}"
+    );
+    assert_eq!(
+        exposed
+            .credential_policy()
+            .expect("the bind parses")
+            .warning(),
+        None
+    );
+
+    // A configured pair is the operator's own: neither arm.
+    let configured = resolution_with(
+        &root,
+        &state,
+        "[auth]\naccess_key = \"AK\"\nsecret_key = \"SK\"\n",
+    );
+    assert_eq!(
+        configured.credential_policy().expect("the bind parses"),
+        CredentialPolicy::Configured
+    );
+}

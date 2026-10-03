@@ -62,7 +62,7 @@ use crate::{
     engine::positional,
     error::Error,
     record::RecordReader,
-    row::{Columns, Field, NameIndex, Record, Value, parse_number},
+    row::{Columns, Field, NameSet, Record, Value, parse_number},
 };
 
 /// One parquet record stream: `Record::Parquet(Columns)` per row — the
@@ -71,12 +71,10 @@ pub struct ParquetReader {
     inner: ParquetRecordBatchReader,
     /// Current batch + row index; the batch's schema field names are the
     /// record's names (post-projection order = schema order) — `Rc`-shared
-    /// into every row of the batch (S7).
+    /// into every row of the batch (S7), with the index built in the same
+    /// step and carried inside the set (P3).
     batch: Option<RecordBatch>,
-    names: Rc<Vec<String>>,
-    /// The index over `names`, built in the same step (P3) — both are
-    /// `Rc`-shared into every row of the batch.
-    index: Rc<NameIndex>,
+    names: Rc<NameSet>,
     /// Top-level root field names carrying the parquet ENUM annotation,
     /// captured once in `new` (never per row or per batch): arrow erases the
     /// annotation into `DataType::Binary`, so reader construction is the last
@@ -112,8 +110,7 @@ impl ParquetReader {
         Ok(Self {
             inner,
             batch: None,
-            names: Rc::new(Vec::new()),
-            index: Rc::new(NameIndex::default()),
+            names: Rc::new(NameSet::new(Vec::new())),
             enum_columns,
             enum_hints: Vec::new(),
             row: 0,
@@ -229,16 +226,17 @@ impl RecordReader for ParquetReader {
                         // two `String`s per column; the CSV reader caches its
                         // index by width for the same reason).
                         let schema = batch.schema();
-                        if self.names.len() != schema.fields().len()
+                        if self.names.names().len() != schema.fields().len()
                             || self
                                 .names
+                                .names()
                                 .iter()
                                 .zip(schema.fields())
                                 .any(|(n, f)| n.as_str() != f.name().as_str())
                         {
-                            self.names =
-                                Rc::new(schema.fields().iter().map(|f| f.name().clone()).collect());
-                            self.index = Rc::new(NameIndex::build(&self.names));
+                            self.names = Rc::new(NameSet::new(
+                                schema.fields().iter().map(|f| f.name().clone()).collect(),
+                            ));
                         }
                         self.enum_hints = enum_hints;
                         self.batch = Some(batch);
@@ -272,7 +270,6 @@ impl RecordReader for ParquetReader {
             return Ok(Some(Record::Parquet(Columns::new(
                 fields,
                 self.names.clone(),
-                self.index.clone(),
             ))));
         }
     }
@@ -761,11 +758,11 @@ mod tests {
     #[test]
     fn reads_mapped_types() {
         let mut r = reader(write_parquet(&fixture()));
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
         assert_eq!(
-            *names,
+            header.names(),
             vec![
                 "id", "small", "score", "name", "price", "at_s", "at_ms", "at_us", "at_ns", "tags",
                 "meta", "ok"
@@ -987,10 +984,10 @@ mod tests {
             MAX_BYTES,
         )
         .unwrap();
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
-        assert_eq!(*names, vec!["id", "price"]);
+        assert_eq!(header.names(), vec!["id", "price"]);
         assert_eq!(fields[0], Field::Present(Value::Int(42)));
         assert_eq!(
             fields[1],
@@ -1002,10 +999,10 @@ mod tests {
     fn projection_matches_case_insensitively() {
         let bytes = write_parquet(&fixture());
         let mut r = ParquetReader::new(Cursor::new(bytes), vec!["ID".into()], MAX_BYTES).unwrap();
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
-        assert_eq!(*names, vec!["id"]);
+        assert_eq!(header.names(), vec!["id"]);
         assert_eq!(fields[0], Field::Present(Value::Int(42)));
     }
 
@@ -1016,10 +1013,10 @@ mod tests {
         // `_2` would starve to MISSING. Fall back to every column.
         let bytes = write_parquet(&fixture());
         let mut r = ParquetReader::new(Cursor::new(bytes), vec!["_2".into()], MAX_BYTES).unwrap();
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
-        assert_eq!(names.len(), 12);
+        assert_eq!(header.names().len(), 12);
         assert_eq!(fields[0], Field::Present(Value::Int(42)));
         assert_eq!(fields[1], Field::Present(Value::Int(-7)));
     }
@@ -1028,14 +1025,14 @@ mod tests {
     fn unknown_projection_name_reads_zero_columns() {
         let bytes = write_parquet(&fixture());
         let mut r = ParquetReader::new(Cursor::new(bytes), vec!["nope".into()], MAX_BYTES).unwrap();
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
-        assert!(fields.is_empty() && names.is_empty());
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        assert!(fields.is_empty() && header.names().is_empty());
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
-        assert!(fields.is_empty() && names.is_empty());
+        assert!(fields.is_empty() && header.names().is_empty());
         assert_eq!(r.next().unwrap(), None);
     }
 
@@ -1176,10 +1173,10 @@ mod tests {
         // Projected to the ENUM column alone: a string.
         let mut r =
             ParquetReader::new(Cursor::new(bytes.clone()), vec!["e".into()], MAX_BYTES).unwrap();
-        let Record::Parquet(Columns { fields, names, .. }) = record(&mut r) else {
+        let Record::Parquet(Columns { fields, header, .. }) = record(&mut r) else {
             panic!("expected parquet record")
         };
-        assert_eq!(*names, vec!["e"]);
+        assert_eq!(header.names(), vec!["e"]);
         assert_eq!(fields[0], Field::Present(Value::String("alpha".into())));
         assert_eq!(r.next().unwrap(), None);
 
@@ -1392,10 +1389,10 @@ mod tests {
     fn committed_fixture_maps_every_row() {
         let rows = read(Vec::new());
         assert_eq!(rows.len(), 3, "the fixture is three rows");
-        let Record::Parquet(Columns { names, .. }) = &rows[0] else {
+        let Record::Parquet(Columns { header, .. }) = &rows[0] else {
             panic!("expected a parquet record")
         };
-        assert_eq!(**names, vec!["id", "name", "score", "ok", "price"]);
+        assert_eq!(header.names(), vec!["id", "name", "score", "ok", "price"]);
         assert_eq!(
             fields(&rows[0]),
             [
@@ -1437,10 +1434,10 @@ mod tests {
         // keeps the file's schema order, so a reversed reference list still
         // reads back `name` before `price`.
         let rows = read(vec!["price".into(), "name".into()]);
-        let Record::Parquet(Columns { names, .. }) = &rows[0] else {
+        let Record::Parquet(Columns { header, .. }) = &rows[0] else {
             panic!("expected a parquet record")
         };
-        assert_eq!(**names, vec!["name", "price"]);
+        assert_eq!(header.names(), vec!["name", "price"]);
         assert_eq!(
             fields(&rows[2]),
             [

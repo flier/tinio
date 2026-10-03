@@ -119,7 +119,7 @@ pub use tinio_util::testing::{ALLOW_SKIP, host_cannot, skip_allowed};
 use crate::{
     _core::Error,
     Backend, Options, acl,
-    capability::{PROBE_NAME, Window, cannot_confine, probe_window},
+    capability::{PROBE_NAME, Window, probe_window},
     launch, sid,
 };
 
@@ -632,9 +632,19 @@ pub struct Run {
     pub terminal: bool,
 }
 
-/// The package SID this run derives for `tree`.
-pub fn sid_for(tree: &Tree) -> sid::PackageSid {
-    sid::PackageSid::derive(&sid::package_name(&tree.root)).expect("derive the package SID")
+/// The package SID this run derives for `root` — a **path**, not a [`Tree`], because the
+/// derivation is [`sid::package_name`]'s and that is a function of the served root alone.
+///
+/// **One value per name is the caller's to hold**, not this function's to enforce: the value
+/// owns the AppContainer profile behind the SID and deletes it when it drops (decision 21), so
+/// a second value derived from one name and dropped takes the profile the first is still
+/// using with it — `DeleteAppContainerProfile` answers an already-gone profile with `S_OK`
+/// (measured 2026-09-21), and what is left is a live `PackageSid` whose profile no longer
+/// exists, which cannot launch (decision 21's 2026-09-19 measurement). Callers that need the
+/// SID for the length of a test therefore derive it once and hold the value; `acl.rs`'s tests
+/// are the ones that made this a rule.
+pub fn sid_for(root: &Path) -> sid::PackageSid {
+    sid::PackageSid::derive(&sid::package_name(root)).expect("derive the package SID")
 }
 
 /// Run `f` while the **capability probe's own throwaway profile** is alive, handing it the
@@ -664,10 +674,7 @@ pub fn sid_for(tree: &Tree) -> sid::PackageSid {
 /// [`can_confine`](crate::capability::can_confine) answers with, so a skipped leg that reports it
 /// still prints one sentence.
 pub fn with_probe_profile<T>(f: impl FnOnce(&sid::PackageSid) -> T) -> Result<T, Error> {
-    probe_window(f).and_then(|window| match window {
-        Window::Used(used) => Ok(used),
-        Window::Cannot(hr) => Err(cannot_confine(hr)),
-    })
+    probe_window(f).and_then(Window::into_result)
 }
 
 /// Leave the capability probe's profile behind, as a probe killed between its create and its
