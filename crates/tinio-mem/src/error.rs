@@ -91,6 +91,15 @@ pub(crate) fn no_such_upload(upload_id: &str) -> Error {
     Error::Storage(storage::no_such_upload(upload_id))
 }
 
+/// The referenced object version does not exist (a well-formed version
+/// identifier naming no version of the key). The version operations are the
+/// only callers, so the constructor compiles with the feature alone.
+#[cfg(feature = "versioning")]
+#[inline]
+pub(crate) fn no_such_version(version_id: impl Into<String>) -> Error {
+    Error::Storage(storage::no_such_version(version_id))
+}
+
 /// A key cannot be stored (folder markers as multipart targets).
 #[inline]
 pub(crate) fn invalid_key(key: String) -> Error {

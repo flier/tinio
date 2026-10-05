@@ -15,11 +15,15 @@
 //! `Result<(), Error>`.
 
 #[doc(hidden)]
+pub extern crate tinio_blob as _blob;
+#[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
 pub extern crate tinio_store as _store;
 #[doc(hidden)]
 pub extern crate tinio_util as _util;
+#[doc(hidden)]
+pub extern crate tinio_version as _version;
 
 mod backend;
 pub mod bucket;
@@ -30,6 +34,8 @@ pub mod etag;
 mod fsutil;
 mod listing;
 pub mod meta;
+#[cfg(feature = "versioning")]
+mod metrics;
 pub mod multipart;
 pub mod path;
 mod scanner;
@@ -38,6 +44,10 @@ pub mod testing;
 #[cfg(test)]
 mod testutil;
 pub mod tombstone;
+#[cfg(feature = "versioning")]
+mod version;
+#[cfg(feature = "versioning")]
+mod version_adapter;
 mod write;
 mod write_task;
 

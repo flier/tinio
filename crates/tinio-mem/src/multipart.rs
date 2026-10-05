@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use redb::ReadableTable;
 use uuid::Uuid;
 
+#[cfg(feature = "versioning")]
+use crate::version::prepare_publish;
 use crate::{
     _core::{
         BodyStream, CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps,
@@ -383,7 +385,7 @@ impl MultipartOps for MemoryStorage {
                     decode_acl_wire(&acl_wire),
                 )
             };
-            let (data, etag, now) = {
+            let (data, etag, now, version_id, history_bytes) = {
                 // The retained OBJECT_PARTS rows: each listed part's size and
                 // its stored checksum row (written by upload_part in the same
                 // transaction as the part row), in part order — joined in
@@ -500,6 +502,20 @@ impl MultipartOps for MemoryStorage {
                     (data, etag, retained)
                 };
                 let now = now_nanos();
+                // The publish hook every write path runs (spec 2026-10-03,
+                // **Write paths**: "the same protocol serves ...
+                // `CompleteMultipartUpload`'s publish"): the outgoing version
+                // moves into history before the object row below replaces it,
+                // and the completion records the identity and sequence the
+                // state machine answers — a fresh identity on an enabled
+                // bucket, the null version (sequence 0, or the key's next
+                // while a superseded null's row occupies 0) for a suspended
+                // one, nothing at all for an unversioned bucket.
+                #[cfg(feature = "versioning")]
+                let (version_id, version_seq, history_bytes) =
+                    prepare_publish(txn, bucket, key, now)?;
+                #[cfg(not(feature = "versioning"))]
+                let history_bytes = 0i64;
                 // The object row: the completion's tags and the
                 // interface-computed composite checksum ride in the same
                 // transaction as the object bytes (the backend never hashes).
@@ -507,22 +523,29 @@ impl MultipartOps for MemoryStorage {
                     let mut objects = objects::Table::open(txn)?;
                     objects.put(b, k, &data)?;
                 }
+                // (The `mut` is the versioning branch's, like `write_object`'s.)
+                #[cfg_attr(not(feature = "versioning"), allow(unused_mut))]
+                let mut stored = meta::Stored {
+                    version_id: None,
+                    version_seq: 0,
+                    is_delete_marker: false,
+                    etag: etag.clone(),
+                    size: data.len() as u64,
+                    mtime: now,
+                    file_identity: 0,
+                    tags: tags.clone(),
+                    checksum: checksum.clone(),
+                    owner: owner.clone(),
+                    acl: acl.clone(),
+                };
+                #[cfg(feature = "versioning")]
+                {
+                    stored.version_id = version_id;
+                    stored.version_seq = version_seq;
+                }
                 {
                     let mut obj_meta = meta::Table::open(txn)?;
-                    obj_meta.put(
-                        b,
-                        k,
-                        &meta::Stored {
-                            etag: etag.clone(),
-                            size: data.len() as u64,
-                            mtime: now,
-                            file_identity: 0,
-                            tags: tags.clone(),
-                            checksum: checksum.clone(),
-                            owner: owner.clone(),
-                            acl: acl.clone(),
-                        },
-                    )?;
+                    obj_meta.put(b, k, &stored)?;
                 }
                 {
                     let mut uploads = upload::Table::open(txn)?;
@@ -561,12 +584,16 @@ impl MultipartOps for MemoryStorage {
                         parts_table.put(b, k, &part)?;
                     }
                 }
-                (data, etag, now)
+                (data, etag, now, stored.version_id, history_bytes)
             };
             // The assembled object replaces the parts byte-for-byte (the
             // tracked total is unchanged), but the per-object limit still
-            // applies to the assembled size.
+            // applies to the assembled size — and the publish above may have
+            // moved the outgoing version into the history's blob table: those
+            // bytes are fresh storage, metered here inside the transaction so
+            // a limit breach aborts the whole completion.
             self.check_object_size(data.len() as u64)?;
+            self.adjust_total(history_bytes)?;
             Ok(object::Info {
                 key: key.clone(),
                 size: data.len() as u64,
@@ -576,6 +603,7 @@ impl MultipartOps for MemoryStorage {
                 checksum,
                 owner,
                 acl,
+                version_id,
             })
         })
     }
@@ -1222,5 +1250,102 @@ mod tests {
             parts[0].checksum.is_none(),
             "a part uploaded without a tee retains no checksum"
         );
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_completion_supersedes_and_names_its_version_on_an_enabled_bucket() {
+        use crate::_core::{
+            storage::VersionOps,
+            version::{ListParams, ReadResult, State},
+        };
+
+        let (storage, b) = with_bucket().await;
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let key = object::key("versioned-mp.bin").unwrap();
+        // A plain write first: the version the completion must supersede.
+        storage
+            .put_object(&b, &key, body(b"first".to_vec()))
+            .await
+            .unwrap();
+        let params = || ListParams {
+            max_keys: 1000,
+            ..Default::default()
+        };
+        let first_id = storage
+            .list_object_versions(&b, params())
+            .await
+            .unwrap()
+            .entries[0]
+            .id
+            .clone()
+            .expect("an enabled write mints an identity");
+
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let part = storage
+            .upload_part(&b, &key, &upload.upload_id, 1.into(), body(b"mp"), None)
+            .await
+            .unwrap();
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &key,
+                &upload.upload_id,
+                &[CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        // The completion ran the publish protocol: its Info names the fresh
+        // identity and the plain read serves the completed bytes under it.
+        let current_id = info
+            .version_id
+            .clone()
+            .expect("a completion on an enabled bucket mints an identity");
+        assert_ne!(current_id, first_id);
+        let head = storage.head_object(&b, &key).await.unwrap();
+        assert_eq!(head.version_id.as_ref(), Some(&current_id));
+        // The completed object's composed ETag rides with the version.
+        assert_eq!(head.etag, info.etag);
+        assert_eq!(
+            read_body(storage.get_object(&b, &key, None).await.unwrap().body)
+                .await
+                .unwrap(),
+            b"mp"
+        );
+
+        // The superseded version is intact under its own id — the completion
+        // superseded the outgoing version instead of overwriting the row.
+        let ReadResult::Object(old) = storage
+            .get_object_version(&b, &key, Some(&first_id), None)
+            .await
+            .unwrap()
+        else {
+            panic!("the superseded version must be an object version");
+        };
+        assert_eq!(read_body(old.body).await.unwrap(), b"first");
+        assert_eq!(old.info.version_id.as_ref(), Some(&first_id));
+
+        // Both versions are listed, current first.
+        let page = storage.list_object_versions(&b, params()).await.unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].id.as_ref(), Some(&current_id));
+        assert_eq!(page.entries[1].id.as_ref(), Some(&first_id));
     }
 }

@@ -113,6 +113,7 @@ tinio-select = { path = "crates/tinio-select" }
 tinio-server = { path = "crates/tinio-server", default-features = false }
 tinio-store = { path = "crates/tinio-store" }
 tinio-util = { path = "crates/tinio-util" }
+tinio-version = { path = "crates/tinio-version" }
 tinio-winsec = { path = "crates/tinio-winsec" }
 
 [patch.crates-io]

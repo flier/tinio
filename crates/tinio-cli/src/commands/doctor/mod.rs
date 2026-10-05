@@ -27,7 +27,7 @@ use crate::_api::bind::reclaim_stale;
 use crate::resolve::for_doctor;
 use crate::{
     _config::state::prepare_home_derived,
-    _core::cleanup::{Cleanup, CleanupOptions, RepairKind},
+    _core::cleanup::{Cleanup, CleanupOptions, RepairActionLevel, RepairKind},
     _fs::{
         FsCleanup, FsStorage,
         database::{Open, compact_if_needed},
@@ -440,7 +440,12 @@ async fn repair_store(
     let mut applied = 0usize;
     while let Some(action) = stream.next().await {
         match action {
-            Ok(_) => applied += 1,
+            // The report-only stages ride the fix pass too (the block check), and their rows are
+            // `Lint` — "a check finding, no action needed". Counting one as a repair would put a
+            // finding in the "N repairs applied" summary; the level is what keeps the ledger a
+            // ledger.
+            Ok(action) if action.level != RepairActionLevel::Lint => applied += 1,
+            Ok(_) => {}
             Err(err) => failures.push(Finding::check(
                 PRIVATE_STATE,
                 Severity::Error,

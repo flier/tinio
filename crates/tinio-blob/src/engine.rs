@@ -479,6 +479,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_short_second_block_is_an_error_for_that_slice_not_a_short_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(LocalBlocks::new(dir.path()));
+        let blob = two_block_blob(&store).await;
+
+        assert_eq!(
+            collect_body(store.open(&blob, None).await.unwrap())
+                .await
+                .unwrap(),
+            b"hello",
+            "the same reference reads whole while both blocks are intact"
+        );
+
+        // The *second* block loses a byte before this open, while the first is
+        // whole: the count is per slice, so the shortfall is caught after a
+        // slice that served in full — not only when a single-block blob ends
+        // short.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(store.blocks().block_path(&blob.blocks()[1].hash))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+
+        let mut opened = store.open(&blob, None).await.unwrap();
+        let mut served = Vec::new();
+        let err = loop {
+            match opened.next().await {
+                Some(Ok(chunk)) => served.extend_from_slice(&chunk),
+                Some(Err(err)) => break err,
+                None => panic!("a short block must not end as a normal body"),
+            }
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            served, b"hell",
+            "the whole first block and the surviving byte of the second are served before the error"
+        );
+    }
+
     #[test]
     fn a_zero_length_block_that_is_not_the_only_block_is_rejected() {
         // The read loop prefix-sums each block's length, so it assumes every

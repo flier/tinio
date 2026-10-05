@@ -520,6 +520,7 @@ impl FsListing {
                     checksum: checksum.clone(),
                     owner: owner.clone(),
                     acl: acl.clone(),
+                    version_id: None,
                 });
             }
         }
@@ -1669,7 +1670,7 @@ mod tests {
                 table
                     .insert(
                         ("data", "f00.txt"),
-                        ("not-an-etag", 1, 1, 0, "", "", "", ""),
+                        ("not-an-etag", 1, 1, 0, "", "", "", "", "null", 0, false),
                     )
                     .unwrap();
             }

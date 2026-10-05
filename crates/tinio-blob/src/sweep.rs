@@ -13,7 +13,7 @@ use futures::StreamExt;
 use smart_default::SmartDefault;
 
 use crate::{
-    _core::blob::{BlockHash, BlockStore},
+    _core::blob::{BlobRef, BlockHash, BlockStore},
     Error,
 };
 
@@ -53,6 +53,30 @@ impl LiveSet {
         Self {
             hashes: hashes.into_iter().collect(),
         }
+    }
+
+    /// Build the set from a version history: the union of every row's blob
+    /// block list. One home for the reduction the engine's `live_blocks`
+    /// walk and the doctor's already-decoded rows both feed — the two can
+    /// never disagree about what is live.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_blob::LiveSet;
+    /// use tinio_core::blob::{BlobRef, BlockHash};
+    ///
+    /// let blob = BlobRef::single(BlockHash::of(b"hello"), 5);
+    /// let live = LiveSet::from_blobs([blob]);
+    /// assert!(live.contains(&BlockHash::of(b"hello")));
+    /// ```
+    pub fn from_blobs(blobs: impl IntoIterator<Item = BlobRef>) -> Self {
+        Self::from_hashes(blobs.into_iter().flat_map(|blob| {
+            blob.blocks()
+                .iter()
+                .map(|block| block.hash)
+                .collect::<Vec<_>>()
+        }))
     }
 
     /// Whether the sweep must keep this block.

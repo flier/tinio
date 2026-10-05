@@ -423,6 +423,9 @@ mod tests {
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = meta::Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: composed.clone(),
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -460,6 +463,9 @@ mod tests {
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = meta::Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -493,6 +499,9 @@ mod tests {
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = meta::Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -534,6 +543,9 @@ mod tests {
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = meta::Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
@@ -571,6 +583,9 @@ mod tests {
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
         let stored = meta::Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: composed,
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),

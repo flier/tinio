@@ -10,9 +10,9 @@
 use std::{ops::Deref, sync::Arc};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::stream::iter;
 
+#[cfg(feature = "versioning")]
+use crate::version::{insert_marker, prepare_publish, rename_refusal};
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
@@ -21,12 +21,13 @@ use crate::{
         bucket::Name,
         checksum, collect_body, from_nanos, group_and_paginate,
         multipart::ObjectPart,
-        now_nanos, object,
+        now_nanos, object, version,
     },
     _store::{bucket, meta, object_part, objects, scan::for_each_pair},
     Error,
     error::{access_denied, invalid_key, no_such_bucket, no_such_key},
     storage::{MemoryStorage, check_bucket},
+    version::object_result,
 };
 
 /// A staged object body: the buffered payload (the commit inserts it)
@@ -114,9 +115,9 @@ impl MemoryStorage {
         } else {
             ETag::from_content(&data)
         };
-        let (_, now) = self
+        let (now, version_id) = self
             .db
-            .write(|txn| -> Result<(i64, u64), Error> {
+            .write(|txn| -> Result<(u64, Option<version::Id>), Error> {
             {
                 check_bucket(&bucket::Table::open(txn)?, bucket)?;
             }
@@ -132,39 +133,64 @@ impl MemoryStorage {
                     .unwrap_or(0)
             };
             let delta = data.len() as i64 - old_len as i64;
-            self.adjust_total(delta)?;
+            let now = now_nanos();
+            // The current version's identity is the version state machine's
+            // call (spec 2026-10-03), and it runs BEFORE the publish below:
+            // what the machine moves into history is the outgoing content, so
+            // the object row must still hold it. An unversioned bucket
+            // records no identity, an enabled one records the freshly minted
+            // one, a suspended one records the null version. Its answer also
+            // carries the bytes the supersede newly stored in the history's
+            // blob table (a dedup hit stores nothing: those bytes are already
+            // metered).
+            #[cfg(feature = "versioning")]
+            let (version_id, version_seq, history_bytes) = prepare_publish(txn, bucket, key, now)?;
+            #[cfg(not(feature = "versioning"))]
+            let history_bytes = 0i64;
             {
                 let mut objects = objects::Table::open(txn)?;
                 objects.put(b, k, &data)?;
             }
-            let now = now_nanos();
             // The 6-tuple row (etag, size, mtime, file identity 0, tags
             // wire, checksum wire) via the shared `meta::Stored` — the
             // write-path encode home. A folder marker records no tags /
             // checksum (accepted and dropped), like the fs backend's
-            // marker commit.
+            // marker commit. (The `mut` is the versioning branch's.)
+            #[cfg_attr(not(feature = "versioning"), allow(unused_mut))]
+            let mut stored = meta::Stored {
+                version_id: None,
+                version_seq: 0,
+                is_delete_marker: false,
+                etag: etag.clone(),
+                size,
+                mtime: now,
+                file_identity: 0,
+                tags: tags.clone(),
+                checksum: checksum.clone(),
+                owner: owner.cloned(),
+                acl: acl.clone(),
+            };
+            #[cfg(feature = "versioning")]
+            {
+                stored.version_id = version_id;
+                stored.version_seq = version_seq;
+            }
             {
                 let mut table = meta::Table::open(txn)?;
-                table.put(
-                    b,
-                    k,
-                    &meta::Stored {
-                        etag: etag.clone(),
-                        size,
-                        mtime: now,
-                        file_identity: 0,
-                        tags: tags.clone(),
-                        checksum: checksum.clone(),
-                        owner: owner.cloned(),
-                        acl: acl.clone(),
-                    },
-                )?;
+                table.put(b, k, &stored)?;
             }
             {
                 let mut parts = object_part::Table::open(txn)?;
                 parts.remove_key(b, k)?;
             }
-            Ok((delta, now))
+            // The write's bytes, in ONE adjustment after every fallible row
+            // operation and inside the transaction: the object row's own
+            // delta (the replaced content leaves, the new content enters) plus
+            // whatever the publish newly stored in the history's blob table.
+            // A limit breach aborts the whole transaction here, leaving both
+            // the rows and the tracked total untouched.
+            self.adjust_total(delta + history_bytes)?;
+            Ok((now, stored.version_id.clone()))
         })
         // The in-memory backend's commit cannot fail (no disk path — an
         // abort-only transaction is the only failure mode), so no
@@ -179,6 +205,7 @@ impl MemoryStorage {
             checksum,
             owner: owner.cloned(),
             acl: acl.clone(),
+            version_id,
         })
     }
 }
@@ -304,29 +331,24 @@ impl ObjectOps for MemoryStorage {
                 Some(r) => Some(r.resolve(size)?),
             };
             // The served slice is copied straight out of the zero-copy redb
-            // guard — a range request never copies the full object.
+            // guard (the shared construction does the slicing) — a range
+            // request never copies the full object.
             let data_guard = objects
                 .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
                 .ok_or_else(|| no_such_key(key))?;
-            let served = match served_range {
-                Some((start, end)) => data_guard.value()[start as usize..=end as usize].to_vec(),
-                None => data_guard.value().to_vec(),
-            };
-            let body: BodyStream = Box::pin(iter(vec![Ok(Bytes::from(served))]));
-            Ok(GetObjectResult {
-                info: object::Info {
-                    key: key.clone(),
-                    size,
-                    last_modified: from_nanos(stored.mtime),
-                    etag: stored.etag,
-                    tags: stored.tags,
-                    checksum: stored.checksum,
-                    owner: stored.owner.clone(),
-                    acl: stored.acl.clone(),
-                },
-                body,
+            Ok(object_result(
+                key,
+                size,
+                from_nanos(stored.mtime),
+                stored.etag,
+                stored.tags,
+                stored.checksum,
+                stored.owner.clone(),
+                stored.acl.clone(),
+                stored.version_id.clone(),
+                data_guard.value(),
                 served_range,
-            })
+            ))
         })
     }
 
@@ -351,45 +373,83 @@ impl ObjectOps for MemoryStorage {
                 checksum: stored.checksum,
                 owner: stored.owner.clone(),
                 acl: stored.acl.clone(),
+                version_id: stored.version_id.clone(),
             })
         })
     }
 
-    async fn delete_object(&self, bucket: &Name, key: &object::Key) -> Result<(), Error> {
-        let old_len = self.db.write(|txn| -> Result<u64, Error> {
-            {
-                check_bucket(&bucket::Table::open(txn)?, bucket)?;
-            }
-            let b = bucket.as_ref().as_str();
-            let k = key.as_ref().as_str();
-            let old_len = {
-                let objects = objects::Table::open(txn)?;
-                objects
-                    .get(b, k)?
-                    .map(|guard| guard.value().len() as u64)
-                    .unwrap_or(0)
-            };
-            {
-                let mut objects = objects::Table::open(txn)?;
-                objects.remove(b, k)?;
-            }
-            {
-                let mut meta = meta::Table::open(txn)?;
-                meta.remove(b, k)?;
-            }
-            // The retained part list dies with the object (one
-            // transaction — a delete must not orphan the rows).
-            {
-                let mut parts = object_part::Table::open(txn)?;
-                parts.remove_key(b, k)?;
-            }
-            Ok(old_len)
-        })?;
-        // A delete only shrinks the total; it cannot exceed a limit.
-        let _ = self.adjust_total(-(old_len as i64));
-        Ok(())
+    async fn delete_object(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+    ) -> Result<version::Marker, Error> {
+        let (old_len, marker, history_bytes) =
+            self.db
+                .write(|txn| -> Result<(u64, version::Marker, i64), Error> {
+                    {
+                        check_bucket(&bucket::Table::open(txn)?, bucket)?;
+                    }
+                    // The reserved segment is never a delete target (FR-020 —
+                    // the fs backend's `resolve_key` refusal).
+                    if key.is_reserved() {
+                        return Err(access_denied(key));
+                    }
+                    let b = bucket.as_ref().as_str();
+                    let k = key.as_ref().as_str();
+                    let old_len = {
+                        let objects = objects::Table::open(txn)?;
+                        objects
+                            .get(b, k)?
+                            .map(|guard| guard.value().len() as u64)
+                            .unwrap_or(0)
+                    };
+                    // The version state machine's call (spec 2026-10-03), before the
+                    // rows below are removed: an unversioned bucket deletes as today
+                    // (no marker), a versioned one moves the outgoing version into
+                    // history and makes a delete marker current — in this same
+                    // transaction. A folder marker never reaches it: folder markers
+                    // stay outside the version model (the design's ruling), so their
+                    // delete removes the rows and creates no marker — the fs
+                    // backend's directory delete.
+                    #[cfg(feature = "versioning")]
+                    let (marker, history_bytes) = if key.is_folder_marker() {
+                        (version::Marker::none(), 0)
+                    } else {
+                        insert_marker(txn, bucket, key, now_nanos())?
+                    };
+                    #[cfg(not(feature = "versioning"))]
+                    let (marker, history_bytes) = (version::Marker::none(), 0i64);
+                    {
+                        let mut objects = objects::Table::open(txn)?;
+                        objects.remove(b, k)?;
+                    }
+                    {
+                        let mut meta = meta::Table::open(txn)?;
+                        meta.remove(b, k)?;
+                    }
+                    // The retained part list dies with the object (one
+                    // transaction — a delete must not orphan the rows).
+                    {
+                        let mut parts = object_part::Table::open(txn)?;
+                        parts.remove_key(b, k)?;
+                    }
+                    Ok((old_len, marker, history_bytes))
+                })?;
+        // The bytes that left the backend: the object row the delete removed,
+        // minus the bytes its supersede newly stored in the history's blob
+        // table (a versioned delete moves the content there instead of
+        // dropping it — the same bytes stay metered; a dedup hit stores
+        // nothing fresh). The net is never positive, so it can never exceed a
+        // limit and needs no check.
+        let _ = self.adjust_total(history_bytes - old_len as i64);
+        Ok(marker)
     }
 
+    /// Rename moves the object's rows in one transaction — except on a bucket
+    /// that records versions, where it is refused (`AccessDenied`): no spec
+    /// defines rename's versioning semantics, and the move would destroy the
+    /// destination's current version and the source's history. An unversioned
+    /// bucket renames exactly as before.
     async fn rename_object(
         &self,
         bucket: &Name,
@@ -424,6 +484,17 @@ impl ObjectOps for MemoryStorage {
             {
                 check_bucket(&bucket::Table::open(txn)?, bucket)?;
             }
+            // A rename has no versioning semantics, so a bucket that records
+            // versions is refused here rather than corrupted by the row move
+            // below (the destination's current version would be overwritten
+            // without superseding it, and the source key's history would
+            // vanish without a marker). The rule itself is the contract's
+            // (`rename_allowed`); the answer is checked inside this
+            // transaction so no state change can slip between the read and
+            // the move. An unversioned bucket — and a build without the
+            // feature — moves the rows exactly as before.
+            #[cfg(feature = "versioning")]
+            rename_refusal(txn, bucket, dst)?;
             let b = bucket.as_ref().as_str();
             let src_key = src.as_ref().as_str();
             let dst_key = dst.as_ref().as_str();
@@ -483,6 +554,7 @@ impl ObjectOps for MemoryStorage {
                 checksum: stored.checksum,
                 owner: stored.owner.clone(),
                 acl: stored.acl.clone(),
+                version_id: stored.version_id.clone(),
             })
         })
     }
@@ -676,6 +748,7 @@ impl ObjectOps for MemoryStorage {
                         checksum: stored.checksum,
                         owner: stored.owner.clone(),
                         acl: stored.acl.clone(),
+                        version_id: stored.version_id.clone(),
                     });
                     Ok(())
                 },
@@ -1271,5 +1344,82 @@ mod tests {
             rows.is_empty(),
             "no OBJECT_PARTS rows may outlive their object: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rename_moves_rows_on_an_unversioned_bucket() {
+        let (storage, b) = with_bucket().await;
+        let src = object::key("mv-src.txt").unwrap();
+        let dst = object::key("mv-dst.txt").unwrap();
+        storage
+            .put_object(&b, &src, body(b"src".to_vec()))
+            .await
+            .unwrap();
+        // The destination exists too: the move overwrites it, today's
+        // semantics.
+        storage
+            .put_object(&b, &dst, body(b"dst".to_vec()))
+            .await
+            .unwrap();
+
+        let moved = storage.rename_object(&b, &src, &dst).await.unwrap();
+        assert_eq!(moved.key, dst);
+        assert_eq!(
+            read_body(storage.get_object(&b, &dst, None).await.unwrap().body)
+                .await
+                .unwrap(),
+            b"src"
+        );
+        assert!(storage.head_object(&b, &src).await.is_err());
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn rename_is_refused_on_a_versioned_bucket_without_touching_either_key() {
+        use crate::_core::{storage::VersionOps, version::State};
+
+        let (storage, b) = with_bucket().await;
+        let src = object::key("v-src.txt").unwrap();
+        let dst = object::key("v-dst.txt").unwrap();
+        storage
+            .put_object(&b, &src, body(b"src".to_vec()))
+            .await
+            .unwrap();
+        storage
+            .put_object(&b, &dst, body(b"dst".to_vec()))
+            .await
+            .unwrap();
+        let src_head = storage.head_object(&b, &src).await.unwrap();
+        let dst_head = storage.head_object(&b, &dst).await.unwrap();
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+
+        let err = storage.rename_object(&b, &src, &dst).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(AccessDenied(_))), "{err}");
+        // Neither key moved: both contents and their version identities are
+        // exactly what they were before the refused call.
+        let kept_src = storage.head_object(&b, &src).await.unwrap();
+        assert_eq!(kept_src.version_id, src_head.version_id);
+        assert_eq!(kept_src.etag, src_head.etag);
+        let kept_dst = storage.head_object(&b, &dst).await.unwrap();
+        assert_eq!(kept_dst.version_id, dst_head.version_id);
+        assert_eq!(kept_dst.etag, dst_head.etag);
+        assert_eq!(
+            read_body(storage.get_object(&b, &dst, None).await.unwrap().body)
+                .await
+                .unwrap(),
+            b"dst"
+        );
+
+        // Suspended refuses too — the same row move would corrupt the null
+        // version's history.
+        storage
+            .set_bucket_versioning(&b, State::Suspended)
+            .await
+            .unwrap();
+        let err = storage.rename_object(&b, &src, &dst).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(AccessDenied(_))), "{err}");
     }
 }

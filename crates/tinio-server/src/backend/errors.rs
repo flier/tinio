@@ -9,6 +9,10 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
         StorageError::NoSuchBucket(_) => s3_error!(NoSuchBucket),
         StorageError::NoSuchKey(_) => s3_error!(NoSuchKey),
         StorageError::NoSuchUpload(id) => s3_error!(NoSuchUpload, "no such upload: {id}"),
+        StorageError::NoSuchVersion(id) => s3_error!(NoSuchVersion, "no such version: {id}"),
+        StorageError::InvalidVersion(raw) => {
+            s3_error!(InvalidArgument, "invalid version: `{raw}`")
+        }
         // A duplicate create on a locally-owned bucket answers
         // `BucketAlreadyOwnedByYou` (AWS/MinIO semantics) — clients such as
         // rclone treat this as the idempotent-create case and continue.
@@ -50,9 +54,9 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
         // symlink-policy refusal — NOT an ACL decision (those answer
         // directly from the access layer). The distinction is invisible
         // on the wire; the source is logged at debug.
-        StorageError::AccessDenied(key) => {
+        StorageError::AccessDenied(subject) => {
             tracing::debug!(
-                key = key.to_string(),
+                subject = subject.to_string(),
                 "storage AccessDenied — OS-level permission denial or symlink-policy refusal, not an ACL decision"
             );
             s3_error!(AccessDenied)
@@ -71,7 +75,7 @@ mod tests {
     use super::*;
     use crate::_core::{
         ETag, bucket, object,
-        storage::{ByteRange, Error as StorageError},
+        storage::{ByteRange, Denied, Error as StorageError},
     };
 
     fn s3_code(err: StorageError) -> S3ErrorCode {
@@ -91,6 +95,14 @@ mod tests {
             (
                 StorageError::NoSuchUpload("u-1".into()),
                 S3ErrorCode::NoSuchUpload,
+            ),
+            (
+                StorageError::NoSuchVersion("v-1".into()),
+                S3ErrorCode::NoSuchVersion,
+            ),
+            (
+                StorageError::InvalidVersion("bad id".into()),
+                S3ErrorCode::InvalidArgument,
             ),
             (
                 StorageError::AlreadyExists(b.clone()),
@@ -133,7 +145,10 @@ mod tests {
                 },
                 S3ErrorCode::InvalidRange,
             ),
-            (StorageError::AccessDenied(k), S3ErrorCode::AccessDenied),
+            (
+                StorageError::AccessDenied(Denied::Key(k)),
+                S3ErrorCode::AccessDenied,
+            ),
             (
                 StorageError::Io(IoError::other("boom")),
                 S3ErrorCode::InternalError,

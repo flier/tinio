@@ -12,14 +12,15 @@ use crate::_core::{acl::Acl, object::OBJECT_TAGS_MAX};
 mod buckets;
 mod multipart;
 mod objects;
+mod version;
 
 use std::{
     collections::HashMap,
-    fs::{Metadata, canonicalize},
+    fs::canonicalize,
     io::{self, ErrorKind},
     path::{Path, PathBuf, absolute},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use derive_more::Debug;
@@ -31,8 +32,14 @@ pub use objects::StagedBody;
 use soft_canonicalize::soft_canonicalize;
 use tokio::fs;
 
+#[cfg(feature = "versioning")]
+use crate::_blob::{LocalBlocks, Store as BlobStore};
+#[cfg(feature = "versioning")]
+use crate::_version::Versions;
 pub use crate::error::Error;
 pub(crate) use crate::error::{invalid_path, invalid_state_dir, invalid_value, root_not_directory};
+#[cfg(feature = "versioning")]
+use crate::version_adapter::{Files, Rows};
 use crate::{
     _core::{
         ETag, acl,
@@ -46,9 +53,14 @@ use crate::{
             META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
         },
         to_nanos,
+        version::Id,
     },
-    _store::{bucket, decode_acl_wire, decode_owner_wire, meta, object_part, upload},
+    _store::{
+        bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, meta, object_part, upload,
+        version as version_rows, version_index,
+    },
     _util::{lockmap, path::contains_under_any_spelling},
+    backend::version::stamp_superseded,
     bucket::Store as BucketStore,
     database::{self, Handle, compact_if_needed},
     etag, fsutil,
@@ -56,8 +68,8 @@ use crate::{
     meta::Store as MetaStore,
     multipart::{CompletedPartRow, Store as MultipartStore, drain_bucket_uploads, drain_upload},
     path::{
-        BoundaryCache, map_bucket_path, map_key_path, map_key_path_lexical, prove_key_contained,
-        state_dir,
+        BLOBS_DIR_NAME, BoundaryCache, map_bucket_path, map_key_path, map_key_path_lexical,
+        prove_key_contained, state_dir,
     },
     write::AtomicWriter,
 };
@@ -259,11 +271,12 @@ pub struct FsStorage {
     multipart_store: MultipartStore,
     /// The shared state-database handle (the stores each hold a clone;
     /// kept here for cross-store single-transaction operations such as
-    /// [`Self::remove_bucket_state`]).
-    #[getset(skip)]
+    /// [`Self::remove_bucket_state`], and for the version adapter's tables).
+    #[getset(get = "pub(crate)")]
     handle: Arc<Handle>,
-    /// Atomic body writer (staging under `<state-dir>/tmp/`).
-    #[getset(skip)]
+    /// Atomic body writer (staging under `<state-dir>/tmp/`; the version
+    /// adapter's materialize publishes through it).
+    #[getset(get = "pub(crate)")]
     writer: AtomicWriter,
     /// The tree-walk listing (shared with the scanner).
     #[getset(get = "pub(crate)")]
@@ -427,6 +440,57 @@ impl FsStorage {
     /// clearing trees inline on their own paths.
     pub(crate) fn remove_pipeline(&self) -> Arc<dyn pipeline::Runner<Result<(), Error>>> {
         Arc::clone(&self.remove_pipeline)
+    }
+
+    /// The orphaned-block-subtree proof the sweep's reclamation and the
+    /// doctor's residue check share — one home for the rule and its lock.
+    ///
+    /// **What makes a subtree provably orphaned**: the `blobs/<name>` entry
+    /// is a directory and the bucket *directory* `<root>/<name>` is absent,
+    /// proven under that name's mutation lock. The directory is the
+    /// backend's own existence authority (`ensure_bucket` reads it, never
+    /// the `BUCKETS` row), so a live bucket whose `BUCKETS` row was lost is
+    /// still recoverable — `create_bucket` re-derives the row, and its
+    /// history still needs these blocks — and is never reclaimed. The lock
+    /// is the discipline the block pass already uses: `create_bucket` and
+    /// `remove_bucket_state` hold the same per-name lock, so a bucket being
+    /// created or deleted cannot interleave between the absence proof and
+    /// the answer. An entry that is not a directory — an out-of-band *file*
+    /// wearing a bucket's name — answers `false`. A name that is not a
+    /// legal bucket name can never be created as a bucket, so nothing can
+    /// race for it and no lock can be taken for it (`create_bucket`
+    /// validates first).
+    ///
+    /// `reclaim` keeps the removal inside the same critical section the
+    /// proof was taken under (the sweep's arm: the guard lives until the
+    /// tree is gone); the doctor asks with `reclaim = false` and only
+    /// reports, leaving the bytes inspectable until the sweep clears them.
+    #[cfg(feature = "versioning")]
+    pub(crate) async fn orphaned_block_subtree(
+        &self,
+        dir: &Path,
+        dir_name: &str,
+        reclaim: bool,
+    ) -> Result<bool, Error> {
+        if !fs::metadata(dir)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let named = name(dir_name).ok();
+        let _guard = match &named {
+            Some(named) => Some(self.lock_bucket_mutations(named).await),
+            None => None,
+        };
+        if !fsutil::is_absent(&self.root().join(dir_name)).await? {
+            return Ok(false);
+        }
+        if reclaim {
+            fsutil::remove_tree(dir).await?;
+        }
+        Ok(true)
     }
 
     fn resolve(root: PathBuf, options: FsOptions) -> Result<(PathBuf, PathBuf, FsOptions), Error> {
@@ -656,6 +720,29 @@ impl FsStorage {
         Ok(path)
     }
 
+    /// The block-store root of this backend (`<state-dir>/blobs/`): one
+    /// subtree per bucket, holding the content-addressed blocks of that
+    /// bucket's superseded versions. The directory is created lazily by the
+    /// first stage, like every other state-dir subtree.
+    #[cfg(feature = "versioning")]
+    pub(crate) fn blobs_dir(&self) -> PathBuf {
+        self.state_dir.join(BLOBS_DIR_NAME)
+    }
+
+    /// The version state machine over `bucket`'s block store: the backend's
+    /// ports ([`Rows`], [`Files`]) and the shared blob engine over
+    /// [`LocalBlocks`] rooted at this bucket's own subtree — so a bucket
+    /// deletion drops its blocks with the rest of its state, and no block
+    /// outside the bucket is ever referenced.
+    #[cfg(feature = "versioning")]
+    pub(crate) fn versions(&self, bucket: &Name) -> Versions<Rows, Files, LocalBlocks> {
+        Versions::new(
+            Rows::new(self.clone()),
+            Files::new(self.clone()),
+            BlobStore::new(LocalBlocks::new(self.blobs_dir().join(bucket.as_ref()))),
+        )
+    }
+
     /// Every bucket of the root matching `prefix`: top-level directories
     /// with valid names (the reserved `.tinio` state dir excluded), in
     /// name order. The scanner, cleanup, and `list_buckets` share this
@@ -730,15 +817,29 @@ impl FsStorage {
         }
     }
 
-    /// Delete the whole derived state of a bucket — the `BUCKETS` row and
-    /// the `OBJECT_META` / `OBJECT_PARTS` / `UPLOADS` / `PARTS` ranges —
+    /// Delete the whole derived state of a bucket — the `BUCKETS` row, the
+    /// `OBJECT_META` / `OBJECT_PARTS` / `UPLOADS` / `PARTS` ranges, and the
+    /// version tables (`VERSIONS`, `VERSION_INDEX`, `BUCKET_VERSIONING`) —
     /// in one write transaction (meta-redb-spec G2: a bucket's state dies
-    /// atomically). The bucket directory itself is removed by the caller
-    /// under the mutation lock; errors propagate — a swallowed failure
-    /// would leak `OBJECT_META` rows that no cleanup stage can see (the
-    /// repair walk only visits live buckets).
+    /// atomically), then drop the bucket's block subtree
+    /// (`<state-dir>/blobs/<bucket>/` — the content-addressed blocks of its
+    /// superseded versions). The bucket directory itself is removed by the
+    /// caller under the mutation lock; errors propagate — a swallowed
+    /// failure would leak `OBJECT_META` rows that no cleanup stage can see
+    /// (the repair walk only visits live buckets).
+    ///
+    /// The version tables drain in **every** build, not only the ones
+    /// carrying the version machinery: a build without it can still be
+    /// pointed at a root a versioned build wrote, and a deleted bucket must
+    /// leave neither rows nor blocks behind.
     pub(crate) async fn remove_bucket_state(&self, bucket: &Name) -> Result<(), Error> {
         let bucket = bucket.clone();
+        // The subtree path is taken before the transaction consumes the
+        // name. The blocks sit under the state dir (which may be on
+        // another volume), so they cannot ride the caller's tombstone
+        // rename — they are removed here, in the call the caller holds the
+        // bucket's mutation lock for, after the rows that named them.
+        let blocks = self.state_dir.join(BLOBS_DIR_NAME).join(bucket.as_ref());
         self.handle
             .write(move |txn| {
                 {
@@ -753,11 +854,25 @@ impl FsStorage {
                     let mut parts = object_part::Table::open(txn)?;
                     parts.drain_bucket(&bucket)?;
                 }
+                {
+                    let mut versions = version_rows::Table::open(txn)?;
+                    versions.drain_bucket(&bucket)?;
+                }
+                {
+                    let mut index = version_index::Table::open(txn)?;
+                    index.drain_bucket(&bucket)?;
+                }
+                {
+                    let mut state = bucket_versioning::Table::open(txn)?;
+                    state.drain_bucket(&bucket)?;
+                }
                 drain_bucket_uploads(txn, &bucket)?;
                 Ok(())
             })
             .await
-            .map_err(Into::into)
+            .map_err(Error::from)?;
+        fsutil::remove_tree(&blocks).await?;
+        Ok(())
     }
 
     /// The post-rename state of a completed multipart upload: delete its
@@ -766,7 +881,13 @@ impl FsStorage {
     /// composite `checksum` — the backends never hash, spec 2026-08-31 —
     /// and the upload's create-time owner/ACL, read from the upload row
     /// this transaction consumes, the tags precedent — never re-ferried
-    /// through the interface), and persist the assembled parts into
+    /// through the interface — plus the completion's version identity and
+    /// sequence, the write branch's `publish_versioned` answer, so the
+    /// completed object's current version is recorded with its content,
+    /// and the landed file's stamp — `size`/`mtime`/`identity` as the
+    /// publish read them off the renamed file, so this call costs no
+    /// second stat), and persist
+    /// the assembled parts into
     /// `OBJECT_PARTS` — the completed object's retained part list, each
     /// row `(part number, size, algorithm wire, base64 checksum value)`;
     /// `parts` is `Store::complete`'s assembled rows (in part-number
@@ -786,20 +907,22 @@ impl FsStorage {
         key: &object::Key,
         upload_id: &str,
         etag: &ETag,
-        path: &Path,
-        metadata: &Metadata,
+        size: u64,
+        mtime: SystemTime,
+        identity: u64,
         checksum: Option<checksum::Recorded>,
         parts: Vec<CompletedPartRow>,
+        version_id: Option<Id>,
+        version_seq: u64,
+        superseded: Option<u64>,
     ) -> Result<(object::Tags, Option<acl::OwnerId>, Acl), Error> {
-        let size = metadata.len();
-        let mtime = metadata.modified()?;
-        let identity = fsutil::file_identity(path, metadata);
         let bucket = bucket.clone();
         let key = key.clone();
         let upload_id = upload_id.to_string();
         let etag = etag.clone();
         let checksum = checksum.clone();
         let parts = parts.clone();
+        let version_id = version_id.clone();
         self.handle
             .write(move |txn| {
                 // The create-time tags, owner and ACL ride in the upload
@@ -832,6 +955,9 @@ impl FsStorage {
                         &bucket,
                         &key,
                         &meta::Stored {
+                            version_id: version_id.clone(),
+                            version_seq,
+                            is_delete_marker: false,
                             etag: etag.clone(),
                             size,
                             mtime: to_nanos(mtime),
@@ -853,6 +979,9 @@ impl FsStorage {
                         parts_table.put(&bucket, &key, &part)?;
                     }
                 }
+                // The transaction that moves the current slot records the
+                // outgoing version as history in the same commit.
+                stamp_superseded(txn, &bucket, &key, superseded)?;
                 Ok((tags, owner, acl))
             })
             .await

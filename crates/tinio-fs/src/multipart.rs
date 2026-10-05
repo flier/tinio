@@ -526,7 +526,7 @@ impl Store {
         // Stream the part body first — a slow client must not stall any
         // other multipart operation. The temp+rename happens after the
         // existence check, so a part file only ever becomes visible whole.
-        let (temp, etag) = match self.writer.stage(body, checksum.as_deref()).await {
+        let (temp, etag, _size) = match self.writer.stage(body, checksum.as_deref()).await {
             Ok(staged) => staged,
             Err(err) => {
                 // An abort may have removed the upload mid-stream.

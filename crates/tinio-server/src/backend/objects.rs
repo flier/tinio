@@ -829,7 +829,9 @@ impl<S: Storage> S3Backend<S> {
             // Per-key write lock, as in `op_delete_object`.
             let _guard = self.lock_object(&bucket, &key).await;
             match self.storage.delete_object(&bucket, &key).await {
-                Ok(()) => {
+                // The delete produced no version (the backends do not version
+                // anything yet); the multi-delete answer carries no marker.
+                Ok(_marker) => {
                     if !quiet {
                         deleted.push(dto::DeletedObject {
                             key: Some(key.to_string()),

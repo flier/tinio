@@ -12,6 +12,7 @@ pub extern crate tinio_core as _core;
 
 mod acl;
 pub mod bucket;
+pub mod bucket_versioning;
 pub mod error;
 pub mod meta;
 pub mod object_part;
@@ -26,6 +27,8 @@ pub mod store;
 pub mod table;
 pub mod upload;
 pub mod upload_checksum;
+pub mod version;
+pub mod version_index;
 
 #[cfg(test)]
 mod contract;
@@ -38,7 +41,7 @@ pub use self::{
     error::Error,
 };
 
-/// Create the seven shared tables inside a write transaction
+/// Create the ten shared tables inside a write transaction
 /// (idempotent). Backends create their local tables in the same
 /// transaction alongside.
 pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
@@ -49,6 +52,9 @@ pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
     upload_checksum::Table::ensure(txn)?;
     part_checksum::Table::ensure(txn)?;
     object_part::Table::ensure(txn)?;
+    version::Table::ensure(txn)?;
+    version_index::Table::ensure(txn)?;
+    bucket_versioning::Table::ensure(txn)?;
     Ok(())
 }
 
@@ -69,7 +75,7 @@ mod tests {
     fn assert_same<A: Same<B>, B>() {}
 
     #[test]
-    fn ensure_all_creates_exactly_the_seven_tables_idempotently() {
+    fn ensure_all_creates_exactly_the_ten_tables_idempotently() {
         let db = Database::builder()
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
@@ -94,6 +100,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "bucket_versioning",
                 "buckets",
                 "object_meta",
                 "object_parts",
@@ -101,6 +108,8 @@ mod tests {
                 "parts",
                 "upload_checksums",
                 "uploads",
+                "version_index",
+                "versions",
             ]
         );
     }

@@ -349,10 +349,13 @@ mod tests {
             object,
             storage::{
                 BucketsListing, Error as StorageError, Error::*, ListBucketsParams, MultipartOps,
-                ObjectOps,
+                ObjectOps, VersionOps,
             },
+            version::State,
         },
+        _store::version as version_rows,
         _util::testing::{assert_conformance, body, etag},
+        database,
         testutil::{
             all_users_read_grant, other_owner_id, owner_id, storage, wait_for, wait_for_lock_waiter,
         },
@@ -840,14 +843,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_bucket_state_clears_all_four_tables_atomically() {
+    async fn remove_bucket_state_clears_every_derived_table_and_the_blocks() {
         let (_root, storage) = storage();
         let b = bucket::name("my-bucket").unwrap();
         let k = object::key("a.txt").unwrap();
-        // Bucket row.
+        // Bucket row (and the bucket directory the versioned write needs).
         storage
-            .bucket_store()
-            .record(&b, SystemTime::now())
+            .create_bucket(&b, None, &Acl::default_private(None))
             .await
             .unwrap();
         // Object meta row.
@@ -881,6 +883,15 @@ mod tests {
             .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
             .await
             .unwrap();
+        // A versioned key: two PUTs leave a history row naming a stored
+        // block — the rows and the block subtree the teardown must take.
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        storage.put_object(&b, &k, body(b"one")).await.unwrap();
+        storage.put_object(&b, &k, body(b"two")).await.unwrap();
+        assert!(storage.blobs_dir().join("my-bucket").is_dir());
 
         storage.remove_bucket_state(&b).await.unwrap();
 
@@ -894,6 +905,32 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            storage.bucket_versioning(&b).await.unwrap(),
+            Default::default(),
+            "the bucket's versioning state is gone"
+        );
+        let drained = b.clone();
+        let rows_left = storage
+            .handle()
+            .read(move |txn| -> Result<Vec<String>, database::Error> {
+                let table = version_rows::Table::open_readonly(txn)?;
+                let mut out = Vec::new();
+                table.for_bucket_of(drained.as_ref(), |key, _| {
+                    out.push(key.to_owned());
+                    Ok(())
+                })?;
+                Ok(out)
+            })
+            .unwrap();
+        assert!(
+            rows_left.is_empty(),
+            "version rows drained with the bucket: {rows_left:?}"
+        );
+        assert!(
+            !storage.blobs_dir().join("my-bucket").exists(),
+            "the bucket's block subtree goes with its state"
         );
     }
 

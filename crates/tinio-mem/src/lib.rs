@@ -17,6 +17,11 @@ pub extern crate tinio_core as _core;
 pub extern crate tinio_store as _store;
 #[cfg(test)]
 extern crate tinio_util as _util;
+/// The shared write-path decision, compiled with the `versioning` feature
+/// (the only code that consults it).
+#[cfg(feature = "versioning")]
+#[doc(hidden)]
+pub extern crate tinio_version as _version;
 
 mod bucket;
 mod cleanup;
@@ -26,6 +31,7 @@ mod object;
 mod storage;
 #[cfg(test)]
 mod testutil;
+mod version;
 
 pub use self::{
     cleanup::MemoryCleanup,

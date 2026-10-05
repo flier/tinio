@@ -16,22 +16,19 @@ use tokio::fs;
 use super::{Error, FsStorage};
 #[cfg(not(unix))]
 use crate::_core::storage::ObjectOps;
+use crate::_core::{
+    BodyStream, acl,
+    acl::Acl,
+    bucket, checksum,
+    multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
+    object::{self, Info},
+    storage::{
+        ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
+        access_denied, invalid_key, key_marker_order, split_uploads_order,
+    },
+};
 #[cfg(unix)]
 use crate::fsutil;
-use crate::{
-    _core::{
-        BodyStream, acl,
-        acl::Acl,
-        bucket, checksum,
-        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
-        object::{self, Info},
-        storage::{
-            ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing,
-            UploadsListing, access_denied, invalid_key, key_marker_order, split_uploads_order,
-        },
-    },
-    write::AtomicWriter,
-};
 
 /// The unix fast path of the part-copy primitive: `copy_file_range` the
 /// source's (range of) bytes into a staged part file, then the store's
@@ -231,50 +228,28 @@ impl MultipartOps for FsStorage {
             .multipart_store
             .complete(bucket, key, upload_id, parts)
             .await?;
-        // Phase 2 (the mutation lock): the rename cannot race a
-        // `delete_bucket` — and a bucket deleted between the phases is
-        // reported, not silently recreated. A failure here (deleted
-        // bucket, swapped symlink) must not strand the assembled temp in
-        // `tmp/` — remove it on the error path. Re-resolve under the
-        // lock: `ensure_bucket` returns the current followed target, and
-        // `resolve_key` re-runs the symlink policy against it.
-        let _guard = self.lock_bucket_mutations(bucket).await;
-        let phase2 = async {
-            #[cfg(unix)]
-            use crate::fsutil::DirOwnerUid;
-            #[cfg(not(unix))]
-            use crate::fsutil::DirOwnerUid;
-
-            let bucket_dir = self.ensure_bucket(bucket).await?;
-            let target = self.resolve_key(&bucket_dir, key).await?;
-            // The unix dir hardening (spec 2026-09-05 §5a): a prefix
-            // dir implicitly created by the completion lands `0700` and
-            // chowned to the bucket owner's mapped uid.
-            #[cfg(unix)]
-            let dir_owner_uid = self.bucket_owner_uid(bucket).await;
-            // F03: the bucket root bounds the first-into-a-new-prefix
-            // ancestor sync.
-            AtomicWriter::commit(
-                &temp,
-                &target,
-                Some(&bucket_dir),
-                #[cfg(unix)]
-                DirOwnerUid(dir_owner_uid),
-                #[cfg(not(unix))]
-                DirOwnerUid,
-            )
-            .await?;
-            Ok::<_, Error>(target)
-        }
-        .await;
-        let target = match phase2 {
-            Ok(target) => target,
+        // Phase 2 (the mutation lock): the version branch, the rename and
+        // the landed stamp are `publish_versioned`'s — the SAME ordering
+        // `commit_staged` runs, one home, so neither path can forget a step
+        // (the version branch commits the outgoing version's row before the
+        // rename, the engine's supersede protocol). The rename cannot race a
+        // `delete_bucket` — a bucket deleted between the phases is reported,
+        // not silently recreated — and the guard the publish answers is kept
+        // until this completion's state transaction is done. A failure here
+        // (deleted bucket, swapped symlink) must not strand the assembled
+        // temp in `tmp/` — remove it on the error path.
+        let published = match self.publish_versioned(bucket, key, &temp).await {
+            Ok(published) => published,
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
                 return Err(err);
             }
         };
-        let metadata = fs::metadata(&target).await?;
+        // The key path the publish landed on — consumed by the unix chown
+        // below, and by the error path that removes a wrongly-owned file.
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let target = published.path.as_path();
+        let (size, mtime) = (published.size, published.mtime);
         // The unix ownership hardening (spec 2026-09-05 §5a): the
         // completion is where the assembled object lands, so the final
         // chown happens here — the upload's create-time owner is read
@@ -304,24 +279,27 @@ impl MultipartOps for FsStorage {
                 return Err(err.into());
             }
         }
-        let size = metadata.len();
-        let mtime = metadata.modified()?;
         // The single state transaction: consume the upload records,
         // persist the object row (tags + the interface-computed composite
         // checksum — the backend never hashes — plus the upload's
         // create-time owner/ACL, read from the row this transaction
         // consumes, the tags precedent), and retain the assembled parts
-        // in `OBJECT_PARTS`.
+        // in `OBJECT_PARTS`. The stamp is the publish's — the file it
+        // renamed and read back — never a second stat here.
         let (tags, owner, acl) = self
             .complete_object_state(
                 bucket,
                 key,
                 upload_id,
                 &etag,
-                &target,
-                &metadata,
+                size,
+                mtime,
+                published.identity,
                 checksum.clone(),
                 part_rows,
+                published.marker.id.clone(),
+                published.seq,
+                published.superseded,
             )
             .await?;
         // The part files are dead weight after the consume — remove them
@@ -345,6 +323,7 @@ impl MultipartOps for FsStorage {
             checksum,
             owner,
             acl,
+            version_id: published.marker.id,
         })
     }
 
@@ -1110,5 +1089,227 @@ mod tests {
         let got = storage.get_object_acl(&b, &k).await.unwrap();
         assert_eq!(got.owner.as_ref(), Some(&owner));
         assert_eq!(got.grants, grants);
+    }
+
+    /// The completion's versioned branch: on an enabled bucket a multipart
+    /// completion supersedes the current version into history and the
+    /// returned `Info` names the version it created.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn fs_complete_on_a_versioned_bucket_supersedes_the_current_version() {
+        use crate::{
+            _core::{
+                ETag,
+                storage::VersionOps,
+                version::{self, ListParams, ReadResult},
+            },
+            _store::version::Slot,
+        };
+
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .set_bucket_versioning(&b, version::State::Enabled)
+            .await
+            .unwrap();
+        let k = object::key("big.bin").unwrap();
+        // The previous version: a plain enabled write.
+        storage.put_object(&b, &k, body(b"first")).await.unwrap();
+        let previous = storage
+            .head_object(&b, &k)
+            .await
+            .unwrap()
+            .version_id
+            .expect("an enabled write mints a version id");
+
+        // A one-part upload completed over it (the final part may be small).
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let part = storage
+            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"second"), None)
+            .await
+            .unwrap();
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload.upload_id,
+                &[CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let fresh = info
+            .version_id
+            .clone()
+            .expect("the completion on an enabled bucket mints a version id");
+        assert_ne!(
+            fresh, previous,
+            "the completion's version is its own identity"
+        );
+        // The completed object is current and serves the assembled bytes.
+        let current = storage.get_object(&b, &k, None).await.unwrap();
+        assert_eq!(read_body(current.body).await.unwrap(), b"second");
+        assert_eq!(current.info.version_id.as_ref(), Some(&fresh));
+
+        // The previous version was superseded into history, not overwritten
+        // in place: it is reachable only through the version table now.
+        match storage
+            .get_object_version(&b, &k, Some(&previous), None)
+            .await
+            .unwrap()
+        {
+            ReadResult::Object(object) => {
+                assert_eq!(read_body(object.body).await.unwrap(), b"first");
+                assert_eq!(object.info.version_id.as_ref(), Some(&previous));
+            }
+            ReadResult::Marker { .. } => panic!("the superseded version is content"),
+        }
+        // The listing names both versions of the key, newest first.
+        let page = storage
+            .list_object_versions(
+                &b,
+                ListParams {
+                    prefix: None,
+                    delimiter: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    max_keys: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].id.as_ref(), Some(&fresh));
+        assert_eq!(page.entries[1].id.as_ref(), Some(&previous));
+        // The completion's own state transaction stamped the superseded row
+        // noncurrent — the same rule the plain write path follows — so the
+        // version is history for every reader (`Row::is_history`) and its
+        // retention clock runs from the moment the slot moved off it.
+        let rows = storage
+            .handle()
+            .read(|txn| {
+                let table = crate::_store::version::Table::open_readonly(txn)?;
+                let mut out = Vec::new();
+                table.for_key(b.as_ref().as_str(), k.as_ref().as_str(), |row| {
+                    out.push(row);
+                    Ok(())
+                })?;
+                Ok(out)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the superseded version's row");
+        assert!(
+            rows[0].is_history(Slot::At(rows[0].seq)),
+            "the completion must stamp the superseded row noncurrent: {rows:?}"
+        );
+
+        // The completion's ETag is the composed `MD5-of-MD5s-N` form — not
+        // the content MD5 — and that is what the version row records. A plain
+        // write then supersedes the composed version; the version read and
+        // the listing must both answer the row's ETag verbatim. This is the
+        // discriminating leg: any path that recomputes the ETag from the
+        // stored bytes answers the plain content MD5 and fails both asserts.
+        let composed = info.etag.clone();
+        assert!(
+            matches!(composed, ETag::Composed(..)) && composed != ETag::from_content(b"second"),
+            "the completion's ETag is the composed form, never the content MD5: {composed}"
+        );
+        storage.put_object(&b, &k, body(b"third")).await.unwrap();
+        match storage
+            .get_object_version(&b, &k, Some(&fresh), None)
+            .await
+            .unwrap()
+        {
+            ReadResult::Object(object) => assert_eq!(
+                object.info.etag, composed,
+                "the version read serves the row's own ETag element"
+            ),
+            ReadResult::Marker { .. } => panic!("the superseded version is content"),
+        }
+        let page = storage
+            .list_object_versions(
+                &b,
+                ListParams {
+                    prefix: None,
+                    delimiter: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    max_keys: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let listed = page
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_ref() == Some(&fresh))
+            .expect("the composed version must still list");
+        assert_eq!(
+            listed.etag, composed,
+            "the listing entry serves the row's own ETag element"
+        );
+
+        // Delete the plain current version: the composed version is
+        // materialized back onto the key path, and restoring it must not
+        // change what its ETag is. Both the version-addressed read and the
+        // plain read of the restored key must answer the composed form —
+        // recording the publish's plain content MD5 instead fails both.
+        let third = storage
+            .head_object(&b, &k)
+            .await
+            .unwrap()
+            .version_id
+            .expect("the plain write minted an identity");
+        storage
+            .delete_object_version(&b, &k, Some(&third))
+            .await
+            .unwrap();
+        match storage
+            .get_object_version(&b, &k, Some(&fresh), None)
+            .await
+            .unwrap()
+        {
+            ReadResult::Object(object) => {
+                assert_eq!(
+                    object.info.version_id.as_ref(),
+                    Some(&fresh),
+                    "the composed version is current again"
+                );
+                assert_eq!(
+                    object.info.etag, composed,
+                    "the restored version keeps its composed ETag for a version-addressed read"
+                );
+            }
+            ReadResult::Marker { .. } => panic!("the restored version is content"),
+        }
+        let restored = storage.get_object(&b, &k, None).await.unwrap();
+        assert_eq!(read_body(restored.body).await.unwrap(), b"second");
+        assert_eq!(
+            restored.info.version_id.as_ref(),
+            Some(&fresh),
+            "the plain read names the restored version"
+        );
+        assert_eq!(
+            restored.info.etag, composed,
+            "the restored current-version row records the composed ETag, never the publish's MD5"
+        );
     }
 }

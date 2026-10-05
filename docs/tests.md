@@ -13,6 +13,7 @@
   - **A file shared by `#[path]` must be declared at file scope, never inside an inline module.** A `#[path]` resolves against the declaring file's directory **plus the name of any enclosing inline module**, so `#[path = "…"] mod fixture;` written inside `mod tests` has `src/<module>/tests/` as its base — and a relative path that climbs out of it traverses a directory that does not exist. **Windows folds the `..` away lexically and compiles; Linux and macOS resolve a path component by component and refuse**, so the lib-test target does not compile there at all while the same tree is green on Windows (`tinio-select`'s shared `json_fixture`, 2026-10-02, where the trap was invisible until the WSL leg ran). Declare the module at file scope — its base is the file's own directory, every component of which is real — and let the inline `mod tests` reach it with `use super::fixture;`. A file shared with a bench is declared by each includer, as `benches/select_scan.rs` does.
   - `tests/` keeps the boundary itself (a re-export list, a published-path binding), legs whose oracle is a foreign process or the OS, fixture and generator pairs shared with benches, and a property suite whose subject is the crate's public API rather than one function (`tinio-core/tests/validation.rs`). A property suite of one module moves inline with its subject, seed file and all (`crates/tinio-fs/src/meta.proptest-regressions`).
   - Deleting a duplicate: only when the survivor asserts the same rule over the same subject. An assertion the survivor lacks is folded into it first — never dropped.
+- State-dir classes: the closed set `crates/tinio-fs/src/backend/tests.rs` pins — `meta.redb`, `tmp/`, `multipart/`, and `blobs/` (the per-bucket content-addressed block store of versioned buckets: `blobs/<bucket>/tmp` stages a block, `blobs/<bucket>/<aa>/<hex>` holds it). Nothing else may appear; a bucket delete takes its `blobs/<bucket>/` subtree with its rows.
 
 ## Scripts
 
@@ -36,6 +37,7 @@ Out of gate: `interop` / `interop-port` (external tools on `PATH`), `audit`, `se
 ## CI legs
 
 - Unit/doc legs mirror gate. `features`: `--each-feature` on facade + `tinio-server` (no powerset) — catch cfg/`use` drift.
+- `tinio-mem` feature-off impl: `cargo check -p tinio-mem --no-default-features --lib` — the crate's own dev-dependency re-enables `versioning` for test targets, so the same check without `--lib` never compiles the feature-off impl (the dev-dependency's feature unification hides it); this form does, and it caught a real defect (2026-10-04, versioning). The self dev-dependency (`tinio-mem`/`tinio-fs` on themselves) is the device: a crate cannot enable its own non-default feature for the lib-as-test build any other way, and a path consumer does not inherit the dev edge, so the stripped build still compiles the trait's refusal defaults.
 - Sandbox e2e `[[test]]` targets: `required-features = ["sandbox"]`. `tinio` binary: feature gates body, not the program — `--no-default-features` must still compile and serve. Keeper: `cargo hack check --package tinio --each-feature` (design decisions 4, 19).
 
 ## Cucumber (tinio-e2e)

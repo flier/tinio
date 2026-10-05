@@ -764,6 +764,7 @@ mod tests {
             checksum: None,
             owner: None,
             acl: Acl::default_private(None),
+            version_id: None,
         }
     }
 

@@ -57,6 +57,11 @@ pub const TMP_DIR_NAME: &str = "tmp";
 /// The multipart parts root inside the state dir.
 pub const MULTIPART_DIR_NAME: &str = "multipart";
 
+/// The content-addressed block-store root inside the state dir: one subtree
+/// per bucket, holding the blocks of that bucket's superseded versions
+/// (spec 2026-10-03-s3-versioning).
+pub const BLOBS_DIR_NAME: &str = "blobs";
+
 /// Upper bound on cached [`PathBoundary`] entries: the storage root plus
 /// one per bucket directory. Bounded so a long-running server with
 /// churning bucket directories cannot grow the cache without bound.

@@ -66,6 +66,34 @@ drain_impl!(
     (a.as_str(), b.as_str(), n)
 );
 
+// The `(bucket, key, seq)` shapes: the version rows' `u64` sequence, and
+// the version index's `(bucket, key, id)` string triple.
+drain_impl!(
+    drain_triple_u64,
+    (&str, &str, u64),
+    (a, b, n),
+    a: &str,
+    b: &str,
+    n: u64
+    =>
+    (a.to_string(), b.to_string(), n),
+    (a, b, n),
+    (a.as_str(), b.as_str(), n)
+);
+
+drain_impl!(
+    drain_triple_str,
+    (&str, &str, &str),
+    (a, b, c),
+    a: &str,
+    b: &str,
+    c: &str
+    =>
+    (a.to_string(), b.to_string(), c.to_string()),
+    (a, b, c),
+    (a.as_str(), b.as_str(), c.as_str())
+);
+
 /// Walk `table` from `lower` while `keep` holds and call `visit` on each
 /// `(key, value)` (the mismatch break is the interval boundary — see
 /// [`drain_pair`]). The visit error type is generic so backends can

@@ -12,7 +12,7 @@ use crate::{
     bucket, checksum,
     etag::ETag,
     multipart::ObjectPart,
-    object,
+    object, version,
 };
 
 /// Result of a successful object write.
@@ -57,6 +57,7 @@ pub struct PutObjectResult {
 ///         checksum: None,
 ///         owner: None,
 ///         acl: acl::Acl::default_private(None),
+///         version_id: None,
 ///     },
 ///     body: Box::pin(stream::empty()),
 ///     served_range: Some((0, 4)),
@@ -290,6 +291,16 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// parts — moves with it; a rename is not a fresh object. An
     /// existing `dst` is overwritten. `NoSuchKey` when `src` is missing;
     /// `NoSuchBucket` when the bucket does not.
+    ///
+    /// A bucket that records versions is the exception: the operation is
+    /// refused with the `AccessDenied` class, naming `dst`, because it has no
+    /// versioning semantics — the move would replace the destination's
+    /// current version without superseding it and strand the source key's
+    /// history. Implementations apply that rule by calling
+    /// [`VersionOps::ensure_rename_allowed`](crate::storage::VersionOps::ensure_rename_allowed)
+    /// (or, where the guard must sit inside an already-open transaction,
+    /// [`rename_allowed`](crate::storage::rename_allowed)) before moving
+    /// anything; the conformance suite's versioning leg pins it.
     async fn rename_object(
         &self,
         bucket: &bucket::Name,
@@ -309,11 +320,16 @@ pub trait ObjectOps: Send + Sync + 'static {
         Self: Storage;
 
     /// Delete an object. S3 semantics: idempotent — missing objects are Ok.
+    ///
+    /// Answers the [`version::Marker`] the delete produced or removed: a
+    /// versioned bucket creates a delete marker (or permanently removes the
+    /// named version), while an unversioned bucket creates nothing and answers
+    /// [`version::Marker::none`].
     async fn delete_object(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<(), <Self as Storage>::Error>
+    ) -> Result<version::Marker, <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -414,6 +430,7 @@ mod tests {
             checksum: None,
             owner: None,
             acl: Acl::default_private(None),
+            version_id: None,
         };
         let listing = ObjectListing {
             objects: vec![info],
@@ -444,6 +461,7 @@ mod tests {
                 checksum: None,
                 owner: None,
                 acl: Acl::default_private(None),
+                version_id: None,
             },
             body: Box::pin(stream::empty()),
             served_range: Some((0, 0)),
@@ -462,6 +480,7 @@ mod tests {
             checksum: None,
             owner: None,
             acl: Acl::default_private(None),
+            version_id: None,
         };
         let result = GetObjectResult {
             info,

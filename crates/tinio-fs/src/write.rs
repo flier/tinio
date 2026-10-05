@@ -81,11 +81,12 @@ pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], Metadata), Err
 /// let state = tempfile::tempdir().unwrap();
 /// let writer = AtomicWriter::new(state.path());
 /// let target = state.path().join("obj.bin");
-/// let etag = Runtime::new()
+/// let (etag, size) = Runtime::new()
 ///     .unwrap()
 ///     .block_on(writer.write(&target, body(b"hello")))
 ///     .unwrap();
 /// assert_eq!(etag.as_str(), "5d41402abc4b2a76b9719d911017c592");
+/// assert_eq!(size, 5);
 /// assert_eq!(read(&target).unwrap(), b"hello");
 /// ```
 #[derive(Debug, Clone)]
@@ -109,12 +110,15 @@ impl AtomicWriter {
 
     /// Stream `body` into a temp file and atomically rename it onto
     /// `target` (creating parent directories). Returns the content MD5
-    /// ETag. On failure the target is untouched; the temp file is left for
-    /// the sweep / startup repair (failure-handling.md §2C).
-    pub async fn write(&self, target: &Path, body: BodyStream) -> Result<ETag, Error> {
-        let (temp, etag) = self.stage(body, None).await?;
+    /// ETag and the number of bytes streamed — the values a caller
+    /// records about what it just wrote without re-opening, re-statting
+    /// or re-hashing the file. On failure the target is untouched; the
+    /// temp file is left for the sweep / startup repair
+    /// (failure-handling.md §2C).
+    pub async fn write(&self, target: &Path, body: BodyStream) -> Result<(ETag, u64), Error> {
+        let (temp, etag, size) = self.stage(body, None).await?;
         Self::commit(&temp, target, None, DirOwnerUid::new(None)).await?;
-        Ok(etag)
+        Ok((etag, size))
     }
 
     /// Rename a staged temp onto `target` (creating parent directories);
@@ -166,22 +170,22 @@ impl AtomicWriter {
     }
 
     /// Stream `body` into a fresh temp file under `tmp/`, returning the
-    /// temp path and content MD5. The caller controls when the temp
-    /// becomes visible (rename under its own lock); on failure the temp is
-    /// removed best-effort. `checksum` is the server's tee slot: with
-    /// the `etag` cell the slot already holds the content MD5 (a part's
-    /// ETag IS its content MD5), so the write is not hashed a second
-    /// time.
+    /// temp path, the content MD5 and the number of bytes written. The
+    /// caller controls when the temp becomes visible (rename under its
+    /// own lock); on failure the temp is removed best-effort. `checksum`
+    /// is the server's tee slot: with the `etag` cell the slot already
+    /// holds the content MD5 (a part's ETag IS its content MD5), so the
+    /// write is not hashed a second time.
     pub(crate) async fn stage(
         &self,
         body: BodyStream,
         checksum: Option<&checksum::PartChecksum>,
-    ) -> Result<(PathBuf, ETag), Error> {
+    ) -> Result<(PathBuf, ETag, u64), Error> {
         self.ensure_tmp_dir().await?;
         let temp = self.tmp_dir.join(format!("upload-{}", Uuid::new_v4()));
         let result = self.write_temp(&temp, body, checksum).await;
         match result {
-            Ok(etag) => Ok((temp, etag)),
+            Ok((etag, size)) => Ok((temp, etag, size)),
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
                 Err(err)
@@ -191,15 +195,16 @@ impl AtomicWriter {
 
     /// The stream+hash core: drain `body` into `temp` with bounded
     /// buffers, returning the content MD5 (from the tee's `etag` cell
-    /// when promised — the write skips its own hash). The temp is the
-    /// future object file — created at `0600` on unix regardless of the
-    /// umask (spec 2026-09-05 §5a; the rename preserves the mode).
+    /// when promised — the write skips its own hash) and the number of
+    /// bytes written. The temp is the future object file — created at
+    /// `0600` on unix regardless of the umask (spec 2026-09-05 §5a; the
+    /// rename preserves the mode).
     async fn write_temp(
         &self,
         temp: &Path,
         body: BodyStream,
         checksum: Option<&checksum::PartChecksum>,
-    ) -> Result<ETag, Error> {
+    ) -> Result<(ETag, u64), Error> {
         let mut file = {
             let mut options = fs::OpenOptions::new();
             options.write(true).create(true).truncate(true);
@@ -208,6 +213,7 @@ impl AtomicWriter {
             options.open(temp).await?
         };
         let mut hasher = (!checksum.is_some_and(|c| c.etag.is_some())).then(Md5::new);
+        let mut written = 0u64;
         let mut stream = pin!(body);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -215,6 +221,7 @@ impl AtomicWriter {
             // whole — it is drained in bounded slices.
             for slice in chunk.as_ref().chunks(CHUNK_SIZE) {
                 file.write_all(slice).await?;
+                written += slice.len() as u64;
                 if let Some(hasher) = &mut hasher {
                     hasher.update(slice);
                 }
@@ -233,14 +240,14 @@ impl AtomicWriter {
         file.sync_all().await?;
         match hasher {
             // The write was hashed inline.
-            Some(hasher) => Ok(ETag::Single(hasher.finalize().into())),
+            Some(hasher) => Ok((ETag::Single(hasher.finalize().into()), written)),
             // The tee's MD5: the raw digest lands in the etag cell before
             // the stream's final `None`, so the value is there.
             None => {
                 let digest = checksum
                     .and_then(|c| c.etag_digest())
                     .expect("the etag tee fills the cell at stream end");
-                Ok(ETag::Single(digest))
+                Ok((ETag::Single(digest), written))
             }
         }
     }
@@ -321,7 +328,8 @@ mod tests {
         let writer = AtomicWriter::new(state.path());
         let target = state.path().join("obj.bin");
         let got = writer.write(&target, body(b"hello world")).await.unwrap();
-        assert_eq!(got, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
+        assert_eq!(got.0, etag("5eb63bbbe01eeed093cb22bb8f5acdc3"));
+        assert_eq!(got.1, 11, "the write answers the bytes it streamed");
         assert_eq!(fs::read(&target).await.unwrap(), b"hello world");
         // No temp files left behind on success.
         let tmp = state.path().join("tmp");
@@ -344,7 +352,8 @@ mod tests {
         let writer = AtomicWriter::new(state.path());
         let target = state.path().join("empty");
         let got = writer.write(&target, body(b"")).await.unwrap();
-        assert_eq!(got, etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(got.0, etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(got.1, 0, "an empty body streams zero bytes");
         assert_eq!(fs::metadata(&target).await.unwrap().len(), 0);
     }
 
@@ -382,7 +391,7 @@ mod tests {
         let writer = AtomicWriter::new(state.path());
         let target = state.path().join("existing-dir");
         fs::create_dir(&target).await.unwrap();
-        let (temp, _) = writer.stage(body(b"x"), None).await.unwrap();
+        let (temp, _, _) = writer.stage(body(b"x"), None).await.unwrap();
         // rename(file, existing-directory) fails on every platform — the
         // target stays untouched and the failed temp is removed (item 7c).
         let err = AtomicWriter::commit(&temp, &target, None, DirOwnerUid::new(None))

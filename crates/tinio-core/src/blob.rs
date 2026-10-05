@@ -231,6 +231,25 @@ impl BlobRef {
         }
     }
 
+    /// The empty blob: one zero-length block whose address is the empty
+    /// content's hash. The shape every delete marker's row carries, so the row
+    /// needs no absent value and a decoded blob is always total; one home for
+    /// it keeps the version engine and both backends from each spelling it.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_core::blob::{BlobRef, BlockHash};
+    ///
+    /// let empty = BlobRef::empty();
+    /// assert!(empty.is_empty());
+    /// assert_eq!(empty.len(), 0);
+    /// assert_eq!(empty, BlobRef::single(BlockHash::of(b""), 0));
+    /// ```
+    pub fn empty() -> Self {
+        Self::single(BlockHash::of(b""), 0)
+    }
+
     /// Assemble a reference from its parts, checking the invariants: at least
     /// one block, the declared length equal to the blocks' sum, and a
     /// zero-length block only as the blob's sole block.

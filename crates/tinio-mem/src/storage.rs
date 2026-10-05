@@ -112,8 +112,9 @@ where
 pub struct MemoryStorage {
     pub(crate) db: store::Handle,
     options: MemoryOptions,
-    /// Current total stored bytes across `objects` and `part_data`
-    /// (updated only when a limit is configured).
+    /// Current total stored bytes across `objects`, `part_data` and the
+    /// version history's `blobs` table (updated only when a limit is
+    /// configured).
     total_bytes: AtomicU64,
 }
 
@@ -123,8 +124,22 @@ pub struct MemoryOptions {
     /// Maximum size of a single object or multipart part in bytes.
     /// `None` (default) = unlimited.
     pub max_object_bytes: Option<u64>,
-    /// Maximum total stored bytes across all objects and parts.
-    /// `None` (default) = unlimited.
+    /// Maximum total stored bytes across all objects, parts and version
+    /// history blobs. `None` (default) = unlimited.
+    ///
+    /// The accounting covers every byte the backend holds: the current
+    /// objects and their parts, **and** the superseded version blobs a
+    /// versioned bucket's history keeps in the mem-local `blobs` table
+    /// (spec 2026-10-03) — a versioned bucket's history is bounded by this
+    /// limit exactly as its live content is. A blob enters the total when its
+    /// row is written (a content-addressed dedup hit adds nothing, its bytes
+    /// are already counted) and leaves it when the row does: when the last
+    /// version row naming that content is dropped — an explicit version
+    /// delete, the one-null-row convergence's displacement — or when the
+    /// bucket teardown drains the table. mem has no sweep, so a blob that no
+    /// version row names any more is still released the moment its last
+    /// naming row goes; the total is the bytes actually held, never a
+    /// reference count that could drift above or below them.
     pub max_total_bytes: Option<u64>,
 }
 
@@ -158,6 +173,8 @@ impl MemoryStorage {
             objects::Table::ensure(txn)?;
             part_data::Table::ensure(txn)?;
             part_meta::Table::ensure(txn)?;
+            #[cfg(feature = "versioning")]
+            crate::version::blobs::Table::ensure(txn)?;
             Ok(())
         })?;
         Ok(Self {
@@ -208,6 +225,29 @@ impl MemoryStorage {
         Ok(())
     }
 
+    /// Apply a signed byte delta to the tracked total **without** the
+    /// `max_total_bytes` check. The paths that only move or drop bytes the
+    /// backend already holds — a version delete (whose materialize can
+    /// re-publish content onto the key path), a bucket teardown — must never
+    /// fail for capacity: the limit governs what a client write may **add**,
+    /// and a backend that refused a delete for space would be unusable. The
+    /// delta is clamped at zero like [`Self::adjust_total`]'s; a delta that
+    /// grows the total can leave it above the limit, which the next write's
+    /// check then sees (the limit is best-effort, exactly as the type doc
+    /// says).
+    ///
+    /// The version paths are its only callers: without them the writes are
+    /// the only paths that move the total, and every one of those is a
+    /// client write the limit governs.
+    #[cfg(feature = "versioning")]
+    pub(crate) fn release_total(&self, delta: i64) {
+        self.total_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(((total as i128 + delta as i128).max(0)) as u64)
+            })
+            .ok();
+    }
+
     /// Roll back a [`Self::adjust_total`] delta after a failed commit
     /// (tested against the direct-accounting surface; the commit-failure
     /// path is unreachable on the in-memory backend — no disk writes).
@@ -249,6 +289,8 @@ mod tests {
     use redb::ReadableDatabase;
 
     use super::*;
+    #[cfg(feature = "versioning")]
+    use crate::_util::testing::{conformance_versioning, unique_bucket};
     use crate::{
         _core::{
             BucketOps, CompletedPart, ListObjectsParams, MultipartOps, ObjectOps, acl::Acl,
@@ -261,6 +303,18 @@ mod tests {
     async fn conformance() {
         let storage = MemoryStorage::new().unwrap();
         assert_conformance(&storage).await;
+        #[cfg(feature = "versioning")]
+        {
+            // The versioning leg runs beside the suite on its own bucket: the
+            // harness keeps the bucket it created to itself, and the leg
+            // leaves its bucket versioned.
+            let b = name(unique_bucket("conform-versioning")).unwrap();
+            storage
+                .create_bucket(&b, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+            conformance_versioning(&storage, &b).await;
+        }
     }
 
     #[tokio::test]

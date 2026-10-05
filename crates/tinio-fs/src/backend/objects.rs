@@ -12,24 +12,21 @@
 
 use std::{
     fs::remove_file,
-    io::{Error as IoError, ErrorKind, SeekFrom},
+    io::{Error as IoError, ErrorKind},
     mem, panic,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
 };
 
-use bytes::{BufMut, BytesMut};
 use futures::stream;
-use tokio::{
-    fs,
-    fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
-    runtime::Handle,
-    task,
-};
+use tokio::{fs, fs::File, runtime::Handle, task};
 
 use super::{Error, FsStorage};
+/// The rename guard's home: `rename_object` calls the contract's defaulted
+/// [`VersionOps::ensure_rename_allowed`] so the rule is never spelled here.
+#[cfg(feature = "versioning")]
+use crate::_core::storage::VersionOps;
 use crate::{
     _core::{
         BodyStream, ETag, acl,
@@ -42,16 +39,70 @@ use crate::{
             ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, access_denied,
             no_such_bucket, no_such_key,
         },
-        to_nanos,
+        to_nanos, version,
     },
     _store::{meta, object_part},
+    backend::version::stamp_superseded,
     fsutil,
-    write::{AtomicWriter, CHUNK_SIZE},
+    meta::{Content, Verdict, gate},
+    write::AtomicWriter,
 };
 
 /// An empty body stream (a zero-byte object with no range).
 fn empty_stream() -> BodyStream {
     Box::pin(stream::empty())
+}
+
+/// Remove the object at `path` — the deletion tail `delete_object` and the
+/// versioned delete share. With following enabled, a leaf link resolves to
+/// the object it aliases: DELETE removes the target (the bytes get/head
+/// serve), not the link (a dangling link is removed as itself — the object is
+/// already gone). Missing, a directory, and Windows' directory-reported-as-
+/// permission-denied are the idempotent no-ops DELETE is.
+pub(crate) async fn remove_object_file(path: &Path, follow_symlinks: bool) -> Result<(), Error> {
+    let remove_path = match fs::symlink_metadata(path).await {
+        Ok(m) if follow_symlinks && fsutil::is_symlink_or_reparse(&m) => fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    };
+    match fs::remove_file(&remove_path).await {
+        Ok(()) => {}
+        // Missing or a directory (DELETE of a marker key without the
+        // trailing slash) — DELETE is idempotent, always 204.
+        Err(err) if err.kind() == ErrorKind::NotFound || err.kind() == ErrorKind::IsADirectory => {
+            // Nothing to do.
+        }
+        // Windows reports a directory as PermissionDenied: the wrong-type
+        // no-op, not an I/O failure.
+        Err(err)
+            if err.kind() == ErrorKind::PermissionDenied
+                && fs::metadata(path)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false) =>
+        {
+            // Nothing to do.
+        }
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+/// Prune now-empty parent directories (best-effort): deleting the last object
+/// under a prefix leaves no residue, so a bucket that only ever held deleted
+/// objects is empty again (S3 semantics).
+pub(crate) async fn prune_parents(path: &Path, bucket_dir: &Path) {
+    let mut parent = path.parent().map(Path::to_path_buf);
+    while let Some(dir) = parent {
+        if dir == bucket_dir {
+            break;
+        }
+        match fs::remove_dir(&dir).await {
+            Ok(()) => parent = dir.parent().map(Path::to_path_buf),
+            Err(_) => break, // non-empty or gone: stop pruning
+        }
+    }
 }
 
 /// A staged object body: a temp file under `tmp/` (with its streaming
@@ -124,55 +175,6 @@ impl Drop for StagedBody {
             }
         }
     }
-}
-
-/// Stream the inclusive byte range `start..=end` of an open file in bounded
-/// chunks (constitution V: no per-object buffering). The stream state
-/// holds one `BytesMut`: each chunk is read into spare capacity via
-/// `read_buf` and handed off via `split().freeze()` — the frozen `Bytes`
-/// owns its memory, so reusing the buffer never invalidates a chunk the
-/// consumer still holds. The old per-chunk copy into a fresh `Bytes` is
-/// gone, but the read is not fully zero-copy: tokio's `File` reads into
-/// an internal buffer on the blocking pool and copies once into the
-/// caller's buffer (`Buf::read_from` + `copy_to`, tokio `src/fs/file.rs`
-/// / `src/io/blocking.rs`); a true zero-copy read would need
-/// `File` + manual `spawn_blocking` + `Read::read_buf` (out of
-/// scope).
-async fn file_stream(file: File, start: u64, end: u64) -> BodyStream {
-    let mut file = file;
-    if let Err(err) = file.seek(SeekFrom::Start(start)).await {
-        return Box::pin(stream::once(async move { Err(err) }));
-    }
-    let remaining = end.saturating_sub(start) + 1;
-    Box::pin(stream::try_unfold(
-        (file, remaining, BytesMut::with_capacity(CHUNK_SIZE)),
-        |(mut file, remaining, mut buf)| async move {
-            if remaining == 0 {
-                return Ok(None);
-            }
-            let want = remaining.min(CHUNK_SIZE as u64) as usize;
-            // The previous chunk's `split` moved the filled prefix out of
-            // `buf`, so make room for a full `want` again: when the
-            // consumer already released the frozen chunk the reserve
-            // reclaims the tail; a consumer still holding it forces a
-            // fresh allocation (inherent to ownership handoff —
-            // transiently two live buffers, the same shape as the old
-            // per-chunk `Bytes`).
-            buf.reserve(want);
-            // Cap the read at `want`: `read_buf` would otherwise fill the
-            // whole spare capacity and overrun the range end.
-            let mut limited = (&mut buf).limit(want);
-            match file.read_buf(&mut limited).await {
-                Ok(0) => Ok(None),
-                Ok(n) => {
-                    let left = remaining - n as u64;
-                    let chunk = buf.split().freeze();
-                    Ok(Some((chunk, (file, left, buf))))
-                }
-                Err(err) => Err(err),
-            }
-        },
-    ))
 }
 
 impl FsStorage {
@@ -250,40 +252,7 @@ impl FsStorage {
             return Err(no_such_key(key).into());
         }
         let path = self.resolve_key(&bucket_dir, key).await?;
-        // One policy open: nofollow when following is disabled (a swap
-        // to a symlink between the resolve and the open is rejected, R3
-        // — the ELOOP → PermissionDenied normalization included).
-        let mut file = match fsutil::open_file(&path, self.follow_symlinks).await {
-            Ok(file) => file,
-            // Missing: the old path-stat's NotFound mapping moves to the
-            // open (the merged read resolves the object in one step).
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Err(no_such_key(key).into());
-            }
-            // Windows opens a directory handle only with
-            // FILE_FLAG_BACKUP_SEMANTICS, so a folder-marker open fails
-            // exactly like a permission denial. One stat classifies: a
-            // directory is a folder marker (NoSuchKey — never an error),
-            // anything else keeps the original error (the symlink-policy
-            // answer when following is disabled, the I/O error
-            // otherwise). Both-fail corner (the stat too — an
-            // unsearchable parent): the follow=false answer is
-            // AccessDenied, where the old path-stat reported Io (500).
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-                let is_dir = fsutil::object_metadata(&path, self.follow_symlinks)
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
-                if is_dir {
-                    return Err(no_such_key(key).into());
-                }
-                if !self.follow_symlinks {
-                    return Err(access_denied(key).into());
-                }
-                return Err(err.into());
-            }
-            Err(err) => return Err(err.into()),
-        };
+        let mut file = self.open_object(&path, key).await?;
         let metadata = match file.metadata().await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -307,6 +276,145 @@ impl FsStorage {
         // impossible by construction).
         let identity = fsutil::file_identity_async(&mut file, &metadata).await;
         Ok((path, file, size, mtime, identity))
+    }
+
+    /// One policy open of an **already resolved** object path: nofollow
+    /// when following is disabled (a swap to a symlink between the resolve
+    /// and the open is rejected, R3 — the ELOOP → PermissionDenied
+    /// normalization included). The error mapping every read path's open
+    /// shares: missing is `NoSuchKey` (the old path-stat's NotFound moved
+    /// to the open), a folder marker (a directory — Windows opens one only
+    /// with `FILE_FLAG_BACKUP_SEMANTICS`, so the open fails exactly like a
+    /// permission denial) is `NoSuchKey` too, and the remaining denial is
+    /// the symlink policy's `AccessDenied` under nofollow. The both-fail
+    /// corner (the classifying stat fails too — an unsearchable parent)
+    /// answers `AccessDenied` under nofollow, where the old path-stat
+    /// reported Io (500).
+    ///
+    /// [`resolve_object_file`](Self::resolve_object_file) is this open plus
+    /// the handle's stamp; the version-addressed read calls it directly on
+    /// the path its own slot resolution already produced, so one request
+    /// never resolves the key twice.
+    async fn open_object(&self, path: &Path, key: &object::Key) -> Result<File, Error> {
+        match fsutil::open_file(path, self.follow_symlinks).await {
+            Ok(file) => Ok(file),
+            Err(err) if err.kind() == ErrorKind::NotFound => Err(no_such_key(key).into()),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                let is_dir = fsutil::object_metadata(path, self.follow_symlinks)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if is_dir {
+                    return Err(no_such_key(key).into());
+                }
+                if !self.follow_symlinks {
+                    return Err(access_denied(key).into());
+                }
+                Err(err.into())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The response body of one resolved object: the caller's range clamped
+    /// to `size`, or the whole object — never a 1-byte read that could
+    /// overshoot if the file grew after the resolution. One home for the
+    /// body shape [`get_object`](ObjectOps::get_object) and the version
+    /// read share.
+    pub(crate) async fn object_body(
+        file: File,
+        size: u64,
+        range: Option<ByteRange>,
+    ) -> Result<(BodyStream, Option<(u64, u64)>), Error> {
+        Ok(match range {
+            Some(range) => {
+                let (start, end) = range.resolve(size)?;
+                (
+                    fsutil::file_stream(file, start, end, fsutil::ShortRead::EndBody).await,
+                    Some((start, end)),
+                )
+            }
+            None if size == 0 => {
+                // No bytes exist to stream — not a 1-byte read, which
+                // could overshoot if the file grew after the stat.
+                (empty_stream(), None)
+            }
+            // The end-of-body policy: the range is a clamp on an object
+            // served as-is, so a file ending early is a normal end.
+            None => (
+                fsutil::file_stream(file, 0, size - 1, fsutil::ShortRead::EndBody).await,
+                None,
+            ),
+        })
+    }
+
+    /// The current object's answer from a slot the version-addressed read
+    /// already resolved: ONE policy open of the resolved path, the shared
+    /// staleness gate applied to the open handle's own facts, and — only
+    /// where the gate degrades the recorded identity — the read path's own
+    /// heal (`ensure_row`, which clears the stale element in the same write
+    /// that rewrites the row). Answers exactly what
+    /// [`resolve_object_info`](Self::resolve_object_info) answers for the
+    /// same state: the open file (the caller's body source), the handle's
+    /// stamp, the row the answer serves, and the gated identity — with the
+    /// path resolution, the row point-read and the gate taken once.
+    #[cfg(feature = "versioning")]
+    pub(crate) async fn serve_current(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        path: &Path,
+        stored: &meta::Stored,
+    ) -> Result<(File, u64, SystemTime, meta::Stored, Option<version::Id>), Error> {
+        let mut file = self.open_object(path, key).await?;
+        let metadata = match file.metadata().await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(no_such_key(key).into());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.is_dir() {
+            return Err(no_such_key(key).into());
+        }
+        let size = metadata.len();
+        let mtime = metadata.modified()?;
+        // The identity comes from the ALREADY-OPEN handle (R3) — the gate
+        // below judges the file the stream will read, never a second
+        // path-based view of it.
+        let identity = fsutil::file_identity_async(&mut file, &metadata).await;
+        match gate(
+            stored,
+            Content::Present {
+                size,
+                mtime,
+                identity,
+            },
+        ) {
+            // The recorded identity names the content: the row the read path
+            // serves is the judged one (`ensure_row` returns it unchanged on
+            // a match), and its identity is live.
+            Verdict::Live => Ok((file, size, mtime, stored.clone(), stored.version_id.clone())),
+            // The gate degraded the recorded identity: the heal answers the
+            // row (the content-derived ETag, the stale element cleared), and
+            // the degraded slot carries no identity.
+            Verdict::Degraded => {
+                let (row, _) = self
+                    .meta_store
+                    .ensure_row(
+                        bucket,
+                        key,
+                        path,
+                        size,
+                        mtime,
+                        identity,
+                        self.follow_symlinks,
+                        stored.version_id.as_ref(),
+                    )
+                    .await?;
+                Ok((file, size, mtime, row, None))
+            }
+        }
     }
 
     /// The stat-only object existence gate of the metadata-only ops
@@ -347,13 +455,52 @@ impl FsStorage {
     /// Resolve the object for a read — the shared head of
     /// `get_object`/`head_object`: the file resolution plus the ensured
     /// meta row (the ETag — and the tags/checksum elements the read
-    /// paths serve — against the meta store; spec 2026-08-31).
-    async fn resolve_object_info(
+    /// paths serve — against the meta store; spec 2026-08-31), and the
+    /// current version identity the response carries.
+    ///
+    /// The identity is gated (F01's size/mtime/identity rule): the row's
+    /// recorded identifier is served only while the content still matches
+    /// it. An out-of-band edit degrades the current version to the null
+    /// version — a stale identifier is never served as if it still named
+    /// content (the same rule the version adapter's `current` applies, so
+    /// the plain read and the version read never disagree about what is
+    /// current). The gate reads the row **before** `ensure_row`, and hands
+    /// the identity it invalidated to the ensure: the rewrite that answers it
+    /// clears the element in the same write transaction that writes the row
+    /// (`meta::Store::rewrite_preserving`'s `stale`), so one read leaves the
+    /// row already correct — no second write, and the next read can never
+    /// resurrect the identifier. The clear is a compare-and-set on the row
+    /// the rewrite itself read, so a concurrent write that installed a live
+    /// version between the two reads keeps its own identity.
+    pub(crate) async fn resolve_object_info(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<(File, u64, SystemTime, meta::Stored), Error> {
+    ) -> Result<(File, u64, SystemTime, meta::Stored, Option<version::Id>), Error> {
         let (path, file, size, mtime, identity) = self.resolve_object_file(bucket, key).await?;
+        let judged = self.meta_store.stored_entry(bucket, key).await?;
+        // The staleness gate, from its one home in the meta store (the same
+        // call the version adapter's `current_with_row` takes): a recorded
+        // identity the content no longer matches is stale, and the version
+        // adapter reads that state as the null version — the two answer one
+        // verdict, never one each.
+        let matched = judged.as_ref().is_some_and(|stored| {
+            gate(
+                stored,
+                Content::Present {
+                    size,
+                    mtime,
+                    identity,
+                },
+            ) == Verdict::Live
+        });
+        let stale = if matched {
+            None
+        } else {
+            judged
+                .as_ref()
+                .and_then(|stored| stored.version_id.as_ref())
+        };
         let (row, _) = self
             .meta_store
             .ensure_row(
@@ -364,9 +511,11 @@ impl FsStorage {
                 mtime,
                 identity,
                 self.follow_symlinks,
+                stale,
             )
             .await?;
-        Ok((file, size, mtime, row))
+        let version_id = matched.then(|| row.version_id.clone()).flatten();
+        Ok((file, size, mtime, row, version_id))
     }
 
     /// The unix fast path of the copy primitive: the kernel's
@@ -537,6 +686,7 @@ impl FsStorage {
                 checksum: None,
                 owner: None,
                 acl: Acl::default_private(None),
+                version_id: None,
             });
         }
         // A real object always arrives with a staged temp (the marker
@@ -549,80 +699,64 @@ impl FsStorage {
         // reports an error instead of silently losing the object with
         // 200). A failed commit removes the staged temp — a rejected
         // write leaves no residue.
-        let result = async {
-            #[cfg(unix)]
-            use crate::fsutil::DirOwnerUid;
-            #[cfg(not(unix))]
-            use crate::fsutil::DirOwnerUid;
-
-            let _guard = self.lock_bucket_mutations(bucket).await;
-            let bucket_dir = self.ensure_bucket(bucket).await?;
-            let target = self.resolve_key(&bucket_dir, key).await?;
-            // The unix dir hardening (spec 2026-09-05 §5a): a prefix
-            // dir implicitly created by a non-bucket-owner's PUT lands
-            // `0700` and chowned to the bucket owner's mapped uid (the
-            // lookup runs once per commit).
-            #[cfg(unix)]
-            let dir_owner_uid = self.bucket_owner_uid(bucket).await;
-            // F03: the bucket root bounds the first-into-a-new-prefix
-            // ancestor sync.
-            AtomicWriter::commit(
-                &temp,
-                &target,
-                Some(&bucket_dir),
-                #[cfg(unix)]
-                DirOwnerUid(dir_owner_uid),
-                #[cfg(not(unix))]
-                DirOwnerUid,
-            )
-            .await?;
-            let metadata = fs::metadata(&target).await?;
-            // The unix ownership hardening (spec 2026-09-05 §5a): the
-            // landed object chowns to the NEW owner's mapped uid (an
-            // overwrite replaces the owner; a copy's owner is the
-            // caller's). A chown failure fails closed — the rename
-            // already landed, so a wrongly-owned 0600 file must not be
-            // left behind: remove it and error the request (the row was
-            // not written yet; the upload-side temp was consumed by the
-            // rename). An unmapped owner stays server-user-owned, still
-            // `0600`.
-            #[cfg(unix)]
-            if let Some(uid) = self.owner_uid(owner)
-                && let Err(err) = fsutil::chown_file(&target, uid).await
-            {
-                let _ = fs::remove_file(&target).await;
-                return Err(err.into());
+        // The publish is `publish_versioned`'s: the bucket mutation lock, the
+        // re-resolved target, the version branch (its supersede commits the
+        // outgoing version's row BEFORE the rename, so a crash between the
+        // two is recovered by adopting that row, never by minting a second
+        // identity for the same content — the engine's supersede protocol)
+        // and the rename, in one call every write path shares. A failed
+        // publish removes the staged temp — a rejected write leaves no
+        // residue.
+        let published = match self.publish_versioned(bucket, key, &temp).await {
+            Ok(published) => published,
+            Err(err) => {
+                let _ = fs::remove_file(&temp).await;
+                return Err(err);
             }
-            // The object is committed — a meta-write failure (full
-            // state dir) must not fail the PUT: the entry is recomputed
-            // from the content on the next read (self-healing, FR-022).
-            // The stale-part removal rides in the same transaction.
-            let identity = fsutil::file_identity(&target, &metadata);
-            let mtime = metadata.modified()?;
-            self.record_committed(
-                bucket,
-                key,
-                &etag,
-                metadata.len(),
-                mtime,
-                identity,
-                &tags,
-                checksum.as_ref(),
-                owner,
-                acl,
-            )
-            .await;
-            Ok::<_, Error>((metadata.len(), mtime))
+        };
+        // The unix ownership hardening (spec 2026-09-05 §5a): the
+        // landed object chowns to the NEW owner's mapped uid (an
+        // overwrite replaces the owner; a copy's owner is the
+        // caller's). A chown failure fails closed — the rename
+        // already landed, so a wrongly-owned 0600 file must not be
+        // left behind: remove it and error the request (the row was
+        // not written yet; the upload-side temp was consumed by the
+        // rename). An unmapped owner stays server-user-owned, still
+        // `0600`.
+        #[cfg(unix)]
+        if let Some(uid) = self.owner_uid(owner)
+            && let Err(err) = fsutil::chown_file(&published.path, uid).await
+        {
+            let _ = fs::remove_file(&published.path).await;
+            return Err(err.into());
         }
+        // The object is committed — a meta-write failure (full
+        // state dir) must not fail the PUT: the entry is recomputed
+        // from the content on the next read (self-healing, FR-022).
+        // The stale-part removal rides in the same transaction. The
+        // guard the publish holds stays alive until this write is
+        // done: the branch, the rename and the row are one critical
+        // section.
+        self.record_committed(
+            bucket,
+            key,
+            &etag,
+            published.size,
+            published.mtime,
+            published.identity,
+            &tags,
+            checksum.as_ref(),
+            owner,
+            acl,
+            published.marker.id.as_ref(),
+            published.seq,
+            published.superseded,
+        )
         .await;
-        if result.is_err() {
-            let _ = fs::remove_file(&temp).await;
-        }
-        let (size, mtime) = result?;
         Ok(Info {
             key: key.clone(),
-            size,
-            last_modified: mtime,
+            size: published.size,
+            last_modified: published.mtime,
             etag,
             tags,
             checksum,
@@ -631,16 +765,21 @@ impl FsStorage {
                 owner: None,
                 grants: acl.grants.clone(),
             },
+            version_id: published.marker.id,
         })
     }
 
     /// The committed object's row write: the `OBJECT_META` entry (tags +
     /// checksum + owner + ACL elements — the stored ACL holds the grant
-    /// set only, the owner rides its own element) and the removal of any
-    /// stale `OBJECT_PARTS` rows of the key in ONE write transaction.
-    /// Best-effort — a failed meta write must not fail the PUT (the
-    /// entry self-heals on the next read, FR-022); the failure is
-    /// warned.
+    /// set only, the owner rides its own element — plus the current
+    /// version's identity and sequence, the write branch's
+    /// `publish_versioned` answer), the removal of any stale
+    /// `OBJECT_PARTS` rows of the key, and the outgoing version's row stamp
+    /// (`superseded`) in ONE write transaction: the transaction that moves
+    /// the current slot off that row is the one that makes it history, so the
+    /// two can never disagree. Best-effort — a failed meta write must not fail
+    /// the PUT (the entry self-heals on the next read, FR-022); the failure
+    /// is warned.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed(
         &self,
@@ -654,6 +793,9 @@ impl FsStorage {
         checksum: Option<&checksum::Recorded>,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        version_id: Option<&version::Id>,
+        version_seq: u64,
+        superseded: Option<u64>,
     ) {
         let bucket = bucket.clone();
         let key = key.clone();
@@ -661,6 +803,7 @@ impl FsStorage {
         let tags = tags.clone();
         let checksum = checksum.cloned();
         let owner = owner.cloned();
+        let version_id = version_id.cloned();
         let acl = Acl {
             owner: None,
             grants: acl.grants.clone(),
@@ -672,6 +815,9 @@ impl FsStorage {
                     &bucket,
                     &key,
                     &meta::Stored {
+                        version_id: version_id.clone(),
+                        version_seq,
+                        is_delete_marker: false,
                         etag: etag.clone(),
                         size,
                         mtime: to_nanos(mtime),
@@ -683,6 +829,7 @@ impl FsStorage {
                     },
                 )?;
                 object_part::Table::open(txn)?.remove_key(&bucket, &key)?;
+                stamp_superseded(txn, &bucket, &key, superseded)?;
                 Ok(())
             })
             .await
@@ -729,7 +876,7 @@ impl ObjectOps for FsStorage {
         // as the tee's stream error (propagated here like any body
         // failure — the fs adds no error of its own), and the validated
         // digest rides into the commit. Absent, no digest is computed.
-        let (temp, etag) = self.writer.stage(body, checksum.as_deref()).await?;
+        let (temp, etag, _size) = self.writer.stage(body, checksum.as_deref()).await?;
         let computed = checksum.as_ref().and_then(|c| c.digest.get()).cloned();
         Ok(StagedBody {
             temp: Some(temp),
@@ -799,19 +946,8 @@ impl ObjectOps for FsStorage {
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
-        let (file, size, mtime, row) = self.resolve_object_info(bucket, key).await?;
-        let (body, served_range) = match range {
-            Some(range) => {
-                let (start, end) = range.resolve(size)?;
-                (file_stream(file, start, end).await, Some((start, end)))
-            }
-            None if size == 0 => {
-                // No bytes exist to stream — not a 1-byte read, which
-                // could overshoot if the file grew after the stat.
-                (empty_stream(), None)
-            }
-            None => (file_stream(file, 0, size - 1).await, None),
-        };
+        let (file, size, mtime, row, version_id) = self.resolve_object_info(bucket, key).await?;
+        let (body, served_range) = Self::object_body(file, size, range).await?;
         Ok(GetObjectResult {
             info: Info {
                 key: key.clone(),
@@ -822,6 +958,7 @@ impl ObjectOps for FsStorage {
                 checksum: row.checksum,
                 owner: row.owner,
                 acl: row.acl,
+                version_id,
             },
             body,
             served_range,
@@ -831,7 +968,7 @@ impl ObjectOps for FsStorage {
     async fn head_object(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Info, Error> {
         // The open is the metadata source too (the same merge as
         // get_object) — the handle is dropped right away.
-        let (_file, size, mtime, row) = self.resolve_object_info(bucket, key).await?;
+        let (_file, size, mtime, row, version_id) = self.resolve_object_info(bucket, key).await?;
         Ok(Info {
             key: key.clone(),
             size,
@@ -841,9 +978,20 @@ impl ObjectOps for FsStorage {
             checksum: row.checksum,
             owner: row.owner,
             acl: row.acl,
+            version_id,
         })
     }
 
+    /// Limitation: a rename has no versioning semantics — it would move one
+    /// key's file and row while the source key's version rows stay behind
+    /// (orphaning the source's version chain) and the destination's current
+    /// version is replaced without being superseded. The contract states the
+    /// rule ([`ObjectOps::rename_object`]) and the shared guard owns it
+    /// ([`VersionOps::ensure_rename_allowed`](crate::_core::storage::VersionOps::ensure_rename_allowed)):
+    /// a bucket that versions
+    /// anything (enabled or suspended) refuses with the contract's
+    /// `AccessDenied` class, and an unversioned bucket renames exactly as
+    /// before.
     async fn rename_object(
         &self,
         bucket: &bucket::Name,
@@ -862,6 +1010,12 @@ impl ObjectOps for FsStorage {
             // backend-level guard keeps the move idempotent.
             return self.head_object(bucket, src).await;
         }
+        // The rename guard, from its one home in the contract: a bucket
+        // that records versions refuses the key-moving operation instead
+        // of corrupting. The shared leg's versioning tripwire fails a
+        // backend that skips the call.
+        #[cfg(feature = "versioning")]
+        self.ensure_rename_allowed(bucket, dst).await?;
         // A reserved destination is never a legal rename target (FR-020
         // — a write through the reserved segment, refused like every
         // other write path); a marker destination cannot hold an object
@@ -892,6 +1046,7 @@ impl ObjectOps for FsStorage {
                 mtime,
                 identity,
                 self.follow_symlinks,
+                None,
             )
             .await?;
         // The file move: same-volume (one bucket), atomic, overwriting an
@@ -1013,10 +1168,15 @@ impl ObjectOps for FsStorage {
             checksum,
             owner,
             acl,
+            version_id: None,
         })
     }
 
-    async fn delete_object(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
+    async fn delete_object(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<version::Marker, Error> {
         let bucket_dir = self.ensure_bucket(bucket).await?;
         // Like every other object op: never resolve through a symlink
         // when `follow_symlinks` is disabled (a DELETE through a linked
@@ -1038,56 +1198,26 @@ impl ObjectOps for FsStorage {
                 }
                 Err(err) => return Err(err.into()),
             }
-            return Ok(());
+            // Folder markers stay outside the version model (the design's
+            // ruling): a delete removes the empty directory, creates no
+            // marker.
+            return Ok(version::Marker::none());
         }
-        // With following enabled, a leaf link resolves to the object it
-        // aliases — DELETE removes the target (the bytes get/head
-        // serve), not the link (a dangling link is removed as itself:
-        // the object is already gone). Mirrors put/get, which address
-        // the target.
-        let remove_path = match fs::symlink_metadata(&path).await {
-            Ok(m) if self.follow_symlinks && fsutil::is_symlink_or_reparse(&m) => {
-                fs::canonicalize(&path).await.unwrap_or(path.clone())
-            }
-            _ => path.clone(),
-        };
-        match fs::remove_file(&remove_path).await {
-            Ok(()) => {}
-            // Missing or a directory (DELETE of a marker key without the
-            // trailing slash) — DELETE is idempotent, always 204.
-            Err(err)
-                if err.kind() == ErrorKind::NotFound || err.kind() == ErrorKind::IsADirectory =>
-            {
-                // Nothing to do.
-            }
-            // Windows reports a directory as PermissionDenied: the
-            // wrong-type no-op, not an I/O failure.
-            Err(err)
-                if err.kind() == ErrorKind::PermissionDenied
-                    && fs::metadata(&path)
-                        .await
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false) =>
-            {
-                // Nothing to do.
-            }
-            Err(err) => return Err(err.into()),
+        // The versioned delete (feature): the outgoing version's row, the
+        // marker's row and the file removal run under one bucket mutation
+        // lock — the marker's identity is durable in the state row BEFORE
+        // the file goes, so a crash cannot strand "file gone + row still
+        // naming the object version". An unversioned bucket answers `None`
+        // and falls through to today's delete unchanged.
+        #[cfg(feature = "versioning")]
+        if let Some(marker) = self.delete_versioned(bucket, key, &path).await? {
+            prune_parents(&path, &bucket_dir).await;
+            return Ok(marker);
         }
+        remove_object_file(&path, self.follow_symlinks).await?;
         self.meta_store.remove(bucket, key).await?;
-        // Prune now-empty parent directories (best-effort): deleting the
-        // last object under a prefix leaves no residue, so a bucket that
-        // only ever held deleted objects is empty again (S3 semantics).
-        let mut parent = path.parent().map(Path::to_path_buf);
-        while let Some(dir) = parent {
-            if dir == bucket_dir {
-                break;
-            }
-            match fs::remove_dir(&dir).await {
-                Ok(()) => parent = dir.parent().map(Path::to_path_buf),
-                Err(_) => break, // non-empty or gone: stop pruning
-            }
-        }
-        Ok(())
+        prune_parents(&path, &bucket_dir).await;
+        Ok(version::Marker::none())
     }
 
     async fn get_object_tags(
@@ -1217,6 +1347,14 @@ mod tests {
     // it unused while the unix build cannot resolve the trait methods.
     #[cfg(unix)]
     use crate::_core::storage::MultipartOps;
+    // The ranged-stream tests assert the shared stream's chunking.
+    use crate::_util::fsutil::CHUNK_SIZE;
+    // The versioning leg is registered in the runner below, not inside
+    // `assert_conformance`: a backend compiled without its versioning
+    // machinery refuses every version operation by contract, so the shared
+    // suite cannot demand it. The gate carries the import with the call.
+    #[cfg(feature = "versioning")]
+    use crate::_util::testing::{conformance_versioning, unique_bucket};
     #[cfg(unix)]
     use crate::FsOptions;
     use crate::{
@@ -1234,6 +1372,18 @@ mod tests {
     async fn conformance_green() {
         let (_root, storage) = storage();
         assert_conformance(&storage).await;
+        #[cfg(feature = "versioning")]
+        {
+            // The versioning leg runs beside the suite on its own bucket: the
+            // harness keeps the bucket it created to itself, and the leg
+            // leaves its bucket versioned.
+            let b = bucket::name(unique_bucket("conform-versioning")).unwrap();
+            storage
+                .create_bucket(&b, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+            conformance_versioning(&storage, &b).await;
+        }
     }
 
     #[tokio::test]

@@ -2,9 +2,9 @@
 
 **Branch**: `001-s3-local-server` | **Date**: 2026-08-22
 
-Design details for the filesystem backend (`tinio-fs`, v1) — the v1 implementation of the `tinio-core` storage contract (`Storage` + `Cleanup` traits, task T012). This document is the single home for fs-specific behavior and algorithms: path mapping, atomic writes, the ETag meta store, bucket creation times, listing, multipart, the sweep, the `Cleanup` impl, and the scanner walk. **Future backends (tinio-s3, tinio-webdav) define their own behavior, documented in their own backend documents; nothing in this file is assumed to carry over.**
+Design details for the filesystem backend (`tinio-fs`, v1) — the v1 implementation of the `tinio-core` storage contract (`Storage` + `Cleanup` traits, task T012). This document is the single home for fs-specific behavior and algorithms: path mapping, atomic writes, the ETag meta store, bucket creation times, listing, multipart, the sweep, the `Cleanup` impl, the scanner walk, and the versioned write path (supersede and materialize) with its block store. **Future backends (tinio-s3, tinio-webdav) define their own behavior, documented in their own backend documents; nothing in this file is assumed to carry over.**
 
-Related: [failure-handling.md](failure-handling.md) (abnormal conditions, reclamation division of labor), [scanner.md](scanner.md) (scanner design), [data-model.md](data-model.md) (state layout — `tmp/`, `multipart/`, `meta.redb` schemas), [contracts/s3-surface.md](contracts/s3-surface.md) (protocol behaviors: folder markers, symlink policy, charset, Range/conditional requests, error codes).
+Related: [failure-handling.md](failure-handling.md) (abnormal conditions, reclamation division of labor), [scanner.md](scanner.md) (scanner design), [data-model.md](data-model.md) (state layout — `tmp/`, `multipart/`, `blobs/`, `meta.redb` schemas), [contracts/s3-surface.md](contracts/s3-surface.md) (protocol behaviors: folder markers, symlink policy, charset, Range/conditional requests, error codes).
 
 ## 1. Path mapping (`crates/tinio-fs/src/path.rs`, T037)
 
@@ -121,11 +121,20 @@ redb's copy-on-write file only grows; `Database::compact(&mut self)` needs an ex
 - Triggers: startup (before the stores are constructed) and `doctor --fix` (offline, exclusive open); `--dry-run` only reports the evaluation.
 - `check_integrity()`: doctor's integrity check — `Ok(true)` healthy / `Ok(false)` repaired / `Err(Corrupted)` unfixable (delete and rebuild; metadata is derivable).
 
-## 11. Scope and reference boundaries
+## 11. Versioned write path and the block store (`crates/tinio-fs/src/version_adapter.rs`)
+
+The fs-side protocol of versioning (`docs/superpowers/specs/2026-10-03-s3-versioning-design.md`, **The storage model** / **Write paths**). The current version stays the plain file at the key path; only history lives elsewhere.
+
+- **Block store**: `<state-dir>/blobs/<bucket>/<prefix>/<block-hash>` holds a bucket's superseded content, content-addressed and immutable (a partial write is inert garbage, never a torn blob); `<state-dir>/blobs/<bucket>/tmp/` stages a block through the same temp + rename path as §2. One subtree per bucket, so a bucket deletion takes `blobs/<bucket>/` with it the way it takes `multipart/<bucket>/` (§8.1), and nothing outside the bucket is ever referenced (layout in data-model.md).
+- **Supersede**: a write that publishes a new current version over an existing one sends the outgoing file's content into the block store — hashed and deduplicated against the bucket's existing blobs (in v1 a blob is one block, so this is a whole-content lookup) — and commits the version row **before** the key path is overwritten. The one interruption window is a crash between the two: the old file is still at the key path and the row describes it, and recovery **adopts** that row (its content is real, and it is the version that was current) rather than minting a second identity for the same content. The outgoing file is re-stated after the read; content that no longer matches the file identity the meta row recorded (the same size/mtime/identity staleness gate reads use) fails the write — one retry, then an error naming the concurrent modification — rather than committing bytes whose provenance is unknown.
+- **Materialize**: a version becomes current again — a delete marker is deleted, or the current version itself is permanently deleted — by reassembling its blocks into the key path through the existing temp + rename path; this is the only path that turns history back into a file. Both directions are I/O-bound and streaming; neither buffers an object whole (constitution V).
+- **Coverage**: the same protocol serves `PutObject`, `PostObject`, `CopyObject`'s destination and `CompleteMultipartUpload`'s publish (§6); a `DELETE` without a version ID is the same protocol with an empty incoming body and a marker in place of the new version. Two writes skip the move entirely, since no previous version may be preserved: a suspended-bucket write replacing an existing null version, and a write onto an object whose current version is already a delete marker.
+
+## 12. Scope and reference boundaries
 
 To keep this document the single home for fs design without duplicating others:
 
-- **Layouts and schemas** (`tmp/`, `meta.redb`, `multipart/`): [data-model.md](data-model.md) — referenced, not duplicated.
+- **Layouts and schemas** (`tmp/`, `meta.redb`, `multipart/`, `blobs/`): [data-model.md](data-model.md) — referenced, not duplicated.
 - **Protocol behaviors** (folder markers, symlink policy, key charset, Range/conditional requests, error codes): [contracts/s3-surface.md](contracts/s3-surface.md).
 - **Abnormal-condition taxonomy and reclamation division of labor**: [failure-handling.md](failure-handling.md).
 - **Scanner pacing, lifecycle, and concurrency correctness**: [scanner.md](scanner.md).

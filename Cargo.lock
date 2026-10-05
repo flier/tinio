@@ -4370,6 +4370,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-properties",
+ "uuid",
 ]
 
 [[package]]
@@ -4417,17 +4418,22 @@ dependencies = [
  "hex",
  "md-5",
  "moka",
+ "prometheus",
  "proptest",
  "redb",
  "rustix 1.1.4",
+ "sha2",
  "smart-default",
  "soft-canonicalize",
  "strict-path",
  "tempfile",
  "thiserror 2.0.20",
+ "tinio-blob",
  "tinio-core",
+ "tinio-fs",
  "tinio-store",
  "tinio-util",
+ "tinio-version",
  "tokio",
  "tracing",
  "uuid",
@@ -4444,8 +4450,10 @@ dependencies = [
  "redb",
  "thiserror 2.0.20",
  "tinio-core",
+ "tinio-mem",
  "tinio-store",
  "tinio-util",
+ "tinio-version",
  "tokio",
  "uuid",
 ]
@@ -4619,6 +4627,7 @@ name = "tinio-store"
 version = "0.1.0"
 dependencies = [
  "derive_more",
+ "parse-display",
  "redb",
  "thiserror 2.0.20",
  "tinio-core",
@@ -4644,6 +4653,22 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tinio-version"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tinio-blob",
+ "tinio-core",
+ "tinio-store",
+ "tinio-util",
+ "tokio",
 ]
 
 [[package]]

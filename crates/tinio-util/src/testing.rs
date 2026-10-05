@@ -124,6 +124,7 @@ use crate::_core::{
     multipart::MIN_PART_BYTES,
     object, storage,
     storage::Error::*,
+    version,
 };
 
 /// Produce a unique bucket name for the harness (fresh backends may already
@@ -218,6 +219,12 @@ fn check(cond: bool, msg: &str) {
 
 /// Run the full conformance suite against a backend. Panics on the first
 /// violation (test-harness semantics).
+///
+/// The versioning leg ([`conformance_versioning`]) is deliberately not one of
+/// these calls: a backend compiled without its versioning machinery refuses
+/// every version operation by contract, so a suite every backend must pass
+/// cannot demand it. Each backend registers that leg in its own runner, where
+/// its own feature gate is visible.
 pub async fn assert_conformance<S: Storage>(storage: &S) {
     let b = bucket::name(unique_bucket("conform")).unwrap();
     conformance_buckets(storage, &b).await;
@@ -2615,6 +2622,801 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
 
     storage.delete_object(b, &big).await.unwrap();
     storage.delete_bucket(b).await.unwrap();
+}
+
+/// The versioning leg of the conformance suite (spec
+/// 2026-10-03-s3-versioning): the default bucket state, an enabled overwrite,
+/// the delete-marker round trip, the null version a suspended bucket writes,
+/// the repeated suspended delete that must leave exactly one marker, and the
+/// five-call journey that must keep a superseded null version listed beside
+/// the null version that superseded it.
+///
+/// The leg asserts through [`crate::_core::storage::VersionOps`] only and says
+/// nothing about layout, so `tinio-fs`'s files-plus-blocks and `tinio-mem`'s
+/// rows must both satisfy it. Each backend registers it in its own runner
+/// (beside [`assert_conformance`], whose own bucket it does not touch): the leg
+/// enables versioning on the bucket it is handed and leaves it suspended when
+/// it returns, so it belongs last.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use tinio_core::{BucketOps, acl, bucket};
+/// use tinio_util::testing::conformance_versioning;
+///
+/// let storage = MyBackend::new(...);
+/// let b = bucket::name("data").unwrap();
+/// storage.create_bucket(&b, None, &acl::Acl::default_private(None)).await.unwrap();
+/// conformance_versioning(&storage, &b).await;
+/// ```
+///
+/// (`ignore`: a test-support item whose example must name a concrete backend
+/// the caller supplies, and the dev-dependency direction runs from the
+/// backends to `tinio-util` — naming one here would be a dependency cycle.
+/// The same reason `Storage`'s own trait example in `tinio-core` is ignored,
+/// and the closed exempt list's test-support class covers it.)
+pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
+    /// Stage and commit one body, answering the committed metadata —
+    /// `put_object` answers the ETag alone, and the version identity rides
+    /// [`object::Info`].
+    async fn commit<S: Storage>(
+        storage: &S,
+        b: &bucket::Name,
+        key: &object::Key,
+        data: &[u8],
+    ) -> object::Info {
+        let staged = storage
+            .stage_body(b, key, body(data.to_vec()), None)
+            .await
+            .unwrap();
+        storage
+            .commit_object(
+                b,
+                key,
+                staged,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap()
+    }
+
+    // The default state: a bucket versions nothing until it is asked to.
+    check(
+        storage.bucket_versioning(b).await.unwrap() == version::State::Unversioned,
+        "a fresh bucket must answer State::Unversioned",
+    );
+
+    // Enabling is visible.
+    storage
+        .set_bucket_versioning(b, version::State::Enabled)
+        .await
+        .unwrap();
+    check(
+        storage.bucket_versioning(b).await.unwrap() == version::State::Enabled,
+        "set_bucket_versioning(Enabled) must be visible to bucket_versioning",
+    );
+
+    // The rename rule the contract states: a bucket that records versions
+    // refuses the operation with the access-denied class, because the move
+    // would replace the destination's current version without superseding it
+    // and strand the source key's history. A backend that skipped the shared
+    // guard would answer Ok here and move the object — the divergence this
+    // check exists to catch.
+    let rename_src = object::key("versioned/rename-src.txt").unwrap();
+    let rename_dst = object::key("versioned/rename-dst.txt").unwrap();
+    let rename_src_id = commit(storage, b, &rename_src, b"move me")
+        .await
+        .version_id
+        .expect("an enabled write must mint a version id");
+    let err = into_core_error(
+        storage
+            .rename_object(b, &rename_src, &rename_dst)
+            .await
+            .expect_err("a rename on a versioned bucket must be refused"),
+    );
+    check(
+        matches!(err, AccessDenied(_)),
+        "a rename on a versioned bucket must answer the access-denied class",
+    );
+    let kept = storage.head_object(b, &rename_src).await.unwrap();
+    check(
+        kept.version_id.as_ref() == Some(&rename_src_id),
+        "a refused rename must leave the source version untouched",
+    );
+    check(
+        storage.head_object(b, &rename_dst).await.is_err(),
+        "a refused rename must not create the destination",
+    );
+
+    // An enabled write mints an identity, and an overwrite keeps the previous
+    // version readable by its own id while the current read serves the new
+    // content.
+    let key = object::key("versioned/notes.txt").unwrap();
+    let first_id = commit(storage, b, &key, b"first")
+        .await
+        .version_id
+        .expect("an enabled write must mint a version id");
+    let second_id = commit(storage, b, &key, b"second")
+        .await
+        .version_id
+        .expect("an enabled write must mint a version id");
+    check(
+        first_id != second_id,
+        "each version of a key must have its own id",
+    );
+    match storage
+        .get_object_version(b, &key, Some(&first_id), None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(old) => {
+            check(
+                read_body(old.body).await.unwrap() == b"first",
+                "a superseded version must keep its content",
+            );
+            check(
+                old.info.version_id.as_ref() == Some(&first_id),
+                "a version-addressed read must answer the version it named",
+            );
+        }
+        version::ReadResult::Marker { .. } => {
+            panic!("conformance violation: the superseded version must not be a marker")
+        }
+    }
+    let current = storage.get_object(b, &key, None).await.unwrap();
+    check(
+        read_body(current.body).await.unwrap() == b"second",
+        "the current read must serve the newest content",
+    );
+    check(
+        current.info.version_id.as_ref() == Some(&second_id),
+        "the current read must name the newest version",
+    );
+
+    // Both versions are listed, newest first.
+    let page = storage
+        .list_object_versions(
+            b,
+            version::ListParams {
+                prefix: Some("versioned/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed: Vec<&version::Entry> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .collect();
+    check(
+        listed.len() == 2,
+        "list_object_versions must list every version of the key",
+    );
+    check(
+        listed[0].id.as_ref() == Some(&second_id) && listed[1].id.as_ref() == Some(&first_id),
+        "list_object_versions must list the newest version first",
+    );
+    check(
+        listed.iter().all(|entry| !entry.is_delete_marker),
+        "no delete marker exists yet",
+    );
+    check(
+        listed[0].size == 6 && listed[1].size == 5,
+        "each listed version must carry its own size",
+    );
+
+    // A simple delete makes a delete marker the current version: the plain
+    // read is unreachable, and the marker is what a version-addressed read
+    // answers — a successful outcome, never content.
+    let marker = storage.delete_object(b, &key).await.unwrap();
+    check(
+        marker.is_delete_marker,
+        "a versioned delete must insert a delete marker",
+    );
+    let marker_id = marker
+        .id
+        .clone()
+        .expect("an enabled bucket's marker carries an identity");
+    check(
+        storage.get_object(b, &key, None).await.is_err(),
+        "a marker's key must not serve content to a plain read",
+    );
+    match storage
+        .get_object_version(b, &key, Some(&marker_id), None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Marker { id, .. } => check(
+            id.as_ref() == Some(&marker_id),
+            "a version-addressed read of a marker must answer that marker",
+        ),
+        version::ReadResult::Object(_) => {
+            panic!("conformance violation: the current version is a marker, not content")
+        }
+    }
+
+    // A delete marker holds no tags and no ACL: every version metadata
+    // operation addressed at the marker's identity answers the contract's
+    // not-found class naming that identity (`storage::marker_has_no_metadata`
+    // — the rule's one home, so two backends cannot answer different
+    // classes).
+    let metadata_refusals = [
+        (
+            "version_tags",
+            into_core_error(
+                storage
+                    .version_tags(b, &key, Some(&marker_id))
+                    .await
+                    .expect_err("a delete marker must hold no tags"),
+            ),
+        ),
+        (
+            "version_acl",
+            into_core_error(
+                storage
+                    .version_acl(b, &key, Some(&marker_id))
+                    .await
+                    .expect_err("a delete marker must hold no ACL"),
+            ),
+        ),
+        (
+            "set_version_tags",
+            into_core_error(
+                storage
+                    .set_version_tags(b, &key, Some(&marker_id), object::Tags::empty())
+                    .await
+                    .expect_err("a delete marker must accept no tags"),
+            ),
+        ),
+        (
+            "set_version_acl",
+            into_core_error(
+                storage
+                    .set_version_acl(b, &key, Some(&marker_id), &Acl::default_private(None))
+                    .await
+                    .expect_err("a delete marker must accept no ACL"),
+            ),
+        ),
+    ];
+    for (op, err) in metadata_refusals {
+        check(
+            matches!(&err, NoSuchVersion(named) if named.as_str() == marker_id.as_str()),
+            &format!("{op} on a delete marker must answer NoSuchVersion naming it: {err}"),
+        );
+    }
+
+    // Deleting the marker by its id removes it and restores the version it
+    // hid as the current version.
+    let removed = storage
+        .delete_object_version(b, &key, Some(&marker_id))
+        .await
+        .unwrap();
+    check(
+        removed.is_delete_marker && removed.id.as_ref() == Some(&marker_id),
+        "removing a marker must answer the marker that was removed",
+    );
+    let restored = storage.get_object(b, &key, None).await.unwrap();
+    check(
+        read_body(restored.body).await.unwrap() == b"second",
+        "deleting the marker must restore the version it hid",
+    );
+    check(
+        restored.info.version_id.as_ref() == Some(&second_id),
+        "the restored version must keep its identity",
+    );
+
+    // The null version: a suspended-bucket write records no identity, and
+    // `versionId=null` (the trait's `None`) resolves to it.
+    storage
+        .set_bucket_versioning(b, version::State::Suspended)
+        .await
+        .unwrap();
+    check(
+        storage.bucket_versioning(b).await.unwrap() == version::State::Suspended,
+        "suspending a bucket must be visible",
+    );
+    let null_key = object::key("versioned/suspended.txt").unwrap();
+    check(
+        commit(storage, b, &null_key, b"null version")
+            .await
+            .version_id
+            .is_none(),
+        "a suspended-bucket write must record the null version",
+    );
+    match storage
+        .get_object_version(b, &null_key, None, None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(null) => {
+            check(
+                read_body(null.body).await.unwrap() == b"null version",
+                "versionId=null must resolve to the null version's content",
+            );
+            check(
+                null.info.version_id.is_none(),
+                "the null version must carry no identity",
+            );
+        }
+        version::ReadResult::Marker { .. } => {
+            panic!("conformance violation: a suspended-bucket write is content, not a marker")
+        }
+    }
+
+    // A suspended delete removes the object's null version and inserts a
+    // delete marker carrying the null version ID; repeated deletes keep
+    // exactly one marker and add no history row (the design's suspended
+    // rule). A backend that superseded the null-identity marker instead
+    // would list one extra phantom marker per repeat — the divergence this
+    // leg exists to catch, which no earlier leg could see.
+    let suspended_delete = object::key("versioned/suspended-delete.txt").unwrap();
+    check(
+        commit(storage, b, &suspended_delete, b"doomed")
+            .await
+            .version_id
+            .is_none(),
+        "the suspended write before the deletes must record the null version",
+    );
+    for _ in 0..3 {
+        let marker = storage.delete_object(b, &suspended_delete).await.unwrap();
+        check(
+            marker.is_delete_marker && marker.id.is_none(),
+            "a suspended delete must insert a delete marker carrying the null version ID",
+        );
+    }
+    check(
+        storage
+            .get_object(b, &suspended_delete, None)
+            .await
+            .is_err(),
+        "the null-identity marker must hide the key from a plain read",
+    );
+    let page = storage
+        .list_object_versions(
+            b,
+            version::ListParams {
+                prefix: Some("versioned/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed: Vec<&version::Entry> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.key == suspended_delete)
+        .collect();
+    check(
+        listed.len() == 1 && listed[0].is_delete_marker,
+        "repeated suspended deletes must leave exactly one delete marker",
+    );
+    check(
+        listed[0].id.is_none(),
+        "the suspended delete marker must carry the null version ID",
+    );
+
+    // The parked journey: a superseded null version survives a later
+    // suspended DELETE. The journey needs a genuinely unversioned first write,
+    // so it runs on a bucket of its own: the write records the null version,
+    // the enabled write moves it into history, and the DELETE supersedes the
+    // real version and makes a delete marker carrying the null version ID
+    // current. A marker that took the null version's own sequence 0 as its row
+    // would overwrite that history row — losing the superseded null version
+    // and stranding its content — which no earlier leg can see.
+    let parked_bucket = bucket::name(unique_bucket("versioned-parked")).unwrap();
+    storage
+        .create_bucket(&parked_bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    let parked = object::key("versioned/parked-null.txt").unwrap();
+    check(
+        commit(storage, &parked_bucket, &parked, b"one")
+            .await
+            .version_id
+            .is_none(),
+        "the unversioned write before the parked journey must record the null version",
+    );
+    storage
+        .set_bucket_versioning(&parked_bucket, version::State::Enabled)
+        .await
+        .unwrap();
+    let parked_real = commit(storage, &parked_bucket, &parked, b"two")
+        .await
+        .version_id
+        .expect("the enabled write must mint an identity");
+    storage
+        .set_bucket_versioning(&parked_bucket, version::State::Suspended)
+        .await
+        .unwrap();
+    let parked_marker = storage
+        .delete_object(&parked_bucket, &parked)
+        .await
+        .unwrap();
+    check(
+        parked_marker.is_delete_marker && parked_marker.id.is_none(),
+        "a suspended DELETE must make a null-identity marker current",
+    );
+    let page = storage
+        .list_object_versions(
+            &parked_bucket,
+            version::ListParams {
+                prefix: Some("versioned/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed: Vec<&version::Entry> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.key == parked)
+        .collect();
+    check(
+        listed.len() == 3,
+        "the superseded null version must survive a suspended DELETE",
+    );
+    check(
+        listed.iter().any(|entry| {
+            entry.id.is_none()
+                && !entry.is_delete_marker
+                && entry.seq == 0
+                && entry.size == 3
+                && entry.etag == ETag::from_content(b"one")
+        }),
+        "the superseded null version must still be listed with its own identity and content",
+    );
+    check(
+        listed
+            .iter()
+            .any(|entry| entry.id.as_ref() == Some(&parked_real) && !entry.is_delete_marker),
+        "the superseded real version must survive the suspended DELETE too",
+    );
+    // Readable by its id: removing the current marker leaves the null
+    // version's index entry as what `versionId=null` resolves to.
+    let unmarked = storage
+        .delete_object_version(&parked_bucket, &parked, None)
+        .await
+        .unwrap();
+    check(
+        unmarked.is_delete_marker,
+        "the null-identity marker must be what `versionId=null` addresses",
+    );
+    match storage
+        .get_object_version(&parked_bucket, &parked, None, None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(null) => {
+            check(
+                read_body(null.body).await.unwrap() == b"one",
+                "the superseded null version must still be readable by its id",
+            );
+            check(
+                null.info.version_id.is_none(),
+                "the surviving null version keeps the null identity",
+            );
+        }
+        version::ReadResult::Marker { .. } => {
+            panic!("conformance violation: the surviving null version is content, not a marker")
+        }
+    }
+    // Empty the journey's bucket so it can be dropped: deleting the real
+    // version materializes the null version back onto the key, and deleting
+    // the null version removes the key.
+    storage
+        .delete_object_version(&parked_bucket, &parked, Some(&parked_real))
+        .await
+        .unwrap();
+    storage
+        .delete_object_version(&parked_bucket, &parked, None)
+        .await
+        .unwrap();
+    check(
+        storage
+            .get_object(&parked_bucket, &parked, None)
+            .await
+            .is_err(),
+        "the parked journey's bucket must be empty after its versions are removed",
+    );
+    storage.delete_bucket(&parked_bucket).await.unwrap();
+
+    // The sequence rule: the null version is sequence 0 and real versions
+    // start at 1. A suspended write onto a fresh key records the null version
+    // at 0 — the sequence `Entry::seq` exposes, carried into history by the
+    // row the superseding write commits — and the version-creating write that
+    // supersedes it takes sequence 1.
+    let sequence = object::key("versioned/sequence.txt").unwrap();
+    storage
+        .set_bucket_versioning(b, version::State::Suspended)
+        .await
+        .unwrap();
+    check(
+        commit(storage, b, &sequence, b"null")
+            .await
+            .version_id
+            .is_none(),
+        "a suspended write onto a fresh key must record the null version",
+    );
+    storage
+        .set_bucket_versioning(b, version::State::Enabled)
+        .await
+        .unwrap();
+    let sequence_real = commit(storage, b, &sequence, b"real")
+        .await
+        .version_id
+        .expect("the version-creating write must mint an identity");
+    let page = storage
+        .list_object_versions(
+            b,
+            version::ListParams {
+                prefix: Some("versioned/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed: Vec<&version::Entry> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.key == sequence)
+        .collect();
+    check(
+        listed.len() == 2,
+        "the null version and the version that superseded it must both list",
+    );
+    check(
+        listed[0].id.as_ref() == Some(&sequence_real) && listed[0].seq == 1,
+        "the version-creating write that supersedes the null version must take sequence 1",
+    );
+    check(
+        listed[1].id.is_none() && listed[1].seq == 0 && !listed[1].is_delete_marker,
+        "the null version's sequence must be 0",
+    );
+
+    // The five-call journey a superseded null version must survive: an
+    // unversioned write records the null version, enabling versioning and
+    // overwriting moves it into history at sequence 0, and suspending then
+    // overwriting makes the null version current again — at the free sequence
+    // the suspended write takes, because 0 is occupied by the superseded
+    // null's row. The listing must carry all three versions. A listing that
+    // forces a current null's sequence to 0 hides the row at 0 — treating the
+    // superseded null version as the current one's duplicate — and drops it
+    // from the answer; the earlier legs cannot see this, because their
+    // current version is a marker (a marker's own sequence is recorded, so the
+    // filter matches nothing).
+    let journey_bucket = bucket::name(unique_bucket("versioned-journey")).unwrap();
+    storage
+        .create_bucket(&journey_bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    let journey = object::key("versioned/two-nulls.txt").unwrap();
+    check(
+        commit(storage, &journey_bucket, &journey, b"one")
+            .await
+            .version_id
+            .is_none(),
+        "the unversioned write before the journey must record the null version",
+    );
+    storage
+        .set_bucket_versioning(&journey_bucket, version::State::Enabled)
+        .await
+        .unwrap();
+    let journey_real = commit(storage, &journey_bucket, &journey, b"two")
+        .await
+        .version_id
+        .expect("the enabled overwrite must mint an identity");
+    storage
+        .set_bucket_versioning(&journey_bucket, version::State::Suspended)
+        .await
+        .unwrap();
+    check(
+        commit(storage, &journey_bucket, &journey, b"three")
+            .await
+            .version_id
+            .is_none(),
+        "the suspended overwrite must make the null version current again",
+    );
+    let page = storage
+        .list_object_versions(
+            &journey_bucket,
+            version::ListParams {
+                prefix: Some("versioned/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed: Vec<&version::Entry> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.key == journey)
+        .collect();
+    check(
+        listed.len() == 3,
+        "the superseded null version, the real version and the current null version must all list",
+    );
+    check(
+        listed.iter().any(|entry| {
+            entry.id.is_none()
+                && !entry.is_delete_marker
+                && entry.seq == 0
+                && entry.size == 3
+                && entry.etag == ETag::from_content(b"one")
+        }),
+        "the superseded null version must still be listed at its own sequence 0",
+    );
+    check(
+        listed
+            .iter()
+            .any(|entry| entry.id.as_ref() == Some(&journey_real) && !entry.is_delete_marker),
+        "the real version the enabled overwrite created must list too",
+    );
+    check(
+        listed.iter().any(|entry| {
+            entry.id.is_none()
+                && !entry.is_delete_marker
+                && entry.seq == 2
+                && entry.size == 5
+                && entry.etag == ETag::from_content(b"three")
+        }),
+        "the current null version must list at the free sequence the suspended overwrite took",
+    );
+    // Empty the journey's bucket so it can be dropped: expiring the real
+    // version leaves the superseded null version as the newest row, the first
+    // null delete removes the current null and materializes it back onto the
+    // key, and the second removes it too.
+    storage
+        .delete_object_version(&journey_bucket, &journey, Some(&journey_real))
+        .await
+        .unwrap();
+    storage
+        .delete_object_version(&journey_bucket, &journey, None)
+        .await
+        .unwrap();
+    storage
+        .delete_object_version(&journey_bucket, &journey, None)
+        .await
+        .unwrap();
+    check(
+        storage
+            .get_object(&journey_bucket, &journey, None)
+            .await
+            .is_err(),
+        "the journey's bucket must be empty after its versions are removed",
+    );
+    storage.delete_bucket(&journey_bucket).await.unwrap();
+
+    // The one-null-version journey: a superseded null version and a later
+    // null version must converge on one `null`-id row, never coexist as two.
+    // The version index is keyed by the identity, so it can name only one of
+    // two rows sharing the `null` wire — the other would be permanently
+    // unaddressable, and stays so even after the pointed-at row expires. An
+    // unversioned write records the null version, the enabled overwrite moves
+    // it into history at sequence 0, the suspended overwrite makes a second
+    // null version current at the first free sequence (0 is occupied), and
+    // the next enabled write supersedes that live null: the supersede must
+    // replace the older null row, not add a second.
+    let converge_bucket = bucket::name(unique_bucket("versioned-converge")).unwrap();
+    storage
+        .create_bucket(&converge_bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    let converge = object::key("versioned/converge.txt").unwrap();
+    check(
+        commit(storage, &converge_bucket, &converge, b"one")
+            .await
+            .version_id
+            .is_none(),
+        "the convergence journey's first write must record the null version",
+    );
+    storage
+        .set_bucket_versioning(&converge_bucket, version::State::Enabled)
+        .await
+        .unwrap();
+    let converge_real = commit(storage, &converge_bucket, &converge, b"two")
+        .await
+        .version_id
+        .expect("the enabled overwrite must mint an identity");
+    storage
+        .set_bucket_versioning(&converge_bucket, version::State::Suspended)
+        .await
+        .unwrap();
+    check(
+        commit(storage, &converge_bucket, &converge, b"three")
+            .await
+            .version_id
+            .is_none(),
+        "the suspended overwrite must make a later null version current",
+    );
+    // Two null candidates coexist here — the superseded row at sequence 0 and
+    // the live null version — and the enabled write below supersedes the live
+    // one. A write side that added a second null-id row would list four
+    // versions here and leave the older null unaddressable.
+    storage
+        .set_bucket_versioning(&converge_bucket, version::State::Enabled)
+        .await
+        .unwrap();
+    let converge_next = commit(storage, &converge_bucket, &converge, b"four")
+        .await
+        .version_id
+        .expect("the final enabled overwrite must mint an identity");
+    let page = storage
+        .list_object_versions(
+            &converge_bucket,
+            version::ListParams {
+                prefix: Some("versioned/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed: Vec<&version::Entry> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.key == converge)
+        .collect();
+    check(
+        listed.len() == 3,
+        "the older null version must be replaced, never listed beside the newer one",
+    );
+    check(
+        listed
+            .iter()
+            .filter(|entry| entry.id.is_none() && !entry.is_delete_marker)
+            .count()
+            == 1,
+        "exactly one addressable null version must remain: {listed:?}",
+    );
+    // The surviving null version is addressable: `versionId=null` reaches the
+    // converged row.
+    match storage
+        .get_object_version(&converge_bucket, &converge, None, None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(null) => {
+            check(
+                read_body(null.body).await.unwrap() == b"three",
+                "the converged null version must be the one that was live",
+            );
+        }
+        version::ReadResult::Marker { .. } => {
+            panic!("conformance violation: the surviving null version is content, not a marker")
+        }
+    }
+    // Empty the journey's bucket so it can be dropped: the current real
+    // version's delete materializes the converged null version, whose own
+    // delete materializes the older real version, whose delete removes the
+    // key.
+    storage
+        .delete_object_version(&converge_bucket, &converge, Some(&converge_next))
+        .await
+        .unwrap();
+    storage
+        .delete_object_version(&converge_bucket, &converge, None)
+        .await
+        .unwrap();
+    storage
+        .delete_object_version(&converge_bucket, &converge, Some(&converge_real))
+        .await
+        .unwrap();
+    check(
+        storage
+            .get_object(&converge_bucket, &converge, None)
+            .await
+            .is_err(),
+        "the convergence journey's bucket must be empty after its versions are removed",
+    );
+    storage.delete_bucket(&converge_bucket).await.unwrap();
 }
 
 /// Convert a backend error into the contract error for assertions.

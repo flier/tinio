@@ -38,6 +38,11 @@ use crate::{
     },
     Error, FsOptions, FsStorage, etag, testing,
 };
+#[cfg(feature = "versioning")]
+use crate::{
+    _core::{object, version::State},
+    _util::testing::body,
+};
 
 /// A canonical owner id for the ACL tests (64 lowercase hex) — the shared
 /// `tinio_util::testing::conform_owner` fixture.
@@ -132,6 +137,35 @@ pub(crate) fn storage() -> (tempfile::TempDir, FsStorage) {
     let root = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options()).unwrap();
     (root, storage)
+}
+
+/// A `data` bucket over `storage` with versioning set to `state`, and
+/// `bodies` committed in order at `notes.txt` — the versioning fixtures'
+/// shared body (the version-table and version-index rows land as the
+/// writes run). A caller that needs another bucket or key name builds from
+/// the returned pair; a caller that needs another state sets it after.
+#[cfg(feature = "versioning")]
+pub(crate) async fn versioned_bucket(
+    storage: &FsStorage,
+    state: State,
+    bodies: &[&[u8]],
+) -> (bucket::Name, object::Key) {
+    use crate::_core::{
+        acl::Acl,
+        storage::{BucketOps, ObjectOps, VersionOps},
+    };
+
+    let b = bucket::name("data").unwrap();
+    storage
+        .create_bucket(&b, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    storage.set_bucket_versioning(&b, state).await.unwrap();
+    let key: object::Key = "notes.txt".into();
+    for bytes in bodies {
+        storage.put_object(&b, &key, body(*bytes)).await.unwrap();
+    }
+    (b, key)
 }
 
 /// A bucket `data` with `n` files `f00.txt..`, each with distinct content

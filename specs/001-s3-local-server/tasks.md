@@ -304,6 +304,13 @@ Incremental surface + authn/authz work implemented on top of the original plan (
 - [X] T141 [US1/US3] Benches + the boto3 journey: `tinio-server/benches/listing.rs`/`multipart_assembly.rs` and `tinio-fs/benches/streaming.rs` adapted to the Tasks 3-9 contract shapes (create_bucket 3-arg, CMU 6-arg); `tests/boto3_journey.py` gains the ACL legs (create-bucket, `cp --acl public-read`, anonymous GET — stdlib urllib, the venv carries no `requests` — `get-bucket-acl` echo, `--expected-bucket-owner` mismatch 403, `list_buckets` per principal incl. the anonymous 403) — FR-033 (boto3 run = the user's boto3 leg)
 - [X] T142 [US1/US3] Specs & docs: FR-033/SC-009 written into `spec.md` (incl. the §5a payload-modes + ownership-mapping contract and the edge-case entries) and `contracts/s3-surface.md`, `[owner]`/`[[users]]` + `local_uid` + the OS-mapping validation into `contracts/config.md`, the row shapes into `meta-redb-spec.md` §5.2 + `data-model.md`, task entries here, checklist items in `checklists/compatibility.md` (CHK052-055) and `checklists/security.md` (CHK042-045), the feature scenarios tagged with the new IDs — FR-033/SC-009
 
+### Addendum 2026-10-03 — S3 versioning, the versioned store (design `docs/superpowers/specs/2026-10-03-s3-versioning-design.md`, plan `docs/superpowers/plans/2026-10-03-s3-versioning-p2-versioned-store.md`)
+
+Incremental storage-layer work on the versioning design, executed as this plan's Tasks 1-6: the `tinio-core` version domain and the `VersionOps` contract, the `tinio-store` version tables and the two appended `object_meta` elements, the `tinio-version` engine (amended 2026-10-03: a crate on its own ports, with a `tinio-fs` adapter) and the versioned object paths, retention and block reclamation, and `tinio-mem` parity with a conformance leg both backends run. No S3 surface changes — plan 3 owns the wire, the capability rows and the config keys; the `object_meta` tuple change is the row-format change the 2026-09-02 ruling covers (delete-and-rebuild).
+
+- [X] T150 Implement the version domain, the version tables and the `tinio-fs` versioned paths (Tasks 1-4)
+- [X] T151 Implement retention, block reclamation, `tinio-mem` parity and the versioning conformance leg (Tasks 5-6)
+
 ---
 
 ## Dependencies & Execution Order

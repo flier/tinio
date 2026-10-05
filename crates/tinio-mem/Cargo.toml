@@ -15,8 +15,14 @@ uuid = { workspace = true, features = ["v4"] }
 
 tinio-core.workspace = true
 tinio-store.workspace = true
+tinio-version = { workspace = true, optional = true }
+
+[features]
+default = []
+versioning = ["dep:tinio-version"]
 
 [dev-dependencies]
+tinio-mem = { path = ".", features = ["versioning"] }
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 

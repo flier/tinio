@@ -5,8 +5,9 @@
 //! mapping layer speaks only to this contract — no backend code.
 //!
 //! The interface is split by operation category — [`BucketOps`],
-//! [`ObjectOps`], [`MultipartOps`] — and aggregated by [`Storage`], so
-//! implementations and consumers can group by concern. Category methods
+//! [`ObjectOps`], [`MultipartOps`], [`VersionOps`] — and aggregated by
+//! [`Storage`], so implementations and consumers can group by concern.
+//! Category methods
 //! reference the aggregate's associated error (`<Self as Storage>::Error`),
 //! declared once on [`Storage`]; it must convert into the contract error
 //! [`Error`] for the mapping layer and the conformance harness.
@@ -36,15 +37,17 @@ mod multipart;
 mod object;
 mod range;
 mod time;
+mod version;
 
 use std::error::Error as StdError;
 
 pub use body::{BodyStream, collect_body};
 pub use bucket::{BucketOps, BucketsListing, ListBucketsParams};
 pub use error::{
-    Error, access_denied, already_exists, entity_too_large, invalid_bucket_name, invalid_checksum,
-    invalid_etag, invalid_key, invalid_part, invalid_part_key, invalid_part_number, invalid_range,
-    io, no_parts, no_such_bucket, no_such_key, no_such_upload, not_empty, part_too_small,
+    Denied, Error, access_denied, access_denied_bucket, already_exists, entity_too_large,
+    invalid_bucket_name, invalid_checksum, invalid_etag, invalid_key, invalid_part,
+    invalid_part_key, invalid_part_number, invalid_range, invalid_version, io, no_parts,
+    no_such_bucket, no_such_key, no_such_upload, no_such_version, not_empty, part_too_small,
     too_many_uploads,
 };
 pub use listing::{
@@ -58,6 +61,7 @@ pub use multipart::{
 pub use object::{GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, PutObjectResult};
 pub use range::ByteRange;
 pub use time::{from_nanos, now_nanos, to_nanos};
+pub use version::{VersionOps, marker_has_no_metadata, rename_allowed};
 
 /// The write-lock histogram bucket upper bounds, microseconds
 /// (pipeline-spec.md §4): `<10, <100, <1k, <5k, <20k, <100k, >100k`. A
@@ -74,9 +78,9 @@ pub const WRITE_LOCK_BUCKET_BOUNDS_US: [u64; 6] = [10, 100, 1_000, 5_000, 20_000
 pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 
 /// The storage backend contract: the aggregation of [`BucketOps`],
-/// [`ObjectOps`], and [`MultipartOps`].
+/// [`ObjectOps`], [`MultipartOps`], and [`VersionOps`].
 ///
-/// Implementations implement the three categories and declare the shared
+/// Implementations implement the four categories and declare the shared
 /// error type once, on the aggregate. The category methods reference
 /// `<Self as Storage>::Error`, so they are only usable on a complete
 /// backend (`S: Storage`).
@@ -86,7 +90,7 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 ///
 /// # Examples
 ///
-/// Implement the three categories, then declare the error type on the
+/// Implement the four categories, then declare the error type on the
 /// aggregate (see `tinio_mem::MemoryStorage` for a complete reference
 /// implementation):
 ///
@@ -94,6 +98,7 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 /// impl BucketOps for X { ... }
 /// impl ObjectOps for X { ... }
 /// impl MultipartOps for X { ... }
+/// impl VersionOps for X { ... }
 /// impl Storage for X { type Error = MyError; }
 ///
 /// use tinio_core::{acl, bucket, ListBucketsParams};
@@ -128,12 +133,17 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 ///
 /// (`ignore`: a runnable example would require dev-depending on a backend
 /// crate, which would create a dependency cycle with `tinio-mem`.)
-pub trait Storage: Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps {
+pub trait Storage:
+    Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps + VersionOps
+{
     /// The backend error type, shared across all operation categories.
     ///
     /// It must convert into the contract error [`Error`] so the S3 mapping
-    /// layer and the conformance harness can translate any backend failure.
-    type Error: StdError + Send + Sync + 'static + Into<Error>;
+    /// layer and the conformance harness can translate any backend failure —
+    /// and from it, so a category method's default body can answer a contract
+    /// refusal in the backend's own error type ([`VersionOps`]'s nine
+    /// refusal defaults are the reason the second bound exists).
+    type Error: StdError + Send + Sync + 'static + Into<Error> + From<Error>;
 }
 
 /// The default symlink policy of the filesystem backend: `false` = reject

@@ -510,7 +510,15 @@ impl Scanner {
         // accumulator flushes outside any read window (P3).
         let candidates: Vec<object::Key> = snapshot
             .into_iter()
-            .filter(|(key, _)| !walked.contains(key))
+            .filter(|(key, stored)| {
+                // A current delete marker's row has no file by design —
+                // `is_absent` is its steady state, never an orphan. The
+                // classification's home is [`meta::orphan_candidate`].
+                !walked.contains(key)
+                    && stored
+                        .as_ref()
+                        .is_none_or(|stored| stored.is_orphan_candidate())
+            })
             .map(|(key, _)| key)
             .collect();
         // The walk is done — drain the in-flight rest.

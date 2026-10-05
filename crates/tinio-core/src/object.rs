@@ -12,6 +12,7 @@ use crate::{
     acl::Acl,
     checksum,
     storage::{self, Error::*},
+    version,
 };
 
 /// Tagging wire: `%`, `=`, `&`, `+`, space (and C0 controls).
@@ -103,7 +104,7 @@ impl From<String> for Key {
 }
 
 /// Metadata of a stored object (key, size, mtime, ETag, tags, checksum,
-/// owner, ACL).
+/// owner, ACL, version identity).
 ///
 /// ETags are stored without the surrounding quotes S3 headers use: single
 /// uploads carry the content MD5 hex, multipart uploads the composed
@@ -129,6 +130,7 @@ impl From<String> for Key {
 ///     checksum: None,
 ///     owner: None,
 ///     acl: acl::Acl::default_private(None),
+///     version_id: None,
 /// };
 /// assert_eq!(info.size, 4);
 /// ```
@@ -152,6 +154,10 @@ pub struct Info {
     pub owner: Option<acl::OwnerId>,
     /// The object's ACL (default private when none was written).
     pub acl: Acl,
+    /// The identity of the version this row is: the current version's
+    /// identifier, or `None` for the `null` version of an unversioned or
+    /// suspended bucket.
+    pub version_id: Option<version::Id>,
 }
 
 /// The per-surface tag-count caps (S3): object tags ≤ 10, bucket tags
@@ -455,6 +461,7 @@ mod tests {
             checksum: None,
             owner: None,
             acl: Acl::default_private(None),
+            version_id: None,
         };
         assert_eq!(o.size, 5);
         assert_eq!(o.last_modified, t);

@@ -14,6 +14,8 @@
 //! Home root-state-dir GC (part of the `Full` scope per failure-handling.md
 //! §3) needs read-only-mode state relocation and lands with US2 (T144).
 
+#[cfg(feature = "versioning")]
+use std::collections::HashSet;
 use std::{
     future::Future,
     io::{self, Error as IoError, ErrorKind},
@@ -23,9 +25,24 @@ use std::{
 
 use async_trait::async_trait;
 use derive_more::Debug;
+#[cfg(feature = "versioning")]
+use futures::StreamExt;
 use futures::stream;
+#[cfg(feature = "versioning")]
+use sha2::{Digest, Sha256};
 use tokio::fs;
 
+#[cfg(feature = "versioning")]
+use crate::{
+    _blob::LiveSet,
+    _core::{
+        blob::{BlockHash, BlockStore, Entry},
+        bucket::Name,
+        version::State,
+    },
+    _store::version as rows,
+    error::projected,
+};
 use crate::{
     _core::{
         cleanup::{
@@ -77,6 +94,47 @@ async fn record_repair(
         })),
         Err(err) => actions.push(Err(err)),
     }
+}
+
+/// Verify one stored block: read it back in bounded chunks, hashing as they
+/// arrive, and answer the finding when the stored bytes are not what the
+/// block's name addresses — `None` when the block verifies. The block is
+/// never buffered whole (constitution V): each chunk is hashed and dropped
+/// before the next arrives. A truncated or corrupt file is the same finding
+/// — the name is the content's hash, and the store records no independent
+/// length to compare against (the walk's entry length is the file's own
+/// metadata) — and a block that cannot be read at all is its own finding.
+#[cfg(feature = "versioning")]
+async fn verify_block<B: BlockStore>(blocks: &B, entry: &Entry) -> Result<Option<String>, Error> {
+    let mut body = match blocks.open(&entry.hash, None).await {
+        Ok(body) => body,
+        Err(err) => {
+            return Ok(Some(format!(
+                "could not be read for verification: {}",
+                projected(err)
+            )));
+        }
+    };
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(chunk) => hasher.update(&chunk),
+            Err(err) => {
+                return Ok(Some(format!(
+                    "could not be read to its end for verification: {}",
+                    projected(err)
+                )));
+            }
+        }
+    }
+    let found = BlockHash::from_digest(hasher.finalize().into());
+    if found != entry.hash {
+        return Ok(Some(format!(
+            "does not hash to its own name (corrupt or truncated): its bytes hash to {}",
+            found.to_hex()
+        )));
+    }
+    Ok(None)
 }
 
 /// The fs implementation of the [`Cleanup`] contract.
@@ -190,6 +248,272 @@ impl FsCleanup {
             )
             .await;
         }
+    }
+
+    /// Stage: `<state-dir>/blobs/<bucket>/tmp` residue — the staged temps
+    /// of block writes a crash interrupted (the block store's own commit
+    /// removes a stage that completes). Cleared like `tmp/`, per bucket
+    /// subtree, because no writer holds one at startup; a bucket that
+    /// never staged a block has no `tmp` and is skipped by the empty
+    /// listing.
+    #[cfg(feature = "versioning")]
+    async fn repair_block_residue(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
+        let entries = match entries_of(&self.storage.blobs_dir()).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                actions.push(Err(err.into()));
+                return;
+            }
+        };
+        for (dir, bucket) in entries {
+            // A bucket that never staged a block has no tmp/; an
+            // out-of-band *file* wearing a bucket's name is skipped
+            // rather than probed as a directory.
+            if !fs::metadata(&dir)
+                .await
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let staged = match entries_of(&dir.join(TMP_DIR_NAME)).await {
+                Ok(staged) => staged,
+                Err(err) => {
+                    actions.push(Err(err.into()));
+                    continue;
+                }
+            };
+            for (path, name) in staged {
+                record_repair(
+                    actions,
+                    self.dry_run,
+                    format!("would clear leftover block staging file {name} of {bucket}"),
+                    format!("cleared leftover block staging file {name} of {bucket}"),
+                    async {
+                        match fs::remove_file(&path).await {
+                            Ok(()) => Ok(()),
+                            // Already gone (a concurrent sweep): nothing to
+                            // report.
+                            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                            Err(err) => Err(err.into()),
+                        }
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    /// A build without the block engine has no `blobs/` subtree: nothing
+    /// to clear.
+    #[cfg(not(feature = "versioning"))]
+    async fn repair_block_residue(&self, _actions: &mut Vec<Result<RepairAction, Error>>) {}
+
+    /// The level a report-stage finding carries on this run: the finding's
+    /// own severity on a report-only (`--dry-run`) pass, and
+    /// [`RepairActionLevel::Lint`] on a `--fix` pass — the level that means
+    /// "a check finding, no action needed", so the doctor's repair ledger
+    /// (which counts applied repairs) never counts a finding as one.
+    #[cfg(feature = "versioning")]
+    fn finding_level(&self, level: RepairActionLevel) -> RepairActionLevel {
+        if self.dry_run {
+            level
+        } else {
+            RepairActionLevel::Lint
+        }
+    }
+
+    /// The doctor's block-store residue check — the one place the read
+    /// path's trust-the-store rule is compensated (the design's
+    /// **Verification** ruling): every version row's blocks are probed
+    /// against the store, every stored block against the rows (and read back
+    /// and re-hashed against its own name by
+    /// [`Self::verify_bucket_blocks`]), and every `blobs/<bucket>/` subtree
+    /// against the buckets that exist. It
+    /// reports and never repairs: a block referenced by no row is what the
+    /// block sweep reclaims, a row whose block is missing is content
+    /// no repair can bring back, and an orphaned subtree is what the
+    /// sweep's own orphan pass reclaims (this check names it one pass
+    /// early, and a `--dry-run` can therefore name it in the same pass
+    /// that the sweep will clear it).
+    ///
+    /// Report-only in **both** modes: the check runs on a `--fix` pass as
+    /// well as a reporting pass — an operator who asked for a repair still
+    /// gets the block answer without a second invocation — and it repairs
+    /// nothing. Its findings carry [`RepairActionLevel::Lint`] on a `--fix`
+    /// pass (the level means "a check finding, no action needed"), so the
+    /// run's repair ledger counts none of them as an applied repair while
+    /// the reporting pass keeps their own severity.
+    #[cfg(feature = "versioning")]
+    async fn report_block_residue(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
+        let buckets = match self.storage.bucket_names("").await {
+            Ok(buckets) => buckets,
+            Err(err) => {
+                actions.push(Err(err));
+                return;
+            }
+        };
+        for bucket in buckets {
+            let versions = self.storage.versions(&bucket);
+            let state = match versions.state(&bucket).await {
+                Ok(state) => state,
+                Err(err) => {
+                    actions.push(Err(projected(err)));
+                    continue;
+                }
+            };
+            if !matches!(state, State::Enabled | State::Suspended) {
+                continue; // no version rows, no block store
+            }
+            if let Err(err) = self.check_bucket_blocks(&bucket, actions).await {
+                actions.push(Err(err));
+            }
+        }
+        // Subtrees whose bucket is gone. `remove_bucket_state` drains the
+        // version rows in one transaction and then removes the block subtree,
+        // so a crash between the two leaves blocks under a bucket name that
+        // no longer exists — and both the per-bucket walk above and the
+        // sweep's `versioned_buckets` iterate existing buckets only, so no
+        // pass reaches it through them. The sweep's `orphan_blobs` pass is
+        // what reclaims it (under the bucket's mutation lock, on the same
+        // absence proof this check makes); a finding here is the one-pass-
+        // early notice, never a repair — the doctor leaves the bytes in
+        // place so they stay inspectable until then.
+        let entries = match entries_of(&self.storage.blobs_dir()).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                actions.push(Err(err.into()));
+                return;
+            }
+        };
+        for (dir, bucket) in entries {
+            // The proof — the bucket directory's absence (the backend's own
+            // existence authority: `ensure_bucket` reads it, never the
+            // `BUCKETS` row, so a lost row alone is re-derived for a live
+            // directory whose history still needs these blocks), under the
+            // same mutation lock the sweep's reclamation holds — is
+            // `FsStorage::orphaned_block_subtree`'s; the doctor only reports
+            // (`reclaim = false`), leaving the bytes inspectable until the
+            // sweep clears them.
+            match self
+                .storage
+                .orphaned_block_subtree(&dir, &bucket, false)
+                .await
+            {
+                Ok(true) => actions.push(Ok(RepairAction {
+                    level: self.finding_level(RepairActionLevel::Lint),
+                    description: format!(
+                        "the block store holds a subtree for bucket {bucket} which no longer exists; the sweep reclaims it on its next pass"
+                    ),
+                })),
+                Ok(false) => {}
+                Err(err) => actions.push(Err(err)),
+            }
+        }
+    }
+
+    /// A build without the block engine has no rows and no blocks to
+    /// check.
+    #[cfg(not(feature = "versioning"))]
+    async fn report_block_residue(&self, _actions: &mut Vec<Result<RepairAction, Error>>) {}
+
+    /// One bucket's half of [`Self::report_block_residue`]: the rows whose
+    /// blocks are missing, then one store walk per stored block — its name
+    /// re-verified, and its membership in the live set that the rows imply
+    /// tested (the residue).
+    #[cfg(feature = "versioning")]
+    async fn check_bucket_blocks(
+        &self,
+        bucket: &Name,
+        actions: &mut Vec<Result<RepairAction, Error>>,
+    ) -> Result<(), Error> {
+        let versions = self.storage.versions(bucket);
+        // The rows, and the live set they imply.
+        let scanned = bucket.clone();
+        let history = self
+            .storage
+            .handle()
+            .clone()
+            .read_blocking(move |txn| {
+                let table = rows::Table::open_readonly(txn)?;
+                let mut out = Vec::new();
+                table.for_bucket_of(scanned.as_ref(), |key, row| {
+                    out.push((key.to_owned(), row));
+                    Ok(())
+                })?;
+                Ok(out)
+            })
+            .await
+            .map_err(Error::from)?;
+        let blocks = versions.blobs().blocks();
+        // A marker holds the empty blob, which is never stored: only a row
+        // that names content can have a missing block. One probe per
+        // distinct block — a block this pass has already found in the store
+        // is not probed again for the next row that names it (a version and
+        // its superseding sibling routinely share blocks), while a block
+        // found *missing* is reported per row, because each row's finding
+        // names the row.
+        let mut confirmed = HashSet::new();
+        for (key, row) in &history {
+            if row.kind == rows::Kind::Marker || row.blob().is_empty() {
+                continue;
+            }
+            for block in row.blob().blocks() {
+                if confirmed.contains(&block.hash) {
+                    continue;
+                }
+                let present = blocks.contains(&block.hash).await.map_err(projected)?;
+                if present {
+                    confirmed.insert(block.hash);
+                    continue;
+                }
+                actions.push(Ok(RepairAction {
+                    level: self.finding_level(RepairActionLevel::Warn),
+                    description: format!(
+                        "version `{key}` ({}) of {bucket} names block {} which the store does not hold",
+                        row.id,
+                        block.hash.to_hex()
+                    ),
+                }));
+            }
+        }
+        // The live set is the history's own answer — the same reduction
+        // [`Versions::live_blocks`] feeds ([`LiveSet::from_blobs`]), derived
+        // here from the rows this pass already holds rather than read back
+        // through a second walk of every bucket's rows.
+        let live = LiveSet::from_blobs(history.iter().map(|(_, row)| row.blob()));
+        // **One walk of the store answers both questions**: whether the
+        // block's bytes still hash to the name that addresses them (the
+        // **verification** ruling — every stored block read back in bounded
+        // chunks and re-hashed), and whether any row names it (residue —
+        // young ones are a publish in flight or a version the sweep has not
+        // reclaimed yet: the doctor names them, the sweep clears them). A
+        // second traversal would answer one of the two per entry.
+        let mut walk = blocks.walk(None).await.map_err(projected)?;
+        let mut residue = 0u64;
+        let mut bytes = 0u64;
+        while let Some(entry) = walk.next().await {
+            let entry = entry.map_err(projected)?;
+            if let Some(finding) = verify_block(blocks, &entry).await? {
+                actions.push(Ok(RepairAction {
+                    level: self.finding_level(RepairActionLevel::Warn),
+                    description: format!("block {} of {bucket} {finding}", entry.hash.to_hex()),
+                }));
+            }
+            if !live.contains(&entry.hash) {
+                residue += 1;
+                bytes += entry.len;
+            }
+        }
+        if residue > 0 {
+            actions.push(Ok(RepairAction {
+                level: self.finding_level(RepairActionLevel::Lint),
+                description: format!(
+                    "the block store of {bucket} holds {residue} block(s) ({bytes} bytes) referenced by no version row"
+                ),
+            }));
+        }
+        Ok(())
     }
 
     /// Unpublished delete-bucket tombstones under `<root>/.tinio/deleting/`
@@ -629,6 +953,10 @@ impl Cleanup for FsCleanup {
     async fn repair(&self, kind: RepairKind) -> Result<ActionStream<Error>, Error> {
         let mut actions = Vec::new();
         self.repair_tmp(&mut actions).await;
+        // The block store's own `tmp/` is the same class of residue as
+        // `tmp/` itself (a crashed stage), and the state dir is private
+        // state — so this stage runs in every mode, like `repair_tmp`.
+        self.repair_block_residue(&mut actions).await;
         // FR-023: the two stages that write the storage root are skipped
         // read-only. A root previously served read-write may legitimately
         // still hold an unpublished tombstone or staging residue — private
@@ -648,6 +976,7 @@ impl Cleanup for FsCleanup {
         self.repair_buckets(&mut actions).await;
         if kind == RepairKind::Full {
             self.repair_meta_orphans(&mut actions).await;
+            self.report_block_residue(&mut actions).await;
         }
         Ok(Box::pin(stream::iter(actions)))
     }
@@ -1970,6 +2299,262 @@ mod tests {
         assert!(
             tombstone.exists(),
             "the leftover stays for the scanner (never a false removal)"
+        );
+    }
+
+    /// A versioned bucket holding `notes.txt` overwritten once: `one` is a
+    /// history row naming a stored block, `two` is current.
+    #[cfg(feature = "versioning")]
+    async fn versioned_fixture(storage: &FsStorage) -> (Name, object::Key, rows::Row) {
+        use crate::{_core::version::State, testutil};
+
+        let (b, key) = testutil::versioned_bucket(storage, State::Enabled, &[b"one", b"two"]).await;
+        let row = storage
+            .versions(&b)
+            .latest(&b, &key)
+            .await
+            .unwrap()
+            .expect("the superseded version's row")
+            .1;
+        (b, key, row)
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn startup_repair_clears_block_staging_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let staged = state.path().join("blobs/data/tmp/aaaa");
+        fs::create_dir_all(staged.parent().unwrap()).await.unwrap();
+        fs::write(&staged, b"torn").await.unwrap();
+
+        // Dry run first: the proposal names the file and removes nothing.
+        let dry = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                ..CleanupOptions::default()
+            },
+        );
+        let actions = collect(dry.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("block staging file aaaa")),
+            "{actions:?}"
+        );
+        assert!(staged.exists(), "a dry run never removes");
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
+        assert!(
+            actions.iter().any(|a| a
+                .description
+                .contains("cleared leftover block staging file")),
+            "{actions:?}"
+        );
+        assert!(!staged.exists(), "the residue is cleared at startup");
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn doctor_reports_missing_blocks_and_block_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let (b, _key, row) = versioned_fixture(&storage).await;
+        let versions = storage.versions(&b);
+        let dry = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                ..CleanupOptions::default()
+            },
+        );
+
+        // A healthy store: the check says nothing about blocks.
+        let actions = collect(dry.repair(RepairKind::Full).await.unwrap()).await;
+        assert!(
+            !actions.iter().any(|a| a.description.contains("block")),
+            "a clean block store is no finding: {actions:?}"
+        );
+
+        // A row whose block the store does not hold, and a block no row
+        // names: both are reported, neither is repaired.
+        let missing = *row.blob().hash();
+        versions.blobs().blocks().remove(&missing).await.unwrap();
+        let orphan = versions.blobs().put(body(b"orphan")).await.unwrap();
+        let actions = collect(dry.repair(RepairKind::Full).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("does not hold")
+                    && a.description.contains(&missing.to_hex())),
+            "the missing block is named: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("referenced by no version row")),
+            "the residue is reported: {actions:?}"
+        );
+        assert!(
+            versions
+                .blobs()
+                .blocks()
+                .contains(orphan.hash())
+                .await
+                .unwrap(),
+            "the check reports; the sweep reclaims"
+        );
+
+        // The block check runs on the `--fix` path too (the doctor's
+        // `--fix` invokes `repair` once; a report-only stage that only ran
+        // on the dry-run pass would leave the fix run without its answer).
+        // It stays report-only there: the findings ride the pass, and the
+        // fixed build's ledger cannot count them as repairs — their level
+        // is `Lint`, the "check finding, no action needed" class.
+        let fixing = FsCleanup::new(&storage, CleanupOptions::default());
+        let actions = collect(fixing.repair(RepairKind::Full).await.unwrap()).await;
+        let check_rows: Vec<&RepairAction> = actions
+            .iter()
+            .filter(|a| {
+                a.description.contains("referenced by no version row")
+                    || a.description.contains("does not hold")
+            })
+            .collect();
+        assert!(
+            !check_rows.is_empty(),
+            "a fix run reports the block check's findings too: {actions:?}"
+        );
+        assert!(
+            check_rows
+                .iter()
+                .all(|a| a.level == RepairActionLevel::Lint),
+            "the fix pass's check rows are findings, never applied repairs: {check_rows:?}"
+        );
+        assert!(
+            versions
+                .blobs()
+                .blocks()
+                .contains(orphan.hash())
+                .await
+                .unwrap(),
+            "the check is report-only on the fix path: the sweep reclaims the orphan"
+        );
+        assert!(
+            !versions.blobs().blocks().contains(&missing).await.unwrap(),
+            "the report never re-creates a missing block"
+        );
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn doctor_verifies_blocks_against_their_own_names() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let (b, _key, row) = versioned_fixture(&storage).await;
+        let versions = storage.versions(&b);
+        let dry = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                ..CleanupOptions::default()
+            },
+        );
+        // The stored block's path: the file name is the content hash.
+        let path = versions.blobs().blocks().block_path(row.blob().hash());
+        let stored = fs::read(&path).await.unwrap();
+
+        // Corrupted bytes (same length): the digest check names the block.
+        let mut corrupted = stored.clone();
+        corrupted[0] ^= 0xff;
+        fs::write(&path, &corrupted).await.unwrap();
+        let actions = collect(dry.repair(RepairKind::Full).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("does not hash to its own name")
+                    && a.description.contains(&row.blob().hash().to_hex())),
+            "the corruption is reported: {actions:?}"
+        );
+
+        // Truncated bytes: the same name check catches them (a truncated
+        // file cannot hash to the content address its name carries).
+        fs::write(&path, &stored[..stored.len() - 1]).await.unwrap();
+        let actions = collect(dry.repair(RepairKind::Full).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("does not hash to its own name")
+                    && a.description.contains("corrupt or truncated")),
+            "the truncation is reported: {actions:?}"
+        );
+        assert!(path.exists(), "the verify pass reports and repairs nothing");
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn doctor_reports_a_block_subtree_of_a_vanished_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                state_dir: Some(state.path().to_path_buf()),
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        // The crash window between `remove_bucket_state`'s row drain and its
+        // subtree removal: blocks under a bucket name whose directory is gone.
+        let orphan = state.path().join("blobs/gone-bucket");
+        fs::create_dir_all(orphan.join("blocks")).await.unwrap();
+        fs::write(orphan.join("blocks/aaaa"), b"block")
+            .await
+            .unwrap();
+        // A live bucket's subtree is not residue, and a live bucket whose
+        // `BUCKETS` row is lost is still recoverable (the directory is the
+        // authority `ensure_bucket` reads).
+        let live = bucket::name("live-bucket").unwrap();
+        storage
+            .create_bucket(&live, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        fs::create_dir_all(state.path().join("blobs/live-bucket"))
+            .await
+            .unwrap();
+
+        let dry = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                ..CleanupOptions::default()
+            },
+        );
+        let actions = collect(dry.repair(RepairKind::Full).await.unwrap()).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.description.contains("subtree for bucket gone-bucket")),
+            "the orphaned subtree must be reported: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| a.description.contains("subtree for bucket live-bucket")),
+            "a live bucket's block subtree is not residue: {actions:?}"
+        );
+        assert!(
+            orphan.exists(),
+            "the doctor reports the subtree one pass early; only the sweep's orphan pass reclaims"
         );
     }
 }

@@ -11,7 +11,7 @@ use tinio_core::{
     etag::ETag,
     object,
     object::OBJECT_TAGS_MAX,
-    to_nanos,
+    to_nanos, version,
 };
 
 use crate::{bucket, bucket::BucketRow, meta, state, upload};
@@ -29,18 +29,37 @@ const GRANTS: &str =
 
 #[test]
 fn meta_validate_self_heals_every_element_independently() {
-    // The 8-tuple: (etag, size, mtime, file_identity, tags wire, checksum
-    // wire, owner wire, acl wire).
-    let valid = meta::validate(("d41d8cd98f00b204e9800998ecf8427e", 1, 2, 0, "", "", "", ""));
+    // The 11-tuple: (etag, size, mtime, file_identity, tags wire, checksum
+    // wire, owner wire, acl wire, version id wire, version sequence,
+    // delete-marker flag).
+    let valid = meta::validate((
+        "d41d8cd98f00b204e9800998ecf8427e",
+        1,
+        2,
+        0,
+        "",
+        "",
+        "",
+        "",
+        "null",
+        0,
+        false,
+    ));
     let row = valid.expect("an empty tags/checksum/owner/acl wire is valid");
     assert_eq!(row.size, 1);
     assert!(row.tags.is_empty());
     assert!(row.checksum.is_none());
     assert_eq!(row.owner, None);
     assert_eq!(row.acl, Acl::default_private(None));
+    assert_eq!(row.version_id, None, "the literal null is the null version");
+    assert_eq!(row.version_seq, 0, "0 is no sequence");
+    assert!(
+        !row.is_delete_marker,
+        "an object row clears the marker flag"
+    );
 
     // A garbage etag is the only element that fails the whole row.
-    assert!(meta::validate(("not-an-etag", 1, 2, 0, "", "", "", "")).is_none());
+    assert!(meta::validate(("not-an-etag", 1, 2, 0, "", "", "", "", "null", 0, false)).is_none());
 
     // Garbage tags/checksum/owner/acl wires self-heal individually; the
     // row survives (the owner element is its own wire — an ACL grant
@@ -54,12 +73,25 @@ fn meta_validate_self_heals_every_element_independently() {
         "CRC32:@@:NOPE",
         "not-a-canonical-id",
         "id=short,READ",
+        "v1",
+        9,
+        true,
     ))
     .expect("the etag is valid, the row is served");
     assert!(healed.tags.is_empty());
     assert!(healed.checksum.is_none());
     assert_eq!(healed.owner, None);
     assert_eq!(healed.acl, Acl::default_private(None));
+    assert_eq!(
+        healed.version_id.unwrap().as_str(),
+        "v1",
+        "a real identifier rides the row untouched"
+    );
+    assert_eq!(healed.version_seq, 9);
+    assert!(
+        healed.is_delete_marker,
+        "the recorded marker flag rides the row untouched"
+    );
 }
 
 #[test]
@@ -93,7 +125,7 @@ fn state_round_trips_version_and_compact_marker() {
     assert!(state.compact_marker().unwrap());
 }
 
-// The row-shape pins (buckets 4, object_meta 8, uploads 5): redb's
+// The row-shape pins (buckets 4, object_meta 10, uploads 5): redb's
 // `TableDefinition` exposes no value-arity getter in 4.2, so each shape
 // is pinned by writing and reading back a full row through the public
 // handle — the destructure below fails to compile on a narrower tuple,
@@ -130,10 +162,13 @@ fn bucket_row_round_trips_the_five_element_shape() {
 }
 
 #[test]
-fn meta_row_round_trips_the_eight_element_shape() {
+fn meta_row_round_trips_the_eleven_element_shape() {
     let db = mem_db();
     let owner = OwnerId::new(OWNER).unwrap();
     let stored = meta::Stored {
+        version_id: None,
+        version_seq: 0,
+        is_delete_marker: false,
         etag: ETag::new(ETAG).unwrap(),
         size: 1,
         mtime: 2,
@@ -158,7 +193,31 @@ fn meta_row_round_trips_the_eight_element_shape() {
     }
     let txn = db.begin_read().unwrap();
     let table = meta::Table::open_readonly(&txn).unwrap();
-    assert_eq!(table.get("data", "k").unwrap(), Some(stored));
+    assert_eq!(table.get("data", "k").unwrap(), Some(stored.clone()));
+
+    // The version elements round-trip too: a real identifier (the null
+    // version is the empty row's `None`), its sequence, and the recorded
+    // delete-marker flag.
+    let versioned = meta::Stored {
+        version_id: Some(version::id("v1").unwrap()),
+        version_seq: 3,
+        is_delete_marker: true,
+        ..stored
+    };
+    {
+        let mut txn = db.begin_write().unwrap();
+        let mut table = meta::Table::open(&mut txn).unwrap();
+        table.put("data", "versioned", &versioned).unwrap();
+        drop(table);
+        txn.commit().unwrap();
+    }
+    let txn = db.begin_read().unwrap();
+    let table = meta::Table::open_readonly(&txn).unwrap();
+    let row = table.get("data", "versioned").unwrap().unwrap();
+    assert_eq!(row.version_id.unwrap().as_str(), "v1");
+    assert_eq!(row.version_seq, 3);
+    assert!(row.is_delete_marker, "the recorded marker flag round-trips");
+    assert_eq!(row.etag, versioned.etag, "the other elements ride");
 }
 
 #[test]

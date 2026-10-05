@@ -30,8 +30,8 @@ use winapi_util::file;
 #[cfg(unix)]
 pub(crate) use crate::_util::fsutil::{DIR_MODE_PRIVATE, FILE_MODE_PRIVATE};
 pub(crate) use crate::_util::fsutil::{
-    DirOwnerUid, commit, ensure_dir, entries_of, ok_if_missing, sync_ancestor_chain,
-    sync_dir_warned,
+    DirOwnerUid, ShortRead, commit, ensure_dir, entries_of, file_stream, ok_if_missing,
+    sync_ancestor_chain, sync_dir_warned,
 };
 
 #[cfg(windows)]

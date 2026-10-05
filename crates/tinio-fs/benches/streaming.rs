@@ -49,8 +49,8 @@ fn streaming_write(c: &mut Criterion) {
             let writer = writer.clone();
             let target = target.clone();
             async move {
-                let etag = writer.write(&target, chunk_stream()).await.unwrap();
-                black_box(etag);
+                let (etag, size) = writer.write(&target, chunk_stream()).await.unwrap();
+                black_box((etag, size));
             }
         });
     });

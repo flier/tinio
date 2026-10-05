@@ -30,6 +30,7 @@ pub mod object;
 pub mod percent;
 pub mod pipeline;
 pub mod storage;
+pub mod version;
 
 pub use self::{
     blob::BlockHash,
@@ -46,4 +47,5 @@ pub use self::{
         key_marker_order, now_nanos, paginate_ordered, split_uploads_order, to_nanos,
         uploads_order,
     },
+    version::{Id, State},
 };

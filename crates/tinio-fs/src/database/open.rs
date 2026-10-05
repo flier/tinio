@@ -155,11 +155,12 @@ mod tests {
     }
 
     /// The on-disk byte-format contract: a freshly opened `meta.redb` contains
-    /// exactly the seven shared store tables plus the fs-local `state` table,
+    /// exactly the ten shared store tables plus the fs-local `state` table,
     /// and nothing else (shared-store-table-layer 2026-09-03 Goal 4 / spec §4
-    /// byte-format guard — tinio-store's own `ensure_all` test pins the seven
+    /// byte-format guard — tinio-store's own `ensure_all` test pins the ten
     /// shared names; this pins the full fs schema). Moved inline from
-    /// `tests/layout.rs`, 2026-10-01.
+    /// `tests/layout.rs`, 2026-10-01; the three version tables joined it with
+    /// the versioning plan (2026-10-03).
     #[test]
     fn open_creates_exactly_the_schema_tables() {
         let dir = tempfile::tempdir().unwrap();
@@ -174,6 +175,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "bucket_versioning",
                 "buckets",
                 "object_meta",
                 "object_parts",
@@ -182,6 +184,8 @@ mod tests {
                 "state",
                 "upload_checksums",
                 "uploads",
+                "version_index",
+                "versions",
             ]
         );
     }

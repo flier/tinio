@@ -38,6 +38,11 @@ pub enum Error {
     /// The referenced multipart upload does not exist.
     #[error("no such multipart upload: `{0}`")]
     NoSuchUpload(String),
+    /// The referenced object version does not exist: a well-formed version
+    /// identifier that names no version of the key (the wire's `404
+    /// NoSuchVersion`).
+    #[error("no such version: `{0}`")]
+    NoSuchVersion(String),
     /// The entity already exists (e.g. bucket creation on an existing name).
     #[error("already exists: `{0}`")]
     AlreadyExists(bucket::Name),
@@ -53,6 +58,11 @@ pub enum Error {
     /// is the rejected input — it cannot be [`bucket::Name`].
     #[error("invalid bucket name: `{0}`")]
     InvalidBucketName(String),
+    /// The version identifier (or versioning state) violates the wire rules —
+    /// empty, or longer than the 1024-byte AWS cap. The payload is the
+    /// rejected input — it cannot be a [`crate::version::Id`].
+    #[error("invalid version: `{0}`")]
+    InvalidVersion(String),
     /// Stored or wire-format ETag could not be parsed.
     #[error("invalid etag: {0}")]
     InvalidETag(#[from] etag::Error),
@@ -112,12 +122,55 @@ pub enum Error {
         size: u64,
     },
     /// The operation is refused (reserved `.tinio` segment — FR-020;
-    /// read-only mode — FR-023).
+    /// read-only mode — FR-023). The payload names the operation's own
+    /// subject: the object key for a key-scoped operation, the bucket for a
+    /// bucket-scoped one.
     #[error("access denied: `{0}`")]
-    AccessDenied(object::Key),
+    AccessDenied(Denied),
     /// A backend I/O failure; the underlying error is preserved.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+}
+
+/// The subject of an [`Error::AccessDenied`] refusal: the object key a
+/// key-scoped operation named, or the bucket a bucket-scoped one named. A
+/// bucket-scoped operation has no key, and fabricating one (the reserved
+/// `.tinio` segment, say) would make the payload a lie about what was
+/// refused — so the payload is shaped like the subject.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::{bucket, object, storage};
+///
+/// let key = object::key("notes.txt").unwrap();
+/// let refused = storage::access_denied(&key);
+/// assert_eq!(refused.to_string(), "access denied: `notes.txt`");
+///
+/// let bucket = bucket::name("data").unwrap();
+/// let refused = storage::access_denied_bucket(&bucket);
+/// assert_eq!(refused.to_string(), "access denied: `data`");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
+pub enum Denied {
+    /// A key-scoped refusal, naming the object key.
+    #[display("{_0}")]
+    Key(object::Key),
+    /// A bucket-scoped refusal, naming the bucket.
+    #[display("{_0}")]
+    Bucket(bucket::Name),
+}
+
+impl From<object::Key> for Denied {
+    fn from(key: object::Key) -> Self {
+        Self::Key(key)
+    }
+}
+
+impl From<bucket::Name> for Denied {
+    fn from(name: bucket::Name) -> Self {
+        Self::Bucket(name)
+    }
 }
 
 /// The referenced bucket does not exist.
@@ -136,6 +189,13 @@ pub fn no_such_key(key: &object::Key) -> Error {
 #[inline]
 pub fn no_such_upload(upload_id: &str) -> Error {
     Error::NoSuchUpload(upload_id.into())
+}
+
+/// The referenced object version does not exist (a well-formed identifier
+/// naming no version).
+#[inline]
+pub fn no_such_version(version_id: impl Into<String>) -> Error {
+    Error::NoSuchVersion(version_id.into())
 }
 
 /// The entity already exists (e.g. bucket creation on an existing name).
@@ -160,6 +220,13 @@ pub fn invalid_key(raw: String) -> Error {
 #[inline]
 pub fn invalid_bucket_name(raw: String) -> Error {
     Error::InvalidBucketName(raw)
+}
+
+/// Invalid version identifier or versioning state (rejected input — it cannot
+/// be a [`crate::version::Id`] or [`crate::version::State`]).
+#[inline]
+pub fn invalid_version(raw: impl Into<String>) -> Error {
+    Error::InvalidVersion(raw.into())
 }
 
 /// Stored or wire-format ETag could not be parsed.
@@ -229,7 +296,14 @@ pub fn invalid_range(range: ByteRange, size: u64) -> Error {
 /// The operation is refused (reserved `.tinio` segment or read-only mode).
 #[inline]
 pub fn access_denied(key: &object::Key) -> Error {
-    Error::AccessDenied(key.clone())
+    Error::AccessDenied(Denied::Key(key.clone()))
+}
+
+/// The bucket-scoped twin of [`access_denied`]: the refusal names the bucket
+/// the operation named, never a fabricated key.
+#[inline]
+pub fn access_denied_bucket(name: &bucket::Name) -> Error {
+    Error::AccessDenied(Denied::Bucket(name.clone()))
 }
 
 /// A backend I/O failure; the underlying error is preserved.
@@ -262,6 +336,14 @@ mod tests {
             (
                 Error::NoSuchUpload("abc-123".into()),
                 "no such multipart upload: `abc-123`",
+            ),
+            (
+                Error::NoSuchVersion("abc-123".into()),
+                "no such version: `abc-123`",
+            ),
+            (
+                Error::InvalidVersion("bad id".into()),
+                "invalid version: `bad id`",
             ),
             (
                 Error::AlreadyExists("my-bucket".into()),
@@ -298,7 +380,7 @@ mod tests {
                 "invalid byte range: requested From(10) on object of 5 bytes",
             ),
             (
-                Error::AccessDenied("a/.tinio/b".into()),
+                Error::AccessDenied(Denied::Key("a/.tinio/b".into())),
                 "access denied: `a/.tinio/b`",
             ),
             (
@@ -349,6 +431,14 @@ mod tests {
             invalid_bucket_name("Bad_Name".into()),
             Error::InvalidBucketName(_)
         ));
+        assert!(matches!(
+            invalid_version("bad id"),
+            Error::InvalidVersion(_)
+        ));
+        assert!(matches!(
+            no_such_version("abc-123"),
+            Error::NoSuchVersion(_)
+        ));
         assert!(matches!(invalid_etag(InvalidFormat), Error::InvalidETag(_)));
         assert!(matches!(
             invalid_checksum("BLAKE3"),
@@ -385,6 +475,8 @@ mod tests {
                 no_such_upload("abc-123"),
                 "no such multipart upload: `abc-123`",
             ),
+            (no_such_version("abc-123"), "no such version: `abc-123`"),
+            (invalid_version("bad id"), "invalid version: `bad id`"),
             (already_exists(&bucket), "already exists: `data`"),
             (not_empty(&bucket), "bucket is not empty: `data`"),
             (invalid_part_number(0), "invalid part number: 0"),

@@ -92,6 +92,9 @@ fn object_lifecycle_across_all_row_tables() {
     // 3. Complete the upload: the object meta row + the retained part
     //    list (one transaction, the same atomicity the backends use).
     let completed = meta::Stored {
+        version_id: None,
+        version_seq: 0,
+        is_delete_marker: false,
         etag: etag.clone(),
         size: 3,
         mtime: 0,

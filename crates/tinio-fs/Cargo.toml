@@ -15,7 +15,9 @@ garde = { workspace = true, features = ["derive"] }
 getset.workspace = true
 hex.workspace = true
 md-5.workspace = true
+prometheus.workspace = true
 redb.workspace = true
+sha2.workspace = true
 smart-default.workspace = true
 soft-canonicalize.workspace = true
 strict-path = { workspace = true, features = ["junctions"] }
@@ -32,9 +34,15 @@ tokio = { workspace = true, features = [
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
+tinio-blob.workspace = true
 tinio-core.workspace = true
 tinio-store.workspace = true
 tinio-util.workspace = true
+tinio-version.workspace = true
+
+[features]
+default = []
+versioning = []
 
 [target.'cfg(unix)'.dependencies]
 moka = { workspace = true, features = ["sync", "atomic64"] }
@@ -53,6 +61,7 @@ proptest.workspace = true
 tempfile.workspace = true
 
 tinio-util = { workspace = true, features = ["testing"] }
+tinio-fs = { path = ".", features = ["versioning"] }
 
 [[bench]]
 name = "streaming"

@@ -2,23 +2,25 @@
 //!
 //! Entries live in the `OBJECT_META` table of `<state-dir>/meta.redb`:
 //! key `(bucket, key)`, value `(etag hex, size, mtime unix nanos, file
-//! identity, tags wire, checksum wire, owner wire, acl wire)` (spec
-//! 2026-08-31 — the object row also records the API-written tag set and
-//! the write-time checksum; spec 2026-09-05 — the owner and ACL elements,
-//! the owner riding its own wire). The composite key keeps one bucket's
-//! entries contiguous, so `walk` and `remove_bucket` are cheap prefix
-//! range scans.
+//! identity, tags wire, checksum wire, owner wire, acl wire, version id
+//! wire, version sequence)` (spec 2026-08-31 — the object row also records
+//! the API-written tag set and the write-time checksum; spec 2026-09-05 —
+//! the owner and ACL elements, the owner riding its own wire; spec
+//! 2026-10-03-s3-versioning — the current version's identity: the version
+//! id's wire form, the literal `null` for the null version, and its
+//! per-key sequence). The composite key keeps one bucket's entries
+//! contiguous, so `walk` and `remove_bucket` are cheap prefix range scans.
 //!
 //! Entries are served only when size + mtime match the object file
 //! (FR-022); otherwise the ETag is recomputed streaming and the entry
-//! rewritten. The tags/checksum elements are NOT recomputable from the
-//! object file: a content-derived rewrite (an ETag recompute) carries the
-//! replaced row's elements over — they describe the object as last
-//! written through the API, and only an API write (PUT/copy/complete/
-//! delete/tag op) clears them. Redb transactions replace the old
-//! temp+rename writes under an in-process lock: single-entry operations
-//! are one short transaction, and a bucket removal is one atomic range
-//! deletion.
+//! rewritten. The tags/checksum/owner/ACL elements and the current-version
+//! identity are NOT recomputable from the object file: a content-derived
+//! rewrite (an ETag recompute) carries the replaced row's elements over —
+//! they describe the object as last written through the API, and only an
+//! API write (PUT/copy/complete/delete/tag op) clears them. Redb
+//! transactions replace the old temp+rename writes under an in-process
+//! lock: single-entry operations are one short transaction, and a bucket
+//! removal is one atomic range deletion.
 //!
 //! `tinio-core` domain types stay serde-free (constitution I); the stored
 //! value uses plain strings and is validated into the domain types on read.
@@ -53,11 +55,11 @@ use crate::{
         acl::{Acl, AclGrants},
         checksum,
         etag::ETag,
-        from_nanos, object, to_nanos,
+        from_nanos, object, to_nanos, version,
     },
     _store::{meta, object_part},
     Error, bucket,
-    database::{Handle, for_bucket_strict},
+    database::{Error as DatabaseError, Handle, for_bucket_strict},
     etag::{self, HashBuffer},
 };
 
@@ -161,6 +163,83 @@ pub(crate) fn entry_matches(
     stored_size == size
         && stored_mtime == to_nanos(mtime)
         && (stored_identity == 0 || identity == 0 || stored_identity == identity)
+}
+
+/// What a reader found at the key path: the file's own stamp (the reader's
+/// open or stat read it), or nothing at all. The staleness gate's second
+/// input beside the recorded row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Content {
+    /// The file the key resolves to, as the caller's own open or stat read
+    /// it — never a second path stat of a file the caller already holds.
+    Present {
+        /// The file's byte count.
+        size: u64,
+        /// The file's modification time.
+        mtime: SystemTime,
+        /// The file's identity (`0` when the platform or the filesystem has
+        /// none).
+        identity: u64,
+    },
+    /// No file: the path holds nothing. A delete marker's key, or a file
+    /// removed out of band while the row still described it. Only the
+    /// version adapter's current-slot gate (a `versioning`-gated module) has
+    /// a missing file to report: every plain read resolves the file it
+    /// serves and reports `NoSuchKey` when there is none, so a stripped build
+    /// never constructs this arm.
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    Missing,
+}
+
+/// The staleness gate's verdict on a recorded row — whether the identity the
+/// row records still names what the key holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The recorded identity still names the content: serve it. A row whose
+    /// **recorded marker flag** is set and whose file is gone is this verdict
+    /// too — a marker holds no content, so there is nothing for it to drift
+    /// from, and its identity is the current version itself.
+    Live,
+    /// The recorded identity is stale: the content drifted from the row
+    /// ([`entry_matches`]), or the file is gone while the row still described
+    /// content (an out-of-band removal — the mirror wins). The version
+    /// degrades to the null version, and the recorded identity is the row's
+    /// to clear.
+    Degraded,
+}
+
+/// The staleness gate — the one home of the decision every current-slot
+/// reader takes: the plain read's `resolve_object_info` (which serves the
+/// gated identity and hands the rewrite the stale one) and the version
+/// adapter's `current_with_row` (the engine's view of the current slot) both
+/// call it, so the two can never disagree about what is current. The leaf
+/// comparison is [`entry_matches`]; this is what the two readers make of it,
+/// including what a **missing** file means (the row's recorded marker flag,
+/// read and never inferred from the row's shape — a zero-byte object's row is
+/// shape-identical to a marker's where the filesystem has no identity).
+pub(crate) fn gate(stored: &meta::Stored, content: Content) -> Verdict {
+    match content {
+        Content::Present {
+            size,
+            mtime,
+            identity,
+        } => {
+            if entry_matches(
+                stored.size,
+                stored.mtime,
+                stored.file_identity,
+                size,
+                mtime,
+                identity,
+            ) {
+                Verdict::Live
+            } else {
+                Verdict::Degraded
+            }
+        }
+        Content::Missing if stored.is_delete_marker => Verdict::Live,
+        Content::Missing => Verdict::Degraded,
+    }
 }
 
 /// A validated meta record (the parsed form of the stored entry).
@@ -282,7 +361,12 @@ impl Store {
     /// missing so the caller recomputes the ETag from the object file and
     /// rewrites the entry (self-healing, FR-022) instead of failing every
     /// read of that object with 500.
-    async fn stored_entry(
+    ///
+    /// The version engine's adapter reads the whole row too — it needs the
+    /// current version identity, the recorded identity the staleness gate
+    /// compares, and the metadata elements a superseded version carries into
+    /// its row.
+    pub(crate) async fn stored_entry(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
@@ -360,7 +444,16 @@ impl Store {
         follow_symlinks: bool,
     ) -> Result<(ETag, bool), Error> {
         let (row, recomputed) = self
-            .ensure_row(bucket, key, path, size, mtime, identity, follow_symlinks)
+            .ensure_row(
+                bucket,
+                key,
+                path,
+                size,
+                mtime,
+                identity,
+                follow_symlinks,
+                None,
+            )
             .await?;
         Ok((row.etag, recomputed))
     }
@@ -381,6 +474,13 @@ impl Store {
     /// the `follow_symlinks` policy (nofollow when disabled — a swap to a
     /// symlink between the metadata check and the hash is rejected, R3)
     /// and persists the hash-time metadata (F19).
+    ///
+    /// `stale` is the current-version identity the caller's staleness gate
+    /// judged invalid; the rewrite that answers this call applies the clear
+    /// in the same write transaction, so the row this call returns can never
+    /// still name a version the content no longer is (see
+    /// [`Self::rewrite_preserving`]). Callers with no gate verdict pass
+    /// `None` — the identity then rides the row exactly as it always has.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn ensure_row(
         &self,
@@ -391,6 +491,7 @@ impl Store {
         mtime: SystemTime,
         identity: u64,
         follow_symlinks: bool,
+        stale: Option<&version::Id>,
     ) -> Result<(meta::Stored, bool), Error> {
         if let Some(stored) = self.stored_entry(bucket, key).await? {
             if entry_matches(
@@ -417,8 +518,8 @@ impl Store {
             if composed_gate(&stored.etag, stored.size, size)
                 && composed_keep(stored.file_identity, stored.mtime, identity, mtime)
             {
-                let (tags, checksum, owner, acl) = self
-                    .rewrite_preserving(bucket, key, &stored.etag, size, mtime, identity)
+                let (tags, checksum, owner, acl, version_id, version_seq) = self
+                    .rewrite_preserving(bucket, key, &stored.etag, size, mtime, identity, stale)
                     .await?;
                 return Ok((
                     meta::Stored {
@@ -430,6 +531,9 @@ impl Store {
                         checksum,
                         owner,
                         acl,
+                        version_id,
+                        version_seq,
+                        is_delete_marker: false,
                     },
                     false,
                 ));
@@ -440,8 +544,8 @@ impl Store {
         // return above) — the rewrite rule has ONE home (F19).
         let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
         let etag = ETag::Single(digest);
-        let (tags, checksum, owner, acl) = self
-            .rewrite_preserving(bucket, key, &etag, size, mtime, identity)
+        let (tags, checksum, owner, acl, version_id, version_seq) = self
+            .rewrite_preserving(bucket, key, &etag, size, mtime, identity, stale)
             .await?;
         Ok((
             meta::Stored {
@@ -453,6 +557,9 @@ impl Store {
                 checksum,
                 owner,
                 acl,
+                version_id,
+                version_seq,
+                is_delete_marker: false,
             },
             true,
         ))
@@ -481,8 +588,9 @@ impl Store {
     /// Store (or overwrite) the entry for `key` — one write transaction,
     /// the content-derived rewrite form (`rewrite_preserving`):
     /// the etag/size/mtime/identity columns are replaced and the replaced
-    /// row's tags/checksum elements are carried over (empty when the row
-    /// is absent). `identity` is the file identity at record time (see
+    /// row's tags/checksum/owner/ACL elements and current-version identity
+    /// are carried over (empty/`None` + `0` when the row is absent).
+    /// `identity` is the file identity at record time (see
     /// `fsutil::file_identity`); `0` marks an unavailable platform
     /// identity.
     pub async fn set(
@@ -494,21 +602,34 @@ impl Store {
         mtime: SystemTime,
         identity: u64,
     ) -> Result<(), Error> {
-        self.rewrite_preserving(bucket, key, etag, size, mtime, identity)
+        self.rewrite_preserving(bucket, key, etag, size, mtime, identity, None)
             .await
             .map(|_| ())
     }
 
     /// One write transaction: read the row being replaced, then
     /// re-insert it with `etag`/`size`/`mtime`/`identity` refreshed and
-    /// the row's tags + checksum + owner + ACL elements carried over
-    /// (empty/`None`/the private default when the row is absent) — the
-    /// content-derived rewrite semantics (see the module doc). Returns
-    /// the elements written, so the caller's response metadata matches
-    /// the row exactly (the read-modify-write runs inside the single
-    /// write transaction — redb's serialized writers make the
-    /// carried-over elements the latest committed at rewrite time).
-    #[allow(clippy::type_complexity)]
+    /// the row's tags + checksum + owner + ACL + current-version identity
+    /// elements carried over (empty/`None`/the private default/`None` +
+    /// `0` when the row is absent) — the content-derived rewrite semantics
+    /// (see the module doc). Returns the elements written, so the caller's
+    /// response metadata matches the row exactly (the read-modify-write
+    /// runs inside the single write transaction — redb's serialized
+    /// writers make the carried-over elements the latest committed at
+    /// rewrite time). Dropping the version identity here would make a
+    /// versioned object look unversioned after an ETag heal or a tag
+    /// write; it rides the row like every other element.
+    ///
+    /// `stale` is the identity the caller's staleness gate judged invalid
+    /// (the read path's out-of-band-edit verdict). The row this
+    /// transaction writes must not keep naming it — the gate judged the
+    /// content gone, and a row that still carried the identifier would
+    /// match on the next read and resurrect it. The clear is a
+    /// compare-and-set inside the same transaction: it applies only while
+    /// the row still names `stale`, so a concurrent write that installed
+    /// its own live version is never cleared by a reader that judged the
+    /// previous content.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn rewrite_preserving(
         &self,
         bucket: &bucket::Name,
@@ -517,12 +638,15 @@ impl Store {
         size: u64,
         mtime: SystemTime,
         identity: u64,
+        stale: Option<&version::Id>,
     ) -> Result<
         (
             object::Tags,
             Option<checksum::Recorded>,
             Option<acl::OwnerId>,
             Acl,
+            Option<version::Id>,
+            u64,
         ),
         Error,
     > {
@@ -531,6 +655,7 @@ impl Store {
         let bucket = bucket.clone();
         let key = key.clone();
         let etag = etag.clone();
+        let stale = stale.cloned();
         self.handle
             .write(move |txn| {
                 let mut table = meta::Table::open(txn)?;
@@ -543,6 +668,25 @@ impl Store {
                 let acl = row
                     .as_ref()
                     .map_or_else(|| Acl::default_private(None), |row| row.acl.clone());
+                // The gate's verdict, applied where the row is written: the
+                // identity rides the row only while the row still names what
+                // the gate judged. A concurrent write that installed its own
+                // version in between moved the field, and its identity is not
+                // this reader's to clear.
+                let cleared = stale.is_some()
+                    && row
+                        .as_ref()
+                        .is_some_and(|row| row.version_id.as_ref() == stale.as_ref());
+                let version_id = if cleared {
+                    None
+                } else {
+                    row.as_ref().and_then(|row| row.version_id.clone())
+                };
+                let version_seq = if cleared {
+                    0
+                } else {
+                    row.as_ref().map_or(0, |row| row.version_seq)
+                };
                 table.put(
                     &bucket,
                     &key,
@@ -555,9 +699,12 @@ impl Store {
                         checksum: checksum.clone(),
                         owner: owner.clone(),
                         acl: acl.clone(),
+                        version_id: version_id.clone(),
+                        version_seq,
+                        is_delete_marker: false,
                     },
                 )?;
-                Ok((tags, checksum, owner, acl))
+                Ok((tags, checksum, owner, acl, version_id, version_seq))
             })
             .await
             .map_err(Into::into)
@@ -635,13 +782,22 @@ impl Store {
             .write(move |txn| {
                 let mut table = meta::Table::open(txn)?;
                 // A row that appeared during the hash keeps its checksum,
-                // owner and ACL (the etag/size/mtime/identity are the
-                // hash-time ones — the row describes the same file read
-                // at hash time).
-                let (checksum, owner, acl) = table.get(&bucket, &key)?.map_or_else(
-                    || (None, None, Acl::default_private(None)),
-                    |row| (row.checksum, row.owner, row.acl),
-                );
+                // owner, ACL and current-version identity (the
+                // etag/size/mtime/identity are the hash-time ones — the row
+                // describes the same file read at hash time).
+                let (checksum, owner, acl, version_id, version_seq) =
+                    table.get(&bucket, &key)?.map_or_else(
+                        || (None, None, Acl::default_private(None), None, 0),
+                        |row| {
+                            (
+                                row.checksum,
+                                row.owner,
+                                row.acl,
+                                row.version_id,
+                                row.version_seq,
+                            )
+                        },
+                    );
                 table.put(
                     &bucket,
                     &key,
@@ -654,6 +810,9 @@ impl Store {
                         checksum,
                         owner,
                         acl,
+                        version_id,
+                        version_seq,
+                        is_delete_marker: false,
                     },
                 )?;
                 Ok(())
@@ -723,6 +882,8 @@ impl Store {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
                 };
+                // The row's other elements — the current-version identity
+                // included — ride the update untouched.
                 table.put(
                     &bucket,
                     &key,
@@ -770,9 +931,10 @@ impl Store {
     /// writes, so the `spawn_blocking` hop there is acceptable, P1).
     ///
     /// Each entry is a content-derived rewrite (`rewrite_preserving`):
-    /// the replaced row's tags/checksum elements are carried over, so a
-    /// producer recompute (a stale ETag refreshed by the list/scanner
-    /// walk) never clears the API-written metadata.
+    /// the replaced row's tags/checksum/owner/ACL elements and
+    /// current-version identity are carried over, so a producer recompute
+    /// (a stale ETag refreshed by the list/scanner walk) never clears the
+    /// API-written metadata nor makes a versioned object look unversioned.
     pub async fn set_batch_owned(
         &self,
         bucket: &bucket::Name,
@@ -795,6 +957,8 @@ impl Store {
                     let acl = row
                         .as_ref()
                         .map_or_else(|| Acl::default_private(None), |row| row.acl.clone());
+                    let version_id = row.as_ref().and_then(|row| row.version_id.clone());
+                    let version_seq = row.as_ref().map_or(0, |row| row.version_seq);
                     table.put(
                         &bucket,
                         &entry.key,
@@ -807,6 +971,9 @@ impl Store {
                             checksum: checksum.clone(),
                             owner: owner.clone(),
                             acl: acl.clone(),
+                            version_id,
+                            version_seq,
+                            is_delete_marker: false,
                         },
                     )?;
                 }
@@ -926,16 +1093,29 @@ impl Store {
     /// collide with a pinned read transaction.
     pub fn load_bucket(&self, bucket: &bucket::Name) -> Result<Vec<GatedMeta>, Error> {
         self.handle
-            .read(|txn| {
-                let table = meta::Table::open_readonly(txn)?;
-                let mut out = Vec::new();
-                table.for_bucket_gated(bucket, |key, stored| {
-                    out.push(GatedMeta { key, stored });
-                    Ok(())
-                })?;
-                Ok(out)
-            })
+            .read(|txn| self.load_bucket_in(txn, bucket))
             .map_err(Into::into)
+    }
+
+    /// [`Self::load_bucket`]'s walk inside a **caller-provided** read
+    /// transaction — the same rows, the same order, the same per-row
+    /// self-healing semantics; the caller owns the transaction (and
+    /// therefore the snapshot and the blocking-pool hop). The version
+    /// listing reads the gated current slots and the bucket's version rows
+    /// from one transaction this way, so its two tables are one point in
+    /// time and one dispatch.
+    pub(crate) fn load_bucket_in(
+        &self,
+        txn: &redb::ReadTransaction,
+        bucket: &bucket::Name,
+    ) -> Result<Vec<GatedMeta>, DatabaseError> {
+        let table = meta::Table::open_readonly(txn)?;
+        let mut out = Vec::new();
+        table.for_bucket_gated(bucket, |key, stored| {
+            out.push(GatedMeta { key, stored });
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     /// Walk every stored entry of `bucket` in key order (the scanner's
@@ -1017,7 +1197,7 @@ mod tests {
         _core::{
             acl,
             acl::{Acl, AclGrants},
-            bucket, object,
+            bucket, object, version,
         },
         _store::meta::{Stored, Table},
         _util::testing::etag,
@@ -1038,7 +1218,10 @@ mod tests {
         {
             let mut table = Table::open(&mut txn).unwrap();
             table
-                .insert((bucket, key), ("not-an-etag", 1, 1, 0, "", "", "", ""))
+                .insert(
+                    (bucket, key),
+                    ("not-an-etag", 1, 1, 0, "", "", "", "", "null", 0, false),
+                )
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -1055,11 +1238,142 @@ mod tests {
             table
                 .insert(
                     (bucket, key),
-                    ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 0, "", "", "", ""),
+                    (
+                        "d41d8cd98f00b204e9800998ecf8427e",
+                        1,
+                        1,
+                        0,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "null",
+                        0,
+                        false,
+                    ),
                 )
                 .unwrap();
         }
         txn.commit().unwrap();
+    }
+
+    /// Plant one row carrying the current-version columns the version engine
+    /// writes (`version_id` / `version_seq`). Runs on its own handle, dropped
+    /// before the store opens the same file (redb's file lock is exclusive).
+    fn plant_versioned_row(state_dir: &Path, bucket: &bucket::Name, key: &object::Key) {
+        let db = database::open(state_dir).unwrap().db;
+        let mut txn = db.begin_write().unwrap();
+        {
+            let mut table = Table::open(&mut txn).unwrap();
+            table
+                .put(
+                    bucket,
+                    key,
+                    &Stored {
+                        etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+                        size: 4,
+                        mtime: to_nanos(mtime(100)),
+                        file_identity: 0,
+                        tags: object::Tags::empty(),
+                        checksum: None,
+                        owner: None,
+                        acl: Acl::default_private(None),
+                        version_id: Some(version::id("v1").unwrap()),
+                        version_seq: 7,
+                        is_delete_marker: false,
+                    },
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// The stored row's current-version columns, through the store's own
+    /// handle (the exclusive redb file lock forbids a second opener).
+    async fn stored_version(
+        store: &Store,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> (Option<String>, u64) {
+        let row = store.stored_entry(bucket, key).await.unwrap().unwrap();
+        (
+            row.version_id.map(|id| id.as_str().to_owned()),
+            row.version_seq,
+        )
+    }
+
+    /// The current-version columns ride every content-derived rewrite: an
+    /// ETag heal (`set` and `ensure_row`'s paths share `rewrite_preserving`),
+    /// a scanner batch write, a tag write and an ACL write must all carry
+    /// the row's version identity — the mechanical `None`/`0` default would
+    /// make a versioned object look unversioned after any of them.
+    #[tokio::test]
+    async fn content_derived_rewrites_preserve_the_version_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        plant_versioned_row(state.path(), &b, &k);
+        let store = meta::store(state.path()).unwrap();
+        let planted = (Some("v1".to_owned()), 7);
+        assert_eq!(stored_version(&store, &b, &k).await, planted);
+
+        // The content-derived rewrite (`ensure_row`'s heal paths share it).
+        store
+            .set(
+                &b,
+                &k,
+                &etag("5eb63bbbe01eeed093cb22bb8f5acdc3"),
+                5,
+                mtime(200),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_version(&store, &b, &k).await,
+            planted,
+            "`set` carries the version identity"
+        );
+
+        // The batch write (the scanner/list ETag-heal path).
+        store
+            .set_batch(
+                &b,
+                &[meta::BatchEntry {
+                    key: k.clone(),
+                    etag: etag("e10adc3949ba59abbe56e057f20f883e"),
+                    size: 6,
+                    mtime: mtime(300),
+                    identity: 0,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_version(&store, &b, &k).await,
+            planted,
+            "`set_batch` carries the version identity"
+        );
+
+        // The read-modify-write element updates.
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+        assert_eq!(
+            stored_version(&store, &b, &k).await,
+            planted,
+            "`set_tags` carries the version identity"
+        );
+        assert!(
+            store
+                .set_acl(&b, &k, &vec![group_read_grant()])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            stored_version(&store, &b, &k).await,
+            planted,
+            "`set_acl` carries the version identity"
+        );
     }
 
     #[tokio::test]
@@ -1171,6 +1485,79 @@ mod tests {
         // the hash-heal), and the table's change-detection already
         // skipped the row write.
         assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+    }
+
+    /// `ensure_tags`'s missing-row branch: a hand-dropped object (a file
+    /// with no row) is hashed and its row inserted with the requested tag
+    /// set in ONE transaction. The second call takes the existing-row
+    /// short-circuit, preserving every content-derived element the insert
+    /// wrote.
+    #[tokio::test]
+    async fn ensure_tags_hashes_and_inserts_the_row_of_a_hand_dropped_object() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = meta::store(state.path()).unwrap();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("a.txt").unwrap();
+        let path = root.path().join("a.txt");
+        fs::write(&path, b"hello").await.unwrap();
+        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
+
+        assert!(
+            store.stored_entry(&b, &k).await.unwrap().is_none(),
+            "a hand-dropped object has no row to start from"
+        );
+        store
+            .ensure_tags(&b, &k, &path, false, &tags)
+            .await
+            .unwrap();
+        let row = store
+            .stored_entry(&b, &k)
+            .await
+            .unwrap()
+            .expect("the insert branch wrote the row");
+        assert_eq!(
+            row.etag.as_str(),
+            "5d41402abc4b2a76b9719d911017c592",
+            "the row's etag is the content's MD5"
+        );
+        assert_eq!(row.size, 5);
+        assert_eq!(row.tags, tags, "the requested tags ride the insert");
+        assert!(row.checksum.is_none(), "no checksum is invented");
+        assert!(row.owner.is_none(), "no owner is invented");
+        assert_eq!(
+            row.acl,
+            Acl::default_private(None),
+            "the private default rides the insert"
+        );
+        assert!(row.version_id.is_none(), "no version identity is invented");
+        assert_eq!(row.version_seq, 0);
+        // The row describes the file it was hashed from (the F19 rules).
+        let metadata = fs::metadata(&path).await.unwrap();
+        assert!(entry_matches(
+            row.size,
+            row.mtime,
+            row.file_identity,
+            metadata.len(),
+            metadata.modified().unwrap(),
+            fsutil::file_identity(&path, &metadata),
+        ));
+
+        // The row now exists: the second call is the plain tag update, which
+        // preserves the content-derived elements the insert wrote.
+        let later = object::Tags::from_pairs([("env".into(), "staging".into())]).unwrap();
+        store
+            .ensure_tags(&b, &k, &path, false, &later)
+            .await
+            .unwrap();
+        let updated = store.stored_entry(&b, &k).await.unwrap().unwrap();
+        assert_eq!(updated.tags, later);
+        assert_eq!(updated.etag, row.etag);
+        assert_eq!(updated.size, row.size);
+        assert_eq!(updated.mtime, row.mtime);
+        assert_eq!(updated.file_identity, row.file_identity);
+        assert_eq!(updated.version_id, row.version_id);
+        assert_eq!(updated.version_seq, row.version_seq);
     }
 
     #[tokio::test]
@@ -1488,7 +1875,19 @@ mod tests {
                 table
                     .insert(
                         ("data", "a.txt"),
-                        ("d41d8cd98f00b204e9800998ecf8427e", 1, 1, 9, "", "", "", ""),
+                        (
+                            "d41d8cd98f00b204e9800998ecf8427e",
+                            1,
+                            1,
+                            9,
+                            "",
+                            "",
+                            "",
+                            "",
+                            "null",
+                            0,
+                            false,
+                        ),
                     )
                     .unwrap();
             }
@@ -1652,6 +2051,95 @@ mod tests {
             .unwrap()
     }
 
+    /// A recorded row for the gate's own test: `size`/`mtime`/identity and
+    /// the marker flag are the caller's, the rest is inert.
+    fn stored_row(size: u64, mtime: u64, identity: u64, marker: bool) -> Stored {
+        Stored {
+            etag: ETag::from_content(b""),
+            size,
+            mtime,
+            file_identity: identity,
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+            version_id: version::Id::from_wire("v1"),
+            version_seq: 1,
+            is_delete_marker: marker,
+        }
+    }
+
+    #[test]
+    fn the_gate_is_one_decision_over_the_four_states_it_distinguishes() {
+        // The one home of the staleness verdict: the plain read
+        // (`resolve_object_info`) and the version adapter's current slot
+        // (`current_with_row`) both call it, so no reader may carry its own
+        // copy of this table. Each arm here is a state the two readers must
+        // answer identically.
+        let row = stored_row(4, 1_000, 7, false);
+        let at = |size, mtime, identity| Content::Present {
+            size,
+            mtime,
+            identity,
+        };
+
+        // Matching: the recorded identity names the file.
+        assert_eq!(
+            gate(
+                &row,
+                at(4, SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000), 7)
+            ),
+            Verdict::Live
+        );
+        // Matching without identities (the platform has none): the size+mtime
+        // pair alone still answers.
+        assert_eq!(
+            gate(
+                &stored_row(4, 1_000, 0, false),
+                at(4, SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000), 0)
+            ),
+            Verdict::Live
+        );
+        // Drifted: the size, the mtime or the identity moved. (The mtime
+        // drift is a millisecond — a nanosecond would be inside the clock's
+        // own granularity on Windows, whose FILETIME ticks are 100 ns.)
+        assert_eq!(
+            gate(
+                &row,
+                at(5, SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000), 7)
+            ),
+            Verdict::Degraded
+        );
+        assert_eq!(
+            gate(
+                &row,
+                at(
+                    4,
+                    SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000_000),
+                    7
+                )
+            ),
+            Verdict::Degraded
+        );
+        assert_eq!(
+            gate(
+                &row,
+                at(4, SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000), 8)
+            ),
+            Verdict::Degraded,
+            "a same-size, mtime-preserving replacement is caught by the identity"
+        );
+        // Missing: the file is gone. A row still describing content is an
+        // out-of-band removal (degraded); a recorded marker holds no content
+        // to drift from, so its identity stays live.
+        assert_eq!(gate(&row, Content::Missing), Verdict::Degraded);
+        assert_eq!(
+            gate(&stored_row(0, 1_000, 0, true), Content::Missing),
+            Verdict::Live,
+            "the recorded marker flag, never the row's content shape, decides"
+        );
+    }
+
     fn group_read_grant() -> acl::Grant {
         acl::Grant {
             grantee: acl::Grantee::Group(acl::GroupUri(acl::GROUP_ALL_USERS.into())),
@@ -1679,6 +2167,9 @@ mod tests {
                         "",
                         "not-a-canonical-id",
                         "id=short,READ",
+                        "null",
+                        0,
+                        false,
                     ),
                 )
                 .unwrap();
@@ -1750,6 +2241,9 @@ mod tests {
                             "",
                             owner.as_str(),
                             "",
+                            "null",
+                            0,
+                            false,
                         ),
                     )
                     .unwrap();

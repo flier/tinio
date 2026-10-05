@@ -19,7 +19,10 @@ use crate::{
         acl::Acl,
         multipart::part_number,
         object,
-        storage::{BucketOps, Error as StorageError, ListPartsParams, MultipartOps, ObjectOps},
+        storage::{
+            BucketOps, Error as StorageError, ListPartsParams, MultipartOps, ObjectOps, VersionOps,
+        },
+        version::State,
     },
     _util::{
         path::path_contains,
@@ -788,7 +791,7 @@ fn bucket_name(raw: &str) -> Name {
 
 /// One full lifecycle over an explicit state dir; then assert the layout.
 #[tokio::test]
-async fn state_dir_holds_only_redb_tmp_and_multipart() {
+async fn state_dir_holds_only_redb_tmp_multipart_and_blobs() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let storage = FsStorage::new(root.path(), fs_options_in(state.path())).unwrap();
@@ -839,9 +842,25 @@ async fn state_dir_holds_only_redb_tmp_and_multipart() {
         .unwrap();
     assert_eq!(listing.parts.len(), 1);
 
-    // The state dir: meta.redb and the multipart tree only (tmp/ appears
-    // on demand when the atomic writer stages a body).
-    let mut allowed = vec!["meta.redb", "multipart"];
+    // The versioned write: a supersede moves the outgoing content into the
+    // bucket's own block subtree (`blobs/<bucket>/<fan-out>/<hash>`), so
+    // the layout below covers the block store too.
+    storage
+        .set_bucket_versioning(&b, State::Enabled)
+        .await
+        .unwrap();
+    storage
+        .put_object(&b, &"hello.txt".into(), body(b"hello again"))
+        .await
+        .unwrap();
+    assert!(
+        state.path().join("blobs/data").is_dir(),
+        "the bucket's block subtree"
+    );
+
+    // The state dir: meta.redb, the multipart tree and the block store
+    // (tmp/ appears on demand when the atomic writer stages a body).
+    let mut allowed = vec!["meta.redb", "multipart", "blobs"];
     if state.path().join("tmp").exists() {
         allowed.push("tmp");
     }

@@ -9,6 +9,8 @@ use async_trait::async_trait;
 
 #[cfg(test)]
 use crate::_core::bucket::name;
+#[cfg(feature = "versioning")]
+use crate::version;
 use crate::{
     _core::{
         Bucket, BucketOps, BucketsListing, ListBucketsParams, acl,
@@ -76,6 +78,17 @@ impl BucketOps for MemoryStorage {
                     return Err(no_such_bucket(name));
                 }
                 buckets.remove(name.as_ref().as_str())?;
+            }
+            // The bucket's version state dies with it (spec 2026-10-03): its
+            // version rows, their index, the state row and its blobs — the
+            // design's bucket delete drops the version data with the bucket.
+            // The bucket was empty of objects (the checks above), so the
+            // blobs are the only stored bytes it can still hold: the tracked
+            // total releases exactly what the drain removed.
+            #[cfg(feature = "versioning")]
+            {
+                let drained = version::drain_bucket(txn, name)?;
+                self.release_total(-(drained as i64));
             }
             Ok(())
         })

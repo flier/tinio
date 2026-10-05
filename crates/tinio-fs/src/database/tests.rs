@@ -216,7 +216,19 @@ async fn compact_if_needed_shrinks_and_clears_marker() {
                 table
                     .insert(
                         ("data", key.as_str()),
-                        (key.as_str(), u64::from(i), u64::from(i), 0, "", "", "", ""),
+                        (
+                            key.as_str(),
+                            u64::from(i),
+                            u64::from(i),
+                            0,
+                            "",
+                            "",
+                            "",
+                            "",
+                            "null",
+                            0,
+                            false,
+                        ),
                     )
                     .unwrap();
             }

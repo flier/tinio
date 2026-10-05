@@ -1,10 +1,26 @@
 //! `(bucket, key)` → `(etag hex, size, mtime unix nanos, file identity,
-//! tags wire, checksum wire, owner wire, acl wire)` — the tags, checksum,
-//! owner and ACL elements are empty strings when the object has none
-//! (spec 2026-08-31; owner/ACL spec 2026-09-05). The checksum wire is
+//! tags wire, checksum wire, owner wire, acl wire, version id wire,
+//! version sequence, delete-marker flag)` — the tags, checksum, owner and
+//! ACL elements are
+//! empty strings when the object has none (spec 2026-08-31; owner/ACL spec
+//! 2026-09-05). The checksum wire is
 //! `<algorithm wire>:<base64 value>:<kind>` — e.g.
 //! `CRC32:NhCmhg==:FULL_OBJECT` — with the kind recorded at write time so
-//! read paths never derive it.
+//! read paths never derive it. The two version elements are the current
+//! version's identity (spec 2026-10-03-s3-versioning): the version id's
+//! wire form — the literal `null` for the null version, never an empty
+//! string — and its per-key sequence (`0` = none, i.e. the bucket was
+//! unversioned when the object was written). The last element is the
+//! **recorded** delete-marker state: the simple-DELETE path writes `true`
+//! and every object write clears it. The flag is recorded, never inferred
+//! from the row's content shape, because that shape cannot tell a delete
+//! marker's row from a genuinely zero-byte object's row on a filesystem
+//! where the file identity is unavailable (both are size `0`, the
+//! empty-content ETag and identity `0`), and a marker is a state the API
+//! created rather than one the reader may guess. The row format change is
+//! additive at the table level but not at the row level: `FORMAT_VERSION`
+//! stays `1` (the 2026-09-02 ruling), so a database written in an older
+//! tuple shape errors at decode and the remedy is delete-and-rebuild.
 
 use redb::{ReadableTable, TableDefinition};
 
@@ -15,6 +31,7 @@ use crate::{
         etag::ETag,
         object,
         object::OBJECT_TAGS_MAX,
+        version,
     },
     acl::{decode_acl_wire, decode_owner_wire},
     error::Error,
@@ -29,14 +46,17 @@ pub enum Def {}
 impl TableDef for Def {
     type Key = (&'static str, &'static str);
     type Value = (
-        &'static str,
-        u64,
-        u64,
-        u64,
-        &'static str,
-        &'static str,
-        &'static str,
-        &'static str,
+        &'static str, // etag hex
+        u64,          // size
+        u64,          // mtime unix nanos
+        u64,          // file identity
+        &'static str, // tags wire
+        &'static str, // checksum wire
+        &'static str, // owner wire
+        &'static str, // acl wire
+        &'static str, // version id wire (the literal "null" = null version)
+        u64,          // version sequence (0 = none)
+        bool,         // delete-marker flag (true = the row describes a marker)
     );
 
     const DEF: TableDefinition<'static, Self::Key, Self::Value> =
@@ -49,7 +69,8 @@ pub type Table<'txn, T = redb::Table<'txn, <Def as TableDef>::Key, <Def as Table
 
 /// One stored `OBJECT_META` entry, validated into domain types (the row
 /// shape is `(etag hex, size, mtime unix nanos, file identity, tags wire,
-/// checksum wire, owner wire, acl wire)`).
+/// checksum wire, owner wire, acl wire, version id wire, version
+/// sequence, delete-marker flag)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
     /// ETag (single MD5 or composed `-N` form).
@@ -76,6 +97,19 @@ pub struct Stored {
     /// `from_grants_wire`'s self-heal (empty/domain-invalid → the
     /// private default with no owner).
     pub acl: Acl,
+    /// The current version's identifier (`None` = the null version, or a
+    /// row written while the bucket was unversioned — the stored element
+    /// is the literal `null`; a corrupt element also reads as the null
+    /// version, self-healing like the tags).
+    pub version_id: Option<version::Id>,
+    /// The current version's sequence (`0` = none — the bucket was
+    /// unversioned when the object was written).
+    pub version_seq: u64,
+    /// Whether the row describes a current delete marker: written by the
+    /// simple-DELETE path, cleared by every object write. A **recorded**
+    /// state, never inferred from the row's content shape — see the module
+    /// doc.
+    pub is_delete_marker: bool,
 }
 
 /// Validate one raw `OBJECT_META` row into [`Stored`] — `None` on a
@@ -87,16 +121,19 @@ pub struct Stored {
 /// point read [`Table::get`] and the gating traversal
 /// [`Table::for_bucket_gated`] — the single home of the rule.
 pub fn validate(
-    (etag, size, mtime, file_identity, tags, checksum, owner_wire, acl_wire): (
-        &str,
-        u64,
-        u64,
-        u64,
-        &str,
-        &str,
-        &str,
-        &str,
-    ),
+    (
+        etag,
+        size,
+        mtime,
+        file_identity,
+        tags,
+        checksum,
+        owner_wire,
+        acl_wire,
+        version_id,
+        version_seq,
+        is_delete_marker,
+    ): (&str, u64, u64, u64, &str, &str, &str, &str, &str, u64, bool),
 ) -> Option<Stored> {
     Some(Stored {
         etag: ETag::new(etag).ok()?,
@@ -107,7 +144,56 @@ pub fn validate(
         checksum: checksum::Recorded::from_wire_opt(checksum),
         owner: decode_owner_wire(owner_wire),
         acl: decode_acl_wire(acl_wire),
+        version_id: version::Id::from_wire(version_id),
+        version_seq,
+        is_delete_marker,
     })
+}
+
+/// The five metadata wires of one row — the recorded ETag, the tags wire,
+/// the checksum wire, the owner wire and the ACL grants wire — in the order
+/// [`Table::put`] encodes them and the version row's metadata elements take
+/// them (the supersede's `carried` elements). `None` — a version superseded
+/// with no `object_meta` row — contributes five empty elements. The single
+/// home of the extraction: the module's own encoder and both backends'
+/// supersedes call it.
+pub fn wires(stored: Option<&Stored>) -> (String, String, String, String, String) {
+    match stored {
+        Some(stored) => (
+            stored.etag.as_str(),
+            stored.tags.to_wire(),
+            stored
+                .checksum
+                .as_ref()
+                .map(checksum::Recorded::to_wire)
+                .unwrap_or_default(),
+            stored
+                .owner
+                .as_ref()
+                .map(|owner| owner.as_str().to_owned())
+                .unwrap_or_default(),
+            stored.acl.to_grants_wire(),
+        ),
+        None => Default::default(),
+    }
+}
+
+/// The object-file orphan classification of one recorded delete-marker flag
+/// — the single home of the rule. A marker's row describes a file that is
+/// absent **by design**: `is_absent` is its steady state, not corruption,
+/// so the object-file orphan passes (the scanner's orphan reclamation and
+/// the doctor's meta-orphan repair) must never reclaim it — its identity,
+/// sequence and index entry survive every pass. A row that is not a marker
+/// may have lost its file and remains an orphan candidate.
+pub const fn orphan_candidate(is_delete_marker: bool) -> bool {
+    !is_delete_marker
+}
+
+impl Stored {
+    /// This row's [`orphan_candidate`] classification.
+    pub const fn is_orphan_candidate(&self) -> bool {
+        orphan_candidate(self.is_delete_marker)
+    }
 }
 
 impl<'txn, T> table::Table<'txn, Def, T>
@@ -158,17 +244,12 @@ impl<'txn> table::Table<'txn, Def> {
     /// atomicity: persisted with the etag, never a post-commit window),
     /// and `checksum` is stored with its recorded kind (`FULL_OBJECT`
     /// for plain PUTs, `COMPOSITE` for multipart completions, the
-    /// source's kind for copies).
+    /// source's kind for copies). The current version's identity rides
+    /// the same row: `version_id`'s wire form — the literal `null` for
+    /// [`Stored::version_id`]` == None` — and its sequence.
     pub fn put(&mut self, bucket: &str, key: &str, meta: &Stored) -> Result<(), Error> {
-        let etag_hex = meta.etag.as_str();
-        let tags_wire = meta.tags.to_wire();
-        let checksum_wire = meta
-            .checksum
-            .as_ref()
-            .map(|c| c.to_wire())
-            .unwrap_or_default();
-        let owner_wire = meta.owner.as_ref().map(|o| o.as_str()).unwrap_or_default();
-        let acl_wire = meta.acl.to_grants_wire();
+        let (etag_hex, tags_wire, checksum_wire, owner_wire, acl_wire) = wires(Some(meta));
+        let version_wire = version::wire_of(meta.version_id.as_ref());
         self.0.insert(
             (bucket, key),
             (
@@ -178,8 +259,11 @@ impl<'txn> table::Table<'txn, Def> {
                 meta.file_identity,
                 tags_wire.as_str(),
                 checksum_wire.as_str(),
-                owner_wire,
+                owner_wire.as_str(),
                 acl_wire.as_str(),
+                version_wire.as_str(),
+                meta.version_seq,
+                meta.is_delete_marker,
             ),
         )?;
         Ok(())
@@ -248,6 +332,9 @@ mod tests {
     fn object_meta_walk_self_heals_a_corrupt_etag_row() {
         let h = handle();
         let valid = Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
             size: 1,
             mtime: 0,
@@ -264,7 +351,19 @@ mod tests {
             // the walk rather than failing it — the gating load's discipline.
             t.insert(
                 ("data", "bad-etag"),
-                ("not-an-etag", 1u64, 0u64, 0u64, "", "", "", ""),
+                (
+                    "not-an-etag",
+                    1u64,
+                    0u64,
+                    0u64,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "null",
+                    0u64,
+                    false,
+                ),
             )
             .map_err(Error::from)?;
             Ok(())
@@ -296,6 +395,9 @@ mod tests {
         let key = object::key("a.txt").unwrap();
         let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let stored = Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
             size: 3,
             mtime: 1,
@@ -341,6 +443,9 @@ mod tests {
                     "",
                     "",
                     "",
+                    "null",
+                    0u64,
+                    false,
                 ),
             )
             .map_err(Error::from)?;
@@ -373,10 +478,122 @@ mod tests {
     }
 
     #[test]
+    fn the_current_identity_elements_round_trip_and_null_encodes_as_the_literal() {
+        let h = handle();
+        let key = object::key("a.txt").unwrap();
+        let base = Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
+            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+            size: 4,
+            mtime: 7,
+            file_identity: 9,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        };
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.put("data", &key, &base)?;
+            Ok(())
+        })
+        .unwrap();
+        // The raw row: element 8 is the version id wire, element 9 the
+        // sequence. `None` is the literal `null`, never an empty string, and
+        // `0` is the no-sequence marker.
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            let (id_wire, seq) = {
+                let guard = t.0.get(("data", "a.txt")).unwrap().expect("present");
+                let (.., id_wire, seq, _marker) = guard.value();
+                (id_wire.to_owned(), seq)
+            };
+            assert_eq!(id_wire, "null", "the null version's wire is the literal");
+            assert_ne!(id_wire, "", "…never the empty-string sentinel");
+            assert_eq!(seq, 0, "zero is the no-sequence marker");
+            let got = t.get("data", &key)?.expect("present");
+            assert_eq!(got, base, "the null identity round-trips");
+            Ok(())
+        })
+        .unwrap();
+        // A real identity round-trips identically.
+        let id = version::Id::new("v-1").unwrap();
+        let with_id = Stored {
+            version_id: Some(id.clone()),
+            version_seq: 7,
+            ..base.clone()
+        };
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?.put("data", &key, &with_id)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let t = Table::open_readonly(txn)?;
+            let (id_wire, seq) = {
+                let guard = t.0.get(("data", "a.txt")).unwrap().expect("present");
+                let (.., id_wire, seq, _marker) = guard.value();
+                (id_wire.to_owned(), seq)
+            };
+            assert_eq!(
+                id_wire,
+                id.as_str(),
+                "the id's own wire form is the element"
+            );
+            assert_eq!(seq, 7, "the sequence element is the row's own");
+            let got = t.get("data", &key)?.expect("present");
+            assert_eq!(got, with_id, "a real identity round-trips");
+            assert_eq!(got.version_id.as_ref(), Some(&id));
+            Ok(())
+        })
+        .unwrap();
+        // A corrupt element self-heals to the null version: a row that
+        // cannot say its identity never invents one.
+        h.write(|txn| -> Result<(), Error> {
+            Table::open(txn)?
+                .insert(
+                    ("data", "a.txt"),
+                    (
+                        "d41d8cd98f00b204e9800998ecf8427e",
+                        4u64,
+                        7u64,
+                        9u64,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0u64,
+                        false,
+                    ),
+                )
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            let got = Table::open_readonly(txn)?
+                .get("data", &key)?
+                .expect("the valid etag still serves");
+            assert_eq!(
+                got.version_id, None,
+                "an empty id wire reads as the null version, not an error"
+            );
+            assert_eq!(got.version_seq, 0, "the sequence heals with the identity");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn object_meta_missing_get_absent_remove_and_drain_bucket() {
         let h = handle();
         let key = object::key("dir/a.txt").unwrap();
         let stored = Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
             etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
             size: 11,
             mtime: 0,

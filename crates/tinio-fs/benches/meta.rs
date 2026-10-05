@@ -47,6 +47,9 @@ fn populated_store() -> (tempfile::TempDir, meta::Store) {
                                 "",
                                 "",
                                 "",
+                                "null",
+                                0,
+                                false,
                             ),
                         )
                         .unwrap();

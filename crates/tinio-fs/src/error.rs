@@ -86,6 +86,23 @@ pub(crate) fn root_not_directory(path: impl Into<PathBuf>) -> Error {
     Error::RootNotDirectory(path.into())
 }
 
+/// Project an engine failure onto this crate's error (the engines' one error
+/// type projects onto [`storage::Error`], which this crate wraps).
+#[cfg(feature = "versioning")]
+#[inline]
+pub(crate) fn projected(err: impl Into<storage::Error>) -> Error {
+    Error::from(err.into())
+}
+
+/// Project this crate's failure onto the contract error the version engine's
+/// ports answer (the engine has one error type; the projection is what the
+/// port discipline exists for).
+#[cfg(feature = "versioning")]
+#[inline]
+pub(crate) fn contract(err: impl Into<Error>) -> storage::Error {
+    err.into().into()
+}
+
 impl From<database::Error> for Error {
     fn from(err: database::Error) -> Self {
         match err {
