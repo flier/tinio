@@ -9,11 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use redb::Database;
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase};
 
 use super::{
     compact::{Stats, snapshot},
-    error::Error,
+    error::{Error, unsupported_version},
     tables::ensure_version,
 };
 use crate::_store::{ensure_all, state};
@@ -89,6 +89,69 @@ pub fn open(state_dir: &Path) -> Result<Open, Error> {
         compact_needed,
         stats,
     })
+}
+
+/// Open (without creating) the state database at `<state_dir>/meta.redb`
+/// **read-only** — the read-only run's one metadata source (FR-023
+/// amended, design 2026-10-03 **Read paths**).
+///
+/// Nothing is created or written: the state dir, the file and the tables
+/// must all be there already, and the file is left exactly as it was
+/// found. The format gate runs here, once, so every later read works on a
+/// database this build wrote: the `STATE` table's version row must exist
+/// and must be [`state::FORMAT_VERSION`] (a missing table or row is a
+/// database this build did not write; a different version is one it does
+/// not read).
+///
+/// # Errors
+///
+/// `Error::Redb(_)` when the file is absent, cannot be opened read-only,
+/// or is not a state database (the `STATE` table is missing) —
+/// [`ReadOnlyDatabase::open`]'s and the table open's failures, unwrapped
+/// from the shared error as this `open`'s are; [`Error::UnsupportedVersion`]
+/// on a version row that is missing (`0` stands in for it) or different.
+/// Every arm is the caller's to report: a read-only run degrades to
+/// serving objects from their files with an empty metadata view.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_fs::database;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let state = dir.path().join("state");
+///
+/// // Nothing to read yet: the open creates nothing — not the state
+/// // directory, not the database — and answers the failure for the
+/// // caller to report.
+/// assert!(database::open_read_only(&state).is_err());
+/// assert!(!state.exists(), "the open created {}", state.display());
+///
+/// // A read-write run creates the database...
+/// drop(database::open(&state).unwrap());
+/// // ...and the read-only open then serves it, creating nothing.
+/// assert!(database::open_read_only(&state).is_ok());
+/// ```
+pub fn open_read_only(state_dir: &Path) -> Result<ReadOnlyDatabase, Error> {
+    let path = meta_db_path(state_dir);
+    let db = ReadOnlyDatabase::open(&path).map_err(|e| Error::Redb(e.into()))?;
+    let version = {
+        let txn = db.begin_read().map_err(|e| Error::Redb(e.into()))?;
+        // The shared read-only handle, not a raw `open_table`: the
+        // missing-table stand-in is scoped to the three version tables
+        // (`TableDef::MAY_BE_ABSENT`, spec 2026-10-03), and `state` is not
+        // one of them — a missing `STATE` table propagates redb's error
+        // through the same arm the raw open used to raise, so the bypass
+        // had nothing left to bypass (a database with no `STATE` table is
+        // not one this build wrote, not one whose metadata is empty).
+        let table = state::Table::open_readonly(&txn)?;
+        table.version()?
+    };
+    match version {
+        Some(found) if found == state::FORMAT_VERSION => Ok(db),
+        Some(found) => Err(unsupported_version(&path, found, state::FORMAT_VERSION)),
+        None => Err(unsupported_version(&path, 0, state::FORMAT_VERSION)),
+    }
 }
 
 #[cfg(test)]

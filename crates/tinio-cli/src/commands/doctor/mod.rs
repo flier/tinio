@@ -311,7 +311,9 @@ pub(crate) fn state_dir_for_run(resolution: &Resolution) -> Result<StateDir, Err
 /// The engine's own scope is `FsCleanup::repair(RepairKind::Full)` — every startup item plus
 /// meta-orphan reclamation — and the things it does not own are named at the call: the meta
 /// store's integrity check and offline compact (both inside `open_store`'s `Pass::Fix`), and the
-/// plane's `state`/socket reclaim (api builds, the socket half unix-only).
+/// plane's `state`/socket reclaim (api builds, the socket half unix-only). A read-only run skips
+/// the store's stages whole ([`repair_store`] says why), so there the plane's reclaim is the
+/// whole of what it applies.
 async fn repair(run: &Run<'_>) -> Repaired {
     let mut notes: Vec<String> = Vec::new();
     let mut failures: Vec<Finding> = Vec::new();
@@ -346,12 +348,31 @@ struct Repaired {
 /// carries the integrity check), the offline compact, and the cleanup stream. Answers the number
 /// of repairs applied; every failure along the way lands in `failures` and the stages behind it
 /// still run.
+///
+/// **A read-only run has no store stages here** (FR-023 amended): its metadata source is the
+/// root's own `<root>/.tinio/meta.redb`, which the storage opens read-only and never creates,
+/// while the relocated tool-state dir holds tool state only — the socket, the `state` file and
+/// the logs. Opening a store at the chosen dir would therefore **create** the very file the mode
+/// promises not to write, and `FsStorage::new_from_db` drops the handle a line later, leaving
+/// the file behind; the compaction in between would write it too. Skipping the leg whole is also
+/// what keeps the home-derived tree uncreated: nothing in the repair needs it once the store's
+/// stages are gone, and the plane's reclaim below only ever removes. A note carries the skip, so
+/// a leg that cannot run stays visible in the summary.
 async fn repair_store(
     run: &Run<'_>,
     notes: &mut Vec<String>,
     failures: &mut Vec<Finding>,
 ) -> usize {
     let Run { resolution, state } = *run;
+
+    if resolution.read_only {
+        notes.push(
+            "read-only: the store stages were skipped; the metadata source is the root's own \
+             database, opened read-only"
+                .to_string(),
+        );
+        return 0;
+    }
 
     // Harden the home parents first when the chosen dir is the home-derived leaf: `Pass::Fix` may
     // create the store, and a bare `create_dir_all` would skip `ensure_roots`. A failure here

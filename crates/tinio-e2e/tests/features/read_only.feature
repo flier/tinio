@@ -126,8 +126,10 @@ Feature: Read-only mode
     And the response body contains "<Key>a.txt</Key>"
 
   # The flag is the mode's first channel (decision 4), and the state dir it relocates is the
-  # half no wire assertion can see: the run's own state lands in `TINIO_STATE_DIR` — the
-  # harness hands every `@cli` child one — and the served root gains no `.tinio` of its own.
+  # half no wire assertion can see: the run's **tool state** lands in `TINIO_STATE_DIR` — the
+  # harness hands every `@cli` child one — and that directory holds no database (the storage
+  # reads the root's own; FR-023 amended 2026-10-03), while the served root gains no `.tinio`
+  # of its own.
   # The discriminator is a signed write: read-write answers NoSuchBucket from the bucket
   # check, read-only refuses before it. The credentials are the harness's, pinned on the child
   # because a first start *generates* a random `[auth]` pair (`the child holds the harness's
@@ -147,7 +149,7 @@ Feature: Read-only mode
     Then the response status is 200
     And the object body is "hello"
     And the run reports serving read-only on the endpoint it bound
-    And the relocated state dir holds the state database
+    And the relocated state dir holds no state database
     And the root holds no state directory
     And its stdout is the readiness frame alone
 
@@ -244,12 +246,16 @@ Feature: Read-only mode
     And its stderr names the missing root
     And the missing root was not created
 
-  # Decision 15: the in-root meta database is not read. The read-write run proves the tag exists
-  # and is visible on the wire (`planted-key`), which is what makes the read-only run's empty
-  # view a fact about the mode rather than about a fixture nothing wrote; the object the tag
-  # belonged to still serves.
+  # FR-023 amended (design 2026-10-03, Read paths): the in-root meta database **is read**,
+  # read-only. The read-write run proves the planted metadata exists and is visible on the wire
+  # (tags, the object's public-read ACL, the bucket's CORS rule); the read-only run then serves
+  # all three from the root's own `.tinio/meta.redb`, which is the amendment's core claim —
+  # history, tags, ACLs and CORS are readable in this mode rather than lost. The object still
+  # serves from its file, and the root is untouched by the run that read it: the entries
+  # recorded after the read-write run (its own `.tinio` included) are the entries found after
+  # the read-only one.
   @cli @FR-023
-  Scenario: The in-root meta database is not read
+  Scenario: The in-root meta database is read, read-only
     Given a storage root
     And the root holds bucket "data" with object "a.txt" and body "hello"
     And the child holds the harness's credentials
@@ -262,7 +268,42 @@ Feature: Read-only mode
     When I send a "GET" request to "/data?tagging" signed as "root"
     Then the response status is 200
     And the response body contains "planted-key"
+    When I send a "PUT" request to "/data/a.txt?acl" signed as "root" with headers
+      | x-amz-acl   | public-read            |
+      | Content-MD5 | 1B2M2Y8AsgTpgAmY7PhCfg== |
+    Then the response status is 200
+    When I send a "PUT" request to "/data?cors" signed as "root" with headers and body "<CORSConfiguration><CORSRule><ID>planted-cors</ID><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>"
+      | Content-Type | application/xml |
+      | Content-MD5  | AAAAAAAAAAAAAAAAAAAAAA== |
+    Then the response status is 200
     When I stop the server through its control channel
+    And the run ends
+    When the served root's entries are recorded
+    When I run "tinio server {root} --port 0 --read-only"
+    And the client is bound to the run's endpoint
+    When I send a "GET" request to "/data/a.txt" signed as "root"
+    Then the response status is 200
+    And the object body is "hello"
+    When I send a "GET" request to "/data?tagging" signed as "root"
+    Then the response status is 200
+    And the response body contains "planted-key"
+    When I send a "GET" request to "/data/a.txt?acl" signed as "root"
+    Then the response status is 200
+    And the response body contains "<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>"
+    And the response body contains "<Permission>READ</Permission>"
+    When I send a "GET" request to "/data?cors" signed as "root"
+    Then the response status is 200
+    And the response body contains "<ID>planted-cors</ID>"
+    And the served root holds the entries it recorded
+
+  # The amendment's degrade path, on the wire: a root whose `.tinio/` cannot be read (here it is
+  # absent) is not an error — current versions serve from their files with an empty metadata view
+  # — and the run still refuses every write and creates nothing under the root.
+  @cli @FR-023
+  Scenario: A root with no in-root database serves with an empty metadata view
+    Given a storage root
+    And the root holds bucket "data" with object "a.txt" and body "hello"
+    And the child holds the harness's credentials
     When I run "tinio server {root} --port 0 --read-only"
     And the client is bound to the run's endpoint
     When I send a "GET" request to "/data/a.txt" signed as "root"
@@ -271,3 +312,9 @@ Feature: Read-only mode
     When I send a "GET" request to "/data?tagging" signed as "root"
     Then the response status is 200
     And the response body does not contain "<Tag>"
+    When I send a "PUT" request to "/data?tagging" signed as "root" with headers and body "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>"
+      | Content-Type | application/xml |
+      | Content-MD5  | AAAAAAAAAAAAAAAAAAAAAA== |
+    Then the response status is 403
+    And the error code is "AccessDenied"
+    And the root holds no state directory

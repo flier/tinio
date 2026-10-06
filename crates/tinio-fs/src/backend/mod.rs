@@ -128,14 +128,23 @@ pub struct FsOptions {
     #[garde(skip)]
     pub follow_symlinks: bool,
     /// State-dir override: where the private state lives. `None` (default)
-    /// = `<root>/.tinio/`; read-only mode relocates it to
-    /// `~/.tinio/roots/<sha256(canonical root)16>/` (FR-023).
+    /// = `<root>/.tinio/`.
+    ///
+    /// **Read-only mode does not use this option** (FR-023 amended): the
+    /// storage's one state dir there is the root's own `<root>/.tinio/`,
+    /// opened read-only — the metadata source is the root's own database.
+    /// The value a read-only caller carries is its own tool state (the
+    /// CLI's relocated socket/`state`/log directory), which the storage
+    /// never holds — and naming one **inside the root** is refused as it
+    /// always was, because the tool state is what a run writes and the
+    /// mode promises the root is never written.
     #[garde(skip)]
     pub state_dir: Option<PathBuf>,
     /// The plane's write policy (FR-023; see [`AccessMode`]). Read-only
-    /// mode never writes the storage root, so it requires an explicit
-    /// out-of-root `state_dir`: the default `<root>/.tinio/` would write
-    /// the root.
+    /// mode writes nothing through the storage: the root's own
+    /// `<root>/.tinio/` database is read read-only, every mutating
+    /// operation is refused upstream, and the scanner and sweeper are not
+    /// run.
     #[garde(skip)]
     pub access: AccessMode,
     /// Compact trigger: the fragmentation percentage at which the state
@@ -375,25 +384,30 @@ impl FsStorage {
     /// directory.
     pub fn new(root: impl Into<PathBuf>, options: FsOptions) -> Result<Self, Error> {
         let (canonical, state_dir, options) = Self::resolve(root.into(), options)?;
-        // Compact strictly before sharing: `Database::compact` needs
-        // `&mut`, and once wrapped in `Arc<Handle>` the mutable
-        // reference is structurally impossible.
-        let database::Open {
-            mut db,
-            compact_needed,
-            stats,
-            ..
-        } = database::open(&state_dir)?;
-        // The outcome is reported, not discarded: an operator seeing
-        // repeated `Compacted`/`Unchanged` rounds can tune the threshold.
-        let compaction = compact_if_needed(
-            &mut db,
-            compact_needed,
-            stats,
-            options.compact_threshold_percent,
-        )?;
-        tracing::info!(?compaction, "startup state-database compaction");
-        Self::from_resolved(canonical, state_dir, options, db)
+        let handle = if options.access.is_read_only() {
+            Self::read_only_source(&state_dir)?
+        } else {
+            // Compact strictly before sharing: `Database::compact` needs
+            // `&mut`, and once wrapped in `Arc<Handle>` the mutable
+            // reference is structurally impossible.
+            let database::Open {
+                mut db,
+                compact_needed,
+                stats,
+                ..
+            } = database::open(&state_dir)?;
+            // The outcome is reported, not discarded: an operator seeing
+            // repeated `Compacted`/`Unchanged` rounds can tune the threshold.
+            let compaction = compact_if_needed(
+                &mut db,
+                compact_needed,
+                stats,
+                options.compact_threshold_percent,
+            )?;
+            tracing::info!(?compaction, "startup state-database compaction");
+            Handle::new(db)
+        };
+        Self::from_resolved(canonical, state_dir, options, handle)
     }
 
     /// Construct the backend over `root` from an **already-opened** state
@@ -401,13 +415,55 @@ impl FsStorage {
     /// with the exclusive handle) → `new_from_db`. The database handle is
     /// wrapped once and shared by every store. The server startup and
     /// doctor orchestration (T068/T073/T074) use this path explicitly.
+    ///
+    /// **In read-only mode the passed handle is not the storage's metadata
+    /// source** (FR-023 amended): a read-only storage reads the root's own
+    /// database, so the caller's database is dropped here (releasing its
+    /// lock) and the root's own is opened read-only under `resolve`'s
+    /// rule — the same call [`FsStorage::new`] makes, so the two paths
+    /// cannot disagree. That is what keeps `doctor`, which opens its store
+    /// at the **tool-state** dir and hands it here, from answering the
+    /// metadata legs out of a database that is not the root's (or from
+    /// leaving a second database behind for this path to use).
+    ///
+    /// A read-write caller keeps its handle, exactly as before.
     pub fn new_from_db(
         root: impl Into<PathBuf>,
         options: FsOptions,
         db: redb::Database,
     ) -> Result<Self, Error> {
         let (canonical, state_dir, options) = Self::resolve(root.into(), options)?;
-        Self::from_resolved(canonical, state_dir, options, db)
+        if options.access.is_read_only() {
+            drop(db);
+            let handle = Self::read_only_source(&state_dir)?;
+            return Self::from_resolved(canonical, state_dir, options, handle);
+        }
+        Self::from_resolved(canonical, state_dir, options, Handle::new(db))
+    }
+
+    /// The read-only run's metadata source: the root's own database, opened
+    /// read-only, or the degraded empty view when that fails — the reason
+    /// is reported (`tracing::warn!`, the one user-visible carrier of the
+    /// degrade). The **one** construction of the read-only arm, shared by
+    /// [`FsStorage::new`] and [`FsStorage::new_from_db`], so no path can
+    /// read a database the other would not.
+    fn read_only_source(state_dir: &Path) -> Result<Arc<Handle>, Error> {
+        match Handle::open_read_only(state_dir) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                // A failure — no database, a corrupt one, a format this
+                // build refuses, or a read-write server holding the same
+                // root — is the **degrade path**, not a construction
+                // failure: objects keep serving from their files with an
+                // empty metadata view.
+                tracing::warn!(
+                    error = %err,
+                    state_dir = %state_dir.display(),
+                    "the root's metadata database could not be read read-only; serving objects with an empty metadata view"
+                );
+                Ok(Handle::empty()?)
+            }
+        }
     }
 
     /// Hold `name`'s directory-mutation lock so a concurrent write's
@@ -495,11 +551,6 @@ impl FsStorage {
 
     fn resolve(root: PathBuf, options: FsOptions) -> Result<(PathBuf, PathBuf, FsOptions), Error> {
         options.validate().map_err(invalid_value)?;
-        if options.access.is_read_only() && options.state_dir.is_none() {
-            return Err(invalid_state_dir(
-                "required in read-only mode (the default `<root>/.tinio` would write the root)",
-            ));
-        }
         // The helper accepts its fallback only for a directory, which is the one
         // fact this function went looking for; the check below is what reports a
         // root that is not there, fallback or not.
@@ -507,20 +558,32 @@ impl FsStorage {
         if !canonical.is_dir() {
             return Err(root_not_directory(canonical));
         }
-        // Read-only mode also refuses an explicit state dir inside the
-        // storage root: such a caller silently writes the very tree the
-        // mode promises to leave alone, and a writable root would never
-        // complain.
+        // **Read-only mode has exactly one metadata source: the root's own
+        // `<root>/.tinio`** (FR-023 amended, design 2026-10-03 **Read
+        // paths**). The rows a read-write run wrote live there — objects,
+        // tags, ACLs, CORS, the version index — so that is what a read-only
+        // run reads, opened read-only, and nothing is created: the open's
+        // failure is the degrade path (`FsStorage::new` serves objects from
+        // their files with an empty metadata view).
         //
-        // The rule itself is `tinio-util`'s `contains_under_any_spelling` —
-        // the one definer, shared with the server launcher's exposure set
-        // (design §9/§10), which asks the same question about the same two
-        // paths one process earlier — and it compares both spellings of
-        // either side. It is deliberately not spelled here: this guard
-        // carried its own copy once, and a second copy of a case-folding
-        // rule is how the other owner ends up comparing components
-        // literally — an in-root state dir in another case reading as
-        // outside (FR-023, decision 17a).
+        // The configured `state_dir` is deliberately **not** used in this
+        // mode: it is the caller's tool state (the CLI's socket, `state`
+        // file and logs, resolved by `resolve_state_dir`), the storage
+        // never holds it, and a read-only run writes nothing through the
+        // storage at all (every mutating operation is refused upstream,
+        // and the scanner and the sweeper are not run).
+        //
+        // **It is still refused inside the root**, as it always was: a
+        // caller that names an in-root state dir is pointing the run's
+        // tool state — the files a run *writes* — into the very tree the
+        // mode promises to leave alone, and a writable root would never
+        // complain. The rule itself is `tinio-util`'s
+        // `contains_under_any_spelling` (the one definer, shared with the
+        // server launcher's exposure set and `tinio-config`'s config
+        // write), and it compares both spellings of either side — a
+        // second copy of a case-folding rule is how the other owner ends
+        // up comparing components literally, an in-root state dir in
+        // another case reading as outside (FR-023, decision 17a).
         if options.access.is_read_only()
             && let Some(dir) = options.state_dir.as_deref()
         {
@@ -532,9 +595,16 @@ impl FsStorage {
                 ));
             }
         }
-        let state_dir = match options.state_dir {
-            Some(ref dir) => dir.clone(),
-            None => state_dir(&canonical)?,
+        // One tail, two rules: a read-only run's storage dir is always the
+        // root's own (the configured one is ignored by design); otherwise
+        // the configured dir wins and the root's own is the fallback.
+        let state_dir = if options.access.is_read_only() {
+            state_dir(&canonical)?
+        } else {
+            match options.state_dir {
+                Some(ref dir) => dir.clone(),
+                None => state_dir(&canonical)?,
+            }
         };
         Ok((canonical, state_dir, options))
     }
@@ -543,7 +613,7 @@ impl FsStorage {
         canonical: PathBuf,
         state_dir: PathBuf,
         options: FsOptions,
-        db: redb::Database,
+        handle: Arc<Handle>,
     ) -> Result<Self, Error> {
         let FsOptions {
             follow_symlinks,
@@ -557,7 +627,6 @@ impl FsStorage {
             remove_pipeline,
             db_pipeline,
         } = options;
-        let handle = Handle::new(db);
 
         Ok(Self {
             follow_symlinks,

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use redb::ReadableDatabase;
+use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
 use tokio::{fs, time};
 
 use super::*;
@@ -114,39 +114,234 @@ async fn read_only_state_relocation_keeps_root_clean() {
     assert!(!root.path().join(".tinio").exists());
 }
 
-#[test]
-fn read_only_requires_an_explicit_state_dir() {
-    // FR-023 (decision 13): read-only with no state dir would silently
-    // create `<root>/.tinio` — the write the mode promises never to make —
-    // so construction refuses it. The check precedes `canonicalize`, so it
-    // answers `InvalidValue` even for a root that does not exist.
+/// The read-only read-path fixture both tests below share: a root whose
+/// read-write run created bucket `data` with `notes.txt` = `"hello"` and a
+/// planted tag, then released the root's database — redb refuses a
+/// read-only open concurrent with a `Database`, so the writer is gone
+/// before the caller's read-only run starts. The tempdir is returned to
+/// hold the root for the caller's storage.
+async fn planted_read_only_root() -> (tempfile::TempDir, Name, object::Key, object::Tags) {
     let root = tempfile::tempdir().unwrap();
-    for missing in [false, true] {
-        let root = if missing {
-            root.path().join("missing")
-        } else {
-            root.path().to_path_buf()
-        };
-        let err = FsStorage::new(
-            &root,
+    let b = name("data").unwrap();
+    let key: object::Key = "notes.txt".into();
+    let tags = object::Tags::from_pairs([("planted".to_owned(), "yes".to_owned())]).unwrap();
+    {
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        storage.put_object(&b, &key, body(b"hello")).await.unwrap();
+        storage.put_object_tags(&b, &key, &tags).await.unwrap();
+    }
+    (root, b, key, tags)
+}
+
+/// FR-023 amended (design 2026-10-03, **Read paths**): a read-only run
+/// reads the root's **own** `.tinio/meta.redb`, opened read-only — so the
+/// metadata a read-write run wrote (here an object's tag) is *served*,
+/// and the object still serves from its file. This is the amendment's
+/// core claim: history, tags, ACLs and CORS are readable in this mode
+/// rather than lost.
+#[tokio::test]
+async fn a_read_only_store_serves_the_metadata_a_read_write_run_wrote() {
+    let (root, b, key, tags) = planted_read_only_root().await;
+
+    // The read-only run over the same root.
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        storage.state_dir(),
+        storage.root().join(".tinio").as_path(),
+        "a read-only storage reads the root's own state dir"
+    );
+
+    let read = storage.get_object(&b, &key, None).await.unwrap();
+    assert_eq!(read.info.size, 5, "the object's row is served");
+    assert_eq!(read_body(read.body).await.unwrap(), b"hello");
+    let served = storage.get_object_tags(&b, &key).await.unwrap();
+    assert_eq!(
+        served, tags,
+        "the tag a read-write run wrote is served by the read-only run"
+    );
+}
+
+/// FR-023 amended: the `new_from_db` orchestration path must read the
+/// **root's** database in a read-only run, never the caller's handle.
+///
+/// `doctor` opens (and, on `--fix`, creates) its store at the **tool-state**
+/// dir and hands it to [`FsStorage::new_from_db`]; before this rule that
+/// handle became the storage's metadata source, so the metadata legs of a
+/// read-only doctor run answered from a database that is not the root's.
+/// The fix drops the caller's handle and opens the root's own read-only —
+/// the same source [`FsStorage::new`] uses — and this path creates no
+/// database of its own in the caller's directory.
+#[tokio::test]
+async fn new_from_db_in_read_only_mode_reads_the_roots_database() {
+    let (root, b, key, tags) = planted_read_only_root().await;
+    let tool = tempfile::tempdir().unwrap();
+
+    // (a) The caller's handle in doctor's shape: a store at the tool-state
+    // dir. The tag exists only in the **root's** database, so serving it is
+    // the proof that the root's database is the metadata source on this
+    // path.
+    let caller_state = tool.path().join("state");
+    let caller = database::open(&caller_state).unwrap().db;
+    let storage = FsStorage::new_from_db(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            state_dir: Some(caller_state),
+            ..fs_options()
+        },
+        caller,
+    )
+    .unwrap();
+    assert_eq!(
+        storage.get_object_tags(&b, &key).await.unwrap(),
+        tags,
+        "the metadata comes from the root's database, not the caller's"
+    );
+    assert_eq!(
+        storage.state_dir(),
+        storage.root().join(".tinio").as_path(),
+        "the storage's one state dir is the root's own"
+    );
+
+    // (b) This path creates no database of its own: a caller whose handle
+    // is in memory leaves the tool-state dir untouched.
+    let fresh = tool.path().join("fresh");
+    let caller = Database::builder()
+        .create_with_backend(InMemoryBackend::new())
+        .unwrap();
+    let storage = FsStorage::new_from_db(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            state_dir: Some(fresh.clone()),
+            ..fs_options()
+        },
+        caller,
+    )
+    .unwrap();
+    assert_eq!(storage.get_object_tags(&b, &key).await.unwrap(), tags);
+    assert!(!fresh.exists(), "the path created `{}`", fresh.display());
+}
+
+/// FR-023 amended: a root with objects but **no** `.tinio/` cannot be
+/// read as a metadata source. The read-only open fails, the run degrades
+/// to today's shape — objects serve from their files, every metadata read
+/// answers empty — and the failure is what the open's `tracing::warn!`
+/// reports (the reason's one user-visible carrier).
+#[tokio::test]
+async fn a_read_only_store_over_a_root_with_no_database_degrades_to_an_empty_view() {
+    let root = tempfile::tempdir().unwrap();
+    // Objects with no database at all: this root was never opened
+    // read-write (the `@fs @read-only` fixture's shape).
+    fs::create_dir(root.path().join("data")).await.unwrap();
+    fs::write(root.path().join("data/a.txt"), b"hello")
+        .await
+        .unwrap();
+    let b = name("data").unwrap();
+    let key: object::Key = "a.txt".into();
+
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+
+    // The object serves from its file...
+    let read = storage.get_object(&b, &key, None).await.unwrap();
+    assert_eq!(read.info.size, 5);
+    assert_eq!(read_body(read.body).await.unwrap(), b"hello");
+    // ...and the metadata view is empty (the degrade's observable).
+    assert!(
+        storage.get_object_tags(&b, &key).await.unwrap().is_empty(),
+        "a degraded run serves no metadata"
+    );
+    // A read-only run writes nothing under the root — not even the
+    // `.tinio/` whose absence degraded it.
+    assert!(
+        !root.path().join(".tinio").exists(),
+        "the degraded read-only run must not create the state dir"
+    );
+}
+
+/// FR-023 amended: read-only mode's storage state dir is the **root's
+/// own** `.tinio/` — with no state dir configured, with one outside the
+/// root, and with one inside it alike — because that is where the rows a
+/// read-write run wrote live. The configured value is the caller's tool
+/// state and is not the storage's in this mode.
+///
+/// **Nothing is created** — neither the root's own `.tinio/` (the run
+/// opens it read-only, and a root with none degrades: the tests above),
+/// nor the configured directory the storage does not use.
+#[tokio::test]
+async fn read_only_uses_the_roots_own_state_dir_whatever_is_configured() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    // A bucket with one object and no database: the degrade's observable
+    // is the served file beside the empty metadata view.
+    fs::create_dir(root.path().join("data")).await.unwrap();
+    fs::write(root.path().join("data/a.txt"), b"hello")
+        .await
+        .unwrap();
+    let b = name("data").unwrap();
+    let key: object::Key = "a.txt".into();
+    for configured in [None, Some(home.path().join("relocated"))] {
+        let storage = FsStorage::new(
+            root.path(),
             FsOptions {
                 access: AccessMode::ReadOnly,
+                state_dir: configured,
                 ..fs_options()
             },
         )
-        .unwrap_err();
-        assert!(matches!(err, Error::InvalidValue(_)), "{err:?}");
-        assert!(err.to_string().contains("state_dir"), "{err}");
+        .unwrap();
+        assert_eq!(
+            storage.state_dir(),
+            storage.root().join(".tinio").as_path(),
+            "the storage's one state dir is the root's own in read-only mode"
+        );
+        assert_eq!(
+            read_body(storage.get_object(&b, &key, None).await.unwrap().body)
+                .await
+                .unwrap(),
+            b"hello",
+            "this root holds no database, so the run degrades: the file serves"
+        );
+        assert!(
+            storage.get_object_tags(&b, &key).await.unwrap().is_empty(),
+            "and the degraded metadata view answers empty"
+        );
     }
+    assert!(
+        !root.path().join(".tinio").exists(),
+        "the read-only runs created nothing under the root"
+    );
+    assert!(
+        !home.path().join("relocated").exists(),
+        "nor the out-of-root one: the storage never holds the tool state"
+    );
 }
 
+/// The old in-root refusal survives the amendment, and now for the
+/// reason the amendment makes exact: the configured state dir is the
+/// caller's **tool state** — the files a run *writes* — so a read-only
+/// run that names one inside the served root would write the very tree
+/// the mode promises to leave alone, whatever the storage reads.
 #[test]
 fn read_only_refuses_an_in_root_state_dir() {
-    // FR-023 (decision 17a): an explicit state dir inside the storage root
-    // writes the very tree the mode promises to leave alone — and a
-    // writable root would never complain — so construction refuses it. A
-    // state dir outside the root is accepted (the check is not a blanket
-    // refusal).
     let root = tempfile::tempdir().unwrap();
     let err = FsStorage::new(
         root.path(),
@@ -203,8 +398,8 @@ fn read_only_refuses_an_in_root_state_dir() {
     // does**, and here that judgement is the accepted one: the resolution lands
     // beside the root rather than inside it, so non-existence decides nothing on
     // its own. This is read-only mode's ordinary input — the directory is the
-    // constructor's to create — and the leg below is the refusal it must not
-    // lose by making existence a condition.
+    // run's tool state, which the serving half creates — and the leg below is
+    // the refusal it must not lose by making existence a condition.
     let home = tempfile::tempdir().unwrap();
     let absent = home.path().join("state");
     assert!(!absent.exists());
@@ -223,15 +418,15 @@ fn read_only_refuses_an_in_root_state_dir() {
 /// hole a literal comparison leaves open, and the shape macOS hands the guard for
 /// free: `tempfile` answers `$TMPDIR` as `/var/folders/…` while construction
 /// canonicalizes the root to `/private/var/folders/…`, so the two agree on no
-/// prefix at all, the guard passes, and read-only mode writes its whole state tree
-/// inside the tree it promises to leave alone. The explicit symlink is what makes
-/// the pair deterministic on every unix host rather than only where the temp
+/// prefix at all, the guard passes, and a read-only run's tool state writes
+/// inside the tree the mode promises to leave alone. The explicit symlink is what
+/// makes the pair deterministic on every unix host rather than only where the temp
 /// directory happens to sit behind a link, and the `path_contains` assertion below
 /// is what keeps the leg from passing vacuously: the literal comparison really does
 /// answer `false` for this pair.
 ///
 /// **Both halves of the state directory's existence are refused**, because the
-/// guard runs before read-only mode creates anything and the refusal cannot be a
+/// guard runs before anything creates the tool state and the refusal cannot be a
 /// question about a directory that is not there yet. The resolution walks to the
 /// nearest existing ancestor — the link, which is the one component that does exist
 /// — and rejoins what is below it, so the absent leaf and the present one are the

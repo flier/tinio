@@ -37,7 +37,7 @@ mod tests;
 pub use compact::{Compaction, Stats, compact_if_needed, needs_compact};
 pub use error::Error;
 pub use handle::{Handle, WriteLockSnapshot};
-pub use open::{Integrity, Open, check_integrity, open};
+pub use open::{Integrity, Open, check_integrity, open, open_read_only};
 pub(crate) use tables::for_bucket_strict;
 
 #[cfg(test)]

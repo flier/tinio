@@ -237,13 +237,16 @@ impl<'a> MetaBatchAccumulator<'a> {
 ///     create_dir(root.path().join("data/dir")).unwrap();
 ///     write(root.path().join("data/dir/b.txt"), b"b").unwrap();
 ///     let page = listing
-///         .list(&ListObjectsParams {
-///             bucket: b,
-///             prefix: String::new(),
-///             delimiter: Some("/".into()),
-///             start_after: None,
-///             max_keys: 1000,
-///         })
+///         .list(
+///             &ListObjectsParams {
+///                 bucket: b,
+///                 prefix: String::new(),
+///                 delimiter: Some("/".into()),
+///                 start_after: None,
+///                 max_keys: 1000,
+///             },
+///             false,
+///         )
 ///         .await
 ///         .unwrap();
 ///     assert_eq!(page.objects.len(), 1);
@@ -338,7 +341,16 @@ impl FsListing {
     /// The page is selected incrementally during the walk (the bounded
     /// [`UnorderedPager`] — P01): only the `max_keys + 1` smallest
     /// entries are held, never a full-bucket collect and sort.
-    pub async fn list(&self, params: &ListObjectsParams) -> Result<ObjectListing, Error> {
+    ///
+    /// `records_versions` is the bucket's versioning state, resolved by
+    /// the caller (the storage's `list_objects`, whose `Info` carrier the
+    /// server reads): the listing engine answers no version identity of
+    /// its own, so the flag is threaded rather than looked up here.
+    pub async fn list(
+        &self,
+        params: &ListObjectsParams,
+        records_versions: bool,
+    ) -> Result<ObjectListing, Error> {
         // The engine's empty-page contract, answered after the bucket
         // existence check (the walk's own await) but before the tree
         // walk: a `max_keys = 0` request never pays the full-bucket stat
@@ -496,9 +508,17 @@ impl FsListing {
             batches.push(done);
         }
         // Q2: the final drain — every enqueued batch commits before the
-        // page is answered.
+        // page is answered. **A read-only handle's refusal is not a
+        // listing failure** (FR-023 amended, design 2026-10-03 **Read
+        // paths**): the recomputed ETags are already in `results`, and
+        // that mode's read "is simply not written back". Every other
+        // failure keeps the existing semantics — it fails the listing.
         for done in batches {
-            done.await??;
+            match done.await? {
+                Ok(()) => {}
+                Err(err) if err.is_read_only() => {}
+                Err(err) => return Err(err),
+            }
         }
         // The page entries in page (key) order — the index-aligned
         // assembly replaces the old HashMap + `sort_by` (item 3: page
@@ -521,6 +541,7 @@ impl FsListing {
                     owner: owner.clone(),
                     acl: acl.clone(),
                     version_id: None,
+                    bucket_records_versions: records_versions,
                 });
             }
         }
@@ -962,7 +983,7 @@ mod tests {
         let (_, _, listing, _) = fixture();
         let missing = bucket::name("ghost").unwrap();
         let err = listing
-            .list(&params(&missing, "", None, None, 1000))
+            .list(&params(&missing, "", None, None, 1000), false)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
@@ -980,7 +1001,7 @@ mod tests {
         )
         .unwrap();
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         let keys: Vec<&str> = page
@@ -1000,7 +1021,7 @@ mod tests {
         // the walk would descend forever.
         symlink(".", root.path().join("data/loop")).unwrap();
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         let keys: Vec<&str> = page
@@ -1028,14 +1049,14 @@ mod tests {
             .unwrap();
             let no_link = listing(root.path(), meta::store(state.path()).unwrap(), false);
             let page = no_link
-                .list(&params(&b, "", None, None, 1000))
+                .list(&params(&b, "", None, None, 1000), false)
                 .await
                 .unwrap();
             assert!(!page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
             drop(no_link);
             let with_link = listing(root.path(), meta::store(state.path()).unwrap(), true);
             let page = with_link
-                .list(&params(&b, "", None, None, 1000))
+                .list(&params(&b, "", None, None, 1000), false)
                 .await
                 .unwrap();
             assert!(page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
@@ -1054,7 +1075,7 @@ mod tests {
         let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
         let b = bucket::name("data").unwrap();
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         let keys: Vec<&str> = page
@@ -1202,7 +1223,7 @@ mod tests {
         let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
         let b = bucket::name("data").unwrap();
         let err = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
@@ -1215,7 +1236,7 @@ mod tests {
         symlink(root.path().join("data/dir"), root.path().join("data/link1")).unwrap();
         symlink(root.path().join("data/dir"), root.path().join("data/link2")).unwrap();
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         let keys: Vec<&str> = page
@@ -1279,7 +1300,7 @@ mod tests {
                 DEFAULT_META_BATCH_BYTES,
             );
             let page = listing
-                .list(&params(&b, "", None, None, 1000))
+                .list(&params(&b, "", None, None, 1000), false)
                 .await
                 .unwrap();
             assert_eq!(page.objects.len(), 5);
@@ -1310,14 +1331,14 @@ mod tests {
             DEFAULT_META_BATCH_BYTES,
         );
         listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(io.enqueued(), 3);
         assert_eq!(db.enqueued(), 3);
 
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(page.objects.len(), 3);
@@ -1343,7 +1364,10 @@ mod tests {
             1,
             DEFAULT_META_BATCH_BYTES,
         );
-        let page = listing.list(&params(&b, "", None, None, 1)).await.unwrap();
+        let page = listing
+            .list(&params(&b, "", None, None, 1), false)
+            .await
+            .unwrap();
         assert_eq!(page.objects.len(), 1);
         assert_eq!(io.enqueued(), 1, "only the emitted page is enqueued (P3)");
         assert_eq!(db.enqueued(), 1);
@@ -1352,7 +1376,7 @@ mod tests {
         // The second page rolls over with its own single enqueue.
         let resume = page.next_start_after.unwrap();
         listing
-            .list(&params(&b, "", None, Some(&resume), 1))
+            .list(&params(&b, "", None, Some(&resume), 1), false)
             .await
             .unwrap();
         assert_eq!(io.enqueued(), 2);
@@ -1373,7 +1397,7 @@ mod tests {
             DEFAULT_META_BATCH_BYTES,
         );
         listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(
@@ -1396,7 +1420,7 @@ mod tests {
             DEFAULT_META_BATCH_BYTES,
         );
         listing1
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(io1.max_in_run(), 1, "one worker serializes");
@@ -1418,7 +1442,7 @@ mod tests {
         );
         let started = Instant::now();
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -1452,8 +1476,11 @@ mod tests {
         );
         let listing2 = listing.clone();
         let b2 = b.clone();
-        let page =
-            tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 1000)).await });
+        let page = tokio::spawn(async move {
+            listing2
+                .list(&params(&b2, "", None, None, 1000), false)
+                .await
+        });
         wait_for(|| io.enqueued() == 1).await;
         // The walk is done (the task is parked); delete the file in
         // the walk-to-hash window.
@@ -1491,8 +1518,11 @@ mod tests {
         );
         let listing2 = listing.clone();
         let b2 = b.clone();
-        let page =
-            tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 1000)).await });
+        let page = tokio::spawn(async move {
+            listing2
+                .list(&params(&b2, "", None, None, 1000), false)
+                .await
+        });
         wait_for(|| io.enqueued() == 1).await;
         let path = root.path().join("data/f00.txt");
         fs::remove_file(&path).await.unwrap();
@@ -1519,7 +1549,7 @@ mod tests {
             DEFAULT_META_BATCH_BYTES,
         );
         let err = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap_err();
         assert!(
@@ -1539,7 +1569,7 @@ mod tests {
             DEFAULT_META_BATCH_BYTES,
         );
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(page.objects.len(), 2);
@@ -1573,7 +1603,7 @@ mod tests {
         let now = fs::metadata(&file).await.unwrap();
         let listing = listing(root.path(), store.clone(), true);
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(page.objects[0].etag, composed);
@@ -1594,7 +1624,7 @@ mod tests {
         let file = root.path().join("data/f00.txt");
         let listing = listing(root.path(), store.clone(), true);
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 0"));
@@ -1607,7 +1637,7 @@ mod tests {
         drop(handle);
         fs::rename(&replacement, &file).await.unwrap();
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 9"));
@@ -1638,7 +1668,9 @@ mod tests {
         let listing2 = listing.clone();
         let b2 = b.clone();
         let page =
-            tokio::spawn(async move { listing2.list(&params(&b2, "", None, None, 2)).await });
+            tokio::spawn(
+                async move { listing2.list(&params(&b2, "", None, None, 2), false).await },
+            );
         wait_for(|| io.enqueued() == 2).await;
         // Delete every file in the walk-to-hash window.
         for i in 0..3 {
@@ -1684,7 +1716,7 @@ mod tests {
         let store = meta::store(state.path()).unwrap();
         let listing = listing(root.path(), store.clone(), true);
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         assert_eq!(page.objects.len(), 1);
@@ -1766,7 +1798,7 @@ mod tests {
         link_directory(&root.path().join("data"), &root.path().join("data/cycle"));
         let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
         let page = listing
-            .list(&params(&b, "", None, None, 1000))
+            .list(&params(&b, "", None, None, 1000), false)
             .await
             .unwrap();
         let keys: Vec<&str> = page

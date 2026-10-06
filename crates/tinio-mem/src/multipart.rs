@@ -385,7 +385,7 @@ impl MultipartOps for MemoryStorage {
                     decode_acl_wire(&acl_wire),
                 )
             };
-            let (data, etag, now, version_id, history_bytes) = {
+            let (data, etag, now, version_id, history_bytes, records_versions) = {
                 // The retained OBJECT_PARTS rows: each listed part's size and
                 // its stored checksum row (written by upload_part in the same
                 // transaction as the part row), in part order — joined in
@@ -512,10 +512,10 @@ impl MultipartOps for MemoryStorage {
                 // while a superseded null's row occupies 0) for a suspended
                 // one, nothing at all for an unversioned bucket.
                 #[cfg(feature = "versioning")]
-                let (version_id, version_seq, history_bytes) =
+                let (version_id, version_seq, history_bytes, records_versions) =
                     prepare_publish(txn, bucket, key, now)?;
                 #[cfg(not(feature = "versioning"))]
-                let history_bytes = 0i64;
+                let (history_bytes, records_versions) = (0i64, false);
                 // The object row: the completion's tags and the
                 // interface-computed composite checksum ride in the same
                 // transaction as the object bytes (the backend never hashes).
@@ -584,7 +584,14 @@ impl MultipartOps for MemoryStorage {
                         parts_table.put(b, k, &part)?;
                     }
                 }
-                (data, etag, now, stored.version_id, history_bytes)
+                (
+                    data,
+                    etag,
+                    now,
+                    stored.version_id,
+                    history_bytes,
+                    records_versions,
+                )
             };
             // The assembled object replaces the parts byte-for-byte (the
             // tracked total is unchanged), but the per-object limit still
@@ -604,6 +611,7 @@ impl MultipartOps for MemoryStorage {
                 owner,
                 acl,
                 version_id,
+                bucket_records_versions: records_versions,
             })
         })
     }

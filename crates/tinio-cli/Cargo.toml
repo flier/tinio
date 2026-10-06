@@ -66,11 +66,12 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [features]
-default = ["api", "mem", "sandbox"]
+default = ["api", "mem", "sandbox", "versioning"]
 api = ["dep:tinio-api"]
 mem = ["dep:tinio-mem"]
 sandbox = ["api"]
 tls = ["api", "tinio-api/tls"]
+versioning = ["tinio-server/versioning"]
 
 [lints.clippy]
 absolute_paths = "warn"

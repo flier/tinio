@@ -50,7 +50,7 @@ Loop shape:
 ## 5. Lifecycle and modes
 
 - **Default on**: the auto-created config includes the `[scanner]` section. Section omitted → scanner off; listings fall back to synchronous recompute (correct, possibly slow on cold trees).
-- **Read-only mode**: runs too — meta writes land in the home state dir (`~/.tinio/roots/<sha256>/`), never in the root (FR-023).
+- **Read-only mode**: **disabled** (amended 2026-10-03) — the scanner writes derived metadata, and in read-only mode the storage's metadata source is the root's own `<root>/.tinio/meta.redb`, opened read-only; the relocated home state dir holds the run's tool state only (`~/.tinio/roots/<sha256>/` — socket, state file, logs), never the meta store (FR-023).
 - **Concurrency correctness**: object deletions/additions during a scan are safe by design — an entry whose object vanishes between stat and read is treated as an orphan and deleted; a new object appears in the next cycle (or the current one if reached later in the walk). Meta writes are atomic; a concurrent recompute and delete of the same entry resolve to either outcome, both consistent.
 
 ## 6. Boundaries with other modules

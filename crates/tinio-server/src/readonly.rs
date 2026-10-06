@@ -164,6 +164,13 @@ mod tests {
                 .build()
                 .expect("a probe input")
         };
+        (PutBucketVersioningInput) => {
+            dto::PutBucketVersioningInput::builder()
+                .bucket(String::new())
+                .versioning_configuration(Default::default())
+                .build()
+                .expect("a probe input")
+        };
         ($other:ident) => {
             dto::$other::default()
         };

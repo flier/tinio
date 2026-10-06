@@ -84,6 +84,11 @@ use std::{
 use fsutil::DirOwnerUid;
 use tokio::fs;
 
+// The feature-off `VersionOps` impl below is the only user, so the gate is
+// the import's too: the feature-on build (whose impl lives in `enabled`)
+// does not carry an unused import.
+#[cfg(not(feature = "versioning"))]
+use crate::_core::storage::VersionOps;
 use crate::{
     _core::{bucket::Name, object, to_nanos, version::Marker},
     _store::{Error as StoreError, version as rows},
@@ -126,7 +131,7 @@ pub(crate) fn stamp_superseded(
 /// (the refusal class for the nine, `Unversioned` for `bucket_versioning`),
 /// so there is nothing to write here and nothing to forget.
 #[cfg(not(feature = "versioning"))]
-impl crate::_core::storage::VersionOps for crate::FsStorage {}
+impl VersionOps for FsStorage {}
 
 /// The version branch's answer for a write that is about to publish content
 /// onto a key path: the identity the response carries and the sequence the
@@ -152,6 +157,12 @@ pub(crate) struct Plan {
     /// write's own state transaction stamps it (`Row::is_history`'s rule);
     /// `None` when no supersede ran.
     pub(crate) superseded: Option<u64>,
+    /// Whether the bucket records versions (state enabled or suspended) —
+    /// the state this plan resolved, carried so the committed
+    /// [`Info`](crate::_core::object::Info) reports the version-header rule
+    /// without a second read. `false` on an unversioned bucket, and in a
+    /// stripped build (the state machinery is not compiled in).
+    pub(crate) records_versions: bool,
 }
 
 /// One published write: the version branch's answer plus the landed file's
@@ -172,6 +183,9 @@ pub(crate) struct Published {
     pub(crate) mtime: SystemTime,
     /// The landed file's identity (`0` when the platform has none).
     pub(crate) identity: u64,
+    /// Whether the bucket records versions — the plan's answer, carried to
+    /// the committed [`Info`](crate::_core::object::Info).
+    pub(crate) records_versions: bool,
     /// The bucket mutation lock, held from before the version branch until
     /// this value is dropped: the caller keeps it alive while it writes the
     /// state row, so the branch, the rename and the stamp are one critical
@@ -196,7 +210,33 @@ impl FsStorage {
                 marker: Marker::none(),
                 seq: 0,
                 superseded: None,
+                records_versions: false,
             })
+        }
+    }
+
+    /// Whether the bucket records versions (state enabled or suspended) —
+    /// the producers' carrier for
+    /// [`Info::bucket_records_versions`](crate::_core::object::Info) on the
+    /// paths that resolve no write plan: one point read of the bucket
+    /// state, no bucket-existence check (every caller resolved the bucket
+    /// already). The feature off answers `false`: a stripped build answers
+    /// no version identity at all, exactly as its write plan does.
+    pub(crate) async fn records_versions(&self, bucket: &Name) -> Result<bool, Error> {
+        #[cfg(feature = "versioning")]
+        {
+            use crate::error::projected;
+            Ok(self
+                .versions(bucket)
+                .state(bucket)
+                .await
+                .map_err(projected)?
+                .records_versions())
+        }
+        #[cfg(not(feature = "versioning"))]
+        {
+            let _ = bucket;
+            Ok(false)
         }
     }
 
@@ -251,6 +291,7 @@ impl FsStorage {
             marker: plan.marker,
             seq: plan.seq,
             superseded: plan.superseded,
+            records_versions: plan.records_versions,
             size: metadata.len(),
             mtime: metadata.modified()?,
             identity: fsutil::file_identity(&target, &metadata),
@@ -282,12 +323,13 @@ mod enabled {
             acl::Acl,
             bucket::Name,
             from_nanos,
-            object::{self, Info, Tags},
+            object::{self, Tags},
             storage,
             storage::VersionOps,
             to_nanos,
             version::{
-                self, HeadResult, Id, ListParams, Listing, Marker, ReadResult, State, wire_of,
+                self, CurrentVersion, HeadResult, Id, ListParams, Listing, Marker, ReadResult,
+                State, wire_of,
             },
         },
         _store::{meta, object_part, version as rows, version_index},
@@ -414,6 +456,7 @@ mod enabled {
                     marker: Marker::none(),
                     seq: 0,
                     superseded: None,
+                    records_versions: false,
                 });
             }
             // The gated current slot with the row it was judged from (the
@@ -444,6 +487,7 @@ mod enabled {
                 // The committed row's sequence, which the caller's own state
                 // transaction stamps noncurrent with the rest of the publish.
                 superseded: plan.supersede.then_some(current.seq),
+                records_versions: state.records_versions(),
             })
         }
 
@@ -897,6 +941,11 @@ mod enabled {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(storage::no_such_key(key).into());
             }
+            // The version-addressed answer's `Info` reports the bucket's
+            // state too (the carrier the server reads for the identity
+            // rule): the resolution runs no write plan, so the state is
+            // read here — one point read per version-addressed read.
+            let records_versions = self.records_versions(bucket).await?;
             match self.locate(bucket, key, version).await? {
                 Found::Marker(stored) => Ok(ReadResult::Marker {
                     id: stored.version_id,
@@ -922,17 +971,14 @@ mod enabled {
                         .await?;
                     let (body, served_range) = FsStorage::object_body(file, size, range).await?;
                     Ok(ReadResult::Object(GetObjectResult {
-                        info: Info {
-                            key: key.clone(),
+                        info: FsStorage::info_of(
+                            key,
                             size,
-                            last_modified: mtime,
-                            etag: row.etag,
-                            tags: row.tags,
-                            checksum: row.checksum,
-                            owner: row.owner,
-                            acl: row.acl,
+                            mtime,
+                            row,
                             version_id,
-                        },
+                            records_versions,
+                        ),
                         body,
                         served_range,
                     }))
@@ -954,7 +1000,7 @@ mod enabled {
                         .await
                         .map_err(projected)?;
                     Ok(ReadResult::Object(GetObjectResult {
-                        info: row.info(key),
+                        info: row.info(key, records_versions),
                         body,
                         served_range,
                     }))
@@ -972,6 +1018,7 @@ mod enabled {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(storage::no_such_key(key).into());
             }
+            let records_versions = self.records_versions(bucket).await?;
             match self.locate(bucket, key, version).await? {
                 Found::Marker(stored) => Ok(HeadResult::Marker {
                     id: stored.version_id,
@@ -987,23 +1034,20 @@ mod enabled {
                     let (_file, size, mtime, row, version_id) = self
                         .serve_current(bucket, key, &path, stored.as_ref())
                         .await?;
-                    Ok(HeadResult::Object(Info {
-                        key: key.clone(),
+                    Ok(HeadResult::Object(FsStorage::info_of(
+                        key,
                         size,
-                        last_modified: mtime,
-                        etag: row.etag,
-                        tags: row.tags,
-                        checksum: row.checksum,
-                        owner: row.owner,
-                        acl: row.acl,
+                        mtime,
+                        row,
                         version_id,
-                    }))
+                        records_versions,
+                    )))
                 }
                 Found::Row(row) if row.kind == rows::Kind::Marker => Ok(HeadResult::Marker {
                     id: row.id(),
                     last_modified: from_nanos(row.created),
                 }),
-                Found::Row(row) => Ok(HeadResult::Object(row.info(key))),
+                Found::Row(row) => Ok(HeadResult::Object(row.info(key, records_versions))),
             }
         }
 
@@ -1072,6 +1116,33 @@ mod enabled {
                     })
                 }
             }
+        }
+
+        /// The bounded per-key probe behind the plain read's 404
+        /// disclosure: the engine's own current resolution
+        /// (`Rows::current_with_row` — the gate's one home, shared with
+        /// the version-addressed readers), so the probe and every read
+        /// agree about what is current. Exact-key reads: one
+        /// `object_meta` row plus one path stat, never a bucket walk.
+        async fn current_version(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+        ) -> Result<CurrentVersion, Error> {
+            self.ensure_bucket(bucket).await?;
+            if key.is_reserved() || key.is_folder_marker() {
+                return Ok(CurrentVersion::Absent);
+            }
+            let judged = Rows::new(self.clone())
+                .current_with_row(bucket, key)
+                .await?;
+            Ok(if !judged.current.exists {
+                CurrentVersion::Absent
+            } else if judged.current.is_delete_marker {
+                CurrentVersion::Marker
+            } else {
+                CurrentVersion::Object
+            })
         }
 
         async fn list_object_versions(

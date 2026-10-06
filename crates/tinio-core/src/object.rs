@@ -131,6 +131,7 @@ impl From<String> for Key {
 ///     owner: None,
 ///     acl: acl::Acl::default_private(None),
 ///     version_id: None,
+///     bucket_records_versions: false,
 /// };
 /// assert_eq!(info.size, 4);
 /// ```
@@ -158,6 +159,13 @@ pub struct Info {
     /// identifier, or `None` for the `null` version of an unversioned or
     /// suspended bucket.
     pub version_id: Option<version::Id>,
+    /// Whether the bucket this row was read from records versions (its
+    /// state is enabled or suspended). The carrier for the version-header
+    /// rule: a `None` identity is answered as the null version only on a
+    /// bucket that records versions, and the producers resolve the state
+    /// on the read they already run rather than the server reading it
+    /// again per request. `false` on a bucket that records none.
+    pub bucket_records_versions: bool,
 }
 
 /// The per-surface tag-count caps (S3): object tags ≤ 10, bucket tags
@@ -462,6 +470,7 @@ mod tests {
             owner: None,
             acl: Acl::default_private(None),
             version_id: None,
+            bucket_records_versions: false,
         };
         assert_eq!(o.size, 5);
         assert_eq!(o.last_modified, t);

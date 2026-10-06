@@ -43,8 +43,9 @@ pub enum Error {
         #[source]
         source: storage::Error,
     },
-    /// A shared redb failure (the five mapping kinds of
-    /// [`crate::_store::Error`]).
+    /// A shared redb failure (the kinds of [`crate::_store::Error`] — the
+    /// five redb mappings and the read-only refusal the shared handle's
+    /// arms answer).
     #[error(transparent)]
     Redb(#[from] _store::Error),
 }
@@ -64,6 +65,21 @@ impl Error {
                 redb::DatabaseError::DatabaseAlreadyOpen
             ))
         )
+    }
+
+    /// Whether this failure is "the handle is read-only" — the write was
+    /// refused because the run opened the root's database read-only
+    /// (FR-023 amended), not because anything is broken. The refusal is
+    /// the shared handle's arm answering
+    /// ([`crate::_store::Error::ReadOnly`]), nested here like every other
+    /// shared failure.
+    ///
+    /// The read paths that recompute a missing or stale entry ask this to
+    /// serve the recomputed row without persisting it: in a read-only run
+    /// that recomputation "is simply not written back" (design 2026-10-03,
+    /// **Read paths**), and the read still answers.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::Redb(_store::Error::ReadOnly))
     }
 }
 

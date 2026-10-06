@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::{
     ByteRange, acl, bucket, object,
     storage::{self, Storage},
-    version::{self, Id, ListParams, Listing, Marker, State},
+    version::{self, CurrentVersion, Id, ListParams, Listing, Marker, State},
 };
 
 /// The version-scoped operations. Backends that do not version anything answer
@@ -152,6 +152,26 @@ pub trait VersionOps: Send + Sync + 'static {
     {
         let _ = params;
         Err(bucket_refusal(bucket))
+    }
+
+    /// The shape of one key's current version — the bounded per-key
+    /// probe behind the plain read's 404 delete-marker disclosure: the
+    /// plain storage reads see no marker (a marked key reads as
+    /// `NoSuchKey`), so the caller asks this instead of listing the
+    /// bucket. Exact-key reads only (one row, or one row range), never a
+    /// listing page; [`CurrentVersion::Absent`] when the key has no
+    /// current version. A backend that versions nothing keeps the
+    /// default: a bucket that records no versions can hide no marker.
+    async fn current_version(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<CurrentVersion, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (bucket, key);
+        Ok(CurrentVersion::Absent)
     }
 
     /// The tags of a specific version (`None` = the `null` version).

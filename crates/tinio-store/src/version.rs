@@ -31,6 +31,8 @@
 //! in the ten-element shape errors at decode and the remedy is
 //! delete-and-rebuild.
 
+use std::ops::Bound;
+
 use parse_display::{Display, FromStr};
 use redb::{ReadableTable, TableDefinition};
 
@@ -72,6 +74,11 @@ impl TableDef for Def {
     );
 
     const DEF: TableDefinition<'static, Self::Key, Self::Value> = TableDefinition::new("versions");
+    /// A root written before the version machinery has no `versions`
+    /// table, and "no history" must not read as "this root cannot be
+    /// read": the missing table reads as empty
+    /// ([`TableDef::MAY_BE_ABSENT`], spec 2026-10-03).
+    const MAY_BE_ABSENT: bool = true;
 }
 
 /// Handle to the version table (writable or read-only).
@@ -500,7 +507,10 @@ impl Row {
     /// element is the value the version was written with (a composed
     /// `MD5-of-MD5s-N` form included), the stamp is the row's creation
     /// time, and the identity is the row's own (the null version answers
-    /// `None`). One home for the nine-field mapping the backends share.
+    /// `None`). One home for the field mapping the backends share;
+    /// `bucket_records_versions` is the caller's — the state read its own
+    /// transaction already took (a row exists only on a bucket that
+    /// records versions, but the caller's read is the honest source).
     ///
     /// # Examples
     ///
@@ -521,11 +531,11 @@ impl Row {
     ///     acl: String::new(),
     ///     seq: 1,
     /// };
-    /// let info = row.info(&"a.txt".into());
+    /// let info = row.info(&"a.txt".into(), true);
     /// assert_eq!(info.size, 5);
     /// assert_eq!(info.version_id.unwrap().as_str(), "abc");
     /// ```
-    pub fn info(&self, key: &object::Key) -> object::Info {
+    pub fn info(&self, key: &object::Key, bucket_records_versions: bool) -> object::Info {
         object::Info {
             key: key.clone(),
             size: self.size,
@@ -536,6 +546,7 @@ impl Row {
             owner: self.owner(),
             acl: self.acl(),
             version_id: self.id(),
+            bucket_records_versions,
         }
     }
 
@@ -924,6 +935,108 @@ where
             }
             if let Some(row) = decode_row(seq, v.value()) {
                 visit(key, row)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::for_bucket_of`] from a **bound**, with an early stop: the same
+    /// rows in the same `(key, seq)` order with the same self-healing decode,
+    /// but the walk starts at `from` — `Included` names the first key (its
+    /// lowest sequence first), `Excluded` the key just below it (the key one
+    /// bucket earlier is never touched, so a caller resuming after a key pays
+    /// no re-read of it), `Unbounded` the bucket's first row — and ends as
+    /// soon as `visit` answers `Ok(false)`.
+    ///
+    /// The bound names a **key**, not a `(key, seq)` position: a caller that
+    /// stops inside a key resumes at that same key (`Included`) and skips the
+    /// sequences it already read itself. A row whose shape is corrupt is
+    /// skipped, never fails the walk, and never reaches `visit` — exactly
+    /// [`Self::for_bucket_of`]'s rule; the keys of one bucket are contiguous,
+    /// so the mismatch break is the interval boundary.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::ops::Bound;
+    ///
+    /// use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
+    /// use tinio_store::{
+    ///     _core::blob::{BlobRef, BlockHash},
+    ///     ensure_all, version,
+    /// };
+    ///
+    /// let db = Database::builder()
+    ///     .create_with_backend(InMemoryBackend::new())
+    ///     .unwrap();
+    /// {
+    ///     let mut txn = db.begin_write().unwrap();
+    ///     ensure_all(&mut txn).unwrap();
+    ///     {
+    ///         let mut table = version::Table::open(&mut txn).unwrap();
+    ///         for (key, seq) in [("a", 1u64), ("b", 2), ("c", 3)] {
+    ///             table
+    ///                 .put(
+    ///                     "data",
+    ///                     key,
+    ///                     &version::Row {
+    ///                         id: format!("v{seq}"),
+    ///                         blob: version::encode_blob(&BlobRef::single(BlockHash::of(b"x"), 1)),
+    ///                         size: 1,
+    ///                         etag: String::new(),
+    ///                         created: 0,
+    ///                         became_noncurrent: 1,
+    ///                         kind: version::Kind::Object,
+    ///                         tags: String::new(),
+    ///                         checksum: String::new(),
+    ///                         owner: String::new(),
+    ///                         acl: String::new(),
+    ///                         seq,
+    ///                     },
+    ///                 )
+    ///                 .unwrap();
+    ///         }
+    ///     }
+    ///     txn.commit().unwrap();
+    /// }
+    /// let txn = db.begin_read().unwrap();
+    /// let table = version::Table::open_readonly(&txn).unwrap();
+    /// let mut seen = Vec::new();
+    /// table
+    ///     .for_bucket_from("data", Bound::Excluded("a"), |key, row| {
+    ///         seen.push((key.to_owned(), row.seq));
+    ///         Ok(false) // stop after the first row past the bound
+    ///     })
+    ///     .unwrap();
+    /// assert_eq!(seen, [("b".to_owned(), 2)]);
+    /// ```
+    pub fn for_bucket_from<F>(
+        &self,
+        bucket: &str,
+        from: Bound<&str>,
+        mut visit: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&str, Row) -> Result<bool, Error>,
+    {
+        // The bound names a key: every sequence of `Included`'s key is in
+        // (the lowest one is `u64::MIN`), and none of `Excluded`'s is (its
+        // own highest sequence is `u64::MAX`) — redb's own bound forms.
+        let start = match from {
+            Bound::Included(key) => Bound::Included((bucket, key, u64::MIN)),
+            Bound::Excluded(key) => Bound::Excluded((bucket, key, u64::MAX)),
+            Bound::Unbounded => Bound::Included((bucket, "", u64::MIN)),
+        };
+        for item in self.0.range((start, Bound::Unbounded))? {
+            let (k, v) = item?;
+            let (name, key, seq) = k.value();
+            if name != bucket {
+                break; // the interval boundary: this bucket's rows ended
+            }
+            if let Some(row) = decode_row(seq, v.value())
+                && !visit(key, row)?
+            {
+                break;
             }
         }
         Ok(())
@@ -1614,5 +1727,71 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn the_bounded_walk_starts_at_the_bound_and_stops_where_it_is_told() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut v = Table::open(txn)?;
+            for (key, seq) in [("a", 1u64), ("b", 1), ("b", 2), ("c", 1)] {
+                v.put("data", key, &row(&format!("v{seq}"), seq))?;
+            }
+            // The next bucket's rows sort after every `data` row: the
+            // bounded walk must never leave its own interval.
+            v.put("dataz", "a", &row("v1", 1))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let walk = |from: Bound<&str>, stop_after: usize| -> Vec<(String, u64)> {
+            h.read(|txn| -> Result<Vec<(String, u64)>, Error> {
+                let v = Table::open_readonly(txn)?;
+                let mut seen = Vec::new();
+                v.for_bucket_from("data", from, |key, row| {
+                    seen.push((key.to_owned(), row.seq));
+                    Ok(seen.len() < stop_after)
+                })?;
+                Ok(seen)
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            walk(Bound::Unbounded, usize::MAX),
+            [
+                ("a".to_owned(), 1),
+                ("b".to_owned(), 1),
+                ("b".to_owned(), 2),
+                ("c".to_owned(), 1),
+            ],
+            "the bucket's rows only, key order, sequence ascending"
+        );
+        // The bound names a KEY: an inclusive bound reads that key from its
+        // lowest sequence, an exclusive one skips the key whole.
+        assert_eq!(
+            walk(Bound::Included("b"), usize::MAX),
+            [
+                ("b".to_owned(), 1),
+                ("b".to_owned(), 2),
+                ("c".to_owned(), 1),
+            ],
+            "an inclusive bound names the first key, its own sequences all in"
+        );
+        assert_eq!(
+            walk(Bound::Excluded("b"), usize::MAX),
+            [("c".to_owned(), 1)],
+            "an exclusive bound never reads the named key's rows"
+        );
+        // The early stop ends the walk at the row it answered `false` on.
+        assert_eq!(
+            walk(Bound::Unbounded, 2),
+            [("a".to_owned(), 1), ("b".to_owned(), 1)]
+        );
+        assert_eq!(
+            walk(Bound::Excluded("c"), usize::MAX),
+            [],
+            "a bound past the bucket's last key ends immediately"
+        );
     }
 }

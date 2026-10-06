@@ -93,18 +93,32 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use futures::stream::iter;
 
-use crate::_core::{
-    BodyStream, ETag, GetObjectResult,
-    acl::{Acl, OwnerId},
-    checksum, object,
-    version::Id,
+// The feature-on `records_versions` body is this import's only user — with
+// the feature off the body answers the constant `false` and the shared
+// state table is never opened.
+#[cfg(feature = "versioning")]
+use crate::_store::bucket_versioning;
+// The feature-off `VersionOps` impl below is the only user, so the gate is
+// the import's too: the feature-on build (whose impl lives in `enabled`)
+// does not carry an unused import.
+#[cfg(not(feature = "versioning"))]
+use crate::{_core::storage::VersionOps, storage::MemoryStorage};
+use crate::{
+    _core::{
+        BodyStream, ETag, GetObjectResult,
+        acl::{Acl, OwnerId},
+        bucket::Name,
+        checksum, object,
+        version::Id,
+    },
+    Error,
 };
 
 /// The feature-off `VersionOps`: the trait's default bodies own every answer
 /// (the refusal class for the nine, `Unversioned` for `bucket_versioning`),
 /// so there is nothing to write here and nothing to forget.
 #[cfg(not(feature = "versioning"))]
-impl crate::_core::storage::VersionOps for crate::storage::MemoryStorage {}
+impl VersionOps for MemoryStorage {}
 
 /// Build a served read's result over content already in hand: the shared
 /// ranged-read construction of both the version-addressed reads and the
@@ -122,6 +136,7 @@ pub(crate) fn object_result(
     owner: Option<OwnerId>,
     acl: Acl,
     version_id: Option<Id>,
+    records_versions: bool,
     data: &[u8],
     served: Option<(u64, u64)>,
 ) -> GetObjectResult {
@@ -140,9 +155,34 @@ pub(crate) fn object_result(
             owner,
             acl,
             version_id,
+            bucket_records_versions: records_versions,
         },
         body: Box::pin(iter(vec![Ok(Bytes::from(body))])) as BodyStream,
         served_range: served,
+    }
+}
+
+/// Whether the bucket records versions (state enabled or suspended) — the
+/// carrier's value for [`object::Info::bucket_records_versions`], read from
+/// the shared state table inside the caller's own read transaction, so the
+/// state and the row it describes are one point in time.
+///
+/// The feature gate is **inside** the body (the fs backend's shape): the
+/// callers carry no cfg pair of their own. With the feature off no state
+/// row can exist — the writes that set one are compiled out — so there is
+/// nothing to read and the answer is the constant `false`.
+pub(crate) fn records_versions(txn: &redb::ReadTransaction, bucket: &Name) -> Result<bool, Error> {
+    #[cfg(feature = "versioning")]
+    {
+        Ok(bucket_versioning::Table::open_readonly(txn)?
+            .get(bucket.as_ref().as_str())?
+            .unwrap_or_default()
+            .records_versions())
+    }
+    #[cfg(not(feature = "versioning"))]
+    {
+        let _ = (txn, bucket);
+        Ok(false)
     }
 }
 
@@ -150,8 +190,10 @@ pub(crate) fn object_result(
 #[cfg(feature = "versioning")]
 mod enabled {
     use std::{
-        cmp::Reverse,
-        collections::{BTreeMap, BTreeSet},
+        cmp::{Reverse, min},
+        collections::{BTreeMap, HashSet},
+        mem,
+        ops::Bound,
     };
 
     use async_trait::async_trait;
@@ -164,9 +206,10 @@ mod enabled {
             blob::{BlobRef, BlockHash},
             bucket::Name,
             from_nanos, object,
-            storage::{VersionOps, marker_has_no_metadata, rename_allowed},
+            storage::{VersionOps, common_prefix, marker_has_no_metadata, rename_allowed},
             version::{
-                self, HeadResult, Id, ListParams, Listing, Marker, ReadResult, State, wire_of,
+                self, CurrentVersion, HeadResult, Id, ListParams, Listing, Marker, ReadResult,
+                State, wire_of,
             },
         },
         _store::{
@@ -178,7 +221,7 @@ mod enabled {
         DatabaseError, Error,
         error::{no_such_key, no_such_version},
         storage::{MemoryStorage, check_bucket},
-        version::object_result,
+        version::{object_result, records_versions},
     };
 
     /// `(bucket, content-hash-hex)` → whole-blob bytes: the content-addressed
@@ -770,7 +813,9 @@ mod enabled {
     /// and the suspended bucket's replacement of its null version — together
     /// with the byte delta the move puts on the tracked total (the freshly
     /// stored blob's bytes; `0` when nothing was superseded or the content was
-    /// a dedup hit). The caller folds the delta into the write's own, one
+    /// a dedup hit) and whether the bucket records versions (the state read
+    /// above, carried into the committed [`object::Info`] so the server never
+    /// reads it again). The caller folds the delta into the write's own, one
     /// adjustment per transaction.
     ///
     /// The decision is the shared `tinio_version::plan_write`'s — one pure
@@ -789,7 +834,7 @@ mod enabled {
         bucket: &Name,
         key: &object::Key,
         now: u64,
-    ) -> Result<(Option<Id>, u64, i64), Error> {
+    ) -> Result<(Option<Id>, u64, i64, bool), Error> {
         let state = {
             bucket_versioning::Table::open(txn)?
                 .get(bucket.as_ref().as_str())?
@@ -805,7 +850,7 @@ mod enabled {
             Identity::Fresh => Some(version::mint()),
             Identity::Null | Identity::Unversioned => None,
         };
-        Ok((id, plan.seq, delta))
+        Ok((id, plan.seq, delta, state.records_versions()))
     }
 
     /// The rename guard as this backend must apply it — inside the
@@ -935,6 +980,334 @@ mod enabled {
         }
     }
 
+    /// The version listing's resume bound: the key the next window starts at,
+    /// or the key it starts after. `After` is the stronger bound —
+    /// `At(key)` includes the key, `After(key)` skips it whole.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Cursor {
+        /// The next window reads this key first.
+        At(String),
+        /// The next window reads from the first key after this one.
+        After(String),
+    }
+
+    impl Cursor {
+        /// The bound a store range scan takes.
+        fn as_bound(&self) -> Bound<&str> {
+            match self {
+                Cursor::At(key) => Bound::Included(key.as_str()),
+                Cursor::After(key) => Bound::Excluded(key.as_str()),
+            }
+        }
+
+        /// The bound's position: its key, and whether the key is already
+        /// skipped. Ordering two positions orders the bounds — the later key
+        /// wins, and at the same key the skipping bound is the later one.
+        fn position(&self) -> (&str, bool) {
+            match self {
+                Cursor::At(key) => (key, false),
+                Cursor::After(key) => (key, true),
+            }
+        }
+
+        /// The later of two bounds.
+        fn later(self, other: Option<Self>) -> Self {
+            match other {
+                Some(other) if other.position() > self.position() => other,
+                _ => self,
+            }
+        }
+    }
+
+    /// The bound that lies past the delimiter group `rolled`: every key in
+    /// `[rolled, bound)` is a member of that group, so a walk resumed at the
+    /// bound has skipped the whole group. `None` when the prefix ends in the
+    /// code point no successor exists for (`U+10FFFF`) — such a group is
+    /// walked member by member (the members' keys are compared, never
+    /// listed).
+    fn group_end(rolled: &str) -> Option<Cursor> {
+        let mut head = rolled.chars();
+        let last = head.next_back()?;
+        let next = char::from_u32(u32::from(last) + 1)?;
+        let mut end = head.as_str().to_owned();
+        end.push(next);
+        Some(Cursor::At(end))
+    }
+
+    /// One key of a read window: its gated current-slot row, as the gating
+    /// walk reports it (`None` = no row, or one the store reads as missing),
+    /// and its version rows in the table's own `(key, seq)` order.
+    struct WindowKey {
+        /// The key, raw: the listing's own prefix and domain filters run on
+        /// it.
+        key: String,
+        /// The current slot's gated row.
+        slot: Option<meta::Stored>,
+        /// The key's version rows, ascending sequence.
+        rows: Vec<stored::Row>,
+    }
+
+    /// One read window: the keys both tables cover from the cursor, in key
+    /// order, and the bound the next window starts at.
+    struct Window {
+        /// The window's keys, ascending.
+        keys: Vec<WindowKey>,
+        /// The next window's bound; `None` = both tables were read to the
+        /// end of the bucket.
+        next: Option<Cursor>,
+    }
+
+    /// Read one window: the gated current slots and the version rows of the
+    /// first `budget` keys at or after `cursor`.
+    ///
+    /// mem's listing is the fs one's bounded walk with no filesystem under
+    /// it: the two tables are keyed the same way and the window covers the
+    /// same span, so a page costs a page here too (a `max_keys` page of a
+    /// bucket with a million keys walks the page's keys, never the million).
+    /// A window ends at a key **both** tables covered (see the fs walk's
+    /// rule): the slot walk stops before the key that would make it
+    /// `budget + 1` keys, the row walk before the key that would, and the
+    /// window keeps the keys at or before the earlier of the two stops —
+    /// never a key whose slot is known and whose rows are not. The stop is
+    /// checked on a key boundary, so a key's version rows are read whole.
+    fn read_window(
+        txn: &redb::ReadTransaction,
+        bucket: &str,
+        cursor: &Cursor,
+        budget: usize,
+    ) -> Result<Window, Error> {
+        let from = cursor.as_bound();
+        let mut slots: BTreeMap<String, Option<meta::Stored>> = BTreeMap::new();
+        {
+            let table = meta::Table::open_readonly(txn)?;
+            table.for_bucket_gated_from(bucket, from, |key, slot| {
+                if slots.len() == budget {
+                    return Ok(false);
+                }
+                slots.insert(key.as_ref().to_owned(), slot);
+                Ok(true)
+            })?;
+        }
+        let slots_end = slots.len() < budget;
+        let mut history: BTreeMap<String, Vec<stored::Row>> = BTreeMap::new();
+        {
+            let table = stored::Table::open_readonly(txn)?;
+            table.for_bucket_from(bucket, from, |key, row| match history.get_mut(key) {
+                Some(rows) => {
+                    rows.push(row);
+                    Ok(true)
+                }
+                None => {
+                    if history.len() == budget {
+                        return Ok(false);
+                    }
+                    history.insert(key.to_owned(), vec![row]);
+                    Ok(true)
+                }
+            })?;
+        }
+        let history_end = history.len() < budget;
+
+        // The window's coverage: a walk that stopped early bounds it (the
+        // other walked past that key), and two early stops meet at the
+        // earlier key. Both walks reaching the bucket's end means nothing is
+        // left to read.
+        let through = match (slots_end, history_end) {
+            (true, true) => None,
+            (false, true) => slots.keys().next_back().cloned(),
+            (true, false) => history.keys().next_back().cloned(),
+            (false, false) => match (slots.keys().next_back(), history.keys().next_back()) {
+                (Some(slot), Some(historic)) => Some(min(slot, historic).clone()),
+                // Unreachable — a walk stops holding its budget's worth of
+                // keys — and a window covering what it read is the safe
+                // answer.
+                (Some(key), None) | (None, Some(key)) => Some(key.clone()),
+                (None, None) => None,
+            },
+        };
+        if let Some(through) = &through {
+            slots.retain(|key, _| key <= through);
+            history.retain(|key, _| key <= through);
+        }
+        let mut keys: BTreeMap<String, WindowKey> = BTreeMap::new();
+        for (key, slot) in slots {
+            keys.insert(
+                key.clone(),
+                WindowKey {
+                    key,
+                    slot,
+                    rows: Vec::new(),
+                },
+            );
+        }
+        for (key, rows) in history {
+            keys.entry(key.clone())
+                .or_insert_with(|| WindowKey {
+                    key,
+                    slot: None,
+                    rows: Vec::new(),
+                })
+                .rows = rows;
+        }
+        Ok(Window {
+            keys: keys.into_values().collect(),
+            next: through.map(Cursor::After),
+        })
+    }
+
+    /// The bounded page walk's state: the entries the page is cut from, the
+    /// delimiter groups already fed to it, and the bound those groups pushed
+    /// the walk past.
+    struct Walk<'a> {
+        /// The listing's parameters — the one source of the prefix, the
+        /// delimiter and the markers.
+        params: &'a ListParams,
+        /// The prefix, materialized once (every key is compared against it).
+        prefix: String,
+        /// The rolled-up groups already fed to the page — the walk's own
+        /// mirror of `version::paginate`'s roll-up dedup, so a group's
+        /// remaining members are skipped.
+        covered: HashSet<String>,
+        /// The bound a rolled-up group pushed the walk past.
+        jump: Option<Cursor>,
+        /// The entries the page is cut from, in the listing's order.
+        entries: Vec<version::Entry>,
+    }
+
+    impl<'a> Walk<'a> {
+        /// Start a walk under `params` with `prefix` materialized.
+        fn new(params: &'a ListParams, prefix: String) -> Self {
+            Self {
+                params,
+                prefix,
+                covered: HashSet::new(),
+                jump: None,
+                entries: Vec::new(),
+            }
+        }
+
+        /// The first key the listing can contain: the later of the prefix (no
+        /// listed key lies below it) and the `key_marker`. The marker's own
+        /// key is **included** — a bare `key_marker` skips the key whole
+        /// inside `version::paginate` (which needs no entry of it), and a
+        /// `version_id_marker` resumes inside it (which needs its entries up
+        /// to the named one).
+        fn start_key(&self) -> String {
+            match self.params.key_marker.as_deref() {
+                Some(marker) if marker > self.prefix.as_str() => marker.to_owned(),
+                _ => self.prefix.clone(),
+            }
+        }
+
+        /// The bound the next window starts at: the window's own resume
+        /// bound, pushed past the rolled-up groups already fed to the page.
+        fn next_cursor(&mut self, window: &Window) -> Option<Cursor> {
+            let jump = self.jump.take();
+            window.next.clone().map(|next| next.later(jump))
+        }
+
+        /// Feed one window to the page: the keys that can contribute entries,
+        /// in key order, and a rolled-up group marked in as soon as one of
+        /// its keys yields — the group's remaining members are then skipped
+        /// (and jumped over), because `version::paginate` drops them as
+        /// duplicates of the group's prefix.
+        fn absorb(&mut self, window: &Window) {
+            let delimiter = self.params.delimiter.as_deref();
+            for window_key in &window.keys {
+                let raw = window_key.key.as_str();
+                if !raw.starts_with(&self.prefix) {
+                    continue; // outside the listing's prefix
+                }
+                let Ok(key) = object::key(raw) else {
+                    continue; // a domain-invalid key is skipped, like a listing
+                };
+                if key.is_reserved() || key.is_folder_marker() {
+                    continue;
+                }
+                if self.params.version_id_marker.is_none()
+                    && self.params.key_marker.as_deref() == Some(raw)
+                {
+                    continue; // the whole key is behind the marker
+                }
+                let rolled =
+                    delimiter.and_then(|delimiter| common_prefix(raw, &self.prefix, delimiter));
+                if let Some(rolled) = rolled
+                    && self.covered.contains(rolled)
+                {
+                    continue; // the group is already in the page
+                }
+                let entries = entries_of(&key, window_key.slot.as_ref(), &window_key.rows);
+                if entries.is_empty() {
+                    continue; // the key has no version to list
+                }
+                if let Some(rolled) = rolled {
+                    // The exception is the key a `version_id_marker` resumes
+                    // inside: the page may drop every entry of it (an
+                    // unmatched marker), so the group is not counted in until
+                    // a member the drop cannot reach has been read. One extra
+                    // member's read is the whole cost, and its entries are
+                    // duplicates the page drops anyway.
+                    let resumed = self.params.version_id_marker.is_some()
+                        && self.params.key_marker.as_deref() == Some(raw);
+                    if !resumed {
+                        self.covered.insert(rolled.to_owned());
+                        self.jump = match (self.jump.take(), group_end(rolled)) {
+                            (Some(jump), Some(end)) => Some(jump.later(Some(end))),
+                            (None, Some(end)) => Some(end),
+                            (jump, None) => jump,
+                        };
+                    }
+                }
+                self.entries.extend(entries);
+            }
+        }
+    }
+
+    /// The entries one key contributes, in the listing's order: its current
+    /// version — the meta row's own object version, or the one version row
+    /// that is not history (a current delete marker has no meta row, so its
+    /// row is the slot) — and then its noncurrent versions newest first.
+    ///
+    /// mem's slot is the row itself: a key whose meta row is gone has no
+    /// current version, so every version row is history and must list (the
+    /// row an aborted publish left unstamped included — a version like any
+    /// other, never a key's second "latest").
+    fn entries_of(
+        key: &object::Key,
+        slot: Option<&meta::Stored>,
+        rows: &[stored::Row],
+    ) -> Vec<version::Entry> {
+        let mut entries: Vec<version::Entry> = Vec::new();
+        match slot {
+            Some(stored) => entries.push(version::Entry {
+                key: key.clone(),
+                id: stored.version_id.clone(),
+                seq: stored.version_seq,
+                is_delete_marker: false,
+                size: stored.size,
+                last_modified: from_nanos(stored.mtime),
+                etag: stored.etag.clone(),
+            }),
+            None => {
+                if let Some(row) = rows
+                    .iter()
+                    .find(|row| !row.is_history(stored::Slot::Unknown))
+                {
+                    entries.push(entry_of(key, row));
+                }
+            }
+        }
+        let mut older: Vec<&stored::Row> = rows
+            .iter()
+            .filter(|row| row.is_history(stored::Slot::Unknown))
+            .collect();
+        older.sort_by_key(|row| Reverse(row.seq));
+        for row in older {
+            entries.push(entry_of(key, row));
+        }
+        entries
+    }
+
     #[async_trait]
     impl VersionOps for MemoryStorage {
         async fn bucket_versioning(&self, bucket: &Name) -> Result<State, Error> {
@@ -966,6 +1339,7 @@ mod enabled {
                 if key.is_reserved() || key.is_folder_marker() {
                     return Err(no_such_key(key));
                 }
+                let records = records_versions(txn, bucket)?;
                 let peek = peek(txn, bucket, key)?;
                 let index = index_seq(txn, bucket, key, version)?;
                 let Some(found) = resolve(&peek, index, version) else {
@@ -991,6 +1365,7 @@ mod enabled {
                             stored.owner.clone(),
                             stored.acl.clone(),
                             stored.version_id.clone(),
+                            records,
                             &data,
                             served,
                         )))
@@ -1012,6 +1387,7 @@ mod enabled {
                             row.owner(),
                             row.acl(),
                             row.id(),
+                            records,
                             &data,
                             served,
                         )))
@@ -1031,6 +1407,7 @@ mod enabled {
                 if key.is_reserved() || key.is_folder_marker() {
                     return Err(no_such_key(key));
                 }
+                let records = records_versions(txn, bucket)?;
                 let peek = peek(txn, bucket, key)?;
                 let index = index_seq(txn, bucket, key, version)?;
                 let Some(found) = resolve(&peek, index, version) else {
@@ -1047,12 +1424,13 @@ mod enabled {
                         owner: stored.owner.clone(),
                         acl: stored.acl.clone(),
                         version_id: stored.version_id.clone(),
+                        bucket_records_versions: records,
                     })),
                     Found::Row(row) if row.kind == stored::Kind::Marker => Ok(HeadResult::Marker {
                         id: row.id(),
                         last_modified: from_nanos(row.created),
                     }),
-                    Found::Row(row) => Ok(HeadResult::Object(row.info(key))),
+                    Found::Row(row) => Ok(HeadResult::Object(row.info(key, records))),
                 }
             })
         }
@@ -1129,6 +1507,61 @@ mod enabled {
             })
         }
 
+        /// The bounded per-key probe behind the plain read's 404
+        /// disclosure: the `object_meta` row is the current object slot;
+        /// with no row, the key's newest version row decides — a row no
+        /// stamp made history is current, and its kind says marker or
+        /// object (the listing's own "what is current" rule). One
+        /// exact-key range (`Table::newest`), never a bucket walk.
+        ///
+        /// The one-row read is the deliberate difference from the
+        /// listing's spelling of that rule: `Peek::current`/`entries_of`
+        /// scan the rows they already hold for the newest one that is not
+        /// history (`.find(!is_history)` over the newest-first window),
+        /// while this probe judges the single newest row. The two agree
+        /// in every state the model reaches — a row is stamped only when
+        /// a newer version supersedes it, and the restore that revives a
+        /// version resets its stamp on the newest row it revives, so any
+        /// non-history row is the newest row and "the newest row is
+        /// history" means "no row is current". If that stamping
+        /// invariant ever weakens, the probe must read on to the newest
+        /// non-history row rather than answering `Absent` off the top
+        /// row; reading on is also why the listing's predicate is not
+        /// reused here — it needs every row between the top and the
+        /// answer, and this probe exists to decode exactly one.
+        async fn current_version(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+        ) -> Result<CurrentVersion, Error> {
+            self.db.read(|txn| -> Result<CurrentVersion, Error> {
+                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
+                if key.is_reserved() || key.is_folder_marker() {
+                    return Ok(CurrentVersion::Absent);
+                }
+                let meta = meta::Table::open_readonly(txn)?
+                    .get(bucket.as_ref().as_str(), key.as_ref().as_str())?;
+                if meta.is_some() {
+                    return Ok(CurrentVersion::Object);
+                }
+                let newest = stored::Table::open_readonly(txn)?.newest(
+                    bucket.as_ref().as_str(),
+                    key.as_ref().as_str(),
+                    1,
+                )?;
+                Ok(match newest.into_iter().next() {
+                    Some((_, row)) if !row.is_history(stored::Slot::Unknown) => {
+                        if row.kind == stored::Kind::Marker {
+                            CurrentVersion::Marker
+                        } else {
+                            CurrentVersion::Object
+                        }
+                    }
+                    _ => CurrentVersion::Absent,
+                })
+            })
+        }
+
         async fn list_object_versions(
             &self,
             bucket: &Name,
@@ -1137,67 +1570,44 @@ mod enabled {
             self.db.read(|txn| -> Result<Listing, Error> {
                 check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
                 let b = bucket.as_ref().as_str();
-                let prefix = params.prefix.as_deref().unwrap_or_default();
-                // The current slots (the object_meta rows) and the version
-                // rows, both keyed by key; the listing merges them per key.
-                let mut currents: BTreeMap<String, meta::Stored> = BTreeMap::new();
-                meta::Table::open_readonly(txn)?.for_bucket_gated(b, |key, stored| {
-                    if let Some(stored) = stored
-                        && key.as_ref().starts_with(prefix)
-                        && !key.is_reserved()
-                        && !key.is_folder_marker()
-                    {
-                        currents.insert(key.as_ref().to_owned(), stored);
+                // A page cut to nothing asks for nothing: `max_keys = 0`
+                // answers the empty page (`version::paginate`'s own rule)
+                // without walking the bucket for a truncation that can never
+                // come.
+                if params.max_keys == 0 {
+                    return Ok(version::paginate(Vec::new(), &params));
+                }
+                // The bounded walk, the fs listing's own shape: one window of
+                // keys at a time, from the listing's first key, stopping as
+                // soon as the page engine can see the page's cut. Both
+                // backends answer one conformance leg, so the two walks must
+                // stay each other's mirror.
+                let prefix = params.prefix.clone().unwrap_or_default();
+                let budget = params.max_keys.saturating_add(1);
+                let mut walk = Walk::new(&params, prefix);
+                let mut cursor = Cursor::At(walk.start_key());
+                loop {
+                    let window = read_window(txn, b, &cursor, budget)?;
+                    walk.absorb(&window);
+                    // The page is decided by the engine that has always cut
+                    // it: its counted items never exceed the entries it is
+                    // handed, so the call is only worth making once the walk
+                    // holds that many — and a truncated answer already carries
+                    // the page's cut and its cursors, so the walk stops there.
+                    if walk.entries.len() >= params.max_keys {
+                        let listing = version::paginate(walk.entries.clone(), &params);
+                        if listing.is_truncated {
+                            return Ok(listing);
+                        }
                     }
-                    Ok(())
-                })?;
-                let mut history: BTreeMap<String, Vec<stored::Row>> = BTreeMap::new();
-                stored::Table::open_readonly(txn)?.for_bucket_of(b, |key, row| {
-                    if key.starts_with(prefix) {
-                        history.entry(key.to_owned()).or_default().push(row);
-                    }
-                    Ok(())
-                })?;
-                let mut keys: BTreeSet<String> = currents.keys().cloned().collect();
-                keys.extend(history.keys().cloned());
-                let mut entries: Vec<version::Entry> = Vec::new();
-                for key in keys {
-                    let Ok(obj_key) = object::key(&key) else {
-                        continue; // a domain-invalid key is skipped, like a listing
-                    };
-                    if obj_key.is_reserved() || obj_key.is_folder_marker() {
-                        continue;
-                    }
-                    let rows = history.get(&key).map(Vec::as_slice).unwrap_or_default();
-                    // The current version first: the meta row's object
-                    // version, or the marker row the slot records.
-                    if let Some(stored) = currents.get(&key) {
-                        entries.push(version::Entry {
-                            key: obj_key.clone(),
-                            id: stored.version_id.clone(),
-                            seq: stored.version_seq,
-                            is_delete_marker: false,
-                            size: stored.size,
-                            last_modified: from_nanos(stored.mtime),
-                            etag: stored.etag.clone(),
-                        });
-                    } else if let Some(row) = rows
-                        .iter()
-                        .find(|row| !row.is_history(stored::Slot::Unknown))
-                    {
-                        entries.push(entry_of(&obj_key, row));
-                    }
-                    // Then the noncurrent versions, newest first.
-                    let mut older: Vec<&stored::Row> = rows
-                        .iter()
-                        .filter(|row| row.is_history(stored::Slot::Unknown))
-                        .collect();
-                    older.sort_by_key(|row| Reverse(row.seq));
-                    for row in older {
-                        entries.push(entry_of(&obj_key, row));
+                    match walk.next_cursor(&window) {
+                        Some(next) => cursor = next,
+                        None => {
+                            let entries = mem::take(&mut walk.entries);
+                            return Ok(version::paginate(entries, &params));
+                        }
                     }
                 }
-                Ok(version::paginate(entries, &params))
             })
         }
 

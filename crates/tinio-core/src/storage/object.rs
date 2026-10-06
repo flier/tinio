@@ -34,6 +34,37 @@ pub struct PutObjectResult {
     pub etag: ETag,
 }
 
+/// Result of a successful tag write (Put/DeleteObjectTagging): the
+/// identity the tags landed on and the bucket's records-versions bit —
+/// the pair the committed [`object::Info`] answers (`version_id` /
+/// `bucket_records_versions`), so the interface names the touched
+/// version without a second read.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::storage::TagWriteResult;
+///
+/// let untouched = TagWriteResult {
+///     version_id: None,
+///     bucket_records_versions: false,
+/// };
+/// assert!(untouched.version_id.is_none() && !untouched.bucket_records_versions);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagWriteResult {
+    /// The current version identity the tags were written to — `None`
+    /// is the null version on a bucket that records one (the bit
+    /// beside it says so) — or no identity at all when the write
+    /// touched nothing: a bucket that records no versions, or the
+    /// idempotent delete that met no object.
+    pub version_id: Option<version::Id>,
+    /// Whether the bucket records versions (the `Info` carrier's bit).
+    /// `false` when the write touched nothing — a missing object names
+    /// no identity and answers no state.
+    pub bucket_records_versions: bool,
+}
+
 /// Result of a successful object read.
 ///
 /// `served_range` is `Some((start, end))` (inclusive) when the response is a
@@ -58,6 +89,7 @@ pub struct PutObjectResult {
 ///         owner: None,
 ///         acl: acl::Acl::default_private(None),
 ///         version_id: None,
+///         bucket_records_versions: false,
 ///     },
 ///     body: Box::pin(stream::empty()),
 ///     served_range: Some((0, 4)),
@@ -176,7 +208,7 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage,
     {
-        let staged = self.stage_body(bucket, key, body, None).await?;
+        let staged = self.stage_body(bucket, key, body, None, None).await?;
         let info = self
             .commit_object(
                 bucket,
@@ -195,20 +227,26 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// writers. The stage is cheap to discard — the body is published
     /// only by the later [`ObjectOps::commit_object`]. Validation that can
     /// fail before any body is read (bucket, key) still rejects here.
-    /// `checksum` is the server's tee slot (the
+    /// `tee` is the server's checksum slot (the
     /// [`crate::storage::MultipartOps::upload_part`] pattern): the
     /// interface wraps the body when the client sent a single
     /// `x-amz-checksum-*` header under the `checksum` toggle, the digest
     /// is computed while the body streams, a mismatch fails the staging
     /// (the multipart path's checksum-mismatch error), and the validated
-    /// digest rides into the later [`ObjectOps::commit_object`]; absent,
-    /// no digest is computed.
+    /// digest rides into the later [`ObjectOps::commit_object`] under the
+    /// write path's FULL_OBJECT rule; absent, no digest is computed.
+    /// `carried` is a recorded value the caller already holds — a
+    /// version-addressed copy's source version checksum, kind included —
+    /// and takes precedence over the tee's streamed digest (a
+    /// multipart-completed source stays COMPOSITE), so the commit records
+    /// it with no second read of the bytes.
     async fn stage_body(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         body: BodyStream,
-        checksum: Option<Arc<checksum::PartChecksum>>,
+        tee: Option<Arc<checksum::PartChecksum>>,
+        carried: Option<checksum::Recorded>,
     ) -> Result<Self::StagedBody, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -218,9 +256,10 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// wins, never a torn object, FR-011). Re-checks everything the
     /// stage checked, under the backend's mutation lock, so the commit
     /// is safe against concurrent bucket deletion. `tags` — validated by
-    /// the interface — and the stage's tee digest (when the stage
-    /// carried one) are recorded atomically with the write, with no
-    /// post-commit tag window. `owner` is the recorded owner element —
+    /// the interface — and the stage's recorded checksum (when the stage
+    /// fixed one: the carried value, else the tee's streamed digest
+    /// under the write path's FULL_OBJECT rule) are recorded atomically
+    /// with the write, with no post-commit tag window. `owner` is the recorded owner element —
     /// `None` = the empty owner wire (the lazy default owner at the auth
     /// layer; a no-identity path records empty, NOT the default owner,
     /// review B4) — and `acl` the ACL row written with it. Returns the
@@ -281,7 +320,9 @@ pub trait ObjectOps: Send + Sync + 'static {
         Self: Storage,
     {
         let get = self.get_object(src_bucket, src_key, None).await?;
-        let staged = self.stage_body(dst_bucket, dst_key, get.body, None).await?;
+        let staged = self
+            .stage_body(dst_bucket, dst_key, get.body, None, None)
+            .await?;
         self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl)
             .await
     }
@@ -344,23 +385,27 @@ pub trait ObjectOps: Send + Sync + 'static {
         Self: Storage;
 
     /// Replace the object's tag set (S3 PutObjectTagging — replace-all,
-    /// no merge). `NoSuchKey` when the object is missing.
+    /// no merge). `NoSuchKey` when the object is missing. Answers the
+    /// identity the tags landed on and the bucket's records-versions
+    /// bit ([`TagWriteResult`]) — the pair the write path knows, so the
+    /// interface names the touched version without a second read.
     async fn put_object_tags(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         tags: &object::Tags,
-    ) -> Result<(), <Self as Storage>::Error>
+    ) -> Result<TagWriteResult, <Self as Storage>::Error>
     where
         Self: Storage;
 
     /// Remove the object's tag set (S3 DeleteObjectTagging). S3
-    /// semantics: idempotent — a missing object is Ok.
+    /// semantics: idempotent — a missing object is Ok and answers a
+    /// [`TagWriteResult`] naming no identity.
     async fn delete_object_tags(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<(), <Self as Storage>::Error>
+    ) -> Result<TagWriteResult, <Self as Storage>::Error>
     where
         Self: Storage;
 
@@ -431,6 +476,7 @@ mod tests {
             owner: None,
             acl: Acl::default_private(None),
             version_id: None,
+            bucket_records_versions: false,
         };
         let listing = ObjectListing {
             objects: vec![info],
@@ -462,6 +508,7 @@ mod tests {
                 owner: None,
                 acl: Acl::default_private(None),
                 version_id: None,
+                bucket_records_versions: false,
             },
             body: Box::pin(stream::empty()),
             served_range: Some((0, 0)),
@@ -481,6 +528,7 @@ mod tests {
             owner: None,
             acl: Acl::default_private(None),
             version_id: None,
+            bucket_records_versions: false,
         };
         let result = GetObjectResult {
             info,

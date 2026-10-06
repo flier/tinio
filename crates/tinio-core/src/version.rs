@@ -172,6 +172,96 @@ pub fn wire_of(id: Option<&Id>) -> String {
     id.map_or_else(|| "null".to_owned(), |id| id.as_str().to_owned())
 }
 
+/// The address a request's `versionId` names: no version (the current one),
+/// the literal `null` version, or a specific id.
+///
+/// The three states are the wire's, and [`Address::from_wire`] is the one
+/// parse that tells them apart: an absent parameter is
+/// [`Address::Current`], the literal `null` is [`Address::Null`], and
+/// anything else must pass [`Id::new`] — so a malformed value is an error,
+/// never the silent collapse into the null version that [`Id::from_wire`]
+/// alone would take. The type is the one home of the presence the handlers
+/// branch on: a request names a version exactly when the address is not
+/// [`Address::Current`].
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::version::{self, Address};
+///
+/// assert_eq!(Address::from_wire(None).unwrap(), Address::Current);
+/// assert_eq!(Address::from_wire(Some("null")).unwrap(), Address::Null);
+/// assert_eq!(
+///     Address::from_wire(Some("abc")).unwrap(),
+///     Address::Id(version::id("abc").unwrap())
+/// );
+/// assert!(
+///     Address::from_wire(Some("")).is_err(),
+///     "a malformed value is an error, never the null version"
+/// );
+///
+/// assert!(!Address::Current.is_addressed());
+/// assert!(Address::Null.is_addressed(), "the literal names a version");
+/// assert_eq!(Address::Current.id(), None);
+/// assert_eq!(Address::Null.id(), None, "the null version has no id");
+/// let id = version::id("abc").unwrap();
+/// assert_eq!(Address::Id(id).id().map(|id| id.as_str()), Some("abc"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    /// No `versionId` on the wire: the request addresses the current
+    /// version.
+    Current,
+    /// The literal `null`: the request addresses the null version.
+    Null,
+    /// A specific version id.
+    Id(Id),
+}
+
+impl Address {
+    /// Read a request's `versionId` off the wire — the one parse of the
+    /// three states.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_core::version::Address;
+    ///
+    /// assert_eq!(Address::from_wire(None).unwrap(), Address::Current);
+    /// assert_eq!(Address::from_wire(Some("null")).unwrap(), Address::Null);
+    /// assert!(
+    ///     Address::from_wire(Some("x".repeat(1025).as_str())).is_err(),
+    ///     "the identifier rule bounds every other value"
+    /// );
+    /// ```
+    pub fn from_wire(value: Option<&str>) -> Result<Address, Error> {
+        let Some(raw) = value else {
+            return Ok(Address::Current);
+        };
+        if raw == wire_of(None) {
+            return Ok(Address::Null);
+        }
+        Id::new(raw).map(Address::Id)
+    }
+
+    /// Whether the request named a version at all (`false` only for
+    /// [`Address::Current`]) — the presence the fail-open guard and every
+    /// addressed branch key on.
+    pub fn is_addressed(&self) -> bool {
+        !matches!(self, Address::Current)
+    }
+
+    /// The specific id the address names: `None` for the current address
+    /// and for the null one — the null version's identity is the absence
+    /// of an id, the `None` an `Option<Id>` spells it with.
+    pub fn id(&self) -> Option<&Id> {
+        match self {
+            Address::Id(id) => Some(id),
+            Address::Current | Address::Null => None,
+        }
+    }
+}
+
 impl FromStr for Id {
     type Err = Error;
 
@@ -212,6 +302,8 @@ impl TryFrom<&str> for Id {
 ///
 /// assert_eq!(State::default(), State::Unversioned);
 /// assert_eq!(State::Enabled.to_string(), "Enabled");
+/// assert!(State::Enabled.records_versions());
+/// assert!(!State::Unversioned.records_versions());
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Display, FromStr)]
 pub enum State {
@@ -236,6 +328,13 @@ impl State {
     /// Whether writes replace the null version in place.
     pub fn is_suspended(self) -> bool {
         self == State::Suspended
+    }
+
+    /// Whether the bucket records versions at all (enabled or suspended) —
+    /// the one home of the rule behind the version-identity carriers
+    /// (`x-amz-version-id` on a null identity, `Info::bucket_records_versions`).
+    pub fn records_versions(self) -> bool {
+        self != State::Unversioned
     }
 }
 
@@ -267,6 +366,30 @@ impl Marker {
     pub fn none() -> Self {
         Self::default()
     }
+}
+
+/// The shape of one key's current version, as the bounded per-key probe
+/// ([`VersionOps::current_version`](crate::storage::VersionOps::current_version))
+/// sees it — the question behind the plain read's 404 delete-marker
+/// disclosure, answered by exact-key reads rather than a listing page.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::version::CurrentVersion;
+///
+/// assert_eq!(CurrentVersion::default(), CurrentVersion::Absent);
+/// assert_ne!(CurrentVersion::Object, CurrentVersion::Marker);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CurrentVersion {
+    /// The key has no current version at all.
+    #[default]
+    Absent,
+    /// The current version is a content object.
+    Object,
+    /// The current version is a delete marker.
+    Marker,
 }
 
 /// One version as the listing returns it.
@@ -550,6 +673,7 @@ pub enum ReadResult {
 ///     owner: None,
 ///     acl: acl::Acl::default_private(None),
 ///     version_id: None,
+///     bucket_records_versions: false,
 /// });
 /// assert!(matches!(head, version::HeadResult::Object(_)));
 /// ```
@@ -626,6 +750,60 @@ mod tests {
     fn the_null_version_reads_as_absent() {
         assert_eq!(Id::from_wire("null"), None);
         assert_eq!(Id::from_wire("abc").unwrap().as_str(), "abc");
+    }
+
+    #[test]
+    fn the_three_wire_addresses_are_told_apart_by_the_one_parse() {
+        let address = |value: Option<&str>| Address::from_wire(value).unwrap();
+        assert_eq!(address(None), Address::Current);
+        assert_eq!(address(Some("null")), Address::Null);
+        assert_eq!(address(Some("abc")), Address::Id(id("abc").unwrap()));
+        assert_eq!(
+            address(Some(&"x".repeat(MAX_ID_LEN))),
+            Address::Id(id("x".repeat(MAX_ID_LEN)).unwrap()),
+            "the cap is inclusive for a specific id too"
+        );
+        // A malformed value is this parse's error, never the null version:
+        // `Id::from_wire` alone answers the same `None` for both, which is
+        // the collapse the validated constructor exists to forbid.
+        for bad in ["", &"x".repeat(MAX_ID_LEN + 1)] {
+            assert!(
+                Address::from_wire(Some(bad)).is_err(),
+                "{bad:?} must not parse as an address"
+            );
+            assert_eq!(
+                Id::from_wire(bad),
+                None,
+                "…while the value-only parse cannot tell it from the literal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_address_presence_and_id_read_the_three_states() {
+        let address = |value: Option<&str>| Address::from_wire(value).unwrap();
+        assert!(!address(None).is_addressed(), "no version was named");
+        assert!(
+            address(Some("null")).is_addressed(),
+            "the literal names one"
+        );
+        assert!(address(Some("abc")).is_addressed());
+        assert_eq!(address(None).id(), None);
+        assert_eq!(
+            address(Some("null")).id(),
+            None,
+            "the null version has no id"
+        );
+        assert_eq!(address(Some("abc")).id().map(Id::as_str), Some("abc"));
+        // The current and the null address answer the same `id()` — the
+        // id alone cannot carry which one was named, `is_addressed` is the
+        // one discriminant (the reason the handlers hold an address rather
+        // than a parallel presence flag).
+        assert_eq!(address(None).id(), address(Some("null")).id());
+        assert_ne!(
+            address(None).is_addressed(),
+            address(Some("null")).is_addressed()
+        );
     }
 
     #[test]

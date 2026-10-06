@@ -58,7 +58,9 @@ pub use listing::{
 pub use multipart::{
     ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
 };
-pub use object::{GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, PutObjectResult};
+pub use object::{
+    GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, PutObjectResult, TagWriteResult,
+};
 pub use range::ByteRange;
 pub use time::{from_nanos, now_nanos, to_nanos};
 pub use version::{VersionOps, marker_has_no_metadata, rename_allowed};

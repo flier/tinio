@@ -125,7 +125,7 @@ fn state_round_trips_version_and_compact_marker() {
     assert!(state.compact_marker().unwrap());
 }
 
-// The row-shape pins (buckets 4, object_meta 10, uploads 5): redb's
+// The row-shape pins (buckets 4, object_meta 11, uploads 5): redb's
 // `TableDefinition` exposes no value-arity getter in 4.2, so each shape
 // is pinned by writing and reading back a full row through the public
 // handle — the destructure below fails to compile on a narrower tuple,

@@ -28,6 +28,7 @@ pub mod reserved_paths;
 pub mod select;
 pub mod sigv4;
 pub mod tag_filter;
+pub mod versioning;
 
 use std::collections::HashMap;
 
@@ -155,6 +156,13 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         // @minimal-caps entry above, spelled out for the acl.feature
         // headings (the 12 legacy feature files use @minimal-caps).
         caps.acl = false;
+    }
+    if tagged("versioning-off") {
+        // The @versioning-off scenario (spec 2026-10-03-s3-versioning):
+        // the three version operations are refused with NotImplemented
+        // and a version-addressed request is refused outright — never
+        // answered from the current version (the fail-open guard).
+        caps.versioning = false;
     }
     if tagged("max-buckets-3") {
         // The ListBuckets-pagination scenarios need a page cap below the

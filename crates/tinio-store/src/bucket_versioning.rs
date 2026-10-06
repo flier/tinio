@@ -24,6 +24,11 @@ impl TableDef for Def {
 
     const DEF: TableDefinition<'static, Self::Key, Self::Value> =
         TableDefinition::new("bucket_versioning");
+    /// A root written before the version machinery has no
+    /// `bucket_versioning` table, and an absent row already means
+    /// `Unversioned`: the missing table reads as empty
+    /// ([`TableDef::MAY_BE_ABSENT`], spec 2026-10-03).
+    const MAY_BE_ABSENT: bool = true;
 }
 
 /// Handle to the bucket-versioning table (writable or read-only).
@@ -62,6 +67,47 @@ where
             .0
             .get(bucket)?
             .map(|guard| guard.value().parse::<State>().unwrap_or_default()))
+    }
+
+    /// How many buckets hold version data: one range scan of the table,
+    /// counting the rows that do not read [`State::Unversioned`] — a corrupt
+    /// wire reads as `Unversioned` too, the same self-heal [`Self::get`]
+    /// applies, so a row that cannot say its state never counts. One walk of
+    /// the table, never a per-bucket lookup: this is the toggle-off startup
+    /// warning's number, and a large root must stay cheap.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
+    /// use tinio_store::{_core::version::State, bucket_versioning, ensure_all};
+    ///
+    /// let db = Database::builder()
+    ///     .create_with_backend(InMemoryBackend::new())
+    ///     .unwrap();
+    /// {
+    ///     let mut txn = db.begin_write().unwrap();
+    ///     ensure_all(&mut txn).unwrap();
+    ///     {
+    ///         let mut table = bucket_versioning::Table::open(&mut txn).unwrap();
+    ///         table.set("data", State::Enabled).unwrap();
+    ///         table.set("backup", State::Suspended).unwrap();
+    ///     }
+    ///     txn.commit().unwrap();
+    /// }
+    /// let txn = db.begin_read().unwrap();
+    /// let table = bucket_versioning::Table::open_readonly(&txn).unwrap();
+    /// assert_eq!(table.versioned_count().unwrap(), 2);
+    /// ```
+    pub fn versioned_count(&self) -> Result<usize, Error> {
+        let mut count = 0;
+        for entry in self.0.iter()? {
+            let (_, value) = entry?;
+            if value.value().parse::<State>().unwrap_or_default() != State::Unversioned {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -167,6 +213,46 @@ mod tests {
                 Table::open_readonly(txn)?.get("data")?,
                 Some(State::Unversioned),
                 "a corrupt state is the default, never Enabled"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_versioned_count_is_one_scan_and_never_counts_a_silent_row() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            assert_eq!(
+                t.versioned_count()?,
+                0,
+                "an empty table holds no version data"
+            );
+            t.set("enabled", State::Enabled)?;
+            t.set("suspended", State::Suspended)?;
+            // A recorded `Unversioned` row holds no version data, and a
+            // corrupt wire reads as `Unversioned` (the point read's self-heal):
+            // neither counts.
+            t.set("explicit", State::Unversioned)?;
+            t.insert("corrupt", "not-a-state").map_err(Error::from)?;
+            assert_eq!(t.versioned_count()?, 2);
+            t.drain_bucket("enabled")?;
+            assert_eq!(t.versioned_count()?, 1);
+            t.drain_bucket("suspended")?;
+            assert_eq!(
+                t.versioned_count()?,
+                0,
+                "the explicit Unversioned row and the corrupt one both read unversioned"
+            );
+            Ok(())
+        })
+        .unwrap();
+        h.read(|txn| -> Result<(), Error> {
+            assert_eq!(
+                Table::open_readonly(txn)?.versioned_count()?,
+                0,
+                "the read handle sees the same rows the write handle wrote"
             );
             Ok(())
         })

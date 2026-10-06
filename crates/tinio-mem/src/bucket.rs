@@ -590,7 +590,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let mut txn = storage.db.db().begin_write().unwrap();
+            let mut txn = storage.db.db().unwrap().begin_write().unwrap();
             bucket::Table::open(&mut txn)
                 .unwrap()
                 .insert(

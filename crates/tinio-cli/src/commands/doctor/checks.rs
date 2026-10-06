@@ -53,6 +53,11 @@ pub enum Pass {
     Diagnostics,
     /// The repair path: creates the store when it is missing. The store is private state, a
     /// repair owns it, and a first server start would create it anyway.
+    ///
+    /// **A read-only run never asks for it** (FR-023 amended): its metadata source is the root's
+    /// own database, opened read-only, and the relocated tool-state dir holds tool state only —
+    /// asking here would create the very file the mode promises not to write, and
+    /// `FsStorage::new_from_db` would drop the handle unread a line later.
     Fix,
 }
 

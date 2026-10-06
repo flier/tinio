@@ -1,10 +1,13 @@
 //! The shared redb error core: the five redb-mapping variants that
-//! tinio-fs and tinio-mem nest/alias (spec 2026-09-03, grilling Q6).
+//! tinio-fs and tinio-mem nest/alias (spec 2026-09-03, grilling Q6), plus
+//! the read-only refusal the shared handle's arms answer ([`Error::ReadOnly`],
+//! not a redb failure at all — no transaction exists to fail).
 //! fs-lifecycle variants (`Compaction`/`Io`/`UnsupportedVersion`/
 //! `CorruptMeta`) stay in tinio-fs; tinio-mem has no compaction, version
 //! gate, or db-layer file I/O.
 
-/// A redb failure: open, transaction, table, storage, or commit.
+/// A redb failure: open, transaction, table, storage, or commit — or a
+/// write refused by a handle whose database is not open for writing.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Database open/create failed.
@@ -22,6 +25,19 @@ pub enum Error {
     /// Commit failed.
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
+    /// A write was attempted through a handle whose arm does not take
+    /// writes — the read-only and empty arms of [`crate::store::Handle`]
+    /// (FR-023 amended).
+    ///
+    /// The read-only policy refuses every mutating operation upstream and
+    /// a read-only run runs neither the scanner nor the sweeper, so this
+    /// is a programming error in most flows — **except** on the read
+    /// paths that rewrite a row they could not hit (a cold or stale
+    /// object's ensured entry), where the refusal is the designed
+    /// outcome and means "recomputed but not written back" (tinio-fs's
+    /// `Error::is_read_only` asks for it through the nesting).
+    #[error("the state database is read-only")]
+    ReadOnly,
 }
 
 #[cfg(test)]

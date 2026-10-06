@@ -475,7 +475,7 @@ Expected: FAIL — there is no read-only open anywhere in the workspace.
 
 `crates/tinio-fs/src/database/open.rs`: `open_read_only(state_dir)` opens `<state_dir>/meta.redb` with `ReadOnlyDatabase::open` and maps every failure (absent file, corrupt, format the build refuses — checked by reading `state::Table::version`, a missing table included) into the crate error, without creating or writing anything.
 
-`crates/tinio-fs/src/database/handle.rs`: the `db` field becomes the `Db` enum; `read`/`read_blocking` work on both arms; `write`/`write_if` on the read-only arm return an error (`Error::ReadOnly`), which the fs's own tests assert is unreachable in a read-only run's flows.
+`crates/tinio-fs/src/database/handle.rs`: the `db` field becomes the shared `tinio_store::store::Handle`, which owns the `Db` arm enum (writable / read-only / empty) and the read-only refusal — the fs handle keeps only the blocking-pool hop and the write-lock histograms (round B2, one database-handle shape); `read`/`read_blocking` work on both arms; `write`/`write_if` on the read-only arm return an error (`Error::ReadOnly`), which the fs's own tests assert is unreachable in a read-only run's flows.
 
 `crates/tinio-store/src/table.rs`: `open_readonly` currently propagates redb's "table does not exist" error; a read-only handle must treat a missing table as empty, because a root written by a build without versioning has no version tables — that is the difference between "no history" and "this root cannot be read".
 
@@ -525,6 +525,8 @@ git commit -m "feat(read-only): serve the root's metadata, read-only"
 - Produces: the feature file with `@FR-037`-class tags (the corpus's FR-035 and FR-036 are the service verbs and the confinement channels, so this feature's requirements are FR-037 onward), and the corpus text that stops being plan-owned the moment it lands.
 
 - [ ] **Step 1: Write the feature file**
+
+> **Landed 2026-10-06 — this sketch is superseded wherever it differs**: the authoritative record is the landed `crates/tinio-e2e/tests/features/versioning.feature` together with the corpus it drives (`contracts/s3-surface.md` §Object versioning, `data-model.md`, `fs-backend.md`, `tasks.md`), and the sketch below is kept as the plan's own record rather than rewritten — it still shows presence-form header steps where the landed file asserts values, an object-addressed `?versions` where the contract's one listing shape is bucket-addressed (`GET /<bucket>?versions&prefix=…`), and it lacks the landed version-addressed delete journey.
 
 ```gherkin
 Feature: Object versioning

@@ -195,7 +195,7 @@ pub struct FsCleanup {
     /// Idle grace for upload directories without a `UPLOADS` record:
     /// an orphan is deleted only when its parts have been idle at least
     /// this long (the sweep's `multipart_ttl` default; the startup
-    /// orchestration T068 will pass the configured `multipart_expire_days`).
+    /// orchestration T068 passes the configured `multipart_expire_days`).
     multipart_grace: Duration,
 }
 
@@ -220,6 +220,15 @@ impl FsCleanup {
     pub fn with_multipart_grace(mut self, grace: Duration) -> Self {
         self.multipart_grace = grace;
         self
+    }
+
+    /// The orphan-upload idle grace this cleanup judges by — the value
+    /// [`Self::with_multipart_grace`] set, or the sweep's default when no
+    /// override was given. A trivial accessor: it exists so the
+    /// orchestration's wiring (which cleanup the caller builds) can be
+    /// asserted beside the value it was built from.
+    pub fn multipart_grace(&self) -> Duration {
+        self.multipart_grace
     }
 
     /// Stage 1: full `tmp/` clear (no active writers at startup).

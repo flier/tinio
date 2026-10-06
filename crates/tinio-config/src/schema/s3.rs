@@ -106,6 +106,15 @@ pub struct Capabilities {
     #[default = true]
     pub acl: bool,
 
+    /// Object versioning (Get/PutBucketVersioning, ListObjectVersions,
+    /// and the version-addressed object operations). Default on; off
+    /// answers `NotImplemented` on the three versioning operations and
+    /// refuses every version-addressed request outright — a request
+    /// naming a version is never answered from the current object.
+    #[serde(default = "versioning")]
+    #[default = true]
+    pub versioning: bool,
+
     /// Cap on concurrently streaming SelectObjectContent responses
     /// (default 4): each job owns a body forwarder and a seat on the
     /// select rayon pool — without a cap, concurrent selects exhaust
@@ -149,14 +158,44 @@ pub struct Config {
     /// SigV2 verification (deprecated; enabling prints a startup warning).
     #[serde(default)]
     pub sig_v2: bool,
-    /// Stale temp-write sweep timeout (hours).
+    /// Stale temp-write sweep timeout (hours). The floor of 1 is the
+    /// parser's (garde `range(min = 1)`): a zero arms the sweeper
+    /// maximally — it removes a staged write temp mid-PUT — so it is
+    /// refused rather than read as the section's "unlimited" convention.
     #[serde(default = "temp_ttl_hours")]
     #[default = 24]
+    #[garde(range(min = 1))]
     pub temp_ttl_hours: u64,
-    /// Abandoned-upload sweep timeout (days).
+    /// Abandoned-upload sweep timeout (days). The floor of 1 is the
+    /// parser's (garde `range(min = 1)`): a zero aborts every in-flight
+    /// multipart upload on the first pass, so it is refused rather than
+    /// read as "unlimited".
     #[serde(default = "multipart_expire_days")]
     #[default = 7]
+    #[garde(range(min = 1))]
     pub multipart_expire_days: u64,
+    /// Noncurrent versions retained per key: the sweep keeps the newest N
+    /// and expires the rest (default 0 = keep every noncurrent version,
+    /// the safe reading of an unset key).
+    #[serde(default = "noncurrent_keep")]
+    #[default = 0]
+    pub noncurrent_keep: u64,
+    /// Age (days) after which a noncurrent version is expired, measured
+    /// from when it stopped being current (default 0 = never expire by
+    /// age). With `noncurrent_keep` set too, whichever threshold is met
+    /// first expires the version.
+    #[serde(default = "noncurrent_expire_days")]
+    #[default = 0]
+    pub noncurrent_expire_days: u64,
+    /// Minimum age (minutes) before an unreferenced block may be
+    /// reclaimed (default 10): the grace narrows the window in which a
+    /// publish still in flight stores a block the live set does not yet
+    /// know about, so a zero is refused at parse rather than silently
+    /// disarming the guard.
+    #[serde(default = "block_grace_minutes")]
+    #[default = 10]
+    #[garde(range(min = 1))]
+    pub block_grace_minutes: u64,
     /// Cap on concurrently in-progress multipart uploads (default 1000):
     /// without a cap an authenticated client can accumulate an unbounded
     /// number of uploads (each up to 10,000 parts), exhausting disk,
@@ -212,6 +251,10 @@ fn acl() -> bool {
     Capabilities::default().acl
 }
 
+fn versioning() -> bool {
+    Capabilities::default().versioning
+}
+
 fn select_concurrency() -> u32 {
     Capabilities::default().select_concurrency
 }
@@ -232,6 +275,18 @@ fn temp_ttl_hours() -> u64 {
 
 fn multipart_expire_days() -> u64 {
     Config::default().multipart_expire_days
+}
+
+fn noncurrent_keep() -> u64 {
+    Config::default().noncurrent_keep
+}
+
+fn noncurrent_expire_days() -> u64 {
+    Config::default().noncurrent_expire_days
+}
+
+fn block_grace_minutes() -> u64 {
+    Config::default().block_grace_minutes
 }
 
 fn max_concurrent_uploads() -> u32 {
@@ -426,5 +481,52 @@ mod tests {
         );
         assert_eq!(caps.max_buckets, 7);
         assert_eq!(caps.max_keys, 9);
+    }
+
+    #[test]
+    fn versioning_defaults_on_and_the_retention_knobs_default_to_keep_everything() {
+        let config = RootConfig::parse("version = 1\n[s3]").unwrap();
+        let s3 = config.s3.clone().unwrap();
+        assert!(
+            s3.capabilities.versioning,
+            "a core-surface capability defaults on, like tagging"
+        );
+        assert_eq!(s3.noncurrent_keep, 0, "0 = keep every noncurrent version");
+        assert_eq!(s3.noncurrent_expire_days, 0, "0 = never expire by age");
+        assert_eq!(
+            s3.block_grace_minutes, 10,
+            "the block sweep's grace defaults to ten minutes"
+        );
+
+        let off = RootConfig::parse("version = 1\n[s3]\nversioning = false\nnoncurrent_keep = 3\nnoncurrent_expire_days = 30\nblock_grace_minutes = 45").unwrap();
+        let s3 = off.s3.unwrap();
+        assert!(!s3.capabilities.versioning);
+        assert_eq!(s3.noncurrent_keep, 3);
+        assert_eq!(s3.noncurrent_expire_days, 30);
+        assert_eq!(s3.block_grace_minutes, 45);
+    }
+
+    #[test]
+    fn a_zero_block_grace_is_refused() {
+        let err = RootConfig::parse("version = 1\n[s3]\nblock_grace_minutes = 0").unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_zero_sweep_ttl_is_refused() {
+        // The retention neighbours use 0 for "unlimited"; the two TTLs do not: a zero arms
+        // the sweeper maximally (a staged write temp removed mid-PUT, every upload aborted),
+        // so both are floored at 1 exactly like `block_grace_minutes`.
+        let err = RootConfig::parse("version = 1\n[s3]\ntemp_ttl_hours = 0").unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "got {err:?}");
+        let err = RootConfig::parse("version = 1\n[s3]\nmultipart_expire_days = 0").unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "got {err:?}");
+        // The floor itself parses.
+        let config =
+            RootConfig::parse("version = 1\n[s3]\ntemp_ttl_hours = 1\nmultipart_expire_days = 1")
+                .unwrap();
+        let s3 = config.s3.unwrap();
+        assert_eq!(s3.temp_ttl_hours, 1);
+        assert_eq!(s3.multipart_expire_days, 1);
     }
 }

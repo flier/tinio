@@ -13,7 +13,8 @@ use s3s::{S3Request, S3Response, S3Result, dto};
 use crate::{
     _core::storage::{ListObjectsParams, Storage},
     backend::{
-        S3Backend, clamp_page_size, map_backend_error, normalize_delimiter, normalize_page_size,
+        S3Backend, clamp_page_size, common_prefixes, map_backend_error, normalize_delimiter,
+        normalize_page_size,
     },
 };
 
@@ -100,11 +101,7 @@ impl<S: Storage> S3Backend<S> {
                     ..Default::default()
                 })
                 .collect(),
-            common_prefixes: page
-                .common_prefixes
-                .into_iter()
-                .map(|p| dto::CommonPrefix { prefix: Some(p) })
-                .collect(),
+            common_prefixes: common_prefixes(page.common_prefixes),
             truncated: page.truncated,
             next_start_after: page.next_start_after,
         })
@@ -476,7 +473,7 @@ mod tests {
                     b,
                     &k,
                     storage
-                        .stage_body(b, &k, body(key.to_string()), None)
+                        .stage_body(b, &k, body(key.to_string()), None, None)
                         .await
                         .unwrap(),
                     object::Tags::empty(),

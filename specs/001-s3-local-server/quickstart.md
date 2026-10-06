@@ -181,7 +181,7 @@ aws s3 cp ./pic.jpg s3://photos/x.jpg --endpoint-url http://127.0.0.1:9002      
 tinio stop /tmp/tinio-archive
 ```
 
-Expected: reads behave identically to normal mode; every mutating call returns `AccessDenied`; `/tmp/tinio-archive` contains no `.tinio/` (state, config with generated credentials, logs, and the ETag meta store all live under `~/.tinio/roots/<hash>/`); `tinio status /tmp/tinio-archive` works via the home state dir.
+Expected: reads behave identically to normal mode; every mutating call returns `AccessDenied`; the root stays untouched (nothing is written there — with a pre-existing database the run reads the root's own `.tinio/meta.redb` read-only, serving the metadata it records, and degrades to current versions with an empty metadata view plus a warning naming the reason when that open fails); the run's tool state — state file, control socket, logs, and the auto-created config with generated credentials — lives under `~/.tinio/roots/<hash>/`; `tinio status /tmp/tinio-archive` works via the home state dir.
 
 ## CI note
 

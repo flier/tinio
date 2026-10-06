@@ -4216,6 +4216,7 @@ dependencies = [
  "tinio-config",
  "tinio-core",
  "tinio-fs",
+ "tinio-mem",
  "tinio-sandbox",
  "tinio-server",
  "tinio-util",

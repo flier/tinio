@@ -776,7 +776,13 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key(key).unwrap();
         let staged = storage
-            .stage_body(&b, &k, Box::pin(stream::empty::<io::Result<Bytes>>()), None)
+            .stage_body(
+                &b,
+                &k,
+                Box::pin(stream::empty::<io::Result<Bytes>>()),
+                None,
+                None,
+            )
             .await
             .unwrap();
         storage

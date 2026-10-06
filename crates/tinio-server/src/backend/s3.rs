@@ -284,4 +284,29 @@ impl<S: Storage> S3 for S3Backend<S> {
     ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
         self.op_select_object_content(req).await
     }
+
+    // --- versioning (spec 2026-10-03) ---
+    #[cfg(feature = "versioning")]
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<dto::GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<dto::GetBucketVersioningOutput>> {
+        self.op_get_bucket_versioning(req).await
+    }
+
+    #[cfg(feature = "versioning")]
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<dto::PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<dto::PutBucketVersioningOutput>> {
+        self.op_put_bucket_versioning(req).await
+    }
+
+    #[cfg(feature = "versioning")]
+    async fn list_object_versions(
+        &self,
+        req: S3Request<dto::ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<dto::ListObjectVersionsOutput>> {
+        self.op_list_object_versions(req).await
+    }
 }

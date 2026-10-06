@@ -42,7 +42,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use assert_cmd::cargo::cargo_bin;
@@ -193,6 +193,11 @@ pub struct Cli {
     /// The entries the root held when the scenario claimed it: what "exactly as it found it" is
     /// measured against.
     entries: usize,
+    /// The served root's entries at the moment `the served root's entries are recorded` ran — the
+    /// names, lengths and mtimes a later write would move. Recorded rather than counted
+    /// ([`Cli::entries`]) because a run can write a tree without adding an entry to it, which is
+    /// exactly what a state database under the root is.
+    recorded: Option<Vec<RootEntry>>,
     /// The servers a run left serving, in spawn order. Killed and reaped by [`Cli::teardown`].
     children: Vec<Child>,
     /// The root a `--daemon` run left serving.
@@ -336,6 +341,7 @@ impl Cli {
             root,
             vars: Vec::new(),
             entries,
+            recorded: None,
             children: Vec::new(),
             daemon: None,
             sandbox_flag: None,
@@ -3544,22 +3550,86 @@ async fn stderr_reports_read_only(world: &mut World) {
     );
 }
 
-/// The other half of FR-023's relocation, and the one no wire response can carry: the run's own
-/// state database is in the **relocated** state dir the harness handed it
-/// ([`Cli::state`] — the first candidate `resolve::resolve_state_dir` reads in this mode), not in
-/// the served root.
+/// The relocation's amended half (FR-023 amended, 2026-10-03), and the one no wire response can
+/// carry: the **relocated** state dir the harness handed the run ([`Cli::state`] — the first
+/// candidate `resolve::resolve_state_dir` reads in this mode) holds **no database**. The storage
+/// reads the root's own `<root>/.tinio`, opened read-only; the relocated directory is tool state
+/// only (the socket, `state` file and logs a run writes there), which is what keeps a read-only
+/// run from writing anything under the served root.
 ///
-/// **`meta.redb` and not "the directory is non-empty"**: the file is the state the mode must not
-/// write under the root, and the run that wrote it elsewhere is the claim — a directory holding
-/// an unrelated `.tinio.toml` would satisfy a weaker test. The assertion beside it is
-/// `the root holds no state directory`, and the pair is what makes the two homes disjoint.
-#[then("the relocated state dir holds the state database")]
-async fn relocated_state_dir_holds_state_database(world: &mut World) {
+/// **`meta.redb` and not "the directory is empty"**: the run legitimately writes its `state`
+/// file there, so the claim is about the database — the one file whose presence would mean a
+/// second metadata store (the old design's shape). The assertion beside it is
+/// `the root holds no state directory`.
+#[then("the relocated state dir holds no state database")]
+async fn relocated_state_dir_holds_no_state_database(world: &mut World) {
     let path = cli(world).state.join("meta.redb");
     assert!(
-        path.is_file(),
-        "read-only mode's state belongs in the relocated state dir: `{}` is not a file",
+        !path.exists(),
+        "read-only mode keeps no second database: `{}` exists",
         path.display()
+    );
+}
+
+/// One entry of a served-root snapshot: its path relative to the root and, for a file, its length
+/// and mtime (directories contribute their name alone).
+type RootEntry = (PathBuf, Option<(u64, SystemTime)>);
+
+/// Every entry under `root`, sorted by relative path.
+///
+/// A write would move one of these — a new name, a file's length or mtime — so two snapshots are
+/// the portable "the run never wrote this tree" evidence a count alone cannot give: a run that
+/// rewrote the root's own `meta.redb` in place would leave the count unchanged.
+fn snapshot_root(root: &Path) -> Vec<RootEntry> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<RootEntry>) {
+        let entries = fs::read_dir(dir).unwrap_or_else(|err| {
+            panic!("the root `{}` is readable: {err}", root.display());
+        });
+        for entry in entries {
+            let entry = entry.expect("a readable entry");
+            let path = entry.path();
+            let meta = entry.metadata().expect("entry metadata");
+            let file = (!meta.is_dir()).then(|| (meta.len(), meta.modified().expect("mtime")));
+            out.push((
+                path.strip_prefix(root)
+                    .expect("under the root")
+                    .to_path_buf(),
+                file,
+            ));
+            if meta.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries);
+    entries.sort();
+    entries
+}
+
+/// Record the served root's entries — the state the read-only run that follows must leave
+/// untouched (FR-023 amended: the run **reads** the root's own database, so "it did not write the
+/// root" is a claim about a run that opened it, not about one that never looked).
+#[when("the served root's entries are recorded")]
+async fn record_root_entries(world: &mut World) {
+    let cli = cli(world);
+    let snapshot = snapshot_root(&cli.root);
+    cli.recorded = Some(snapshot);
+}
+
+/// The served root holds exactly the entries recorded before the run under test: every name,
+/// every file's length and mtime.
+#[then("the served root holds the entries it recorded")]
+async fn root_holds_the_recorded_entries(world: &mut World) {
+    let cli = cli(world);
+    let recorded = cli
+        .recorded
+        .as_ref()
+        .expect("`the served root's entries are recorded` ran before this assertion");
+    let now = snapshot_root(&cli.root);
+    assert_eq!(
+        &now, recorded,
+        "the run wrote the served root: recorded {recorded:?}, found {now:?}"
     );
 }
 

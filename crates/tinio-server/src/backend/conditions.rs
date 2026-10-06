@@ -194,6 +194,21 @@ impl<'a> ConditionalHeaders<'a> {
         }
         Ok(())
     }
+
+    /// The versioned missing-object policy (spec 2026-10-03): on a bucket
+    /// that records versions, "no current version" — the key never
+    /// existed, or its current version is a delete marker, which a plain
+    /// read answers exactly like an absent key — makes `If-Match` a `404
+    /// NoSuchKey`, not the create-if-absent `412`. `If-None-Match: *`
+    /// passes either way: it applies to the current version only, and
+    /// there is none. A bucket that records nothing keeps
+    /// [`ConditionalHeaders::check_missing`]'s legacy `412`.
+    pub(crate) fn check_missing_versioned(&self, records_versions: bool) -> S3Result<()> {
+        if records_versions && self.if_match.is_some() {
+            return Err(s3_error!(NoSuchKey));
+        }
+        self.check_missing()
+    }
 }
 
 /// The strong ETag-match rule shared by every condition site (the
@@ -765,6 +780,7 @@ mod tests {
             owner: None,
             acl: Acl::default_private(None),
             version_id: None,
+            bucket_records_versions: false,
         }
     }
 

@@ -57,7 +57,7 @@ use crate::{
         etag::ETag,
         from_nanos, object, to_nanos, version,
     },
-    _store::{meta, object_part},
+    _store::{bucket_versioning, meta, object_part},
     Error, bucket,
     database::{Error as DatabaseError, Handle, for_bucket_strict},
     etag::{self, HashBuffer},
@@ -74,6 +74,20 @@ use crate::{
 /// hashing, so any mtime drift re-hashes there (correctness first, F04;
 /// a touch degrades the composed form but a wrong ETag is never served).
 pub(crate) const COMPOSED_MTIME_JITTER: Duration = Duration::from_secs(60);
+
+/// A tag rewrite's answer: the row the write left behind plus the
+/// bucket's records-versions bit, both read in the rewrite's own
+/// transaction. The backend gates the row's identity against the object
+/// file (the read paths' staleness rule) and answers the contract's
+/// `TagWriteResult` — no second read anywhere.
+#[derive(Debug)]
+pub struct TagRow {
+    /// The row the tag write left behind (its other elements verbatim).
+    pub(crate) row: meta::Stored,
+    /// Whether the bucket records versions (read off the same write
+    /// transaction's state table).
+    pub(crate) records_versions: bool,
+}
 
 /// The absolute time difference between two instants (symmetric — an
 /// mtime drift into the past counts the same as into the future).
@@ -493,7 +507,12 @@ impl Store {
         follow_symlinks: bool,
         stale: Option<&version::Id>,
     ) -> Result<(meta::Stored, bool), Error> {
-        if let Some(stored) = self.stored_entry(bucket, key).await? {
+        // The replaced row is kept in hand for the whole call: the tail's
+        // read-only stand-in carries its elements over exactly as the
+        // rewrite's own read would have (`not_written_back`), so the two
+        // answers agree.
+        let mut previous = self.stored_entry(bucket, key).await?;
+        if let Some(stored) = previous.take() {
             if entry_matches(
                 stored.size,
                 stored.mtime,
@@ -518,9 +537,17 @@ impl Store {
             if composed_gate(&stored.etag, stored.size, size)
                 && composed_keep(stored.file_identity, stored.mtime, identity, mtime)
             {
-                let (tags, checksum, owner, acl, version_id, version_seq) = self
+                let Carried {
+                    tags,
+                    checksum,
+                    owner,
+                    acl,
+                    version_id,
+                    version_seq,
+                } = self
                     .rewrite_preserving(bucket, key, &stored.etag, size, mtime, identity, stale)
-                    .await?;
+                    .await
+                    .or_else(|err| not_written_back(Some(&stored), stale, err))?;
                 return Ok((
                     meta::Stored {
                         etag: stored.etag,
@@ -538,15 +565,26 @@ impl Store {
                     false,
                 ));
             }
+            // The stale-entry case falls through to the shared tail; the
+            // row it replaced rides along for the carry-over.
+            previous = Some(stored);
         }
         // One recompute-and-rewrite tail for both the stale-entry and
         // missing-entry cases (the matching and composed-keep branches
         // return above) — the rewrite rule has ONE home (F19).
         let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
         let etag = ETag::Single(digest);
-        let (tags, checksum, owner, acl, version_id, version_seq) = self
+        let Carried {
+            tags,
+            checksum,
+            owner,
+            acl,
+            version_id,
+            version_seq,
+        } = self
             .rewrite_preserving(bucket, key, &etag, size, mtime, identity, stale)
-            .await?;
+            .await
+            .or_else(|err| not_written_back(previous.as_ref(), stale, err))?;
         Ok((
             meta::Stored {
                 etag,
@@ -624,12 +662,12 @@ impl Store {
     /// (the read path's out-of-band-edit verdict). The row this
     /// transaction writes must not keep naming it — the gate judged the
     /// content gone, and a row that still carried the identifier would
-    /// match on the next read and resurrect it. The clear is a
-    /// compare-and-set inside the same transaction: it applies only while
-    /// the row still names `stale`, so a concurrent write that installed
-    /// its own live version is never cleared by a reader that judged the
-    /// previous content.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    /// match on the next read and resurrect it. The clear rides the
+    /// shared [`carried`] rule, whose compare-and-set runs inside this
+    /// same transaction, so a concurrent write that installed its own
+    /// live version is never cleared by a reader that judged the previous
+    /// content.
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_preserving(
         &self,
         bucket: &bucket::Name,
@@ -639,17 +677,7 @@ impl Store {
         mtime: SystemTime,
         identity: u64,
         stale: Option<&version::Id>,
-    ) -> Result<
-        (
-            object::Tags,
-            Option<checksum::Recorded>,
-            Option<acl::OwnerId>,
-            Acl,
-            Option<version::Id>,
-            u64,
-        ),
-        Error,
-    > {
+    ) -> Result<Carried, Error> {
         // The closure runs on the blocking pool (`Handle::write` is
         // async, G3 revision) — clone the borrowed captures into it.
         let bucket = bucket.clone();
@@ -660,33 +688,11 @@ impl Store {
             .write(move |txn| {
                 let mut table = meta::Table::open(txn)?;
                 let row = table.get(&bucket, &key)?;
-                let tags = row
-                    .as_ref()
-                    .map_or_else(object::Tags::empty, |row| row.tags.clone());
-                let checksum = row.as_ref().and_then(|row| row.checksum.clone());
-                let owner = row.as_ref().and_then(|row| row.owner.clone());
-                let acl = row
-                    .as_ref()
-                    .map_or_else(|| Acl::default_private(None), |row| row.acl.clone());
-                // The gate's verdict, applied where the row is written: the
-                // identity rides the row only while the row still names what
-                // the gate judged. A concurrent write that installed its own
-                // version in between moved the field, and its identity is not
-                // this reader's to clear.
-                let cleared = stale.is_some()
-                    && row
-                        .as_ref()
-                        .is_some_and(|row| row.version_id.as_ref() == stale.as_ref());
-                let version_id = if cleared {
-                    None
-                } else {
-                    row.as_ref().and_then(|row| row.version_id.clone())
-                };
-                let version_seq = if cleared {
-                    0
-                } else {
-                    row.as_ref().map_or(0, |row| row.version_seq)
-                };
+                // The carry-over rule, from its one home (`carried`): the
+                // row this transaction re-read is the one the write
+                // preserves, and the gate's verdict (`stale`) is applied
+                // here, where the row is written.
+                let carried = carried(row.as_ref(), stale.as_ref());
                 table.put(
                     &bucket,
                     &key,
@@ -695,16 +701,16 @@ impl Store {
                         size,
                         mtime: to_nanos(mtime),
                         file_identity: identity,
-                        tags: tags.clone(),
-                        checksum: checksum.clone(),
-                        owner: owner.clone(),
-                        acl: acl.clone(),
-                        version_id: version_id.clone(),
-                        version_seq,
+                        tags: carried.tags.clone(),
+                        checksum: carried.checksum.clone(),
+                        owner: carried.owner.clone(),
+                        acl: carried.acl.clone(),
+                        version_id: carried.version_id.clone(),
+                        version_seq: carried.version_seq,
                         is_delete_marker: false,
                     },
                 )?;
-                Ok((tags, checksum, owner, acl, version_id, version_seq))
+                Ok(carried)
             })
             .await
             .map_err(Into::into)
@@ -727,29 +733,44 @@ impl Store {
     /// Replace the stored tag set of `key`, preserving the row's other
     /// elements — one read-modify-write transaction (last-writer-wins
     /// against concurrent writes, like every tagging op — spec
-    /// 2026-08-31: tagging ops take no per-key lock). Returns whether a
-    /// row was updated: a missing row is not created here — the object
-    /// file exists but its row is absent (a hand-dropped object), and
-    /// the caller heals the row first (the etag is not derivable without
-    /// a content hash).
+    /// 2026-08-31: tagging ops take no per-key lock). Answers the
+    /// rewritten row and the bucket's records-versions bit ([`TagRow`]),
+    /// both read in the SAME transaction — the tag write's answer, no
+    /// second read — or `None` when no row was updated: a missing row is
+    /// not created here — the object file exists but its row is absent (a
+    /// hand-dropped object), and the caller heals the row first (the
+    /// etag is not derivable without a content hash).
     pub async fn set_tags(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         tags: &object::Tags,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<TagRow>, Error> {
         let bucket = bucket.clone();
         let key = key.clone();
         let tags = tags.clone();
         self.handle
             .write_if(move |txn| {
-                Ok(meta::Table::open(txn)?
-                    .put_tags(&bucket, &key, &tags)?
-                    .is_some()
-                    .then_some(()))
+                let row = {
+                    let mut table = meta::Table::open(txn)?;
+                    if table.put_tags(&bucket, &key, &tags)?.is_none() {
+                        return Ok(None);
+                    }
+                    table.get(&bucket, &key)?
+                };
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let records_versions = bucket_versioning::Table::open(txn)?
+                    .get(bucket.as_ref().as_str())?
+                    .unwrap_or_default()
+                    .records_versions();
+                Ok(Some(TagRow {
+                    row,
+                    records_versions,
+                }))
             })
             .await
-            .map(|wrote| wrote.is_some())
             .map_err(Into::into)
     }
 
@@ -761,7 +782,9 @@ impl Store {
     /// row (F19, like `ensure_row`); a row that appears between the
     /// probe and the write is tag-updated, never clobbered. A file that
     /// vanishes before the hash surfaces as the hash's `NotFound`
-    /// (the caller maps it to `NoSuchKey`).
+    /// (the caller maps it to `NoSuchKey`). Answers the written row and
+    /// the bucket state ([`TagRow`]), the state read riding the same
+    /// transaction.
     pub(crate) async fn ensure_tags(
         &self,
         bucket: &bucket::Name,
@@ -769,9 +792,9 @@ impl Store {
         path: &Path,
         follow_symlinks: bool,
         tags: &object::Tags,
-    ) -> Result<(), Error> {
-        if self.set_tags(bucket, key, tags).await? {
-            return Ok(());
+    ) -> Result<TagRow, Error> {
+        if let Some(written) = self.set_tags(bucket, key, tags).await? {
+            return Ok(written);
         }
         let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
         let etag = ETag::Single(digest);
@@ -780,6 +803,13 @@ impl Store {
         let tags = tags.clone();
         self.handle
             .write(move |txn| {
+                // The bucket state first: the write handle borrows the
+                // transaction exclusively, so each table is a separate
+                // pass (the shared-handle rule).
+                let records_versions = bucket_versioning::Table::open(txn)?
+                    .get(bucket.as_ref().as_str())?
+                    .unwrap_or_default()
+                    .records_versions();
                 let mut table = meta::Table::open(txn)?;
                 // A row that appeared during the hash keeps its checksum,
                 // owner, ACL and current-version identity (the
@@ -798,24 +828,24 @@ impl Store {
                             )
                         },
                     );
-                table.put(
-                    &bucket,
-                    &key,
-                    &meta::Stored {
-                        etag: etag.clone(),
-                        size,
-                        mtime: to_nanos(mtime),
-                        file_identity: identity,
-                        tags: tags.clone(),
-                        checksum,
-                        owner,
-                        acl,
-                        version_id,
-                        version_seq,
-                        is_delete_marker: false,
-                    },
-                )?;
-                Ok(())
+                let stored = meta::Stored {
+                    etag: etag.clone(),
+                    size,
+                    mtime: to_nanos(mtime),
+                    file_identity: identity,
+                    tags: tags.clone(),
+                    checksum,
+                    owner,
+                    acl,
+                    version_id,
+                    version_seq,
+                    is_delete_marker: false,
+                };
+                table.put(&bucket, &key, &stored)?;
+                Ok(TagRow {
+                    row: stored,
+                    records_versions,
+                })
             })
             .await
             .map_err(Into::into)
@@ -823,19 +853,38 @@ impl Store {
 
     /// Clear the stored tag set of `key`, preserving the row's other
     /// elements (idempotent — a missing row is a no-op, and an
-    /// already-empty set commits nothing).
-    pub async fn clear_tags(&self, bucket: &bucket::Name, key: &object::Key) -> Result<(), Error> {
+    /// already-empty set commits nothing). Answers the cleared row and
+    /// the bucket's records-versions bit ([`TagRow`]), read in the SAME
+    /// transaction — or `None` when no row was there to clear.
+    pub async fn clear_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Option<TagRow>, Error> {
         let bucket = bucket.clone();
         let key = key.clone();
         self.handle
             .write_if(move |txn| {
-                Ok(meta::Table::open(txn)?
-                    .clear_tags(&bucket, &key)?
-                    .unwrap_or(false)
-                    .then_some(()))
+                let row = {
+                    let mut table = meta::Table::open(txn)?;
+                    if table.clear_tags(&bucket, &key)?.is_none() {
+                        return Ok(None);
+                    }
+                    table.get(&bucket, &key)?
+                };
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let records_versions = bucket_versioning::Table::open(txn)?
+                    .get(bucket.as_ref().as_str())?
+                    .unwrap_or_default()
+                    .records_versions();
+                Ok(Some(TagRow {
+                    row,
+                    records_versions,
+                }))
             })
             .await
-            .map(|_| ())
             .map_err(Into::into)
     }
 
@@ -1167,6 +1216,93 @@ impl Store {
     }
 }
 
+/// The row elements a content-derived rewrite carries over from the row it
+/// replaces — the one shape [`carried`] builds, which
+/// [`Store::rewrite_preserving`] returns and [`not_written_back`] serves,
+/// so the write's answer and the read-only stand-in can never describe
+/// different values (FR-023 amended, design 2026-10-03 **Read paths**).
+///
+/// The tags, checksum, owner and ACL are the elements the API last wrote
+/// (only an API write clears them — a content-derived rewrite preserves
+/// them), and `version_id`/`version_seq` are the row's current-version
+/// identity, cleared (`None` + `0`) when the caller's staleness gate judged
+/// it invalid — the compare-and-set [`carried`] applies. A row that was not
+/// there leaves every element at its default.
+struct Carried {
+    /// The carried-over tag set (empty when no row was there).
+    tags: object::Tags,
+    /// The carried-over checksum record.
+    checksum: Option<checksum::Recorded>,
+    /// The carried-over owner.
+    owner: Option<acl::OwnerId>,
+    /// The carried-over ACL (the private default when no row was there).
+    acl: Acl,
+    /// The carried-over current-version identity.
+    version_id: Option<version::Id>,
+    /// The carried-over current version's sequence number.
+    version_seq: u64,
+}
+
+/// The carry-over rule a content-derived rewrite applies to the row it
+/// replaces — **one home** for the decision, taken by the write closure
+/// (which passes the row it re-reads inside its transaction) and by the
+/// read-only stand-in [`not_written_back`] (which passes its `previous`),
+/// so the two can never describe different values (FR-023 amended, design
+/// 2026-10-03 **Read paths**).
+///
+/// The tags, checksum, owner and ACL ride the rewrite verbatim; the
+/// current-version identity is a **compare-and-set**: it rides the row
+/// only while the row still names what `stale` judged invalid — a
+/// concurrent write that installed its own version in between moved the
+/// field, and its identity is not this reader's to clear. A row that was
+/// not there ([`None`], or an absent `previous`) leaves every element at
+/// its default.
+fn carried(row: Option<&meta::Stored>, stale: Option<&version::Id>) -> Carried {
+    let Some(row) = row else {
+        return Carried {
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+            version_id: None,
+            version_seq: 0,
+        };
+    };
+    let cleared = stale.is_some() && row.version_id.as_ref() == stale;
+    Carried {
+        tags: row.tags.clone(),
+        checksum: row.checksum.clone(),
+        owner: row.owner.clone(),
+        acl: row.acl.clone(),
+        version_id: if cleared {
+            None
+        } else {
+            row.version_id.clone()
+        },
+        version_seq: if cleared { 0 } else { row.version_seq },
+    }
+}
+
+/// The carry-over elements a **read-only** handle's refused rewrite serves
+/// (FR-023 amended, design 2026-10-03 **Read paths**): the recomputation
+/// is answered but "simply not written back".
+///
+/// The values are the ones [`Store::rewrite_preserving`] would have
+/// written — the replaced row's elements through the shared [`carried`]
+/// rule, and the absent row's defaults when there was no row. Every error
+/// that is *not* the read-only refusal propagates unchanged: a read-only
+/// run degrades, it does not swallow real failures.
+fn not_written_back(
+    previous: Option<&meta::Stored>,
+    stale: Option<&version::Id>,
+    err: Error,
+) -> Result<Carried, Error> {
+    if !err.is_read_only() {
+        return Err(err);
+    }
+    Ok(carried(previous, stale))
+}
+
 /// Create a store over its **own** state database at `<state_dir>`.
 ///
 /// Each call opens the `meta.redb` file exclusively — creating two
@@ -1357,7 +1493,7 @@ mod tests {
 
         // The read-modify-write element updates.
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
-        assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap().is_some());
         assert_eq!(
             stored_version(&store, &b, &k).await,
             planted,
@@ -1456,8 +1592,8 @@ mod tests {
         let k = object::key("a.txt").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         // A missing row: no update — the caller heals the row first
-        // (ensure_tags) and the bool answers "row was not updated".
-        assert!(!store.set_tags(&b, &k, &tags).await.unwrap());
+        // (ensure_tags) and the `None` answers "row was not updated".
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap().is_none());
         store
             .set(
                 &b,
@@ -1469,7 +1605,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap().is_some());
         assert_eq!(store.tags(&b, &k).await.unwrap(), tags);
         // The row's other elements ride the rewrite.
         let row = store
@@ -1480,11 +1616,11 @@ mod tests {
             .unwrap();
         assert_eq!(row.size, 3);
         assert_eq!(row.file_identity, 7);
-        // An identical set still reports an update: the bool is the
+        // An identical set still reports a row: the `Some` is the
         // "row exists" probe of [`Self::ensure_tags`] (it short-circuits
         // the hash-heal), and the table's change-detection already
         // skipped the row write.
-        assert!(store.set_tags(&b, &k, &tags).await.unwrap());
+        assert!(store.set_tags(&b, &k, &tags).await.unwrap().is_some());
     }
 
     /// `ensure_tags`'s missing-row branch: a hand-dropped object (a file

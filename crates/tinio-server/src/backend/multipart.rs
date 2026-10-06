@@ -25,8 +25,12 @@ use tracing::warn;
 use crate::_core::acl;
 #[cfg(feature = "copy")]
 use crate::_core::storage::ByteRange;
+#[cfg(feature = "copy")]
+use crate::_core::version;
 #[cfg(feature = "acl")]
 use crate::backend::acls::grant_headers;
+#[cfg(feature = "copy")]
+use crate::backend::copy_source_version;
 #[cfg(feature = "copy")]
 use crate::backend::{ConditionalHeaders, byte_range};
 use crate::{
@@ -45,8 +49,10 @@ use crate::{
             self, HasFields, VerifyState, VerifyStream, compose_composite, echo_validated,
             linearize_full_object, map_part_error, single_checksum_value,
         },
-        map_backend_error, normalize_delimiter, normalize_page_size, same_whole_second,
+        common_prefixes, map_backend_error, normalize_delimiter, normalize_page_size,
+        same_whole_second,
         tags::parse_tagging_header,
+        versioning::{query_version_id, require_versioning},
     },
 };
 
@@ -210,6 +216,15 @@ impl<S: Storage> S3Backend<S> {
         use crate::_core::acl::Acl;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        // The fail-open guard for a request carrying `versionId`: s3s's
+        // non-`minio` `CreateMultipartUploadInput` drops the parameter
+        // (the field exists only under s3s's `minio` feature, which this
+        // workspace does not enable), so the guard reads it from the raw
+        // query. With versioning unavailable the request is refused like
+        // every other version-addressed one, and with versioning
+        // available the parameter stays ignored (the create is the plain
+        // create; no per-version behavior is invented).
+        require_versioning(self, query_version_id(&req.uri))?;
         // The create-time checksum spec is persisted and drives the
         // per-part algorithm consistency + the compute-only tee (spec
         // 2026-08-31); the toggle off ⇒ today's accept-and-drop.
@@ -432,6 +447,11 @@ impl<S: Storage> S3Backend<S> {
         let upload_id = req.input.upload_id;
         let part_number = part_number(req.input.part_number)?;
         let (src_bucket, src_key) = self.copy_source(&req.input.copy_source)?;
+        // The source's `versionId`, through the shared wire-value path:
+        // the fail-open guard, then the one parse. A version-addressed
+        // source streams that version's bytes (the copy-part primitive
+        // has no version parameter).
+        let src_address = self.version_address(copy_source_version(&req.input.copy_source))?;
 
         // The copy source's byte range, if any (`x-amz-copy-source-range`).
         let range = req
@@ -443,12 +463,13 @@ impl<S: Storage> S3Backend<S> {
 
         // Source conditionals (412 on failure, per S3 copy semantics):
         // the head's info carries the source ETag + mtime (no body — the
-        // copy primitive moves the bytes). The source head and the
+        // copy primitive moves the bytes). The source read and the
         // destination upload's checksum spec are independent reads — run
         // them concurrently (the spec comes from the read-through cache,
         // F04: a 10k-part copy flow pays the same zero storage reads as
-        // UploadPart).
-        let (head, algo) = tokio::join!(self.storage.head_object(&src_bucket, &src_key), async {
+        // UploadPart). A version-addressed source reads that version's
+        // bytes here; the plain source keeps the head + primitive path.
+        let spec_read = async {
             if self.caps.checksum {
                 self.upload_checksum_spec(&bucket, &key, &upload_id)
                     .await
@@ -456,9 +477,26 @@ impl<S: Storage> S3Backend<S> {
             } else {
                 Ok(None)
             }
-        },);
-        let info = head.map_err(map_backend_error)?;
-        let algo = algo?;
+        };
+        let (info, src_body, algo) = if src_address.is_addressed() {
+            let (fetched, algo) = tokio::join!(
+                self.storage
+                    .get_object_version(&src_bucket, &src_key, src_address.id(), range),
+                spec_read,
+            );
+            let algo = algo?;
+            match fetched.map_err(map_backend_error)? {
+                version::ReadResult::Object(result) => (result.info, Some(result.body), algo),
+                // A marker holds no bytes: the copy's source is missing.
+                version::ReadResult::Marker { .. } => {
+                    return Err(s3_error!(NoSuchKey, "the source is a delete marker"));
+                }
+            }
+        } else {
+            let (head, algo) =
+                tokio::join!(self.storage.head_object(&src_bucket, &src_key), spec_read);
+            (head.map_err(map_backend_error)?, None, algo?)
+        };
         ConditionalHeaders::new(
             req.input.copy_source_if_match.as_ref(),
             req.input.copy_source_if_none_match.as_ref(),
@@ -475,15 +513,22 @@ impl<S: Storage> S3Backend<S> {
         // unix). Toggle off ⇒ exactly today's code path.
         let (part, echo) = if let Some(algo) = algo {
             // The compute-only tee's digest rides into the backend's
-            // commit transaction with the part row.
+            // commit transaction with the part row. The bytes come from
+            // the version-addressed read above when the source named one,
+            // and from the plain source's ranged read otherwise.
             let state = Arc::new(VerifyState::new(algo == Algorithm::Md5));
             let spec = checksum::Spec::compute_only(algo);
-            let get = self
-                .storage
-                .get_object(&src_bucket, &src_key, range)
-                .await
-                .map_err(map_backend_error)?;
-            let body = VerifyStream::wrap(get.body, &spec, None, &state);
+            let body = match src_body {
+                Some(body) => body,
+                None => {
+                    self.storage
+                        .get_object(&src_bucket, &src_key, range)
+                        .await
+                        .map_err(map_backend_error)?
+                        .body
+                }
+            };
+            let body = VerifyStream::wrap(body, &spec, None, &state);
             let part = self
                 .storage
                 .upload_part(
@@ -498,6 +543,16 @@ impl<S: Storage> S3Backend<S> {
                 .map_err(|err| map_part_error(Some(&state), err))?;
             let echo = state.computed().map(|computed| (algo, computed));
             (part, echo)
+        } else if let Some(body) = src_body {
+            // A version-addressed source without a create-algorithm: the
+            // version's bytes stream straight into the part (the
+            // copy-part primitive cannot name a version).
+            let part = self
+                .storage
+                .upload_part(&bucket, &key, &upload_id, part_number, body, None)
+                .await
+                .map_err(map_backend_error)?;
+            (part, None)
         } else {
             let part = self
                 .storage
@@ -843,7 +898,7 @@ impl<S: Storage> S3Backend<S> {
         self.evict_checksum_spec(&upload_id);
         let location = Some(format!("/{bucket}/{}", info.key));
         let mut output = dto::CompleteMultipartUploadOutput {
-            bucket: Some(String::from(bucket)),
+            bucket: Some(String::from(bucket.clone())),
             key: Some(String::from(key)),
             e_tag: Some(Self::etag_wire(&info.etag)),
             location,
@@ -852,7 +907,16 @@ impl<S: Storage> S3Backend<S> {
         if let Some((algo, value, _)) = echo_checksum {
             output.set_checksum(algo, value.as_str());
         }
-        Ok(S3Response::new(output))
+        let mut resp = S3Response::new(output);
+        // The version the completion published (`null` on a suspended
+        // bucket; nothing on one that records no versions) — the
+        // committed `Info` carries the bucket state.
+        self.echo_version_id(
+            &mut resp.headers,
+            info.version_id.as_ref(),
+            info.bucket_records_versions,
+        );
+        Ok(resp)
     }
 
     #[cfg(feature = "multipart")]
@@ -1043,11 +1107,7 @@ impl<S: Storage> S3Backend<S> {
                 ..Default::default()
             })
             .collect();
-        let common_prefixes = page
-            .common_prefixes
-            .into_iter()
-            .map(|p| dto::CommonPrefix { prefix: Some(p) })
-            .collect();
+        let common_prefixes = common_prefixes(page.common_prefixes);
         Ok(S3Response::new(dto::ListMultipartUploadsOutput {
             bucket: Some(String::from(bucket)),
             is_truncated: Some(page.truncated),

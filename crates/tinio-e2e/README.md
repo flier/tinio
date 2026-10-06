@@ -52,6 +52,7 @@ by the in-process server and the `@external` spawn); feature-level tags are inhe
 | `@read-only` | scenario | `PlaneConfig::read_only` — every mutating operation answers `AccessDenied` (FR-023). An `@external` scenario spells the same mode on its spawned server (`--read-only`; `steps/clients.rs`). |
 | `@acl` | scenario | The identity-wired ACL plane (`DataPlane::new_with_acl`, the config fixture's identity): the four ACL ops and the enforced authorization pipeline; read by the `#[before]` hook, which spawns this plane instead of the plain one. |
 | `@acl-off` | scenario | `caps.acl = false` on the legacy no-identity plane — the four ACL ops answer `NotImplemented`; read by `config_from_tags`, and not `@acl`'s branch. |
+| `@versioning-off` | scenario | `caps.versioning = false` — the three `?versioning` ops answer `NotImplemented`, and a version-addressed request is refused outright rather than answered from the current version (the fail-open guard, FR-039). |
 | `@cold-listing` | scenario | fs scanner interval 100 ms (cold-listing scenarios). |
 | `@parquet` | scenario | Parquet input; needs `--features parquet` (the reader lives behind `tinio-server/select-parquet`) — excluded by the default filter when the feature is off. |
 | `@max-buckets-3` | scenario | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
@@ -150,6 +151,9 @@ were replaced by the cucumber `@interop`/`@boto3`/`@mc` features).
 | Auth (SigV4) | US3 (auth.sh) | US3 | — | ✓ (alias) |
 | Cold listing w/ and w/o scanner | ✓ (interop/advanced.feature) | — | — | — |
 | Ephemeral port (`--port 0`) | ✓ (interop/journey.feature) | — | — | — |
+| Version history (overwrite, `?versions`, marker, restore, purge) | ✓ (interop/journey.feature) | — | ✓ (boto3_journey.py) | — |
+
+**Versioning legs (2026-10-05, plan 3 fix wave):** both external journeys gained the versioning legs — the `@interop` scenario `The version history journey with aws cli v2` and the versioning section of `crates/tinio-server/tests/boto3_journey.py` — and both ran the same day on Windows: `--tags '@interop and not @confinement'` finished 22 scenarios / 191 steps green against aws cli v2, and `--tags '@boto3 and not @confinement'` finished 3 scenarios green against boto3 1.43.108 in the conventional `<target>/tinio-e2e-venv`. The tiers' own gating is unchanged: the aws cli legs join the mandated tier CI's interop stage already runs (`@interop and not @confinement`), and the boto3 legs stay on the best-effort tier, which CI never runs (FR-025).
 
 ### Known deviations (documented, v1)
 

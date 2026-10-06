@@ -17,6 +17,10 @@
 //! `copy_object` toggle (FR-021); the tagging ops gate on `caps.tagging`.
 
 use std::sync::Arc;
+/// The stage tee slot's digest cell: the version-addressed copy carries the
+/// source version's recorded checksum into the destination's recorded row
+/// through it.
+#[cfg(feature = "copy")]
 /// The copy-only conditionals of [`op_copy_object`]/[`op_rename_object`]
 /// (`x-amz-if-match`/`x-amz-if-none-match`, the `x-amz-rename-source-if-*`
 /// String fields, and the shared 412 constructor): the destination-put
@@ -40,8 +44,7 @@ use crate::_auth::source::rename_source;
 use crate::_core::acl::Acl;
 #[cfg(feature = "copy")]
 use crate::backend::{
-    conditions::{ConditionFailure, condition_error},
-    parse_etag_condition_header, parse_etag_condition_value,
+    copy_source_version, parse_etag_condition_header, parse_etag_condition_value,
 };
 #[cfg(feature = "acl")]
 use crate::{
@@ -52,11 +55,12 @@ use crate::{
 };
 use crate::{
     _core::{
-        acl, bucket,
+        BodyStream, acl, bucket,
         checksum::Algorithm,
         object,
         object::OBJECT_TAGS_MAX,
         storage::{Error as StorageError, GetObjectResult, Storage},
+        version,
     },
     backend::{
         ConditionalHeaders, DeleteConditions, S3Backend, byte_range, check_write_shape,
@@ -65,9 +69,11 @@ use crate::{
             HasFields, Spec, VerifyState, VerifyStream, echo_recorded, echo_validated,
             map_part_error,
         },
+        conditions::{ConditionFailure, condition_error},
         decide_fetch, decide_range_error, generation_changed, map_backend_error,
-        normalize_page_size, parse_if_range,
+        normalize_page_size, parse_if_range, set_version_headers,
         tags::{parse_tagging_header, tag_set_from_tags, tags_from_tag_set},
+        versioning::{object_of, query_version_id, read_object_of, require_versioning},
     },
 };
 
@@ -81,6 +87,22 @@ use crate::{
 /// (request-shape error, before the body is staged); this checker keeps
 /// only the state-dependent part.
 impl<S: Storage> S3Backend<S> {
+    /// Map a read's storage error: a missing key is the object family's
+    /// `404` (with the delete-marker disclosure, [`Self::no_such_object`]),
+    /// anything else the shared backend mapping. One home for the idiom the
+    /// GET and HEAD read paths share.
+    pub(crate) async fn read_error(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        err: StorageError,
+    ) -> S3Error {
+        match err {
+            StorageError::NoSuchKey(_) => self.no_such_object(bucket, key).await,
+            err => map_backend_error(err),
+        }
+    }
+
     /// Head the object at `(bucket, key)`, mapping a missing object to
     /// `None` — the conditional paths' "no current state" case. One home
     /// for the preamble the destination, delete, and complete checks
@@ -120,7 +142,10 @@ impl<S: Storage> S3Backend<S> {
         if let Some(info) = self.head_optional(bucket, key).await? {
             conditions.check(&info.etag, info.last_modified, true)?;
         } else {
-            conditions.check_missing()?;
+            // A key with no current version: the versioned policy makes
+            // `If-Match` a 404 on a bucket that records versions (the
+            // current version is a delete marker, or there never was one).
+            conditions.check_missing_versioned(self.records_versions(bucket).await)?;
         }
         Ok(())
     }
@@ -166,14 +191,42 @@ impl<S: Storage> S3Backend<S> {
     }
 }
 
-/// The batch-delete error entry for a failed key (the S3 error into the
-/// wire `dto::Error` shape).
-fn delete_error(err: &S3Error, key: String) -> dto::Error {
+/// The batch-delete error entry for a failed entry (the S3 error into the
+/// wire `dto::Error` shape). `named_version` is the entry's own `versionId`
+/// when the request carried one: AWS's `Error` element names the version
+/// the caller asked to delete, so a failed entry answers with the version
+/// it addressed rather than with a bare key.
+fn delete_error(err: &S3Error, key: String, named_version: Option<&str>) -> dto::Error {
     dto::Error {
         code: Some(err.code().as_str().into()),
         message: err.message().map(str::to_string),
         key: Some(key),
-        version_id: None,
+        version_id: named_version.map(str::to_owned),
+    }
+}
+
+/// The batch-delete success entry of one key, from the [`version::Marker`]
+/// the delete path answered — the same triple the single-object `DELETE`
+/// renders as `x-amz-version-id` / `x-amz-delete-marker`:
+/// `VersionId` only when the request named one (AWS's shape; the wire
+/// value the request sent — the literal `null` included — so an entry
+/// addressing the null version names it), and `DeleteMarkerVersionId` the
+/// identity of the marker a versioned delete created (or permanently
+/// removed).
+fn deleted_entry(
+    key: String,
+    marker: &version::Marker,
+    address: &version::Address,
+) -> dto::DeletedObject {
+    dto::DeletedObject {
+        key: Some(key),
+        version_id: address
+            .is_addressed()
+            .then(|| version::wire_of(marker.id.as_ref())),
+        delete_marker: marker.is_delete_marker.then_some(true),
+        delete_marker_version_id: marker
+            .is_delete_marker
+            .then(|| version::wire_of(marker.id.as_ref())),
     }
 }
 
@@ -185,6 +238,16 @@ impl<S: Storage> S3Backend<S> {
         // Cloned: the checksum-spec parse below borrows the whole input.
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
+        // The fail-open guard for a request carrying `versionId`: s3s's
+        // non-`minio` `PutObjectInput` drops the parameter (the field
+        // exists only under s3s's `minio` feature, which this workspace
+        // does not enable), so the guard reads it from the raw query.
+        // With versioning unavailable the request is refused like every
+        // other version-addressed one — never answered as an ordinary
+        // write — and with versioning available the parameter stays
+        // ignored (the write is the plain write; no per-version behavior
+        // is invented).
+        require_versioning(self, query_version_id(&req.uri))?;
 
         // The write-path shape gate (AWS conditional writes): If-Match +
         // If-None-Match together → 400, and If-None-Match accepts `*`
@@ -294,6 +357,7 @@ impl<S: Storage> S3Backend<S> {
                 &key,
                 body,
                 tee.as_ref().map(|(state, _)| state.slot()),
+                None,
             )
             .await
             .map_err(|err| map_part_error(tee.as_ref().map(|(state, _)| state.as_ref()), err))?;
@@ -324,7 +388,16 @@ impl<S: Storage> S3Backend<S> {
             ..Default::default()
         };
         echo_validated(&mut output, tee.as_ref());
-        Ok(S3Response::new(output))
+        let mut resp = S3Response::new(output);
+        // The version the write created (`null` on a suspended bucket;
+        // nothing on one that records no versions) — the committed
+        // `Info` carries the bucket state, so no state read runs here.
+        self.echo_version_id(
+            &mut resp.headers,
+            put.version_id.as_ref(),
+            put.bucket_records_versions,
+        );
+        Ok(resp)
     }
 
     pub(crate) async fn op_get_object(
@@ -333,6 +406,12 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::GetObjectOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        // The version address, through the one wire-value path: the
+        // fail-open guard first (a version-addressed request on a server
+        // without versioning is refused, never answered from the current
+        // version), then the one parse (a malformed value is 400; the
+        // literal `null` is the null version).
+        let address = self.version_address(req.input.version_id.as_deref())?;
 
         let range = req.input.range.map(byte_range);
         let conditions = ConditionalHeaders::new(
@@ -341,6 +420,53 @@ impl<S: Storage> S3Backend<S> {
             req.input.if_modified_since,
             req.input.if_unmodified_since,
         );
+        // A version-addressed read (spec 2026-10-03): the named version is
+        // immutable, so the conditions evaluate against its own snapshot
+        // and none of the head/refetch race handling below applies. A
+        // delete marker is the `405` rule, not a body.
+        let if_range = parse_if_range(&req.headers);
+        if address.is_addressed() {
+            let mut fetched = read_object_of(
+                self.storage
+                    .get_object_version(&bucket, &key, address.id(), range)
+                    .await
+                    .map_err(map_backend_error)?,
+            )?;
+            // If-Range still gates the Range (RFC 9110 §13.1.5). The
+            // version never changes, so a stale validator only costs the
+            // full re-read of the same bytes — never the plain path's
+            // generation race.
+            if let (Some(ir), Some(_)) = (if_range.as_ref(), fetched.served_range)
+                && !ir.matches(&fetched.info.etag, fetched.info.last_modified)
+            {
+                fetched = match self
+                    .storage
+                    .get_object_version(&bucket, &key, address.id(), None)
+                    .await
+                    .map_err(map_backend_error)?
+                {
+                    version::ReadResult::Object(result) => result,
+                    // Unreachable: the version was just read as an object.
+                    version::ReadResult::Marker { .. } => {
+                        return Err(s3_error!(NoSuchKey, "the version changed under the read"));
+                    }
+                };
+            }
+            let GetObjectResult {
+                body,
+                served_range,
+                info,
+            } = fetched;
+            conditions.check(&info.etag, info.last_modified, false)?;
+            let mut resp = S3Response::new(self.get_output(
+                &info,
+                body,
+                served_range,
+                req.input.response_content_type,
+            ));
+            set_version_headers(&mut resp.headers, info.version_id.as_ref(), false);
+            return Ok(resp);
+        }
         // If-Range gates the Range header only (RFC 9110 §13.1.5); a
         // parse failure or a wildcard drops the header. Read-path
         // snapshot policy: ONLY a Range request carrying RFC 7232
@@ -354,15 +480,12 @@ impl<S: Storage> S3Backend<S> {
         // snapshot discards the served range and refetches the full
         // object (below) — a stale validator pays a wasted range read,
         // no more.
-        let if_range = parse_if_range(&req.headers);
         let needs_head = range.is_some() && !conditions.absent();
         let head = if needs_head {
-            Some(
-                self.storage
-                    .head_object(&bucket, &key)
-                    .await
-                    .map_err(map_backend_error)?,
-            )
+            match self.storage.head_object(&bucket, &key).await {
+                Ok(info) => Some(info),
+                Err(err) => return Err(self.read_error(&bucket, &key, err.into()).await),
+            }
         } else {
             None
         };
@@ -424,7 +547,10 @@ impl<S: Storage> S3Backend<S> {
                             .await
                             .map_err(map_backend_error)?
                     }
-                    err => return Err(map_backend_error(err)),
+                    // Everything else through the read-error mapper: a
+                    // plain miss may be hidden by a delete marker, which
+                    // the 404 discloses.
+                    err => return Err(self.read_error(&bucket, &key, err).await),
                 }
             }
         };
@@ -489,6 +615,36 @@ impl<S: Storage> S3Backend<S> {
             info,
         } = fetched;
 
+        let mut resp = S3Response::new(self.get_output(
+            &info,
+            body,
+            served_range,
+            req.input.response_content_type,
+        ));
+        // The plain read of a recording bucket answers the version id it
+        // served too (operator ruling 2026-10-03): a client records the
+        // current version from exactly this header, which is what makes a
+        // later `?versionId=` request possible without a listing first.
+        // The producer reported the bucket state on the `Info` — no
+        // state read here.
+        self.echo_version_id(
+            &mut resp.headers,
+            info.version_id.as_ref(),
+            info.bucket_records_versions,
+        );
+        Ok(resp)
+    }
+
+    /// The GET answer of one object snapshot — the plain and the
+    /// version-addressed paths share it, so both describe an object the
+    /// same way (headers, checksum echo, tag count).
+    fn get_output(
+        &self,
+        info: &object::Info,
+        body: BodyStream,
+        served_range: Option<(u64, u64)>,
+        response_content_type: Option<String>,
+    ) -> dto::GetObjectOutput {
         let (content_length, content_range) = match served_range {
             Some((start, end)) => (
                 end - start + 1,
@@ -496,10 +652,7 @@ impl<S: Storage> S3Backend<S> {
             ),
             None => (info.size, None),
         };
-        let content_type = req
-            .input
-            .response_content_type
-            .or(Some(Self::content_type(info.key.as_ref())));
+        let content_type = response_content_type.or(Some(Self::content_type(info.key.as_ref())));
         let mut output = dto::GetObjectOutput {
             accept_ranges: Some("bytes".into()),
             body: Some(Self::stream_out(body)),
@@ -529,7 +682,7 @@ impl<S: Storage> S3Backend<S> {
         if self.caps.tagging && !info.tags.is_empty() {
             output.tag_count = Some(info.tags.len() as i32);
         }
-        Ok(S3Response::new(output))
+        output
     }
 
     pub(crate) async fn op_head_object(
@@ -538,11 +691,30 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        let head = self
-            .storage
-            .head_object(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
+        let address = self.version_address(req.input.version_id.as_deref())?;
+        // A version-addressed head: the same 405 marker rule as GET.
+        if address.is_addressed() {
+            let info = object_of(
+                self.storage
+                    .head_object_version(&bucket, &key, address.id())
+                    .await
+                    .map_err(map_backend_error)?,
+            )?;
+            ConditionalHeaders::new(
+                req.input.if_match.as_ref(),
+                req.input.if_none_match.as_ref(),
+                req.input.if_modified_since,
+                req.input.if_unmodified_since,
+            )
+            .check(&info.etag, info.last_modified, false)?;
+            let mut resp = self.head_response(&info);
+            set_version_headers(&mut resp.headers, info.version_id.as_ref(), false);
+            return Ok(resp);
+        }
+        let head = match self.storage.head_object(&bucket, &key).await {
+            Ok(head) => head,
+            Err(err) => return Err(self.read_error(&bucket, &key, err.into()).await),
+        };
         ConditionalHeaders::new(
             req.input.if_match.as_ref(),
             req.input.if_none_match.as_ref(),
@@ -550,6 +722,18 @@ impl<S: Storage> S3Backend<S> {
             req.input.if_unmodified_since,
         )
         .check(&head.etag, head.last_modified, false)?;
+        let mut resp = self.head_response(&head);
+        self.echo_version_id(
+            &mut resp.headers,
+            head.version_id.as_ref(),
+            head.bucket_records_versions,
+        );
+        Ok(resp)
+    }
+
+    /// The HEAD answer of one object snapshot — the plain and the
+    /// version-addressed paths share it.
+    fn head_response(&self, head: &object::Info) -> S3Response<dto::HeadObjectOutput> {
         let mut output = dto::HeadObjectOutput {
             accept_ranges: Some("bytes".into()),
             content_length: Some(head.size as i64),
@@ -576,7 +760,7 @@ impl<S: Storage> S3Backend<S> {
                 HeaderValue::from_str(&head.tags.len().to_string()).unwrap(),
             );
         }
-        Ok(resp)
+        resp
     }
 
     /// GetObjectAttributes — the requested subset of ETag / ObjectSize
@@ -592,17 +776,53 @@ impl<S: Storage> S3Backend<S> {
     /// is recorded while the checksum toggle is off, so an object
     /// written under it has no checksum or part checksums to echo.
     /// StorageClass is always STANDARD (tinio has no tiers).
+    ///
+    /// A version-addressed request describes the VERSION it names, from
+    /// that version's own row (the plan-2 `head_object_version`: ETag,
+    /// size, recorded checksum, identity — the design's per-version
+    /// metadata parity), never the current object: an unknown id is the
+    /// contract's `404 NoSuchVersion`, a delete-marker address the shared
+    /// `405` marker rule, and the answer carries the addressed version's
+    /// identity. **The plain path carries the current version's identity
+    /// the same way** — the head the handler reads reports it on the
+    /// `Info` (`version_id` + `bucket_records_versions`), the R23-class
+    /// rule plain GET/HEAD/tagging already follow, and an unversioned
+    /// bucket emits none. The plan set models no per-version part list, so
+    /// a version-addressed request that explicitly asks for ObjectParts is
+    /// refused with `NotImplemented` — never answered with a container
+    /// silently lacking what was asked; every other requested attribute
+    /// is the version's own value.
     pub(crate) async fn op_get_object_attributes(
         &self,
         req: S3Request<dto::GetObjectAttributesInput>,
     ) -> S3Result<S3Response<dto::GetObjectAttributesOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        let info = self
-            .storage
-            .head_object(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
+        // The version address keys on the request's presence — the rule the
+        // R12 branch's refusal was built on, kept now that the branch
+        // answers: `versionId=null` is a version address too. It runs the
+        // shared wire-value path first: a versioning-less server answers
+        // the family's exact refusal, and a malformed value the
+        // request-shape 400, before any storage read.
+        let address = self.version_address(req.input.version_id.as_deref())?;
+        // The snapshot the answer describes: the addressed version through
+        // the plan-2 version head (its row carries the per-version
+        // metadata), or the current object. A marker address is the shared
+        // `405` rule; an unknown id maps to the contract's `404
+        // NoSuchVersion`.
+        let info = if address.is_addressed() {
+            object_of(
+                self.storage
+                    .head_object_version(&bucket, &key, address.id())
+                    .await
+                    .map_err(map_backend_error)?,
+            )?
+        } else {
+            self.storage
+                .head_object(&bucket, &key)
+                .await
+                .map_err(map_backend_error)?
+        };
         // The requested subset. Each `x-amz-object-attributes` entry
         // names one attribute, but s3s keeps a comma-joined header
         // value as ONE entry — the wire form of the AWS SDKs — so the
@@ -613,6 +833,18 @@ impl<S: Storage> S3Backend<S> {
                 .iter()
                 .any(|x| x.as_str().split(',').any(|token| token.trim() == attr))
         };
+        // A version address cannot serve ObjectParts: the plan set models
+        // no per-version part list, so an explicit request for the
+        // attribute is refused (501) rather than answered with a
+        // container silently lacking what was asked. `max_parts` /
+        // `part_number_marker` stay inert without it (AWS consults them
+        // only for ObjectParts).
+        if address.is_addressed() && want("ObjectParts") {
+            return Err(s3_error!(
+                NotImplemented,
+                "ObjectParts is not modelled for a version-addressed GetObjectAttributes"
+            ));
+        }
         let mut out = dto::GetObjectAttributesOutput {
             e_tag: want("ETag").then(|| Self::etag_wire(&info.etag)),
             object_size: want("ObjectSize").then_some(info.size as i64),
@@ -633,6 +865,20 @@ impl<S: Storage> S3Backend<S> {
             echo_recorded(&mut fields, recorded);
             out.checksum = Some(fields);
         }
+        // The answer carries the identity it described — the shared member
+        // rule (`version_id_member`: the null version spelled `null`,
+        // nothing on a bucket that records none), which s3s renders as
+        // `x-amz-version-id`. **Both paths carry it**: the plain path's
+        // head reports the current version's identity and bucket state on
+        // its `Info` — the same rule plain GET/HEAD/tagging follow — and
+        // the version-addressed `Info` reports the addressed version's.
+        // An unversioned bucket answers no member on either path.
+        out.version_id =
+            self.version_id_member(info.version_id.as_ref(), info.bucket_records_versions);
+        // ObjectParts is the CURRENT object's retained part list (a
+        // version address requesting it was refused above): a
+        // non-multipart object omits the container rather than inventing
+        // parts.
         if want("ObjectParts") {
             let parts = self
                 .storage
@@ -704,6 +950,9 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::DeleteObjectOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        // The version address, through the one wire-value path, before the
+        // lock (a refused request must not take it).
+        let address = self.version_address(req.input.version_id.as_deref())?;
         // The malformed-size rejection is request-shape (a negative
         // value can never match any object) — validated up front,
         // state-independently, like the both-present 400. The validated
@@ -721,23 +970,79 @@ impl<S: Storage> S3Backend<S> {
         // the precondition was evaluated against.
         let _guard = self.lock_object(&bucket, &key).await;
         // Conditional delete: ETag / last-modified-time / size — every
-        // provided header must match the object AT the key, else 412.
+        // provided header must match the addressed object, else 412.
         // The head-check + delete run in the per-key critical section
-        // above. A missing object answers 204 under every conditional
-        // header (AWS model text: "if the ETag matches or if the object
-        // doesn't exist, the operation will return a 204") — delete is
-        // idempotent and the conditions gate an existing object only
-        // (the module doc in conditions.rs states the policy centrally).
-        if !conditions.absent()
+        // above. A plain request gates the object AT the key; a
+        // version-addressed one gates the VERSION IT NAMES — the same
+        // rule the version-addressed read paths apply, because the
+        // current object can be a different object entirely. A missing
+        // object answers 204 under every conditional header (AWS model
+        // text: "if the ETag matches or if the object doesn't exist,
+        // the operation will return a 204") — delete is idempotent and
+        // the conditions gate an existing object only (the module doc in
+        // conditions.rs states the policy centrally).
+        if address.is_addressed() {
+            if !conditions.absent() {
+                match self
+                    .storage
+                    .head_object_version(&bucket, &key, address.id())
+                    .await
+                {
+                    Ok(version::HeadResult::Object(info)) => conditions.check(&info)?,
+                    // A marker is addressable but has no content, so a
+                    // content conditional cannot be satisfied — 412 is the
+                    // honest answer. The unconditional marker delete is
+                    // untouched (the head is skipped above).
+                    Ok(version::HeadResult::Marker { .. }) => {
+                        return Err(condition_error(ConditionFailure::Match, true));
+                    }
+                    // A version that names nothing is the delete's own 404
+                    // (`NoSuchVersion`), exactly as before — a condition
+                    // cannot rescue a version that is not there.
+                    Err(err) => {
+                        let err: StorageError = err.into();
+                        match err {
+                            StorageError::NoSuchVersion(_) => {}
+                            err => return Err(map_backend_error(err)),
+                        }
+                    }
+                }
+            }
+        } else if !conditions.absent()
             && let Some(info) = self.head_optional(&bucket, &key).await?
         {
             conditions.check(&info)?;
         }
-        self.storage
-            .delete_object(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
-        Ok(S3Response::new(DeleteObjectOutput::default()))
+        // A version-addressed delete removes exactly the named version; a
+        // plain one is the ordinary delete (a versioned bucket inserts a
+        // marker — the design's delete rules).
+        let marker = if address.is_addressed() {
+            self.storage
+                .delete_object_version(&bucket, &key, address.id())
+                .await
+        } else {
+            self.storage.delete_object(&bucket, &key).await
+        }
+        .map_err(map_backend_error)?;
+        let mut resp = S3Response::new(DeleteObjectOutput::default());
+        // The delete's own report: the version it removed (or, on a plain
+        // delete, the marker it created) and whether that version is a
+        // marker. A bucket that records nothing answers the empty
+        // `Marker::none` and without either header. The equivalence below
+        // is `Marker`'s field count: `Marker::none()` is `id: None,
+        // is_delete_marker: false` and the derived `PartialEq` compares
+        // exactly those two, so a third field on `Marker` would silently
+        // widen this guard (an answer whose new field is non-default
+        // would start carrying headers) — revisit the comparison if the
+        // type ever grows.
+        if marker != version::Marker::none() {
+            set_version_headers(
+                &mut resp.headers,
+                marker.id.as_ref(),
+                marker.is_delete_marker,
+            );
+        }
+        Ok(resp)
     }
 
     pub(crate) async fn op_delete_objects(
@@ -746,6 +1051,19 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::DeleteObjectsOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let quiet = req.input.delete.quiet.unwrap_or(false);
+        // The fail-open rule for the batch: an entry that names a version
+        // refuses the whole request when versioning is unavailable, before
+        // any delete runs — the same guard the single-object path applies
+        // (a per-entry refusal would let the batch's other entries proceed
+        // past a server that cannot answer the one the client asked for).
+        require_versioning(
+            self,
+            req.input
+                .delete
+                .objects
+                .iter()
+                .find_map(|id| id.version_id.as_deref()),
+        )?;
         // The enforced-mode per-key check (spec 2026-09-05, review B2):
         // the op-level coarse gate — bucket owner or any bucket-ACL
         // grant to P — is the access layer's (whole-op 403); here each
@@ -784,7 +1102,20 @@ impl<S: Storage> S3Backend<S> {
             let key = match self.key(id.key.clone()) {
                 Ok(key) => key,
                 Err(err) => {
-                    errors.push(delete_error(&err, id.key));
+                    errors.push(delete_error(&err, id.key, id.version_id.as_deref()));
+                    continue;
+                }
+            };
+            // The entry's version id, through the shared wire-value path
+            // as every other site (the batch-level guard above already
+            // refused a version-addressed batch on a server without
+            // versioning): a malformed one is this entry's error (the
+            // batch's mixed-result model), a valid one addresses that
+            // version.
+            let address = match self.version_address(id.version_id.as_deref()) {
+                Ok(address) => address,
+                Err(err) => {
+                    errors.push(delete_error(&err, id.key, id.version_id.as_deref()));
                     continue;
                 }
             };
@@ -812,36 +1143,51 @@ impl<S: Storage> S3Backend<S> {
                                 lazy_default,
                                 acl.owner.as_ref(),
                             ) {
-                                errors.push(delete_error(&denied, key.to_string()));
+                                errors.push(delete_error(
+                                    &denied,
+                                    key.to_string(),
+                                    id.version_id.as_deref(),
+                                ));
                                 continue;
                             }
                         }
                         Err(err) => {
                             let err: StorageError = err.into();
                             if !matches!(err, StorageError::NoSuchKey(_)) {
-                                errors.push(delete_error(&map_backend_error(err), key.to_string()));
+                                errors.push(delete_error(
+                                    &map_backend_error(err),
+                                    key.to_string(),
+                                    id.version_id.as_deref(),
+                                ));
                                 continue;
                             }
                         }
                     }
                 }
             }
-            // Per-key write lock, as in `op_delete_object`.
+            // Per-key write lock, as in `op_delete_object`; the same
+            // version-addressed / plain delete branch too.
             let _guard = self.lock_object(&bucket, &key).await;
-            match self.storage.delete_object(&bucket, &key).await {
-                // The delete produced no version (the backends do not version
-                // anything yet); the multi-delete answer carries no marker.
-                Ok(_marker) => {
+            let deleted_marker = if address.is_addressed() {
+                self.storage
+                    .delete_object_version(&bucket, &key, address.id())
+                    .await
+            } else {
+                self.storage.delete_object(&bucket, &key).await
+            };
+            match deleted_marker {
+                Ok(marker) => {
                     if !quiet {
-                        deleted.push(dto::DeletedObject {
-                            key: Some(key.to_string()),
-                            ..Default::default()
-                        });
+                        deleted.push(deleted_entry(key.to_string(), &marker, &address));
                     }
                 }
                 Err(err) => {
                     let err = map_backend_error(err);
-                    errors.push(delete_error(&err, key.to_string()));
+                    errors.push(delete_error(
+                        &err,
+                        key.to_string(),
+                        id.version_id.as_deref(),
+                    ));
                 }
             }
         }
@@ -865,21 +1211,44 @@ impl<S: Storage> S3Backend<S> {
     /// and doubles as the tag source (`Info.tags` is always populated —
     /// no dedicated tag fetch on the read path); a tag-less object
     /// answers the empty set (aws cli invokes this before server-side
-    /// copies).
+    /// copies). A request naming a version reads that version's row
+    /// instead (the design's per-version metadata) — the fail-open guard
+    /// first, so a version-addressed request never falls back to the
+    /// current object's set. The answer's `version_id` member is the
+    /// addressed version's identity, the current object's on the plain
+    /// path, and nothing on a bucket that records none.
     pub(crate) async fn op_get_object_tagging(
         &self,
         req: S3Request<dto::GetObjectTaggingInput>,
     ) -> S3Result<S3Response<dto::GetObjectTaggingOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        let head = self
-            .storage
-            .head_object(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
+        let address = self.version_address(req.input.version_id.as_deref())?;
+        let (tags, version_id) = if address.is_addressed() {
+            // The addressed version's own row; a tag read carries no
+            // `Info`, so the bucket-state half of the identity rule comes
+            // from its one home (`records_for`).
+            let tags = self
+                .storage
+                .version_tags(&bucket, &key, address.id())
+                .await
+                .map_err(map_backend_error)?;
+            let records = self.records_for(&bucket, &address).await;
+            let version_id = self.version_id_member(address.id(), records);
+            (tags, version_id)
+        } else {
+            let head = self
+                .storage
+                .head_object(&bucket, &key)
+                .await
+                .map_err(map_backend_error)?;
+            let version_id =
+                self.version_id_member(head.version_id.as_ref(), head.bucket_records_versions);
+            (head.tags, version_id)
+        };
         Ok(S3Response::new(dto::GetObjectTaggingOutput {
-            tag_set: tag_set_from_tags(&head.tags),
-            version_id: None,
+            tag_set: tag_set_from_tags(&tags),
+            version_id,
         }))
     }
 
@@ -888,42 +1257,97 @@ impl<S: Storage> S3Backend<S> {
     /// (duplicate keys, the ≤10 object cap → `InvalidTag` 400) before
     /// the contract call; a missing object answers 404 `NoSuchKey`. No
     /// per-key lock (spec decision — AWS gives no atomicity guarantee
-    /// between tag and object writes; last-writer-wins is accepted).
+    /// between tag and object writes; last-writer-wins is accepted). A
+    /// request naming a version replaces that version's set instead, and
+    /// the answer's `version_id` member names the version the set landed
+    /// on — the plain path reads it off the write's own
+    /// [`TagWriteResult`](crate::_core::storage::TagWriteResult), no
+    /// second read.
     pub(crate) async fn op_put_object_tagging(
         &self,
         req: S3Request<dto::PutObjectTaggingInput>,
     ) -> S3Result<S3Response<dto::PutObjectTaggingOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        let address = self.version_address(req.input.version_id.as_deref())?;
         let tags = tags_from_tag_set(&req.input.tagging.tag_set, OBJECT_TAGS_MAX)?;
-        self.storage
-            .put_object_tags(&bucket, &key, &tags)
-            .await
-            .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::PutObjectTaggingOutput::default()))
+        let version_id = if address.is_addressed() {
+            self.storage
+                .set_version_tags(&bucket, &key, address.id(), tags)
+                .await
+                .map_err(map_backend_error)?;
+            // The addressed identity, with the bucket-state half from its
+            // one home (`records_for`).
+            let records = self.records_for(&bucket, &address).await;
+            self.version_id_member(address.id(), records)
+        } else {
+            // The write answers the identity it landed on and the bucket
+            // state itself — no post-write head, and an unversioned
+            // bucket pays neither a head nor a state read. The heal the
+            // retired head performed on a stale row is deferred to the
+            // next full resolution: the answers are identical, only the
+            // repair moves.
+            let written = self
+                .storage
+                .put_object_tags(&bucket, &key, &tags)
+                .await
+                .map_err(map_backend_error)?;
+            self.version_id_member(written.version_id.as_ref(), written.bucket_records_versions)
+        };
+        Ok(S3Response::new(dto::PutObjectTaggingOutput { version_id }))
     }
 
     /// DeleteObjectTagging — remove the object's tag set. Idempotent,
     /// like the object delete: a missing object answers 204. No per-key
-    /// lock (spec decision).
+    /// lock (spec decision). A request naming a version clears that
+    /// version's set instead (the same replace-all through the row), and
+    /// the answer's `version_id` member names the version the set was
+    /// removed from — the plain path reads it off the write's own
+    /// [`TagWriteResult`](crate::_core::storage::TagWriteResult), and
+    /// the idempotent no-op on a missing object names nothing.
     pub(crate) async fn op_delete_object_tagging(
         &self,
         req: S3Request<dto::DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<dto::DeleteObjectTaggingOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        self.storage
-            .delete_object_tags(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::DeleteObjectTaggingOutput::default()))
+        let address = self.version_address(req.input.version_id.as_deref())?;
+        // The addressed version (or the plain write's own answer) is the
+        // identity: a missing object answers 204 and names nothing.
+        let version_id = if address.is_addressed() {
+            self.storage
+                .set_version_tags(&bucket, &key, address.id(), object::Tags::empty())
+                .await
+                .map_err(map_backend_error)?;
+            // The addressed identity, with the bucket-state half from its
+            // one home (`records_for`).
+            let records = self.records_for(&bucket, &address).await;
+            self.version_id_member(address.id(), records)
+        } else {
+            // The write answers the identity it touched and the bucket
+            // state itself — the idempotent no-op names neither, and the
+            // heal the retired post-write head performed on a stale row
+            // is deferred to the next full resolution (the answers are
+            // identical, only the repair moves).
+            let written = self
+                .storage
+                .delete_object_tags(&bucket, &key)
+                .await
+                .map_err(map_backend_error)?;
+            self.version_id_member(written.version_id.as_ref(), written.bucket_records_versions)
+        };
+        Ok(S3Response::new(dto::DeleteObjectTaggingOutput {
+            version_id,
+        }))
     }
 
     /// GetObjectAcl — the object's real ACL (spec 2026-09-05). The
     /// existence head answers 404 `NoSuchKey` (the object-tagging
     /// precedent) and its `Info` carries the ACL row — no dedicated
     /// fetch. The Owner element resolves through the identity map and
-    /// the grants echo the row's canonical set.
+    /// the grants echo the row's canonical set. A request naming a
+    /// version reads that version's row instead (the fail-open guard
+    /// first, never the current object's ACL).
     #[cfg(feature = "acl")]
     pub(crate) async fn op_get_object_acl(
         &self,
@@ -931,14 +1355,26 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::GetObjectAclOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        let head = self
-            .storage
-            .head_object(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
+        let address = self.version_address(req.input.version_id.as_deref())?;
+        let stored = if address.is_addressed() {
+            self.storage
+                .version_acl(&bucket, &key, address.id())
+                .await
+                .map_err(map_backend_error)?
+        } else {
+            let head = self
+                .storage
+                .head_object(&bucket, &key)
+                .await
+                .map_err(map_backend_error)?;
+            Acl {
+                owner: head.owner,
+                grants: head.acl.grants,
+            }
+        };
         Ok(S3Response::new(dto::GetObjectAclOutput {
-            owner: Some(self.acl_owner(head.owner.as_ref())),
-            grants: Some(grants_dto(&head.acl.grants)),
+            owner: Some(self.acl_owner(stored.owner.as_ref())),
+            grants: Some(grants_dto(&stored.grants)),
             request_charged: None,
         }))
     }
@@ -951,7 +1387,8 @@ impl<S: Storage> S3Backend<S> {
     /// policy body whose Owner does not match the row owner answers 400
     /// `InvalidArgument` (fail-closed). A missing object answers 404
     /// `NoSuchKey`. The bucket owner — for the `bucket-owner-*` canned
-    /// names (review A6) — is the bucket row's owner, lazy resolved.
+    /// names (review A6) — is the bucket row's owner, lazy resolved. A
+    /// request naming a version replaces that version's grant set.
     #[cfg(feature = "acl")]
     pub(crate) async fn op_put_object_acl(
         &self,
@@ -960,13 +1397,24 @@ impl<S: Storage> S3Backend<S> {
         require_content_md5(req.input.content_md5.as_deref())?;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        // The version address, through the one wire-value path, before any
+        // storage read (a refused request must not reach a row).
+        let address = self.version_address(req.input.version_id.as_deref())?;
         // The ACL row read doubles as the existence check (NoSuchKey
-        // 404) and the owner the policy Owner must match.
-        let row = self
-            .storage
-            .get_object_acl(&bucket, &key)
-            .await
-            .map_err(map_backend_error)?;
+        // 404) and the owner the policy Owner must match — the named
+        // version's row when the request carries one, the current
+        // object's otherwise.
+        let row = if address.is_addressed() {
+            self.storage
+                .version_acl(&bucket, &key, address.id())
+                .await
+                .map_err(map_backend_error)?
+        } else {
+            self.storage
+                .get_object_acl(&bucket, &key)
+                .await
+                .map_err(map_backend_error)?
+        };
         let owner = self.row_owner(row.owner.as_ref());
         let policy = req.input.access_control_policy.as_ref();
         if let Some(policy) = policy {
@@ -999,10 +1447,28 @@ impl<S: Storage> S3Backend<S> {
             &owner,
             &bucket_owner,
         )?;
-        self.storage
-            .put_object_acl(&bucket, &key, &grants)
-            .await
-            .map_err(map_backend_error)?;
+        // Replace-all on the grants either way; the owner element rides
+        // the row and a put never changes it (contract ruling, per
+        // version).
+        if address.is_addressed() {
+            self.storage
+                .set_version_acl(
+                    &bucket,
+                    &key,
+                    address.id(),
+                    &Acl {
+                        owner: None,
+                        grants,
+                    },
+                )
+                .await
+                .map_err(map_backend_error)?;
+        } else {
+            self.storage
+                .put_object_acl(&bucket, &key, &grants)
+                .await
+                .map_err(map_backend_error)?;
+        }
         Ok(S3Response::new(dto::PutObjectAclOutput::default()))
     }
 
@@ -1015,6 +1481,11 @@ impl<S: Storage> S3Backend<S> {
         let (src_bucket, src_key) = self.copy_source(&req.input.copy_source)?;
         let dst_bucket = self.bucket(req.input.bucket)?;
         let dst_key = self.key(req.input.key)?;
+        // The source's `versionId` (the dto's bucket form): the fail-open
+        // guard, then the one parse. A version-addressed source is read
+        // through the version path below — the copy primitive has no
+        // version parameter.
+        let src_address = self.version_address(copy_source_version(&req.input.copy_source))?;
 
         // The destination conditionals (`x-amz-if-match` /
         // `x-amz-if-none-match`) are parsed FIRST — a pure header parse,
@@ -1087,11 +1558,29 @@ impl<S: Storage> S3Backend<S> {
         // FR-015 — a backend may copy them kernel-side). The head's info
         // carries the source ETag + mtime for the conditionals (412 on
         // failure, per S3 copy semantics — no body is streamed to drop).
-        let info = self
-            .storage
-            .head_object(&src_bucket, &src_key)
-            .await
-            .map_err(map_backend_error)?;
+        // A version-addressed source reads THAT version instead, body and
+        // info in one read (the primitive cannot name a version).
+        let (info, src_body) = if src_address.is_addressed() {
+            let fetched = self
+                .storage
+                .get_object_version(&src_bucket, &src_key, src_address.id(), None)
+                .await
+                .map_err(map_backend_error)?;
+            match fetched {
+                version::ReadResult::Object(result) => (result.info, Some(result.body)),
+                // A marker holds no bytes: the copy's source is missing.
+                version::ReadResult::Marker { .. } => {
+                    return Err(s3_error!(NoSuchKey, "the source is a delete marker"));
+                }
+            }
+        } else {
+            let info = self
+                .storage
+                .head_object(&src_bucket, &src_key)
+                .await
+                .map_err(map_backend_error)?;
+            (info, None)
+        };
         ConditionalHeaders::new(
             req.input.copy_source_if_match.as_ref(),
             req.input.copy_source_if_none_match.as_ref(),
@@ -1141,28 +1630,61 @@ impl<S: Storage> S3Backend<S> {
             Some((owner, acl)) => (Some(owner), acl),
             None => (None, &default_acl),
         };
-        let put = self
-            .storage
-            .copy_object(
-                &src_bucket,
-                &src_key,
-                &dst_bucket,
-                &dst_key,
-                tags,
-                owner,
-                acl,
-                checksum,
-            )
-            .await
-            .map_err(map_backend_error)?;
-        Ok(S3Response::new(dto::CopyObjectOutput {
+        let put = match src_body {
+            // A version-addressed source: the version's bytes were read
+            // above, so the destination is an ordinary staged write. The
+            // plain path's carrier — the primitive's `checksum` argument —
+            // cannot name a version, so the source version's recorded
+            // value is passed to the stage as the explicit `carried`
+            // parameter instead (the copy's bytes ARE the source's — the
+            // plain path's carry rule), kind included, so the commit
+            // records the destination's checksum exactly as the plain
+            // path's carried value would (a multipart-completed source
+            // stays COMPOSITE), with no second read of the bytes. `None`
+            // (no recorded checksum, or the toggle off) stages exactly as
+            // before.
+            Some(body) => {
+                let staged = self
+                    .storage
+                    .stage_body(&dst_bucket, &dst_key, body, None, checksum.clone())
+                    .await
+                    .map_err(map_backend_error)?;
+                self.storage
+                    .commit_object(&dst_bucket, &dst_key, staged, tags, owner, acl)
+                    .await
+                    .map_err(map_backend_error)?
+            }
+            None => self
+                .storage
+                .copy_object(
+                    &src_bucket,
+                    &src_key,
+                    &dst_bucket,
+                    &dst_key,
+                    tags,
+                    owner,
+                    acl,
+                    checksum,
+                )
+                .await
+                .map_err(map_backend_error)?,
+        };
+        let mut resp = S3Response::new(dto::CopyObjectOutput {
             copy_object_result: Some(dto::CopyObjectResult {
                 e_tag: Some(Self::etag_wire(&put.etag)),
                 last_modified: Some(Self::last_modified(SystemTime::now())),
                 ..Default::default()
             }),
             ..Default::default()
-        }))
+        });
+        // The destination version the copy created — the committed
+        // `Info` carries the bucket state.
+        self.echo_version_id(
+            &mut resp.headers,
+            put.version_id.as_ref(),
+            put.bucket_records_versions,
+        );
+        Ok(resp)
     }
 
     /// RenameObject — atomically move the source onto the destination
@@ -1327,7 +1849,10 @@ mod tests {
     #[cfg(feature = "acl")]
     use crate::{
         _core::storage::BucketOps,
-        backend::testutil::{acl_backend, credentials_for, post_request, signed_request, user_id},
+        backend::testutil::{
+            acl_backend, canonical_grantee, credentials_for, grant, group_grantee, post_request,
+            signed_request, user_id, valid_md5,
+        },
         capability::CapabilityS3,
     };
     use crate::{
@@ -1354,43 +1879,6 @@ mod tests {
         })
         .await;
         (backend, bucket::name(b.as_str()).unwrap())
-    }
-
-    /// A well-formed Content-MD5 value (base64 of 16 zero bytes).
-    #[cfg(feature = "acl")]
-    fn valid_md5() -> String {
-        use base64::engine::general_purpose::STANDARD;
-        base64::Engine::encode(&STANDARD, [0u8; 16])
-    }
-
-    #[cfg(feature = "acl")]
-    fn canonical_grantee(id: &str) -> dto::Grantee {
-        dto::Grantee {
-            type_: dto::Type::from_static(dto::Type::CANONICAL_USER),
-            id: Some(id.into()),
-            uri: None,
-            display_name: None,
-            email_address: None,
-        }
-    }
-
-    #[cfg(feature = "acl")]
-    fn group_grantee(uri: &str) -> dto::Grantee {
-        dto::Grantee {
-            type_: dto::Type::from_static(dto::Type::GROUP),
-            uri: Some(uri.into()),
-            id: None,
-            display_name: None,
-            email_address: None,
-        }
-    }
-
-    #[cfg(feature = "acl")]
-    fn grant(grantee: dto::Grantee, permission: &'static str) -> dto::Grant {
-        dto::Grant {
-            grantee: Some(grantee),
-            permission: Some(dto::Permission::from_static(permission)),
-        }
     }
 
     /// An `AccessControlPolicy` body with the given grants (the owner
@@ -2020,7 +2508,7 @@ mod tests {
                     b,
                     &k,
                     storage
-                        .stage_body(b, &k, body(key.to_string()), None)
+                        .stage_body(b, &k, body(key.to_string()), None, None)
                         .await
                         .unwrap(),
                     object::Tags::empty(),
@@ -2139,7 +2627,10 @@ mod tests {
             .commit_object(
                 &b,
                 &k,
-                storage.stage_body(&b, &k, body(b"a"), None).await.unwrap(),
+                storage
+                    .stage_body(&b, &k, body(b"a"), None, None)
+                    .await
+                    .unwrap(),
                 object::Tags::empty(),
                 Some(&alice),
                 &Acl::default_private(Some(alice.clone())),
@@ -3789,7 +4280,7 @@ mod tests {
                 &src,
                 backend
                     .storage()
-                    .stage_body(&b, &src, body(b"source data"), None)
+                    .stage_body(&b, &src, body(b"source data"), None, None)
                     .await
                     .unwrap(),
                 object::Tags::empty(),
@@ -3895,7 +4386,7 @@ mod tests {
                 &src,
                 backend
                     .storage()
-                    .stage_body(&b, &src, body(b"data"), None)
+                    .stage_body(&b, &src, body(b"data"), None, None)
                     .await
                     .unwrap(),
                 object::Tags::empty(),
@@ -3969,7 +4460,7 @@ mod tests {
                 &existing,
                 backend
                     .storage()
-                    .stage_body(&b, &existing, body(b"x"), None)
+                    .stage_body(&b, &existing, body(b"x"), None, None)
                     .await
                     .unwrap(),
                 object::Tags::empty(),

@@ -27,7 +27,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use redb::{Database, ReadableTable, backends::InMemoryBackend};
+use redb::ReadableTable;
 
 #[cfg(test)]
 use crate::_core::bucket::name;
@@ -159,11 +159,7 @@ impl MemoryStorage {
     /// Fails only if the redb database cannot be created (programmer error —
     /// the in-memory backend cannot fail in practice).
     pub fn with_options(options: MemoryOptions) -> Result<Self, Error> {
-        let handle = store::Handle::new(
-            Database::builder()
-                .create_with_backend(InMemoryBackend::new())
-                .map_err(|e| Error::Database(e.into()))?,
-        );
+        let handle = store::Handle::new(store::open_in_memory()?);
         handle.write(|txn| -> Result<(), Error> {
             // Create all tables up front: read transactions refuse to open
             // a table that does not exist yet. The seven shared tables and
@@ -451,7 +447,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        let txn = storage.db.db().begin_read().unwrap();
+        let txn = storage.db.db().unwrap().begin_read().unwrap();
         let objects = objects::Table::open_readonly(&txn).unwrap();
         let bucket_str = bucket.as_ref().as_str();
         // The tuple-keyed scan of one bucket: `(bucket, "")` lower bound,

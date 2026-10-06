@@ -355,6 +355,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             &tagged_src,
             body(data.to_vec()),
             Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+            None,
         )
         .await
         .unwrap();
@@ -436,7 +437,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
     ];
     let src_acled = object::key("copy-owned-src.bin").unwrap();
     let staged = storage
-        .stage_body(b, &src_acled, body(data.to_vec()), None)
+        .stage_body(b, &src_acled, body(data.to_vec()), None, None)
         .await
         .unwrap();
     storage
@@ -1140,7 +1141,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
 
     // The two-phase write (stage + commit) equals a direct put.
     let staged = storage
-        .stage_body(b, &hello, body(data.to_vec()), None)
+        .stage_body(b, &hello, body(data.to_vec()), None, None)
         .await
         .unwrap();
     let put = storage
@@ -1182,7 +1183,14 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     ])
     .unwrap();
     let replaced = object::Tags::from_pairs([("tier".into(), "gold".into())]).unwrap();
-    storage.put_object_tags(b, &hello, &tags).await.unwrap();
+    // The write's answer: this bucket records no versions, so the tags
+    // landed on no named identity (the pair the versioning legs carry on
+    // a recording bucket).
+    let written = storage.put_object_tags(b, &hello, &tags).await.unwrap();
+    check(
+        written.version_id.is_none() && !written.bucket_records_versions,
+        "an unversioned tag write must name no identity",
+    );
     let got = storage.get_object_tags(b, &hello).await.unwrap();
     check(got == tags, "object tags must round-trip");
     let head = storage.head_object(b, &hello).await.unwrap();
@@ -1190,7 +1198,11 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.put_object_tags(b, &hello, &replaced).await.unwrap();
     let got = storage.get_object_tags(b, &hello).await.unwrap();
     check(got == replaced, "put_object_tags must replace, not merge");
-    storage.delete_object_tags(b, &hello).await.unwrap();
+    let written = storage.delete_object_tags(b, &hello).await.unwrap();
+    check(
+        written.version_id.is_none() && !written.bucket_records_versions,
+        "an unversioned tag delete must name no identity",
+    );
     let got = storage.get_object_tags(b, &hello).await.unwrap();
     check(got.is_empty(), "delete_object_tags must clear the set");
     storage.delete_object_tags(b, &hello).await.unwrap(); // idempotent
@@ -1209,7 +1221,11 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         matches!(err, NoSuchKey(_)),
         "tagging a missing object must be NoSuchKey",
     );
-    storage.delete_object_tags(b, &missing).await.unwrap(); // idempotent
+    let written = storage.delete_object_tags(b, &missing).await.unwrap(); // idempotent
+    check(
+        written.version_id.is_none() && !written.bucket_records_versions,
+        "the idempotent delete must name no identity",
+    );
 
     // The tagged write path: a staged commit records its tags with the
     // object — head and get serve the same set.
@@ -1220,7 +1236,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     ])
     .unwrap();
     let staged = storage
-        .stage_body(b, &tagged, body(data.to_vec()), None)
+        .stage_body(b, &tagged, body(data.to_vec()), None, None)
         .await
         .unwrap();
     let committed = storage
@@ -1258,7 +1274,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     let acl_grants = vec![conform_group_read_grant()];
     let acl_key = object::key("acl.bin").unwrap();
     let staged = storage
-        .stage_body(b, &acl_key, body(data.to_vec()), None)
+        .stage_body(b, &acl_key, body(data.to_vec()), None, None)
         .await
         .unwrap();
     let committed = storage
@@ -1338,6 +1354,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             &recorded,
             body(b"abc"),
             Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+            None,
         )
         .await
         .unwrap();
@@ -1367,7 +1384,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         "get must echo the recorded checksum",
     );
     let staged = storage
-        .stage_body(b, &recorded, body(b"abc"), None)
+        .stage_body(b, &recorded, body(b"abc"), None, None)
         .await
         .unwrap();
     let committed = storage
@@ -1384,6 +1401,66 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     check(
         committed.checksum.is_none(),
         "a commit staged without a tee must record no checksum",
+    );
+
+    // A carried value (the version-addressed copy's shape): the stage's
+    // explicit `carried` parameter commits that value verbatim — a
+    // multipart-completed source's COMPOSITE must survive the staged
+    // write, never silently become the write path's FULL_OBJECT default.
+    let carried_key = object::key("carried-kind.bin").unwrap();
+    let carried = checksum::Recorded {
+        part: checksum::Part {
+            algorithm: Algorithm::Crc32,
+            value: checksum::Value("y/Q5Jg==".into()),
+        },
+        kind: Type::Composite,
+    };
+    let staged = storage
+        .stage_body(b, &carried_key, body(b"abc"), None, Some(carried.clone()))
+        .await
+        .unwrap();
+    let committed = storage
+        .commit_object(
+            b,
+            &carried_key,
+            staged,
+            object::Tags::empty(),
+            None,
+            &Acl::default_private(None),
+        )
+        .await
+        .unwrap();
+    check(
+        committed.checksum == Some(carried.clone()),
+        "the carried value's kind must survive the commit",
+    );
+    // A carried value outranks the tee's streamed digest: both present,
+    // the recorded value (kind included) still wins.
+    let staged = storage
+        .stage_body(
+            b,
+            &carried_key,
+            body(b"abc"),
+            Some(checksum_tee(Algorithm::Crc32, "AAAAAA==")),
+            Some(carried.clone()),
+        )
+        .await
+        .unwrap();
+    storage
+        .commit_object(
+            b,
+            &carried_key,
+            staged,
+            object::Tags::empty(),
+            None,
+            &Acl::default_private(None),
+        )
+        .await
+        .unwrap();
+    let head = storage.head_object(b, &carried_key).await.unwrap();
+    check(
+        head.checksum == Some(carried),
+        "head must echo the carried kind",
     );
 
     // Completed-object parts: a plain put has none, and the listing of a
@@ -1420,6 +1497,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             &mv_src,
             body(mv_data.to_vec()),
             Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
+            None,
         )
         .await
         .unwrap();
@@ -1594,6 +1672,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
     storage.delete_object(b, &digits).await.unwrap();
     storage.delete_object(b, &tagged).await.unwrap();
     storage.delete_object(b, &recorded).await.unwrap();
+    storage.delete_object(b, &carried_key).await.unwrap();
     storage.delete_object(b, &acl_key).await.unwrap();
     storage.delete_object(b, &plain).await.unwrap();
     storage.delete_object(b, &mv_over).await.unwrap();
@@ -1677,7 +1756,7 @@ async fn conformance_listing<S: Storage>(storage: &S, b: &bucket::Name) {
     let own_key = object::key("own.txt").unwrap();
     let listed_owner = conform_owner();
     let staged = storage
-        .stage_body(b, &own_key, body(b"owned"), None)
+        .stage_body(b, &own_key, body(b"owned"), None, None)
         .await
         .unwrap();
     storage
@@ -2529,7 +2608,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
     // multipart state — tags, recorded checksum, retained parts.
     let commit_tags = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
     let staged = storage
-        .stage_body(b, &moved, body(b"flat"), None)
+        .stage_body(b, &moved, body(b"flat"), None, None)
         .await
         .unwrap();
     let committed = storage
@@ -2666,7 +2745,7 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
         data: &[u8],
     ) -> object::Info {
         let staged = storage
-            .stage_body(b, key, body(data.to_vec()), None)
+            .stage_body(b, key, body(data.to_vec()), None, None)
             .await
             .unwrap();
         storage
@@ -2688,6 +2767,27 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
         "a fresh bucket must answer State::Unversioned",
     );
 
+    // The version-identity carrier on the produced metadata: every `Info`
+    // reports whether its bucket records versions
+    // (`bucket_records_versions`), which is what lets the server answer
+    // the version-header rule without a state read of its own. A backend
+    // that left the flag false everywhere would silently drop
+    // `x-amz-version-id` from every plain answer on a recording bucket.
+    let carrier = object::key("carrier/state.txt").unwrap();
+    let unwritten = commit(storage, b, &carrier, b"unversioned").await;
+    check(
+        !unwritten.bucket_records_versions,
+        "an unversioned bucket's write must report that it records no versions",
+    );
+    check(
+        !storage
+            .head_object(b, &carrier)
+            .await
+            .unwrap()
+            .bucket_records_versions,
+        "an unversioned bucket's read must report that it records no versions",
+    );
+
     // Enabling is visible.
     storage
         .set_bucket_versioning(b, version::State::Enabled)
@@ -2696,6 +2796,20 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     check(
         storage.bucket_versioning(b).await.unwrap() == version::State::Enabled,
         "set_bucket_versioning(Enabled) must be visible to bucket_versioning",
+    );
+    check(
+        storage
+            .head_object(b, &carrier)
+            .await
+            .unwrap()
+            .bucket_records_versions,
+        "an enabled bucket's read must report that it records versions",
+    );
+    check(
+        commit(storage, b, &carrier, b"enabled")
+            .await
+            .bucket_records_versions,
+        "an enabled bucket's write must report that it records versions",
     );
 
     // The rename rule the contract states: a bucket that records versions
@@ -2838,6 +2952,28 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
             panic!("conformance violation: the current version is a marker, not content")
         }
     }
+
+    // The bounded per-key probe behind the plain read's 404 disclosure:
+    // the marked key answers Marker, a content key Object, and a key
+    // with no version at all Absent — three exact-key reads, no listing
+    // page. A backend that answered `Object` here would drop the
+    // `x-amz-delete-marker` disclosure; one that answered `Marker` for a
+    // content key would invent it.
+    let content_key = object::key("versioned/content.txt").unwrap();
+    commit(storage, b, &content_key, b"still here").await;
+    let absent_key = object::key("versioned/absent.txt").unwrap();
+    check(
+        storage.current_version(b, &key).await.unwrap() == version::CurrentVersion::Marker,
+        "the probe must answer Marker for the key whose current version is a marker",
+    );
+    check(
+        storage.current_version(b, &content_key).await.unwrap() == version::CurrentVersion::Object,
+        "the probe must answer Object for a key whose current version is content",
+    );
+    check(
+        storage.current_version(b, &absent_key).await.unwrap() == version::CurrentVersion::Absent,
+        "the probe must answer Absent for a key with no current version",
+    );
 
     // A delete marker holds no tags and no ACL: every version metadata
     // operation addressed at the marker's identity answers the contract's
@@ -3417,6 +3553,190 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
         "the convergence journey's bucket must be empty after its versions are removed",
     );
     storage.delete_bucket(&converge_bucket).await.unwrap();
+
+    // The page-bounded walk. `ListObjectVersions` lists one page at a time,
+    // and the backend walks the page's own keys to answer it — never the
+    // bucket's — so the page has to reassemble the bucket exactly, through
+    // the cursors alone, with the bucket's other keys unread. The leg seeds a
+    // bucket with more keys than a page holds, pages it at two entries a
+    // page, and compares the reassembly with the sequence the writes made
+    // (and, for the delimiter leg, with the one-call listing's own answer).
+    let bounded_bucket = bucket::name(unique_bucket("versioned-bounded")).unwrap();
+    storage
+        .create_bucket(&bounded_bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    storage
+        .set_bucket_versioning(&bounded_bucket, version::State::Enabled)
+        .await
+        .unwrap();
+    let listed = |listing: &version::Listing| -> Vec<(String, String)> {
+        listing
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.as_ref().to_owned(),
+                    version::wire_of(entry.id.as_ref()),
+                )
+            })
+            .collect()
+    };
+    // Nine keys, every third one overwritten: two entries a page has to
+    // cross both a key boundary and a version boundary.
+    let mut seeds: Vec<(object::Key, Vec<version::Id>)> = Vec::new();
+    let mut expected: Vec<(String, String)> = Vec::new();
+    for index in 0..9usize {
+        let key = object::key(format!("bounded/{index:02}.txt")).unwrap();
+        let first = commit(
+            storage,
+            &bounded_bucket,
+            &key,
+            format!("one {index}").as_bytes(),
+        )
+        .await
+        .version_id
+        .expect("an enabled write mints an identity");
+        let mut ids = vec![first.clone()];
+        if index % 3 == 0 {
+            let second = commit(
+                storage,
+                &bounded_bucket,
+                &key,
+                format!("two {index}").as_bytes(),
+            )
+            .await
+            .version_id
+            .expect("an enabled write mints an identity");
+            expected.push((key.as_ref().to_owned(), version::wire_of(Some(&second))));
+            ids.push(second);
+        }
+        expected.push((key.as_ref().to_owned(), version::wire_of(Some(&first))));
+        seeds.push((key, ids));
+    }
+    let mut collected: Vec<(String, String)> = Vec::new();
+    let (mut key_marker, mut version_marker) = (None, None);
+    let mut pages = 0usize;
+    loop {
+        let listing = storage
+            .list_object_versions(
+                &bounded_bucket,
+                version::ListParams {
+                    prefix: Some("bounded/".into()),
+                    key_marker: key_marker.clone(),
+                    version_id_marker: version_marker.clone().map(version::IdMarker),
+                    max_keys: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        check(
+            listing.entries.len() <= 2,
+            "a page must never exceed max_keys",
+        );
+        check(pages <= 16, "the cursor walk must terminate");
+        collected.extend(listed(&listing));
+        if !listing.is_truncated {
+            check(
+                listing.next_key_marker.is_none() && listing.next_version_id_marker.is_none(),
+                "an untruncated page must carry no resume cursors",
+            );
+            break;
+        }
+        key_marker = listing.next_key_marker.clone();
+        version_marker = listing.next_version_id_marker.clone();
+        check(
+            key_marker.is_some(),
+            "a truncated page must name its resume key",
+        );
+    }
+    check(
+        pages == 6,
+        "twelve versions at two a page must take six pages",
+    );
+    check(
+        collected == expected,
+        &format!("the bounded pages must reassemble the bucket in the wire's order: {collected:?}"),
+    );
+
+    // The delimiter leg: a rolled-up group counts once and its members are
+    // skipped, not listed per member. The two keys under `bounded/roll/`
+    // roll into one common prefix, so the paged listing and the one-call
+    // listing must agree on the prefix and on every entry around it.
+    for name in ["bounded/roll/a.txt", "bounded/roll/b.txt"] {
+        let key = object::key(name).unwrap();
+        let id = commit(storage, &bounded_bucket, &key, name.as_bytes())
+            .await
+            .version_id
+            .expect("an enabled write mints an identity");
+        seeds.push((key, vec![id]));
+    }
+    let rolled = storage
+        .list_object_versions(
+            &bounded_bucket,
+            version::ListParams {
+                prefix: Some("bounded/".into()),
+                delimiter: Some("/".into()),
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    check(
+        rolled.common_prefixes == ["bounded/roll/"],
+        "the two rolled keys must answer one common prefix",
+    );
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let (mut key_marker, mut version_marker) = (None, None);
+    loop {
+        let listing = storage
+            .list_object_versions(
+                &bounded_bucket,
+                version::ListParams {
+                    prefix: Some("bounded/".into()),
+                    delimiter: Some("/".into()),
+                    key_marker: key_marker.clone(),
+                    version_id_marker: version_marker.clone().map(version::IdMarker),
+                    max_keys: 2,
+                },
+            )
+            .await
+            .unwrap();
+        prefixes.extend(listing.common_prefixes.iter().cloned());
+        entries.extend(listed(&listing));
+        if !listing.is_truncated {
+            break;
+        }
+        key_marker = listing.next_key_marker.clone();
+        version_marker = listing.next_version_id_marker.clone();
+    }
+    check(
+        prefixes == rolled.common_prefixes,
+        &format!(
+            "the rolled pages must reassemble the same common prefixes: {prefixes:?} vs {:?}",
+            rolled.common_prefixes
+        ),
+    );
+    check(
+        entries == listed(&rolled),
+        "the rolled pages must reassemble the same entries, in order",
+    );
+
+    // Empty the section's bucket so it can be dropped: every key's versions,
+    // newest first, each delete materializing the next until the key is gone.
+    for (key, ids) in &seeds {
+        for id in ids.iter().rev() {
+            storage
+                .delete_object_version(&bounded_bucket, key, Some(id))
+                .await
+                .unwrap();
+        }
+    }
+    storage.delete_bucket(&bounded_bucket).await.unwrap();
 }
 
 /// Convert a backend error into the contract error for assertions.

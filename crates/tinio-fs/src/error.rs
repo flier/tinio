@@ -70,9 +70,8 @@ pub(crate) fn invalid_value(report: garde::Report) -> Error {
 }
 
 /// The `state_dir` option violates a read-only-mode rule: `garde` validates
-/// field by field, so a cross-field rule (read-only mode requires an
-/// explicit state dir, outside the storage root) builds its report by hand
-/// (FR-023).
+/// field by field, so a cross-field rule (a read-only run's state dir must
+/// be outside the root) builds its report by hand (FR-023).
 #[inline]
 pub(crate) fn invalid_state_dir(message: &str) -> Error {
     let mut report = Report::new();
@@ -101,6 +100,32 @@ pub(crate) fn projected(err: impl Into<storage::Error>) -> Error {
 #[inline]
 pub(crate) fn contract(err: impl Into<Error>) -> storage::Error {
     err.into().into()
+}
+
+impl Error {
+    /// Whether this failure is "the handle is read-only" — a write was
+    /// refused because the run opened the root's database read-only
+    /// (FR-023 amended; [`database::Error::is_read_only`]'s crate-level
+    /// spelling). The read paths that rewrite a row they could not hit
+    /// ask this to serve the recomputed row without persisting it.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_fs::{Error, database};
+    ///
+    /// // The shared handle's arm answer, nested like every shared failure.
+    /// let refused: Error = database::Error::from(tinio_store::Error::ReadOnly).into();
+    /// assert!(refused.is_read_only());
+    ///
+    /// // Anything else keeps propagating: only the read-only refusal is
+    /// // the designed "recomputed but not written back" answer.
+    /// let unrelated = Error::InvalidPath("a/../b".into());
+    /// assert!(!unrelated.is_read_only());
+    /// ```
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::Database(err) if err.is_read_only())
+    }
 }
 
 impl From<database::Error> for Error {

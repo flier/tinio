@@ -425,16 +425,18 @@ Feature: Doctor diagnostics
     And its stdout contains "meta.redb"
     And the file "{root}/live/object.txt" holds "user data"
 
-  # B13 (M-4): `--fix --read-only` repairs in the **relocated** state dir and
-  # writes nothing in the served root — not even the store the repair path opens.
+  # B13 (M-4, amended 2026-10-05): `--fix --read-only` builds **no** store, in the relocated
+  # state dir or the served root — a read-only resolution skips the store's stages whole (the
+  # T154 fix), so neither the repair path nor the diagnostics path opens one. The stale state
+  # file is the fixture that keeps the run failing (the reclaim that removes it rides the
+  # read-only run's own test, so this scenario stays about the store's absence).
   @cli
-  Scenario: `--fix --read-only` repairs the relocated state dir and not the root
+  Scenario: `--fix --read-only` writes no store in the relocated state dir or the root
     Given a configured storage root
     And the relocated state dir holds a stale state file
     When I run "tinio doctor {root} --fix --read-only"
     Then the run fails with exit code 1
-    And the file "{state}/state" does not exist
-    And the file "{state}/meta.redb" exists
+    And the file "{state}/meta.redb" does not exist
     And the file "{root}/.tinio/meta.redb" does not exist
 
   # **A host that cannot confine, which is the one host state a scenario has to create rather

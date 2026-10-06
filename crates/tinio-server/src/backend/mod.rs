@@ -44,6 +44,7 @@ mod errors;
 mod locks;
 pub(crate) mod ops;
 mod s3;
+mod versioning;
 
 pub(crate) mod buckets;
 pub(crate) mod checksum;
@@ -178,9 +179,71 @@ use crate::{
     _core::{
         BodyStream, ETag, bucket, object,
         storage::{ByteRange, Error as StorageError, Storage},
+        version,
     },
     _util::lockmap::{self, Map},
 };
+
+/// The `x-amz-version-id` header value of a version identity, when the
+/// HTTP header rules accept it — the one guard the two identity carriers
+/// share: [`set_version_headers`] inserts what this returns, and
+/// [`S3Backend::version_id_member`] answers the identity only when it is
+/// `Some`, so an unrenderable identity is skipped by both instead of
+/// failing the response's renderer. The identifier is validated for length
+/// only (constitution II), so a rejected wire is a wire-shape failure, not
+/// a caller error.
+pub(crate) fn version_id_header(id: Option<&version::Id>) -> Option<http::HeaderValue> {
+    http::HeaderValue::from_str(&version::wire_of(id)).ok()
+}
+
+/// Set the versioning headers of an answer from a version identity — the
+/// `x-amz-version-id` AWS carries on the writes and reads of a bucket that
+/// records versions (the literal `null` for the null version), and
+/// `x-amz-delete-marker: true` when the answer is about a delete marker.
+///
+/// The caller owns the *when*: a bucket that records no versions answers
+/// without `x-amz-version-id` (operator ruling 2026-10-03 for the plain,
+/// non-version-addressed `GET`/`HEAD`), and only the caller knows whether
+/// it read the state. The identity rides the header verbatim; a value the
+/// header rules reject is skipped rather than panicking
+/// ([`version_id_header`] is that one guard).
+pub(crate) fn set_version_headers(
+    out: &mut http::HeaderMap,
+    id: Option<&version::Id>,
+    is_delete_marker: bool,
+) {
+    if let Some(value) = version_id_header(id) {
+        out.insert("x-amz-version-id", value);
+    }
+    if is_delete_marker {
+        out.insert(
+            "x-amz-delete-marker",
+            http::HeaderValue::from_static("true"),
+        );
+    }
+}
+
+/// The `versionId` a copy source names — the bucket form of
+/// `x-amz-copy-source`; the ARN forms this workspace refuses
+/// ([`S3Backend::copy_source`]) carry none of their own.
+#[cfg(feature = "copy")]
+pub(crate) fn copy_source_version(source: &dto::CopySource) -> Option<&str> {
+    match source {
+        dto::CopySource::Bucket { version_id, .. } => version_id.as_deref(),
+        _ => None,
+    }
+}
+
+/// The IMF-fixdate value of a `Last-Modified` header, rendered by s3s's own
+/// formatter so a raw-header site (a marker's `405`) matches every other
+/// answer's [`S3Backend::last_modified`].
+pub(crate) fn last_modified_header(t: SystemTime) -> Option<http::HeaderValue> {
+    let mut buf = Vec::new();
+    dto::LastModified::from(t)
+        .format(dto::TimestampFormat::HttpDate, &mut buf)
+        .ok()?;
+    http::HeaderValue::from_bytes(&buf).ok()
+}
 
 /// The S3 mapping over one [`Storage`] backend.
 ///
@@ -575,11 +638,34 @@ pub(crate) fn byte_range(r: dto::Range) -> ByteRange {
 /// Normalize the S3 wire `delimiter`: an empty `delimiter=` value means
 /// "no delimiter" (clients like mc always send it) — a `Some("")` would
 /// roll every key up into an empty common prefix and empty the page.
-/// One home for the boundary rule, shared by the object and upload
-/// listings.
-#[cfg(any(feature = "multipart", feature = "list-v1", feature = "list-v2"))]
+/// One home for the boundary rule, shared by the object, upload and
+/// version listings.
+#[cfg(any(
+    feature = "multipart",
+    feature = "list-v1",
+    feature = "list-v2",
+    feature = "versioning"
+))]
 pub(crate) fn normalize_delimiter(delimiter: Option<String>) -> Option<String> {
     delimiter.filter(|d| !d.is_empty())
+}
+
+/// The wire `CommonPrefix` elements of a listing's delimiter roll-up — the
+/// one mapping the object, upload and version listings share (the core
+/// listings hand the roll-up as plain strings).
+#[cfg(any(
+    feature = "multipart",
+    feature = "list-v1",
+    feature = "list-v2",
+    feature = "versioning"
+))]
+pub(crate) fn common_prefixes(prefixes: Vec<String>) -> Vec<dto::CommonPrefix> {
+    prefixes
+        .into_iter()
+        .map(|prefix| dto::CommonPrefix {
+            prefix: Some(prefix),
+        })
+        .collect()
 }
 
 /// Clamp a requested page size to the configured cap. `cap = 0` means

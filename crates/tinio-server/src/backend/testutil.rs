@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::S3Request;
+#[cfg(feature = "acl")]
+use s3s::dto;
 
 use super::{Capabilities, S3Backend};
 #[cfg(feature = "acl")]
@@ -115,4 +117,47 @@ pub(crate) fn post_request<T>(input: T) -> S3Request<T> {
 #[cfg(feature = "acl")]
 pub(crate) fn acl_backend() -> S3Backend<MemoryStorage> {
     S3Backend::new(MemoryStorage::new().unwrap(), Default::default()).with_identity(acl_identity())
+}
+
+// --- the ACL request fixtures (one home for the three test modules'
+// copies: objects, buckets, versioning) ---
+
+/// A well-formed `Content-MD5` value (base64 of 16 zero bytes).
+#[cfg(feature = "acl")]
+pub(crate) fn valid_md5() -> String {
+    use base64::engine::general_purpose::STANDARD;
+    base64::Engine::encode(&STANDARD, [0u8; 16])
+}
+
+/// A canonical-user grantee.
+#[cfg(feature = "acl")]
+pub(crate) fn canonical_grantee(id: &str) -> dto::Grantee {
+    dto::Grantee {
+        type_: dto::Type::from_static(dto::Type::CANONICAL_USER),
+        id: Some(id.into()),
+        uri: None,
+        display_name: None,
+        email_address: None,
+    }
+}
+
+/// A group grantee.
+#[cfg(feature = "acl")]
+pub(crate) fn group_grantee(uri: &str) -> dto::Grantee {
+    dto::Grantee {
+        type_: dto::Type::from_static(dto::Type::GROUP),
+        uri: Some(uri.into()),
+        id: None,
+        display_name: None,
+        email_address: None,
+    }
+}
+
+/// A dto grant of one grantee.
+#[cfg(feature = "acl")]
+pub(crate) fn grant(grantee: dto::Grantee, permission: &'static str) -> dto::Grant {
+    dto::Grant {
+        grantee: Some(grantee),
+        permission: Some(dto::Permission::from_static(permission)),
+    }
 }

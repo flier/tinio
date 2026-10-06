@@ -24,6 +24,7 @@ use crate::{
     meta::{Content, Verdict, gate},
     sweep::{Options as SweepOptions, Sweeper},
     testutil,
+    version::list::RESOLVE_CONCURRENCY,
 };
 
 /// A storage with a `data` bucket — unversioned, the state the round-trip
@@ -43,7 +44,7 @@ async fn put(
 ) -> object::Info {
     let chunk = Bytes::copy_from_slice(bytes);
     let body: BodyStream = Box::pin(stream::once(async move { Ok(chunk) }));
-    let staged = storage.stage_body(b, key, body, None).await.unwrap();
+    let staged = storage.stage_body(b, key, body, None, None).await.unwrap();
     storage
         .commit_object(
             b,
@@ -612,6 +613,88 @@ async fn an_out_of_band_removal_degrades_the_key_to_the_null_version_and_retires
     assert!(
         list(&storage, &b).await.entries.is_empty(),
         "neither a current entry nor history: the key has nothing to list"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_band_removal_under_a_marker_history_discloses_no_marker() {
+    // The plain read's 404 discloses a marker only when the key's *current*
+    // version is one (the design's delete-marker rule). A key whose current
+    // file is removed out of band while a marker sits in its version table
+    // is not a marked key: the disclosure's probe — `VersionOps::
+    // current_version`, the server's `miss_hides_a_marker` input — reads
+    // the current slot, and that slot is the gone content version, never
+    // the marker the history holds. The retired listing-based probe would
+    // have answered the newest history row (the marker) and put
+    // `x-amz-delete-marker: true` on a 404 about content that is merely
+    // gone; this test pins the design's rule instead.
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    put(&storage, &b, &key, b"first").await;
+
+    // Two plain deletes stack two markers: the second takes the slot, the
+    // first becomes a marker row in the version table (the history).
+    let history_marker = storage
+        .delete_object(&b, &key)
+        .await
+        .unwrap()
+        .id
+        .expect("an enabled bucket's marker carries an identity");
+    storage.delete_object(&b, &key).await.unwrap();
+
+    // The write over the current marker supersedes it like any other
+    // version — a marker has no content to move, but its row still enters
+    // the version table — so the slot describes content while the stack's
+    // marker rows sit in the history.
+    let current = put(&storage, &b, &key, b"second")
+        .await
+        .version_id
+        .expect("an enabled write mints an identity");
+    let page = list(&storage, &b).await;
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.is_delete_marker && entry.id.as_ref() == Some(&history_marker)),
+        "the premise: a marker sits in the key's history: {:?}",
+        listed(&page.entries)
+    );
+    assert_eq!(
+        page.entries[0].id.as_ref(),
+        Some(&current),
+        "and the current version is the object the last write put there"
+    );
+
+    // Out of band: the current file goes, the row still describes content.
+    fs::remove_file(root.path().join("data").join("notes.txt")).unwrap();
+    // The retired probe's answer, for contrast: the listing drops the gone
+    // current slot and leads with a marker of the key's history, so a
+    // `ListObjectVersions(prefix=key, max_keys=1)` page would have
+    // disclosed the marker on this 404.
+    let after = list(&storage, &b).await;
+    assert!(
+        after.entries[0].is_delete_marker,
+        "the listing leads with a marker of the key's history: {:?}",
+        listed(&after.entries)
+    );
+    // Nothing about that marker makes the slot the marker: the probe reads
+    // the current slot, which the mirror reports as the gone content
+    // version, not a marker.
+    assert_eq!(
+        storage.current_version(&b, &key).await.unwrap(),
+        version::CurrentVersion::Object,
+        "the probe reads the current slot, never the newest history row"
+    );
+    let err = storage
+        .get_object(&b, &key, None)
+        .await
+        .expect_err("the plain read of the gone file misses");
+    assert!(
+        matches!(err, crate::Error::Storage(storage::Error::NoSuchKey(_))),
+        "the plain read answers NoSuchKey, and the 404 discloses no marker: {err:?}"
     );
 }
 
@@ -1618,6 +1701,7 @@ async fn a_superseded_version_carries_its_tags_checksum_owner_and_acl() {
                 checksum::Algorithm::Md5,
                 &testutil::md5_wire(b"first"),
             )),
+            None,
         )
         .await
         .unwrap();
@@ -1904,4 +1988,187 @@ async fn a_page_wider_than_the_resolution_window_lists_every_key_in_order() {
     .await;
     assert_eq!(rolled.common_prefixes, ["k005", "k015", "k025", "k035"]);
     assert_eq!(rolled.entries.len(), expected.len() - 4);
+}
+
+/// The page walk is bounded by the listing's own bound, not by the bucket: a
+/// page resumed past a `key_marker` never opens — never **resolves** — the
+/// keys below the marker.
+///
+/// The proof is the resolution's own side effect: a key whose file drifted
+/// out of band is healed by the `resolve_object_slot` the page runs for it
+/// (the row is rewritten with the file it found), so the keys the page never
+/// reached keep exactly the rows the drift left them. The walk this test
+/// replaced resolved and healed **every** key under the prefix before cutting
+/// the page, so it fails on that shape and passes only on a bounded one.
+#[tokio::test]
+async fn a_page_past_the_key_marker_never_resolves_the_keys_before_it() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let names: Vec<String> = (0..6).map(|i| format!("k{i}.txt")).collect();
+    let mut recorded = Vec::new();
+    for name in &names {
+        let key = object::key(name).unwrap();
+        put(&storage, &b, &key, b"before").await;
+        recorded.push(stored_row(&storage, &b, &key).await);
+    }
+    // Drift every key out of band: the recorded size no longer describes the
+    // file, so a resolution heals that key's row — and only a resolution
+    // does. The ETag is unaffected (nothing recomputes it here).
+    let tampered = names
+        .iter()
+        .map(|name| {
+            let path = root.path().join("data").join(name);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.extend_from_slice(b"-tampered");
+            fs::write(&path, &bytes).unwrap();
+            bytes.len() as u64
+        })
+        .collect::<Vec<u64>>();
+
+    // The page resumes past the third key: the keys below the marker are
+    // behind the cursor and must not be read, and the marker's own key is
+    // skipped whole (a bare `key_marker` needs no entry of it).
+    let page = page(
+        &storage,
+        &b,
+        ListParams {
+            key_marker: Some(names[2].clone()),
+            max_keys: 10,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        listed(&page.entries),
+        [
+            (names[3].clone(), None),
+            (names[4].clone(), None),
+            (names[5].clone(), None),
+        ],
+        "the marker skips its own key and every key below it"
+    );
+
+    // The page's keys were resolved, so their rows now describe the file on
+    // disk (the heal the read path's gate writes).
+    for (name, size) in names[3..].iter().zip(&tampered[3..]) {
+        let now = stored_row(&storage, &b, &object::key(name).unwrap()).await;
+        assert_eq!(
+            now.size, *size,
+            "{name} is in the page, so the walk resolved and healed it"
+        );
+    }
+    // ...and the keys below the marker kept the recording the drift left:
+    // they were never opened.
+    for index in 0..3 {
+        let now = stored_row(&storage, &b, &object::key(&names[index]).unwrap()).await;
+        assert_eq!(
+            now, recorded[index],
+            "{} is behind the marker, so nothing may have resolved it",
+            names[index]
+        );
+    }
+}
+
+/// A rolled-up group is found from the members it needs, never by walking
+/// all of them: the walk counts the group once, skips its remaining keys
+/// without opening them, and jumps the group's whole key range on the next
+/// round.
+///
+/// The group is forty members — more than two resolve pipes
+/// ([`RESOLVE_CONCURRENCY`](crate::version::list::RESOLVE_CONCURRENCY))
+/// wide while that stays below twenty — so "every member" and "a group's
+/// worth of work" are far apart: the walk may open the pipe's depth of
+/// members while the first one's answer is in flight — a bounded,
+/// documented cost — and must leave the rest of the group untouched. The
+/// drift-and-heal proof is the marker test's: only a resolution rewrites a
+/// drifted row. The walk this test replaced resolved every key under the
+/// prefix, all forty members included; the bound below
+/// (`RESOLVE_CONCURRENCY` + 8, checked against the forty) still fails that
+/// walk only while `RESOLVE_CONCURRENCY` stays below 32 — raise it past
+/// either margin and this test's fixture, not its prose, is what has to
+/// grow.
+#[tokio::test]
+async fn a_rolled_up_group_never_resolves_every_member() {
+    let (root, storage, b) = fixture().await;
+    let group: Vec<String> = (0..40).map(|i| format!("roll-{i:02}.txt")).collect();
+    let tail = "tail.txt".to_owned();
+    let names: Vec<String> = group.iter().cloned().chain([tail.clone()]).collect();
+    for name in &names {
+        let key = object::key(name).unwrap();
+        put(&storage, &b, &key, format!("{name}!").as_bytes()).await;
+    }
+    let mut recorded = Vec::new();
+    for name in &names {
+        recorded.push(stored_row(&storage, &b, &object::key(name).unwrap()).await);
+    }
+    let tampered = names
+        .iter()
+        .map(|name| {
+            let path = root.path().join("data").join(name);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.extend_from_slice(b"-tampered");
+            fs::write(&path, &bytes).unwrap();
+            bytes.len() as u64
+        })
+        .collect::<Vec<u64>>();
+
+    let page = page(
+        &storage,
+        &b,
+        ListParams {
+            delimiter: Some("-".to_owned()),
+            max_keys: 1000,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        page.common_prefixes,
+        ["roll-"],
+        "the forty members are one entry"
+    );
+    assert_eq!(listed(&page.entries), [(tail.clone(), None)]);
+
+    // The first member's resolution is what told the walk the group yields,
+    // and the group's remaining members are duplicates the page drops: the
+    // walk may open the resolve pipe's worth of them (they were pushed while
+    // the first one's answer was in flight — the pipe is one
+    // `RESOLVE_CONCURRENCY` wide), never a member more.
+    let mut resolved: Vec<&String> = Vec::new();
+    for (index, name) in group.iter().enumerate() {
+        let row = stored_row(&storage, &b, &object::key(name).unwrap()).await;
+        if row.size == tampered[index] {
+            resolved.push(name);
+        } else {
+            assert_eq!(
+                row, recorded[index],
+                "{name} must keep the row the drift left it"
+            );
+        }
+    }
+    assert_eq!(
+        resolved.first().copied(),
+        Some(&group[0]),
+        "the group's first member is the one the walk reads it from"
+    );
+    // The bound follows the resolve pipe's own width, with a slot of slack
+    // as headroom for a walk that fills the pipe across a window boundary
+    // — never a re-spelled 16: raising `RESOLVE_CONCURRENCY` cannot fail a
+    // walk that respects it, while a walk that opens every member — forty
+    // of them — still fails here while `RESOLVE_CONCURRENCY` + 8 stays
+    // under forty (below 32).
+    let bound = RESOLVE_CONCURRENCY + 8;
+    assert!(
+        resolved.len() <= bound,
+        "a rolled-up group costs a pipe's worth of resolutions, never one \
+         per member: {} of {} members were opened (bound {bound})",
+        resolved.len(),
+        group.len()
+    );
+    // The plain key after the group is in the page and resolves normally.
+    let tail_row = stored_row(&storage, &b, &object::key(&tail).unwrap()).await;
+    assert_eq!(tail_row.size, tampered[tampered.len() - 1]);
 }

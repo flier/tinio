@@ -298,7 +298,8 @@ impl Store {
                     .map_err(Into::into)
             })
             .await
-            .map_err(Into::into)
+            .map_err(Error::from)
+            .or_else(|err| not_recorded(now, err))
     }
 
     /// The creation time of a bucket, recorded on first sight in ONE
@@ -318,7 +319,8 @@ impl Store {
                     .map_err(Into::into)
             })
             .await
-            .map_err(Into::into)
+            .map_err(Error::from)
+            .or_else(|err| not_recorded(now, err))
     }
 
     /// The creation times of the given buckets, in order — one read
@@ -406,6 +408,19 @@ impl Store {
                 Ok(out)
             })
             .map_err(Into::into)
+    }
+}
+
+/// The first-sight creation time a **read-only** handle's refused record
+/// answers (FR-023 amended, design 2026-10-03 **Read paths**): `now` — the
+/// value the write would have recorded — served without writing anything.
+/// Every other error propagates: a read-only run degrades, it does not
+/// swallow real failures.
+fn not_recorded(now: SystemTime, err: Error) -> Result<SystemTime, Error> {
+    if err.is_read_only() {
+        Ok(now)
+    } else {
+        Err(err)
     }
 }
 

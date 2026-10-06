@@ -1076,6 +1076,26 @@ mod tests {
             call!(get_object_acl, dto::GetObjectAclInput);
             call!(put_object_acl, dto::PutObjectAclInput);
         }
+        #[cfg(feature = "versioning")]
+        {
+            call!(get_bucket_versioning, dto::GetBucketVersioningInput);
+            call!(list_object_versions, dto::ListObjectVersionsInput);
+            // `PutBucketVersioningInput` has a required configuration — no
+            // Default derive — built explicitly like the tagging inputs.
+            let _ = rt.block_on(backend.put_bucket_versioning(request(
+                dto::PutBucketVersioningInput {
+                    bucket: "b".into(),
+                    checksum_algorithm: None,
+                    content_md5: None,
+                    expected_bucket_owner: None,
+                    mfa: None,
+                    versioning_configuration: dto::VersioningConfiguration {
+                        status: None,
+                        mfa_delete: None,
+                    },
+                },
+            )));
+        }
         let expected: Vec<&str> = {
             let base = [
                 "DeleteBucket",
@@ -1107,6 +1127,12 @@ mod tests {
             let base = base.chain(["UploadPart", "ListParts", "ListMultipartUploads"]);
             #[cfg(feature = "cors")]
             let base = base.chain(["GetBucketCors", "PutBucketCors", "DeleteBucketCors"]);
+            #[cfg(feature = "versioning")]
+            let base = base.chain([
+                "GetBucketVersioning",
+                "PutBucketVersioning",
+                "ListObjectVersions",
+            ]);
             base.collect()
         };
         let recorded: Vec<&str> = expected
@@ -1224,8 +1250,8 @@ pub(crate) use wire_name;
 ///
 /// The label is the input dto's name minus `Input` — s3s's codegen names
 /// each dto pair after the operation, so `CreateMultipartUploadInput` labels
-/// `CreateMultipartUpload`. Every one of the 36 labels is pinned by a
-/// counter: `metric_s3_records_every_delegated_operation` asserts 32 at 501
+/// `CreateMultipartUpload`. Every one of the 39 labels is pinned by a
+/// counter: `metric_s3_records_every_delegated_operation` asserts 35 at 501
 /// (its feature-gated rows under their own `#[cfg]`),
 /// `metric_s3_records_status_classes` pins `CreateBucket`, and
 /// `metric_s3_maintains_multipart_gauge` pins the multipart trio's 200s

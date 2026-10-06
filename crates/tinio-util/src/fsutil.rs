@@ -743,9 +743,14 @@ pub async fn entries_of(dir: &Path) -> io::Result<Vec<(PathBuf, String)>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::read_dir, time::Duration};
+    use std::{
+        cell::Cell,
+        fs::read_dir,
+        future::Future,
+        time::{Duration, Instant},
+    };
 
-    use tokio::time::timeout;
+    use tokio::time::sleep;
 
     use super::*;
     use crate::_core::storage::collect_body;
@@ -884,13 +889,145 @@ mod tests {
         remove_staged_temp(temp.clone());
         // The unlink runs on the blocking pool; wait for it (the call is
         // detached by design).
-        timeout(Duration::from_secs(5), async {
-            while fs::try_exists(&temp).await.unwrap() {
-                task::yield_now().await;
+        await_absent(&temp, || fs::try_exists(&temp)).await;
+    }
+
+    /// Wait for a probe to stop finding the path — the wait the detached
+    /// unlink forces on every caller, and the one place a probe can lie.
+    ///
+    /// `try_exists` is not an observation of the removal. On Windows a probe
+    /// landing while the name is mid-unlink answers `ERROR_ACCESS_DENIED`, not
+    /// `Ok(false)`: the access-0 open meets the delete-pending entry, and the
+    /// fallback std takes for exactly that class (`FindFirstFileExW`, cached
+    /// attributes) finds the name already gone, so the original error surfaces
+    /// instead of `NotFound` — measured on this host: 242 of 21 443 paced
+    /// probe/unlink races, 320 of 4 000 runs of the tight-spin shape, and 0 of
+    /// 37 000 probes with no unlink in flight. That error says nothing about
+    /// the temp, so it is retried; any other error is a real one and panics
+    /// rather than waiting out the deadline.
+    ///
+    /// The poll is paced, not spun: a tight loop is both the widest window the
+    /// race can land in and needless load on the shared temp root the
+    /// real-time scanner also reads, while a 10 ms cadence still observes the
+    /// removal promptly. The bound is the assertion — gone within 5 s.
+    ///
+    /// **The bound's failure dumps what it waited on** ([`parent_entries`]
+    /// plus the last probe's answer). The retried `PermissionDenied` race is
+    /// one recorded signature of this file's flake; a plain 5 s timeout is
+    /// the other, seen once with no mechanism proven (the model leaves two
+    /// candidates, both reachable: a real-time scanner holding the freshly
+    /// written file, or a late dispatch of the detached unlink). A bare
+    /// assertion tells neither apart nor says what state the directory was
+    /// left in, and the dump is what makes a recurrence attributable.
+    async fn await_absent<F, Fut>(path: &Path, mut probe: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<bool>>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let last = match probe().await {
+                Ok(false) => return,
+                Ok(true) => "the name was still there".to_owned(),
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    format!("the unlink race: {err}")
+                }
+                Err(err) => panic!("probing the staged temp: {err}"),
+            };
+            assert!(
+                Instant::now() < deadline,
+                "the staged temp's removal (waited 5 s; the last probe answered {last}; {})",
+                parent_entries(path)
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The timeout dump's directory listing, best-effort and sorted for a
+    /// stable message: the path's parent and each entry's name with its kind
+    /// and length when the metadata reads, a name-only line when it does
+    /// not. An unreadable parent says so rather than hiding the failure —
+    /// that answer is itself the diagnosis.
+    fn parent_entries(path: &Path) -> String {
+        let Some(parent) = path.parent() else {
+            return "the path has no parent directory".to_owned();
+        };
+        let entries = match read_dir(parent) {
+            Ok(entries) => entries,
+            Err(err) => return format!("{} could not be listed: {err}", parent.display()),
+        };
+        let mut entries: Vec<String> = entries
+            .map(|entry| match entry {
+                Ok(entry) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    match entry.metadata() {
+                        Ok(metadata) => {
+                            let kind = if metadata.is_dir() {
+                                "dir"
+                            } else if metadata.is_file() {
+                                "file"
+                            } else {
+                                "other"
+                            };
+                            format!("{name} ({kind}, {} bytes)", metadata.len())
+                        }
+                        Err(err) => format!("{name} (metadata: {err})"),
+                    }
+                }
+                Err(err) => format!("<unreadable entry: {err}>"),
+            })
+            .collect();
+        entries.sort();
+        format!("{} holds [{}]", parent.display(), entries.join(", "))
+    }
+
+    /// The tolerance [`await_absent`] exists for, pinned: a probe answering
+    /// `PermissionDenied` once — the unlink race — is retried, not unwrapped
+    /// into a panic, and the removal is still observed.
+    #[tokio::test]
+    async fn the_staged_temp_wait_retries_a_probe_that_races_the_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("staged");
+        let probes = Cell::new(0);
+        await_absent(&temp, || {
+            probes.set(probes.get() + 1);
+            let raced = probes.get() == 1;
+            async move {
+                if raced {
+                    Err(io::Error::from(ErrorKind::PermissionDenied))
+                } else {
+                    Ok(false)
+                }
             }
         })
-        .await
-        .expect("the staged temp's removal");
+        .await;
+        assert_eq!(probes.get(), 2, "the raced probe was retried");
+    }
+
+    /// The timeout dump's listing, pinned without waiting out the 5 s bound:
+    /// the entry's name and metadata are rendered, and an unreadable parent
+    /// answers with the reason instead of panicking in the dump itself.
+    #[tokio::test]
+    async fn the_timeout_dump_lists_the_parent_and_tolerates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).await.unwrap();
+        fs::write(dir.path().join("staged"), b"payload")
+            .await
+            .unwrap();
+        let listing = parent_entries(&dir.path().join("staged"));
+        assert!(
+            listing.contains("staged (file, 7 bytes)"),
+            "the entry's name and metadata are in the dump: {listing}"
+        );
+        assert!(
+            listing.contains("sub (dir,"),
+            "a directory entry renders its kind: {listing}"
+        );
+        let absent = parent_entries(&dir.path().join("no-such-dir").join("staged"));
+        assert!(
+            absent.contains("could not be listed"),
+            "an unreadable parent says so: {absent}"
+        );
     }
 
     #[tokio::test]

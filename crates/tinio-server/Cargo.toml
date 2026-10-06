@@ -57,6 +57,8 @@ tinio-api = { workspace = true, optional = true }
 tinio-auth = { workspace = true, optional = true }
 tinio-config.workspace = true
 tinio-core.workspace = true
+tinio-fs = { workspace = true, optional = true }
+tinio-mem = { workspace = true, optional = true }
 tinio-select = { workspace = true, optional = true }
 tinio-util.workspace = true
 
@@ -136,7 +138,17 @@ name = "pipeline"
 harness = false
 
 [features]
-default = ["multipart", "copy", "list-v1", "list-v2", "cors", "select", "acl", "sandbox"]
+default = [
+    "multipart",
+    "copy",
+    "list-v1",
+    "list-v2",
+    "cors",
+    "select",
+    "acl",
+    "sandbox",
+    "versioning",
+]
 # The confinement e2e targets' own switch, and nothing else's: `sandbox_e2e`, `sandbox_e2e_windows`
 # and `sandbox_macos_e2e` carry `required-features = ["sandbox"]`, and the crate they read the
 # confined child's events with is the dev-dependency above. Kept in `default` so
@@ -153,6 +165,12 @@ select = ["dep:tinio-select", "dep:cfg-if", "dep:rayon"]
 select-parquet = ["select", "tinio-select/parquet"]
 acl = ["dep:tinio-auth"]
 api = ["dep:tinio-api"]
+versioning = [
+    "dep:tinio-fs",
+    "dep:tinio-mem",
+    "tinio-fs/versioning",
+    "tinio-mem/versioning",
+]
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry-otlp",

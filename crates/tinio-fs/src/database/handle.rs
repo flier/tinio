@@ -1,4 +1,11 @@
 //! Shared database access handle.
+//!
+//! The database arm, the transaction entry, and the closure-passing
+//! `read`/`write` pattern are the shared store handle's
+//! ([`crate::_store::store::Handle`]); this type adds what is genuinely
+//! fs-specific — the tokio blocking-pool hop every fs transaction takes
+//! and the write-lock histograms the server's `tinio_write_lock_*`
+//! metrics are scraped from.
 
 use std::{
     array::from_fn,
@@ -16,11 +23,11 @@ use tokio::task::spawn_blocking;
 use super::{
     compact::{needs_compact, snapshot},
     error::Error,
-    open::open,
+    open::{open, open_read_only},
 };
 use crate::{
     _core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
-    _store::{state, store},
+    _store::{Error as StoreError, state, store},
 };
 
 /// The histogram bucket of a duration in microseconds.
@@ -95,12 +102,15 @@ impl WriteHistogram {
     }
 }
 
-/// The shared access handle to a state database.
+/// The fs access handle to a state database.
 ///
 /// Every store holds an `Arc<Handle>` clone; the single redb writer
 /// serializes writes (the per-store in-process locks are gone). `compact`
 /// cannot run through this handle (`&mut` is structurally unavailable once
 /// shared) — it runs before `FsStorage` construction (meta-redb-spec §5.9).
+/// The database arm — writable, read-only, or the degraded empty view, and
+/// with it the write refusal — is the wrapped store handle's
+/// ([`crate::_store::store::Handle`], FR-023 amended).
 ///
 /// **Write transactions run on the tokio blocking pool** (G3, revised by
 /// the data-path review 2026-08-27): every commit is a
@@ -122,8 +132,9 @@ impl WriteHistogram {
 /// and self-healing, but this trade-off was deliberately not made).
 #[derive(Debug)]
 pub struct Handle {
-    /// The shared transaction core (the closure-passing read/write arms).
-    core: store::Handle,
+    /// The shared store handle: the database arm, its transactions and
+    /// the closure-passing read/write pattern.
+    db: store::Handle,
     /// The write-lock histograms (pipeline-spec.md §4).
     hist: WriteHistogram,
 }
@@ -132,20 +143,65 @@ impl Handle {
     /// Open the state database at `state_dir` and wrap it (the single
     /// construction path of the standalone store constructors).
     pub fn open(state_dir: &Path) -> Result<Arc<Self>, Error> {
-        Ok(Self::new(open(state_dir)?.db))
+        Ok(Self::wrap(store::Handle::new(open(state_dir)?.db)))
+    }
+
+    /// Open `state_dir`'s database **read-only** and wrap it — the
+    /// read-only run's metadata source (FR-023 amended). The open
+    /// creates nothing; its failure is the caller's to report (the
+    /// degraded read-only view is [`Handle::empty`]).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_fs::database::Handle;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// // A read-write run created the root's database...
+    /// drop(Handle::open(dir.path()).unwrap());
+    /// // ...and the read-only run opens the same file, creating nothing.
+    /// let handle = Handle::open_read_only(dir.path()).unwrap();
+    /// assert!(!handle.compact_needed().unwrap());
+    /// ```
+    pub fn open_read_only(state_dir: &Path) -> Result<Arc<Self>, Error> {
+        Ok(Self::wrap(store::Handle::new_read_only(open_read_only(
+            state_dir,
+        )?)))
+    }
+
+    /// Wrap an empty in-memory database — the degraded read-only view:
+    /// every table reads as empty, every write is refused.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_fs::database::Handle;
+    ///
+    /// // The view a read-only run degrades to when the root database
+    /// // cannot be opened: reads answer the empty state, writes are
+    /// // refused with the read-only refusal (`Error::is_read_only`).
+    /// let handle = Handle::empty().unwrap();
+    /// assert!(!handle.compact_needed().unwrap());
+    /// ```
+    pub fn empty() -> Result<Arc<Self>, Error> {
+        Ok(Self::wrap(store::Handle::empty()?))
     }
 
     /// Wrap an opened database (after the pre-sharing compact window —
     /// the orchestration path: `open` → `compact_if_needed` → `Handle::new`,
     /// meta-redb-spec §5.9/G1).
     pub fn new(db: Database) -> Arc<Self> {
+        Self::wrap(store::Handle::new(db))
+    }
+
+    fn wrap(db: store::Handle) -> Arc<Self> {
         Arc::new(Self {
-            core: store::Handle::new(db),
+            db,
             hist: WriteHistogram::default(),
         })
     }
 
-    /// Run `f` against a read transaction.
+    /// Run `f` against a read transaction — every arm reads.
     ///
     /// Zero-copy guards live only inside `f`; return owned copies (guards
     /// are invalid once the transaction ends).
@@ -153,7 +209,7 @@ impl Handle {
         &self,
         f: impl FnOnce(&ReadTransaction) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.core.read(f)
+        self.db.read(f)
     }
 
     /// Run `f` against a read transaction on the tokio blocking pool —
@@ -176,7 +232,7 @@ impl Handle {
         T: Send + 'static,
     {
         let this = Arc::clone(self);
-        spawn_blocking(move || this.core.read(f))
+        spawn_blocking(move || this.read(f))
             .await
             .unwrap_or_else(|join| panic!("the read-transaction task panicked: {join}"))
     }
@@ -277,6 +333,12 @@ impl Handle {
     where
         T: Send + 'static,
     {
+        // A non-writable arm refuses before the hop: no transaction exists
+        // to open, and the refusal is the arm's answer (the wrapped store
+        // handle's), not a pool failure.
+        if !self.db.is_writable() {
+            return Err(StoreError::ReadOnly.into());
+        }
         // The wrapper entry — the recorded wait/total span the
         // spawn_blocking hop (queue delay included, see the doc above).
         let start = Instant::now();
@@ -294,7 +356,10 @@ impl Handle {
         start: Instant,
         f: impl FnOnce(WriteTransaction) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let txn = match self.core.db().begin_write() {
+        // The write transaction's entry is the store handle's, which owns
+        // the arm (and with it the refusal): a non-writable arm answered it
+        // at the async wrapper, before the hop.
+        let txn = match self.db.begin_write() {
             Ok(txn) => txn,
             Err(err) => {
                 // No transaction opened: wait == total (no commit phase).
@@ -303,7 +368,7 @@ impl Handle {
                 // (Handle owns the Database).
                 let duration = start.elapsed();
                 self.hist.record(duration, duration);
-                return Err(Error::Redb(err.into()));
+                return Err(err.into());
             }
         };
         let waited = start.elapsed();

@@ -637,6 +637,47 @@ async fn a_panicking_write_closure_panics_the_caller() {
     drop(state);
 }
 
+/// FR-023 amended: a read-only handle reads and refuses every write. The
+/// read-only policy refuses the mutating operations upstream and a
+/// read-only run runs neither the scanner nor the sweeper, so a write
+/// through the handle is a programming error — and the refusal is loud
+/// (the read-only refusal, `Error::is_read_only`), on both non-writable
+/// arms and on the degraded empty view, without opening a transaction.
+#[tokio::test]
+async fn a_read_only_handle_refuses_writes_and_serves_reads() {
+    let (state, db, _) = open_db();
+    {
+        let mut txn = db.begin_write().unwrap();
+        StateTable::open(&mut txn)
+            .unwrap()
+            .set_compact_marker(true)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    drop(db);
+
+    let handle = Handle::open_read_only(state.path()).unwrap();
+    // Reads work, over the database's own rows.
+    assert!(handle.compact_needed().unwrap());
+
+    // Both write arms answer the refusal, before any transaction exists.
+    let err = handle.write(|_txn| Ok(())).await.unwrap_err();
+    assert!(err.is_read_only(), "{err:?}");
+    assert_eq!(err.to_string(), "the state database is read-only");
+    let err = handle.write_if(|_txn| Ok(Some(()))).await.unwrap_err();
+    assert!(err.is_read_only(), "{err:?}");
+
+    // The degraded empty view reads as empty and refuses writes alike.
+    let empty = Handle::empty().unwrap();
+    assert!(!empty.compact_needed().unwrap());
+    let err = empty
+        .write(move |_txn| -> Result<(), Error> { panic!("no transaction exists") })
+        .await
+        .unwrap_err();
+    assert!(err.is_read_only(), "{err:?}");
+    drop(state);
+}
+
 #[tokio::test]
 async fn compact_if_needed_unchanged_when_nothing_to_reclaim() {
     let (state, mut db, _) = open_db();

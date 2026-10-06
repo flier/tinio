@@ -16,29 +16,30 @@ use crate::version::{insert_marker, prepare_publish, rename_refusal};
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
-        acl,
+        TagWriteResult, acl,
         acl::{Acl, AclGrants},
         bucket::Name,
         checksum, collect_body, from_nanos, group_and_paginate,
         multipart::ObjectPart,
         now_nanos, object, version,
     },
-    _store::{bucket, meta, object_part, objects, scan::for_each_pair},
+    _store::{bucket, bucket_versioning, meta, object_part, objects, scan::for_each_pair},
     Error,
     error::{access_denied, invalid_key, no_such_bucket, no_such_key},
     storage::{MemoryStorage, check_bucket},
-    version::object_result,
+    version::{object_result, records_versions},
 };
 
 /// A staged object body: the buffered payload (the commit inserts it)
-/// plus the stage's tee digest (spec 2026-08-31) — the validated checksum
-/// of the staged content, computed while the body streamed under the
-/// server's `checksum` slot; committed as the object's recorded checksum
-/// (`FULL_OBJECT` kind) with no re-hashing. `None` when the stage carried
-/// no tee slot.
+/// plus the stage's recorded checksum (spec 2026-08-31) — the explicit
+/// `carried` value when the caller passed one (a version-addressed
+/// copy's source version, kind included), else the validated checksum
+/// computed while the body streamed under the server's tee slot and
+/// recorded as FULL_OBJECT (the write path's kind) — committed with no
+/// re-hashing. `None` when the stage fixed neither.
 pub struct StagedBody {
     data: Vec<u8>,
-    checksum: Option<checksum::Part>,
+    checksum: Option<checksum::Recorded>,
 }
 
 impl MemoryStorage {
@@ -46,26 +47,47 @@ impl MemoryStorage {
     /// `put_object_tags` and `delete_object_tags` (the bucket and key
     /// gates stay in the ops): the table accessor replaces the row's
     /// tags element, keeping the row's other elements (etag, size,
-    /// mtime, recorded checksum) verbatim. Returns whether the row
-    /// existed (a missing row commits nothing — nothing changed).
+    /// mtime, recorded checksum) verbatim, and the same transaction
+    /// reads the rewritten row's current-version identity and the
+    /// bucket's records-versions bit — the answer's pair ([`TagWriteResult`]),
+    /// one transaction, no second read. `None` when the row is missing
+    /// (nothing changed — nothing to name).
     async fn rewrite_tags_element(
         &self,
         bucket: &Name,
         key: &object::Key,
         tags: &object::Tags,
-    ) -> Result<bool, Error> {
-        self.db.write(|txn| -> Result<bool, Error> {
-            Ok(meta::Table::open(txn)?
-                .put_tags(bucket.as_ref().as_str(), key.as_ref().as_str(), tags)?
-                .is_some())
-        })
+    ) -> Result<Option<TagWriteResult>, Error> {
+        self.db
+            .write(|txn| -> Result<Option<TagWriteResult>, Error> {
+                let b = bucket.as_ref().as_str();
+                let k = key.as_ref().as_str();
+                let row = {
+                    let mut table = meta::Table::open(txn)?;
+                    if table.put_tags(b, k, tags)?.is_none() {
+                        return Ok(None);
+                    }
+                    table.get(b, k)?
+                };
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let records_versions = bucket_versioning::Table::open(txn)?
+                    .get(b)?
+                    .unwrap_or_default()
+                    .records_versions();
+                Ok(Some(TagWriteResult {
+                    version_id: row.version_id,
+                    bucket_records_versions: records_versions,
+                }))
+            })
     }
 
     /// The shared commit tail of the object write paths
     /// ([`ObjectOps::commit_object`] and the copy primitive): atomically
     /// publish `data` onto `key` in one write transaction and record the
     /// interface-validated `tags` and the recorded `checksum` (the
-    /// FULL_OBJECT tee digest of a plain commit, or the copy's carried
+    /// FULL_OBJECT tee digest of a plain commit, or an explicit carried
     /// value — kind included) in the same `OBJECT_META` row — no
     /// post-commit tag window — while removing any stale `OBJECT_PARTS`
     /// rows of the key (a fresh object is single-part: overwriting a
@@ -115,9 +137,9 @@ impl MemoryStorage {
         } else {
             ETag::from_content(&data)
         };
-        let (now, version_id) = self
+        let (now, version_id, records_versions) = self
             .db
-            .write(|txn| -> Result<(u64, Option<version::Id>), Error> {
+            .write(|txn| -> Result<(u64, Option<version::Id>, bool), Error> {
             {
                 check_bucket(&bucket::Table::open(txn)?, bucket)?;
             }
@@ -144,9 +166,10 @@ impl MemoryStorage {
             // blob table (a dedup hit stores nothing: those bytes are already
             // metered).
             #[cfg(feature = "versioning")]
-            let (version_id, version_seq, history_bytes) = prepare_publish(txn, bucket, key, now)?;
+            let (version_id, version_seq, history_bytes, records_versions) =
+                prepare_publish(txn, bucket, key, now)?;
             #[cfg(not(feature = "versioning"))]
-            let history_bytes = 0i64;
+            let (history_bytes, records_versions) = (0i64, false);
             {
                 let mut objects = objects::Table::open(txn)?;
                 objects.put(b, k, &data)?;
@@ -190,7 +213,7 @@ impl MemoryStorage {
             // A limit breach aborts the whole transaction here, leaving both
             // the rows and the tracked total untouched.
             self.adjust_total(delta + history_bytes)?;
-            Ok((now, stored.version_id.clone()))
+            Ok((now, stored.version_id.clone(), records_versions))
         })
         // The in-memory backend's commit cannot fail (no disk path — an
         // abort-only transaction is the only failure mode), so no
@@ -206,6 +229,7 @@ impl MemoryStorage {
             owner: owner.cloned(),
             acl: acl.clone(),
             version_id,
+            bucket_records_versions: records_versions,
         })
     }
 }
@@ -221,7 +245,8 @@ impl ObjectOps for MemoryStorage {
         bucket: &Name,
         key: &object::Key,
         body: BodyStream,
-        checksum: Option<Arc<checksum::PartChecksum>>,
+        tee: Option<Arc<checksum::PartChecksum>>,
+        carried: Option<checksum::Recorded>,
     ) -> Result<StagedBody, Error> {
         if key.is_reserved() {
             return Err(access_denied(key));
@@ -242,19 +267,24 @@ impl ObjectOps for MemoryStorage {
             });
         }
         // Stream the body before opening the transaction (the body future
-        // cannot borrow the transaction guard). `checksum` is the
-        // server's tee slot (spec 2026-08-31 — the `upload_part` pattern):
-        // the interface wraps the body when the client sent a single
+        // cannot borrow the transaction guard). `tee` is the server's
+        // checksum slot (spec 2026-08-31 — the `upload_part` pattern): the
+        // interface wraps the body when the client sent a single
         // `x-amz-checksum-*` header, the digest is computed while the body
         // streams, a mismatch fails the staging as the tee's stream error
         // (propagated here like any body failure — the mem adds no error
-        // of its own), and the validated digest rides into the commit.
-        // Absent, no digest is computed.
+        // of its own), and the validated digest rides into the commit as
+        // FULL_OBJECT (the write path's kind). Absent, no digest is
+        // computed. `carried` — a version-addressed copy's source version
+        // checksum, kind included — wins over the streamed digest.
         let data = collect_body(body).await?;
-        let computed = checksum.as_ref().and_then(|c| c.digest.get()).cloned();
+        let computed = tee.as_ref().and_then(|c| c.digest.get()).cloned();
         Ok(StagedBody {
             data,
-            checksum: computed,
+            checksum: carried.or(computed.map(|part| checksum::Recorded {
+                part,
+                kind: checksum::Type::FullObject,
+            })),
         })
     }
 
@@ -267,14 +297,7 @@ impl ObjectOps for MemoryStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<object::Info, Error> {
-        // The stage's tee digest records as the object's FULL_OBJECT
-        // checksum (the kind is fixed by the write path — a plain PUT's
-        // digest is over the whole content).
-        let checksum = staged.checksum.map(|part| checksum::Recorded {
-            part,
-            kind: checksum::Type::FullObject,
-        });
-        self.write_object(bucket, key, staged.data, tags, checksum, owner, acl)
+        self.write_object(bucket, key, staged.data, tags, staged.checksum, owner, acl)
             .await
     }
 
@@ -315,6 +338,11 @@ impl ObjectOps for MemoryStorage {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(no_such_key(key));
             }
+            // The bucket's versioning state rides the same transaction as
+            // the row it describes — the carrier for the plain read's
+            // version-header rule (the state the server used to read again
+            // per request).
+            let records_versions = records_versions(txn, bucket)?;
             let objects = objects::Table::open_readonly(txn)?;
             let meta = meta::Table::open_readonly(txn)?;
             // The meta row is the existence gate; the shared validation decodes
@@ -346,6 +374,7 @@ impl ObjectOps for MemoryStorage {
                 stored.owner.clone(),
                 stored.acl.clone(),
                 stored.version_id.clone(),
+                records_versions,
                 data_guard.value(),
                 served_range,
             ))
@@ -360,6 +389,7 @@ impl ObjectOps for MemoryStorage {
             if key.is_folder_marker() || key.is_reserved() {
                 return Err(no_such_key(key));
             }
+            let records_versions = records_versions(txn, bucket)?;
             let meta = meta::Table::open_readonly(txn)?;
             let stored = meta
                 .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
@@ -374,6 +404,7 @@ impl ObjectOps for MemoryStorage {
                 owner: stored.owner.clone(),
                 acl: stored.acl.clone(),
                 version_id: stored.version_id.clone(),
+                bucket_records_versions: records_versions,
             })
         })
     }
@@ -555,6 +586,9 @@ impl ObjectOps for MemoryStorage {
                 owner: stored.owner.clone(),
                 acl: stored.acl.clone(),
                 version_id: stored.version_id.clone(),
+                // The rename guard above passed, so the bucket is
+                // unversioned — it records no versions by construction.
+                bucket_records_versions: false,
             })
         })
     }
@@ -590,7 +624,7 @@ impl ObjectOps for MemoryStorage {
         bucket: &Name,
         key: &object::Key,
         tags: &object::Tags,
-    ) -> Result<(), Error> {
+    ) -> Result<TagWriteResult, Error> {
         // Existence is the `OBJECT_META` row (`NoSuchKey` when missing —
         // mirroring `head_object`; rows are written with their object, so
         // the fs backend's row-heal for hand-dropped files has no mem
@@ -602,22 +636,29 @@ impl ObjectOps for MemoryStorage {
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
-        if !self.rewrite_tags_element(bucket, key, tags).await? {
-            return Err(no_such_key(key));
-        }
-        Ok(())
+        self.rewrite_tags_element(bucket, key, tags)
+            .await?
+            .ok_or_else(|| no_such_key(key))
     }
 
-    async fn delete_object_tags(&self, bucket: &Name, key: &object::Key) -> Result<(), Error> {
+    async fn delete_object_tags(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+    ) -> Result<TagWriteResult, Error> {
         // Idempotent like `delete_object`: only the bucket must exist
         // (`NoSuchBucket` when missing); a missing object — key, marker,
-        // or row — is a no-op.
+        // or row — is a no-op that names no identity.
         if !self.has_bucket(bucket)? {
             return Err(no_such_bucket(bucket));
         }
-        self.rewrite_tags_element(bucket, key, &object::Tags::empty())
-            .await?;
-        Ok(())
+        Ok(self
+            .rewrite_tags_element(bucket, key, &object::Tags::empty())
+            .await?
+            .unwrap_or(TagWriteResult {
+                version_id: None,
+                bucket_records_versions: false,
+            }))
     }
 
     async fn get_object_acl(&self, bucket: &Name, key: &object::Key) -> Result<Acl, Error> {
@@ -708,6 +749,9 @@ impl ObjectOps for MemoryStorage {
             {
                 check_bucket(&bucket::Table::open_readonly(txn)?, &params.bucket)?;
             }
+            // The page's objects all carry the bucket's state — one read
+            // for the page, the carrier's value on every row.
+            let records_versions = records_versions(txn, &params.bucket)?;
             let meta = meta::Table::open_readonly(txn)?;
             let bucket_str = params.bucket.as_ref().as_str();
             // The shared per-bucket walk starts at the prefix lower bound
@@ -749,6 +793,7 @@ impl ObjectOps for MemoryStorage {
                         owner: stored.owner.clone(),
                         acl: stored.acl.clone(),
                         version_id: stored.version_id.clone(),
+                        bucket_records_versions: records_versions,
                     });
                     Ok(())
                 },
@@ -1167,7 +1212,7 @@ mod tests {
         // The commit records the tags with the object — no post-commit
         // tag window.
         let staged = storage
-            .stage_body(&b, &a, body(b"hi".to_vec()), None)
+            .stage_body(&b, &a, body(b"hi".to_vec()), None, None)
             .await
             .unwrap();
         let info = storage
@@ -1219,6 +1264,7 @@ mod tests {
                 &k,
                 body(b"hello".to_vec()),
                 Some(checksum_tee(checksum::Algorithm::Crc32, "NhCmhg==")),
+                None,
             )
             .await
             .unwrap();
@@ -1263,7 +1309,7 @@ mod tests {
         // (a) An overwriting commit is a fresh single-part object: its
         // parts rows are gone.
         let staged = storage
-            .stage_body(&b, &k, body(b"plain".to_vec()), None)
+            .stage_body(&b, &k, body(b"plain".to_vec()), None, None)
             .await
             .unwrap();
         storage
@@ -1328,7 +1374,7 @@ mod tests {
         storage.delete_object(&b, &dst).await.unwrap();
         let err: Error = storage.list_object_parts(&b, &dst).await.unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchKey(_))));
-        let txn = storage.db.db().begin_read().unwrap();
+        let txn = storage.db.db().unwrap().begin_read().unwrap();
         let parts = object_part::Table::open_readonly(&txn).unwrap();
         let bucket_str = b.as_ref().as_str();
         let mut rows: Vec<String> = Vec::new();

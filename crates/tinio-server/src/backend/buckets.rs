@@ -417,7 +417,10 @@ mod tests {
     #[cfg(feature = "acl")]
     use crate::_core::acl;
     #[cfg(feature = "acl")]
-    use crate::backend::testutil::{acl_backend, credentials_for, signed_request, user_id};
+    use crate::backend::testutil::{
+        acl_backend, canonical_grantee, credentials_for, grant, group_grantee, signed_request,
+        user_id, valid_md5,
+    };
     use crate::{
         _core::{
             acl::Acl,
@@ -1333,43 +1336,6 @@ mod tests {
     }
 
     // --- bucket ACL ops (spec 2026-09-05) ---
-
-    /// A well-formed Content-MD5 value (base64 of 16 zero bytes).
-    #[cfg(feature = "acl")]
-    fn valid_md5() -> String {
-        use base64::engine::general_purpose::STANDARD;
-        base64::Engine::encode(&STANDARD, [0u8; 16])
-    }
-
-    #[cfg(feature = "acl")]
-    fn canonical_grantee(id: &str) -> dto::Grantee {
-        dto::Grantee {
-            type_: dto::Type::from_static(dto::Type::CANONICAL_USER),
-            id: Some(id.into()),
-            uri: None,
-            display_name: None,
-            email_address: None,
-        }
-    }
-
-    #[cfg(feature = "acl")]
-    fn group_grantee(uri: &str) -> dto::Grantee {
-        dto::Grantee {
-            type_: dto::Type::from_static(dto::Type::GROUP),
-            uri: Some(uri.into()),
-            id: None,
-            display_name: None,
-            email_address: None,
-        }
-    }
-
-    #[cfg(feature = "acl")]
-    fn grant(grantee: dto::Grantee, permission: &'static str) -> dto::Grant {
-        dto::Grant {
-            grantee: Some(grantee),
-            permission: Some(dto::Permission::from_static(permission)),
-        }
-    }
 
     #[tokio::test]
     #[cfg(feature = "acl")]

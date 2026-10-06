@@ -41,8 +41,8 @@ pub use self::{
     storage::{
         BodyStream, BucketOps, BucketsListing, ByteRange, GetObjectResult, ListBucketsParams,
         ListObjectsParams, ListPartsParams, ListUploadsParams, MultipartOps, ObjectListing,
-        ObjectOps, PartsListing, PutObjectResult, Storage, UnorderedPager, UploadsListing,
-        WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, collect_body, from_nanos,
+        ObjectOps, PartsListing, PutObjectResult, Storage, TagWriteResult, UnorderedPager,
+        UploadsListing, WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, collect_body, from_nanos,
         group_and_paginate, group_and_paginate_ordered, group_and_paginate_unordered,
         key_marker_order, now_nanos, paginate_ordered, split_uploads_order, to_nanos,
         uploads_order,

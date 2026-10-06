@@ -24,6 +24,10 @@ impl TableDef for Def {
 
     const DEF: TableDefinition<'static, Self::Key, Self::Value> =
         TableDefinition::new("version_index");
+    /// A root written before the version machinery has no
+    /// `version_index` table: the missing table reads as empty
+    /// ([`TableDef::MAY_BE_ABSENT`], spec 2026-10-03).
+    const MAY_BE_ABSENT: bool = true;
 }
 
 /// Handle to the version-index table (writable or read-only).

@@ -65,6 +65,70 @@ Feature: Interop journey (third-party S3 clients)
     Then the scratch file "down.bin" equals the scratch file "big.bin"
     When I run aws s3 rb s3://checksum-bucket --force
 
+  # The versioning journey (spec 2026-10-03-s3-versioning, FR-037/FR-038): the
+  # same journey `versioning.feature` drives in process, replayed through aws
+  # cli v2 — the client's own rendering of the version ids, the
+  # bucket-addressed `?versions` listing, the marker's 404 and the two
+  # version-addressed deletes. Added 2026-10-05 and run the same day against
+  # aws cli v2 (`--tags '@interop and not @confinement'`, 22/22 scenarios).
+  # The `--debug` leg is how the cli discloses a response
+  # header: its normal error output carries only the code, and botocore's
+  # debug dump is where `x-amz-delete-marker` becomes visible — printed as
+  # `X-Amz-Delete-Marker`, which is why the assertion below is case-insensitive.
+  @interop @aws @FR-037 @FR-038
+  Scenario: The version history journey with aws cli v2
+    When I run aws s3api create-bucket --bucket versioned-bucket
+    And I run aws s3api put-bucket-versioning --bucket versioned-bucket --versioning-configuration Status=Enabled
+    And I run aws s3api get-bucket-versioning --bucket versioned-bucket --query Status --output text
+    Then the external client output contains "Enabled"
+    Given I write "first" to the scratch file "first.txt"
+    And I write "second" to the scratch file "second.txt"
+    # Every version-creating write answers the identity it created; the id
+    # captured here is the version this journey later purges by.
+    When I run aws s3api put-object --bucket versioned-bucket --key notes.txt --body "{work}/first.txt" --query VersionId --output text
+    Then the external client output is not empty
+    And I capture the client output
+    When I run aws s3api get-object --bucket versioned-bucket --key notes.txt --version-id {captured} "{work}/older.txt"
+    Then the scratch file "older.txt" equals the scratch file "first.txt"
+    # The overwrite supersedes the first version; the plain read serves the
+    # current one.
+    When I run aws s3api put-object --bucket versioned-bucket --key notes.txt --body "{work}/second.txt"
+    And I run aws s3api get-object --bucket versioned-bucket --key notes.txt "{work}/current.txt"
+    Then the scratch file "current.txt" equals the scratch file "second.txt"
+    # The listing is bucket-addressed and scoped with prefix: both versions,
+    # newest first.
+    When I run aws s3api list-object-versions --bucket versioned-bucket --prefix notes.txt --query "length(Versions)" --output text
+    Then the external client output equals "2"
+    And I run aws s3api list-object-versions --bucket versioned-bucket --prefix notes.txt --query Versions[0].IsLatest --output text
+    Then the external client output contains "True"
+    # A plain delete inserts a marker: the delete answers the marker's own
+    # identity, the key 404s with the marker disclosed, and the history keeps
+    # both versions plus the marker.
+    When I run aws s3api delete-object --bucket versioned-bucket --key notes.txt --query VersionId --output text
+    Then the external client output is not empty
+    And I capture the client output
+    When I try aws s3api head-object --bucket versioned-bucket --key notes.txt --debug
+    Then the external client error contains "404"
+    And the external client error contains "x-amz-delete-marker" ignoring case
+    When I run aws s3api list-object-versions --bucket versioned-bucket --prefix notes.txt --query "length(DeleteMarkers)" --output text
+    Then the external client output equals "1"
+    # Deleting the marker version restores the version below it.
+    When I run aws s3api delete-object --bucket versioned-bucket --key notes.txt --version-id {captured}
+    And I run aws s3api get-object --bucket versioned-bucket --key notes.txt "{work}/restored.txt"
+    Then the scratch file "restored.txt" equals the scratch file "second.txt"
+    # Purging the noncurrent version by id is permanent; the remaining
+    # version still serves by its own id.
+    When I run aws s3api list-object-versions --bucket versioned-bucket --prefix notes.txt --query Versions[1].VersionId --output text
+    Then the external client output is not empty
+    And I capture the client output
+    When I run aws s3api delete-object --bucket versioned-bucket --key notes.txt --version-id {captured}
+    And I run aws s3api list-object-versions --bucket versioned-bucket --prefix notes.txt --query "length(Versions)" --output text
+    Then the external client output equals "1"
+    And I run aws s3api list-object-versions --bucket versioned-bucket --prefix notes.txt --query Versions[0].VersionId --output text
+    And I capture the client output
+    And I run aws s3api get-object --bucket versioned-bucket --key notes.txt --version-id {captured} "{work}/newest.txt"
+    Then the scratch file "newest.txt" equals the scratch file "second.txt"
+
   @boto3 @T034 @SC-001
   Scenario: The SC-001 basic journey via the boto3 SDK
     When I run the boto3 script "boto3_journey.py"

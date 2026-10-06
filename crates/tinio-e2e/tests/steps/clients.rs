@@ -44,7 +44,7 @@ use tinio_util::testing::{job, kill_and_reap};
 
 use super::{
     FsKind, World,
-    common::{deterministic_bytes, frame_line},
+    common::{contains_ignore_case, deterministic_bytes, frame_line},
     has_tag,
 };
 use crate::_server::{
@@ -919,9 +919,8 @@ async fn output_contains(world: &mut World, text: String) {
 /// (mc prints `ETag` in newer releases, `Etag` in older ones).
 #[then(expr = "the external client output contains {string} ignoring case")]
 async fn output_contains_ignore_case(world: &mut World, text: String) {
-    let lower = text.to_lowercase();
     assert!(
-        world.ext_output.to_lowercase().contains(&lower),
+        contains_ignore_case(&world.ext_output, &text),
         "client output missing {text:?} (case-insensitive): {}",
         world.ext_output
     );
@@ -959,6 +958,21 @@ async fn error_contains(world: &mut World, text: String) {
     assert!(
         world.ext_error.contains(&text),
         "client error missing {text:?}: {}",
+        world.ext_error
+    );
+}
+
+/// The `… ignoring case` twin of the step above, for a leg that asserts a **response header**
+/// through a client's own rendering: the client prints the header name as it read it, not as the
+/// contract spells it — aws cli's debug dump shows `X-Amz-Delete-Marker` where the wire contract
+/// writes `x-amz-delete-marker` (measured 2026-10-05) — so a case-sensitive assertion would pin
+/// the client's rendering rather than the header's presence. The stdout step's `ignoring case`
+/// variant exists for the same reason (`mc`'s `ETag`/`Etag`); this one covers the stderr side.
+#[then(expr = "the external client error contains {string} ignoring case")]
+async fn error_contains_ignore_case(world: &mut World, text: String) {
+    assert!(
+        contains_ignore_case(&world.ext_error, &text),
+        "client error missing {text:?} (case-insensitive): {}",
         world.ext_error
     );
 }

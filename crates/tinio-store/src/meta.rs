@@ -22,6 +22,8 @@
 //! stays `1` (the 2026-09-02 ruling), so a database written in an older
 //! tuple shape errors at decode and the remedy is delete-and-rebuild.
 
+use std::ops::Bound;
+
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
@@ -233,6 +235,110 @@ where
                 visit(key, stored)
             },
         )
+    }
+
+    /// [`Self::for_bucket_gated`] from a **bound**, with an early stop: the
+    /// same rows in the same key order with the same per-row semantics, but
+    /// the walk starts at `from` — `Included` names the first key, `Excluded`
+    /// the key just below it (the key one bucket earlier is never touched, so
+    /// a caller resuming after a key pays no re-read of it), `Unbounded` the
+    /// bucket's first row — and ends as soon as `visit` answers `Ok(false)`.
+    /// The bounded sibling of the gating load: a caller that needs only the
+    /// next page's keys walks only those rows (the version listing's page
+    /// walk), instead of materializing the bucket to cut a `max_keys` page
+    /// out of it.
+    ///
+    /// The bound is a key bound, never a prefix: a caller that wants the
+    /// keys of one delimiter group must stop the walk itself (or resume
+    /// past the group's successor). The early stop is per-visited row — an
+    /// invalid-key row is skipped exactly as [`Self::for_bucket_gated`]
+    /// skips it, so `visit` never sees one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::ops::Bound;
+    ///
+    /// use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
+    /// use tinio_store::{
+    ///     _core::{ETag, acl::Acl, object::Tags},
+    ///     ensure_all, meta,
+    /// };
+    ///
+    /// let db = Database::builder()
+    ///     .create_with_backend(InMemoryBackend::new())
+    ///     .unwrap();
+    /// {
+    ///     let mut txn = db.begin_write().unwrap();
+    ///     ensure_all(&mut txn).unwrap();
+    ///     {
+    ///         let mut table = meta::Table::open(&mut txn).unwrap();
+    ///         for key in ["a.txt", "b.txt", "c.txt"] {
+    ///             table
+    ///                 .put(
+    ///                     "data",
+    ///                     key,
+    ///                     &meta::Stored {
+    ///                         etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+    ///                         size: 0,
+    ///                         mtime: 0,
+    ///                         file_identity: 0,
+    ///                         tags: Tags::empty(),
+    ///                         checksum: None,
+    ///                         owner: None,
+    ///                         acl: Acl::default_private(None),
+    ///                         version_id: None,
+    ///                         version_seq: 0,
+    ///                         is_delete_marker: false,
+    ///                     },
+    ///                 )
+    ///                 .unwrap();
+    ///         }
+    ///     }
+    ///     txn.commit().unwrap();
+    /// }
+    /// let txn = db.begin_read().unwrap();
+    /// let table = meta::Table::open_readonly(&txn).unwrap();
+    /// let mut seen = Vec::new();
+    /// table
+    ///     .for_bucket_gated_from("data", Bound::Excluded("a.txt"), |key, _| {
+    ///         seen.push(key.as_ref().to_owned());
+    ///         Ok(seen.len() < 2) // stop after the second row
+    ///     })
+    ///     .unwrap();
+    /// assert_eq!(seen, ["b.txt", "c.txt"]);
+    /// ```
+    pub fn for_bucket_gated_from<F>(
+        &self,
+        bucket: &str,
+        from: Bound<&str>,
+        mut visit: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(object::Key, Option<Stored>) -> Result<bool, Error>,
+    {
+        // The tuple's second element is the key, so the bound is the exact
+        // `(bucket, key)` row — redb's own bound forms (no sentinel key, no
+        // successor arithmetic).
+        let start = match from {
+            Bound::Included(key) => Bound::Included((bucket, key)),
+            Bound::Excluded(key) => Bound::Excluded((bucket, key)),
+            Bound::Unbounded => Bound::Included((bucket, "")),
+        };
+        for item in self.0.range((start, Bound::Unbounded))? {
+            let (k, v) = item?;
+            let (name, raw_key) = k.value();
+            if name != bucket {
+                break; // the interval boundary: this bucket's rows ended
+            }
+            let Ok(key) = object::key(raw_key) else {
+                continue; // invalid key domain → skip the row
+            };
+            if !visit(key, validate(v.value()))? {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -649,5 +755,73 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn the_bounded_gated_walk_starts_at_the_bound_and_stops_where_it_is_told() {
+        let h = handle();
+        let stored = Stored {
+            version_id: None,
+            version_seq: 0,
+            is_delete_marker: false,
+            etag: etag("d41d8cd98f00b204e9800998ecf8427e"),
+            size: 1,
+            mtime: 0,
+            file_identity: 0,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        };
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            for key in ["a.txt", "b.txt", "c.txt"] {
+                t.put("data", &object::key(key).unwrap(), &stored)?;
+            }
+            // The next bucket's rows sort after every `data` row: the
+            // bounded walk must never leave its own interval.
+            t.put("dataz", &object::key("a.txt").unwrap(), &stored)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let walk = |from: Bound<&str>, stop_after: usize| -> Vec<String> {
+            h.read(|txn| -> Result<Vec<String>, Error> {
+                let t = Table::open_readonly(txn)?;
+                let mut seen = Vec::new();
+                t.for_bucket_gated_from("data", from, |key, stored| {
+                    assert!(stored.is_some(), "every row of the fixture is valid");
+                    seen.push(key.as_ref().to_owned());
+                    Ok(seen.len() < stop_after)
+                })?;
+                Ok(seen)
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            walk(Bound::Unbounded, usize::MAX),
+            ["a.txt", "b.txt", "c.txt"],
+            "the whole interval, in key order"
+        );
+        assert_eq!(
+            walk(Bound::Included("b.txt"), usize::MAX),
+            ["b.txt", "c.txt"],
+            "an inclusive bound names the first key"
+        );
+        assert_eq!(
+            walk(Bound::Excluded("b.txt"), usize::MAX),
+            ["c.txt"],
+            "an exclusive bound skips the named key whole"
+        );
+        // The early stop ends the walk at the row it answered `false` on —
+        // the bound a `max_keys` page pays for, never the whole table.
+        assert_eq!(walk(Bound::Unbounded, 1), ["a.txt"]);
+        assert_eq!(walk(Bound::Excluded("a.txt"), 1), ["b.txt"]);
+        assert_eq!(
+            walk(Bound::Included("c.txt"), usize::MAX),
+            ["c.txt"],
+            "a bound past the middle still ends at the bucket's last row"
+        );
     }
 }

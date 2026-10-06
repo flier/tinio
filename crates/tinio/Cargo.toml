@@ -17,6 +17,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 tinio-fs.workspace = true
+tinio-mem.workspace = true
 tinio-sandbox.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 
@@ -42,6 +43,7 @@ full=[
     "sandbox",
     "select",
     "tls",
+    "versioning",
 ]
 
 acl = ["tinio-server/acl"]
@@ -57,6 +59,7 @@ otel = ["tinio-server/otel"]
 sandbox = ["tinio-cli/sandbox"]
 select = ["tinio-server/select"]
 tls = ["tinio-api/tls", "tinio-cli/tls"]
+versioning = ["tinio-server/versioning", "tinio-cli/versioning"]
 
 [lints.clippy]
 absolute_paths = "warn"

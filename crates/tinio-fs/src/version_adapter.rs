@@ -569,6 +569,51 @@ impl ContentPort for Files {
     }
 }
 
+impl FsStorage {
+    /// How many buckets of this root hold version data — the number the
+    /// toggle-off startup warning names (spec 2026-10-03: the feature
+    /// compiled in, `[s3] versioning` off, a root that still holds version
+    /// data). One range scan of the bucket-versioning table, never a
+    /// per-bucket lookup, so a large root stays cheap; the scan runs on the
+    /// blocking pool like every full-table read.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_core::{
+    ///     acl::Acl,
+    ///     bucket,
+    ///     storage::{BucketOps, VersionOps},
+    ///     version::State,
+    /// };
+    /// use tinio_fs::{FsStorage, testing};
+    /// use tokio::runtime::Runtime;
+    ///
+    /// let root = tempfile::tempdir().unwrap();
+    /// let storage = FsStorage::new(root.path(), testing::fs_options()).unwrap();
+    /// let b = bucket::name("data").unwrap();
+    /// Runtime::new().unwrap().block_on(async {
+    ///     storage
+    ///         .create_bucket(&b, None, &Acl::default_private(None))
+    ///         .await
+    ///         .unwrap();
+    ///     storage
+    ///         .set_bucket_versioning(&b, State::Enabled)
+    ///         .await
+    ///         .unwrap();
+    ///     assert_eq!(storage.versioned_bucket_count().await.unwrap(), 1);
+    /// });
+    /// ```
+    pub async fn versioned_bucket_count(&self) -> Result<usize, Error> {
+        self.handle()
+            .read_blocking(|txn| {
+                Ok(bucket_versioning::Table::open_readonly(txn)?.versioned_count()?)
+            })
+            .await
+            .map_err(Error::from)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs as std_fs;
@@ -580,6 +625,7 @@ mod tests {
             blob::{BlobRef, BlockHash, BlockStore},
             bucket,
             object::Tags,
+            storage::VersionOps,
             to_nanos, version,
         },
         testutil,
@@ -1178,6 +1224,35 @@ mod tests {
             rows.latest(&bucket, &key).await.unwrap().unwrap().0,
             3,
             "the converged row is the key's newest"
+        );
+    }
+
+    /// The toggle-off warning's number: one scan counts the buckets whose
+    /// state row is not `Unversioned` — a plain directory is not version
+    /// data, and a bucket that only ever suspended still counts.
+    #[tokio::test]
+    async fn the_versioned_bucket_count_counts_only_buckets_that_hold_a_state() {
+        let (root, storage) = testutil::storage();
+        fs::create_dir(root.path().join("plain")).await.unwrap();
+        fs::create_dir(root.path().join("versioned")).await.unwrap();
+        assert_eq!(
+            storage.versioned_bucket_count().await.unwrap(),
+            0,
+            "bucket directories alone hold no version data"
+        );
+        storage
+            .set_bucket_versioning(&bucket::name("versioned").unwrap(), version::State::Enabled)
+            .await
+            .unwrap();
+        assert_eq!(storage.versioned_bucket_count().await.unwrap(), 1);
+        storage
+            .set_bucket_versioning(&bucket::name("plain").unwrap(), version::State::Suspended)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.versioned_bucket_count().await.unwrap(),
+            2,
+            "a suspended bucket holds version data too"
         );
     }
 }

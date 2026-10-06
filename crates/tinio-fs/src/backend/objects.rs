@@ -36,8 +36,8 @@ use crate::{
         object::{self, Info, Tags},
         storage,
         storage::{
-            ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, access_denied,
-            no_such_bucket, no_such_key,
+            ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
+            TagWriteResult, access_denied, no_such_bucket, no_such_key,
         },
         to_nanos, version,
     },
@@ -120,12 +120,14 @@ pub(crate) async fn prune_parents(path: &Path, bucket_dir: &Path) {
 pub struct StagedBody {
     temp: Option<PathBuf>,
     etag: ETag,
-    /// The stage's tee digest (spec 2026-08-31): the validated checksum
-    /// of the staged content, computed while the body streamed under the
-    /// server's `checksum` slot — committed as the object's recorded
-    /// checksum (`FULL_OBJECT` kind) with no re-hashing. `None` when the
-    /// stage carried no tee slot.
-    checksum: Option<checksum::Part>,
+    /// The stage's recorded checksum (spec 2026-08-31): the explicit
+    /// `carried` value when the caller passed one (a version-addressed
+    /// copy's source version — kind included), else the validated
+    /// checksum computed while the body streamed under the server's
+    /// tee slot, recorded under the write path's FULL_OBJECT rule —
+    /// committed as the object's recorded checksum with no re-hashing.
+    /// `None` when the stage fixed neither.
+    checksum: Option<checksum::Recorded>,
 }
 
 impl StagedBody {
@@ -140,10 +142,9 @@ impl StagedBody {
         self.temp.take()
     }
 
-    /// The stage's tee digest, when the stage ran under a checksum slot
-    /// (the digest cell is filled at stream end — the commit records it
-    /// as the object's `FULL_OBJECT` checksum).
-    pub(crate) fn checksum(&self) -> Option<&checksum::Part> {
+    /// The stage's recorded checksum, when the stage fixed one: the
+    /// explicit carried value, else the tee's streamed digest.
+    pub(crate) fn checksum(&self) -> Option<&checksum::Recorded> {
         self.checksum.as_ref()
     }
 }
@@ -353,11 +354,14 @@ impl FsStorage {
     /// staleness gate applied to the open handle's own facts, and — only
     /// where the gate degrades the recorded identity — the read path's own
     /// heal (`ensure_row`, which clears the stale element in the same write
-    /// that rewrites the row). Answers exactly what
+    /// that rewrites the row). Answers what
     /// [`resolve_object_info`](Self::resolve_object_info) answers for the
-    /// same state: the open file (the caller's body source), the handle's
-    /// stamp, the row the answer serves, and the gated identity — with the
-    /// path resolution, the row point-read and the gate taken once.
+    /// same state — the open file (the caller's body source), the handle's
+    /// stamp, the row the answer serves, and the gated identity, with the
+    /// path resolution, the row point-read and the gate taken once — except
+    /// the bucket's versioning state, which the version-addressed callers
+    /// read on their own (a version-addressed request runs no write plan,
+    /// and the flag rides the `Info` they build).
     #[cfg(feature = "versioning")]
     pub(crate) async fn serve_current(
         &self,
@@ -455,8 +459,13 @@ impl FsStorage {
     /// Resolve the object for a read — the shared head of
     /// `get_object`/`head_object`: the file resolution plus the ensured
     /// meta row (the ETag — and the tags/checksum elements the read
-    /// paths serve — against the meta store; spec 2026-08-31), and the
-    /// current version identity the response carries.
+    /// paths serve — against the meta store; spec 2026-08-31), the
+    /// current version identity the response carries, and whether the
+    /// bucket records versions (the state read the answer's
+    /// `Info::bucket_records_versions` carrier needs; the server no
+    /// longer reads it per request). Callers that build no `Info` (the
+    /// version listing's per-key slot resolution) take
+    /// [`Self::resolve_object_slot`] and skip the state read.
     ///
     /// The identity is gated (F01's size/mtime/identity rule): the row's
     /// recorded identifier is served only while the content still matches
@@ -473,6 +482,32 @@ impl FsStorage {
     /// the rewrite itself read, so a concurrent write that installed a live
     /// version between the two reads keeps its own identity.
     pub(crate) async fn resolve_object_info(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<
+        (
+            File,
+            u64,
+            SystemTime,
+            meta::Stored,
+            Option<version::Id>,
+            bool,
+        ),
+        Error,
+    > {
+        // The carrier's state read — one point read on the read paths that
+        // answer an `Info`; the server used to run it per request.
+        let records_versions = self.records_versions(bucket).await?;
+        let (file, size, mtime, row, version_id) = self.resolve_object_slot(bucket, key).await?;
+        Ok((file, size, mtime, row, version_id, records_versions))
+    }
+
+    /// [`Self::resolve_object_info`]'s gate-and-row body, without the
+    /// versioning-state read: the version listing resolves each key's
+    /// current slot with this (its entries carry no `Info`, so the carrier
+    /// would be discarded) and never pays a state read per key.
+    pub(crate) async fn resolve_object_slot(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
@@ -516,6 +551,37 @@ impl FsStorage {
             .await?;
         let version_id = matched.then(|| row.version_id.clone()).flatten();
         Ok((file, size, mtime, row, version_id))
+    }
+
+    /// The [`Info`] of one stored row — the 11-field assembly every read
+    /// path that serves one shares (the plain `get`/`head` and the
+    /// version-addressed pair's current slot), so a field change lands
+    /// once. `size` and `mtime` are the caller's own resolution (the
+    /// open file's stamp) and `version_id` the identity its gate left
+    /// live; the row is **moved in**, because every site owns the row its
+    /// resolver answered and the `Info` takes the row's elements — the
+    /// same division [`tinio_store::version::Row::info`] keeps for the
+    /// version rows, whose file size the caller passes likewise.
+    pub(crate) fn info_of(
+        key: &object::Key,
+        size: u64,
+        mtime: SystemTime,
+        row: meta::Stored,
+        version_id: Option<version::Id>,
+        records_versions: bool,
+    ) -> Info {
+        Info {
+            key: key.clone(),
+            size,
+            last_modified: mtime,
+            etag: row.etag,
+            tags: row.tags,
+            checksum: row.checksum,
+            owner: row.owner,
+            acl: row.acl,
+            version_id,
+            bucket_records_versions: records_versions,
+        }
     }
 
     /// The unix fast path of the copy primitive: the kernel's
@@ -677,6 +743,11 @@ impl FsStorage {
             )
             .await?;
             let mtime = fs::metadata(&target).await?.modified()?;
+            // The marker's answer still carries the bucket's versioning
+            // state (the server's identity rule reads it off the `Info`):
+            // this branch never runs a write plan, so the state is read
+            // here — the one point read the marker path pays.
+            let records_versions = self.records_versions(bucket).await?;
             return Ok(Info {
                 key: key.clone(),
                 size: 0,
@@ -687,6 +758,7 @@ impl FsStorage {
                 owner: None,
                 acl: Acl::default_private(None),
                 version_id: None,
+                bucket_records_versions: records_versions,
             });
         }
         // A real object always arrives with a staged temp (the marker
@@ -766,6 +838,8 @@ impl FsStorage {
                 grants: acl.grants.clone(),
             },
             version_id: published.marker.id,
+            // The publish's plan resolved the state; no second read.
+            bucket_records_versions: published.records_versions,
         })
     }
 
@@ -851,7 +925,8 @@ impl ObjectOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
         body: BodyStream,
-        checksum: Option<Arc<checksum::PartChecksum>>,
+        tee: Option<Arc<checksum::PartChecksum>>,
+        carried: Option<checksum::Recorded>,
     ) -> Result<StagedBody, Error> {
         let bucket_dir = self.ensure_bucket(bucket).await?;
         // Symlink policy applies to markers too — a PUT `sub/dir/` whose
@@ -869,19 +944,25 @@ impl ObjectOps for FsStorage {
                 checksum: None,
             });
         }
-        // `checksum` is the server's tee slot (spec 2026-08-31 — the
+        // `tee` is the server's checksum slot (spec 2026-08-31 — the
         // `upload_part` pattern): the interface wraps the body when the
         // client sent a single `x-amz-checksum-*` header, the digest is
         // computed while the body streams, a mismatch fails the staging
         // as the tee's stream error (propagated here like any body
         // failure — the fs adds no error of its own), and the validated
-        // digest rides into the commit. Absent, no digest is computed.
-        let (temp, etag, _size) = self.writer.stage(body, checksum.as_deref()).await?;
-        let computed = checksum.as_ref().and_then(|c| c.digest.get()).cloned();
+        // digest rides into the commit as FULL_OBJECT (the write path's
+        // kind). Absent, no digest is computed. `carried` — a
+        // version-addressed copy's source version checksum, kind
+        // included — wins over the streamed digest.
+        let (temp, etag, _size) = self.writer.stage(body, tee.as_deref()).await?;
+        let computed = tee.as_ref().and_then(|c| c.digest.get()).cloned();
         Ok(StagedBody {
             temp: Some(temp),
             etag,
-            checksum: computed,
+            checksum: carried.or(computed.map(|part| checksum::Recorded {
+                part,
+                kind: checksum::Type::FullObject,
+            })),
         })
     }
 
@@ -894,13 +975,9 @@ impl ObjectOps for FsStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<Info, Error> {
-        // The stage's tee digest records as the object's FULL_OBJECT
-        // checksum (the kind is fixed by the write path — a plain PUT's
-        // digest is over the whole content).
-        let checksum = staged.checksum().cloned().map(|part| checksum::Recorded {
-            part,
-            kind: checksum::Type::FullObject,
-        });
+        // The stage's recorded checksum — the carried value or the tee
+        // digest, kind included — fixed by `stage_body`.
+        let checksum = staged.checksum().cloned();
         self.commit_staged(bucket, key, staged, tags, owner, acl, checksum)
             .await
     }
@@ -934,7 +1011,9 @@ impl ObjectOps for FsStorage {
             // the destination never inherits the source's retained
             // parts.
             let get = self.get_object(src_bucket, src_key, None).await?;
-            let staged = self.stage_body(dst_bucket, dst_key, get.body, None).await?;
+            let staged = self
+                .stage_body(dst_bucket, dst_key, get.body, None, None)
+                .await?;
             self.commit_staged(dst_bucket, dst_key, staged, tags, owner, acl, checksum)
                 .await
         }
@@ -946,20 +1025,11 @@ impl ObjectOps for FsStorage {
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
-        let (file, size, mtime, row, version_id) = self.resolve_object_info(bucket, key).await?;
+        let (file, size, mtime, row, version_id, records_versions) =
+            self.resolve_object_info(bucket, key).await?;
         let (body, served_range) = Self::object_body(file, size, range).await?;
         Ok(GetObjectResult {
-            info: Info {
-                key: key.clone(),
-                size,
-                last_modified: mtime,
-                etag: row.etag,
-                tags: row.tags,
-                checksum: row.checksum,
-                owner: row.owner,
-                acl: row.acl,
-                version_id,
-            },
+            info: Self::info_of(key, size, mtime, row, version_id, records_versions),
             body,
             served_range,
         })
@@ -968,18 +1038,16 @@ impl ObjectOps for FsStorage {
     async fn head_object(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Info, Error> {
         // The open is the metadata source too (the same merge as
         // get_object) — the handle is dropped right away.
-        let (_file, size, mtime, row, version_id) = self.resolve_object_info(bucket, key).await?;
-        Ok(Info {
-            key: key.clone(),
+        let (_file, size, mtime, row, version_id, records_versions) =
+            self.resolve_object_info(bucket, key).await?;
+        Ok(Self::info_of(
+            key,
             size,
-            last_modified: mtime,
-            etag: row.etag,
-            tags: row.tags,
-            checksum: row.checksum,
-            owner: row.owner,
-            acl: row.acl,
+            mtime,
+            row,
             version_id,
-        })
+            records_versions,
+        ))
     }
 
     /// Limitation: a rename has no versioning semantics — it would move one
@@ -1169,6 +1237,9 @@ impl ObjectOps for FsStorage {
             owner,
             acl,
             version_id: None,
+            // The rename guard above passed, so the bucket is unversioned
+            // — it records no versions by construction.
+            bucket_records_versions: false,
         })
     }
 
@@ -1238,34 +1309,83 @@ impl ObjectOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
         tags: &object::Tags,
-    ) -> Result<(), Error> {
+    ) -> Result<TagWriteResult, Error> {
         // Existence is the object file (`NoSuchKey` when missing —
         // mirroring head_object). The row update preserves the row's
         // other elements; a file without a row (a hand-dropped object)
-        // is healed and tagged in one transaction (`ensure_tags`).
-        let (path, _file, _, _, _) = self.resolve_object_file(bucket, key).await?;
-        self.meta_store
+        // is healed and tagged in one transaction (`ensure_tags`), which
+        // answers the row it wrote. The answer's identity is the row's
+        // current version under the read paths' staleness gate
+        // (`resolve_object_slot`'s rule): an out-of-band edit degrades
+        // it to the null identity, exactly as the head the interface
+        // used to read.
+        let (path, _file, size, mtime, identity) = self.resolve_object_file(bucket, key).await?;
+        let tagged = self
+            .meta_store
             .ensure_tags(bucket, key, &path, self.follow_symlinks, tags)
             .await
             .map_err(|err| match err {
                 Error::Io(err) if err.kind() == ErrorKind::NotFound => no_such_key(key).into(),
                 err => err,
             })?;
-        Ok(())
+        let live = gate(
+            &tagged.row,
+            Content::Present {
+                size,
+                mtime,
+                identity,
+            },
+        ) == Verdict::Live;
+        Ok(TagWriteResult {
+            version_id: live.then(|| tagged.row.version_id.clone()).flatten(),
+            bucket_records_versions: tagged.records_versions,
+        })
     }
 
     async fn delete_object_tags(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<(), Error> {
+    ) -> Result<TagWriteResult, Error> {
         // Idempotent like `delete_object`: only the bucket must exist
         // (`NoSuchBucket` when missing) and a reserved key is refused the
         // same way (FR-020 — mirroring `delete_object`); a missing
-        // object — file, marker, or row — is a no-op.
+        // object — file, marker, or row — is a no-op naming no identity.
         let bucket_dir = self.ensure_bucket(bucket).await?;
         let _ = self.resolve_key(&bucket_dir, key).await?;
-        self.meta_store.clear_tags(bucket, key).await
+        let cleared = self.meta_store.clear_tags(bucket, key).await?;
+        // The file decides existence and the staleness gate, exactly as
+        // the head the interface used to read: a missing file names
+        // nothing (no row is named either, and no state is read), a
+        // hand-dropped file with no row is the null identity with the
+        // bucket state, and a cleared row answers its gated identity.
+        match self.resolve_object_file(bucket, key).await {
+            Ok((_path, _file, size, mtime, identity)) => match cleared {
+                Some(tagged) => {
+                    let live = gate(
+                        &tagged.row,
+                        Content::Present {
+                            size,
+                            mtime,
+                            identity,
+                        },
+                    ) == Verdict::Live;
+                    Ok(TagWriteResult {
+                        version_id: live.then(|| tagged.row.version_id.clone()).flatten(),
+                        bucket_records_versions: tagged.records_versions,
+                    })
+                }
+                None => Ok(TagWriteResult {
+                    version_id: None,
+                    bucket_records_versions: self.records_versions(bucket).await?,
+                }),
+            },
+            Err(Error::Storage(storage::Error::NoSuchKey(_))) => Ok(TagWriteResult {
+                version_id: None,
+                bucket_records_versions: false,
+            }),
+            Err(err) => Err(err),
+        }
     }
 
     async fn get_object_acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Acl, Error> {
@@ -1324,7 +1444,11 @@ impl ObjectOps for FsStorage {
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
-        self.listing.list(&params).await
+        // The page's `Info` rows all report the bucket's versioning
+        // state — one read for the page, resolved here (the listing
+        // engine answers no version identity of its own).
+        let records_versions = self.records_versions(&params.bucket).await?;
+        self.listing.list(&params, records_versions).await
     }
 }
 
@@ -1894,7 +2018,7 @@ mod tests {
             .unwrap();
         let k = object::key("a.txt").unwrap();
         let staged = storage
-            .stage_body(&b, &k, body(b"hello"), None)
+            .stage_body(&b, &k, body(b"hello"), None, None)
             .await
             .unwrap();
         storage.delete_bucket(&b).await.unwrap();
@@ -1933,7 +2057,7 @@ mod tests {
             .unwrap();
         let k = object::key("big.bin").unwrap();
         let staged = storage
-            .stage_body(&b, &k, body(b"x".repeat(1024)), None)
+            .stage_body(&b, &k, body(b"x".repeat(1024)), None, None)
             .await
             .unwrap();
         drop(staged); // the server's precondition-failure path
@@ -2083,7 +2207,7 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("a.txt").unwrap();
         let staged = storage
-            .stage_body(&b, &k, body(b"hello"), None)
+            .stage_body(&b, &k, body(b"hello"), None, None)
             .await
             .unwrap();
         let storage2 = storage.clone();
@@ -2199,7 +2323,10 @@ mod tests {
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         // The commit records the tags with the object — no post-commit
         // tag window.
-        let staged = storage.stage_body(&b, &a, body(b"hi"), None).await.unwrap();
+        let staged = storage
+            .stage_body(&b, &a, body(b"hi"), None, None)
+            .await
+            .unwrap();
         let info = storage
             .commit_object(
                 &b,
@@ -2254,6 +2381,7 @@ mod tests {
                 &k,
                 body(b"hello"),
                 Some(checksum_tee(checksum::Algorithm::Crc32, "NhCmhg==")),
+                None,
             )
             .await
             .unwrap();
@@ -2305,6 +2433,7 @@ mod tests {
                 &k,
                 body(b"hello"),
                 Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(b"hello"))),
+                None,
             )
             .await
             .unwrap();
@@ -2362,7 +2491,7 @@ mod tests {
         // (a) An overwriting commit is a fresh single-part object: its
         // parts rows are gone.
         let staged = storage
-            .stage_body(&b, &k, body(b"plain"), None)
+            .stage_body(&b, &k, body(b"plain"), None, None)
             .await
             .unwrap();
         storage
@@ -2517,7 +2646,7 @@ mod tests {
             grants: grants.clone(),
         };
         let staged = storage
-            .stage_body(&b, &k, body(b"hello"), None)
+            .stage_body(&b, &k, body(b"hello"), None, None)
             .await
             .unwrap();
         let info = storage
@@ -2605,7 +2734,7 @@ mod tests {
         let owner = owner_id();
         let grants = vec![all_users_read_grant()];
         let staged = storage
-            .stage_body(&b, &src, body(b"rename me"), None)
+            .stage_body(&b, &src, body(b"rename me"), None, None)
             .await
             .unwrap();
         storage
@@ -2692,7 +2821,10 @@ mod tests {
             .await
             .unwrap();
         let k = object::key("a.txt").unwrap();
-        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        let staged = storage
+            .stage_body(&b, &k, body(b"x"), None, None)
+            .await
+            .unwrap();
         storage
             .commit_object(
                 &b,
@@ -2729,7 +2861,10 @@ mod tests {
         // server-user-owned, still 0600.
         let owner = testutil::owner_id();
         let k = object::key("unmapped.txt").unwrap();
-        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        let staged = storage
+            .stage_body(&b, &k, body(b"x"), None, None)
+            .await
+            .unwrap();
         storage
             .commit_object(
                 &b,
@@ -2780,7 +2915,10 @@ mod tests {
             .await
             .unwrap();
         let k = object::key("a.txt").unwrap();
-        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        let staged = storage
+            .stage_body(&b, &k, body(b"x"), None, None)
+            .await
+            .unwrap();
         storage
             .commit_object(
                 &b,
@@ -2830,7 +2968,7 @@ mod tests {
         let src = object::key("src.bin").unwrap();
         let dst = object::key("dst.bin").unwrap();
         let staged = storage
-            .stage_body(&b, &src, body(b"x"), None)
+            .stage_body(&b, &src, body(b"x"), None, None)
             .await
             .unwrap();
         storage
@@ -2998,7 +3136,10 @@ mod tests {
             .await
             .unwrap();
         let k = object::key("a.txt").unwrap();
-        let staged = storage.stage_body(&b, &k, body(b"x"), None).await.unwrap();
+        let staged = storage
+            .stage_body(&b, &k, body(b"x"), None, None)
+            .await
+            .unwrap();
         let err = storage
             .commit_object(
                 &b,

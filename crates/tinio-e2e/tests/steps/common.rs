@@ -691,6 +691,15 @@ async fn body_is(world: &mut super::World, text: String) {
 }
 
 /// How many times `tag` (a wire-XML open tag like `<Key>`) occurs in the
+/// The case-insensitive containment rule the `… ignoring case` step pair
+/// shares: a client renders a header or a field as it read it, not as the
+/// contract spells it (`mc`'s `ETag`/`Etag`; aws cli's
+/// `X-Amz-Delete-Marker`), so both the stdout and the stderr assertion fold
+/// case before comparing.
+pub(super) fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
 /// response body — the "shows N keys/parts/uploads" assertions' one home
 /// (a folder marker is never a key, so `<Key>` occurrences are counted,
 /// not parsed).

@@ -273,7 +273,7 @@ impl MultipartOps for FsStorage {
                 })
                 .map_err(Error::from)?;
             if let Some(uid) = self.owner_uid(stored_owner.as_ref())
-                && let Err(err) = fsutil::chown_file(&target, uid).await
+                && let Err(err) = fsutil::chown_file(target, uid).await
             {
                 let _ = fs::remove_file(&target).await;
                 return Err(err.into());
@@ -324,6 +324,8 @@ impl MultipartOps for FsStorage {
             owner,
             acl,
             version_id: published.marker.id,
+            // The publish's plan resolved the state; no second read.
+            bucket_records_versions: published.records_versions,
         })
     }
 

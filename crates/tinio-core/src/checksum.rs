@@ -182,6 +182,13 @@ pub struct Part {
 /// (filled at stream end, whenever the tee hashed MD5 — the algorithm
 /// slot, or the `Content-MD5` check — F05), so the backend skips its
 /// own hash.
+///
+/// The tee is the staged write's own streaming digest carrier: a plain
+/// PUT's digest is computed under it while the body streams and is
+/// recorded as FULL_OBJECT (the write path's kind). A value that is not
+/// stream-computed — a version-addressed copy's source version checksum,
+/// kind included — is carried as the explicit `stage_body` parameter:
+/// it is never pre-set on the tee.
 #[derive(Debug, Default)]
 pub struct PartChecksum {
     /// The digest (set once at stream end; empty when the part carried

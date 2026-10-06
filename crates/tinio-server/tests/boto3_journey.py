@@ -7,6 +7,15 @@ expected-bucket-owner mismatch, list_buckets per principal. Driven by the
 boto3_journey.py <endpoint>`. Best-effort client per FR-025 (targeted/
 manual, NOT CI-gated).
 
+Extended 2026-10-05 with the versioning legs (spec 2026-10-03-s3-versioning,
+FR-037/FR-038): the overwrite keeps the superseded version retrievable,
+the listing is bucket-addressed, a plain delete leaves a marker the plain
+read answers 404 with the marker disclosed for, deleting the marker
+version restores the version below it, and purging one version by id is
+permanent. The legs ran the same day under the `@boto3` tier (boto3
+1.43.108, the conventional `<target>/tinio-e2e-venv` the harness
+documents); like the rest of this script they stay opt-in, never CI-run.
+
 A second argument, `--read-only`, swaps the journey for the SDK's own
 read-only expectations (G22 of the sandbox BDD plan): the server behind the
 endpoint was spawned `--read-only --sandbox`, so every mutating operation
@@ -270,5 +279,83 @@ try:
     raise AssertionError("anonymous list_buckets must be denied")
 except anon.exceptions.ClientError as e:
     assert e.response["Error"]["Code"] == "AccessDenied", e.response["Error"]["Code"]
+
+# Versioning journey (spec 2026-10-03-s3-versioning, FR-037/FR-038): the
+# same journey `versioning.feature` drives in process, seen through the
+# SDK. The listing is bucket-addressed (`?versions`, scoped with prefix) —
+# the one shape `contracts/s3-surface.md` §Object versioning records for a
+# version listing. Added 2026-10-05 and run the same day under the
+# `@boto3` tier (`--tags '@boto3 and not @confinement'`, 3/3 scenarios).
+versioned = "boto3-versioned"
+s3.create_bucket(Bucket=versioned)
+s3.put_bucket_versioning(
+    Bucket=versioned, VersioningConfiguration={"Status": "Enabled"}
+)
+assert s3.get_bucket_versioning(Bucket=versioned)["Status"] == "Enabled"
+
+# The overwrite supersedes the first version into the history store, and
+# the plain read serves the current one — whose identity the bucket-records-
+# versions rule discloses.
+first = s3.put_object(Bucket=versioned, Key="notes.txt", Body=b"first")
+second = s3.put_object(Bucket=versioned, Key="notes.txt", Body=b"second")
+assert first.get("VersionId") and second.get("VersionId"), (first, second)
+assert first["VersionId"] != second["VersionId"], (first, second)
+current = s3.get_object(Bucket=versioned, Key="notes.txt")
+assert current["Body"].read() == b"second", "the plain read serves the current version"
+assert current.get("VersionId") == second["VersionId"], current.get("VersionId")
+
+# Both versions list, newest first within the key (`IsLatest` on the first
+# entry — the contract's ordering rule).
+listing = s3.list_object_versions(Bucket=versioned, Prefix="notes.txt")
+assert [v["VersionId"] for v in listing["Versions"]] == [
+    second["VersionId"],
+    first["VersionId"],
+], listing["Versions"]
+assert listing["Versions"][0]["IsLatest"] is True, listing["Versions"]
+assert not listing.get("DeleteMarkers"), listing.get("DeleteMarkers")
+
+# A version-addressed read serves the immutable snapshot, not the current
+# object.
+older = s3.get_object(Bucket=versioned, Key="notes.txt", VersionId=first["VersionId"])
+assert older["Body"].read() == b"first", "the addressed version is not the current one"
+assert older["VersionId"] == first["VersionId"], older["VersionId"]
+
+# A plain delete inserts a marker: the delete answers the marker's own
+# identity, the key 404s with the marker disclosed, and every version stays
+# in the history.
+marker = s3.delete_object(Bucket=versioned, Key="notes.txt")
+assert marker.get("DeleteMarker") is True, marker
+assert marker.get("VersionId"), marker
+try:
+    s3.get_object(Bucket=versioned, Key="notes.txt")
+    raise AssertionError("a marked key must answer 404")
+except s3.exceptions.ClientError as err:
+    assert err.response["ResponseMetadata"]["HTTPStatusCode"] == 404, err.response
+    assert err.response["Error"]["Code"] == "NoSuchKey", err.response["Error"]
+    headers = {
+        name.lower(): value
+        for name, value in err.response["ResponseMetadata"].get("HTTPHeaders", {}).items()
+    }
+    assert headers.get("x-amz-delete-marker") == "true", headers
+listing = s3.list_object_versions(Bucket=versioned, Prefix="notes.txt")
+assert [m["VersionId"] for m in listing["DeleteMarkers"]] == [marker["VersionId"]], listing
+assert [v["VersionId"] for v in listing["Versions"]] == [
+    second["VersionId"],
+    first["VersionId"],
+], listing["Versions"]
+
+# Deleting the marker version restores the version below it as current.
+s3.delete_object(Bucket=versioned, Key="notes.txt", VersionId=marker["VersionId"])
+restored = s3.get_object(Bucket=versioned, Key="notes.txt")
+assert restored["Body"].read() == b"second", "the restored current version"
+
+# Purging one content version by id is permanent: the listing loses it and
+# the surviving version still serves by its own id.
+s3.delete_object(Bucket=versioned, Key="notes.txt", VersionId=first["VersionId"])
+listing = s3.list_object_versions(Bucket=versioned, Prefix="notes.txt")
+assert [v["VersionId"] for v in listing["Versions"]] == [second["VersionId"]], listing
+assert not listing.get("DeleteMarkers"), listing.get("DeleteMarkers")
+survivor = s3.get_object(Bucket=versioned, Key="notes.txt", VersionId=second["VersionId"])
+assert survivor["Body"].read() == b"second", "the surviving version serves by its id"
 
 print("BOTO3 JOURNEY OK")

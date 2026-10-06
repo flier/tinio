@@ -629,6 +629,115 @@ async fn a_held_store_during_fix_is_a_warn_not_an_ok_note() {
     );
 }
 
+/// T154: a read-only `--fix` opens — and therefore creates — no store at the chosen state dir.
+///
+/// FR-023 amended puts a read-only run's metadata source at the **root's own**
+/// `<root>/.tinio/meta.redb`, opened read-only by the storage, and the relocated tool-state dir
+/// holds tool state only (the socket, the `state` file, the logs). The `Pass::Fix` open this leg
+/// used to take created `meta.redb` under the relocated dir and handed the handle to
+/// `FsStorage::new_from_db`, which drops it unread a line later — so the file outlived the very
+/// run that promised not to write it. The state dir is left exactly as the run found it.
+#[tokio::test]
+async fn a_read_only_fix_opens_no_store_at_the_state_dir() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).expect("root");
+    // The relocated state dir a read-only run resolves: outside the served root, which is the
+    // mode's rule, and empty — the shape the assertions below are about.
+    let state_dir = dir.path().join("home-state/roots/0123456789abcdef");
+    std::fs::create_dir_all(&state_dir).expect("the relocated state dir");
+    let mut resolution = resolution(&root, "version = 1\n");
+    resolution.read_only = true;
+    resolution.state_dir = state_dir.clone();
+    resolution.state_dir_override = Some(state_dir.clone());
+    let state = StateDir {
+        dir: state_dir.clone(),
+        resolved: true,
+        liveness: Liveness::NoStateFile,
+        control_name: None,
+        channel_answers: false,
+    };
+
+    let outcome = super::repair(&Run {
+        resolution: &resolution,
+        state: &state,
+    })
+    .await;
+
+    assert!(
+        !state_dir.join("meta.redb").exists(),
+        "a read-only repair never opens the tool-state store, so it never creates it"
+    );
+    assert!(
+        std::fs::read_dir(&state_dir)
+            .expect("the state dir is readable")
+            .next()
+            .is_none(),
+        "and nothing else either: the run left the state dir as it found it"
+    );
+    assert!(
+        outcome.summary.contains("read-only"),
+        "the skipped stages are named, not silent: {}",
+        outcome.summary
+    );
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+}
+
+/// T154's other half: the stages a read-only repair **does** own still run — the store's stages
+/// are skipped, not the repair. A crashed read-only server's `state` file is still reclaimed,
+/// and the absence of a store is not a failure row.
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn a_read_only_fix_still_reclaims_the_plane_leftovers() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).expect("root");
+    let state_dir = dir.path().join("home-state/roots/0123456789abcdef");
+    std::fs::create_dir_all(&state_dir).expect("the relocated state dir");
+    // A crashed run's document, written through the plane's own writer so the fixture cannot
+    // drift from the file a server publishes. Nothing answers the channel it records, which is
+    // what makes the leftovers reclaimable. The name is the derivation the server's own fallback
+    // uses (`socket_path`), not a second spelling.
+    let control = crate::_api::state::socket_path(&state_dir, &root).expect("the control name");
+    crate::_api::State::with_token(
+        control.to_string_lossy().into_owned(),
+        Some(9000),
+        &root,
+        "00".repeat(32),
+    )
+    .expect("the fixture's state document")
+    .write(&state_dir)
+    .expect("the stale state file");
+    let mut resolution = resolution(&root, "version = 1\n");
+    resolution.read_only = true;
+    resolution.state_dir = state_dir.clone();
+    resolution.state_dir_override = Some(state_dir.clone());
+    let state = StateDir {
+        dir: state_dir.clone(),
+        resolved: true,
+        liveness: Liveness::Stopped,
+        control_name: Some(control.to_string_lossy().into_owned()),
+        channel_answers: false,
+    };
+
+    let outcome = super::repair(&Run {
+        resolution: &resolution,
+        state: &state,
+    })
+    .await;
+
+    assert!(
+        !state_dir.join("state").exists(),
+        "the plane's reclaim still runs: {:?}",
+        outcome.failures
+    );
+    assert!(
+        !state_dir.join("meta.redb").exists(),
+        "and the store is still never created"
+    );
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+}
+
 #[tokio::test]
 async fn a_store_held_by_another_process_is_a_warn_not_an_error() {
     // The test holds the store open first (that `FsStorage::new` also creates the file is

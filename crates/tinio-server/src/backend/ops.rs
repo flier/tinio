@@ -22,8 +22,8 @@
 //! ```
 //!
 //! The compile-time strip and the runtime refusal are one fact at two layers,
-//! and the strip is a function of the capability — verified across all 36
-//! operations against `backend/s3.rs`'s 19 `#[cfg]` attributes. So the row
+//! and the strip is a function of the capability — verified across all 39
+//! operations against `backend/s3.rs`'s 22 `#[cfg]` attributes. So the row
 //! states the feature once, and the consumers derive the attribute. A
 //! capability with no cargo feature (`tagging`, `delete_objects`) is written
 //! bare: `#[gated(tagging)]`.
@@ -63,6 +63,10 @@ macro_rules! tinio_s3_ops {
                 fn get_object (GetObjectInput) -> GetObjectOutput;
                 fn head_object (HeadObjectInput) -> HeadObjectOutput;
                 fn get_object_attributes (GetObjectAttributesInput) -> GetObjectAttributesOutput;
+                #[gated(versioning: "versioning")]
+                fn get_bucket_versioning (GetBucketVersioningInput) -> GetBucketVersioningOutput;
+                #[gated(versioning: "versioning")]
+                fn list_object_versions (ListObjectVersionsInput) -> ListObjectVersionsOutput;
                 #[gated(tagging)]
                 fn get_object_tagging (GetObjectTaggingInput) -> GetObjectTaggingOutput;
                 #[gated(acl: "acl")]
@@ -97,6 +101,8 @@ macro_rules! tinio_s3_ops {
                 fn delete_object (DeleteObjectInput) -> DeleteObjectOutput;
                 #[gated(delete_objects)]
                 fn delete_objects (DeleteObjectsInput) -> DeleteObjectsOutput;
+                #[gated(versioning: "versioning")]
+                fn put_bucket_versioning (PutBucketVersioningInput) -> PutBucketVersioningOutput;
                 #[gated(tagging)]
                 fn put_object_tagging (PutObjectTaggingInput) -> PutObjectTaggingOutput;
                 #[gated(tagging)]
@@ -132,7 +138,7 @@ pub(crate) use tinio_s3_ops;
 ///   name plus stripping features — and must be comparable with `s3.rs`'s raw
 ///   text, which `include_str!` never filters by feature;
 /// - [`table_ops`] carries the derived `#[cfg]`, so it is what *this* build
-///   compiles (measured on this table: 36 names under `--all-features`, 23
+///   compiles (measured on this table: 39 names under `--all-features`, 23
 ///   under `--no-default-features --features multipart`, 17 under
 ///   `--no-default-features`). It is a subset check against the table, never
 ///   an equality with the file.
@@ -309,12 +315,12 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// The twenty mutating operations, written out from the design's `Kind`
-    /// column and the plan's table, in sorted order so it compares directly
-    /// with the sorted group. The independent side of
+    /// The twenty-one mutating operations, written out from the design's
+    /// `Kind` column and the plan's table, in sorted order so it compares
+    /// directly with the sorted group. The independent side of
     /// [`table_groups_operations_by_whether_they_mutate`], which is why it
     /// is spelled out rather than read back from the table it pins.
-    const WRITE_OPS: [&str; 20] = [
+    const WRITE_OPS: [&str; 21] = [
         "abort_multipart_upload",
         "complete_multipart_upload",
         "copy_object",
@@ -329,6 +335,7 @@ mod tests {
         "put_bucket_acl",
         "put_bucket_cors",
         "put_bucket_tagging",
+        "put_bucket_versioning",
         "put_object",
         "put_object_acl",
         "put_object_tagging",
@@ -353,7 +360,7 @@ mod tests {
         writes.sort();
         assert_eq!(writes, WRITE_OPS);
         // The two groups partition the table, so the read group is exactly
-        // the other sixteen rows: no row in both, none in neither. A row
+        // the other eighteen rows: no row in both, none in neither. A row
         // listed twice inside one group, or in both groups, breaks the
         // sorted comparison below; a row duplicated in the table itself is
         // `table_has_no_duplicates`'s to catch.
